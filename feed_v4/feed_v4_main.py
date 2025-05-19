@@ -16,8 +16,8 @@ async def main():
     # Запуск всех воркеров с защитой
     await asyncio.gather(
         run_safe_loop(lambda: run_feed_and_aggregator(pg, redis), "FEED+AGGREGATOR"),
-        run_safe_loop(lambda: asyncio.sleep(1), "INDICATORS"),
-        run_safe_loop(lambda: asyncio.sleep(1), "SNAPSHOT")
+#         run_safe_loop(lambda: asyncio.sleep(1), "INDICATORS"),
+#         run_safe_loop(lambda: asyncio.sleep(1), "SNAPSHOT")
     )
 
 # 🔸 Запуск
