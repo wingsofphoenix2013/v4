@@ -12,15 +12,30 @@
     </style>
   </head>
   <body class="min-h-screen font-sans text-slate-800">
-    <!-- Верхнее меню -->
+    <!-- Верхнее меню навигации -->
     <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
-      <div class="max-w-7xl mx-auto px-4 py-3 flex justify-start items-center">
-        <a href="/tickers" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад к тикерам</a>
+      <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+        <h1 class="text-2xl font-semibold text-blue-900 tracking-wide">Торговый Движок v4</h1>
+        <nav class="space-x-4 text-sm font-medium text-slate-700">
+          <a href="/" class="hover:text-blue-600 transition-colors">Главная</a>
+          <a href="/tickers" class="hover:text-blue-600 transition-colors">Тикеры</a>
+          <a href="/indicators" class="hover:text-blue-600 transition-colors">Индикаторы</a>
+          <a href="/signals" class="hover:text-blue-600 transition-colors">Сигналы</a>
+          <a href="/strategies" class="hover:text-blue-600 transition-colors">Стратегии</a>
+          <a href="/trades" class="hover:text-blue-600 transition-colors">Торги</a>
+          <a href="/status" class="hover:text-blue-600 transition-colors">Статус</a>
+        </nav>
       </div>
     </header>
 
-    <!-- Форма добавления -->
+    <!-- Контейнер формы -->
     <main class="max-w-xl mx-auto px-4 py-10">
+      {% if error %}
+        <div class="mb-4 p-4 bg-red-100 text-red-800 rounded border border-red-300">
+          {{ error }}
+        </div>
+      {% endif %}
+
       <form method="post" action="/tickers/create" class="space-y-6 bg-white/80 p-6 rounded-2xl shadow">
         <div>
           <label class="block mb-1 font-medium">Название тикера (в верхнем регистре)</label>
