@@ -2,19 +2,7 @@
 
 import asyncio
 from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
-
-# 🔸 Заглушки для воркеров (будут реализованы позже)
-async def run_feed_and_aggregator(pg, redis):
-    while True:
-        await asyncio.sleep(1)  # заглушка цикла
-
-async def run_indicator_worker(pg, redis):
-    while True:
-        await asyncio.sleep(1)  # заглушка цикла
-
-async def run_snapshot_loop(pg, redis):
-    while True:
-        await asyncio.sleep(1)  # заглушка цикла
+from feed_and_aggregate import run_feed_and_aggregator
 
 # 🔸 Главная точка запуска
 async def main():
@@ -28,8 +16,8 @@ async def main():
     # Запуск всех воркеров с защитой
     await asyncio.gather(
         run_safe_loop(lambda: run_feed_and_aggregator(pg, redis), "FEED+AGGREGATOR"),
-        run_safe_loop(lambda: run_indicator_worker(pg, redis), "INDICATORS"),
-        run_safe_loop(lambda: run_snapshot_loop(pg, redis), "SNAPSHOT")
+        run_safe_loop(lambda: asyncio.sleep(1), "INDICATORS"),
+        run_safe_loop(lambda: asyncio.sleep(1), "SNAPSHOT")
     )
 
 # 🔸 Запуск
