@@ -62,7 +62,7 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                     await refresh_queue.put("refresh")
 
                 await redis.xack(stream, group, msg_id)
-# 🔸 Слушает WebSocket Binance и автоматически переподключается при изменении тикеров
+# 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
     logger = logging.getLogger("KLINE")
 
@@ -80,45 +80,52 @@ async def listen_kline_stream(redis, state, refresh_queue):
             async with websockets.connect(stream_url) as ws:
                 logger.info(f"Подключено к WebSocket Binance: {len(symbols)} тикеров")
 
+                recv_task = asyncio.create_task(ws.recv())
+                refresh_task = asyncio.create_task(refresh_queue.get())
+
                 while True:
-                    done, pending = await asyncio.wait(
-                        [
-                            asyncio.create_task(ws.recv()),
-                            asyncio.create_task(refresh_queue.get())
-                        ],
+                    done, _ = await asyncio.wait(
+                        [recv_task, refresh_task],
                         return_when=asyncio.FIRST_COMPLETED
                     )
 
-                    for task in done:
-                        result = task.result()
+                    if refresh_task in done:
+                        logger.info("Получен сигнал переподключения WebSocket")
+                        recv_task.cancel()
+                        return  # выйдет из with ws → пересоздаст соединение
 
-                        if isinstance(result, str):  # WebSocket сообщение
-                            data = json.loads(result)
-                            if "data" not in data or "k" not in data["data"]:
-                                continue
+                    if recv_task in done:
+                        try:
+                            msg = recv_task.result()
+                        except Exception as e:
+                            logger.error(f"Ошибка чтения WebSocket: {e}")
+                            return
 
-                            kline = data["data"]["k"]
-                            if not kline["x"]:
-                                continue  # Только is_final == true
+                        data = json.loads(msg)
+                        if "data" not in data or "k" not in data["data"]:
+                            continue
 
-                            symbol = kline["s"]
-                            open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
+                        kline = data["data"]["k"]
+                        if not kline["x"]:
+                            continue  # Только is_final
 
-                            log_str = (
-                                f"[{symbol}] Получена свеча M1: {open_time} — "
-                                f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
-                                f"C:{kline['c']} V:{kline['v']}"
-                            )
-                            logger.info(log_str)
+                        symbol = kline["s"]
+                        open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
 
-                        elif result == "refresh":
-                            logger.info("Получен сигнал переподключения WebSocket")
-                            return  # прерываем `with ws`, начнётся новый цикл
+                        log_str = (
+                            f"[{symbol}] Получена свеча M1: {open_time} — "
+                            f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
+                            f"C:{kline['c']} V:{kline['v']}"
+                        )
+                        logger.info(log_str)
+
+                        # перезапустить задачи
+                        recv_task = asyncio.create_task(ws.recv())
+                        refresh_task = asyncio.create_task(refresh_queue.get())
 
         except Exception as e:
             logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
             await asyncio.sleep(5)
-
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
     log = logging.getLogger("FEED+AGGREGATOR")
