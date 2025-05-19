@@ -1,4 +1,4 @@
-# feed_and_aggregate.py — приём и агрегация рыночных данных
+# feed_and_aggregate.py — приём и агрегация рыночных данных 
 
 import logging
 import asyncio
