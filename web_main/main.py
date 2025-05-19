@@ -9,7 +9,7 @@ import os
 app = FastAPI()
 
 # Настройка шаблонов Jinja2 (директория с HTML-файлами)
-templates = Jinja2Templates(directory="web_main/templates")
+templates = Jinja2Templates(directory="templates")
 
 # Маршрут для главной страницы интерфейса
 @app.get("/", response_class=HTMLResponse)
