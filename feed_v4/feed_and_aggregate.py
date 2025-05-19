@@ -145,8 +145,12 @@ async def run_feed_and_aggregator(pg, redis):
     # Запуск подписки на Redis Stream
     asyncio.create_task(handle_ticker_events(redis, state, pg, refresh_queue))
 
-    # Запуск приёма свечей через WebSocket
-    asyncio.create_task(listen_kline_stream(redis, state, refresh_queue))
+    # Постоянный перезапуск слушателя WebSocket
+    async def loop_listen():
+        while True:
+            await listen_kline_stream(redis, state, refresh_queue)
+
+    asyncio.create_task(loop_listen())
 
     # Цикл ожидания (можно будет использовать как watchdog)
     while True:
