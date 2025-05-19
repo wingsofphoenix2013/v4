@@ -1,15 +1,21 @@
-# feed_and_aggregate.py — приём и агрегация рыночных данных 
+# feed_and_aggregate.py — приём и агрегация рыночных данных
 
 import logging
 import asyncio
 
-# 🔸 Загрузка всех тикеров и точности округления из PostgreSQL
+# 🔸 Загрузка всех тикеров, точности и статуса из PostgreSQL
 async def load_all_tickers(pg_pool):
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT symbol, precision_price FROM tickers_v4
+            SELECT symbol, precision_price, status FROM tickers_v4
         """)
-        return {row['symbol']: row['precision_price'] for row in rows}
+        tickers = {}
+        active = set()
+        for row in rows:
+            tickers[row['symbol']] = row['precision_price']
+            if row['status'] == 'enabled':
+                active.add(row['symbol'].lower())
+        return tickers, active
 
 # 🔸 Обработка событий включения/отключения тикеров через Redis Stream
 async def handle_ticker_events(redis, state, pg):
@@ -56,8 +62,7 @@ async def run_feed_and_aggregator(pg, redis):
     log = logging.getLogger("FEED+AGGREGATOR")
 
     # Загрузка всех тикеров (enabled + disabled)
-    tickers = await load_all_tickers(pg)
-    active = set([s.lower() for s in tickers])
+    tickers, active = await load_all_tickers(pg)
     log.info(f"Загружено тикеров: {len(tickers)} → {list(tickers.keys())}")
 
     for s in tickers:
