@@ -2,21 +2,41 @@
 
 import os
 from decimal import Decimal
-
+import redis.asyncio as aioredis
+import json
+import logging
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.status import HTTP_303_SEE_OTHER
 import asyncpg
 
+# 🔸 Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
 # 🔸 Переменные окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
 
 # 🔸 Подключение к PostgreSQL (асинхронный пул)
 pg_pool: asyncpg.Pool = None
 
 async def init_pg_pool():
     return await asyncpg.create_pool(DATABASE_URL)
+
+# 🔸 Подключение к Redis
+redis_client: aioredis.Redis = None
+
+def init_redis_client():
+    return aioredis.from_url(
+        f"redis://{REDIS_HOST}:{REDIS_PORT}",
+        password=REDIS_PASSWORD,
+        ssl=REDIS_USE_TLS,
+        decode_responses=True
+    )
 
 # 🔸 FastAPI и шаблоны
 app = FastAPI()
@@ -25,8 +45,9 @@ templates = Jinja2Templates(directory="templates")
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
-    global pg_pool
+    global pg_pool, redis_client
     pg_pool = await init_pg_pool()
+    redis_client = init_redis_client()
 
 # 🔸 Получение всех тикеров из базы
 async def get_all_tickers():
@@ -121,3 +142,29 @@ async def create_ticker(
         "min_qty": min_qty
     })
     return RedirectResponse(url="/tickers", status_code=HTTP_303_SEE_OTHER)
+# 🔸 Обновление поля тикера и отправка уведомления в Redis
+async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
+    # Обновление поля в PostgreSQL
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE tickers_v4 SET {field} = $1 WHERE id = $2",
+            new_value, ticker_id
+        )
+        symbol = await conn.fetchval("SELECT symbol FROM tickers_v4 WHERE id = $1", ticker_id)
+
+    # Формирование события
+    event = {
+        "type": field,
+        "action": new_value,
+        "symbol": symbol,
+        "source": "web_ui"
+    }
+
+    # Отправка в Redis Pub/Sub
+    await redis_client.publish("tickers_v4_events", json.dumps(event))
+    logging.info(f"[PubSub] {event}")
+
+    # Отправка в Redis Stream
+    stream_name = f"tickers_{field}_stream"
+    await redis_client.xadd(stream_name, event)
+    logging.info(f"[Stream:{stream_name}] {event}")
