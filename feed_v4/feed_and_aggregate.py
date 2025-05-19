@@ -22,7 +22,7 @@ async def load_all_tickers(pg_pool):
         return tickers, active
 
 # 🔸 Обработка событий включения/отключения тикеров через Redis Stream
-async def handle_ticker_events(redis, state, pg):
+async def handle_ticker_events(redis, state, pg, refresh_queue):
     group = "aggregator_group"
     stream = "tickers_status_stream"
     logger = logging.getLogger("TICKER_STREAM")
@@ -54,14 +54,16 @@ async def handle_ticker_events(redis, state, pg):
                 if action == "enabled" and symbol in state["tickers"]:
                     logger.info(f"Активирован тикер: {symbol}")
                     state["active"].add(symbol.lower())
+                    await refresh_queue.put("refresh")
 
                 elif action == "disabled" and symbol in state["tickers"]:
                     logger.info(f"Отключён тикер: {symbol}")
                     state["active"].discard(symbol.lower())
+                    await refresh_queue.put("refresh")
 
                 await redis.xack(stream, group, msg_id)
-# 🔸 Слушает WebSocket Binance по тикерам из state["active"]
-async def listen_kline_stream(redis, state):
+# 🔸 Слушает WebSocket Binance и автоматически переподключается при изменении тикеров
+async def listen_kline_stream(redis, state, refresh_queue):
     logger = logging.getLogger("KLINE")
 
     while True:
@@ -78,29 +80,45 @@ async def listen_kline_stream(redis, state):
             async with websockets.connect(stream_url) as ws:
                 logger.info(f"Подключено к WebSocket Binance: {len(symbols)} тикеров")
 
-                async for msg in ws:
-                    data = json.loads(msg)
-
-                    if "data" not in data:
-                        continue
-                    kline = data["data"]["k"]
-                    if not kline["x"]:
-                        continue  # Только is_final == true
-
-                    symbol = kline["s"]
-                    open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
-
-                    log_str = (
-                        f"[{symbol}] Получена свеча M1: {open_time} — "
-                        f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
-                        f"C:{kline['c']} V:{kline['v']}"
+                while True:
+                    done, pending = await asyncio.wait(
+                        [
+                            asyncio.create_task(ws.recv()),
+                            asyncio.create_task(refresh_queue.get())
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED
                     )
-                    logger.info(log_str)
+
+                    for task in done:
+                        result = task.result()
+
+                        if isinstance(result, str):  # WebSocket сообщение
+                            data = json.loads(result)
+                            if "data" not in data or "k" not in data["data"]:
+                                continue
+
+                            kline = data["data"]["k"]
+                            if not kline["x"]:
+                                continue  # Только is_final == true
+
+                            symbol = kline["s"]
+                            open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
+
+                            log_str = (
+                                f"[{symbol}] Получена свеча M1: {open_time} — "
+                                f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
+                                f"C:{kline['c']} V:{kline['v']}"
+                            )
+                            logger.info(log_str)
+
+                        elif result == "refresh":
+                            logger.info("Получен сигнал переподключения WebSocket")
+                            return  # прерываем `with ws`, начнётся новый цикл
 
         except Exception as e:
             logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
             await asyncio.sleep(5)
-            
+
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
     log = logging.getLogger("FEED+AGGREGATOR")
@@ -121,11 +139,14 @@ async def run_feed_and_aggregator(pg, redis):
         "active": active      # set of lowercase symbols
     }
 
+    # Очередь сигналов на переподключение WebSocket
+    refresh_queue = asyncio.Queue()
+
     # Запуск подписки на Redis Stream
-    asyncio.create_task(handle_ticker_events(redis, state, pg))
+    asyncio.create_task(handle_ticker_events(redis, state, pg, refresh_queue))
 
     # Запуск приёма свечей через WebSocket
-    asyncio.create_task(listen_kline_stream(redis, state))
+    asyncio.create_task(listen_kline_stream(redis, state, refresh_queue))
 
     # Цикл ожидания (можно будет использовать как watchdog)
     while True:
