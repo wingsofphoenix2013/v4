@@ -61,7 +61,10 @@ async def run_feed_and_aggregator(pg, redis):
     log.info(f"Загружено тикеров: {len(tickers)} → {list(tickers.keys())}")
 
     for s in tickers:
-        log.info(f"Активен по умолчанию: {s}")
+        if s.lower() in active:
+            log.info(f"Активен по умолчанию: {s}")
+        else:
+            log.info(f"Выключен по умолчанию: {s}")
 
     # Общее состояние
     state = {
