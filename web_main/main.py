@@ -89,25 +89,25 @@ async def tickers_page(request: Request):
     tickers = await get_all_tickers()
     return templates.TemplateResponse("tickers.html", {"request": request, "tickers": tickers})
 
-# 🔸 POST: Включение/выключение статуса и торговли (заглушки)
+# 🔸 POST: Включение/выключение статуса и торговли
 @app.post("/tickers/{ticker_id}/enable_status")
 async def enable_status(ticker_id: int):
-    print(f"[DEBUG] Включить статус тикера ID={ticker_id}")
+    await update_ticker_and_notify(ticker_id, field="status", new_value="enabled")
     return RedirectResponse(url="/tickers", status_code=HTTP_303_SEE_OTHER)
 
 @app.post("/tickers/{ticker_id}/disable_status")
 async def disable_status(ticker_id: int):
-    print(f"[DEBUG] Выключить статус тикера ID={ticker_id}")
+    await update_ticker_and_notify(ticker_id, field="status", new_value="disabled")
     return RedirectResponse(url="/tickers", status_code=HTTP_303_SEE_OTHER)
 
 @app.post("/tickers/{ticker_id}/enable_trade")
 async def enable_trade(ticker_id: int):
-    print(f"[DEBUG] Включить торговлю для тикера ID={ticker_id}")
+    await update_ticker_and_notify(ticker_id, field="tradepermission", new_value="enabled")
     return RedirectResponse(url="/tickers", status_code=HTTP_303_SEE_OTHER)
 
 @app.post("/tickers/{ticker_id}/disable_trade")
 async def disable_trade(ticker_id: int):
-    print(f"[DEBUG] Выключить торговлю для тикера ID={ticker_id}")
+    await update_ticker_and_notify(ticker_id, field="tradepermission", new_value="disabled")
     return RedirectResponse(url="/tickers", status_code=HTTP_303_SEE_OTHER)
 
 # 🔸 Форма создания тикера
