@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Тикеры</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body {
+        background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
+      }
+    </style>
+  </head>
+  <body class="min-h-screen font-sans text-slate-800">
+    <!-- Верхнее меню навигации -->
+    <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
+      <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+        <h1 class="text-2xl font-semibold text-blue-900 tracking-wide">Торговый Движок v4</h1>
+        <nav class="space-x-4 text-sm font-medium text-slate-700">
+          <a href="/" class="hover:text-blue-600 transition-colors">Главная</a>
+          <a href="/tickers" class="hover:text-blue-600 transition-colors">Тикеры</a>
+          <a href="/indicators" class="hover:text-blue-600 transition-colors">Индикаторы</a>
+          <a href="/signals" class="hover:text-blue-600 transition-colors">Сигналы</a>
+          <a href="/strategies" class="hover:text-blue-600 transition-colors">Стратегии</a>
+          <a href="/trades" class="hover:text-blue-600 transition-colors">Торги</a>
+          <a href="/status" class="hover:text-blue-600 transition-colors">Статус</a>
+        </nav>
+      </div>
+    </header>
+
+    <!-- Заголовок и кнопки управления -->
+    <section class="max-w-7xl mx-auto px-4 pt-10 pb-4 flex justify-between items-center">
+      <a href="/" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад</a>
+      <a href="/tickers/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition">Добавить тикер</a>
+    </section>
+
+    <!-- Основная таблица -->
+    <main class="max-w-5xl mx-auto px-4 pb-10">
+      <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
+        <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+          <tr>
+            <th class="px-4 py-3">№№</th>
+            <th class="px-4 py-3">Название тикера</th>
+            <th class="px-4 py-3">Статус</th>
+            <th class="px-4 py-3">Торговля</th>
+          </tr>
+        </thead>
+        <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+          {% for i, t in enumerate(tickers, 1) %}
+          <tr>
+            <td class="px-4 py-3">{{ i }}</td>
+            <td class="px-4 py-3 font-semibold uppercase">{{ t.symbol }}</td>
+            <td class="px-4 py-3 flex items-center space-x-3">
+              {% if t.status == 'enabled' %}
+                <div class="h-3 w-3 rounded-full bg-green-500"></div>
+                <form method="post" action="/tickers/{{ t.id }}/disable_status">
+                  <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+                </form>
+              {% else %}
+                <div class="h-3 w-3 rounded-full bg-red-500"></div>
+                <form method="post" action="/tickers/{{ t.id }}/enable_status">
+                  <button class="text-sm text-blue-600 hover:underline">Включить</button>
+                </form>
+              {% endif %}
+            </td>
+            <td class="px-4 py-3 flex items-center space-x-3">
+              {% if t.tradepermission == 'enabled' %}
+                <div class="h-3 w-3 rounded-full bg-green-500"></div>
+                <form method="post" action="/tickers/{{ t.id }}/disable_trade">
+                  <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+                </form>
+              {% else %}
+                <div class="h-3 w-3 rounded-full bg-red-500"></div>
+                <form method="post" action="/tickers/{{ t.id }}/enable_trade">
+                  <button class="text-sm text-blue-600 hover:underline">Включить</button>
+                </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>
