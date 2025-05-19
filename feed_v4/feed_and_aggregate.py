@@ -45,12 +45,15 @@ async def handle_ticker_events(redis, state):
 
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
-    log = logging.getLogger("FEED")
+    log = logging.getLogger("FEED+AGGREGATOR")
 
     # Загрузка тикеров и точности округления
     tickers = await load_active_tickers(pg)
     active = set([s.lower() for s in tickers])
     log.info(f"Загружено тикеров: {len(tickers)} → {list(tickers.keys())}")
+
+    for s in tickers:
+        log.info(f"Активен по умолчанию: {s}")
 
     # Общее состояние
     state = {
