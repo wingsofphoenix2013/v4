@@ -46,9 +46,9 @@
           </tr>
         </thead>
         <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-          {% for i, t in enumerate(tickers, 1) %}
+          {% for t in tickers %}
           <tr>
-            <td class="px-4 py-3">{{ i }}</td>
+            <td class="px-4 py-3">{{ loop.index }}</td>
             <td class="px-4 py-3 font-semibold uppercase">{{ t.symbol }}</td>
             <td class="px-4 py-3 flex items-center space-x-3">
               {% if t.status == 'enabled' %}
