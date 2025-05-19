@@ -6,13 +6,13 @@ import asyncpg
 import redis.asyncio as aioredis
 
 # 🔸 Переменные окружения
+DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
-POSTGRES_URL = os.getenv("POSTGRES_URL")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 # 🔸 Подключение к PostgreSQL
 async def init_pg_pool():
-    return await asyncpg.create_pool(POSTGRES_URL)
+    return await asyncpg.create_pool(DATABASE_URL)
 
 # 🔸 Подключение к Redis
 def init_redis_client():
