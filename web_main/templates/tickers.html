@@ -28,14 +28,15 @@
       </div>
     </header>
 
-    <!-- Заголовок и кнопки управления -->
-    <section class="max-w-7xl mx-auto px-4 pt-10 pb-4 flex justify-between items-center">
-      <a href="/" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад</a>
-      <a href="/tickers/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition">Добавить тикер</a>
-    </section>
+    <!-- Контейнер кнопок и таблицы -->
+    <main class="max-w-7xl mx-auto px-4 py-10">
+      <!-- Панель управления -->
+      <div class="flex justify-between items-center mb-6">
+        <a href="/" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад</a>
+        <a href="/tickers/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition">Добавить тикер</a>
+      </div>
 
-    <!-- Основная таблица -->
-    <main class="max-w-5xl mx-auto px-4 pb-10">
+      <!-- Таблица тикеров -->
       <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
         <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
           <tr>
@@ -50,32 +51,41 @@
           <tr>
             <td class="px-4 py-3">{{ loop.index }}</td>
             <td class="px-4 py-3 font-semibold uppercase">{{ t.symbol }}</td>
-            <td class="px-4 py-3 flex items-center space-x-3">
-              {% if t.status == 'enabled' %}
-                <div class="h-3 w-3 rounded-full bg-green-500"></div>
-                <form method="post" action="/tickers/{{ t.id }}/disable_status">
-                  <button class="text-sm text-blue-600 hover:underline">Выключить</button>
-                </form>
-              {% else %}
-                <div class="h-3 w-3 rounded-full bg-red-500"></div>
-                <form method="post" action="/tickers/{{ t.id }}/enable_status">
-                  <button class="text-sm text-blue-600 hover:underline">Включить</button>
-                </form>
-              {% endif %}
+
+            <!-- Столбец: Статус -->
+            <td class="px-4 py-3">
+              <div class="flex items-center space-x-3">
+                {% if t.status == 'enabled' %}
+                  <div class="h-3 w-3 rounded-full bg-green-500"></div>
+                  <form method="post" action="/tickers/{{ t.id }}/disable_status">
+                    <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+                  </form>
+                {% else %}
+                  <div class="h-3 w-3 rounded-full bg-red-500"></div>
+                  <form method="post" action="/tickers/{{ t.id }}/enable_status">
+                    <button class="text-sm text-blue-600 hover:underline">Включить</button>
+                  </form>
+                {% endif %}
+              </div>
             </td>
-            <td class="px-4 py-3 flex items-center space-x-3">
-              {% if t.tradepermission == 'enabled' %}
-                <div class="h-3 w-3 rounded-full bg-green-500"></div>
-                <form method="post" action="/tickers/{{ t.id }}/disable_trade">
-                  <button class="text-sm text-blue-600 hover:underline">Выключить</button>
-                </form>
-              {% else %}
-                <div class="h-3 w-3 rounded-full bg-red-500"></div>
-                <form method="post" action="/tickers/{{ t.id }}/enable_trade">
-                  <button class="text-sm text-blue-600 hover:underline">Включить</button>
-                </form>
-              {% endif %}
+
+            <!-- Столбец: Торговля -->
+            <td class="px-4 py-3">
+              <div class="flex items-center space-x-3">
+                {% if t.tradepermission == 'enabled' %}
+                  <div class="h-3 w-3 rounded-full bg-green-500"></div>
+                  <form method="post" action="/tickers/{{ t.id }}/disable_trade">
+                    <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+                  </form>
+                {% else %}
+                  <div class="h-3 w-3 rounded-full bg-red-500"></div>
+                  <form method="post" action="/tickers/{{ t.id }}/enable_trade">
+                    <button class="text-sm text-blue-600 hover:underline">Включить</button>
+                  </form>
+                {% endif %}
+              </div>
             </td>
+
           </tr>
           {% endfor %}
         </tbody>
