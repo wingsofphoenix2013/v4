@@ -16,11 +16,11 @@ async def load_active_tickers(pg_pool):
 # 🔸 Обработка событий включения/отключения тикеров через Redis Stream
 async def handle_ticker_events(redis, state):
     group = "aggregator_group"
-    stream = "tickers_v4_events"
+    stream = "tickers_status_stream"
     logger = logging.getLogger("TICKER_STREAM")
 
     try:
-        await redis.xgroup_create(stream, group, id="$", mkstream=True)
+        await redis.xgroup_create(stream, group, id="0", mkstream=True)
     except Exception:
         pass  # группа уже существует
 
