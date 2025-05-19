@@ -1,7 +1,7 @@
 # feed_v4_main.py — управляющий модуль системы v4
 
 import asyncio
-from infra import init_pg_pool, init_redis_client, run_safe_loop
+from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
 
 # 🔸 Заглушки для воркеров (будут реализованы позже)
 async def run_feed_and_aggregator(pg, redis):
@@ -18,6 +18,9 @@ async def run_snapshot_loop(pg, redis):
 
 # 🔸 Главная точка запуска
 async def main():
+    # Настройка логирования
+    setup_logging()
+
     # Инициализация подключений
     pg = await init_pg_pool()
     redis = init_redis_client()
