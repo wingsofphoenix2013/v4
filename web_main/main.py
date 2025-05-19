@@ -31,10 +31,10 @@ async def init_pg_pool():
 redis_client: aioredis.Redis = None
 
 def init_redis_client():
+    protocol = "rediss" if REDIS_USE_TLS else "redis"
     return aioredis.from_url(
-        f"redis://{REDIS_HOST}:{REDIS_PORT}",
+        f"{protocol}://{REDIS_HOST}:{REDIS_PORT}",
         password=REDIS_PASSWORD,
-        ssl=REDIS_USE_TLS,
         decode_responses=True
     )
 
