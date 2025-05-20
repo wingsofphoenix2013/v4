@@ -441,7 +441,7 @@ async def watch_mark_price(symbol, redis, precision):
         except Exception as e:
             logger.error(f"[{symbol}] Ошибка WebSocket markPrice (futures): {e}", exc_info=True)
             await asyncio.sleep(5)
-# 🔸 Основной запуск компонента
+# 🔸 Основной запуск компонента с управлением тасками
 async def run_feed_and_aggregator(pg, redis):
 
     log = logging.getLogger("FEED+AGGREGATOR")
@@ -460,21 +460,36 @@ async def run_feed_and_aggregator(pg, redis):
     state = {
         "tickers": tickers,            # symbol -> precision_price
         "active": active,              # set of lowercase symbols
-        "markprice_tasks": {}          # symbol -> asyncio.Task
+        "markprice_tasks": {},         # symbol -> asyncio.Task
+        "tasks": set()                 # все фоновые таски
     }
 
     # Очередь сигналов на переподключение WebSocket
     refresh_queue = asyncio.Queue()
 
+    # Хелпер для создания отслеживаемых тасок
+    def create_tracked_task(coro, name):
+        task = asyncio.create_task(coro)
+        state["tasks"].add(task)
+        def on_done(t):
+            try:
+                t.result()
+            except Exception as e:
+                log.exception(f"[{name}] Task crashed: {e}")
+            finally:
+                state["tasks"].discard(t)
+        task.add_done_callback(on_done)
+        return task
+
     # Запуск подписки на Redis Stream
-    asyncio.create_task(handle_ticker_events(redis, state, pg, refresh_queue))
+    create_tracked_task(handle_ticker_events(redis, state, pg, refresh_queue), "ticker_events")
 
     # Запуск потоков markPrice для каждого активного тикера (фьючерсный рынок)
     for symbol in state["active"]:
         upper_symbol = symbol.upper()
         precision = state["tickers"].get(upper_symbol)
         if precision is not None:
-            task = asyncio.create_task(watch_mark_price(upper_symbol, redis, precision))
+            task = create_tracked_task(watch_mark_price(upper_symbol, redis, precision), f"markprice_{upper_symbol}")
             state["markprice_tasks"][upper_symbol] = task
 
     # 🔸 Фоновая проверка отсутствующих M1
@@ -485,7 +500,7 @@ async def run_feed_and_aggregator(pg, redis):
                 await detect_missing_m1(redis, pg, symbol.upper(), now_ts)
             await asyncio.sleep(60)
 
-    asyncio.create_task(recovery_loop())
+    create_tracked_task(recovery_loop(), "recovery_loop")
 
     # 🔸 Фоновое восстановление всех пропущенных свечей
     async def restore_loop():
@@ -511,15 +526,22 @@ async def run_feed_and_aggregator(pg, redis):
 
             await asyncio.sleep(60)
 
-    asyncio.create_task(restore_loop())
+    create_tracked_task(restore_loop(), "restore_loop")
 
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
         while True:
             await listen_kline_stream(redis, state, refresh_queue)
 
-    asyncio.create_task(loop_listen())
+    create_tracked_task(loop_listen(), "listen_kline")
 
-    # Цикл ожидания (можно будет использовать как watchdog)
-    while True:
-        await asyncio.sleep(5)
+    # Цикл ожидания (можно будет использовать как watchdog или точка завершения)
+    try:
+        while True:
+            await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        log.info("Aggregator shutdown requested, cancelling tasks...")
+        for t in list(state["tasks"]):
+            t.cancel()
+        await asyncio.gather(*state["tasks"], return_exceptions=True)
+        log.info("All tasks shut down cleanly.")
