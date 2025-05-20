@@ -231,6 +231,9 @@ async def run_feed_and_aggregator(pg, redis):
 
     # Запуск подписки на Redis Stream
     asyncio.create_task(handle_ticker_events(redis, state, pg, refresh_queue))
+    
+    # Вызов внутри run_feed_and_aggregator()
+    asyncio.create_task(listen_mark_price(redis, state))
 
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
