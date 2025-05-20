@@ -353,7 +353,7 @@ async def check_consecutive_m1_failures(pg, symbol):
                 INSERT INTO system_log_v4 (module, level, message, details)
                 VALUES ($1, $2, $3, $4)
             """, "AGGREGATOR", "CRITICAL", "M1 permanently degraded",
-                {"symbol": symbol, "reason": "4+ consecutive missing M1"})
+                json.dumps({"symbol": symbol, "reason": "4+ consecutive missing M1"}))
 
             logger.critical(f"[{symbol}] Отключён — 4+ подряд пропущенных свечей")
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
