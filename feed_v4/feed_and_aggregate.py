@@ -412,7 +412,7 @@ async def run_feed_and_aggregator(pg, redis):
     # 🔸 Фоновая проверка отсутствующих M1
     async def recovery_loop():
         while True:
-            now_ts = int(datetime.utcnow().timestamp() * 1000)
+            now_ts = int(datetime.utcnow().replace(second=0, microsecond=0).timestamp() * 1000)
             for symbol in state["active"]:
                 await detect_missing_m1(redis, pg, symbol.upper(), now_ts)
             await asyncio.sleep(60)
