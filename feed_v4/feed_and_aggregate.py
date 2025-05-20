@@ -286,8 +286,49 @@ async def restore_missing_m1_loop(redis, pg, state):
                 minute = open_time.minute
                 if minute % 5 == 4:
                     await try_aggregate_m5(redis, symbol, open_time)
-
         await asyncio.sleep(60)
+# 🔸 Проверка: 4 и более подряд невосстановленных свечей → отключение тикера
+async def check_consecutive_m1_failures(pg, symbol):
+    import logging
+    logger = logging.getLogger("RECOVERY")
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT open_time FROM missing_m1_log_v4
+            WHERE symbol = $1 AND fixed IS NOT true
+            ORDER BY open_time ASC
+            LIMIT 10
+        """, symbol)
+
+        if len(rows) < 4:
+            return
+
+        timestamps = [row["open_time"] for row in rows]
+        deltas = [(timestamps[i+1] - timestamps[i]).total_seconds() for i in range(len(timestamps)-1)]
+
+        # Проверяем подряд 4 интервала по 60 секунд (разброс ±1с)
+        count = 1
+        for i in range(len(deltas)):
+            if 59 <= deltas[i] <= 61:
+                count += 1
+                if count >= 4:
+                    break
+            else:
+                count = 1
+
+        if count >= 4:
+            await conn.execute("""
+                UPDATE tickers_v4 SET tradepermission = 'disabled'
+                WHERE symbol = $1 AND tradepermission = 'enabled'
+            """, symbol)
+
+            await conn.execute("""
+                INSERT INTO system_log_v4 (module, level, message, details)
+                VALUES ($1, $2, $3, $4)
+            """, "AGGREGATOR", "CRITICAL", "M1 permanently degraded",
+                {"symbol": symbol, "reason": "4+ consecutive missing M1"})
+
+            logger.critical(f"[{symbol}] Отключён — 4+ подряд пропущенных свечей")
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
     logger = logging.getLogger("KLINE")
@@ -375,6 +416,9 @@ async def watch_mark_price(symbol, redis, precision):
             await asyncio.sleep(5)
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
+    import logging
+    from datetime import datetime
+    import asyncio
 
     log = logging.getLogger("FEED+AGGREGATOR")
 
@@ -420,7 +464,30 @@ async def run_feed_and_aggregator(pg, redis):
     asyncio.create_task(recovery_loop())
 
     # 🔸 Фоновое восстановление всех пропущенных свечей
-    asyncio.create_task(restore_missing_m1_loop(redis, pg, state))
+    async def restore_loop():
+        while True:
+            async with pg.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT symbol, open_time FROM missing_m1_log_v4 WHERE fixed IS NOT true ORDER BY open_time ASC"
+                )
+
+            for row in rows:
+                symbol = row["symbol"]
+                open_time = row["open_time"]
+                precision = state["tickers"].get(symbol)
+                if not precision:
+                    continue
+
+                await check_consecutive_m1_failures(pg, symbol)
+
+                success = await restore_missing_m1(symbol, open_time, redis, pg, precision)
+
+                if success and open_time.minute % 5 == 4:
+                    await try_aggregate_m5(redis, symbol, open_time)
+
+            await asyncio.sleep(60)
+
+    asyncio.create_task(restore_loop())
 
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
