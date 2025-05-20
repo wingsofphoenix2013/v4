@@ -43,7 +43,6 @@ def setup_logging():
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-# 🔸 Отдельная функция для отладочных сообщений
-def debug_log(message):
+def info_log(logger_name, message):
     if DEBUG_MODE:
-        logging.getLogger("DEBUG").debug(message)
+        logging.getLogger(logger_name).info(message)

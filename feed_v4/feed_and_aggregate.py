@@ -4,6 +4,7 @@ import logging
 import asyncio
 import websockets
 import json
+from infra import info_log
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 
@@ -47,7 +48,7 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         """, symbol)
                         if row:
                             state["tickers"][symbol] = row["precision_price"]
-                            logger.info(f"Добавлен тикер из БД: {symbol}")
+                            info_log("TICKER_STREAM", f"Добавлен тикер из БД: {symbol}")
 
                 if action == "enabled" and symbol in state["tickers"]:
                     logger.info(f"Активирован тикер: {symbol}")
@@ -70,13 +71,97 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
+# 🔸 Сохранение M1 в Redis TS и публикация события
+async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
+
+    ts_key = f"ohlcv:{symbol.lower()}:m1"
+    stream_key = "ohlcv_m1_ready"
+
+    timestamp = int(open_time.timestamp() * 1000)
+
+    # Округление значений через Decimal
+    def round_str(val):
+        return str(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+
+    fields = {
+        "o": round_str(kline["o"]),
+        "h": round_str(kline["h"]),
+        "l": round_str(kline["l"]),
+        "c": round_str(kline["c"]),
+        "v": round_str(kline["v"]),
+    }
+
+    try:
+        await redis.execute_command(
+            "TS.ADD", ts_key, timestamp, fields["c"], "RETENTION", 86400000, "LABELS",
+            "symbol", symbol.lower(), "tf", "m1"
+        )
+    except Exception as e:
+        logger = logging.getLogger("TS")
+        logger.warning(f"TS.ADD ошибка (ключ мог существовать): {e}")
+        await redis.execute_command("TS.CREATE", ts_key, "RETENTION", 86400000, "LABELS",
+            "symbol", symbol.lower(), "tf", "m1")
+        await redis.execute_command("TS.ADD", ts_key, timestamp, fields["c"])
+
+    await redis.xadd(stream_key, {
+        "symbol": symbol,
+        "open_time": str(open_time)
+    })
+
+    logger = logging.getLogger("KLINE")
+    info_log("KLINE", f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
+    
+    # вызов агрегации M5
+    await try_aggregate_m5(redis, symbol, timestamp)
+# 🔸 Попытка агрегировать M5 на основе последних M1
+async def try_aggregate_m5(redis, symbol, now_ts):
+    import logging
+    from datetime import datetime, timedelta
+
+    logger = logging.getLogger("KLINE")
+
+    dt = datetime.utcfromtimestamp(now_ts / 1000)
+    if dt.minute % 5 != 4:
+        return  # не конец 5-минутного блока
+
+    key_m1 = f"ohlcv:{symbol.lower()}:m1"
+    key_m5 = f"ohlcv:{symbol.lower()}:m5"
+    end_ts = now_ts
+    start_ts = end_ts - 4 * 60 * 1000  # 4 предыдущие минуты + текущая
+
+    try:
+        raw = await redis.execute_command("TS.RANGE", key_m1, start_ts, end_ts)
+        if len(raw) != 5:
+            logger.warning(f"[{symbol}] Недостаточно M1 для M5 ({len(raw)}/5)")
+            return
+
+        values = [float(v[1]) for v in raw]
+        o = values[0]
+        h = max(values)
+        l = min(values)
+        c = values[-1]
+        v = 0.0  # объём пока не аггрегируем, если нужно — надо вытягивать из полей
+
+        m5_ts = end_ts  # метка времени M5 — это конец интервала
+
+        # 🔸 Запись агрегированной свечи в TS с RETENTION 7 суток
+        await redis.execute_command(
+            "TS.ADD", key_m5, m5_ts, c,
+            "RETENTION", 604800000,
+            "LABELS", "symbol", symbol.lower(), "tf", "m5"
+        )
+
+        logger.info(f"[{symbol}] Построена M5: {dt.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+
+    except Exception as e:
+        logger.error(f"[{symbol}] Ошибка агрегации M5: {e}", exc_info=True)
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
     logger = logging.getLogger("KLINE")
 
     while True:
         if not state["active"]:
-            logger.info("Нет активных тикеров для подписки")
+            info_log("KLINE", "Нет активных тикеров для подписки")
             await asyncio.sleep(10)
             continue
 
@@ -123,45 +208,6 @@ async def listen_kline_stream(redis, state, refresh_queue):
         except Exception as e:
             logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
             await asyncio.sleep(5)
-# 🔸 Сохранение M1 в Redis TS и публикация события
-async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
-
-    ts_key = f"ohlcv:{symbol.lower()}:m1"
-    stream_key = "ohlcv_m1_ready"
-
-    timestamp = int(open_time.timestamp() * 1000)
-
-    # Округление значений через Decimal
-    def round_str(val):
-        return str(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
-
-    fields = {
-        "o": round_str(kline["o"]),
-        "h": round_str(kline["h"]),
-        "l": round_str(kline["l"]),
-        "c": round_str(kline["c"]),
-        "v": round_str(kline["v"]),
-    }
-
-    try:
-        await redis.execute_command(
-            "TS.ADD", ts_key, timestamp, fields["c"], "RETENTION", 86400000, "LABELS",
-            "symbol", symbol.lower(), "tf", "m1"
-        )
-    except Exception as e:
-        logger = logging.getLogger("TS")
-        logger.warning(f"TS.ADD ошибка (ключ мог существовать): {e}")
-        await redis.execute_command("TS.CREATE", ts_key, "RETENTION", 86400000, "LABELS",
-            "symbol", symbol.lower(), "tf", "m1")
-        await redis.execute_command("TS.ADD", ts_key, timestamp, fields["c"])
-
-    await redis.xadd(stream_key, {
-        "symbol": symbol,
-        "open_time": str(open_time)
-    })
-
-    logger = logging.getLogger("KLINE")
-    logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
 # 🔸 Поток markPrice для одного тикера с fstream.binance.com
 async def watch_mark_price(symbol, redis, precision):
     import time
@@ -190,7 +236,7 @@ async def watch_mark_price(symbol, redis, precision):
                         last_update = now
                         rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
                         await redis.set(f"price:{symbol}", rounded)
-                        logger.info(f"[{symbol}] Обновление markPrice (futures): {rounded}")
+                        info_log("KLINE", f"[{symbol}] Обновление markPrice (futures): {rounded}")
                     except Exception as e:
                         logger.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
         except Exception as e:
