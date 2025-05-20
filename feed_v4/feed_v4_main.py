@@ -1,10 +1,12 @@
 # feed_v4_main.py — управляющий модуль системы v4
 import uuid
-from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
-from feed_and_aggregate import run_feed_and_aggregator
 import uuid
 import asyncio
 import logging
+from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
+from feed_and_aggregate import run_feed_and_aggregator
+from core_io import run_core_writer
+
 
 # 🔸 Попытка захватить лидерство через Redis Lock
 async def try_acquire_team_lock(redis, lock_key="team_leader_lock", ttl=60):
@@ -53,8 +55,8 @@ async def main():
     # Запуск всех воркеров с защитой
     await asyncio.gather(
         run_safe_loop(lambda: run_feed_and_aggregator(pg, redis), "FEED+AGGREGATOR"),
+        run_safe_loop(lambda: run_core_writer(pg, redis), "CORE_IO")
     )
-
 # 🔸 Запуск
 if __name__ == "__main__":
     asyncio.run(main())
