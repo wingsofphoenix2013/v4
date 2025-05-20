@@ -20,7 +20,6 @@ async def load_all_tickers(pg_pool):
             if row['status'] == 'enabled':
                 active.add(row['symbol'].lower())
         return tickers, active
-
 # 🔸 Обработка событий включения/отключения тикеров через Redis Stream
 async def handle_ticker_events(redis, state, pg, refresh_queue):
     group = "aggregator_group"
@@ -56,6 +55,10 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                     state["active"].add(symbol.lower())
                     await refresh_queue.put("refresh")
 
+                    # запуск потока markPrice
+                    precision = state["tickers"][symbol]
+                    asyncio.create_task(watch_mark_price(symbol, redis, precision))
+
                 elif action == "disabled" and symbol in state["tickers"]:
                     logger.info(f"Отключён тикер: {symbol}")
                     state["active"].discard(symbol.lower())
@@ -74,7 +77,7 @@ async def listen_kline_stream(redis, state, refresh_queue):
 
         symbols = sorted(state["active"])
         streams = [f"{s}@kline_1m" for s in symbols]
-        stream_url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+        stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
         try:
             async with websockets.connect(stream_url) as ws:
@@ -123,7 +126,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
 
     timestamp = int(open_time.timestamp() * 1000)
 
-    # 🔸 Округление значений через Decimal
+    # Округление значений через Decimal
     def round_str(val):
         return str(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
 
@@ -154,57 +157,39 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
 
     logger = logging.getLogger("KLINE")
     logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
-# 🔸 Обработка потока markPrice с обновлением Redis
-async def listen_mark_price(redis, state):
+# 🔸 Поток markPrice для одного тикера с fstream.binance.com
+async def watch_mark_price(symbol, redis, precision):
     import time
+    from decimal import Decimal, ROUND_DOWN
+    import logging
     logger = logging.getLogger("KLINE")
 
-    last_update = {}
+    url = f"wss://fstream.binance.com/ws/{symbol.lower()}@markPrice"
+    last_update = 0
 
     while True:
-        if not state["active"]:
-            logger.info("Нет активных тикеров для подписки на markPrice")
-            await asyncio.sleep(10)
-            continue
-
-        symbols = sorted(state["active"])
-        streams = [f"{s}@markPrice" for s in symbols]
-        stream_url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
-
         try:
-            async with websockets.connect(stream_url) as ws:
-                logger.info(f"Подключено к WebSocket Binance (markPrice): {len(symbols)} тикеров")
-
+            async with websockets.connect(url) as ws:
+                logger.info(f"[{symbol}] Подключение к потоку markPrice (futures)")
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
-                        if "data" not in data or "p" not in data["data"]:
+                        price = data.get("p")
+                        if not price:
                             continue
-                        payload = data["data"]
-                        symbol = payload["s"]
-                        price = payload["p"]
+
                         now = time.time()
-
-                        # 🔸 Частотный фильтр — не чаще 1/сек
-                        if symbol in last_update and now - last_update[symbol] < 1:
+                        if now - last_update < 1:
                             continue
 
-                        last_update[symbol] = now
-                        precision = state["tickers"].get(symbol)
-                        if precision is None:
-                            continue
-
-                        from decimal import Decimal, ROUND_DOWN
+                        last_update = now
                         rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
-
                         await redis.set(f"price:{symbol}", rounded)
-                        logger.info(f"[{symbol}] Обновление markPrice: {rounded}")
-
+                        logger.info(f"[{symbol}] Обновление markPrice (futures): {rounded}")
                     except Exception as e:
-                        logger.warning(f"Ошибка обработки markPrice: {e}")
-
+                        logger.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
         except Exception as e:
-            logger.error(f"Ошибка WebSocket markPrice: {e}", exc_info=True)
+            logger.error(f"[{symbol}] Ошибка WebSocket markPrice (futures): {e}", exc_info=True)
             await asyncio.sleep(5)
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
@@ -232,9 +217,13 @@ async def run_feed_and_aggregator(pg, redis):
     # Запуск подписки на Redis Stream
     asyncio.create_task(handle_ticker_events(redis, state, pg, refresh_queue))
     
-    # Вызов внутри run_feed_and_aggregator()
-    asyncio.create_task(listen_mark_price(redis, state))
-
+    # Запуск потоков markPrice для каждого активного тикера (фьючерсный рынок)
+    for symbol in state["active"]:
+        upper_symbol = symbol.upper()
+        precision = state["tickers"].get(upper_symbol)
+        if precision is not None:
+            asyncio.create_task(watch_mark_price(upper_symbol, redis, precision))
+            
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
         while True:
