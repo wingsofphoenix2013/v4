@@ -73,7 +73,10 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
-# 🔸 Сохранение полной свечи M1 в RedisJSON
+import json
+from decimal import Decimal, ROUND_DOWN
+
+# 🔸 Сохранение полной свечи M1 в RedisJSON + Stream + Pub/Sub
 async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
 
     logger = logging.getLogger("KLINE")
@@ -92,11 +95,26 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
         "ts": timestamp
     }
 
-    await redis.execute_command("JSON.SET", json_key, "$", str(candle).replace("'", '"'))
+    # Сохраняем свечу в Redis JSON
+    await redis.execute_command("JSON.SET", json_key, "$", json.dumps(candle))
+
     logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
-    # вызов агрегации M5
+
+    # Формируем событие
+    event = {
+        "symbol": symbol,
+        "interval": "m1",
+        "timestamp": str(timestamp)
+    }
+
+    # Публикация в Redis Stream (для core_io.py)
+    await redis.xadd("ohlcv_stream", event)
+
+    # Публикация в Redis Pub/Sub (для realtime-подписчиков)
+    await redis.publish("ohlcv_channel", json.dumps(event))
+
+    # Агрегация M5 и M15
     await try_aggregate_m5(redis, symbol, open_time)
-    # вызов агрегации M15
     await try_aggregate_m15(redis, symbol, open_time)
 # 🔸 Агрегация M5 на основе RedisJSON M1-свечей (только при minute % 5 == 4)
 async def try_aggregate_m5(redis, symbol, open_time):
@@ -133,7 +151,14 @@ async def try_aggregate_m5(redis, symbol, open_time):
     m5_ts = ts_list[0]
 
     key = f"ohlcv:{symbol.lower()}:m5:{m5_ts}"
-    candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m5_ts }
+    candle = {
+        "o": o,
+        "h": h,
+        "l": l,
+        "c": c,
+        "v": v,
+        "ts": m5_ts
+    }
 
     exists = await redis.exists(key)
     if exists:
@@ -141,6 +166,20 @@ async def try_aggregate_m5(redis, symbol, open_time):
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
     logger.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+
+    # 📤 Redis Stream (для core_io.py)
+    await redis.xadd("ohlcv_stream", {
+        "symbol": symbol,
+        "interval": "m5",
+        "timestamp": str(m5_ts)
+    })
+
+    # 📢 Redis Pub/Sub (для realtime подписчиков)
+    await redis.publish("ohlcv_channel", json.dumps({
+        "symbol": symbol,
+        "interval": "m5",
+        "timestamp": m5_ts
+    }))
 # 🔸 Агрегация M15 на основе RedisJSON M1-свечей (только при minute % 15 == 14)
 async def try_aggregate_m15(redis, symbol, open_time):
     import logging
@@ -176,7 +215,14 @@ async def try_aggregate_m15(redis, symbol, open_time):
     m15_ts = ts_list[0]
 
     key = f"ohlcv:{symbol.lower()}:m15:{m15_ts}"
-    candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m15_ts }
+    candle = {
+        "o": o,
+        "h": h,
+        "l": l,
+        "c": c,
+        "v": v,
+        "ts": m15_ts
+    }
 
     exists = await redis.exists(key)
     if exists:
@@ -184,6 +230,20 @@ async def try_aggregate_m15(redis, symbol, open_time):
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
     logger.info(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+
+    # 📤 Redis Stream (для core_io.py)
+    await redis.xadd("ohlcv_stream", {
+        "symbol": symbol,
+        "interval": "m15",
+        "timestamp": str(m15_ts)
+    })
+
+    # 📢 Redis Pub/Sub (для realtime подписчиков)
+    await redis.publish("ohlcv_channel", json.dumps({
+        "symbol": symbol,
+        "interval": "m15",
+        "timestamp": m15_ts
+    }))
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 async def detect_missing_m1(redis, pg, symbol, now_ts):
     logger = logging.getLogger("RECOVERY")

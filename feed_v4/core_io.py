@@ -1,4 +1,4 @@
-# core_io.py — запись OHLCV-свечей из Redis Stream в PostgreSQL
+# core_io.py — запись OHLCV-свечей из Redis Stream в PostgreSQL с ограничением в 14 дней
 
 import asyncio
 import json
@@ -62,23 +62,22 @@ async def run_core_writer(pg, redis):
             log.error(f"Ошибка чтения из потока: {e}", exc_info=True)
             await asyncio.sleep(3)
 
-# Вставка свечи в нужную таблицу
+# Вставка свечи в нужную таблицу + удаление старых (> 14 дней)
 async def insert_candle(pg, symbol, interval, ts, candle):
     open_time = datetime.utcfromtimestamp(ts / 1000)
-    query = f"""
-        INSERT INTO ohlcv4_{interval} (symbol, open_time, open, high, low, close, volume, source, inserted_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-        ON CONFLICT DO NOTHING
-    """
+    table = f"ohlcv4_{interval}"
+
     async with pg.acquire() as conn:
-        await conn.execute(
-            query,
-            symbol,
-            open_time,
-            candle["o"],
-            candle["h"],
-            candle["l"],
-            candle["c"],
-            candle["v"],
-            candle.get("fixed") and "api" or "stream"
-        )
+        # Вставка новой свечи
+        await conn.execute(f"""
+            INSERT INTO {table} (symbol, open_time, open, high, low, close, volume, source, inserted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            ON CONFLICT DO NOTHING
+        """, symbol, open_time, candle["o"], candle["h"], candle["l"], candle["c"],
+             candle["v"], candle.get("fixed") and "api" or "stream")
+
+        # Удаление устаревших записей
+        await conn.execute(f"""
+            DELETE FROM {table}
+            WHERE symbol = $1 AND open_time < NOW() - INTERVAL '14 days'
+        """, symbol)
