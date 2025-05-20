@@ -285,7 +285,7 @@ async def restore_missing_m1_loop(redis, pg, state):
             if success:
                 minute = open_time.minute
                 if minute % 5 == 4:
-                    await try_aggregate_m5(redis, symbol, int(open_time.timestamp() * 1000))
+                    await try_aggregate_m5(redis, symbol, open_time)
 
         await asyncio.sleep(60)
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
