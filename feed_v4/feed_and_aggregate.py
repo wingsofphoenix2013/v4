@@ -228,7 +228,8 @@ async def run_feed_and_aggregator(pg, redis):
         upper_symbol = symbol.upper()
         precision = state["tickers"].get(upper_symbol)
         if precision is not None:
-            asyncio.create_task(watch_mark_price(upper_symbol, redis, precision))
+            task = asyncio.create_task(watch_mark_price(upper_symbol, redis, precision))
+            state["markprice_tasks"][upper_symbol] = task
             
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
