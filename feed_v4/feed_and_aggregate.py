@@ -132,7 +132,7 @@ async def try_aggregate_m5(redis, symbol, open_time):
 
     key = f"ohlcv:{symbol.lower()}:m5:{m5_ts}"
     candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m5_ts }
-    await redis.execute_command("JSON.SET", key, "$", str(candle).replace("'", '"'))
+    await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
 
     logger.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 # 🔸 Агрегация M15 на основе RedisJSON M1-свечей
@@ -169,7 +169,7 @@ async def try_aggregate_m15(redis, symbol, open_time):
 
     key = f"ohlcv:{symbol.lower()}:m15:{m15_ts}"
     candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m15_ts }
-    await redis.execute_command("JSON.SET", key, "$", str(candle).replace("'", '"'))
+    await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
 
     logger.info(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
