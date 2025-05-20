@@ -100,16 +100,18 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     await try_aggregate_m15(redis, symbol, open_time)
 # 🔸 Агрегация M5 на основе RedisJSON M1-свечей
 async def try_aggregate_m5(redis, symbol, open_time):
+    import logging
+    import json
 
     logger = logging.getLogger("KLINE")
 
-    if open_time.minute % 5 != 4:
-        return
+    # Вычисляем начало пятиминутного интервала
+    base_minute = (open_time.minute // 5) * 5
+    start_time = open_time.replace(minute=base_minute, second=0, microsecond=0)
+    start_ts = int(start_time.timestamp() * 1000)
+    ts_list = [start_ts + 60_000 * i for i in range(5)]
 
-    end_ts = int(open_time.timestamp() * 1000)
-    ts_list = [end_ts - 60_000 * i for i in reversed(range(5))]
     candles = []
-
     for ts in ts_list:
         key = f"ohlcv:{symbol.lower()}:m1:{ts}"
         try:
@@ -134,19 +136,21 @@ async def try_aggregate_m5(redis, symbol, open_time):
     candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m5_ts }
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
 
-    logger.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    logger.info(f"[{symbol}] Построена M5: {start_time} → O:{o} H:{h} L:{l} C:{c}")
 # 🔸 Агрегация M15 на основе RedisJSON M1-свечей
 async def try_aggregate_m15(redis, symbol, open_time):
+    import logging
+    import json
 
     logger = logging.getLogger("KLINE")
 
-    if open_time.minute % 15 != 14:
-        return
+    # Определяем начало 15-минутного блока
+    base_minute = (open_time.minute // 15) * 15
+    start_time = open_time.replace(minute=base_minute, second=0, microsecond=0)
+    start_ts = int(start_time.timestamp() * 1000)
+    ts_list = [start_ts + 60_000 * i for i in range(15)]
 
-    end_ts = int(open_time.timestamp() * 1000)
-    ts_list = [end_ts - 60_000 * i for i in reversed(range(15))]
     candles = []
-
     for ts in ts_list:
         key = f"ohlcv:{symbol.lower()}:m1:{ts}"
         try:
@@ -171,7 +175,7 @@ async def try_aggregate_m15(redis, symbol, open_time):
     candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m15_ts }
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
 
-    logger.info(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    logger.info(f"[{symbol}] Построена M15: {start_time} → O:{o} H:{h} L:{l} C:{c}")
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 async def detect_missing_m1(redis, pg, symbol, now_ts):
     logger = logging.getLogger("RECOVERY")
