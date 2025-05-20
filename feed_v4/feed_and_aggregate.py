@@ -40,7 +40,6 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                 if not symbol or not action:
                     continue
 
-                # Пополняем state["tickers"] при необходимости
                 if symbol not in state["tickers"]:
                     async with pg.acquire() as conn:
                         row = await conn.fetchrow("""
@@ -55,14 +54,20 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                     state["active"].add(symbol.lower())
                     await refresh_queue.put("refresh")
 
-                    # запуск потока markPrice
+                    # запуск потока markPrice и отслеживание задачи
                     precision = state["tickers"][symbol]
-                    asyncio.create_task(watch_mark_price(symbol, redis, precision))
+                    task = asyncio.create_task(watch_mark_price(symbol, redis, precision))
+                    state["markprice_tasks"][symbol] = task
 
                 elif action == "disabled" and symbol in state["tickers"]:
                     logger.info(f"Отключён тикер: {symbol}")
                     state["active"].discard(symbol.lower())
                     await refresh_queue.put("refresh")
+
+                    # отмена потока markPrice, если он есть
+                    task = state["markprice_tasks"].pop(symbol, None)
+                    if task:
+                        task.cancel()
 
                 await redis.xack(stream, group, msg_id)
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
@@ -208,7 +213,8 @@ async def run_feed_and_aggregator(pg, redis):
     # Общее состояние
     state = {
         "tickers": tickers,   # symbol -> precision_price
-        "active": active      # set of lowercase symbols
+        "active": active,     # set of lowercase symbols
+        "markprice_tasks": {}          # symbol -> asyncio.Task
     }
 
     # Очередь сигналов на переподключение WebSocket
