@@ -80,48 +80,32 @@ async def listen_kline_stream(redis, state, refresh_queue):
             async with websockets.connect(stream_url) as ws:
                 logger.info(f"Подключено к WebSocket Binance: {len(symbols)} тикеров")
 
-                recv_task = asyncio.create_task(ws.recv())
-                refresh_task = asyncio.create_task(refresh_queue.get())
+                async def reader():
+                    try:
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            if "data" not in data or "k" not in data["data"]:
+                                continue
+                            kline = data["data"]["k"]
+                            if not kline["x"]:
+                                continue
+                            symbol = kline["s"]
+                            open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
+                            log_str = (
+                                f"[{symbol}] Получена свеча M1: {open_time} — "
+                                f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
+                                f"C:{kline['c']} V:{kline['v']}"
+                            )
+                            logger.info(log_str)
+                    except Exception as e:
+                        logger.error(f"Ошибка чтения WebSocket: {e}", exc_info=True)
 
-                while True:
-                    done, _ = await asyncio.wait(
-                        [recv_task, refresh_task],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
+                async def watcher():
+                    await refresh_queue.get()
+                    logger.info("Получен сигнал переподключения WebSocket")
+                    await ws.close()
 
-                    if refresh_task in done:
-                        logger.info("Получен сигнал переподключения WebSocket")
-                        recv_task.cancel()
-                        return  # выйдет из with ws → пересоздаст соединение
-
-                    if recv_task in done:
-                        try:
-                            msg = recv_task.result()
-                        except Exception as e:
-                            logger.error(f"Ошибка чтения WebSocket: {e}")
-                            return
-
-                        data = json.loads(msg)
-                        if "data" not in data or "k" not in data["data"]:
-                            continue
-
-                        kline = data["data"]["k"]
-                        if not kline["x"]:
-                            continue  # Только is_final
-
-                        symbol = kline["s"]
-                        open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
-
-                        log_str = (
-                            f"[{symbol}] Получена свеча M1: {open_time} — "
-                            f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
-                            f"C:{kline['c']} V:{kline['v']}"
-                        )
-                        logger.info(log_str)
-
-                        # перезапустить задачи
-                        recv_task = asyncio.create_task(ws.recv())
-                        refresh_task = asyncio.create_task(refresh_queue.get())
+                await asyncio.wait([reader(), watcher()], return_when=asyncio.FIRST_COMPLETED)
 
         except Exception as e:
             logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
