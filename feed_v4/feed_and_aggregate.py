@@ -154,6 +154,58 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
 
     logger = logging.getLogger("KLINE")
     logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
+# 🔸 Обработка потока markPrice с обновлением Redis
+async def listen_mark_price(redis, state):
+    import time
+    logger = logging.getLogger("KLINE")
+
+    last_update = {}
+
+    while True:
+        if not state["active"]:
+            logger.info("Нет активных тикеров для подписки на markPrice")
+            await asyncio.sleep(10)
+            continue
+
+        symbols = sorted(state["active"])
+        streams = [f"{s}@markPrice" for s in symbols]
+        stream_url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+
+        try:
+            async with websockets.connect(stream_url) as ws:
+                logger.info(f"Подключено к WebSocket Binance (markPrice): {len(symbols)} тикеров")
+
+                async for msg in ws:
+                    try:
+                        data = json.loads(msg)
+                        if "data" not in data or "p" not in data["data"]:
+                            continue
+                        payload = data["data"]
+                        symbol = payload["s"]
+                        price = payload["p"]
+                        now = time.time()
+
+                        # 🔸 Частотный фильтр — не чаще 1/сек
+                        if symbol in last_update and now - last_update[symbol] < 1:
+                            continue
+
+                        last_update[symbol] = now
+                        precision = state["tickers"].get(symbol)
+                        if precision is None:
+                            continue
+
+                        from decimal import Decimal, ROUND_DOWN
+                        rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+
+                        await redis.set(f"price:{symbol}", rounded)
+                        logger.info(f"[{symbol}] Обновление markPrice: {rounded}")
+
+                    except Exception as e:
+                        logger.warning(f"Ошибка обработки markPrice: {e}")
+
+        except Exception as e:
+            logger.error(f"Ошибка WebSocket markPrice: {e}", exc_info=True)
+            await asyncio.sleep(5)
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
     log = logging.getLogger("FEED+AGGREGATOR")
