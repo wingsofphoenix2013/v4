@@ -245,7 +245,7 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                 }
 
                 key = f"ohlcv:{symbol.lower()}:m1:{timestamp}"
-                await redis.execute_command("JSON.SET", key, "$", str(candle).replace("'", '"'))
+                await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
 
                 async with pg.acquire() as conn:
                     await conn.execute(
