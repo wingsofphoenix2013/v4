@@ -164,7 +164,7 @@ async def watch_mark_price(symbol, redis, precision):
     import logging
     logger = logging.getLogger("KLINE")
 
-    url = f"wss://fstream.binance.com/ws/{symbol.lower()}@markPrice"
+    url = f"wss://fstream.binance.com/ws/{symbol.lower()}@markPrice@1s"
     last_update = 0
 
     while True:
