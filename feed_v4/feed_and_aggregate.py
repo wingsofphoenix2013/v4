@@ -7,6 +7,7 @@ import json
 import aiohttp
 from infra import info_log
 from decimal import Decimal, ROUND_DOWN
+import time
 from datetime import datetime, timedelta
 
 # 🔸 Загрузка всех тикеров, точности и статуса из PostgreSQL
@@ -263,6 +264,31 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
     except Exception as e:
         logger.error(f"[{symbol}] Ошибка восстановления через API: {e}", exc_info=True)
         return False
+# 🔸 Циклическое восстановление всех пропущенных свечей из missing_m1_log_v4
+async def restore_missing_m1_loop(redis, pg, state):
+    logger = logging.getLogger("RECOVERY")
+
+    while True:
+        async with pg.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT symbol, open_time FROM missing_m1_log_v4 WHERE fixed IS NOT true ORDER BY open_time ASC"
+            )
+
+        for row in rows:
+            symbol = row["symbol"]
+            open_time = row["open_time"]
+            precision = state["tickers"].get(symbol)
+            if not precision:
+                continue
+
+            success = await restore_missing_m1(symbol, open_time, redis, pg, precision)
+
+            if success:
+                minute = open_time.minute
+                if minute % 5 == 4:
+                    await try_aggregate_m5(redis, symbol, int(open_time.timestamp() * 1000))
+
+        await asyncio.sleep(60)
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
     logger = logging.getLogger("KLINE")
@@ -393,6 +419,9 @@ async def run_feed_and_aggregator(pg, redis):
             await asyncio.sleep(60)
 
     asyncio.create_task(recovery_loop())
+
+    # 🔸 Фоновое восстановление всех пропущенных свечей
+    asyncio.create_task(restore_missing_m1_loop(redis, pg, state))
 
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
