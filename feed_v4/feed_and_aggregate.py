@@ -4,7 +4,7 @@ import logging
 import asyncio
 import websockets
 import json
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 
 # 🔸 Загрузка всех тикеров, точности и статуса из PostgreSQL
@@ -91,12 +91,15 @@ async def listen_kline_stream(redis, state, refresh_queue):
                                 continue
                             symbol = kline["s"]
                             open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
-                            log_str = (
-                                f"[{symbol}] Получена свеча M1: {open_time} — "
-                                f"O:{kline['o']} H:{kline['h']} L:{kline['l']} "
-                                f"C:{kline['c']} V:{kline['v']}"
+
+                            await store_and_publish_m1(
+                                redis,
+                                symbol,
+                                open_time,
+                                kline,
+                                state["tickers"][symbol]
                             )
-                            logger.info(log_str)
+
                     except Exception as e:
                         logger.error(f"Ошибка чтения WebSocket: {e}", exc_info=True)
 
@@ -112,6 +115,45 @@ async def listen_kline_stream(redis, state, refresh_queue):
         except Exception as e:
             logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
             await asyncio.sleep(5)
+# 🔸 Сохранение M1 в Redis TS и публикация события
+async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
+
+    ts_key = f"ohlcv:{symbol.lower()}:m1"
+    stream_key = "ohlcv_m1_ready"
+
+    timestamp = int(open_time.timestamp() * 1000)
+
+    # 🔸 Округление значений через Decimal
+    def round_str(val):
+        return str(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+
+    fields = {
+        "o": round_str(kline["o"]),
+        "h": round_str(kline["h"]),
+        "l": round_str(kline["l"]),
+        "c": round_str(kline["c"]),
+        "v": round_str(kline["v"]),
+    }
+
+    try:
+        await redis.execute_command(
+            "TS.ADD", ts_key, timestamp, fields["c"], "RETENTION", 86400000, "LABELS",
+            "symbol", symbol.lower(), "tf", "m1"
+        )
+    except Exception as e:
+        logger = logging.getLogger("TS")
+        logger.warning(f"TS.ADD ошибка (ключ мог существовать): {e}")
+        await redis.execute_command("TS.CREATE", ts_key, "RETENTION", 86400000, "LABELS",
+            "symbol", symbol.lower(), "tf", "m1")
+        await redis.execute_command("TS.ADD", ts_key, timestamp, fields["c"])
+
+    await redis.xadd(stream_key, {
+        "symbol": symbol,
+        "open_time": str(open_time)
+    })
+
+    logger = logging.getLogger("KLINE")
+    logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
     log = logging.getLogger("FEED+AGGREGATOR")
