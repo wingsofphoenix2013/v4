@@ -195,7 +195,7 @@ async def detect_missing_m1(redis, pg, symbol, now_ts):
                 await conn.execute(
                     "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
                     "AGGREGATOR", "WARNING", "M1 missing", 
-                    {"symbol": symbol, "open_time": str(open_time)}
+                    json.dumps({"symbol": symbol, "open_time": str(open_time)})
                 )
                 logger.warning(f"[{symbol}] Пропущена свеча: {open_time}")
             except Exception as e:
@@ -254,10 +254,9 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                     )
                     await conn.execute(
                         "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
-                        "AGGREGATOR", "INFO", "M1 restored",
-                        {"symbol": symbol, "open_time": str(open_time)}
+                        "AGGREGATOR", "WARNING", "M1 missing", 
+                        json.dumps({"symbol": symbol, "open_time": str(open_time)})
                     )
-
                 logger.info(f"[{symbol}] Восстановлена M1: {open_time}")
                 return True
 
