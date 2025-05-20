@@ -105,7 +105,9 @@ async def listen_kline_stream(redis, state, refresh_queue):
                     logger.info("Получен сигнал переподключения WebSocket")
                     await ws.close()
 
-                await asyncio.wait([reader(), watcher()], return_when=asyncio.FIRST_COMPLETED)
+                reader_task = asyncio.create_task(reader())
+                watcher_task = asyncio.create_task(watcher())
+                await asyncio.wait([reader_task, watcher_task], return_when=asyncio.FIRST_COMPLETED)
 
         except Exception as e:
             logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
