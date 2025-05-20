@@ -1,5 +1,4 @@
 # infra.py — инфраструктурный модуль системы
-
 import os
 import logging
 import asyncpg

@@ -207,7 +207,7 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
     ts = int(open_time.timestamp() * 1000)
     end_ts = ts + 60_000
 
-    url = f"https://fapi.binance.com/fapi/v1/klines"
+    url = "https://fapi.binance.com/fapi/v1/klines"
     params = {
         "symbol": symbol.upper(),
         "interval": "1m",
@@ -222,6 +222,7 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                 if resp.status != 200:
                     logger.error(f"[{symbol}] Binance API error: {resp.status}")
                     return False
+
                 raw = await resp.json()
                 if not raw:
                     logger.warning(f"[{symbol}] Binance API пустой результат")
@@ -254,10 +255,17 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                     )
                     await conn.execute(
                         "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
-                        "AGGREGATOR", "WARNING", "M1 missing", 
+                        "AGGREGATOR", "INFO", "M1 restored", 
                         json.dumps({"symbol": symbol, "open_time": str(open_time)})
                     )
+
                 logger.info(f"[{symbol}] Восстановлена M1: {open_time}")
+
+                # 🔸 Попытка построить M5 для нужного интервала
+                m5_minute = (open_time.minute // 5) * 5
+                m5_time = open_time.replace(minute=m5_minute, second=0, microsecond=0)
+                await try_aggregate_m5(redis, symbol, m5_time)
+
                 return True
 
     except Exception as e:
@@ -289,7 +297,6 @@ async def restore_missing_m1_loop(redis, pg, state):
         await asyncio.sleep(60)
 # 🔸 Проверка: 4 и более подряд невосстановленных свечей → отключение тикера
 async def check_consecutive_m1_failures(pg, symbol):
-    import logging
     logger = logging.getLogger("RECOVERY")
 
     async with pg.acquire() as conn:
@@ -416,9 +423,6 @@ async def watch_mark_price(symbol, redis, precision):
             await asyncio.sleep(5)
 # 🔸 Основной запуск компонента
 async def run_feed_and_aggregator(pg, redis):
-    import logging
-    from datetime import datetime
-    import asyncio
 
     log = logging.getLogger("FEED+AGGREGATOR")
 
