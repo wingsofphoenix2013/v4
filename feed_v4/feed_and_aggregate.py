@@ -109,7 +109,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     })
 
     logger = logging.getLogger("KLINE")
-    info_log("KLINE", f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
+    logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
     
     # вызов агрегации M5
     await try_aggregate_m5(redis, symbol, timestamp)
