@@ -71,90 +71,71 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
-# 🔸 Сохранение M1 в Redis TS и публикация события
+# 🔸 Сохранение полной свечи M1 в RedisJSON
 async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
+    from decimal import Decimal, ROUND_DOWN
+    import logging
 
-    ts_key = f"ohlcv:{symbol.lower()}:m1"
-    stream_key = "ohlcv_m1_ready"
-
+    logger = logging.getLogger("KLINE")
     timestamp = int(open_time.timestamp() * 1000)
+    json_key = f"ohlcv:{symbol.lower()}:m1:{timestamp}"
 
-    # Округление значений через Decimal
-    def round_str(val):
-        return str(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+    def r(val):
+        return float(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
 
-    fields = {
-        "o": round_str(kline["o"]),
-        "h": round_str(kline["h"]),
-        "l": round_str(kline["l"]),
-        "c": round_str(kline["c"]),
-        "v": round_str(kline["v"]),
+    candle = {
+        "o": r(kline["o"]),
+        "h": r(kline["h"]),
+        "l": r(kline["l"]),
+        "c": r(kline["c"]),
+        "v": r(kline["v"]),
+        "ts": timestamp
     }
 
-    try:
-        await redis.execute_command(
-            "TS.ADD", ts_key, timestamp, fields["c"], "RETENTION", 86400000, "LABELS",
-            "symbol", symbol.lower(), "tf", "m1"
-        )
-    except Exception as e:
-        logger = logging.getLogger("TS")
-        logger.warning(f"TS.ADD ошибка (ключ мог существовать): {e}")
-        await redis.execute_command("TS.CREATE", ts_key, "RETENTION", 86400000, "LABELS",
-            "symbol", symbol.lower(), "tf", "m1")
-        await redis.execute_command("TS.ADD", ts_key, timestamp, fields["c"])
+    await redis.execute_command("JSON.SET", json_key, "$", str(candle).replace("'", '"'))
+    logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
 
-    await redis.xadd(stream_key, {
-        "symbol": symbol,
-        "open_time": str(open_time)
-    })
-
-    logger = logging.getLogger("KLINE")
-    logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={fields['c']}")
-    
-    # вызов агрегации M5
-    await try_aggregate_m5(redis, symbol, timestamp)
-# 🔸 Попытка агрегировать M5 на основе последних M1
-async def try_aggregate_m5(redis, symbol, now_ts):
+    await try_aggregate_m5(redis, symbol, open_time)
+# 🔸 Агрегация M5 на основе RedisJSON M1-свечей
+async def try_aggregate_m5(redis, symbol, open_time):
     import logging
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     logger = logging.getLogger("KLINE")
 
-    dt = datetime.utcfromtimestamp(now_ts / 1000)
-    if dt.minute % 5 != 4:
-        return  # не конец 5-минутного блока
+    if open_time.minute % 5 != 4:
+        return
 
-    key_m1 = f"ohlcv:{symbol.lower()}:m1"
-    key_m5 = f"ohlcv:{symbol.lower()}:m5"
-    end_ts = now_ts
-    start_ts = end_ts - 4 * 60 * 1000  # 4 предыдущие минуты + текущая
+    end_ts = int(open_time.timestamp() * 1000)
+    ts_list = [end_ts - 60_000 * i for i in reversed(range(5))]
+    candles = []
 
-    try:
-        raw = await redis.execute_command("TS.RANGE", key_m1, start_ts, end_ts)
-        if len(raw) != 5:
-            logger.warning(f"[{symbol}] Недостаточно M1 для M5 ({len(raw)}/5)")
+    for ts in ts_list:
+        key = f"ohlcv:{symbol.lower()}:m1:{ts}"
+        try:
+            data = await redis.execute_command("JSON.GET", key, "$")
+            if not data:
+                logger.warning(f"[{symbol}] M5: пропущена свеча {ts}")
+                return
+            import json
+            parsed = json.loads(data)[0]
+            candles.append(parsed)
+        except Exception as e:
+            logger.error(f"[{symbol}] Ошибка чтения JSON для M5: {e}")
             return
 
-        values = [float(v[1]) for v in raw]
-        o = values[0]
-        h = max(values)
-        l = min(values)
-        c = values[-1]
-        v = 0.0  # объём пока не аггрегируем, если нужно — надо вытягивать из полей
+    o = candles[0]["o"]
+    h = max(c["h"] for c in candles)
+    l = min(c["l"] for c in candles)
+    c = candles[-1]["c"]
+    v = sum(c["v"] for c in candles)
+    m5_ts = ts_list[0]
 
-        m5_ts = end_ts  # метка времени M5 — это конец интервала
+    key = f"ohlcv:{symbol.lower()}:m5:{m5_ts}"
+    candle = { "o": o, "h": h, "l": l, "c": c, "v": v, "ts": m5_ts }
+    await redis.execute_command("JSON.SET", key, "$", str(candle).replace("'", '"'))
 
-        # 🔸 Запись агрегированной свечи в TS с RETENTION 7 суток
-        await redis.execute_command(
-            "TS.ADD", key_m5, m5_ts, c,
-            "RETENTION", 604800000,
-            "LABELS", "symbol", symbol.lower(), "tf", "m5"
-        )
-
-        logger.info(f"[{symbol}] Построена M5: {dt.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
-
-    except Exception as e:
-        logger.error(f"[{symbol}] Ошибка агрегации M5: {e}", exc_info=True)
+    logger.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
     logger = logging.getLogger("KLINE")
