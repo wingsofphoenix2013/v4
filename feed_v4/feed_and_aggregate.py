@@ -98,7 +98,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     # Сохраняем свечу в Redis JSON
     await redis.execute_command("JSON.SET", json_key, "$", json.dumps(candle))
 
-    logger.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
+    info_log("KLINE", f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
 
     # Формируем событие
     event = {
@@ -165,7 +165,7 @@ async def try_aggregate_m5(redis, symbol, open_time):
         return
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
-    logger.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    info_log("KLINE", f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 
     # 📤 Redis Stream (для core_io.py)
     await redis.xadd("ohlcv_stream", {
@@ -229,7 +229,7 @@ async def try_aggregate_m15(redis, symbol, open_time):
         return
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
-    logger.info(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    info_log("KLINE", f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 
     # 📤 Redis Stream (для core_io.py)
     await redis.xadd("ohlcv_stream", {

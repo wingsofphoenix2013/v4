@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from infra import info_log
 
 STREAM_NAME = "ohlcv_stream"
 GROUP_NAME = "core_writer"
@@ -51,7 +52,7 @@ async def run_core_writer(pg, redis):
                         candle = json.loads(raw)[0]
                         await insert_candle(pg, symbol, interval, timestamp, candle)
 
-                        log.info(f"[{symbol}] {interval.upper()} записана в PG: {timestamp}")
+                        info_log("CORE_IO", f"[{symbol}] {interval.upper()} записана в PG: {timestamp}")
                         await redis.xack(STREAM_NAME, GROUP_NAME, msg_id)
 
                     except Exception as e:
