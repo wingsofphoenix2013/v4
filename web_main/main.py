@@ -240,6 +240,10 @@ async def update_indicator_and_notify(indicator_id: int, field: str, new_value: 
     stream_name = f"indicators_{field}_stream"
     await redis_client.xadd(stream_name, event)
     logging.info(f"[Stream:{stream_name}] {event}")
+# 🔸 GET: отрисовка формы создания нового индикатора
+@app.get("/indicators/create", response_class=HTMLResponse)
+async def indicators_create_form(request: Request):
+    return templates.TemplateResponse("indicators_create.html", {"request": request})
 # 🔸 POST: создание нового расчёта индикатора и параметров
 @app.post("/indicators/create")
 async def create_indicator(
