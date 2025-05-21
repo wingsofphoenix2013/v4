@@ -168,7 +168,7 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
     stream_name = f"tickers_{field}_stream"
     await redis_client.xadd(stream_name, event)
     logging.info(f"[Stream:{stream_name}] {event}")
-# 🔸 Страница со списком всех расчётов индикаторов и их параметрами    
+# 🔸 Страница со списком всех расчётов индикаторов и их параметрами
 @app.get("/indicators", response_class=HTMLResponse)
 async def indicators_page(request: Request):
     async with pg_pool.acquire() as conn:
@@ -188,7 +188,7 @@ async def indicators_page(request: Request):
                 "timeframe": row["timeframe"],
                 "enabled": row["enabled"],
                 "stream_publish": row["stream_publish"],
-                "params": row["parameters"] or {}
+                "params": json.loads(row["parameters"]) if isinstance(row["parameters"], str) else row["parameters"]
             })
         return templates.TemplateResponse("indicators.html", {
             "request": request,
