@@ -97,7 +97,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     # Сохраняем свечу в Redis JSON
     await redis.execute_command("JSON.SET", json_key, "$", json.dumps(candle))
 
-    log.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
+    log.debug(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
 
     # Формируем событие
     event = {
@@ -160,7 +160,7 @@ async def try_aggregate_m5(redis, symbol, open_time):
         return
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
-    log.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    log.debug(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 
     # 📤 Redis Stream (для core_io.py)
     await redis.xadd("ohlcv_stream", {
@@ -220,7 +220,7 @@ async def try_aggregate_m15(redis, symbol, open_time):
         return
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
-    log.info(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    log.debug(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 
     # 📤 Redis Stream (для core_io.py)
     await redis.xadd("ohlcv_stream", {
@@ -320,7 +320,7 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                         json.dumps({"symbol": symbol, "open_time": str(open_time)})
                     )
 
-                log.info(f"[{symbol}] Восстановлена M1: {open_time}")
+                log.debug(f"[{symbol}] Восстановлена M1: {open_time}")
 
                 # 🔸 Попытка построить M5 и M15 по нужным интервалам
                 m5_minute = (open_time.minute // 5) * 5
@@ -475,7 +475,7 @@ async def watch_mark_price(symbol, redis, precision):
                         last_update = now
                         rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
                         await redis.set(f"price:{symbol}", rounded)
-                        log.info(f"[{symbol}] Обновление markPrice (futures): {rounded}")
+                        log.debug(f"[{symbol}] Обновление markPrice (futures): {rounded}")
                     except Exception as e:
                         log.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
         except Exception as e:

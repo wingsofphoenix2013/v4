@@ -16,7 +16,7 @@ async def subscribe_ticker_events(redis):
         if message['type'] == 'message':
             try:
                 event = json.loads(message['data'])
-                log.info(f"Событие tickers_v4_events: {event}")
+                log.debug(f"Событие tickers_v4_events: {event}")
                 # Здесь далее — обработка статуса тикера (включение/выключение)
             except Exception as e:
                 log.error(f"Ошибка при обработке tickers_v4_events: {e}")
@@ -31,7 +31,7 @@ async def subscribe_ohlcv_channel(redis):
         if message['type'] == 'message':
             try:
                 event = json.loads(message['data'])
-                log.info(f"Событие ohlcv_channel: {event}")
+                log.debug(f"Событие ohlcv_channel: {event}")
                 # Здесь далее — обработка появления новой свечи (запуск расчёта индикатора)
             except Exception as e:
                 log.error(f"Ошибка при обработке ohlcv_channel: {e}")
@@ -45,7 +45,7 @@ async def subscribe_indicator_events(pg, redis, indicator_pool, param_pool):
         if message['type'] == 'message':
             try:
                 event = json.loads(message['data'])
-                log.info(f"Событие indicators_v4_events: {event}")
+                log.debug(f"Событие indicators_v4_events: {event}")
                 indicator_id = event.get("id")
                 action = event.get("action")
                 field = event.get("type")
