@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 
 CHANNEL = "tickers_v4_events"
@@ -58,7 +58,7 @@ async def restore_missing_m1(pg, redis):
     while True:
         log.info("[AUDITOR] ⏳ Старт проверки дыр M1")
 
-        now = datetime.utcnow().replace(second=0, microsecond=0, tzinfo=timezone.utc)
+        now = datetime.utcnow().replace(second=0, microsecond=0)
         start_time = now - timedelta(hours=24)
         audit_end = now - timedelta(minutes=5)  # ⛔️ не проверяем последние 5 минут
 
@@ -86,7 +86,7 @@ async def restore_missing_m1(pg, redis):
                 """, symbol, start_time, audit_end)
 
             for row in rows:
-                t = row["missing_time"].replace(tzinfo=timezone.utc)
+                t = row["missing_time"]
                 ts = int(t.timestamp() * 1000)
                 redis_key = f"ohlcv:{symbol.lower()}:m1:{ts}"
 
