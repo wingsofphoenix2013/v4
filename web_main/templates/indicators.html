@@ -46,67 +46,36 @@
         <th class="px-4 py-3">Публикация</th>
       </tr>
     </thead>
-    <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-      <!-- Мок-строка 1 -->
-      <tr>
-        <td class="px-4 py-3">1</td>
-        <td class="px-4 py-3 font-semibold uppercase">EMA</td>
-        <td class="px-4 py-3">m5</td>
-        <td class="px-4 py-3 text-slate-600">length: 50</td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500"></div>
-            <span class="text-sm text-slate-700">Выключено</span>
-          </div>
-        </td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500"></div>
-            <span class="text-sm text-slate-700">Выключено</span>
-          </div>
-        </td>
-      </tr>
-
-      <!-- Мок-строка 2 -->
-      <tr>
-        <td class="px-4 py-3">2</td>
-        <td class="px-4 py-3 font-semibold uppercase">RSI</td>
-        <td class="px-4 py-3">m1</td>
-        <td class="px-4 py-3 text-slate-600">length: 14</td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-green-500"></div>
-            <span class="text-sm text-slate-700">Включено</span>
-          </div>
-        </td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-green-500"></div>
-            <span class="text-sm text-slate-700">Включено</span>
-          </div>
-        </td>
-      </tr>
-
-      <!-- Мок-строка 3 -->
-      <tr>
-        <td class="px-4 py-3">3</td>
-        <td class="px-4 py-3 font-semibold uppercase">LR</td>
-        <td class="px-4 py-3">m15</td>
-        <td class="px-4 py-3 text-slate-600">length: 50</td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500"></div>
-            <span class="text-sm text-slate-700">Выключено</span>
-          </div>
-        </td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500"></div>
-            <span class="text-sm text-slate-700">Выключено</span>
-          </div>
-        </td>
-      </tr>
-    </tbody>
+<tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+  {% for i in indicators %}
+  <tr>
+    <td class="px-4 py-3">{{ i.id }}</td>
+    <td class="px-4 py-3 font-semibold uppercase">{{ i.indicator }}</td>
+    <td class="px-4 py-3">{{ i.timeframe }}</td>
+    <td class="px-4 py-3 text-slate-600">
+      {% for key, value in i.params.items() %}
+        {{ key }}: {{ value }}{% if not loop.last %}, {% endif %}
+      {% endfor %}
+    </td>
+    <td class="px-4 py-3">
+      <div class="flex items-center space-x-3">
+        <div class="h-3 w-3 rounded-full {{ 'bg-green-500' if i.enabled else 'bg-red-500' }}"></div>
+        <span class="text-sm text-slate-700">
+          {{ 'Включено' if i.enabled else 'Выключено' }}
+        </span>
+      </div>
+    </td>
+    <td class="px-4 py-3">
+      <div class="flex items-center space-x-3">
+        <div class="h-3 w-3 rounded-full {{ 'bg-green-500' if i.stream_publish else 'bg-red-500' }}"></div>
+        <span class="text-sm text-slate-700">
+          {{ 'Включено' if i.stream_publish else 'Выключено' }}
+        </span>
+      </div>
+    </td>
+  </tr>
+  {% endfor %}
+</tbody>
   </table>
 </main>
   </body>
