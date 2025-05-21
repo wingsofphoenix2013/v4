@@ -194,3 +194,49 @@ async def indicators_page(request: Request):
             "request": request,
             "indicators": indicators
         })
+# 🔸 POST: Включение/выключение расчёта индикатора и публикации
+@app.post("/indicators/{indicator_id}/enable_status")
+async def enable_indicator_status(indicator_id: int):
+    await update_indicator_and_notify(indicator_id, field="enabled", new_value="true")
+    return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
+
+@app.post("/indicators/{indicator_id}/disable_status")
+async def disable_indicator_status(indicator_id: int):
+    await update_indicator_and_notify(indicator_id, field="enabled", new_value="false")
+    return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
+
+@app.post("/indicators/{indicator_id}/enable_stream")
+async def enable_indicator_stream(indicator_id: int):
+    await update_indicator_and_notify(indicator_id, field="stream_publish", new_value="true")
+    return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
+
+@app.post("/indicators/{indicator_id}/disable_stream")
+async def disable_indicator_stream(indicator_id: int):
+    await update_indicator_and_notify(indicator_id, field="stream_publish", new_value="false")
+    return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
+# 🔸 Обновление поля индикатора и отправка уведомления в Redis
+async def update_indicator_and_notify(indicator_id: int, field: str, new_value: str):
+    # Обновление поля в базе
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE indicator_instances_v4 SET {field} = $1 WHERE id = $2",
+            new_value == "true",  # преобразуем в bool
+            indicator_id
+        )
+
+    # Формирование события
+    event = {
+        "id": indicator_id,
+        "type": field,
+        "action": new_value,
+        "source": "web_ui"
+    }
+
+    # Отправка в Redis Pub/Sub
+    await redis_client.publish("indicators_v4_events", json.dumps(event))
+    logging.info(f"[PubSub] {event}")
+
+    # Отправка в Redis Stream
+    stream_name = f"indicators_{field}_stream"
+    await redis_client.xadd(stream_name, event)
+    logging.info(f"[Stream:{stream_name}] {event}")
