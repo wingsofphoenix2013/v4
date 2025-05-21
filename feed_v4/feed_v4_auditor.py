@@ -54,7 +54,7 @@ def r(val, precision):
 async def restore_missing(interval, offset_minutes, pg, redis):
     await asyncio.sleep(300)
     log = logging.getLogger("AUDITOR")
-    interval_sec = {"m5": 300, "m15": 900}[interval]
+    interval_sec = {"m1": 60, "m5": 300, "m15": 900}[interval]
 
     while True:
         log.info(f"[AUDITOR] ⏳ Старт проверки дыр {interval.upper()}")
