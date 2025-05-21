@@ -5,10 +5,13 @@ import asyncio
 import websockets
 import json
 import aiohttp
-from infra import info_log
+from infra import setup_logging
 from decimal import Decimal, ROUND_DOWN
 import time
 from datetime import datetime, timedelta
+
+# Получаем логгер для модуля
+log = logging.getLogger("FEED+AGGREGATOR")
 
 # 🔸 Загрузка всех тикеров, точности и статуса из PostgreSQL
 async def load_all_tickers(pg_pool):
@@ -27,7 +30,6 @@ async def load_all_tickers(pg_pool):
 async def handle_ticker_events(redis, state, pg, refresh_queue):
     group = "aggregator_group"
     stream = "tickers_status_stream"
-    logger = logging.getLogger("TICKER_STREAM")
 
     try:
         await redis.xgroup_create(stream, group, id="0", mkstream=True)
@@ -50,10 +52,10 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         """, symbol)
                         if row:
                             state["tickers"][symbol] = row["precision_price"]
-                            info_log("TICKER_STREAM", f"Добавлен тикер из БД: {symbol}")
+                            log.info(f"Добавлен тикер из БД: {symbol}")
 
                 if action == "enabled" and symbol in state["tickers"]:
-                    logger.info(f"Активирован тикер: {symbol}")
+                    log.info(f"Активирован тикер: {symbol}")
                     state["active"].add(symbol.lower())
                     await refresh_queue.put("refresh")
 
@@ -63,7 +65,7 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                     state["markprice_tasks"][symbol] = task
 
                 elif action == "disabled" and symbol in state["tickers"]:
-                    logger.info(f"Отключён тикер: {symbol}")
+                    log.info(f"Отключён тикер: {symbol}")
                     state["active"].discard(symbol.lower())
                     await refresh_queue.put("refresh")
 
@@ -77,7 +79,6 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
 # 🔸 Сохранение полной свечи M1 в RedisJSON + Stream + Pub/Sub
 async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
 
-    logger = logging.getLogger("KLINE")
     timestamp = int(open_time.timestamp() * 1000)
     json_key = f"ohlcv:{symbol.lower()}:m1:{timestamp}"
 
@@ -96,7 +97,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     # Сохраняем свечу в Redis JSON
     await redis.execute_command("JSON.SET", json_key, "$", json.dumps(candle))
 
-    info_log("KLINE", f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
+    log.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
 
     # Формируем событие
     event = {
@@ -116,10 +117,6 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     await try_aggregate_m15(redis, symbol, open_time)
 # 🔸 Агрегация M5 на основе RedisJSON M1-свечей (только при minute % 5 == 4)
 async def try_aggregate_m5(redis, symbol, open_time):
-    import logging
-    import json
-
-    logger = logging.getLogger("KLINE")
 
     if open_time.minute % 5 != 4:
         return
@@ -133,12 +130,12 @@ async def try_aggregate_m5(redis, symbol, open_time):
         try:
             data = await redis.execute_command("JSON.GET", key, "$")
             if not data:
-                logger.warning(f"[{symbol}] M5: пропущена свеча {ts}")
+                log.warning(f"[{symbol}] M5: пропущена свеча {ts}")
                 return
             parsed = json.loads(data)[0]
             candles.append(parsed)
         except Exception as e:
-            logger.error(f"[{symbol}] Ошибка чтения JSON для M5: {e}")
+            log.error(f"[{symbol}] Ошибка чтения JSON для M5: {e}")
             return
 
     o = candles[0]["o"]
@@ -163,7 +160,7 @@ async def try_aggregate_m5(redis, symbol, open_time):
         return
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
-    info_log("KLINE", f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    log.info(f"[{symbol}] Построена M5: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 
     # 📤 Redis Stream (для core_io.py)
     await redis.xadd("ohlcv_stream", {
@@ -180,10 +177,6 @@ async def try_aggregate_m5(redis, symbol, open_time):
     }))
 # 🔸 Агрегация M15 на основе RedisJSON M1-свечей (только при minute % 15 == 14)
 async def try_aggregate_m15(redis, symbol, open_time):
-    import logging
-    import json
-
-    logger = logging.getLogger("KLINE")
 
     if open_time.minute % 15 != 14:
         return
@@ -197,12 +190,12 @@ async def try_aggregate_m15(redis, symbol, open_time):
         try:
             data = await redis.execute_command("JSON.GET", key, "$")
             if not data:
-                logger.warning(f"[{symbol}] M15: пропущена свеча {ts}")
+                log.warning(f"[{symbol}] M15: пропущена свеча {ts}")
                 return
             parsed = json.loads(data)[0]
             candles.append(parsed)
         except Exception as e:
-            logger.error(f"[{symbol}] Ошибка чтения JSON для M15: {e}")
+            log.error(f"[{symbol}] Ошибка чтения JSON для M15: {e}")
             return
 
     o = candles[0]["o"]
@@ -227,7 +220,7 @@ async def try_aggregate_m15(redis, symbol, open_time):
         return
 
     await redis.execute_command("JSON.SET", key, "$", json.dumps(candle))
-    info_log("KLINE", f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
+    log.info(f"[{symbol}] Построена M15: {open_time.replace(second=0)} → O:{o} H:{h} L:{l} C:{c}")
 
     # 📤 Redis Stream (для core_io.py)
     await redis.xadd("ohlcv_stream", {
@@ -244,7 +237,6 @@ async def try_aggregate_m15(redis, symbol, open_time):
     }))
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 async def detect_missing_m1(redis, pg, symbol, now_ts):
-    logger = logging.getLogger("RECOVERY")
     missing = []
 
     for i in range(1, 5):  # последние 4 минуты
@@ -267,17 +259,12 @@ async def detect_missing_m1(redis, pg, symbol, now_ts):
                     "AGGREGATOR", "WARNING", "M1 missing", 
                     json.dumps({"symbol": symbol, "open_time": str(open_time)})
                 )
-                logger.warning(f"[{symbol}] Пропущена свеча: {open_time}")
+                log.warning(f"[{symbol}] Пропущена свеча: {open_time}")
             except Exception as e:
-                logger.error(f"[{symbol}] Ошибка записи пропуска: {e}")
+                log.error(f"[{symbol}] Ошибка записи пропуска: {e}")
 # 🔸 Восстановление одной M1 свечи через Binance API
 async def restore_missing_m1(symbol, open_time, redis, pg, precision):
-    import logging
-    import aiohttp
-    import json
-    from decimal import Decimal, ROUND_DOWN
 
-    logger = logging.getLogger("RECOVERY")
     ts = int(open_time.timestamp() * 1000)
     end_ts = ts + 60_000
 
@@ -294,12 +281,12 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
-                    logger.error(f"[{symbol}] Binance API error: {resp.status}")
+                    log.error(f"[{symbol}] Binance API error: {resp.status}")
                     return False
 
                 raw = await resp.json()
                 if not raw:
-                    logger.warning(f"[{symbol}] Binance API пустой результат")
+                    log.warning(f"[{symbol}] Binance API пустой результат")
                     return False
 
                 data = raw[0]
@@ -333,7 +320,7 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                         json.dumps({"symbol": symbol, "open_time": str(open_time)})
                     )
 
-                logger.info(f"[{symbol}] Восстановлена M1: {open_time}")
+                log.info(f"[{symbol}] Восстановлена M1: {open_time}")
 
                 # 🔸 Попытка построить M5 и M15 по нужным интервалам
                 m5_minute = (open_time.minute // 5) * 5
@@ -347,11 +334,10 @@ async def restore_missing_m1(symbol, open_time, redis, pg, precision):
                 return True
 
     except Exception as e:
-        logger.error(f"[{symbol}] Ошибка восстановления через API: {e}", exc_info=True)
+        log.error(f"[{symbol}] Ошибка восстановления через API: {e}", exc_info=True)
         return False
 # 🔸 Циклическое восстановление всех пропущенных свечей из missing_m1_log_v4
 async def restore_missing_m1_loop(redis, pg, state):
-    logger = logging.getLogger("RECOVERY")
 
     while True:
         async with pg.acquire() as conn:
@@ -375,7 +361,6 @@ async def restore_missing_m1_loop(redis, pg, state):
         await asyncio.sleep(60)
 # 🔸 Проверка: 4 и более подряд невосстановленных свечей → отключение тикера
 async def check_consecutive_m1_failures(pg, symbol):
-    logger = logging.getLogger("RECOVERY")
 
     async with pg.acquire() as conn:
         rows = await conn.fetch("""
@@ -413,14 +398,13 @@ async def check_consecutive_m1_failures(pg, symbol):
             """, "AGGREGATOR", "CRITICAL", "M1 permanently degraded",
                 json.dumps({"symbol": symbol, "reason": "4+ consecutive missing M1"}))
 
-            logger.critical(f"[{symbol}] Отключён — 4+ подряд пропущенных свечей")
+            log.critical(f"[{symbol}] Отключён — 4+ подряд пропущенных свечей")
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
-    logger = logging.getLogger("KLINE")
 
     while True:
         if not state["active"]:
-            info_log("KLINE", "Нет активных тикеров для подписки")
+            log.info("Нет активных тикеров для подписки")
             await asyncio.sleep(10)
             continue
 
@@ -430,7 +414,7 @@ async def listen_kline_stream(redis, state, refresh_queue):
 
         try:
             async with websockets.connect(stream_url) as ws:
-                logger.info(f"Подключено к WebSocket Binance: {len(symbols)} тикеров")
+                log.info(f"Подключено к WebSocket Binance: {len(symbols)} тикеров")
 
                 async def reader():
                     try:
@@ -453,11 +437,11 @@ async def listen_kline_stream(redis, state, refresh_queue):
                             )
 
                     except Exception as e:
-                        logger.error(f"Ошибка чтения WebSocket: {e}", exc_info=True)
+                        log.error(f"Ошибка чтения WebSocket: {e}", exc_info=True)
 
                 async def watcher():
                     await refresh_queue.get()
-                    logger.info("Получен сигнал переподключения WebSocket")
+                    log.info("Получен сигнал переподключения WebSocket")
                     await ws.close()
 
                 reader_task = asyncio.create_task(reader())
@@ -465,12 +449,10 @@ async def listen_kline_stream(redis, state, refresh_queue):
                 await asyncio.wait([reader_task, watcher_task], return_when=asyncio.FIRST_COMPLETED)
 
         except Exception as e:
-            logger.error(f"Ошибка WebSocket: {e}", exc_info=True)
+            log.error(f"Ошибка WebSocket: {e}", exc_info=True)
             await asyncio.sleep(5)
 # 🔸 Поток markPrice для одного тикера с fstream.binance.com
 async def watch_mark_price(symbol, redis, precision):
-
-    logger = logging.getLogger("KLINE")
 
     url = f"wss://fstream.binance.com/ws/{symbol.lower()}@markPrice@1s"
     last_update = 0
@@ -478,7 +460,7 @@ async def watch_mark_price(symbol, redis, precision):
     while True:
         try:
             async with websockets.connect(url) as ws:
-                logger.info(f"[{symbol}] Подключение к потоку markPrice (futures)")
+                log.info(f"[{symbol}] Подключение к потоку markPrice (futures)")
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
@@ -493,16 +475,14 @@ async def watch_mark_price(symbol, redis, precision):
                         last_update = now
                         rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
                         await redis.set(f"price:{symbol}", rounded)
-                        info_log("KLINE", f"[{symbol}] Обновление markPrice (futures): {rounded}")
+                        log.info(f"[{symbol}] Обновление markPrice (futures): {rounded}")
                     except Exception as e:
-                        logger.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
+                        log.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
         except Exception as e:
-            logger.error(f"[{symbol}] Ошибка WebSocket markPrice (futures): {e}", exc_info=True)
+            log.error(f"[{symbol}] Ошибка WebSocket markPrice (futures): {e}", exc_info=True)
             await asyncio.sleep(5)
 # 🔸 Основной запуск компонента с управлением тасками
 async def run_feed_and_aggregator(pg, redis):
-
-    log = logging.getLogger("FEED+AGGREGATOR")
 
     # Загрузка всех тикеров (enabled + disabled)
     tickers, active = await load_all_tickers(pg)

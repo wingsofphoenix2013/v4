@@ -3,6 +3,10 @@ import logging
 import json
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
+from infra import setup_logging
+
+# Получаем логгер для модуля
+log = logging.getLogger("auditor")
 
 CHANNEL = "tickers_v4_events"
 state = {
@@ -18,13 +22,13 @@ async def preload_tickers(pg):
             symbol = row["symbol"].upper()
             state["tickers"].add(symbol)
             state["precision"][symbol] = row["precision_price"]
-        logging.info(f"[AUDITOR] Загружено активных тикеров: {len(state['tickers'])}")
+        log.info(f"[AUDITOR] Загружено активных тикеров: {len(state['tickers'])}")
 
 
 async def listen_ticker_events(redis):
     pubsub = redis.pubsub()
     await pubsub.subscribe(CHANNEL)
-    logging.info(f"[AUDITOR] Подписан на канал: {CHANNEL}")
+    log.info(f"[AUDITOR] Подписан на канал: {CHANNEL}")
 
     async for msg in pubsub.listen():
         if msg["type"] != "message":
@@ -39,12 +43,12 @@ async def listen_ticker_events(redis):
             if action_type == "status":
                 if action == "enabled":
                     state["tickers"].add(symbol)
-                    logging.info(f"[AUDITOR] Активирован тикер: {symbol}")
+                    log.info(f"[AUDITOR] Активирован тикер: {symbol}")
                 elif action == "disabled":
                     state["tickers"].discard(symbol)
-                    logging.info(f"[AUDITOR] Отключён тикер: {symbol}")
+                    log.info(f"[AUDITOR] Отключён тикер: {symbol}")
         except Exception as e:
-            logging.warning(f"[AUDITOR] Ошибка обработки события: {e}")
+            log.warning(f"[AUDITOR] Ошибка обработки события: {e}")
 
 
 def r(val, precision):
@@ -53,7 +57,6 @@ def r(val, precision):
 
 async def restore_missing(interval, offset_minutes, pg, redis):
     await asyncio.sleep(300)
-    log = logging.getLogger("AUDITOR")
     interval_sec = {"m1": 60, "m5": 300, "m15": 900}[interval]
 
     while True:

@@ -23,7 +23,7 @@ def init_redis_client():
 
 # 🔸 Безопасный запуск фонового воркера
 async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
-    log = logging.getLogger(name)
+    log = logging.getLogger("INFRA_PY")
     while True:
         try:
             log.info("Запуск воркера")
@@ -33,14 +33,16 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
             log.info(f"Перезапуск через {retry_delay} секунд...")
             await asyncio.sleep(retry_delay)
 
-# 🔸 Настройка логирования
+# 🔸 Настройка централизованного логирования
 def setup_logging():
+    """
+    Централизованная настройка логирования для всех компонентов системы.
+    Если DEBUG_MODE=True — показываются debug/info/warning/error,
+    если DEBUG_MODE=False — только info/warning/error.
+    """
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
     logging.basicConfig(
-        level=logging.DEBUG if DEBUG_MODE else logging.INFO,
+        level=level,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-
-def info_log(logger_name, message):
-    if DEBUG_MODE:
-        logging.getLogger(logger_name).info(message)

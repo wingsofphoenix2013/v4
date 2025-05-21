@@ -5,8 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
-
-from infra import info_log
+from infra import setup_logging
 
 STREAM_NAME = "ohlcv_stream"
 GROUP_NAME = "core_writer"
@@ -15,6 +14,8 @@ TICKER_CHANNEL = "tickers_v4_events"
 
 state = {"tickers": {}}  # symbol.upper() -> precision_price
 
+# Получаем логгер для модуля
+log = logging.getLogger("core_io")
 
 def r(val, precision):
     return Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN)
@@ -25,7 +26,7 @@ async def preload_tickers(pg):
         rows = await conn.fetch("SELECT symbol, precision_price FROM tickers_v4 WHERE status = 'enabled'")
         for row in rows:
             state["tickers"][row["symbol"].upper()] = row["precision_price"]
-        info_log("CORE_IO", f"📥 Загружено тикеров при старте: {len(state['tickers'])}")
+        log.info(f"📥 Загружено тикеров при старте: {len(state['tickers'])}")
 
 
 async def listen_ticker_pubsub(redis, pg):
@@ -42,9 +43,9 @@ async def listen_ticker_pubsub(redis, pg):
                     row = await conn.fetchrow("SELECT precision_price FROM tickers_v4 WHERE symbol = $1", symbol)
                     if row:
                         state["tickers"][symbol.upper()] = row["precision_price"]
-                        info_log("CORE_IO", f"[TICKER] {symbol} enabled → precision={row['precision_price']}")
+                        log.info(f"[TICKER] {symbol} enabled → precision={row['precision_price']}")
         except Exception as e:
-            info_log("CORE_IO", f"[TICKER] Ошибка PubSub: {e}")
+            log.error(f"[TICKER] Ошибка PubSub: {e}")
 
 
 async def insert_candle(pg, symbol, interval, ts, candle):
@@ -76,7 +77,7 @@ async def insert_candle(pg, symbol, interval, ts, candle):
             """, symbol)
 
     except Exception as e:
-        info_log("CORE_IO", f"❌ Ошибка insert_candle: {e}")
+        log.error(f"❌ Ошибка insert_candle: {e}")
 
 
 async def m5_integrity_loop(pg, redis):
@@ -130,7 +131,7 @@ async def m5_integrity_loop(pg, redis):
                         ON CONFLICT DO NOTHING
                     """, symbol, t, o, h, l, c, v)
                     await redis.execute_command("JSON.SET", redis_key, "$", json.dumps(candle))
-                    info_log("CORE_IO", f"🔁 Восстановлена M5: {symbol} @ {t}")
+                    log.info(f"🔁 Восстановлена M5: {symbol} @ {t}")
 
                 t += timedelta(minutes=5)
 
@@ -138,7 +139,7 @@ async def m5_integrity_loop(pg, redis):
 
 
 async def run_core_writer(pg, redis):
-    info_log("CORE_IO", "▶ Старт обработчика core_writer")
+    log.info("▶ Старт обработчика core_writer")
 
     try:
         await redis.xgroup_create(STREAM_NAME, GROUP_NAME, id="0", mkstream=True)
@@ -173,7 +174,7 @@ async def run_core_writer(pg, redis):
                         await redis.xack(STREAM_NAME, GROUP_NAME, msg_id)
 
                     except Exception as e:
-                        info_log("CORE_IO", f"❌ Ошибка обработки сообщения: {e}")
+                        log.warning(f" Ошибка обработки сообщения: {e}")
         except Exception as e:
-            info_log("CORE_IO", f"❌ Ошибка чтения из потока: {e}")
+            log.warning(f" Ошибка чтения из потока: {e}")
             await asyncio.sleep(3)
