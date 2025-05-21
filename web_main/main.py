@@ -240,3 +240,42 @@ async def update_indicator_and_notify(indicator_id: int, field: str, new_value: 
     stream_name = f"indicators_{field}_stream"
     await redis_client.xadd(stream_name, event)
     logging.info(f"[Stream:{stream_name}] {event}")
+# 🔸 POST: создание нового расчёта индикатора и параметров
+@app.post("/indicators/create")
+async def create_indicator(
+    request: Request,
+    indicator: str = Form(...),
+    status: str = Form(...),
+    stream_publish: str = Form(...),
+    timeframe: str = Form(...),
+    param_count: int = Form(...),
+):
+    async with pg_pool.acquire() as conn:
+        # Вставка в indicator_instances_v4 (без поля symbol)
+        result = await conn.fetchrow(
+            """
+            INSERT INTO indicator_instances_v4 (indicator, timeframe, enabled, stream_publish, created_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            RETURNING id
+            """,
+            indicator.upper(),
+            timeframe,
+            status == "enabled",
+            stream_publish == "enabled"
+        )
+        instance_id = result["id"]
+
+        # Чтение всех параметров из формы
+        form = await request.form()
+        for i in range(1, param_count + 1):
+            param = form.get(f"param_{i}_name")
+            value = form.get(f"param_{i}_value")
+            await conn.execute(
+                """
+                INSERT INTO indicator_parameters_v4 (instance_id, param, value)
+                VALUES ($1, $2, $3)
+                """,
+                instance_id, param, value
+            )
+
+    return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
