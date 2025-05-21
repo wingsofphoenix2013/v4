@@ -51,16 +51,17 @@ def r(val, precision):
     return Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN)
 
 
-async def restore_missing_m1(pg, redis):
-    await asyncio.sleep(300)  # ⏱ подождать 5 минут после запуска
+async def restore_missing(interval, offset_minutes, pg, redis):
+    await asyncio.sleep(300)
     log = logging.getLogger("AUDITOR")
+    interval_sec = {"m5": 300, "m15": 900}[interval]
 
     while True:
-        log.info("[AUDITOR] ⏳ Старт проверки дыр M1")
+        log.info(f"[AUDITOR] ⏳ Старт проверки дыр {interval.upper()}")
 
         now = datetime.utcnow().replace(second=0, microsecond=0)
         start_time = now - timedelta(hours=24)
-        audit_end = now - timedelta(minutes=5)  # ⛔️ не проверяем последние 5 минут
+        audit_end = now - timedelta(minutes=offset_minutes)
 
         for symbol in state["tickers"]:
             precision = state["precision"].get(symbol)
@@ -68,12 +69,12 @@ async def restore_missing_m1(pg, redis):
                 continue
 
             async with pg.acquire() as conn:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(f"""
                     WITH gaps AS (
                         SELECT
                             LAG(open_time) OVER (PARTITION BY symbol ORDER BY open_time) AS prev_time,
                             open_time AS next_time
-                        FROM ohlcv4_m1
+                        FROM ohlcv4_{interval}
                         WHERE symbol = $1 AND open_time BETWEEN $2 AND $3
                     )
                     SELECT generate_series(
@@ -87,8 +88,11 @@ async def restore_missing_m1(pg, redis):
 
             for row in rows:
                 t = row["missing_time"]
+                if (t.minute % (interval_sec // 60)) != 0:
+                    continue  # пропускаем если не выровнено
+
                 ts = int(t.timestamp() * 1000)
-                redis_key = f"ohlcv:{symbol.lower()}:m1:{ts}"
+                redis_key = f"ohlcv:{symbol.lower()}:{interval}:{ts}"
 
                 try:
                     raw = await redis.execute_command("JSON.GET", redis_key, "$")
@@ -97,8 +101,8 @@ async def restore_missing_m1(pg, redis):
                     candle = json.loads(raw)[0]
 
                     async with pg.acquire() as conn:
-                        await conn.execute("""
-                            INSERT INTO ohlcv4_m1 (symbol, open_time, open, high, low, close, volume, source, inserted_at)
+                        await conn.execute(f"""
+                            INSERT INTO ohlcv4_{interval} (symbol, open_time, open, high, low, close, volume, source, inserted_at)
                             VALUES ($1, $2, $3, $4, $5, $6, $7, 'auditor', now())
                             ON CONFLICT DO NOTHING
                         """,
@@ -111,15 +115,17 @@ async def restore_missing_m1(pg, redis):
                             r(candle["v"], 2),
                         )
 
-                        log.info(f"[AUDITOR] ✅ Восстановлено: {symbol} @ {t}")
+                        log.info(f"[AUDITOR] ✅ Восстановлено {interval.upper()}: {symbol} @ {t}")
                 except Exception as e:
                     log.warning(f"[AUDITOR] ⚠️ Ошибка Redis/PG для {symbol} @ {t}: {e}")
 
-        log.info("[AUDITOR] 💤 Завершено. Спим 5 минут.")
+        log.info(f"[AUDITOR] 💤 Завершено {interval.upper()}. Спим 5 минут.")
         await asyncio.sleep(300)
 
 
 async def run_auditor(pg, redis):
     await preload_tickers(pg)
-    asyncio.create_task(restore_missing_m1(pg, redis))
+    asyncio.create_task(restore_missing("m1", 5, pg, redis))
+    asyncio.create_task(restore_missing("m5", 6, pg, redis))
+    asyncio.create_task(restore_missing("m15", 16, pg, redis))
     await listen_ticker_events(redis)
