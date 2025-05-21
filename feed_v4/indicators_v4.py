@@ -1,9 +1,26 @@
 import asyncio
 import logging
+import json
 from infra import info_log
 
 # Получаем логгер для модуля
 logger = logging.getLogger("indicators_v4")
+
+# 🔸 Подписка на события о смене статуса тикеров
+async def subscribe_ticker_events(redis):
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("tickers_v4_events")
+    logger = logging.getLogger("indicators_v4")
+    logger.info("Подписан на канал: tickers_v4_events")
+
+    async for message in pubsub.listen():
+        if message['type'] == 'message':
+            try:
+                event = json.loads(message['data'])
+                logger.info(f"Событие tickers_v4_events: {event}")
+                # Здесь далее — обработка статуса тикера (включение/выключение)
+            except Exception as e:
+                logger.error(f"Ошибка при обработке tickers_v4_events: {e}")
 
 # 🔸 Точка входа indicators_v4
 async def run_indicators_v4(pg, redis):
@@ -24,6 +41,9 @@ async def run_indicators_v4(pg, redis):
     indicator_params = await load_indicator_parameters(pg)
     info_log("indicators_v4", f"Загружено параметров индикаторов: {len(indicator_params)}")
 
+    # Запуск задачи подписки на события о тикерах
+    asyncio.create_task(subscribe_ticker_events(redis))
+    
     # TODO: Подписка на события tickers_v4_events и ohlcv_channel, цикл расчёта
     info_log("indicators_v4", "🔸 Основной цикл indicators_v4 запущен (лог-заглушка)")
 
@@ -50,7 +70,6 @@ async def load_indicator_parameters(pg):
 
 # 🔸 Основная точка входа (для отдельного теста воркера)
 async def main():
-    # ВНИМАНИЕ: setup_logging() вызывается только один раз — в главном модуле!
     info_log("indicators_v4", "🔸 indicators_v4 main() стартует (отдельный запуск)")
 
     # Инициализация подключений
