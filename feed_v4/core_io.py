@@ -1,3 +1,5 @@
+# core_io.py — запись в базу
+
 import asyncio
 import json
 import logging
