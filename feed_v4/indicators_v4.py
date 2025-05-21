@@ -21,6 +21,22 @@ async def subscribe_ticker_events(redis):
                 # Здесь далее — обработка статуса тикера (включение/выключение)
             except Exception as e:
                 logger.error(f"Ошибка при обработке tickers_v4_events: {e}")
+                
+# 🔸 Подписка на ohlcv_channel (события по новым свечам)
+async def subscribe_ohlcv_channel(redis):
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("ohlcv_channel")
+    logger = logging.getLogger("indicators_v4")
+    logger.info("Подписан на канал: ohlcv_channel")
+
+    async for message in pubsub.listen():
+        if message['type'] == 'message':
+            try:
+                event = json.loads(message['data'])
+                logger.info(f"Событие ohlcv_channel: {event}")
+                # Здесь далее — обработка появления новой свечи (запуск расчёта индикатора)
+            except Exception as e:
+                logger.error(f"Ошибка при обработке ohlcv_channel: {e}")
 
 # 🔸 Точка входа indicators_v4
 async def run_indicators_v4(pg, redis):
@@ -43,6 +59,9 @@ async def run_indicators_v4(pg, redis):
 
     # Запуск задачи подписки на события о тикерах
     asyncio.create_task(subscribe_ticker_events(redis))
+
+    # Запуск задачи подписки на ohlcv_channel
+    asyncio.create_task(subscribe_ohlcv_channel(redis))
     
     # TODO: Подписка на события tickers_v4_events и ohlcv_channel, цикл расчёта
     info_log("indicators_v4", "🔸 Основной цикл indicators_v4 запущен (лог-заглушка)")
