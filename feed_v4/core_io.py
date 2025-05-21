@@ -20,7 +20,7 @@ def r(val, precision):
 
 async def preload_tickers(pg):
     async with pg.acquire() as conn:
-        rows = await conn.fetch("SELECT symbol, precision_price FROM tickers_v4 WHERE tradepermission = 'enabled'")
+        rows = await conn.fetch("SELECT symbol, precision_price FROM tickers_v4 WHERE status = 'enabled'")
         for row in rows:
             state["tickers"][row["symbol"].upper()] = row["precision_price"]
         info_log("CORE_IO", f"📥 Загружено тикеров при старте: {len(state['tickers'])}")
