@@ -188,7 +188,7 @@ async def indicators_page(request: Request):
                 "timeframe": row["timeframe"],
                 "enabled": row["enabled"],
                 "stream_publish": row["stream_publish"],
-                "params": dict(row["parameters"])
+                "params": row["parameters"] or {}
             })
         return templates.TemplateResponse("indicators.html", {
             "request": request,
