@@ -73,8 +73,6 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
-import json
-from decimal import Decimal, ROUND_DOWN
 
 # 🔸 Сохранение полной свечи M1 в RedisJSON + Stream + Pub/Sub
 async def store_and_publish_m1(redis, symbol, open_time, kline, precision):

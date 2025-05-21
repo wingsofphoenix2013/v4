@@ -7,12 +7,12 @@ from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
 from feed_and_aggregate import run_feed_and_aggregator
 from core_io import run_core_writer
 from feed_v4_auditor import run_auditor
+from indicators_v4 import run_indicators_v4
 
 
 # 🔸 Попытка захватить лидерство через Redis Lock
 async def try_acquire_team_lock(redis, lock_key="team_leader_lock", ttl=60):
     
-
     instance_id = str(uuid.uuid4())
     log = logging.getLogger("TEAM_LOCK")
 
@@ -47,9 +47,9 @@ async def main():
 
     # Инициализация подключений
     pg = await init_pg_pool()
-    redis = init_redis_client()
-    
-    # 🔸 Попытка стать ведущим инстансом
+    redis = await init_redis_client()
+
+    # Попытка стать ведущим инстансом
     if not await try_acquire_team_lock(redis):
         return  # Завершаем, если это не лидер    
 
@@ -57,7 +57,8 @@ async def main():
     await asyncio.gather(
         run_safe_loop(lambda: run_feed_and_aggregator(pg, redis), "FEED+AGGREGATOR"),
         run_safe_loop(lambda: run_core_writer(pg, redis), "CORE_IO"),
-        run_safe_loop(lambda: run_auditor(pg, redis), "AUDITOR")
+        run_safe_loop(lambda: run_auditor(pg, redis), "AUDITOR"),
+        run_safe_loop(lambda: run_indicators_v4(pg, redis), "INDICATORS_V4")
     )
 # 🔸 Запуск
 if __name__ == "__main__":

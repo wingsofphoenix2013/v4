@@ -34,7 +34,6 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
             await asyncio.sleep(retry_delay)
 
 # 🔸 Настройка логирования
-
 def setup_logging():
     logging.basicConfig(
         level=logging.DEBUG if DEBUG_MODE else logging.INFO,
