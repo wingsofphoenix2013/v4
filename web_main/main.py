@@ -168,3 +168,32 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
     stream_name = f"tickers_{field}_stream"
     await redis_client.xadd(stream_name, event)
     logging.info(f"[Stream:{stream_name}] {event}")
+@app.get("/indicators", response_class=HTMLResponse)
+async def indicators_page(request: Request):
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT i.id, i.indicator, i.timeframe, i.enabled, i.stream_publish,
+                   COALESCE(json_agg(json_build_object(p.param, p.value))
+                            FILTER (WHERE p.id IS NOT NULL), '[]') AS parameters
+            FROM indicator_instances_v4 i
+            LEFT JOIN indicator_parameters_v4 p ON p.instance_id = i.id
+            GROUP BY i.id
+            ORDER BY i.id
+        """)
+        indicators = []
+        for row in rows:
+            param_map = {}
+            for p in row["parameters"]:
+                param_map.update(p)
+            indicators.append({
+                "id": row["id"],
+                "indicator": row["indicator"],
+                "timeframe": row["timeframe"],
+                "enabled": row["enabled"],
+                "stream_publish": row["stream_publish"],
+                "params": param_map
+            })
+        return templates.TemplateResponse("indicators.html", {
+            "request": request,
+            "indicators": indicators
+        })
