@@ -37,7 +37,50 @@ async def subscribe_ohlcv_channel(redis):
                 # Здесь далее — обработка появления новой свечи (запуск расчёта индикатора)
             except Exception as e:
                 logger.error(f"Ошибка при обработке ohlcv_channel: {e}")
+# 🔸 Подписка на события об изменении статуса индикаторов
+async def subscribe_indicator_events(pg, redis, indicator_pool, param_pool):
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("indicators_v4_events")
+    logger = logging.getLogger("indicators_v4")
+    logger.info("Подписан на канал: indicators_v4_events")
 
+    async for message in pubsub.listen():
+        if message['type'] == 'message':
+            try:
+                event = json.loads(message['data'])
+                logger.info(f"Событие indicators_v4_events: {event}")
+                indicator_id = event.get("id")
+                action = event.get("action")
+                field = event.get("type")
+
+                if field == "enabled":
+                    if action == "true":
+                        # Загрузка расчёта и параметров из БД
+                        async with pg.acquire() as conn:
+                            row = await conn.fetchrow("SELECT * FROM indicator_instances_v4 WHERE id = $1", indicator_id)
+                            if row:
+                                indicator = dict(row)
+                                param_rows = await conn.fetch(
+                                    "SELECT * FROM indicator_parameters_v4 WHERE instance_id = $1", indicator_id)
+                                params = [dict(p) for p in param_rows]
+                                indicator_pool[indicator_id] = indicator
+                                param_pool[indicator_id] = params
+                                logger.info(f"Добавлен индикатор: id={indicator_id}")
+                            else:
+                                logger.error(f"Индикатор id={indicator_id} не найден в БД")
+                    elif action == "false":
+                        if indicator_id in indicator_pool:
+                            indicator_pool.pop(indicator_id)
+                            param_pool.pop(indicator_id, None)
+                            logger.info(f"Индикатор id={indicator_id} отключён")
+                elif field == "stream_publish":
+                    # Переключение флага stream_publish без подгрузки параметров
+                    if indicator_id in indicator_pool:
+                        indicator_pool[indicator_id]["stream_publish"] = (action == "true")
+                        logger.info(f"Индикатор id={indicator_id} stream_publish = {action}")
+
+            except Exception as e:
+                logger.error(f"Ошибка при обработке indicators_v4_events: {e}")
 # 🔸 Точка входа indicators_v4
 async def run_indicators_v4(pg, redis):
     """
@@ -57,14 +100,20 @@ async def run_indicators_v4(pg, redis):
     indicator_params = await load_indicator_parameters(pg)
     info_log("indicators_v4", f"Загружено параметров индикаторов: {len(indicator_params)}")
 
+    # Формируем in-memory пулы для динамического управления
+    indicator_pool = {str(ind["id"]): ind for ind in indicator_instances}
+    param_pool = {str(ind["id"]): [p for p in indicator_params if str(p["instance_id"]) == str(ind["id"])] for ind in indicator_instances}
+
     # Запуск задачи подписки на события о тикерах
     asyncio.create_task(subscribe_ticker_events(redis))
 
     # Запуск задачи подписки на ohlcv_channel
     asyncio.create_task(subscribe_ohlcv_channel(redis))
-    
-    # TODO: Подписка на события tickers_v4_events и ohlcv_channel, цикл расчёта
-    info_log("indicators_v4", "🔸 Основной цикл indicators_v4 запущен (лог-заглушка)")
+
+    # Запуск подписки на события о статусе индикаторов
+    asyncio.create_task(subscribe_indicator_events(pg, redis, indicator_pool, param_pool))
+
+    info_log("indicators_v4", "🔸 Основной цикл indicators_v4 запущен")
 
     while True:
         await asyncio.sleep(60)  # Пульс воркера
