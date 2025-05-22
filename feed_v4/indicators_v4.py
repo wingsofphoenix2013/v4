@@ -159,7 +159,9 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                     log.info(f"Расчёт {param_name} для {symbol}/{interval}: отказ, есть {len(close_prices)} цен, требуется минимум {period}")
                     continue
 
+                log.info(f"BEFORE_EMA_CALC {symbol}/{interval} at {datetime.now().isoformat()}")
                 ema_value = ema_pandas(close_prices, period)
+                log.info(f"AFTER_EMA_CALC {symbol}/{interval} at {datetime.now().isoformat()}")
                 precision = ticker_precisions.get(symbol.lower(), 6)
                 if ema_value is not None:
                     ema_value_rounded = round(ema_value, precision)
