@@ -315,8 +315,8 @@ async def detect_missing_m1(redis, pg, symbol, now_ts, state):
             continue
 
         try:
-            exists = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:o", ts)
-            if not exists:
+            result = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+            if not result:
                 missing.append(ts)
         except Exception:
             missing.append(ts)
