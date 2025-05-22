@@ -228,42 +228,6 @@ async def run_feed_and_aggregator(pg, redis):
             task = create_tracked_task(watch_mark_price(upper_symbol, redis, precision), f"markprice_{upper_symbol}")
             state["markprice_tasks"][upper_symbol] = task
 
-    # 🔸 Фоновая проверка отсутствующих M1
-    async def recovery_loop():
-        while True:
-            now_ts = int(datetime.utcnow().replace(second=0, microsecond=0).timestamp() * 1000)
-            for symbol in state["active"]:
-                await detect_missing_m1(redis, pg, symbol.upper(), now_ts)
-            await asyncio.sleep(60)
-
-    create_tracked_task(recovery_loop(), "recovery_loop")
-
-    # 🔸 Фоновое восстановление всех пропущенных свечей
-    async def restore_loop():
-        while True:
-            async with pg.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT symbol, open_time FROM missing_m1_log_v4 WHERE fixed IS NOT true ORDER BY open_time ASC"
-                )
-
-            for row in rows:
-                symbol = row["symbol"]
-                open_time = row["open_time"]
-                precision = state["tickers"].get(symbol)
-                if not precision:
-                    continue
-
-                await check_consecutive_m1_failures(pg, symbol)
-
-                success = await restore_missing_m1(symbol, open_time, redis, pg, precision)
-
-                if success and open_time.minute % 5 == 4:
-                    await try_aggregate_m5(redis, symbol, open_time)
-
-            await asyncio.sleep(60)
-
-    create_tracked_task(restore_loop(), "restore_loop")
-
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
         while True:
