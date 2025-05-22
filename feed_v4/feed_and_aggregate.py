@@ -201,18 +201,18 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
     await safe_ts_add(f"ts:{symbol}:m5:v", v, "v")
 
     log.info(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
-# 🔸 Фоновая агрегация M5: регулярная проверка возможности построить недостающие свечи
-async def aggregate_m5_loop():
+# 🔸 Фоновая агрегация M5
+async def aggregate_m5_loop(redis, state):
     while True:
         now = datetime.utcnow()
         if now.minute % 5 == 0:
-            now -= timedelta(minutes=1)  # чтобы не захватить только что начавшийся интервал
+            now -= timedelta(minutes=1)
 
         base_minute = (now.minute // 5) * 5
         base_time = now.replace(minute=base_minute, second=0, microsecond=0)
 
         for symbol in state["active"]:
-            await try_aggregate_m5(redis, symbol.upper(), base_time)
+            await try_aggregate_m5(redis, symbol.upper(), base_time, state)
 
         await asyncio.sleep(60)
 # 🔸 Попытка построить свечу M15 из 15 M1 в RedisTimeSeries
@@ -288,8 +288,8 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     await safe_ts_add(f"ts:{symbol}:m15:v", v, "v")
 
     log.info(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
-# 🔸 Фоновая агрегация M15: регулярная попытка построения завершённых свечей
-async def aggregate_m15_loop():
+# 🔸 Фоновая агрегация M15
+async def aggregate_m15_loop(redis, state):
     while True:
         now = datetime.utcnow()
         if now.minute % 15 == 0:
@@ -299,7 +299,7 @@ async def aggregate_m15_loop():
         base_time = now.replace(minute=base_minute, second=0, microsecond=0)
 
         for symbol in state["active"]:
-            await try_aggregate_m15(redis, symbol.upper(), base_time)
+            await try_aggregate_m15(redis, symbol.upper(), base_time, state)
 
         await asyncio.sleep(60)
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
@@ -547,10 +547,10 @@ async def run_feed_and_aggregator(pg, redis):
     create_tracked_task(recovery_loop(), "recovery_loop")
     
     # 🔸 Фоновая генерация М5
-    create_tracked_task(aggregate_m5_loop(), "aggregate_m5_loop")
+    create_tracked_task(aggregate_m5_loop(redis, state), "aggregate_m5_loop")
     
     # 🔸 Фоновая генерация М15
-    create_tracked_task(aggregate_m15_loop(), "aggregate_m15_loop")
+    create_tracked_task(aggregate_m15_loop(redis, state), "aggregate_m15_loop")
     
     # 🔸 Фоновое восстановление пропущенных M1 через Binance API
     async def restore_loop():
