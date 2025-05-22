@@ -136,21 +136,21 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
 
     for ts in ts_list:
         try:
-            o = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:o", ts)
-            h = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:h", ts)
-            l = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:l", ts)
-            c = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:c", ts)
-            v = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:v", ts)
+            o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+            h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
+            l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
+            c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
+            v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
 
             if not all([o, h, l, c, v]):
                 return
 
             candles.append({
-                "o": float(o[1]),
-                "h": float(h[1]),
-                "l": float(l[1]),
-                "c": float(c[1]),
-                "v": float(v[1]),
+                "o": float(o[0][1]),
+                "h": float(h[0][1]),
+                "l": float(l[0][1]),
+                "c": float(c[0][1]),
+                "v": float(v[0][1]),
                 "ts": ts
             })
         except Exception:
@@ -194,6 +194,11 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
             else:
                 raise
 
+    # Проверка: свеча уже построена?
+    exists = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m5:o", m5_ts, m5_ts)
+    if exists:
+        return
+
     await safe_ts_add(f"ts:{symbol}:m5:o", o, "o")
     await safe_ts_add(f"ts:{symbol}:m5:h", h, "h")
     await safe_ts_add(f"ts:{symbol}:m5:l", l, "l")
@@ -223,21 +228,21 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
 
     for ts in ts_list:
         try:
-            o = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:o", ts)
-            h = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:h", ts)
-            l = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:l", ts)
-            c = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:c", ts)
-            v = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:v", ts)
+            o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+            h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
+            l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
+            c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
+            v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
 
             if not all([o, h, l, c, v]):
                 return
 
             candles.append({
-                "o": float(o[1]),
-                "h": float(h[1]),
-                "l": float(l[1]),
-                "c": float(c[1]),
-                "v": float(v[1]),
+                "o": float(o[0][1]),
+                "h": float(h[0][1]),
+                "l": float(l[0][1]),
+                "c": float(c[0][1]),
+                "v": float(v[0][1]),
                 "ts": ts
             })
         except Exception:
@@ -253,7 +258,6 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     c = candles[-1]["c"]
     v = sum(c["v"] for c in candles)
 
-    # Округление
     precision_price = state["tickers"][symbol]["precision_price"]
     precision_qty = state["tickers"][symbol]["precision_qty"]
 
@@ -280,6 +284,11 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
                 await redis.execute_command("TS.ADD", key, m15_ts, value)
             else:
                 raise
+
+    # Проверка: свеча уже построена?
+    exists = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m15:o", m15_ts, m15_ts)
+    if exists:
+        return
 
     await safe_ts_add(f"ts:{symbol}:m15:o", o, "o")
     await safe_ts_add(f"ts:{symbol}:m15:h", h, "h")
