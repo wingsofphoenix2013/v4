@@ -69,9 +69,9 @@ async def get_last_candles(redis, symbol, interval, n=250):
     ВНИМАНИЕ: symbol и interval должны быть строго в нижнем регистре!
     """
     pattern = f"ohlcv:{symbol}:{interval}:*"
-    log.info(f"DEBUG: вызов get_last_candles c symbol={symbol}, interval={interval}, pattern={pattern}")
+    log.debug(f"DEBUG: вызов get_last_candles c symbol={symbol}, interval={interval}, pattern={pattern}")
     keys = await redis.keys(pattern)
-    log.info(f"DEBUG: найдено ключей: {len(keys)} для pattern={pattern}")
+    log.debug(f"DEBUG: найдено ключей: {len(keys)} для pattern={pattern}")
     if not keys:
         log.info(f"Нет свечей для {symbol}/{interval} в Redis (ключи {pattern})")
         return []
@@ -85,13 +85,13 @@ async def get_last_candles(redis, symbol, interval, n=250):
     keys_needed = keys_sorted[:n]
     # mget — получить значения всех свечей сразу
     raw = await redis.mget(*keys_needed)
-    log.info(f"DEBUG: mget вернул {len(raw)} значений, первые 5: {raw[:5]}")
+    log.debug(f"DEBUG: mget вернул {len(raw)} значений, первые 5: {raw[:5]}")
     candles = []
     for k in keys_needed:
         candle = await redis.json().get(k)
         if candle:
             candles.append(candle)
-    log.info(f"DEBUG: candles после redis.json().get: {len(candles)}, первые 2: {candles[:2]}")
+    log.debug(f"DEBUG: candles после redis.json().get: {len(candles)}, первые 2: {candles[:2]}")
     # Теперь сортируем свечи уже от старых к новым для расчёта индикаторов
     candles = sorted(candles, key=lambda c: c.get("ts", 0))
     if len(candles) < n:
