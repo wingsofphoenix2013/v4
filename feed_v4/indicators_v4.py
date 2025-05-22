@@ -14,7 +14,10 @@ log = logging.getLogger("indicators_v4")
 async def load_enabled_tickers(pg):
     async with pg.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM tickers_v4 WHERE status = 'enabled'")
-        return [dict(row) for row in rows]
+        tickers = [dict(row) for row in rows]
+        # Формируем словарь precision_price по тикеру (lower-case)
+        ticker_precisions = {t["symbol"].lower(): t["precision_price"] for t in tickers}
+        return tickers, ticker_precisions
 
 # 🔸 Загрузка активных расчётов индикаторов
 async def load_enabled_indicator_instances(pg):
@@ -154,8 +157,13 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                     log.info(f"Расчёт {param_name} для {symbol}/{interval}: отказ, есть {len(close_prices)} цен, требуется минимум {period}")
                     continue
 
-                ema_value = ema(close_prices, period)[-1]
-                log.info(f"{param_name.upper()} ({symbol}/{interval}): {ema_value}")
+                ema_value = ema_pandas(close_prices, period)
+                precision = ticker_precisions.get(symbol, 6)
+                if ema_value is not None:
+                    ema_value_rounded = round(ema_value, precision)
+                    log.info(f"{param_name.upper()} ({symbol.upper()}/{interval}): {ema_value_rounded}")
+                else:
+                    log.info(f"{param_name.upper()} ({symbol.upper()}/{interval}): недостаточно данных для расчёта EMA")
 
         except Exception as e:
             log.error(f"Ошибка при обработке ohlcv_channel: {e}")
@@ -213,7 +221,7 @@ async def run_indicators_v4(pg, redis):
     log.info("🔸 indicators_v4 стартует")
 
     # Загрузка стартовых тикеров из базы
-    enabled_tickers = await load_enabled_tickers(pg)
+    enabled_tickers, ticker_precisions = await load_enabled_tickers(pg)
     log.info(f"Загружено тикеров со статусом enabled: {len(enabled_tickers)}")
 
     # Загрузка активных расчётов индикаторов

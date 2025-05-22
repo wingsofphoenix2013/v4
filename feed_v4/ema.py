@@ -1,16 +1,16 @@
 import logging
-
-log = logging.getLogger("ema")
+import pandas as pd
 
 # Получение и логирование входных данных для расчёта EMA
-def ema(prices, period):
+def ema_pandas(prices, period):
     """
-    Функция-обёртка для расчёта EMA.
-    На этом этапе только логирует первые элементы массива цен и период.
-    prices — массив close-цен (list of float)
-    period — период EMA (int)
-    Возвращает заглушку: список с одним элементом 0.0
+    Расчёт EMA по массиву цен через pandas.Series.ewm (совпадает с TradingView).
+    prices: list[float] — массив close-цен.
+    period: int — период EMA.
+    Возвращает последний ema_value (float).
     """
-    log.info(f"Получен вызов ema(): первые 5 цен: {prices[:5]}... всего: {len(prices)}, period={period}")
-    # TODO: Реализовать фактический расчёт EMA
-    return [0.0]
+    if len(prices) < period:
+        return None
+    closes = pd.Series(prices)
+    ema_series = closes.ewm(span=period, adjust=False).mean()
+    return ema_series.iloc[-1]
