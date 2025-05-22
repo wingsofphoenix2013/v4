@@ -22,7 +22,10 @@ async def load_all_tickers(pg_pool):
         tickers = {}
         active = set()
         for row in rows:
-            tickers[row['symbol']] = row['precision_price']
+            tickers[row['symbol']] = {
+                "precision_price": row["precision_price"],
+                "precision_qty": row["precision_qty"]
+            }
             if row['status'] == 'enabled':
                 active.add(row['symbol'].lower())
         return tickers, active
@@ -76,9 +79,53 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
 
                 await redis.xack(stream, group, msg_id)
 
-# 🔸 Сохранение полной свечи M1 в RedisTS (временно отключено, используется заглушка)
-async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
-    log.info("Я тут: store_and_publish_m1")
+# 🔸 Сохранение полной свечи M1 в RedisTimeSeries + Stream + Pub/Sub
+async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price, precision_qty):
+    ts = int(open_time.timestamp() * 1000)
+
+    def r(val, precision):
+        return float(Decimal(val).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+
+    o = r(kline["o"], precision_price)
+    h = r(kline["h"], precision_price)
+    l = r(kline["l"], precision_price)
+    c = r(kline["c"], precision_price)
+    v = r(kline["v"], precision_qty)
+
+    async def safe_ts_add(field_key, value, field_name):
+        try:
+            await redis.execute_command("TS.ADD", field_key, ts, value)
+        except Exception as e:
+            if "TSDB: the key does not exist" in str(e):
+                await redis.execute_command(
+                    "TS.CREATE", field_key,
+                    "RETENTION", 2592000000,  # 30 дней
+                    "DUPLICATE_POLICY", "last",
+                    "LABELS",
+                    "symbol", symbol,
+                    "interval", "m1",
+                    "field", field_name
+                )
+                await redis.execute_command("TS.ADD", field_key, ts, value)
+            else:
+                raise
+
+    await safe_ts_add(f"ts:{symbol}:m1:o", o, "o")
+    await safe_ts_add(f"ts:{symbol}:m1:h", h, "h")
+    await safe_ts_add(f"ts:{symbol}:m1:l", l, "l")
+    await safe_ts_add(f"ts:{symbol}:m1:c", c, "c")
+    await safe_ts_add(f"ts:{symbol}:m1:v", v, "v")
+
+    log.info(f"[{symbol}] M1 TS сохранена: ts={ts} O={o} H={h} L={l} C={c} V={v}")
+
+    event = {
+        "symbol": symbol,
+        "interval": "m1",
+        "timestamp": str(ts)
+    }
+
+    await redis.xadd("ohlcv_stream", event)
+    await redis.publish("ohlcv_channel", json.dumps(event))
 # 🔸 Агрегация M5 на основе RedisJSON M1-свечей (временно отключено, используется заглушка)
 async def try_aggregate_m5(redis, symbol, open_time):
     log.info("Я тут: try_aggregate_m5")
@@ -125,7 +172,8 @@ async def listen_kline_stream(redis, state, refresh_queue):
                                 symbol,
                                 open_time,
                                 kline,
-                                state["tickers"][symbol]
+                                state["tickers"][symbol]["precision_price"],
+                                state["tickers"][symbol]["precision_qty"]
                             )
 
                     except Exception as e:
