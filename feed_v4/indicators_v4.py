@@ -7,7 +7,7 @@ from infra import setup_logging
 log = logging.getLogger("indicators_v4")
 
 # 🔸 Подписка на события о смене статуса тикеров
-async def subscribe_ticker_events(redis):
+async def subscribe_ticker_events(redis, active_tickers):
     pubsub = redis.pubsub()
     await pubsub.subscribe("tickers_v4_events")
     log.info("Подписан на канал: tickers_v4_events")
@@ -16,25 +16,57 @@ async def subscribe_ticker_events(redis):
         if message['type'] == 'message':
             try:
                 event = json.loads(message['data'])
-                log.debug(f"Событие tickers_v4_events: {event}")
-                # Здесь далее — обработка статуса тикера (включение/выключение)
+                symbol = event.get("symbol", "").upper()
+                action_type = event.get("type")
+                action = event.get("action")
+
+                if action_type == "status":
+                    if action == "enabled":
+                        active_tickers.add(symbol)
+                        log.info(f"Тикер включён: {symbol}")
+                    elif action == "disabled":
+                        active_tickers.discard(symbol)
+                        log.info(f"Тикер выключен: {symbol}")
             except Exception as e:
                 log.error(f"Ошибка при обработке tickers_v4_events: {e}")
                 
 # 🔸 Подписка на ohlcv_channel (события по новым свечам)
-async def subscribe_ohlcv_channel(redis):
+async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool):
     pubsub = redis.pubsub()
     await pubsub.subscribe("ohlcv_channel")
     log.info("Подписан на канал: ohlcv_channel")
 
     async for message in pubsub.listen():
-        if message['type'] == 'message':
-            try:
-                event = json.loads(message['data'])
-                log.debug(f"Событие ohlcv_channel: {event}")
-                # Здесь далее — обработка появления новой свечи (запуск расчёта индикатора)
-            except Exception as e:
-                log.error(f"Ошибка при обработке ohlcv_channel: {e}")
+        if message['type'] != 'message':
+            continue
+        try:
+            event = json.loads(message['data'])
+            symbol = event.get("symbol")
+            interval = event.get("interval")
+
+            if not symbol or not interval:
+                continue
+            if symbol.upper() not in active_tickers:
+                log.debug(f"Пропущено событие для неактивного тикера: {symbol}")
+                continue
+
+            # Найти расчёты по symbol/interval (добавить фильтр по symbol если нужно)
+            relevant_indicators = [
+                ind for ind in indicator_pool.values()
+                if ind.get("enabled", True)
+                and ind["timeframe"] == interval
+                # Если в индикаторе есть привязка к symbol — добавить:
+                # and ind.get("symbol", "").upper() == symbol.upper()
+            ]
+            if not relevant_indicators:
+                log.info(f"Нет активных расчётов для {symbol} / {interval}")
+                continue
+
+            log.info(f"Получено событие по {symbol} ({interval}) — найдено {len(relevant_indicators)} расчётов, запуск обработки индикатора")
+            # Здесь далее — логика расчёта по каждому найденному индикатору
+
+        except Exception as e:
+            log.error(f"Ошибка при обработке ohlcv_channel: {e}")
 # 🔸 Подписка на события об изменении статуса индикаторов
 async def subscribe_indicator_events(pg, redis, indicator_pool, param_pool):
     pubsub = redis.pubsub()
@@ -98,14 +130,15 @@ async def run_indicators_v4(pg, redis):
     log.info(f"Загружено параметров индикаторов: {len(indicator_params)}")
 
     # Формируем in-memory пулы для динамического управления
+    active_tickers = set([t["symbol"].upper() for t in enabled_tickers])
     indicator_pool = {str(ind["id"]): ind for ind in indicator_instances}
     param_pool = {str(ind["id"]): [p for p in indicator_params if str(p["instance_id"]) == str(ind["id"])] for ind in indicator_instances}
 
     # Запуск задачи подписки на события о тикерах
-    asyncio.create_task(subscribe_ticker_events(redis))
+    asyncio.create_task(subscribe_ticker_events(redis, active_tickers))
 
     # Запуск задачи подписки на ohlcv_channel
-    asyncio.create_task(subscribe_ohlcv_channel(redis))
+    asyncio.create_task(subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool))
 
     # Запуск подписки на события о статусе индикаторов
     asyncio.create_task(subscribe_indicator_events(pg, redis, indicator_pool, param_pool))
