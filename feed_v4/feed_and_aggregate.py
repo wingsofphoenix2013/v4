@@ -128,12 +128,180 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
 
     await redis.xadd("ohlcv_stream", event)
     await redis.publish("ohlcv_channel", json.dumps(event))
-# 🔸 Агрегация M5 на основе RedisJSON M1-свечей (временно отключено, используется заглушка)
-async def try_aggregate_m5(redis, symbol, open_time):
-    log.info("Я тут: try_aggregate_m5")
-# 🔸 Агрегация M15 на основе RedisJSON M1-свечей (временно отключено, используется заглушка)
-async def try_aggregate_m15(redis, symbol, open_time):
-    log.info("Я тут: try_aggregate_m15")
+# 🔸 Попытка построить свечу M5 из 5 M1 в RedisTimeSeries
+async def try_aggregate_m5(redis, symbol, base_time, state):
+    end_ts = int(base_time.timestamp() * 1000) + 4 * 60_000
+    ts_list = [end_ts - i * 60_000 for i in reversed(range(5))]
+    candles = []
+
+    for ts in ts_list:
+        try:
+            o = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:o", ts)
+            h = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:h", ts)
+            l = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:l", ts)
+            c = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:c", ts)
+            v = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:v", ts)
+
+            if not all([o, h, l, c, v]):
+                return
+
+            candles.append({
+                "o": float(o[1]),
+                "h": float(h[1]),
+                "l": float(l[1]),
+                "c": float(c[1]),
+                "v": float(v[1]),
+                "ts": ts
+            })
+        except Exception:
+            return
+
+    if not candles:
+        return
+
+    m5_ts = ts_list[0]
+    o = candles[0]["o"]
+    h = max(c["h"] for c in candles)
+    l = min(c["l"] for c in candles)
+    c = candles[-1]["c"]
+    v = sum(c["v"] for c in candles)
+
+    # Округление по точности
+    precision_price = state["tickers"][symbol]["precision_price"]
+    precision_qty = state["tickers"][symbol]["precision_qty"]
+
+    def r(val, p):
+        return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+    o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
+    v = r(v, precision_qty)
+
+    async def safe_ts_add(key, value, field):
+        try:
+            await redis.execute_command("TS.ADD", key, m5_ts, value)
+        except Exception as e:
+            if "TSDB: the key does not exist" in str(e):
+                await redis.execute_command(
+                    "TS.CREATE", key,
+                    "RETENTION", 2592000000,
+                    "DUPLICATE_POLICY", "last",
+                    "LABELS",
+                    "symbol", symbol,
+                    "interval", "m5",
+                    "field", field
+                )
+                await redis.execute_command("TS.ADD", key, m5_ts, value)
+            else:
+                raise
+
+    await safe_ts_add(f"ts:{symbol}:m5:o", o, "o")
+    await safe_ts_add(f"ts:{symbol}:m5:h", h, "h")
+    await safe_ts_add(f"ts:{symbol}:m5:l", l, "l")
+    await safe_ts_add(f"ts:{symbol}:m5:c", c, "c")
+    await safe_ts_add(f"ts:{symbol}:m5:v", v, "v")
+
+    log.info(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+# 🔸 Фоновая агрегация M5: регулярная проверка возможности построить недостающие свечи
+async def aggregate_m5_loop():
+    while True:
+        now = datetime.utcnow()
+        if now.minute % 5 == 0:
+            now -= timedelta(minutes=1)  # чтобы не захватить только что начавшийся интервал
+
+        base_minute = (now.minute // 5) * 5
+        base_time = now.replace(minute=base_minute, second=0, microsecond=0)
+
+        for symbol in state["active"]:
+            await try_aggregate_m5(redis, symbol.upper(), base_time)
+
+        await asyncio.sleep(60)
+# 🔸 Попытка построить свечу M15 из 15 M1 в RedisTimeSeries
+async def try_aggregate_m15(redis, symbol, base_time, state):
+    end_ts = int(base_time.timestamp() * 1000) + 14 * 60_000
+    ts_list = [end_ts - i * 60_000 for i in reversed(range(15))]
+    candles = []
+
+    for ts in ts_list:
+        try:
+            o = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:o", ts)
+            h = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:h", ts)
+            l = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:l", ts)
+            c = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:c", ts)
+            v = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:v", ts)
+
+            if not all([o, h, l, c, v]):
+                return
+
+            candles.append({
+                "o": float(o[1]),
+                "h": float(h[1]),
+                "l": float(l[1]),
+                "c": float(c[1]),
+                "v": float(v[1]),
+                "ts": ts
+            })
+        except Exception:
+            return
+
+    if not candles:
+        return
+
+    m15_ts = ts_list[0]
+    o = candles[0]["o"]
+    h = max(c["h"] for c in candles)
+    l = min(c["l"] for c in candles)
+    c = candles[-1]["c"]
+    v = sum(c["v"] for c in candles)
+
+    # Округление
+    precision_price = state["tickers"][symbol]["precision_price"]
+    precision_qty = state["tickers"][symbol]["precision_qty"]
+
+    def r(val, p):
+        return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+    o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
+    v = r(v, precision_qty)
+
+    async def safe_ts_add(key, value, field):
+        try:
+            await redis.execute_command("TS.ADD", key, m15_ts, value)
+        except Exception as e:
+            if "TSDB: the key does not exist" in str(e):
+                await redis.execute_command(
+                    "TS.CREATE", key,
+                    "RETENTION", 2592000000,
+                    "DUPLICATE_POLICY", "last",
+                    "LABELS",
+                    "symbol", symbol,
+                    "interval", "m15",
+                    "field", field
+                )
+                await redis.execute_command("TS.ADD", key, m15_ts, value)
+            else:
+                raise
+
+    await safe_ts_add(f"ts:{symbol}:m15:o", o, "o")
+    await safe_ts_add(f"ts:{symbol}:m15:h", h, "h")
+    await safe_ts_add(f"ts:{symbol}:m15:l", l, "l")
+    await safe_ts_add(f"ts:{symbol}:m15:c", c, "c")
+    await safe_ts_add(f"ts:{symbol}:m15:v", v, "v")
+
+    log.info(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+# 🔸 Фоновая агрегация M15: регулярная попытка построения завершённых свечей
+async def aggregate_m15_loop():
+    while True:
+        now = datetime.utcnow()
+        if now.minute % 15 == 0:
+            now -= timedelta(minutes=1)
+
+        base_minute = (now.minute // 15) * 15
+        base_time = now.replace(minute=base_minute, second=0, microsecond=0)
+
+        for symbol in state["active"]:
+            await try_aggregate_m15(redis, symbol.upper(), base_time)
+
+        await asyncio.sleep(60)
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 async def detect_missing_m1(redis, pg, symbol, now_ts, state):
     missing = []
@@ -377,6 +545,12 @@ async def run_feed_and_aggregator(pg, redis):
             await asyncio.sleep(60)
 
     create_tracked_task(recovery_loop(), "recovery_loop")
+    
+    # 🔸 Фоновая генерация М5
+    create_tracked_task(aggregate_m5_loop(), "aggregate_m5_loop")
+    
+    # 🔸 Фоновая генерация М15
+    create_tracked_task(aggregate_m15_loop(), "aggregate_m15_loop")
     
     # 🔸 Фоновое восстановление пропущенных M1 через Binance API
     async def restore_loop():
