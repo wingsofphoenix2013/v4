@@ -102,7 +102,7 @@ async def get_last_candles(redis, symbol, interval, n=250):
         return []
     return candles
 # 🔸 Подписка на ohlcv_channel (события по новым свечам)
-async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool):
+async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool, ticker_precisions):
     pubsub = redis.pubsub()
     await pubsub.subscribe("ohlcv_channel")
     log.info("Подписан на канал: ohlcv_channel")
@@ -247,7 +247,7 @@ async def run_indicators_v4(pg, redis):
     asyncio.create_task(subscribe_ticker_events(redis, active_tickers))
 
     # Запуск задачи подписки на ohlcv_channel
-    asyncio.create_task(subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool))
+    asyncio.create_task(subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool, ticker_precisions))
 
     # Запуск подписки на события о статусе индикаторов
     asyncio.create_task(subscribe_indicator_events(pg, redis, indicator_pool, param_pool))
