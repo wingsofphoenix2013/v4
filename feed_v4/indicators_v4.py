@@ -142,7 +142,7 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                 period = int(params_dict["length"])
 
                 # 🔸 Получаем массив свечей для symbol/interval (универсальный подход)
-                candles = await get_last_candles(redis, symbol, interval, 250)
+                candles = await get_last_candles(redis, symbol.lower(), interval, 250)
                 if not candles:
                     log.info(f"Расчёт {param_name} для {symbol}/{interval}: отказ, недостаточно свечей")
                     continue
