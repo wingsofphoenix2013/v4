@@ -5,7 +5,7 @@ import json
 from infra import setup_logging
 
 # 🔸 Блок импортов файлов конкретных индикаторов
-from ema import ema
+from ema import ema_pandas
 
 # Получаем логгер для модуля
 log = logging.getLogger("indicators_v4")
@@ -128,7 +128,7 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                 and ind["timeframe"] == interval
             ]
             if not relevant_indicators:
-                log.info(f"Нет активных расчётов для {symbol} / {interval}")
+                log.debug(f"Нет активных расчётов для {symbol} / {interval}")
                 continue
 
             for ind in relevant_indicators:
