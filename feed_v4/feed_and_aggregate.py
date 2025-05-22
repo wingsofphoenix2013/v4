@@ -63,6 +63,7 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                 if action == "enabled" and symbol in state["tickers"]:
                     log.info(f"Активирован тикер: {symbol}")
                     state["active"].add(symbol.lower())
+                    state["activated_at"][symbol] = datetime.utcnow()
                     await refresh_queue.put("refresh")
 
                     # запуск потока markPrice и отслеживание задачи
@@ -133,12 +134,97 @@ async def try_aggregate_m5(redis, symbol, open_time):
 # 🔸 Агрегация M15 на основе RedisJSON M1-свечей (временно отключено, используется заглушка)
 async def try_aggregate_m15(redis, symbol, open_time):
     log.info("Я тут: try_aggregate_m15")
-# 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4 (временно отключено, используется заглушка)
-async def detect_missing_m1(redis, pg, symbol, now_ts):
-    log.info("Я тут: detect_missing_m1")
-# 🔸 Восстановление одной M1 свечи через Binance API  (временно отключено, используется заглушка)
-async def restore_missing_m1(symbol, open_time, redis, pg, precision):
-    log.info("Я тут: restore_missing_m1")
+# 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
+async def detect_missing_m1(redis, pg, symbol, now_ts, state):
+    missing = []
+
+    for i in range(1, 16):  # проверка последних 15 минут
+        ts = now_ts - i * 60 * 1000
+        open_time = datetime.utcfromtimestamp(ts / 1000)
+
+        # Пропустить, если свеча раньше момента включения тикера
+        if open_time < state["activated_at"].get(symbol, datetime.min):
+            continue
+
+        try:
+            exists = await redis.execute_command("TS.GET", f"ts:{symbol}:m1:o", ts)
+            if not exists:
+                missing.append(ts)
+        except Exception:
+            missing.append(ts)
+
+    async with pg.acquire() as conn:
+        for ts in missing:
+            open_time = datetime.utcfromtimestamp(ts / 1000)
+            try:
+                await conn.execute(
+                    "INSERT INTO missing_m1_log_v4 (symbol, open_time) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    symbol, open_time
+                )
+                await conn.execute(
+                    "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
+                    "AGGREGATOR", "WARNING", "M1 missing",
+                    json.dumps({"symbol": symbol, "open_time": str(open_time)})
+                )
+                log.warning(f"[{symbol}] Пропущена свеча: {open_time}")
+            except Exception as e:
+                log.error(f"[{symbol}] Ошибка записи пропуска: {e}")
+# 🔸 Восстановление одной M1 свечи через Binance API + Redis TS + отметка в БД
+async def restore_missing_m1(symbol, open_time, redis, pg, precision_price, precision_qty):
+    ts = int(open_time.timestamp() * 1000)
+    end_ts = ts + 60_000
+
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": symbol.upper(),
+        "interval": "1m",
+        "startTime": ts,
+        "endTime": end_ts,
+        "limit": 1
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    log.error(f"[{symbol}] Binance API error: {resp.status}")
+                    return False
+
+                raw = await resp.json()
+                if not raw:
+                    log.warning(f"[{symbol}] Binance API пустой результат")
+                    return False
+
+                data = raw[0]
+                o, h, l, c, v = data[1:6]
+                timestamp = int(data[0])
+
+                def r(val, p):
+                    return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+                await redis.execute_command("TS.ADD", f"ts:{symbol}:m1:o", timestamp, r(o, precision_price))
+                await redis.execute_command("TS.ADD", f"ts:{symbol}:m1:h", timestamp, r(h, precision_price))
+                await redis.execute_command("TS.ADD", f"ts:{symbol}:m1:l", timestamp, r(l, precision_price))
+                await redis.execute_command("TS.ADD", f"ts:{symbol}:m1:c", timestamp, r(c, precision_price))
+                await redis.execute_command("TS.ADD", f"ts:{symbol}:m1:v", timestamp, r(v, precision_qty))
+
+                async with pg.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE missing_m1_log_v4 SET fixed = true, fixed_at = NOW() WHERE symbol = $1 AND open_time = $2",
+                        symbol, open_time
+                    )
+                    await conn.execute(
+                        "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
+                        "AGGREGATOR", "INFO", "M1 restored",
+                        json.dumps({"symbol": symbol, "open_time": str(open_time)})
+                    )
+
+                log.info(f"[{symbol}] Восстановлена M1: {open_time}")
+                return True
+
+    except Exception as e:
+        log.error(f"[{symbol}] Ошибка восстановления через API: {e}", exc_info=True)
+        return False
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
 
@@ -243,10 +329,11 @@ async def run_feed_and_aggregator(pg, redis):
 
     # Общее состояние
     state = {
-        "tickers": tickers,            # symbol -> precision_price
+        "tickers": tickers,            # symbol -> {precision_price, precision_qty}
         "active": active,              # set of lowercase symbols
         "markprice_tasks": {},         # symbol -> asyncio.Task
-        "tasks": set()                 # все фоновые таски
+        "tasks": set(),                # все фоновые таски
+        "activated_at": {}             # symbol -> datetime.utcnow()
     }
 
     # Очередь сигналов на переподключение WebSocket
@@ -281,6 +368,41 @@ async def run_feed_and_aggregator(pg, redis):
             )
             state["markprice_tasks"][upper_symbol] = task
 
+    # 🔸 Фоновая проверка отсутствующих M1-свечей
+    async def recovery_loop():
+        while True:
+            now_ts = int((datetime.utcnow() - timedelta(minutes=1)).replace(second=0, microsecond=0).timestamp() * 1000)
+            for symbol in state["active"]:
+                await detect_missing_m1(redis, pg, symbol.upper(), now_ts, state)
+            await asyncio.sleep(60)
+
+    create_tracked_task(recovery_loop(), "recovery_loop")
+    
+    # 🔸 Фоновое восстановление пропущенных M1 через Binance API
+    async def restore_loop():
+        while True:
+            async with pg.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT symbol, open_time FROM missing_m1_log_v4
+                    WHERE fixed IS NOT true
+                    ORDER BY open_time ASC
+                """)
+
+            for row in rows:
+                symbol = row["symbol"]
+                open_time = row["open_time"]
+                try:
+                    precision_price = state["tickers"][symbol]["precision_price"]
+                    precision_qty   = state["tickers"][symbol]["precision_qty"]
+                except KeyError:
+                    continue  # символ не в state — пропускаем
+
+                await restore_missing_m1(symbol, open_time, redis, pg, precision_price, precision_qty)
+
+            await asyncio.sleep(60)
+
+    create_tracked_task(restore_loop(), "restore_loop")
+    
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
         while True:
