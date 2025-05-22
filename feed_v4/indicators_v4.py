@@ -76,7 +76,7 @@ async def get_last_candles(redis, symbol, interval, n=250):
     # Извлекаем timestamp из ключей, сортируем по времени (от новых к старым)
     keys_sorted = sorted(
         keys,
-        key=lambda x: int(x.decode().split(":")[-1]),
+        key=lambda x: int((x.decode() if isinstance(x, bytes) else x).split(":")[-1]),
         reverse=True
     )
     # Берём только последние n ключей (по времени — от новых к старым)
