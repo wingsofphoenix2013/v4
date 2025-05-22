@@ -193,6 +193,8 @@ async def listen_kline_stream(redis, state, refresh_queue):
             await asyncio.sleep(5)
 # 🔸 Поток markPrice для одного тикера с fstream.binance.com
 async def watch_mark_price(symbol, redis, state):
+    log.debug(f"[{symbol}] DEBUG | type(state): {type(state)}, keys: {list(state.keys())}")
+
     url = f"wss://fstream.binance.com/ws/{symbol.lower()}@markPrice@1s"
     last_update = 0
 
