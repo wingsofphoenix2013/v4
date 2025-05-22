@@ -192,8 +192,7 @@ async def listen_kline_stream(redis, state, refresh_queue):
             log.error(f"Ошибка WebSocket: {e}", exc_info=True)
             await asyncio.sleep(5)
 # 🔸 Поток markPrice для одного тикера с fstream.binance.com
-async def watch_mark_price(symbol, redis, precision):
-
+async def watch_mark_price(symbol, redis, state):
     url = f"wss://fstream.binance.com/ws/{symbol.lower()}@markPrice@1s"
     last_update = 0
 
@@ -213,11 +212,16 @@ async def watch_mark_price(symbol, redis, precision):
                             continue
 
                         last_update = now
-                        rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+                        precision = state["tickers"][symbol]["precision_price"]
+                        rounded = str(
+                            Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN)
+                        )
                         await redis.set(f"price:{symbol}", rounded)
-                        log.info(f"[{symbol}] Обновление markPrice (futures): {rounded}")
-                    except Exception as e:
-                        log.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
+                        log.debug(f"[{symbol}] Обновление markPrice: {rounded}")
+
+                    except (InvalidOperation, ValueError, TypeError) as e:
+                        log.warning(f"[{symbol}] Ошибка обработки markPrice: {type(e)}")
+
         except Exception as e:
             log.error(f"[{symbol}] Ошибка WebSocket markPrice (futures): {e}", exc_info=True)
             await asyncio.sleep(5)
@@ -267,9 +271,11 @@ async def run_feed_and_aggregator(pg, redis):
     # Запуск потоков markPrice для каждого активного тикера (фьючерсный рынок)
     for symbol in state["active"]:
         upper_symbol = symbol.upper()
-        precision = state["tickers"].get(upper_symbol)
-        if precision is not None:
-            task = create_tracked_task(watch_mark_price(upper_symbol, redis, precision), f"markprice_{upper_symbol}")
+        if upper_symbol in state["tickers"]:
+            task = create_tracked_task(
+                watch_mark_price(upper_symbol, redis, state),
+                f"markprice_{upper_symbol}"
+            )
             state["markprice_tasks"][upper_symbol] = task
 
     # Постоянный перезапуск слушателя WebSocket
