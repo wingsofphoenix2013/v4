@@ -159,6 +159,7 @@ async def subscribe_indicator_events(pg, redis, indicator_pool, param_pool):
                                 param_rows = await conn.fetch(
                                     "SELECT * FROM indicator_parameters_v4 WHERE instance_id = $1", indicator_id)
                                 params = [dict(p) for p in param_rows]
+                                indicator["param_name"] = get_param_name(indicator, params)
                                 indicator_pool[indicator_id] = indicator
                                 param_pool[indicator_id] = params
                                 log.info(f"Добавлен индикатор: id={indicator_id}")
