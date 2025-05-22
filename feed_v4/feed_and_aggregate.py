@@ -6,7 +6,7 @@ import websockets
 import json
 import aiohttp
 from infra import setup_logging
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import time
 from datetime import datetime, timedelta
 
