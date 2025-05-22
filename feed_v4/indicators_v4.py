@@ -62,14 +62,15 @@ async def subscribe_ticker_events(redis, active_tickers):
                         log.info(f"Тикер выключен: {symbol}")
             except Exception as e:
                 log.error(f"Ошибка при обработке tickers_v4_events: {e}")
-# 🔸 Получение последних N “сырых” свечей из RedisJSON для symbol/interval
 async def get_last_candles(redis, symbol, interval, n=250):
     """
     Возвращает массив последних n свечей (dict) по ключам ohlcv:{symbol}:{interval}:<timestamp>
+    ВНИМАНИЕ: symbol и interval должны быть строго в нижнем регистре!
     """
-    pattern = f"ohlcv:{symbol.lower()}:{interval}:*"
-    # Получаем все ключи, подходящие под шаблон
+    pattern = f"ohlcv:{symbol}:{interval}:*"
+    log.info(f"DEBUG: вызов get_last_candles c symbol={symbol}, interval={interval}, pattern={pattern}")
     keys = await redis.keys(pattern)
+    log.info(f"DEBUG: найдено ключей: {len(keys)} для pattern={pattern}")
     if not keys:
         log.info(f"Нет свечей для {symbol}/{interval} в Redis (ключи {pattern})")
         return []
