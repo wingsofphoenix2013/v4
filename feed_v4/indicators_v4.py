@@ -114,7 +114,8 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
             event = json.loads(message['data'])
             symbol = event.get("symbol")
             interval = event.get("interval")
-
+            log.info(f"EVENT_RECEIVED {symbol}/{interval} at {datetime.now().isoformat()}")
+            
             if not symbol or not interval:
                 continue
             if symbol.lower() not in active_tickers:
