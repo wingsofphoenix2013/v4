@@ -132,7 +132,10 @@ async def try_aggregate_m5(redis, symbol, open_time):
             if not data:
                 log.warning(f"[{symbol}] M5: пропущена свеча {ts}")
                 return
-            parsed = json.loads(data)[0]
+            if isinstance(data, list):
+                parsed = data[0]
+            else:
+                parsed = json.loads(data)[0]
             candles.append(parsed)
         except Exception as e:
             log.error(f"[{symbol}] Ошибка чтения JSON для M5: {e}")
@@ -192,7 +195,10 @@ async def try_aggregate_m15(redis, symbol, open_time):
             if not data:
                 log.warning(f"[{symbol}] M15: пропущена свеча {ts}")
                 return
-            parsed = json.loads(data)[0]
+            if isinstance(data, list):
+                parsed = data[0]
+            else:
+                parsed = json.loads(data)[0]
             candles.append(parsed)
         except Exception as e:
             log.error(f"[{symbol}] Ошибка чтения JSON для M15: {e}")
