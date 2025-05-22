@@ -1,3 +1,4 @@
+# indicators_v4 - модуль индикаторов
 import asyncio
 import logging
 import json
