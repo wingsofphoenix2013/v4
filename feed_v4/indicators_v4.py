@@ -65,19 +65,37 @@ async def subscribe_ticker_events(redis, active_tickers):
 # 🔸 Получение последних N “сырых” свечей из RedisJSON для symbol/interval
 async def get_last_candles(redis, symbol, interval, n=250):
     """
-    Возвращает массив последних n свечей (dict) из RedisJSON для тикера/таймфрейма.
-    Каждый элемент — dict с полями: 'o', 'h', 'l', 'c', 'v', 't' и др.
+    Возвращает массив последних n свечей (dict) по ключам ohlcv:{symbol}:{interval}:<timestamp>
     """
-    key = f"candles:{symbol}:{interval}"
-    result = await redis.json().get(key, f"$[-{n}:]")
-    if not result or not isinstance(result, list) or not result[0]:
-        log.info(f"Нет свечей для {symbol} / {interval} в RedisJSON (запрошено {n}, найдено 0)")
+    pattern = f"ohlcv:{symbol.lower()}:{interval}:*"
+    # Получаем все ключи, подходящие под шаблон
+    keys = await redis.keys(pattern)
+    if not keys:
+        log.info(f"Нет свечей для {symbol}/{interval} в Redis (ключи {pattern})")
         return []
-    candles = result[0]
+    # Извлекаем timestamp из ключей, сортируем по времени (от новых к старым)
+    keys_sorted = sorted(
+        keys,
+        key=lambda x: int(x.decode().split(":")[-1]),
+        reverse=True
+    )
+    # Берём только последние n ключей (по времени — от новых к старым)
+    keys_needed = keys_sorted[:n]
+    # mget — получить значения всех свечей сразу
+    raw = await redis.mget(*keys_needed)
+    candles = []
+    for v in raw:
+        if v:
+            try:
+                candles.append(json.loads(v))
+            except Exception:
+                continue
+    # Теперь сортируем свечи уже от старых к новым для расчёта индикаторов
+    candles = sorted(candles, key=lambda c: c.get("ts", 0))
     if len(candles) < n:
-        log.info(f"Недостаточно свечей для {symbol} / {interval}: есть {len(candles)}, требуется {n}. Расчёт не производится.")
+        log.info(f"Недостаточно свечей для {symbol}/{interval}: есть {len(candles)}, требуется {n}. Расчёт не производится.")
         return []
-    return candles 
+    return candles
 # 🔸 Подписка на ohlcv_channel (события по новым свечам)
 async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool):
     pubsub = redis.pubsub()
