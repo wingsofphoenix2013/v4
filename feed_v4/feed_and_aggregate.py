@@ -1,4 +1,4 @@
-# feed_and_aggregate.py — приём и агрегация рыночных данных - 20/05/2025
+# feed_and_aggregate.py — приём и агрегация рыночных данных - 22/05/2025
 
 import logging
 import asyncio
@@ -97,7 +97,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision):
     # Сохраняем свечу в Redis JSON
     await redis.execute_command("JSON.SET", json_key, "$", json.dumps(candle))
 
-    log.debug(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
+    log.info(f"[{symbol}] M1 сохранена и опубликована: {open_time} → C={candle['c']}")
 
     # Формируем событие
     event = {

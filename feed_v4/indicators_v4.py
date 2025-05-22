@@ -72,9 +72,9 @@ async def get_last_candles(redis, symbol, interval, n=250):
     ВНИМАНИЕ: symbol и interval должны быть строго в нижнем регистре!
     """
     pattern = f"ohlcv:{symbol}:{interval}:*"
-    log.debug(f"DEBUG: вызов get_last_candles c symbol={symbol}, interval={interval}, pattern={pattern}")
+    log.info(f"DEBUG: вызов get_last_candles c symbol={symbol}, interval={interval}, pattern={pattern}")
     keys = await redis.keys(pattern)
-    log.debug(f"DEBUG: найдено ключей: {len(keys)} для pattern={pattern}")
+    log.info(f"DEBUG: найдено ключей: {len(keys)} для pattern={pattern}")
     if not keys:
         log.info(f"Нет свечей для {symbol}/{interval} в Redis (ключи {pattern})")
         return []
@@ -158,7 +158,7 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                     continue
 
                 ema_value = ema_pandas(close_prices, period)
-                precision = ticker_precisions.get(symbol, 6)
+                precision = ticker_precisions.get(symbol.lower(), 6)
                 if ema_value is not None:
                     ema_value_rounded = round(ema_value, precision)
                     log.info(f"{param_name.upper()} ({symbol.upper()}/{interval}): {ema_value_rounded}")
