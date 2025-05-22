@@ -170,36 +170,38 @@ async def subscribe_indicator_events(pg, redis, indicator_pool, param_pool):
             try:
                 event = json.loads(message['data'])
                 log.debug(f"Событие indicators_v4_events: {event}")
-                indicator_id = str(event.get("id"))
+
+                # Получаем id как int для запросов в БД
+                indicator_id_int = int(event.get("id"))
+                indicator_id_str = str(indicator_id_int)
                 action = event.get("action")
                 field = event.get("type")
 
                 if field == "enabled":
                     if action == "true":
-                        # Загрузка расчёта и параметров из БД
+                        # Загрузка расчёта и параметров из БД (используем int)
                         async with pg.acquire() as conn:
-                            row = await conn.fetchrow("SELECT * FROM indicator_instances_v4 WHERE id = $1", indicator_id)
+                            row = await conn.fetchrow("SELECT * FROM indicator_instances_v4 WHERE id = $1", indicator_id_int)
                             if row:
                                 indicator = dict(row)
                                 param_rows = await conn.fetch(
-                                    "SELECT * FROM indicator_parameters_v4 WHERE instance_id = $1", indicator_id)
+                                    "SELECT * FROM indicator_parameters_v4 WHERE instance_id = $1", indicator_id_int)
                                 params = [dict(p) for p in param_rows]
                                 indicator["param_name"] = get_param_name(indicator, params)
-                                indicator_pool[indicator_id] = indicator
-                                param_pool[indicator_id] = params
-                                log.info(f"Добавлен индикатор: id={indicator_id}")
+                                indicator_pool[indicator_id_str] = indicator
+                                param_pool[indicator_id_str] = params
+                                log.info(f"Добавлен индикатор: id={indicator_id_str}")
                             else:
-                                log.error(f"Индикатор id={indicator_id} не найден в БД")
+                                log.error(f"Индикатор id={indicator_id_str} не найден в БД")
                     elif action == "false":
-                        if indicator_id in indicator_pool:
-                            indicator_pool.pop(indicator_id)
-                            param_pool.pop(indicator_id, None)
-                            log.info(f"Индикатор id={indicator_id} отключён")
+                        if indicator_id_str in indicator_pool:
+                            indicator_pool.pop(indicator_id_str)
+                            param_pool.pop(indicator_id_str, None)
+                            log.info(f"Индикатор id={indicator_id_str} отключён")
                 elif field == "stream_publish":
-                    # Переключение флага stream_publish без подгрузки параметров
-                    if indicator_id in indicator_pool:
-                        indicator_pool[indicator_id]["stream_publish"] = (action == "true")
-                        log.info(f"Индикатор id={indicator_id} stream_publish = {action}")
+                    if indicator_id_str in indicator_pool:
+                        indicator_pool[indicator_id_str]["stream_publish"] = (action == "true")
+                        log.info(f"Индикатор id={indicator_id_str} stream_publish = {action}")
 
             except Exception as e:
                 log.error(f"Ошибка при обработке indicators_v4_events: {e}")
