@@ -85,6 +85,9 @@ async def try_aggregate_m5(redis, symbol, open_time):
 # 🔸 Агрегация M15 на основе RedisJSON M1-свечей (временно отключено, используется заглушка)
 async def try_aggregate_m15(redis, symbol, open_time):
     log.info("Я тут: try_aggregate_m15")
+# 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4 (временно отключено, используется заглушка)
+async def detect_missing_m1(redis, pg, symbol, now_ts):
+    log.info("Я тут: detect_missing_m1")
 # 🔸 Восстановление одной M1 свечи через Binance API  (временно отключено, используется заглушка)
 async def restore_missing_m1(symbol, open_time, redis, pg, precision):
     log.info("Я тут: restore_missing_m1")
