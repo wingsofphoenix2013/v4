@@ -134,6 +134,12 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                 # 🔸 Получаем параметры индикатора (например, period для EMA)
                 params = param_pool.get(str(ind["id"]), [])
                 params_dict = {p["param"]: p["value"] for p in params}
+                if "length" not in params_dict:
+                    log.error(
+                        f"Нет параметра 'length' для индикатора id={ind['id']} "
+                        f"(param_name={param_name}). params_dict={params_dict}, params={params}"
+                    )
+                    continue  # пропустить расчёт, чтобы не было ошибки
                 period = int(params_dict["length"])
 
                 # 🔸 Получаем массив свечей для symbol/interval (универсальный подход)
@@ -164,7 +170,7 @@ async def subscribe_indicator_events(pg, redis, indicator_pool, param_pool):
             try:
                 event = json.loads(message['data'])
                 log.debug(f"Событие indicators_v4_events: {event}")
-                indicator_id = event.get("id")
+                indicator_id = str(event.get("id"))
                 action = event.get("action")
                 field = event.get("type")
 
