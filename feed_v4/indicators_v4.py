@@ -3,9 +3,41 @@ import logging
 import json
 from infra import setup_logging
 
+# 🔸 Блок импортов файлов конкретных индикаторов
+from ema import ema
+
 # Получаем логгер для модуля
 log = logging.getLogger("indicators_v4")
 
+# 🔸 Загрузка тикеров с status = 'enabled'
+async def load_enabled_tickers(pg):
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM tickers_v4 WHERE status = 'enabled'")
+        return [dict(row) for row in rows]
+
+# 🔸 Загрузка активных расчётов индикаторов
+async def load_enabled_indicator_instances(pg):
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM indicator_instances_v4 WHERE enabled = true")
+        return [dict(row) for row in rows]
+
+# 🔸 Загрузка параметров расчётов индикаторов
+async def load_indicator_parameters(pg):
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM indicator_parameters_v4")
+        return [dict(row) for row in rows]
+
+# 🔸 Генерация ключа param_name для индикатора (например, 'ema21', 'rsi14', ...)
+def get_param_name(indicator_instance, param_list):
+    """
+    Формирует строку param_name по типу индикатора и его параметрам.
+    Например, 'ema21' для EMA с length=21.
+    """
+    indicator = indicator_instance["indicator"]
+    params = {p["param"]: p["value"] for p in param_list}
+    if "length" in params:
+        return f"{indicator}{params['length']}"
+    return indicator
 # 🔸 Подписка на события о смене статуса тикеров
 async def subscribe_ticker_events(redis, active_tickers):
     pubsub = redis.pubsub()
@@ -29,7 +61,22 @@ async def subscribe_ticker_events(redis, active_tickers):
                         log.info(f"Тикер выключен: {symbol}")
             except Exception as e:
                 log.error(f"Ошибка при обработке tickers_v4_events: {e}")
-                
+# 🔸 Получение последних N “сырых” свечей из RedisJSON для symbol/interval
+async def get_last_candles(redis, symbol, interval, n=250):
+    """
+    Возвращает массив последних n свечей (dict) из RedisJSON для тикера/таймфрейма.
+    Каждый элемент — dict с полями: 'o', 'h', 'l', 'c', 'v', 't' и др.
+    """
+    key = f"candles:{symbol}:{interval}"
+    result = await redis.json().get(key, f"$[-{n}:]")
+    if not result or not isinstance(result, list) or not result[0]:
+        log.info(f"Нет свечей для {symbol} / {interval} в RedisJSON (запрошено {n}, найдено 0)")
+        return []
+    candles = result[0]
+    if len(candles) < n:
+        log.info(f"Недостаточно свечей для {symbol} / {interval}: есть {len(candles)}, требуется {n}. Расчёт не производится.")
+        return []
+    return candles 
 # 🔸 Подписка на ohlcv_channel (события по новым свечам)
 async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_pool):
     pubsub = redis.pubsub()
@@ -50,20 +97,40 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                 log.debug(f"Пропущено событие для неактивного тикера: {symbol}")
                 continue
 
-            # Найти расчёты по symbol/interval (добавить фильтр по symbol если нужно)
+            # 🔸 Фильтруем расчёты по symbol/interval
             relevant_indicators = [
                 ind for ind in indicator_pool.values()
                 if ind.get("enabled", True)
                 and ind["timeframe"] == interval
-                # Если в индикаторе есть привязка к symbol — добавить:
+                # Если потребуется — фильтр по symbol:
                 # and ind.get("symbol", "").upper() == symbol.upper()
             ]
             if not relevant_indicators:
                 log.info(f"Нет активных расчётов для {symbol} / {interval}")
                 continue
 
-            log.info(f"Получено событие по {symbol} ({interval}) — найдено {len(relevant_indicators)} расчётов, запуск обработки индикатора")
-            # Здесь далее — логика расчёта по каждому найденному индикатору
+            for ind in relevant_indicators:
+                param_name = ind["param_name"]
+
+                # 🔸 Получаем параметры индикатора (например, period для EMA)
+                params = param_pool.get(str(ind["id"]), [])
+                params_dict = {p["param"]: p["value"] for p in params}
+                period = int(params_dict["length"])
+
+                # 🔸 Получаем массив свечей для symbol/interval (универсальный подход)
+                candles = await get_last_candles(redis, symbol, interval, 250)
+                if not candles:
+                    log.info(f"Расчёт {param_name} для {symbol}/{interval}: отказ, недостаточно свечей")
+                    continue
+
+                # 🔸 Для EMA — берём только close-цены
+                close_prices = [float(c["c"]) for c in candles if "c" in c]
+                if len(close_prices) < period:
+                    log.info(f"Расчёт {param_name} для {symbol}/{interval}: отказ, есть {len(close_prices)} цен, требуется минимум {period}")
+                    continue
+
+                ema_value = ema(close_prices, period)[-1]
+                log.info(f"{param_name.upper()} ({symbol}/{interval}): {ema_value}")
 
         except Exception as e:
             log.error(f"Ошибка при обработке ohlcv_channel: {e}")
@@ -129,6 +196,12 @@ async def run_indicators_v4(pg, redis):
     indicator_params = await load_indicator_parameters(pg)
     log.info(f"Загружено параметров индикаторов: {len(indicator_params)}")
 
+    # Формируем param_name для каждого расчёта (обязательно до формирования пулов)
+    for ind in indicator_instances:
+        iid = str(ind["id"])
+        param_list = [p for p in indicator_params if str(p["instance_id"]) == iid]
+        ind["param_name"] = get_param_name(ind, param_list)
+
     # Формируем in-memory пулы для динамического управления
     active_tickers = set([t["symbol"].upper() for t in enabled_tickers])
     indicator_pool = {str(ind["id"]): ind for ind in indicator_instances}
@@ -147,25 +220,6 @@ async def run_indicators_v4(pg, redis):
 
     while True:
         await asyncio.sleep(60)  # Пульс воркера
-
-# 🔸 Загрузка тикеров с status = 'enabled'
-async def load_enabled_tickers(pg):
-    async with pg.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM tickers_v4 WHERE status = 'enabled'")
-        return [dict(row) for row in rows]
-
-# 🔸 Загрузка активных расчётов индикаторов
-async def load_enabled_indicator_instances(pg):
-    async with pg.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM indicator_instances_v4 WHERE enabled = true")
-        return [dict(row) for row in rows]
-
-# 🔸 Загрузка параметров расчётов индикаторов
-async def load_indicator_parameters(pg):
-    async with pg.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM indicator_parameters_v4")
-        return [dict(row) for row in rows]
-
 # 🔸 Основная точка входа (для отдельного теста воркера)
 async def main():
     log.info("🔸 indicators_v4 main() стартует (отдельный запуск)")
