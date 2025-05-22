@@ -62,6 +62,7 @@ async def subscribe_ticker_events(redis, active_tickers):
                         log.info(f"Тикер выключен: {symbol}")
             except Exception as e:
                 log.error(f"Ошибка при обработке tickers_v4_events: {e}")
+# 🔸 Получения массива из 250 свечей
 async def get_last_candles(redis, symbol, interval, n=250):
     """
     Возвращает массив последних n свечей (dict) по ключам ohlcv:{symbol}:{interval}:<timestamp>
@@ -86,13 +87,11 @@ async def get_last_candles(redis, symbol, interval, n=250):
     raw = await redis.mget(*keys_needed)
     log.info(f"DEBUG: mget вернул {len(raw)} значений, первые 5: {raw[:5]}")
     candles = []
-    for v in raw:
-        if v:
-            try:
-                candles.append(json.loads(v))
-            except Exception:
-                continue
-    log.info(f"DEBUG: candles после json.loads: {len(candles)}, первые 2: {candles[:2]}")
+    for k in keys_needed:
+        candle = await redis.json().get(k)
+        if candle:
+            candles.append(candle)
+    log.info(f"DEBUG: candles после redis.json().get: {len(candles)}, первые 2: {candles[:2]}")
     # Теперь сортируем свечи уже от старых к новым для расчёта индикаторов
     candles = sorted(candles, key=lambda c: c.get("ts", 0))
     if len(candles) < n:
