@@ -91,12 +91,6 @@ async def detect_missing_m1(redis, pg, symbol, now_ts):
 # 🔸 Восстановление одной M1 свечи через Binance API  (временно отключено, используется заглушка)
 async def restore_missing_m1(symbol, open_time, redis, pg, precision):
     log.info("Я тут: restore_missing_m1")
-# 🔸 Циклическое восстановление всех пропущенных свечей из missing_m1_log_v4 (временно отключено, используется заглушка)
-async def restore_missing_m1_loop(redis, pg, state):
-    log.info("Я тут: restore_missing_m1_loop")
-# 🔸 Проверка: 4 и более подряд невосстановленных свечей → отключение тикера (временно отключено, используется заглушка)
-async def check_consecutive_m1_failures(pg, symbol):
-    log.info("Я тут: check_consecutive_m1_failures")
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
 
@@ -173,7 +167,7 @@ async def watch_mark_price(symbol, redis, precision):
                         last_update = now
                         rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
                         await redis.set(f"price:{symbol}", rounded)
-                        log.debug(f"[{symbol}] Обновление markPrice (futures): {rounded}")
+                        log.info(f"[{symbol}] Обновление markPrice (futures): {rounded}")
                     except Exception as e:
                         log.warning(f"[{symbol}] Ошибка обработки markPrice: {e}")
         except Exception as e:
@@ -210,6 +204,8 @@ async def run_feed_and_aggregator(pg, redis):
         def on_done(t):
             try:
                 t.result()
+            except asyncio.CancelledError:
+                log.info(f"[{name}] Task cancelled")
             except Exception as e:
                 log.exception(f"[{name}] Task crashed: {e}")
             finally:
