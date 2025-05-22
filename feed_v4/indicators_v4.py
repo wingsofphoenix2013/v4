@@ -49,7 +49,7 @@ async def subscribe_ticker_events(redis, active_tickers):
         if message['type'] == 'message':
             try:
                 event = json.loads(message['data'])
-                symbol = event.get("symbol", "").upper()
+                symbol = event.get("symbol", "").lower()
                 action_type = event.get("type")
                 action = event.get("action")
 
@@ -112,7 +112,7 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
 
             if not symbol or not interval:
                 continue
-            if symbol.upper() not in active_tickers:
+            if symbol.lower() not in active_tickers:
                 log.debug(f"Пропущено событие для неактивного тикера: {symbol}")
                 continue
 
@@ -121,8 +121,6 @@ async def subscribe_ohlcv_channel(redis, active_tickers, indicator_pool, param_p
                 ind for ind in indicator_pool.values()
                 if ind.get("enabled", True)
                 and ind["timeframe"] == interval
-                # Если потребуется — фильтр по symbol:
-                # and ind.get("symbol", "").upper() == symbol.upper()
             ]
             if not relevant_indicators:
                 log.info(f"Нет активных расчётов для {symbol} / {interval}")
@@ -231,7 +229,7 @@ async def run_indicators_v4(pg, redis):
         ind["param_name"] = get_param_name(ind, param_list)
 
     # Формируем in-memory пулы для динамического управления
-    active_tickers = set([t["symbol"].upper() for t in enabled_tickers])
+    active_tickers = set([t["symbol"].lower() for t in enabled_tickers])
     indicator_pool = {str(ind["id"]): ind for ind in indicator_instances}
     param_pool = {str(ind["id"]): [p for p in indicator_params if str(p["instance_id"]) == str(ind["id"])] for ind in indicator_instances}
 
