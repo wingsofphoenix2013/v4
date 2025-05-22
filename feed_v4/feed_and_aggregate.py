@@ -51,10 +51,13 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                 if symbol not in state["tickers"]:
                     async with pg.acquire() as conn:
                         row = await conn.fetchrow("""
-                            SELECT precision_price FROM tickers_v4 WHERE symbol = $1
+                            SELECT precision_price, precision_qty FROM tickers_v4 WHERE symbol = $1
                         """, symbol)
                         if row:
-                            state["tickers"][symbol] = row["precision_price"]
+                            state["tickers"][symbol] = {
+                                "precision_price": row["precision_price"],
+                                "precision_qty": row["precision_qty"]
+                            }
                             log.info(f"Добавлен тикер из БД: {symbol}")
 
                 if action == "enabled" and symbol in state["tickers"]:
@@ -63,8 +66,7 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                     await refresh_queue.put("refresh")
 
                     # запуск потока markPrice и отслеживание задачи
-                    precision = state["tickers"][symbol]
-                    task = asyncio.create_task(watch_mark_price(symbol, redis, precision))
+                    task = asyncio.create_task(watch_mark_price(symbol, redis, state))
                     state["markprice_tasks"][symbol] = task
 
                 elif action == "disabled" and symbol in state["tickers"]:
@@ -78,7 +80,6 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
-
 # 🔸 Сохранение полной свечи M1 в RedisTimeSeries + Stream + Pub/Sub
 async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price, precision_qty):
     ts = int(open_time.timestamp() * 1000)
