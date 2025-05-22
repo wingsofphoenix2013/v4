@@ -17,7 +17,7 @@ log = logging.getLogger("FEED+AGGREGATOR")
 async def load_all_tickers(pg_pool):
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT symbol, precision_price, status FROM tickers_v4
+            SELECT symbol, precision_price, precision_qty, status FROM tickers_v4
         """)
         tickers = {}
         active = set()

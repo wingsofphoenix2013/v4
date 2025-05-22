@@ -3,6 +3,7 @@ import os
 import logging
 import asyncpg
 import redis.asyncio as aioredis
+import asyncio
 
 # 🔸 Переменные окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
