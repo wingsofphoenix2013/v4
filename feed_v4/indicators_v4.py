@@ -255,7 +255,7 @@ async def run_indicators_v4(pg, redis):
     log.info("🔸 Основной цикл indicators_v4 запущен")
 
     while True:
-        await asyncio.sleep(60)  # Пульс воркера
+        await asyncio.Event().wait()  # Пульс воркера
 # 🔸 Основная точка входа (для отдельного теста воркера)
 async def main():
     log.info("🔸 indicators_v4 main() стартует (отдельный запуск)")
