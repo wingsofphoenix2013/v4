@@ -196,7 +196,8 @@ async def listen_kline_stream(redis, state, refresh_queue):
                                 open_time,
                                 kline,
                                 state["tickers"][symbol]["precision_price"],
-                                state["tickers"][symbol]["precision_qty"]
+                                state["tickers"][symbol]["precision_qty"],
+                                state
                             )
 
                     except Exception as e:
