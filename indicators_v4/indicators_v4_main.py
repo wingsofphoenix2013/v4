@@ -110,7 +110,29 @@ async def watch_indicator_updates(pg, redis):
 
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
+# 🔸 Подписка на ohlcv_channel — запуск расчёта индикаторов по сигналу
+async def watch_ohlcv_events(redis):
+    log = logging.getLogger("OHLCV_EVENTS")
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("ohlcv_channel")
+    log.info("Подписка на канал ohlcv_channel")
 
+    async for msg in pubsub.listen():
+        if msg["type"] != "message":
+            continue
+        try:
+            data = json.loads(msg["data"])
+            symbol = data.get("symbol")
+            interval = data.get("interval")
+            timestamp = data.get("timestamp")
+
+            if symbol not in active_tickers:
+                log.debug(f"Пропущено: неактивный тикер {symbol}")
+                continue
+
+            log.info(f"🟢 Сигнал к расчёту: {symbol} / {interval} @ {timestamp}")
+        except Exception as e:
+            log.warning(f"Ошибка в ohlcv_channel: {e}")
 # 🔸 Заглушка расчёта индикаторов
 async def run_indicators(pg, redis):
     log = logging.getLogger("INDICATORS")
@@ -130,6 +152,7 @@ async def main():
     await asyncio.gather(
         watch_ticker_updates(redis),
         watch_indicator_updates(pg, redis),
+        watch_ohlcv_events(redis),
         run_indicators(pg, redis)
     )
 
