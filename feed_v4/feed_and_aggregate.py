@@ -81,8 +81,8 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
-# 🔸 Сохранение полной свечи M1 в RedisTimeSeries + Stream + Pub/Sub
-async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price, precision_qty):
+# 🔸 Сохранение полной свечи M1 в RedisTimeSeries + Stream + Pub/Sub + триггеры на M5/M15
+async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price, precision_qty, state):
     ts = int(open_time.timestamp() * 1000)
 
     def r(val, precision):
@@ -120,14 +120,35 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
 
     log.info(f"[{symbol}] M1 TS сохранена: ts={ts} O={o} H={h} L={l} C={c} V={v}")
 
-    event = {
+    # Публикация в Stream (полная свеча)
+    stream_event = {
+        "symbol": symbol,
+        "interval": "m1",
+        "timestamp": str(ts),
+        "o": str(o),
+        "h": str(h),
+        "l": str(l),
+        "c": str(c),
+        "v": str(v)
+    }
+    await redis.xadd("ohlcv_stream", stream_event)
+
+    # Публикация в Pub/Sub (только уведомление)
+    pubsub_event = {
         "symbol": symbol,
         "interval": "m1",
         "timestamp": str(ts)
     }
+    await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
 
-    await redis.xadd("ohlcv_stream", event)
-    await redis.publish("ohlcv_channel", json.dumps(event))
+    # Триггеры на построение M5/M15
+    if open_time.minute % 5 == 4:
+        base_m5 = open_time.replace(minute=(open_time.minute // 5) * 5, second=0, microsecond=0)
+        await try_aggregate_m5(redis, symbol, base_m5, state)
+
+    if open_time.minute % 15 == 14:
+        base_m15 = open_time.replace(minute=(open_time.minute // 15) * 15, second=0, microsecond=0)
+        await try_aggregate_m15(redis, symbol, base_m15, state)
 # 🔸 Заглушка: попытка построения свечи M5
 async def try_aggregate_m5(redis, symbol, base_time, state):
     log.info(f"[{symbol}] Я тут: try_aggregate_m5")
