@@ -19,8 +19,8 @@ async def run_core_io(pg, redis):
 
     while True:
         try:
-            # Чтение одного сообщения из Redis Stream
-            response = await redis.xread({stream_key: last_id}, count=1, block=5000)
+            # 🔸 Чтение одного сообщения из Redis Stream
+            response = await redis.xread({stream_key: last_id}, count=10, block=5000)
 
             if not response:
                 continue  # таймаут
@@ -29,21 +29,28 @@ async def run_core_io(pg, redis):
                 for msg_id, data in messages:
                     last_id = msg_id
 
-                    # Распаковка и преобразование данных
+                    # 🔸 Распаковка и преобразование данных
                     interval = data["interval"]
                     table = TABLE_MAP.get(interval)
                     if not table:
                         continue
 
                     symbol = data["symbol"]
-                    open_time = datetime.utcfromtimestamp(int(data["timestamp"])).replace(tzinfo=timezone.utc)
+
+                    try:
+                        ts_int = int(data["timestamp"]) // 1000
+                        open_time = datetime.utcfromtimestamp(ts_int).replace(tzinfo=timezone.utc)
+                    except Exception as e:
+                        log.warning(f"Ошибка преобразования timestamp: {data.get('timestamp')} → {e}")
+                        continue
+
                     o = Decimal(data["o"])
                     h = Decimal(data["h"])
                     l = Decimal(data["l"])
                     c = Decimal(data["c"])
                     v = Decimal(data["v"])
 
-                    # Вставка записи в PostgreSQL и удаление старых
+                    # 🔸 Вставка записи в PostgreSQL и удаление старых
                     async with pg.acquire() as conn:
                         async with conn.transaction():
                             inserted = await conn.execute(f"""
@@ -61,6 +68,6 @@ async def run_core_io(pg, redis):
 
                             log.info(f"Удалено старых записей из {table}: {deleted}")
         except Exception as e:
-            # Обработка исключений и логирование
+            # 🔸 Обработка исключений и логирование
             log.error(f"Ошибка: {e}", exc_info=True)
             await asyncio.sleep(2)
