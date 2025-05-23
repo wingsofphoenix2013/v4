@@ -149,9 +149,104 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
     if open_time.minute % 15 == 14:
         base_m15 = open_time.replace(minute=(open_time.minute // 15) * 15, second=0, microsecond=0)
         await try_aggregate_m15(redis, symbol, base_m15, state)
-# 🔸 Заглушка: попытка построения свечи M5
+# 🔸 Построение свечи M5 из 5 M1 в RedisTimeSeries
 async def try_aggregate_m5(redis, symbol, base_time, state):
-    log.info(f"[{symbol}] Я тут: try_aggregate_m5")
+    end_ts = int(base_time.timestamp() * 1000) + 4 * 60_000
+    ts_list = [end_ts - i * 60_000 for i in reversed(range(5))]
+    candles = []
+
+    for ts in ts_list:
+        try:
+            o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+            h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
+            l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
+            c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
+            v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+
+            if not all([o, h, l, c, v]):
+                raise ValueError("недостаточно данных")
+
+            candles.append({
+                "o": float(o[0][1]),
+                "h": float(h[0][1]),
+                "l": float(l[0][1]),
+                "c": float(c[0][1]),
+                "v": float(v[0][1]),
+                "ts": ts
+            })
+        except Exception:
+            log.warning(f"[{symbol}] Невозможно построить M5: отсутствуют M1 для {base_time}")
+            await m5_auditor(symbol, base_time)  # заглушка
+            return
+
+    if not candles:
+        return
+
+    m5_ts = ts_list[0]
+    o = candles[0]["o"]
+    h = max(c["h"] for c in candles)
+    l = min(c["l"] for c in candles)
+    c = candles[-1]["c"]
+    v = sum(c["v"] for c in candles)
+
+    precision_price = state["tickers"][symbol]["precision_price"]
+    precision_qty = state["tickers"][symbol]["precision_qty"]
+
+    def r(val, p):
+        return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+    o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
+    v = r(v, precision_qty)
+
+    async def safe_ts_add(key, value, field):
+        try:
+            await redis.execute_command("TS.ADD", key, m5_ts, value)
+        except Exception as e:
+            if "TSDB: the key does not exist" in str(e):
+                await redis.execute_command(
+                    "TS.CREATE", key,
+                    "RETENTION", 2592000000,
+                    "DUPLICATE_POLICY", "last",
+                    "LABELS",
+                    "symbol", symbol,
+                    "interval", "m5",
+                    "field", field
+                )
+                await redis.execute_command("TS.ADD", key, m5_ts, value)
+            else:
+                raise
+
+    await safe_ts_add(f"ts:{symbol}:m5:o", o, "o")
+    await safe_ts_add(f"ts:{symbol}:m5:h", h, "h")
+    await safe_ts_add(f"ts:{symbol}:m5:l", l, "l")
+    await safe_ts_add(f"ts:{symbol}:m5:c", c, "c")
+    await safe_ts_add(f"ts:{symbol}:m5:v", v, "v")
+
+    log.info(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+
+    # Stream: полная свеча
+    stream_event = {
+        "symbol": symbol,
+        "interval": "m5",
+        "timestamp": str(m5_ts),
+        "o": str(o),
+        "h": str(h),
+        "l": str(l),
+        "c": str(c),
+        "v": str(v)
+    }
+    await redis.xadd("ohlcv_stream", stream_event)
+
+    # Pub/Sub: только уведомление
+    pubsub_event = {
+        "symbol": symbol,
+        "interval": "m5",
+        "timestamp": str(m5_ts)
+    }
+    await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
+# 🔸 Заглушка: аудитор свечей М5
+async def m5_auditor(symbol, base_time):
+    log.info(f"[{symbol}] Я тут: m5_auditor для {base_time}")
 # 🔸 Заглушка: попытка построения свечи M15
 async def try_aggregate_m15(redis, symbol, base_time, state):
     log.info(f"[{symbol}] Я тут: try_aggregate_m15")
