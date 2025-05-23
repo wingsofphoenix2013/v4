@@ -151,17 +151,19 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
         await try_aggregate_m15(redis, symbol, base_m15, state)
 # 🔸 Построение свечи M5 из 5 M1 в RedisTimeSeries
 async def try_aggregate_m5(redis, symbol, base_time, state):
-    end_ts = int(base_time.timestamp() * 1000) + 4 * 60_000
-    ts_list = [end_ts - i * 60_000 for i in reversed(range(5))]
+    end_ts = int(base_time.timestamp() * 1000) + 4 * 60_000 + 1
+    ts_list = [end_ts - 1 - i * 60_000 for i in reversed(range(5))]
     candles = []
 
     for ts in ts_list:
         try:
-            o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
-            h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
-            l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
-            c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
-            v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+            o, h, l, c, v = await asyncio.gather(
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+            )
 
             if not all([o, h, l, c, v]):
                 raise ValueError("недостаточно данных")
@@ -176,13 +178,13 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
             })
         except Exception:
             log.warning(f"[{symbol}] Невозможно построить M5: отсутствуют M1 для {base_time}")
-            await m5_auditor(symbol, base_time)  # заглушка
+            await m5_auditor(symbol, base_time)
             return
 
     if not candles:
         return
 
-    m5_ts = ts_list[0]
+    m5_ts = candles[0]["ts"]
     o = candles[0]["o"]
     h = max(c["h"] for c in candles)
     l = min(c["l"] for c in candles)
@@ -198,29 +200,11 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
     o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
     v = r(v, precision_qty)
 
-    async def safe_ts_add(key, value, field):
-        try:
-            await redis.execute_command("TS.ADD", key, m5_ts, value)
-        except Exception as e:
-            if "TSDB: the key does not exist" in str(e):
-                await redis.execute_command(
-                    "TS.CREATE", key,
-                    "RETENTION", 2592000000,
-                    "DUPLICATE_POLICY", "last",
-                    "LABELS",
-                    "symbol", symbol,
-                    "interval", "m5",
-                    "field", field
-                )
-                await redis.execute_command("TS.ADD", key, m5_ts, value)
-            else:
-                raise
-
-    await safe_ts_add(f"ts:{symbol}:m5:o", o, "o")
-    await safe_ts_add(f"ts:{symbol}:m5:h", h, "h")
-    await safe_ts_add(f"ts:{symbol}:m5:l", l, "l")
-    await safe_ts_add(f"ts:{symbol}:m5:c", c, "c")
-    await safe_ts_add(f"ts:{symbol}:m5:v", v, "v")
+    await safe_ts_add(redis, f"ts:{symbol}:m5:o", m5_ts, o, "o", symbol, "m5")
+    await safe_ts_add(redis, f"ts:{symbol}:m5:h", m5_ts, h, "h", symbol, "m5")
+    await safe_ts_add(redis, f"ts:{symbol}:m5:l", m5_ts, l, "l", symbol, "m5")
+    await safe_ts_add(redis, f"ts:{symbol}:m5:c", m5_ts, c, "c", symbol, "m5")
+    await safe_ts_add(redis, f"ts:{symbol}:m5:v", m5_ts, v, "v", symbol, "m5")
 
     log.info(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
 
@@ -249,17 +233,19 @@ async def m5_auditor(symbol, base_time):
     log.info(f"[{symbol}] Я тут: m5_auditor для {base_time}")
 # 🔸 Построение свечи M15 из 15 M1 в RedisTimeSeries
 async def try_aggregate_m15(redis, symbol, base_time, state):
-    end_ts = int(base_time.timestamp() * 1000) + 14 * 60_000
-    ts_list = [end_ts - i * 60_000 for i in reversed(range(15))]
+    end_ts = int(base_time.timestamp() * 1000) + 14 * 60_000 + 1
+    ts_list = [end_ts - 1 - i * 60_000 for i in reversed(range(15))]
     candles = []
 
     for ts in ts_list:
         try:
-            o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
-            h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
-            l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
-            c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
-            v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+            o, h, l, c, v = await asyncio.gather(
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts),
+                redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+            )
 
             if not all([o, h, l, c, v]):
                 raise ValueError("недостаточно данных")
@@ -274,13 +260,13 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
             })
         except Exception:
             log.warning(f"[{symbol}] Невозможно построить M15: отсутствуют M1 для {base_time}")
-            await m15_auditor(symbol, base_time)  # заглушка
+            await m15_auditor(symbol, base_time)
             return
 
     if not candles:
         return
 
-    m15_ts = ts_list[0]
+    m15_ts = candles[0]["ts"]
     o = candles[0]["o"]
     h = max(c["h"] for c in candles)
     l = min(c["l"] for c in candles)
@@ -296,33 +282,14 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
     v = r(v, precision_qty)
 
-    async def safe_ts_add(key, value, field):
-        try:
-            await redis.execute_command("TS.ADD", key, m15_ts, value)
-        except Exception as e:
-            if "TSDB: the key does not exist" in str(e):
-                await redis.execute_command(
-                    "TS.CREATE", key,
-                    "RETENTION", 2592000000,
-                    "DUPLICATE_POLICY", "last",
-                    "LABELS",
-                    "symbol", symbol,
-                    "interval", "m15",
-                    "field", field
-                )
-                await redis.execute_command("TS.ADD", key, m15_ts, value)
-            else:
-                raise
-
-    await safe_ts_add(f"ts:{symbol}:m15:o", o, "o")
-    await safe_ts_add(f"ts:{symbol}:m15:h", h, "h")
-    await safe_ts_add(f"ts:{symbol}:m15:l", l, "l")
-    await safe_ts_add(f"ts:{symbol}:m15:c", c, "c")
-    await safe_ts_add(f"ts:{symbol}:m15:v", v, "v")
+    await safe_ts_add(redis, f"ts:{symbol}:m15:o", m15_ts, o, "o", symbol, "m15")
+    await safe_ts_add(redis, f"ts:{symbol}:m15:h", m15_ts, h, "h", symbol, "m15")
+    await safe_ts_add(redis, f"ts:{symbol}:m15:l", m15_ts, l, "l", symbol, "m15")
+    await safe_ts_add(redis, f"ts:{symbol}:m15:c", m15_ts, c, "c", symbol, "m15")
+    await safe_ts_add(redis, f"ts:{symbol}:m15:v", m15_ts, v, "v", symbol, "m15")
 
     log.info(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
 
-    # Stream: полная свеча
     stream_event = {
         "symbol": symbol,
         "interval": "m15",
@@ -335,14 +302,13 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     }
     await redis.xadd("ohlcv_stream", stream_event)
 
-    # Pub/Sub: только уведомление
     pubsub_event = {
         "symbol": symbol,
         "interval": "m15",
         "timestamp": str(m15_ts)
     }
     await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
-# 🔸 Заглушка: аудитор свечей М5
+# 🔸 Заглушка: аудитор свечей М15
 async def m15_auditor(symbol, base_time):
     log.info(f"[{symbol}] Я тут: m15_auditor для {base_time}")
 # 🔸 Заглушка: проверка пропущенных M1
