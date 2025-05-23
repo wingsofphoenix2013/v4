@@ -168,6 +168,9 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     }[interval]
     start_ts = end_ts - (count - 1) * step_ms
 
+    log.debug(f"🔍 Запрос MRANGE: symbol={symbol}, interval={interval}, from={start_ts}, to={end_ts} "
+              f"→ {(end_ts - start_ts) // step_ms + 1} точек")
+
     try:
         response = await redis.execute_command(
             "TS.MRANGE", start_ts, end_ts,
@@ -177,10 +180,12 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
         log.error(f"Ошибка запроса к Redis TS: {e}")
         return None
 
+    log.debug(f"📦 TS.MRANGE вернул {len(response)} рядов")
     series = {}
     for entry in response:
         key, labels, datapoints = entry
         field = next((l[1] for l in labels if l[0] == "field"), None)
+        log.debug(f"▶️ {key} [{field}] — {len(datapoints)} точек")
         if field:
             series[field] = {int(ts): float(val) for ts, val in datapoints}
 
@@ -192,7 +197,6 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
 
     df = df.sort_index()
 
-    # 🔸 Проверка количества строк
     if len(df) < count:
         log.warning(f"⛔ Недостаточно данных для {symbol}/{interval}: {len(df)} из {count} требуемых — расчёт пропущен")
         return None
