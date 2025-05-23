@@ -166,7 +166,7 @@ async def watch_ohlcv_events(redis):
 
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
-# 🔸 Загрузка свечей из RedisTimeSeries
+# 🔸 Загрузка свечей через TS.RANGE по каждому ключу
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
 
@@ -177,41 +177,25 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     }[interval]
     start_ts = end_ts - (count - 1) * step_ms
 
-    log.info(f"🔍 Запрос MRANGE: symbol={symbol}, interval={interval}, from={start_ts}, to={end_ts} "
-             f"→ {(end_ts - start_ts) // step_ms + 1} точек")
-
-    try:
-        response = await redis.execute_command(
-            "TS.MRANGE", start_ts, end_ts,
-            "FILTER", f"symbol={symbol}", f"interval={interval}"
-        )
-    except Exception as e:
-        log.error(f"Ошибка запроса к Redis TS: {e}")
-        return None
-
-    log.info(f"📦 TS.MRANGE вернул {len(response)} рядов")
+    fields = ["o", "h", "l", "c", "v"]
     series = {}
 
-    for entry in response:
-        key, labels, datapoints = entry
-        log.debug(f"🔍 labels = {labels}")
+    for field in fields:
+        key = f"ts:{symbol}:{interval}:{field}"
+        try:
+            points = await redis.execute_command("TS.RANGE", key, start_ts, end_ts)
+            log.info(f"▶️ {key} — {len(points)} точек")
+            if points:
+                series[field] = {int(ts): float(val) for ts, val in points}
+        except Exception as e:
+            log.warning(f"Ошибка чтения {key}: {e}")
 
-        field = None
-        for pair in labels:
-            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0] == "field":
-                field = pair[1]
-                break
-
-        log.info(f"▶️ {key} [{field}] — {len(datapoints)} точек")
-        if field:
-            series[field] = {int(ts): float(val) for ts, val in datapoints}
-
+    import pandas as pd
     index = sorted(set(ts for col in series.values() for ts in col))
     df = pd.DataFrame(index=pd.to_datetime(index, unit='ms'))
     for field, values in series.items():
         df[field] = pd.Series(values)
     df.index.name = "open_time"
-
     df = df.sort_index()
 
     if len(df) < count:
