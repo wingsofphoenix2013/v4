@@ -138,7 +138,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
     await safe_ts_add(f"ts:{symbol}:m1:c", c, "c")
     await safe_ts_add(f"ts:{symbol}:m1:v", v, "v")
 
-    log.info(f"[{symbol}] M1 TS сохранена: ts={ts} O={o} H={h} L={l} C={c} V={v}")
+    log.debug(f"[{symbol}] M1 TS сохранена: ts={ts} O={o} H={h} L={l} C={c} V={v}")
 
     # Публикация в Stream (полная свеча)
     stream_event = {
@@ -226,7 +226,7 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
     await safe_ts_add(redis, f"ts:{symbol}:m5:c", m5_ts, c, "c", symbol, "m5")
     await safe_ts_add(redis, f"ts:{symbol}:m5:v", m5_ts, v, "v", symbol, "m5")
 
-    log.info(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+    log.debug(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
 
     # Stream: полная свеча
     stream_event = {
@@ -308,7 +308,7 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     await safe_ts_add(redis, f"ts:{symbol}:m15:c", m15_ts, c, "c", symbol, "m15")
     await safe_ts_add(redis, f"ts:{symbol}:m15:v", m15_ts, v, "v", symbol, "m15")
 
-    log.info(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+    log.debug(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
 
     stream_event = {
         "symbol": symbol,
@@ -332,6 +332,7 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
 async def m15_auditor(symbol, base_time):
     log.info(f"[{symbol}] Я тут: m15_auditor для {base_time}")
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
+# Поиск пропущенных M1 и немедленное восстановление через Binance API
 async def detect_missing_m1(redis, pg, symbol, now_ts, state):
     depth_minutes = 15
     missing = []
@@ -346,13 +347,12 @@ async def detect_missing_m1(redis, pg, symbol, now_ts, state):
         try:
             result = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
             if not result:
-                missing.append(ts)
+                missing.append((ts, open_time))
         except Exception:
-            missing.append(ts)
+            missing.append((ts, open_time))
 
     async with pg.acquire() as conn:
-        for ts in missing:
-            open_time = datetime.utcfromtimestamp(ts / 1000)
+        for ts, open_time in missing:
             try:
                 await conn.execute(
                     "INSERT INTO missing_m1_log_v4 (symbol, open_time) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -366,15 +366,103 @@ async def detect_missing_m1(redis, pg, symbol, now_ts, state):
                 log.warning(f"[{symbol}] Пропущена свеча: {open_time}")
             except Exception as e:
                 log.error(f"[{symbol}] Ошибка записи пропуска: {e}")
-# 🔸 Заглушка: восстановление одной M1 через API
+                continue  # не восстанавливаем, если не смогли зафиксировать
+
+            # Вызов восстановления сразу после фиксации
+            try:
+                precision_price = state["tickers"][symbol]["precision_price"]
+                precision_qty = state["tickers"][symbol]["precision_qty"]
+                await restore_missing_m1(symbol, open_time, redis, pg, precision_price, precision_qty)
+            except Exception as e:
+                log.error(f"[{symbol}] Ошибка вызова restore_missing_m1: {e}", exc_info=True)
+# Восстановление одной M1-свечи через Binance API
 async def restore_missing_m1(symbol, open_time, redis, pg, precision_price, precision_qty):
-    log.info(f"[{symbol}] Я тут: restore_missing_m1")
+    ts = int(open_time.timestamp() * 1000)
+    end_ts = ts + 60_000
+
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": symbol.upper(),
+        "interval": "1m",
+        "startTime": ts,
+        "endTime": end_ts,
+        "limit": 1
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    log.error(f"[{symbol}] Binance API ошибка: {resp.status}")
+                    return False
+
+                raw = await resp.json()
+                if not raw:
+                    log.warning(f"[{symbol}] Binance API вернул пусто для {open_time}")
+                    return False
+
+                k = raw[0]
+                o, h, l, c, v = k[1:6]
+
+                def r(val, p):
+                    return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+                o = r(o, precision_price)
+                h = r(h, precision_price)
+                l = r(l, precision_price)
+                c = r(c, precision_price)
+                v = r(v, precision_qty)
+
+                await safe_ts_add(redis, f"ts:{symbol}:m1:o", ts, o, "o", symbol, "m1")
+                await safe_ts_add(redis, f"ts:{symbol}:m1:h", ts, h, "h", symbol, "m1")
+                await safe_ts_add(redis, f"ts:{symbol}:m1:l", ts, l, "l", symbol, "m1")
+                await safe_ts_add(redis, f"ts:{symbol}:m1:c", ts, c, "c", symbol, "m1")
+                await safe_ts_add(redis, f"ts:{symbol}:m1:v", ts, v, "v", symbol, "m1")
+
+                # Публикация в Stream
+                stream_event = {
+                    "symbol": symbol,
+                    "interval": "m1",
+                    "timestamp": str(ts),
+                    "o": str(o),
+                    "h": str(h),
+                    "l": str(l),
+                    "c": str(c),
+                    "v": str(v)
+                }
+                await redis.xadd("ohlcv_stream", stream_event)
+
+                # Публикация в Pub/Sub
+                pubsub_event = {
+                    "symbol": symbol,
+                    "interval": "m1",
+                    "timestamp": str(ts)
+                }
+                await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
+
+                async with pg.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE missing_m1_log_v4 SET fixed = true, fixed_at = NOW() WHERE symbol = $1 AND open_time = $2",
+                        symbol, open_time
+                    )
+                    await conn.execute(
+                        "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
+                        "AGGREGATOR", "INFO", "M1 restored",
+                        json.dumps({"symbol": symbol, "open_time": str(open_time)})
+                    )
+
+                log.info(f"[{symbol}] Восстановлена M1: {open_time}")
+                return True
+
+    except Exception as e:
+        log.error(f"[{symbol}] Ошибка восстановления свечи: {e}", exc_info=True)
+        return False
 # 🔸 Слушает WebSocket Binance и переподключается при изменении тикеров
 async def listen_kline_stream(redis, state, refresh_queue):
 
     while True:
         if not state["active"]:
-            log.info("Нет активных тикеров для подписки")
+            log.debug("Нет активных тикеров для подписки")
             await asyncio.sleep(10)
             continue
 
