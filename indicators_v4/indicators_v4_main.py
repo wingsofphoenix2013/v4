@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import pandas as pd
 from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
 
@@ -142,15 +143,63 @@ async def watch_ohlcv_events(redis):
 
             depth = required_candles.get(interval, 200)
             log.info(f"🟢 Сигнал к расчёту: {symbol} / {interval} @ {timestamp} → загрузить {depth} свечей")
+
+            # 🔸 Загрузка свечей
+            df = await load_ohlcv_from_redis(redis, symbol, interval, int(timestamp), depth)
+
+            if df is None:
+                log.warning(f"⛔ Пропуск расчёта: {symbol} / {interval} — данные не загружены")
+                continue
+
+            log.info(f"✅ Данные готовы к расчёту: {symbol} / {interval} — {len(df)} строк")
+
+            # Здесь в будущем: запуск расчёта индикаторов
+
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
-# 🔸 Заглушка расчёта индикаторов
-async def run_indicators(pg, redis):
-    log = logging.getLogger("INDICATORS")
-    while True:
-        log.info(f"📊 Активных тикеров: {len(active_tickers)}, индикаторов: {len(indicator_instances)}")
-        await asyncio.sleep(60)
+# 🔸 Загрузка свечей из RedisTimeSeries
+async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
+    log = logging.getLogger("REDIS_LOAD")
 
+    step_ms = {
+        "m1": 60_000,
+        "m5": 300_000,
+        "m15": 900_000
+    }[interval]
+    start_ts = end_ts - (count - 1) * step_ms
+
+    try:
+        response = await redis.execute_command(
+            "TS.MRANGE", start_ts, end_ts,
+            "FILTER", f"symbol={symbol}", f"interval={interval}"
+        )
+    except Exception as e:
+        log.error(f"Ошибка запроса к Redis TS: {e}")
+        return None
+
+    series = {}
+    for entry in response:
+        key, labels, datapoints = entry
+        field = next((l[1] for l in labels if l[0] == "field"), None)
+        if field:
+            series[field] = {int(ts): float(val) for ts, val in datapoints}
+
+    index = sorted(set(ts for col in series.values() for ts in col))
+    df = pd.DataFrame(index=pd.to_datetime(index, unit='ms'))
+    for field, values in series.items():
+        df[field] = pd.Series(values)
+    df.index.name = "open_time"
+
+    df = df.sort_index()
+
+    # 🔸 Проверка количества строк
+    if len(df) < count:
+        log.warning(f"⛔ Недостаточно данных для {symbol}/{interval}: {len(df)} из {count} требуемых — расчёт пропущен")
+        return None
+    else:
+        log.info(f"🔹 Загружено {len(df)} свечей для {symbol}/{interval} (ожидалось {count})")
+
+    return df
 # 🔸 Главная точка запуска
 async def main():
     setup_logging()
@@ -163,8 +212,7 @@ async def main():
     await asyncio.gather(
         watch_ticker_updates(redis),
         watch_indicator_updates(pg, redis),
-        watch_ohlcv_events(redis),
-        run_indicators(pg, redis)
+        watch_ohlcv_events(redis)
     )
 
 if __name__ == "__main__":
