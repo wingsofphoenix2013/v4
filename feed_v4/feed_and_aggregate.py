@@ -12,7 +12,8 @@ from datetime import datetime, timedelta
 
 # Получаем логгер для модуля
 log = logging.getLogger("FEED+AGGREGATOR")
-
+# Добавление для safe_ts_add
+created_ts_keys = set()
 # 🔸 Загрузка всех тикеров, точности и статуса из PostgreSQL
 async def load_all_tickers(pg_pool):
     async with pg_pool.acquire() as conn:
@@ -81,6 +82,25 @@ async def handle_ticker_events(redis, state, pg, refresh_queue):
                         task.cancel()
 
                 await redis.xack(stream, group, msg_id)
+
+# Безопасное добавление в RedisTimeSeries с кэшом
+async def safe_ts_add(redis, key, ts, value, field, symbol, interval):
+    if key not in created_ts_keys:
+        try:
+            await redis.execute_command(
+                "TS.CREATE", key,
+                "RETENTION", 2592000000,
+                "DUPLICATE_POLICY", "last",
+                "LABELS",
+                "symbol", symbol,
+                "interval", interval,
+                "field", field
+            )
+            created_ts_keys.add(key)
+        except Exception as e:
+            if "already exists" not in str(e):
+                raise
+    await redis.execute_command("TS.ADD", key, ts, value)
 # 🔸 Сохранение полной свечи M1 в RedisTimeSeries + Stream + Pub/Sub + триггеры на M5/M15
 async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price, precision_qty, state):
     ts = int(open_time.timestamp() * 1000)
@@ -311,9 +331,41 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
 # 🔸 Заглушка: аудитор свечей М15
 async def m15_auditor(symbol, base_time):
     log.info(f"[{symbol}] Я тут: m15_auditor для {base_time}")
-# 🔸 Заглушка: проверка пропущенных M1
+# 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 async def detect_missing_m1(redis, pg, symbol, now_ts, state):
-    log.info(f"[{symbol}] Я тут: detect_missing_m1")
+    depth_minutes = 15
+    missing = []
+
+    for i in range(1, depth_minutes + 1):
+        ts = now_ts - i * 60_000
+        open_time = datetime.utcfromtimestamp(ts / 1000)
+
+        if open_time < state["activated_at"].get(symbol, datetime.min):
+            continue
+
+        try:
+            result = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+            if not result:
+                missing.append(ts)
+        except Exception:
+            missing.append(ts)
+
+    async with pg.acquire() as conn:
+        for ts in missing:
+            open_time = datetime.utcfromtimestamp(ts / 1000)
+            try:
+                await conn.execute(
+                    "INSERT INTO missing_m1_log_v4 (symbol, open_time) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    symbol, open_time
+                )
+                await conn.execute(
+                    "INSERT INTO system_log_v4 (module, level, message, details) VALUES ($1, $2, $3, $4)",
+                    "AGGREGATOR", "WARNING", "M1 missing",
+                    json.dumps({"symbol": symbol, "open_time": str(open_time)})
+                )
+                log.warning(f"[{symbol}] Пропущена свеча: {open_time}")
+            except Exception as e:
+                log.error(f"[{symbol}] Ошибка записи пропуска: {e}")
 # 🔸 Заглушка: восстановление одной M1 через API
 async def restore_missing_m1(symbol, open_time, redis, pg, precision_price, precision_qty):
     log.info(f"[{symbol}] Я тут: restore_missing_m1")
@@ -407,7 +459,7 @@ async def watch_mark_price(symbol, redis, state):
         except Exception as e:
             log.error(f"[{symbol}] Ошибка WebSocket markPrice (futures): {e}", exc_info=True)
             await asyncio.sleep(5)
-# 🔸 Основной запуск компонента с управлением тасками
+# Основной запуск компонента с управлением тасками
 async def run_feed_and_aggregator(pg, redis):
 
     # Загрузка всех тикеров (enabled + disabled)
@@ -460,7 +512,17 @@ async def run_feed_and_aggregator(pg, redis):
                 f"markprice_{upper_symbol}"
             )
             state["markprice_tasks"][upper_symbol] = task
-    
+
+    # Фоновая проверка отсутствующих M1-свечей
+    async def recovery_loop():
+        while True:
+            now_ts = int((datetime.utcnow() - timedelta(minutes=1)).replace(second=0, microsecond=0).timestamp() * 1000)
+            for symbol in state["active"]:
+                await detect_missing_m1(redis, pg, symbol.upper(), now_ts, state)
+            await asyncio.sleep(60)
+
+    create_tracked_task(recovery_loop(), "recovery_loop")
+
     # Постоянный перезапуск слушателя WebSocket
     async def loop_listen():
         while True:
