@@ -138,7 +138,16 @@ async def watch_ohlcv_events(redis):
             timestamp = data.get("timestamp")
 
             if symbol not in active_tickers:
-                log.debug(f"Пропущено: неактивный тикер {symbol}")
+                log.info(f"Пропущено: неактивный тикер {symbol}")
+                continue
+
+            # 🔸 Фильтр по активным индикаторам для данного таймфрейма
+            relevant_instances = [
+                iid for iid, inst in indicator_instances.items()
+                if inst["timeframe"] == interval
+            ]
+            if not relevant_instances:
+                log.info(f"⛔ Нет активных индикаторов для {symbol} / {interval} — расчёт не требуется")
                 continue
 
             depth = required_candles.get(interval, 200)
@@ -169,7 +178,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     start_ts = end_ts - (count - 1) * step_ms
 
     log.info(f"🔍 Запрос MRANGE: symbol={symbol}, interval={interval}, from={start_ts}, to={end_ts} "
-              f"→ {(end_ts - start_ts) // step_ms + 1} точек")
+             f"→ {(end_ts - start_ts) // step_ms + 1} точек")
 
     try:
         response = await redis.execute_command(
@@ -182,9 +191,17 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
 
     log.info(f"📦 TS.MRANGE вернул {len(response)} рядов")
     series = {}
+
     for entry in response:
         key, labels, datapoints = entry
-        field = next((l[1] for l in labels if l[0] == "field"), None)
+        log.debug(f"🔍 labels = {labels}")
+
+        field = None
+        for pair in labels:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0] == "field":
+                field = pair[1]
+                break
+
         log.info(f"▶️ {key} [{field}] — {len(datapoints)} точек")
         if field:
             series[field] = {int(ts): float(val) for ts, val in datapoints}
