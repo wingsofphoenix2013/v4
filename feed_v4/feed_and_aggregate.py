@@ -198,7 +198,7 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
             })
         except Exception:
             log.warning(f"[{symbol}] Невозможно построить M5: отсутствуют M1 для {base_time}")
-            await m5_auditor(symbol, base_time)
+            await m5_auditor(symbol, base_time, redis, state)
             return
 
     if not candles:
@@ -248,9 +248,82 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
         "timestamp": str(m5_ts)
     }
     await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
-# 🔸 Заглушка: аудитор свечей М5
-async def m5_auditor(symbol, base_time):
-    log.info(f"[{symbol}] Я тут: m5_auditor для {base_time}")
+# 🔸 Асинхронный аудит M5: ждёт появления недостающих M1 и собирает M5
+async def m5_auditor(symbol, base_time, redis, state):
+    timeout = 300  # 5 минут
+    interval = 10  # опрашивать каждые 10 секунд
+    deadline = datetime.utcnow() + timedelta(seconds=timeout)
+
+    ts_list = [int((base_time + timedelta(minutes=i)).timestamp() * 1000) for i in range(5)]
+
+    while datetime.utcnow() < deadline:
+        try:
+            candles = []
+            for ts in ts_list:
+                o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+                h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
+                l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
+                c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
+                v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+
+                if not all([o, h, l, c, v]):
+                    break  # ещё не все есть
+
+                candles.append({
+                    "ts": ts,
+                    "o": float(o[0][1]),
+                    "h": float(h[0][1]),
+                    "l": float(l[0][1]),
+                    "c": float(c[0][1]),
+                    "v": float(v[0][1])
+                })
+
+            if len(candles) == 5:
+                m5_ts = candles[0]["ts"]
+                o = candles[0]["o"]
+                h = max(c["h"] for c in candles)
+                l = min(c["l"] for c in candles)
+                c = candles[-1]["c"]
+                v = sum(c["v"] for c in candles)
+
+                # По точности округляем
+                precision_price = state["tickers"][symbol]["precision_price"]
+                precision_qty = state["tickers"][symbol]["precision_qty"]
+
+                def r(val, p):
+                    return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+                o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
+                v = r(v, precision_qty)
+
+                await safe_ts_add(redis, f"ts:{symbol}:m5:o", m5_ts, o, "o", symbol, "m5")
+                await safe_ts_add(redis, f"ts:{symbol}:m5:h", m5_ts, h, "h", symbol, "m5")
+                await safe_ts_add(redis, f"ts:{symbol}:m5:l", m5_ts, l, "l", symbol, "m5")
+                await safe_ts_add(redis, f"ts:{symbol}:m5:c", m5_ts, c, "c", symbol, "m5")
+                await safe_ts_add(redis, f"ts:{symbol}:m5:v", m5_ts, v, "v", symbol, "m5")
+
+                stream_event = {
+                    "symbol": symbol,
+                    "interval": "m5",
+                    "timestamp": str(m5_ts),
+                    "o": str(o),
+                    "h": str(h),
+                    "l": str(l),
+                    "c": str(c),
+                    "v": str(v)
+                }
+                await redis.xadd("ohlcv_stream", stream_event)
+
+                log.info(f"[{symbol}] M5 аудит: построена после ожидания — {datetime.utcfromtimestamp(m5_ts / 1000)}")
+                return
+
+            await asyncio.sleep(interval)
+
+        except Exception as e:
+            log.error(f"[{symbol}] Ошибка в m5_auditor: {e}", exc_info=True)
+            return
+
+    log.warning(f"[{symbol}] M5 аудит: таймаут ожидания для {base_time}")
 # 🔸 Построение свечи M15 из 15 M1 в RedisTimeSeries
 async def try_aggregate_m15(redis, symbol, base_time, state):
     end_ts = int(base_time.timestamp() * 1000) + 14 * 60_000 + 1
@@ -280,7 +353,7 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
             })
         except Exception:
             log.warning(f"[{symbol}] Невозможно построить M15: отсутствуют M1 для {base_time}")
-            await m15_auditor(symbol, base_time)
+            await m15_auditor(symbol, base_time, redis, state)
             return
 
     if not candles:
@@ -328,9 +401,81 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
         "timestamp": str(m15_ts)
     }
     await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
-# 🔸 Заглушка: аудитор свечей М15
-async def m15_auditor(symbol, base_time):
-    log.info(f"[{symbol}] Я тут: m15_auditor для {base_time}")
+# 🔸 Асинхронный аудит M15: ждёт появления недостающих M1 и собирает M15
+async def m15_auditor(symbol, base_time, redis, state):
+    timeout = 300  # 5 минут
+    interval = 10  # каждые 10 секунд
+    deadline = datetime.utcnow() + timedelta(seconds=timeout)
+
+    ts_list = [int((base_time + timedelta(minutes=i)).timestamp() * 1000) for i in range(15)]
+
+    while datetime.utcnow() < deadline:
+        try:
+            candles = []
+            for ts in ts_list:
+                o = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:o", ts, ts)
+                h = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:h", ts, ts)
+                l = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:l", ts, ts)
+                c = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:c", ts, ts)
+                v = await redis.execute_command("TS.RANGE", f"ts:{symbol}:m1:v", ts, ts)
+
+                if not all([o, h, l, c, v]):
+                    break
+
+                candles.append({
+                    "ts": ts,
+                    "o": float(o[0][1]),
+                    "h": float(h[0][1]),
+                    "l": float(l[0][1]),
+                    "c": float(c[0][1]),
+                    "v": float(v[0][1])
+                })
+
+            if len(candles) == 15:
+                m15_ts = candles[0]["ts"]
+                o = candles[0]["o"]
+                h = max(c["h"] for c in candles)
+                l = min(c["l"] for c in candles)
+                c = candles[-1]["c"]
+                v = sum(c["v"] for c in candles)
+
+                precision_price = state["tickers"][symbol]["precision_price"]
+                precision_qty = state["tickers"][symbol]["precision_qty"]
+
+                def r(val, p):
+                    return float(Decimal(val).quantize(Decimal(f"1e-{p}"), rounding=ROUND_DOWN))
+
+                o, h, l, c = map(lambda x: r(x, precision_price), [o, h, l, c])
+                v = r(v, precision_qty)
+
+                await safe_ts_add(redis, f"ts:{symbol}:m15:o", m15_ts, o, "o", symbol, "m15")
+                await safe_ts_add(redis, f"ts:{symbol}:m15:h", m15_ts, h, "h", symbol, "m15")
+                await safe_ts_add(redis, f"ts:{symbol}:m15:l", m15_ts, l, "l", symbol, "m15")
+                await safe_ts_add(redis, f"ts:{symbol}:m15:c", m15_ts, c, "c", symbol, "m15")
+                await safe_ts_add(redis, f"ts:{symbol}:m15:v", m15_ts, v, "v", symbol, "m15")
+
+                stream_event = {
+                    "symbol": symbol,
+                    "interval": "m15",
+                    "timestamp": str(m15_ts),
+                    "o": str(o),
+                    "h": str(h),
+                    "l": str(l),
+                    "c": str(c),
+                    "v": str(v)
+                }
+                await redis.xadd("ohlcv_stream", stream_event)
+
+                log.info(f"[{symbol}] M15 аудит: построена после ожидания — {datetime.utcfromtimestamp(m15_ts / 1000)}")
+                return
+
+            await asyncio.sleep(interval)
+
+        except Exception as e:
+            log.error(f"[{symbol}] Ошибка в m15_auditor: {e}", exc_info=True)
+            return
+
+    log.warning(f"[{symbol}] M15 аудит: таймаут ожидания для {base_time}")
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 # Поиск пропущенных M1 и немедленное восстановление через Binance API
 async def detect_missing_m1(redis, pg, symbol, now_ts, state):
