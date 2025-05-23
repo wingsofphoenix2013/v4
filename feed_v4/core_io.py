@@ -39,7 +39,7 @@ async def run_core_io(pg, redis):
 
                     try:
                         ts_int = int(data["timestamp"]) // 1000
-                        open_time = datetime.utcfromtimestamp(ts_int).replace(tzinfo=timezone.utc)
+                        open_time = datetime.utcfromtimestamp(ts_int)
                     except Exception as e:
                         log.warning(f"Ошибка преобразования timestamp: {data.get('timestamp')} → {e}")
                         continue
