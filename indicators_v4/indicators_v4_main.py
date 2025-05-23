@@ -3,10 +3,12 @@
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
 
 active_tickers = {}         # symbol -> precision_price
 indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
+required_candles = defaultdict(lambda: 200)  # tf -> сколько свечей загружать
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
@@ -40,6 +42,14 @@ async def load_initial_indicators(pg):
                 "params": param_map
             }
 
+            # 🔸 Расчёт нужной глубины свечей по таймфрейму
+            tf = inst["timeframe"]
+            if "length" in param_map:
+                try:
+                    length = int(param_map["length"])
+                    required_candles[tf] = max(required_candles[tf], length * 4)
+                except ValueError:
+                    continue
 # 🔸 Подписка на обновления тикеров
 async def watch_ticker_updates(redis):
     log = logging.getLogger("TICKER_UPDATES")
@@ -130,7 +140,8 @@ async def watch_ohlcv_events(redis):
                 log.debug(f"Пропущено: неактивный тикер {symbol}")
                 continue
 
-            log.info(f"🟢 Сигнал к расчёту: {symbol} / {interval} @ {timestamp}")
+            depth = required_candles.get(interval, 200)
+            log.info(f"🟢 Сигнал к расчёту: {symbol} / {interval} @ {timestamp} → загрузить {depth} свечей")
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
 # 🔸 Заглушка расчёта индикаторов
