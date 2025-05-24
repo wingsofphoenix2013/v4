@@ -7,6 +7,8 @@ import pandas as pd
 from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
 
+from indicators.compute_and_store import compute_and_store
+
 active_tickers = {}         # symbol -> precision_price
 indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
 required_candles = defaultdict(lambda: 200)  # tf -> сколько свечей загружать
@@ -117,7 +119,7 @@ async def watch_indicator_updates(pg, redis):
 
             elif field == "stream_publish" and iid in indicator_instances:
                 indicator_instances[iid]["stream_publish"] = (action == "true")
-                log.info(f"🔁 stream_publish обновлён: id={iid} → {action}")
+                log.debug(f"🔁 stream_publish обновлён: id={iid} → {action}")
 
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
@@ -138,35 +140,44 @@ async def watch_ohlcv_events(redis):
             timestamp = data.get("timestamp")
 
             if symbol not in active_tickers:
-                log.info(f"Пропущено: неактивный тикер {symbol}")
+                log.debug(f"Пропущено: неактивный тикер {symbol}")
                 continue
 
-            # 🔸 Фильтр по активным индикаторам для данного таймфрейма
+            # Фильтр по активным индикаторам для данного таймфрейма
             relevant_instances = [
                 iid for iid, inst in indicator_instances.items()
                 if inst["timeframe"] == interval
             ]
             if not relevant_instances:
-                log.info(f"⛔ Нет активных индикаторов для {symbol} / {interval} — расчёт не требуется")
+                log.debug(f"⛔ Нет активных индикаторов для {symbol} / {interval} — расчёт не требуется")
                 continue
 
             depth = required_candles.get(interval, 200)
-            log.info(f"🟢 Сигнал к расчёту: {symbol} / {interval} @ {timestamp} → загрузить {depth} свечей")
+            log.info(f"Сигнал к расчёту: {symbol} / {interval} @ {timestamp} → загрузить {depth} свечей")
 
-            # 🔸 Загрузка свечей
+            # Загрузка свечей
             df = await load_ohlcv_from_redis(redis, symbol, interval, int(timestamp), depth)
 
             if df is None:
-                log.warning(f"⛔ Пропуск расчёта: {symbol} / {interval} — данные не загружены")
+                log.warning(f"Пропуск расчёта: {symbol} / {interval} — данные не загружены")
                 continue
 
-            log.info(f"✅ Данные готовы к расчёту: {symbol} / {interval} — {len(df)} строк")
+            log.info(f"Данные готовы к расчёту: {symbol} / {interval} — {len(df)} строк")
 
-            # Здесь в будущем: запуск расчёта индикаторов
+            # Запуск параллельных расчётов всех индикаторов на этот таймфрейм
+            tasks = []
+            for iid in relevant_instances:
+                inst = indicator_instances[iid]
+                tasks.append(compute_and_store(iid, inst, symbol, df, int(timestamp), pg, redis))
+
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
-# 🔸 Загрузка свечей через TS.RANGE по каждому ключу
+
+# 🔸 Загрузка свечей через параллельные TS.RANGE по каждому ключу
+import asyncio
+
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
 
@@ -178,17 +189,26 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     start_ts = end_ts - (count - 1) * step_ms
 
     fields = ["o", "h", "l", "c", "v"]
-    series = {}
+    keys = {field: f"ts:{symbol}:{interval}:{field}" for field in fields}
 
-    for field in fields:
-        key = f"ts:{symbol}:{interval}:{field}"
-        try:
-            points = await redis.execute_command("TS.RANGE", key, start_ts, end_ts)
-            log.info(f"▶️ {key} — {len(points)} точек")
-            if points:
-                series[field] = {int(ts): float(val) for ts, val in points}
-        except Exception as e:
-            log.warning(f"Ошибка чтения {key}: {e}")
+    log.debug(f"🔍 Запрос TS.RANGE по ключам: {list(keys.values())}, from={start_ts}, to={end_ts}")
+
+    # Параллельная отправка запросов
+    tasks = {
+        field: redis.execute_command("TS.RANGE", key, start_ts, end_ts)
+        for field, key in keys.items()
+    }
+
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    series = {}
+    for field, result in zip(tasks.keys(), results):
+        if isinstance(result, Exception):
+            log.warning(f"Ошибка чтения {keys[field]}: {result}")
+            continue
+        log.debug(f"▶️ {keys[field]} — {len(result)} точек")
+        if result:
+            series[field] = {int(ts): float(val) for ts, val in result}
 
     import pandas as pd
     index = sorted(set(ts for col in series.values() for ts in col))
