@@ -35,7 +35,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")
         return
 
-    log.info(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
+    log.debug(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
 
     # 🔸 Построение базового имени (label)
     if "length" in params:
