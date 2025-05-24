@@ -124,7 +124,7 @@ async def watch_indicator_updates(pg, redis):
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
 # 🔸 Подписка на ohlcv_channel — запуск расчёта индикаторов по сигналу
-async def watch_ohlcv_events(redis):
+async def watch_ohlcv_events(pg, redis):
     log = logging.getLogger("OHLCV_EVENTS")
     pubsub = redis.pubsub()
     await pubsub.subscribe("ohlcv_channel")
@@ -237,7 +237,7 @@ async def main():
     await asyncio.gather(
         watch_ticker_updates(redis),
         watch_indicator_updates(pg, redis),
-        watch_ohlcv_events(redis)
+        watch_ohlcv_events(pg, redis)
     )
 
 if __name__ == "__main__":
