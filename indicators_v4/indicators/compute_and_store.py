@@ -1,13 +1,14 @@
-# 🔸 indicators/compute_and_store.py - 24/05/2025
+# 🔸 indicators/compute_and_store.py
 
 import logging
 import pandas as pd
 import asyncio
-from indicators import ema  # пока только ema
+from indicators import ema, atr
 
 # 🔸 Сопоставление имён индикаторов с функциями
 INDICATOR_DISPATCH = {
     "ema": ema.compute,
+    "atr": atr.compute,
 }
 
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
