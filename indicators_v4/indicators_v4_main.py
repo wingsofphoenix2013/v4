@@ -6,7 +6,7 @@ import logging
 import pandas as pd
 from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
-from indicators_v4.core_io import run_core_io
+from core_io import run_core_io
 
 from indicators.compute_and_store import compute_and_store
 
