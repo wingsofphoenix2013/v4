@@ -13,9 +13,13 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
     """
     length = int(params.get("length", 14))
 
-    if "c" not in df:
-        raise ValueError("DataFrame должен содержать колонку 'c' (close)")
+    if "c" not in df or df["c"].isna().all():
+        raise ValueError("Нет данных в колонке 'c' для расчёта EMA")
 
-    ema_series = df["c"].ewm(span=length, adjust=False).mean()
+    df = df.copy()
+    ema_series = df["c"].astype(float).ewm(span=length, adjust=False).mean()
 
-    return {"value": float(ema_series.iloc[-1])}
+    last_valid = ema_series.dropna()
+    value = float(last_valid.iloc[-1]) if not last_valid.empty else float("nan")
+
+    return {"value": value}
