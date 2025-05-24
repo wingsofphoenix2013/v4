@@ -262,7 +262,7 @@ async def create_indicator(
             VALUES ($1, $2, $3, $4, NOW())
             RETURNING id
             """,
-            indicator.upper(),
+            indicator.lower(),
             timeframe,
             status == "enabled",
             stream_publish == "enabled"
