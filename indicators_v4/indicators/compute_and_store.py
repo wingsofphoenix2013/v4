@@ -3,7 +3,7 @@
 import logging
 import pandas as pd
 import asyncio
-from indicators import ema, atr, lr, mfi
+from indicators import ema, atr, lr, mfi, rsi
 
 # 🔸 Сопоставление имён индикаторов с функциями
 INDICATOR_DISPATCH = {
@@ -11,6 +11,7 @@ INDICATOR_DISPATCH = {
     "atr": atr.compute,
     "lr": lr.compute,
     "mfi": mfi.compute,
+    "rsi": rsi.compute,
 }
 
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра

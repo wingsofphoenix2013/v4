@@ -33,4 +33,4 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
     mfr = pos_sum / neg_sum.replace(0, 1e-6)
     mfi_series = 100 - (100 / (1 + mfr))
 
-    return {"value": float(mfi_series.iloc[-1])}
+    return {"value": round(float(mfi_series.iloc[-1]), 2)}
