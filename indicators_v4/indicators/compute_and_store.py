@@ -51,12 +51,12 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
         # Redis key для быстрого доступа
         redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
-        log.info(f"SET {redis_key} = {value}")
+        log.debug(f"SET {redis_key} = {value}")
         tasks.append(redis.set(redis_key, str(value)))
 
         # Redis TS для истории
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
-        log.info(f"TS.ADD {ts_key} {ts} {value}")
+        log.debug(f"TS.ADD {ts_key} {ts} {value}")
         ts_add = redis.execute_command(
             "TS.ADD", ts_key, ts, str(value),
             "RETENTION", 604800000,
@@ -68,7 +68,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
             log.warning(f"TS.ADD не вернул coroutine для {ts_key}")
 
         # Stream для core_io (по одному значению)
-        log.info(f"XADD indicator_stream_core: {param_name}={value}")
+        log.debug(f"XADD indicator_stream_core: {param_name}={value}")
         tasks.append(redis.xadd("indicator_stream_core", {
             "symbol": symbol,
             "interval": timeframe,
@@ -80,7 +80,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     # Stream для сигнала "готово" (по расчёту)
     if stream:
-        log.info(f"XADD indicator_stream: {base} ready for {symbol}/{timeframe}")
+        log.debug(f"XADD indicator_stream: {base} ready for {symbol}/{timeframe}")
         tasks.append(redis.xadd("indicator_stream", {
             "symbol": symbol,
             "indicator": base,
