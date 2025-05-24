@@ -1,4 +1,4 @@
-# 🔸 indicators/compute_and_store.py
+# 🔸 indicators/compute_and_store.py - 24/05/2025
 
 import logging
 import pandas as pd
