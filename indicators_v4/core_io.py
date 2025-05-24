@@ -1,6 +1,8 @@
 # core_io.py — воркер для записи индикаторов в PostgreSQL
-from datetime import datetime
+
 import logging
+from datetime import datetime
+from decimal import Decimal
 
 # 🔸 Асинхронный воркер для чтения из Redis Stream и записи в PG
 async def run_core_io(pg, redis):
@@ -24,7 +26,7 @@ async def run_core_io(pg, redis):
                         instance_id = int(data["instance_id"])
                         open_time = datetime.fromisoformat(data["open_time"])
                         param_name = data["param_name"]
-                        value = float(data["value"])
+                        value = Decimal(data["value"])
 
                         async with pg.acquire() as conn:
                             await conn.execute("""
