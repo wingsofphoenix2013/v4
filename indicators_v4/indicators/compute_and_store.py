@@ -1,5 +1,4 @@
 # 🔸 indicators/compute_and_store.py
-
 import logging
 from indicators import ema  # пока только ema
 
@@ -24,6 +23,8 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis):
 
     try:
         result = compute_fn(df, params)  # {'value': float, ...}
+        precision = active_tickers.get(symbol, 8)
+        result = {k: round(v, precision) for k, v in result.items()}
     except Exception as e:
         log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")
         return
