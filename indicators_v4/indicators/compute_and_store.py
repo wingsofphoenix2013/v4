@@ -8,7 +8,7 @@ INDICATOR_DISPATCH = {
 }
 
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
-async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis):
+async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
     log = logging.getLogger("CALC")
 
     indicator = instance["indicator"]
@@ -23,7 +23,6 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis):
 
     try:
         result = compute_fn(df, params)  # {'value': float, ...}
-        precision = active_tickers.get(symbol, 8)
         result = {k: round(v, precision) for k, v in result.items()}
     except Exception as e:
         log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")

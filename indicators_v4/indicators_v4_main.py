@@ -162,22 +162,20 @@ async def watch_ohlcv_events(pg, redis):
                 log.warning(f"Пропуск расчёта: {symbol} / {interval} — данные не загружены")
                 continue
 
-            log.info(f"Данные готовы к расчёту: {symbol} / {interval} — {len(df)} строк")
+            log.debug(f"Данные готовы к расчёту: {symbol} / {interval} — {len(df)} строк")
 
             # Запуск параллельных расчётов всех индикаторов на этот таймфрейм
             tasks = []
             for iid in relevant_instances:
                 inst = indicator_instances[iid]
-                tasks.append(compute_and_store(iid, inst, symbol, df, int(timestamp), pg, redis))
+                precision = active_tickers.get(symbol, 8)
+                tasks.append(compute_and_store(iid, inst, symbol, df, int(timestamp), pg, redis, precision))
 
             await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
-
 # 🔸 Загрузка свечей через параллельные TS.RANGE по каждому ключу
-import asyncio
-
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
 
@@ -191,7 +189,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     fields = ["o", "h", "l", "c", "v"]
     keys = {field: f"ts:{symbol}:{interval}:{field}" for field in fields}
 
-    log.info(f"🔍 Запрос TS.RANGE по ключам: {list(keys.values())}, from={start_ts}, to={end_ts}")
+    log.debug(f"🔍 Запрос TS.RANGE по ключам: {list(keys.values())}, from={start_ts}, to={end_ts}")
 
     # Параллельная отправка запросов
     tasks = {
@@ -206,7 +204,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
         if isinstance(result, Exception):
             log.warning(f"Ошибка чтения {keys[field]}: {result}")
             continue
-        log.info(f"▶️ {keys[field]} — {len(result)} точек")
+        log.debug(f"▶️ {keys[field]} — {len(result)} точек")
         try:
             if result:
                 series[field] = {
@@ -216,7 +214,6 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
         except Exception as e:
             log.warning(f"Ошибка при обработке значений {keys[field]}: {e}")
 
-    import pandas as pd
     df = None
     for field, values in series.items():
         s = pd.Series(values)
@@ -241,7 +238,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
         log.warning(f"⛔ Недостаточно данных для {symbol}/{interval}: {len(df)} из {count} требуемых — расчёт пропущен")
         return None
     else:
-        log.info(f"🔹 Загружено {len(df)} свечей для {symbol}/{interval} (ожидалось {count})")
+        log.debug(f"🔹 Загружено {len(df)} свечей для {symbol}/{interval} (ожидалось {count})")
 
     return df
 # 🔸 Главная точка запуска
