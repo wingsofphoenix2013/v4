@@ -1,4 +1,5 @@
 # 🔸 indicators/compute_and_store.py
+
 import logging
 from indicators import ema  # пока только ema
 
@@ -30,4 +31,16 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     log.info(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
 
-    # 🔸 В будущем: сохранение в Redis, PG и Stream
+    # 🔸 Построение базового имени (label)
+    if "length" in params:
+        base = f"{indicator}{params['length']}"
+    else:
+        base = indicator
+
+    # 🔸 Сохранение результатов в Redis
+    for param, value in result.items():
+        param_name = f"{base}_{param}" if param != "value" else base
+        redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
+        await redis.set(redis_key, str(value))
+
+    # 🔸 В будущем: сохранение в PG и публикация в Stream
