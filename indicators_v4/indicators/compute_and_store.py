@@ -2,6 +2,7 @@
 
 import logging
 import pandas as pd
+import asyncio
 from indicators import ema  # пока только ema
 
 # 🔸 Сопоставление имён индикаторов с функциями
@@ -52,11 +53,15 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         # Redis TS для истории
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
         log.info(f"TS.ADD {ts_key} {ts} {value}")
-        tasks.append(redis.execute_command(
+        ts_add = redis.execute_command(
             "TS.ADD", ts_key, ts, str(value),
-            "RETENTION", 604800000,  # 7 дней
+            "RETENTION", 604800000,
             "DUPLICATE_POLICY", "last"
-        ))
+        )
+        if asyncio.iscoroutine(ts_add):
+            tasks.append(ts_add)
+        else:
+            log.warning(f"TS.ADD не вернул coroutine для {ts_key}")
 
         # Stream для core_io (по одному значению)
         log.info(f"XADD indicator_stream_core: {param_name}={value}")
