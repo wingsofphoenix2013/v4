@@ -1,6 +1,7 @@
 # 🔸 indicators/compute_and_store.py
 
 import logging
+import pandas as pd
 from indicators import ema  # пока только ema
 
 # 🔸 Сопоставление имён индикаторов с функциями
@@ -37,10 +38,46 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
     else:
         base = indicator
 
-    # 🔸 Сохранение результатов в Redis
+    tasks = []
+    open_time_iso = pd.to_datetime(ts, unit="ms").isoformat()
+
     for param, value in result.items():
         param_name = f"{base}_{param}" if param != "value" else base
-        redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
-        await redis.set(redis_key, str(value))
 
-    # 🔸 В будущем: сохранение в PG и публикация в Stream
+        # Redis key для быстрого доступа
+        redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
+        log.info(f"SET {redis_key} = {value}")
+        tasks.append(redis.set(redis_key, str(value)))
+
+        # Redis TS для истории
+        ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
+        log.info(f"TS.ADD {ts_key} {ts} {value}")
+        tasks.append(redis.execute_command(
+            "TS.ADD", ts_key, ts, str(value),
+            "RETENTION", 604800000,  # 7 дней
+            "DUPLICATE_POLICY", "last"
+        ))
+
+        # Stream для core_io (по одному значению)
+        log.info(f"XADD indicator_stream_core: {param_name}={value}")
+        tasks.append(redis.xadd("indicator_stream_core", {
+            "symbol": symbol,
+            "interval": timeframe,
+            "instance_id": str(instance_id),
+            "open_time": open_time_iso,
+            "param_name": param_name,
+            "value": str(value)
+        }))
+
+    # Stream для сигнала "готово" (по расчёту)
+    if stream:
+        log.info(f"XADD indicator_stream: {base} ready for {symbol}/{timeframe}")
+        tasks.append(redis.xadd("indicator_stream", {
+            "symbol": symbol,
+            "indicator": base,
+            "timeframe": timeframe,
+            "open_time": open_time_iso,
+            "status": "ready"
+        }))
+
+    await asyncio.gather(*tasks, return_exceptions=True)
