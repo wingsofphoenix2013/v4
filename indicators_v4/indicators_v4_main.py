@@ -176,6 +176,8 @@ async def watch_ohlcv_events(pg, redis):
             log.warning(f"Ошибка в ohlcv_channel: {e}")
 
 # 🔸 Загрузка свечей через параллельные TS.RANGE по каждому ключу
+import asyncio
+
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
 
@@ -214,17 +216,26 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
         except Exception as e:
             log.warning(f"Ошибка при обработке значений {keys[field]}: {e}")
 
-    index = sorted(set(ts for col in series.values() for ts in col))
-    df = pd.DataFrame(index=pd.to_datetime(index, unit='ms'))
+    import pandas as pd
+    df = None
     for field, values in series.items():
-        df[field] = pd.Series(values)
+        s = pd.Series(values)
+        s.index = pd.to_datetime(s.index, unit='ms')
+        s.name = field
+        if df is None:
+            df = s.to_frame()
+        else:
+            df = df.join(s, how="outer")
+
+    if df is None or df.empty:
+        log.warning(f"⛔ DataFrame пустой — расчёт пропущен")
+        return None
+
     df.index.name = "open_time"
     df = df.sort_index()
-    log.debug(f"df['c'].head(5): {df['c'].head(5).to_dict()}")
-    log.debug(f"df['c'].tail(5): {df['c'].tail(5).to_dict()}")
-    
+
     if "c" in df:
-        log.info(f"Пример значений 'c': {df['c'].dropna().head().tolist()}")
+        log.debug(f"Пример значений 'c': {df['c'].dropna().head().tolist()}")
 
     if len(df) < count:
         log.warning(f"⛔ Недостаточно данных для {symbol}/{interval}: {len(df)} из {count} требуемых — расчёт пропущен")
