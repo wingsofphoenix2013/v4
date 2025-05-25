@@ -3,9 +3,14 @@ import asyncio
 import logging
 
 from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
-from feed_and_aggregate import run_feed_and_aggregator, load_all_tickers, handle_ticker_events
 from core_io import run_core_io
 from markprice_watcher import run_markprice_watcher
+from feed_and_aggregate import (
+    run_feed_and_aggregator,
+    run_feed_and_aggregator_m5,
+    load_all_tickers,
+    handle_ticker_events
+)
 
 # 🔸 Главная точка запуска
 async def main():
