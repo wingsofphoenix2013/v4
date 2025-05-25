@@ -38,7 +38,7 @@ async def watch_mark_price(symbol, redis, state):
                         rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
 
                         await redis.set(f"price:{symbol}", rounded)
-                        log.info(f"[{symbol}] Обновление markPrice: {rounded}")
+                        log.debug(f"[{symbol}] Обновление markPrice: {rounded}")
 
                     except (InvalidOperation, ValueError, TypeError) as e:
                         log.warning(f"[{symbol}] Ошибка обработки markPrice: {type(e)}")
