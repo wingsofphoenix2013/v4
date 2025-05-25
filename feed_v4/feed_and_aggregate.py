@@ -1,6 +1,7 @@
 # feed_and_aggregate.py — основной агрегатор свечей M1 + агрегация M5/M15 + контроль тикеров
 import asyncio
 import logging
+import time
 from asyncpg import Pool
 from redis.asyncio import Redis
 from datetime import datetime
@@ -12,7 +13,7 @@ async def load_all_tickers(pg: Pool):
     async with pg.acquire() as conn:
         rows = await conn.fetch("SELECT symbol, precision_price, precision_qty FROM tickers_v4")
 
-    now = asyncio.get_event_loop().time()
+    now = time.time()
     tickers = {}
     active = set()
     activated_at = {}
@@ -64,7 +65,7 @@ async def handle_ticker_events(redis: Redis, state: dict, pg: Pool, refresh_queu
 
                 if action == "enabled" and symbol in state["tickers"]:
                     state["active"].add(symbol)
-                    ts = asyncio.get_event_loop().time()
+                    ts = time.time()
                     state["activated_at"][symbol] = ts
                     log.info(f"[{symbol}] Активирован тикер — activated_at={datetime.utcfromtimestamp(ts).isoformat()}Z")
                     await refresh_queue.put("refresh")

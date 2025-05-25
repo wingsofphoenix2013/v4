@@ -17,11 +17,11 @@ async def main():
     redis = await init_redis_client()
 
     # Загрузка тикеров и состояния
-    tickers, active = await load_all_tickers(pg)
+    tickers, active, activated_at = await load_all_tickers(pg)
     state = {
         "tickers": tickers,
         "active": active,
-        "activated_at": {},
+        "activated_at": activated_at,
         "markprice_tasks": {},
     }
     refresh_queue = asyncio.Queue()
