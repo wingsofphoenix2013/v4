@@ -38,7 +38,14 @@ async def load_all_tickers(pg: Pool):
     return tickers, active, activated_at
 
 # 🔸 Отслеживание включения/выключения тикеров через Redis Stream
-async def handle_ticker_events(redis: Redis, state: dict, pg: Pool, refresh_queue: asyncio.Queue):
+async def handle_ticker_events(
+    redis: Redis,
+    state: dict,
+    pg: Pool,
+    refresh_queue_m1: asyncio.Queue,
+    refresh_queue_m5: asyncio.Queue,
+    refresh_queue_m15: asyncio.Queue
+):
     group = "aggregator_group"
     stream = "tickers_status_stream"
 
@@ -75,12 +82,16 @@ async def handle_ticker_events(redis: Redis, state: dict, pg: Pool, refresh_queu
                     ts = time.time()
                     state["activated_at"][symbol] = ts
                     log.info(f"[{symbol}] Активирован тикер — activated_at={datetime.utcfromtimestamp(ts).isoformat()}Z")
-                    await refresh_queue.put("refresh")
+                    await refresh_queue_m1.put("refresh")
+                    await refresh_queue_m5.put("refresh")
+                    await refresh_queue_m15.put("refresh")
 
                 elif action == "disabled" and symbol in state["active"]:
                     state["active"].remove(symbol)
                     log.info(f"[{symbol}] Деактивирован тикер")
-                    await refresh_queue.put("refresh")
+                    await refresh_queue_m1.put("refresh")
+                    await refresh_queue_m5.put("refresh")
+                    await refresh_queue_m15.put("refresh")
 
 # 🔸 Разбиение тикеров на группы
 def chunked(iterable, size):
@@ -184,3 +195,37 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
             task = state["m5_tasks"].pop(group_key)
             task.cancel()
             log.info(f"[KLINE:M5:{group_key}] Поток остановлен — тикеры неактивны")
+# 🔸 M15: Реактивный запуск и логирование M15 свечей
+async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
+    log.info("🔸 Запуск приёма M15 свечей")
+    queue = asyncio.Queue()
+    state["m15_tasks"] = {}
+
+    for _ in range(2):
+        asyncio.create_task(kline_worker(queue, interval="M15"))
+
+    await refresh_queue.put("initial-m15")
+
+    while True:
+        await refresh_queue.get()
+        log.info("🔁 [M15] Пересборка групп WebSocket")
+
+        active_symbols = sorted(state["active"])
+        log.info(f"[M15] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
+
+        new_groups = {
+            f"M15:{','.join(group)}": group
+            for group in chunked(active_symbols, 3)
+        }
+        current_groups = set(state["m15_tasks"].keys())
+        desired_groups = set(new_groups.keys())
+
+        for group_key in desired_groups - current_groups:
+            group_symbols = new_groups[group_key]
+            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue, interval="15m"))
+            state["m15_tasks"][group_key] = task
+
+        for group_key in current_groups - desired_groups:
+            task = state["m15_tasks"].pop(group_key)
+            task.cancel()
+            log.info(f"[KLINE:M15:{group_key}] Поток остановлен — тикеры неактивны")
