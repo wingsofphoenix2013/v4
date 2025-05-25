@@ -23,6 +23,8 @@ async def main():
         "active": active,
         "activated_at": activated_at,
         "markprice_tasks": {},
+        "kline_tasks": {},   # для @kline_1m
+        "m5_tasks": {},      # для @kline_5m
     }
     refresh_queue = asyncio.Queue()
 
@@ -30,6 +32,7 @@ async def main():
     await asyncio.gather(
         run_safe_loop(lambda: handle_ticker_events(redis, state, pg, refresh_queue), "TICKER_EVENTS"),
         run_safe_loop(lambda: run_feed_and_aggregator(state, redis, pg, refresh_queue), "FEED+AGGREGATOR"),
+        run_safe_loop(lambda: run_feed_and_aggregator_m5(state, redis, pg, refresh_queue), "FEED+AGGREGATOR:M5"),
         run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
         run_safe_loop(lambda: run_markprice_watcher(state, redis), "MARKPRICE")
     )
