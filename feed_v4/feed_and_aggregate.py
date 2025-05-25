@@ -7,6 +7,7 @@ from asyncpg import Pool
 from redis.asyncio import Redis
 from datetime import datetime
 from websockets import connect
+from itertools import islice
 
 log = logging.getLogger("FEED+AGGREGATOR")
 
@@ -84,7 +85,7 @@ async def handle_ticker_events(redis: Redis, state: dict, pg: Pool, refresh_queu
 # 🔸 Разбиение тикеров на группы
 def chunked(iterable, size):
     it = iter(iterable)
-    while chunk := list([*it][:size]):
+    while chunk := list(islice(it, size)):
         yield chunk
 
 # 🔸 Подключение к WebSocket Binance по группе тикеров
@@ -132,6 +133,7 @@ async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: 
         log.info("🔁 Пересборка групп WebSocket после изменения активных тикеров")
 
         active_symbols = sorted(state["active"])
+        log.info(f"[M1] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
         new_groups = {
             ",".join(group): group
             for group in chunked(active_symbols, 3)
@@ -165,6 +167,7 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
         log.info("🔁 [M5] Пересборка групп WebSocket")
 
         active_symbols = sorted(state["active"])
+        log.info(f"[M5] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
         new_groups = {
             ",".join(group): group
             for group in chunked(active_symbols, 3)
