@@ -11,7 +11,7 @@ log = logging.getLogger("FEED+AGGREGATOR")
 # 🔸 Загрузка всех тикеров из БД
 async def load_all_tickers(pg: Pool):
     async with pg.acquire() as conn:
-        rows = await conn.fetch("SELECT symbol, precision_price, precision_qty FROM tickers_v4")
+        rows = await conn.fetch("SELECT symbol, precision_price, precision_qty, status FROM tickers_v4")
 
     now = time.time()
     tickers = {}
@@ -24,9 +24,13 @@ async def load_all_tickers(pg: Pool):
             "precision_price": row["precision_price"],
             "precision_qty": row["precision_qty"]
         }
-        active.add(symbol.lower())
-        activated_at[symbol] = now
-        log.info(f"[{symbol}] Активен по умолчанию — activated_at={datetime.utcfromtimestamp(now).isoformat()}Z")
+
+        if row["status"] == "enabled":
+            active.add(symbol)
+            activated_at[symbol] = now
+            log.info(f"[{symbol}] Активен по умолчанию — activated_at={datetime.utcfromtimestamp(now).isoformat()}Z")
+        else:
+            log.info(f"[{symbol}] Неактивен по умолчанию")
 
     return tickers, active, activated_at
 
