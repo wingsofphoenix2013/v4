@@ -138,7 +138,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
     await safe_ts_add(f"ts:{symbol}:m1:c", c, "c")
     await safe_ts_add(f"ts:{symbol}:m1:v", v, "v")
 
-    log.info(f"[{symbol}] M1 TS сохранена: ts={ts} O={o} H={h} L={l} C={c} V={v}")
+    log.info(f"[{symbol}] M1 TS записана в Redis: open_time={open_time}, завершено={datetime.utcnow()}")
 
     # Публикация в Stream (полная свеча)
     stream_event = {
@@ -152,6 +152,7 @@ async def store_and_publish_m1(redis, symbol, open_time, kline, precision_price,
         "v": str(v)
     }
     await redis.xadd("ohlcv_stream", stream_event)
+    log.info(f"[{symbol}] M1 отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
 
     # Публикация в Pub/Sub (только уведомление)
     pubsub_event = {
@@ -226,7 +227,7 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
     await safe_ts_add(redis, f"ts:{symbol}:m5:c", m5_ts, c, "c", symbol, "m5")
     await safe_ts_add(redis, f"ts:{symbol}:m5:v", m5_ts, v, "v", symbol, "m5")
 
-    log.info(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+    log.debug(f"[{symbol}] Построена M5: {datetime.utcfromtimestamp(m5_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
 
     # Stream: полная свеча
     stream_event = {
@@ -250,7 +251,7 @@ async def try_aggregate_m5(redis, symbol, base_time, state):
     await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
 # 🔸 Асинхронный аудит M5: ждёт появления недостающих M1 и собирает M5
 async def m5_auditor(symbol, base_time, redis, state):
-    log.info("Я тут: m15_auditor")
+    log.debug("Я тут: m15_auditor")
 # 🔸 Построение свечи M15 из 15 M1 в RedisTimeSeries
 async def try_aggregate_m15(redis, symbol, base_time, state):
     end_ts = int(base_time.timestamp() * 1000) + 14 * 60_000 + 1
@@ -308,7 +309,7 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     await safe_ts_add(redis, f"ts:{symbol}:m15:c", m15_ts, c, "c", symbol, "m15")
     await safe_ts_add(redis, f"ts:{symbol}:m15:v", m15_ts, v, "v", symbol, "m15")
 
-    log.info(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
+    log.debug(f"[{symbol}] Построена M15: {datetime.utcfromtimestamp(m15_ts / 1000)} O:{o} H:{h} L:{l} C:{c}")
 
     stream_event = {
         "symbol": symbol,
@@ -330,7 +331,7 @@ async def try_aggregate_m15(redis, symbol, base_time, state):
     await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
 # 🔸 Асинхронный аудит M15: ждёт появления недостающих M1 и собирает M15
 async def m15_auditor(symbol, base_time, redis, state):
-    log.info("Я тут: m15_auditor")
+    log.debug("Я тут: m15_auditor")
 # 🔸 Поиск пропущенных M1 и запись в missing_m1_log_v4 + system_log_v4
 async def detect_missing_m1(redis, pg, symbol, now_ts, state):
     depth_minutes = 15
@@ -484,6 +485,7 @@ async def listen_kline_stream(redis, state, refresh_queue):
                                 continue
                             symbol = kline["s"]
                             open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
+                            log.info(f"[{symbol}] Получена закрытая свеча M1: {open_time} в {now}")
 
                             await store_and_publish_m1(
                                 redis,

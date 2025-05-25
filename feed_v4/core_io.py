@@ -59,14 +59,17 @@ async def run_core_io(pg, redis):
                                 ON CONFLICT (symbol, open_time) DO NOTHING
                             """, symbol, open_time, o, h, l, c, v)
 
-                            log.info(f"Вставлена запись в {table}: {symbol} @ {open_time.isoformat()} [{interval.upper()}]")
+                            log.info(
+                                f"Вставлена запись в {table}: {symbol} @ {open_time.isoformat()} "
+                                f"[{interval.upper()}] вставлено={datetime.utcnow().isoformat()}"
+                            )
 
                             deleted = await conn.execute(f"""
                                 DELETE FROM {table}
                                 WHERE open_time < (NOW() - INTERVAL '30 days')
                             """)
 
-                            log.info(f"Удалено старых записей из {table}: {deleted}")
+                            log.debug(f"Удалено старых записей из {table}: {deleted}")
         except Exception as e:
             # 🔸 Обработка исключений и логирование
             log.error(f"Ошибка: {e}", exc_info=True)
