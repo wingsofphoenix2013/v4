@@ -135,7 +135,7 @@ async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: 
         active_symbols = sorted(state["active"])
         log.info(f"[M1] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
         new_groups = {
-            ",".join(group): group
+            f"M1:{','.join(group)}": group
             for group in chunked(active_symbols, 3)
         }
         current_groups = set(state["kline_tasks"].keys())
@@ -169,7 +169,7 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
         active_symbols = sorted(state["active"])
         log.info(f"[M5] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
         new_groups = {
-            ",".join(group): group
+            f"M5:{','.join(group)}": group
             for group in chunked(active_symbols, 3)
         }
         current_groups = set(state["m5_tasks"].keys())
