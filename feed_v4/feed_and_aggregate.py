@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from datetime import datetime
 from websockets import connect
 from itertools import islice
+from decimal import Decimal, ROUND_DOWN
 
 log = logging.getLogger("FEED+AGGREGATOR")
 
