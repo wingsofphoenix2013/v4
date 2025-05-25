@@ -1,4 +1,4 @@
-# feed_and_aggregate.py — приём и логирование M1 свечей с реактивным управлением
+# feed_and_aggregate.py — приём и логирование M1 и M5 свечей с реактивным управлением
 import asyncio
 import logging
 import time
@@ -88,8 +88,8 @@ def chunked(iterable, size):
         yield chunk
 
 # 🔸 Подключение к WebSocket Binance по группе тикеров
-async def listen_kline_stream(group_key, symbols, queue):
-    stream_names = [f"{s.lower()}@kline_1m" for s in symbols]
+async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
+    stream_names = [f"{s.lower()}@kline_{interval}" for s in symbols]
     stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(stream_names)}"
 
     try:
@@ -105,25 +105,25 @@ async def listen_kline_stream(group_key, symbols, queue):
         log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
 
 # 🔸 Воркер для логирования свечей
-async def kline_worker(queue):
+async def kline_worker(queue, interval="M1"):
     while True:
         kline = await queue.get()
         try:
             symbol = kline["s"]
             open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
             received_time = datetime.utcnow()
-            log.info(f"[M1] {symbol} @ {open_time.isoformat()} получена в {received_time.isoformat()}Z")
+            log.info(f"[{interval}] {symbol} @ {open_time.isoformat()} получена в {received_time.isoformat()}Z")
         except Exception as e:
             log.warning(f"Ошибка при логировании kline: {e}", exc_info=True)
 
-# 🔸 Реактивный запуск и управление WebSocket-группами по активным тикерам
+# 🔸 M1: Реактивный запуск и управление WebSocket-группами
 async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.info("🔸 Запуск приёма M1 свечей с реактивным управлением")
     queue = asyncio.Queue()
     state["kline_tasks"] = {}
 
     for _ in range(5):
-        asyncio.create_task(kline_worker(queue))
+        asyncio.create_task(kline_worker(queue, interval="M1"))
 
     await refresh_queue.put("initial")
 
@@ -134,19 +134,50 @@ async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: 
         active_symbols = sorted(state["active"])
         new_groups = {
             ",".join(group): group
-            for group in chunked(active_symbols, 10)
+            for group in chunked(active_symbols, 3)
         }
         current_groups = set(state["kline_tasks"].keys())
         desired_groups = set(new_groups.keys())
 
-        # Запустить недостающие
         for group_key in desired_groups - current_groups:
             group_symbols = new_groups[group_key]
-            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue))
+            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue, interval="1m"))
             state["kline_tasks"][group_key] = task
 
-        # Остановить лишние
         for group_key in current_groups - desired_groups:
             task = state["kline_tasks"].pop(group_key)
             task.cancel()
             log.info(f"[KLINE:{group_key}] Поток остановлен — тикеры неактивны")
+
+# 🔸 M5: Реактивный запуск и логирование M5 свечей
+async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
+    log.info("🔸 Запуск приёма M5 свечей")
+    queue = asyncio.Queue()
+    state["m5_tasks"] = {}
+
+    for _ in range(2):
+        asyncio.create_task(kline_worker(queue, interval="M5"))
+
+    await refresh_queue.put("initial-m5")
+
+    while True:
+        await refresh_queue.get()
+        log.info("🔁 [M5] Пересборка групп WebSocket")
+
+        active_symbols = sorted(state["active"])
+        new_groups = {
+            ",".join(group): group
+            for group in chunked(active_symbols, 3)
+        }
+        current_groups = set(state["m5_tasks"].keys())
+        desired_groups = set(new_groups.keys())
+
+        for group_key in desired_groups - current_groups:
+            group_symbols = new_groups[group_key]
+            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue, interval="5m"))
+            state["m5_tasks"][group_key] = task
+
+        for group_key in current_groups - desired_groups:
+            task = state["m5_tasks"].pop(group_key)
+            task.cancel()
+            log.info(f"[KLINE:M5:{group_key}] Поток остановлен — тикеры неактивны")
