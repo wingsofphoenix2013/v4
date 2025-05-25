@@ -1,4 +1,4 @@
-# feed_and_aggregate.py — приём и логирование M1 свечей без Redis
+# feed_and_aggregate.py — приём и логирование M1 свечей с реактивным управлением
 import asyncio
 import logging
 import time
@@ -81,32 +81,30 @@ async def handle_ticker_events(redis: Redis, state: dict, pg: Pool, refresh_queu
                     log.info(f"[{symbol}] Деактивирован тикер")
                     await refresh_queue.put("refresh")
 
-# 🔸 Вспомогательная функция для разбиения тикеров на группы
+# 🔸 Разбиение тикеров на группы
 def chunked(iterable, size):
     it = iter(iterable)
     while chunk := list([*it][:size]):
         yield chunk
 
-# 🔸 WebSocket-приём закрытых M1-свечей
-async def listen_kline_stream(symbols, state, queue):
+# 🔸 Подключение к WebSocket Binance по группе тикеров
+async def listen_kline_stream(group_key, symbols, queue):
     stream_names = [f"{s.lower()}@kline_1m" for s in symbols]
     stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(stream_names)}"
 
-    while True:
-        try:
-            async with connect(stream_url) as ws:
-                log.info(f"[KLINE] Подключено к WebSocket: {stream_url}")
-                async for msg in ws:
-                    data = json.loads(msg)
-                    kline = data.get("data", {}).get("k")
-                    if not kline or not kline.get("x"):
-                        continue
-                    await queue.put(kline)
-        except Exception as e:
-            log.error(f"Ошибка WebSocket: {e}", exc_info=True)
-            await asyncio.sleep(5)
+    try:
+        async with connect(stream_url) as ws:
+            log.info(f"[KLINE:{group_key}] Подключено к WebSocket: {stream_url}")
+            async for msg in ws:
+                data = json.loads(msg)
+                kline = data.get("data", {}).get("k")
+                if not kline or not kline.get("x"):
+                    continue
+                await queue.put(kline)
+    except Exception as e:
+        log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
 
-# 🔸 Воркер для логирования полученных свечей
+# 🔸 Воркер для логирования свечей
 async def kline_worker(queue):
     while True:
         kline = await queue.get()
@@ -118,16 +116,37 @@ async def kline_worker(queue):
         except Exception as e:
             log.warning(f"Ошибка при логировании kline: {e}", exc_info=True)
 
-# 🔸 Главный запуск: логирование M1 без Redis
+# 🔸 Реактивный запуск и управление WebSocket-группами по активным тикерам
 async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
-    log.info("🔸 Запуск приёма M1 свечей (log-only mode)")
+    log.info("🔸 Запуск приёма M1 свечей с реактивным управлением")
     queue = asyncio.Queue()
-
-    for group in chunked(sorted(state["active"]), 10):
-        asyncio.create_task(listen_kline_stream(group, state, queue))
+    state["kline_tasks"] = {}
 
     for _ in range(5):
         asyncio.create_task(kline_worker(queue))
 
+    await refresh_queue.put("initial")
+
     while True:
-        await asyncio.sleep(60)
+        await refresh_queue.get()
+        log.info("🔁 Пересборка групп WebSocket после изменения активных тикеров")
+
+        active_symbols = sorted(state["active"])
+        new_groups = {
+            ",".join(group): group
+            for group in chunked(active_symbols, 10)
+        }
+        current_groups = set(state["kline_tasks"].keys())
+        desired_groups = set(new_groups.keys())
+
+        # Запустить недостающие
+        for group_key in desired_groups - current_groups:
+            group_symbols = new_groups[group_key]
+            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue))
+            state["kline_tasks"][group_key] = task
+
+        # Остановить лишние
+        for group_key in current_groups - desired_groups:
+            task = state["kline_tasks"].pop(group_key)
+            task.cancel()
+            log.info(f"[KLINE:{group_key}] Поток остановлен — тикеры неактивны")
