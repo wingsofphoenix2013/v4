@@ -12,7 +12,11 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 # 🔸 Подключение к PostgreSQL
 async def init_pg_pool():
-    return await asyncpg.create_pool(DATABASE_URL)
+    return await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=10,
+        max_size=20  # Соответствует максимальному числу параллельных вставок в run_core_io
+    )
 
 # 🔸 Подключение к Redis
 def init_redis_client():
