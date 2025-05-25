@@ -76,7 +76,7 @@ async def handle_ticker_events(
                                 "precision_price": row["precision_price"],
                                 "precision_qty": row["precision_qty"]
                             }
-                            log.info(f"[{symbol}] Добавлен тикер из БД")
+                            log.debug(f"[{symbol}] Добавлен тикер из БД")
 
                 if action == "enabled" and symbol in state["tickers"]:
                     state["active"].add(symbol)
@@ -107,7 +107,7 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
 
     try:
         async with connect(stream_url) as ws:
-            log.info(f"[KLINE:{group_key}] Подключено к WebSocket: {stream_url}")
+            log.debug(f"[KLINE:{group_key}] Подключено к WebSocket: {stream_url}")
             async for msg in ws:
                 data = json.loads(msg)
                 kline = data.get("data", {}).get("k")
@@ -179,7 +179,7 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
         safe_ts_add(f"ts:{symbol}:{interval}:v", v, "v"),
     )
 
-    log.info(f"[{symbol}] {interval.upper()} TS записана: open_time={open_time}, завершено={datetime.utcnow()}")
+    log.debug(f"[{symbol}] {interval.upper()} TS записана: open_time={open_time}, завершено={datetime.utcnow()}")
 
     # Публикация в Redis Stream (для core_io)
     stream_event = {
@@ -193,7 +193,7 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
         "v": str(v),
     }
     await redis.xadd("ohlcv_stream", stream_event)
-    log.info(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
+    log.debug(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
 
     # Уведомление через Pub/Sub
     pubsub_event = {
@@ -204,7 +204,7 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
     await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
 # 🔸 M1: Реактивный запуск и управление WebSocket-группами
 async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
-    log.info("🔸 Запуск приёма M1 свечей с реактивным управлением")
+    log.debug("🔸 Запуск приёма M1 свечей с реактивным управлением")
     queue = asyncio.Queue()
     state["kline_tasks"] = {}
 
@@ -215,7 +215,7 @@ async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: 
 
     while True:
         await refresh_queue.get()
-        log.info("🔁 Пересборка групп WebSocket после изменения активных тикеров")
+        log.debug("🔁 Пересборка групп WebSocket после изменения активных тикеров")
 
         active_symbols = sorted(state["active"])
         log.info(f"[M1] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
@@ -234,11 +234,11 @@ async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: 
         for group_key in current_groups - desired_groups:
             task = state["kline_tasks"].pop(group_key)
             task.cancel()
-            log.info(f"[KLINE:{group_key}] Поток остановлен — тикеры неактивны")
+            log.debug(f"[KLINE:{group_key}] Поток остановлен — тикеры неактивны")
 
 # 🔸 M5: Реактивный запуск и логирование M5 свечей
 async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
-    log.info("🔸 Запуск приёма M5 свечей")
+    log.debug("🔸 Запуск приёма M5 свечей")
     queue = asyncio.Queue()
     state["m5_tasks"] = {}
 
@@ -249,7 +249,7 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
 
     while True:
         await refresh_queue.get()
-        log.info("🔁 [M5] Пересборка групп WebSocket")
+        log.debug("🔁 [M5] Пересборка групп WebSocket")
 
         active_symbols = sorted(state["active"])
         log.info(f"[M5] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
@@ -268,10 +268,10 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
         for group_key in current_groups - desired_groups:
             task = state["m5_tasks"].pop(group_key)
             task.cancel()
-            log.info(f"[KLINE:M5:{group_key}] Поток остановлен — тикеры неактивны")
+            log.debug(f"[KLINE:M5:{group_key}] Поток остановлен — тикеры неактивны")
 # 🔸 M15: Реактивный запуск и логирование M15 свечей
 async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
-    log.info("🔸 Запуск приёма M15 свечей")
+    log.debug("🔸 Запуск приёма M15 свечей")
     queue = asyncio.Queue()
     state["m15_tasks"] = {}
 
@@ -282,7 +282,7 @@ async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_que
 
     while True:
         await refresh_queue.get()
-        log.info("🔁 [M15] Пересборка групп WebSocket")
+        log.debug("🔁 [M15] Пересборка групп WebSocket")
 
         active_symbols = sorted(state["active"])
         log.info(f"[M15] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
@@ -302,4 +302,4 @@ async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_que
         for group_key in current_groups - desired_groups:
             task = state["m15_tasks"].pop(group_key)
             task.cancel()
-            log.info(f"[KLINE:M15:{group_key}] Поток остановлен — тикеры неактивны")
+            log.debug(f"[KLINE:M15:{group_key}] Поток остановлен — тикеры неактивны")
