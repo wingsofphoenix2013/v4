@@ -485,7 +485,7 @@ async def listen_kline_stream(redis, state, refresh_queue):
                                 continue
                             symbol = kline["s"]
                             open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
-                            log.info(f"[{symbol}] Получена закрытая свеча M1: {open_time} в {now}")
+                            log.info(f"[{symbol}] Получена закрытая свеча M1: {open_time} в {datetime.utcnow()}")
 
                             await store_and_publish_m1(
                                 redis,
