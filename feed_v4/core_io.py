@@ -32,7 +32,7 @@ async def run_core_io(pg, redis):
                 ts_int = int(data["timestamp"]) // 1000
                 open_time = datetime.utcfromtimestamp(ts_int)
             except Exception as e:
-                log.warning(f"\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u0435\u043e\u0431\u0440\u0430\u0437\u043e\u0432\u0430\u043d\u0438\u044f timestamp: {data.get('timestamp')} → {e}")
+                log.warning(f"Ошибка преобразования timestamp: {data.get('timestamp')} → {e}")
                 return
 
             try:

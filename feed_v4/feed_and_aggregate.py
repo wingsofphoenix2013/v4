@@ -116,18 +116,91 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
     except Exception as e:
         log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
 
-# 🔸 Воркер для логирования свечей
-async def kline_worker(queue, interval="M1"):
+# 🔸 Воркер для обработки свечей
+async def kline_worker(queue, state, redis, interval="M1"):
     while True:
         kline = await queue.get()
         try:
             symbol = kline["s"]
             open_time = datetime.utcfromtimestamp(kline["t"] / 1000)
-            received_time = datetime.utcnow()
-            log.info(f"[{interval}] {symbol} @ {open_time.isoformat()} получена в {received_time.isoformat()}Z")
-        except Exception as e:
-            log.warning(f"Ошибка при логировании kline: {e}", exc_info=True)
 
+            precision_price = state["tickers"][symbol]["precision_price"]
+            precision_qty = state["tickers"][symbol]["precision_qty"]
+
+            await store_and_publish_kline(
+                redis=redis,
+                symbol=symbol,
+                open_time=open_time,
+                kline=kline,
+                interval=interval.lower(),  # для key/stream
+                precision_price=precision_price,
+                precision_qty=precision_qty
+            )
+        except Exception as e:
+            log.warning(f"[{interval}] Ошибка обработки свечи {symbol}: {e}", exc_info=True)
+# 🔸 Универсальная функция сохранения в Redis
+async def store_and_publish_kline(redis, symbol, open_time, kline, interval, precision_price, precision_qty):
+    ts = int(open_time.timestamp() * 1000)
+    
+    # Цены используем как есть (уже округлены), просто приводим к float
+    o = float(kline["o"])
+    h = float(kline["h"])
+    l = float(kline["l"])
+    c = float(kline["c"])
+    
+    # Объём округляем вручную по precision_qty
+    v = float(Decimal(kline["v"]).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN))
+
+    async def safe_ts_add(field_key, value, field_name):
+        try:
+            await redis.execute_command("TS.ADD", field_key, ts, value)
+        except Exception as e:
+            if "TSDB: the key does not exist" in str(e):
+                await redis.execute_command(
+                    "TS.CREATE", field_key,
+                    "RETENTION", 604800000,  # 7 дней
+                    "DUPLICATE_POLICY", "last",
+                    "LABELS",
+                    "symbol", symbol,
+                    "interval", interval,
+                    "field", field_name
+                )
+                await redis.execute_command("TS.ADD", field_key, ts, value)
+            else:
+                raise
+
+    # Параллельная запись 5 полей в TS
+    await asyncio.gather(
+        safe_ts_add(f"ts:{symbol}:{interval}:o", o, "o"),
+        safe_ts_add(f"ts:{symbol}:{interval}:h", h, "h"),
+        safe_ts_add(f"ts:{symbol}:{interval}:l", l, "l"),
+        safe_ts_add(f"ts:{symbol}:{interval}:c", c, "c"),
+        safe_ts_add(f"ts:{symbol}:{interval}:v", v, "v"),
+    )
+
+    log.info(f"[{symbol}] {interval.upper()} TS записана: open_time={open_time}, завершено={datetime.utcnow()}")
+
+    # Публикация в Redis Stream (для core_io)
+    stream_event = {
+        "symbol": symbol,
+        "interval": interval,
+        "timestamp": str(ts),
+        "o": str(o),
+        "h": str(h),
+        "l": str(l),
+        "c": str(c),
+        "v": str(v),
+    }
+    await redis.xadd("ohlcv_stream", stream_event)
+    log.info(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
+
+    # Уведомление через Pub/Sub
+    pubsub_event = {
+        "symbol": symbol,
+        "interval": interval,
+        "timestamp": str(ts)
+    }
+    await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
 # 🔸 M1: Реактивный запуск и управление WebSocket-группами
 async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.info("🔸 Запуск приёма M1 свечей с реактивным управлением")
@@ -135,7 +208,7 @@ async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: 
     state["kline_tasks"] = {}
 
     for _ in range(5):
-        asyncio.create_task(kline_worker(queue, interval="M1"))
+        asyncio.create_task(kline_worker(queue, state, redis, interval="M1"))
 
     await refresh_queue.put("initial")
 
@@ -169,7 +242,7 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
     state["m5_tasks"] = {}
 
     for _ in range(2):
-        asyncio.create_task(kline_worker(queue, interval="M5"))
+        asyncio.create_task(kline_worker(queue, state, redis, interval="M5"))
 
     await refresh_queue.put("initial-m5")
 
@@ -202,7 +275,7 @@ async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_que
     state["m15_tasks"] = {}
 
     for _ in range(2):
-        asyncio.create_task(kline_worker(queue, interval="M15"))
+        asyncio.create_task(kline_worker(queue, state, redis, interval="M15"))
 
     await refresh_queue.put("initial-m15")
 
