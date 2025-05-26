@@ -247,7 +247,8 @@ async def main():
     await asyncio.gather(
         watch_ticker_updates(pg, redis),
         watch_indicator_updates(pg, redis),
-        watch_ohlcv_events(pg, redis)
+        watch_ohlcv_events(pg, redis),
+        run_core_io(pg, redis) 
     )
 
 if __name__ == "__main__":
