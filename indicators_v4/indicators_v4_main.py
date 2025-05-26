@@ -120,7 +120,37 @@ async def watch_indicator_updates(pg, redis):
                 log.info(f"🔁 stream_publish обновлён: id={iid} → {action}")
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
+# 🔸 Подписка на ohlcv_channel — проверка передачи precision
+async def watch_ohlcv_events(pg, redis):
+    log = logging.getLogger("OHLCV_EVENTS")
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("ohlcv_channel")
+    log.info("Подписка на канал ohlcv_channel")
 
+    async for msg in pubsub.listen():
+        if msg["type"] != "message":
+            continue
+        try:
+            data = json.loads(msg["data"])
+            symbol = data.get("symbol")
+            interval = data.get("interval")
+            timestamp = data.get("timestamp")
+
+            if symbol not in active_tickers:
+                log.debug(f"Пропущено: неактивный тикер {symbol}")
+                continue
+
+            precision = active_tickers.get(symbol, 8)
+            log.info(f"[TRACE] preparing compute for {symbol} → precision={precision}")
+
+            for iid, inst in indicator_instances.items():
+                if inst["timeframe"] != interval:
+                    continue
+                await compute_and_store(iid, inst, symbol, None, int(timestamp), pg, redis, precision)
+
+        except Exception as e:
+            log.warning(f"Ошибка в ohlcv_channel: {e}")
+            
 # 🔸 Точка входа
 async def main():
     setup_logging()
@@ -132,7 +162,8 @@ async def main():
 
     await asyncio.gather(
         watch_ticker_updates(pg, redis),
-        watch_indicator_updates(pg, redis)
+        watch_indicator_updates(pg, redis),
+        watch_ohlcv_events(pg, redis)
     )
 
 if __name__ == "__main__":
