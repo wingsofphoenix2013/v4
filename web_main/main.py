@@ -1,5 +1,4 @@
 # main.py — стартовая точка FastAPI приложения для UI движка v4
-
 import os
 from decimal import Decimal
 import redis.asyncio as aioredis
@@ -13,7 +12,12 @@ from starlette.status import HTTP_303_SEE_OTHER
 import asyncpg
 from fastapi import Form
 
-# 🔸 Режим отладки
+# 🔸 Переменные окружения
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 # 🔸 Централизованная настройка логирования
