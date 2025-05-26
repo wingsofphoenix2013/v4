@@ -283,3 +283,7 @@ async def create_indicator(
             )
 
     return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
+# 🔸 Страница сигналов
+@app.get("/signals", response_class=HTMLResponse)
+async def signals_page(request: Request):
+    return templates.TemplateResponse("signals.html", {"request": request})
