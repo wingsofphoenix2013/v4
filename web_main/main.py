@@ -371,3 +371,36 @@ async def create_signal(
         """, name, long_phrase, short_phrase, timeframe, source, description, enabled_bool)
 
     return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 Приём сигналов от TradingView (формат JSON, v4)
+@app.post("/webhook_v4")
+async def webhook_v4(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    message = payload.get("message")
+    symbol = payload.get("symbol")
+    bar_time = payload.get("time")
+    sent_at = payload.get("sent_at")
+
+    if not message or not symbol:
+        raise HTTPException(status_code=422, detail="Missing 'message' or 'symbol'")
+
+    # 🔹 Очистка тикера от постфикса .P
+    if symbol.endswith(".P"):
+        symbol = symbol[:-2]
+
+    received_at = datetime.utcnow().isoformat()
+
+    logging.info(f"Webhook V4: {message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
+
+    await redis_client.xadd("signals_stream", {
+        "message": message,
+        "symbol": symbol,
+        "bar_time": bar_time or "",
+        "sent_at": sent_at or "",
+        "received_at": received_at
+    })
+
+    return JSONResponse({"status": "ok", "received_at": received_at})
