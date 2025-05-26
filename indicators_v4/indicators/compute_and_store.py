@@ -30,8 +30,13 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         return
 
     try:
-        raw_result = compute_fn(df, params)  # {'value': float, ...}
-        result = {k: round(v, precision) for k, v in raw_result.items()}
+        raw_result = compute_fn(df, params)
+        result = {}
+        for k, v in raw_result.items():
+            if "angle" in k:
+                result[k] = round(v, 5)
+            else:
+                result[k] = round(v, precision)
     except Exception as e:
         log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")
         return
@@ -50,16 +55,22 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
     for param, value in result.items():
         param_name = f"{base}_{param}" if param != "value" else base
 
-        # Redis key для быстрого доступа
-        redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
-        log.debug(f"SET {redis_key} = {value}")
-        tasks.append(redis.set(redis_key, str(value)))
+        # 🔸 Форматирование строкового значения строго по precision
+        if "angle" in param:
+            str_value = f"{value:.5f}"
+        else:
+            str_value = f"{value:.{precision}f}"
 
-        # Redis TS для истории
+        # Redis key
+        redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
+        log.debug(f"SET {redis_key} = {str_value}")
+        tasks.append(redis.set(redis_key, str_value))
+
+        # Redis TS
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
-        log.debug(f"TS.ADD {ts_key} {ts} {value}")
+        log.debug(f"TS.ADD {ts_key} {ts} {str_value}")
         ts_add = redis.execute_command(
-            "TS.ADD", ts_key, ts, str(value),
+            "TS.ADD", ts_key, ts, str_value,
             "RETENTION", 604800000,
             "DUPLICATE_POLICY", "last"
         )
@@ -68,19 +79,19 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         else:
             log.warning(f"TS.ADD не вернул coroutine для {ts_key}")
 
-        # Stream для core_io (по одному значению)
-        log.debug(f"XADD indicator_stream_core: {param_name}={value}")
+        # Redis Stream (core)
+        log.debug(f"XADD indicator_stream_core: {param_name}={str_value}")
         tasks.append(redis.xadd("indicator_stream_core", {
             "symbol": symbol,
             "interval": timeframe,
             "instance_id": str(instance_id),
             "open_time": open_time_iso,
             "param_name": param_name,
-            "value": str(value),
+            "value": str_value,
             "precision": str(precision)
         }))
 
-    # Stream для сигнала "готово" (по расчёту)
+    # Redis Stream (готовность)
     if stream:
         log.debug(f"XADD indicator_stream: {base} ready for {symbol}/{timeframe}")
         tasks.append(redis.xadd("indicator_stream", {
