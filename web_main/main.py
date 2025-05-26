@@ -414,7 +414,59 @@ async def webhook_v4(request: Request):
 # 🔸 Страница стратегий
 @app.get("/strategies", response_class=HTMLResponse)
 async def strategies_page(request: Request):
-    return templates.TemplateResponse("strategies.html", {"request": request})
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT s.id, s.name, s.human_name, s.timeframe, s.enabled,
+                   COALESCE(sig.name, '-') AS signal_name
+            FROM strategies_v4 s
+            LEFT JOIN signals_v4 sig ON sig.id = s.signal_id
+            ORDER BY s.id
+        """)
+        strategies = []
+        for r in rows:
+            strategies.append({
+                "id": r["id"],
+                "name": r["name"],
+                "human_name": r["human_name"],
+                "signal_name": r["signal_name"],
+                "timeframe": r["timeframe"].upper(),
+                "enabled": r["enabled"]
+            })
+
+    return templates.TemplateResponse("strategies.html", {
+        "request": request,
+        "strategies": strategies
+    })
+# 🔸 POST: включение стратегии
+@app.post("/strategies/{strategy_id}/enable")
+async def enable_strategy(strategy_id: int):
+    await update_strategy_status(strategy_id, True)
+    return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+
+# 🔸 POST: отключение стратегии
+@app.post("/strategies/{strategy_id}/disable")
+async def disable_strategy(strategy_id: int):
+    await update_strategy_status(strategy_id, False)
+    return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 Обновление статуса стратегии и отправка уведомления в Redis
+log = logging.getLogger("STRATEGIES")
+
+async def update_strategy_status(strategy_id: int, new_value: bool):
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE strategies_v4 SET enabled = $1 WHERE id = $2",
+            new_value, strategy_id
+        )
+
+    event = {
+        "id": strategy_id,
+        "type": "enabled",
+        "action": str(new_value).lower(),
+        "source": "web_ui"
+    }
+
+    await redis_client.publish("strategies_v4_events", json.dumps(event))
+    log.info(f"[PubSub] {event}")
 # 🔸 GET: форма создания новой стратегии
 @app.get("/strategies/create", response_class=HTMLResponse)
 async def strategies_create_form(request: Request):
