@@ -23,7 +23,7 @@ async def load_initial_tickers(pg):
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
         for row in rows:
-            active_tickers[row["symbol"]] = row["precision_price"]
+            active_tickers[row["symbol"]] = int(row["precision_price"])
 
 # 🔸 Загрузка расчётов индикаторов и их параметров
 async def load_initial_indicators(pg):
