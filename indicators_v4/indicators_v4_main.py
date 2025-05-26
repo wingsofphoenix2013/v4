@@ -1,9 +1,10 @@
-# indicators_v4_main.py (временная минимальная версия)
+# indicators_v4_main.py (временная отладочная версия с точной загрузкой precision)
 
 import asyncio
 import logging
 import json
 from infra import init_pg_pool, init_redis_client, setup_logging
+from indicators.compute_and_store import compute_and_store
 
 active_tickers = {}
 indicator_instances = {}
@@ -61,7 +62,15 @@ async def watch_ticker_updates(redis):
 
             if field in ("status", "tradepermission"):
                 if action == "enabled":
-                    log.info(f"✅ Тикер включён: {symbol}")
+                    # 🔸 При включении тикера — загрузка precision из PG
+                    async with redis.connection_pool.get_connection() as conn:
+                        row = await conn.fetchrow("""
+                            SELECT precision_price FROM tickers_v4
+                            WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
+                        """, symbol)
+                        if row:
+                            active_tickers[symbol] = int(row["precision_price"])
+                            log.info(f"✅ Тикер включён: {symbol} → precision = {row['precision_price']}")
                 else:
                     active_tickers.pop(symbol, None)
                     log.info(f"⛔️ Тикер отключён: {symbol}")
