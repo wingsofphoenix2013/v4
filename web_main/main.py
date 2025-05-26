@@ -411,3 +411,7 @@ async def webhook_v4(request: Request):
     })
 
     return JSONResponse({"status": "ok", "received_at": received_at})
+# 🔸 Страница стратегий
+@app.get("/strategies", response_class=HTMLResponse)
+async def strategies_page(request: Request):
+    return templates.TemplateResponse("strategies.html", {"request": request})
