@@ -17,7 +17,7 @@ INDICATOR_DISPATCH = {
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
     log = logging.getLogger("CALC")
-    log.info(f"[DEBUG] precision for {symbol} = {precision}")
+    log.info(f"[TRACE] compute_and_store received precision={precision} for {symbol} (instance_id={instance_id})")
     
     indicator = instance["indicator"]
     timeframe = instance["timeframe"]

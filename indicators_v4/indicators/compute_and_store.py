@@ -17,7 +17,7 @@ INDICATOR_DISPATCH = {
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
     log = logging.getLogger("CALC")
-    log.info(f"[TRACE] compute_and_store received precision={precision} for {symbol} (instance_id={instance_id})")
+    log.debug(f"[TRACE] compute_and_store received precision={precision} for {symbol} (instance_id={instance_id})")
     
     indicator = instance["indicator"]
     timeframe = instance["timeframe"]
@@ -41,7 +41,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")
         return
 
-    log.info(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
+    log.debug(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
 
     # 🔸 Построение базового имени (label)
     if "length" in params:

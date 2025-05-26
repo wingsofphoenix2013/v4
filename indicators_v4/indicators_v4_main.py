@@ -24,7 +24,7 @@ async def load_initial_tickers(pg):
         """)
         for row in rows:
             active_tickers[row["symbol"]] = int(row["precision_price"])
-            log.info(f"[DEBUG] Loaded ticker: {row['symbol']} → precision={row['precision_price']}")
+            log.debug(f"[DEBUG] Loaded ticker: {row['symbol']} → precision={row['precision_price']}")
 
 # 🔸 Загрузка расчётов индикаторов и параметров
 async def load_initial_indicators(pg):
@@ -47,7 +47,7 @@ async def load_initial_indicators(pg):
                 "stream_publish": inst["stream_publish"],
                 "params": param_map
             }
-            log.info(f"[DEBUG] Loaded instance id={inst['id']} → {inst['indicator']} {param_map}")
+            log.debug(f"[DEBUG] Loaded instance id={inst['id']} → {inst['indicator']} {param_map}")
 
 # 🔸 Подписка на обновления тикеров
 async def watch_ticker_updates(pg, redis):
@@ -190,7 +190,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
         log.debug(f"🔹 Загружено {len(df)} свечей для {symbol}/{interval} (ожидалось {count})")
 
     return df 
-# 🔸 Подписка на ohlcv_channel — восстановленный расчёт
+# 🔸 Подписка на ohlcv_channel — восстановленный расчёт с фильтром по активным индикаторам
 async def watch_ohlcv_events(pg, redis):
     log = logging.getLogger("OHLCV_EVENTS")
     pubsub = redis.pubsub()
@@ -210,8 +210,17 @@ async def watch_ohlcv_events(pg, redis):
                 log.debug(f"Пропущено: неактивный тикер {symbol}")
                 continue
 
+            # 🔸 фильтрация по активным индикаторам
+            relevant_instances = [
+                iid for iid, inst in indicator_instances.items()
+                if inst["timeframe"] == interval
+            ]
+            if not relevant_instances:
+                log.debug(f"Пропущено: нет активных индикаторов для {symbol}/{interval}")
+                continue
+
             precision = active_tickers.get(symbol, 8)
-            log.info(f"[TRACE] preparing compute for {symbol} → precision={precision}")
+            log.debug(f"[TRACE] preparing compute for {symbol} → precision={precision}")
 
             # 🔸 загрузка свечей
             depth = required_candles.get(interval, 200)
@@ -220,13 +229,12 @@ async def watch_ohlcv_events(pg, redis):
                 log.warning(f"Пропуск расчёта: нет данных для {symbol} / {interval}")
                 continue
 
-            for iid, inst in indicator_instances.items():
-                if inst["timeframe"] != interval:
-                    continue
+            for iid in relevant_instances:
+                inst = indicator_instances[iid]
                 await compute_and_store(iid, inst, symbol, df, int(timestamp), pg, redis, precision)
 
         except Exception as e:
-            log.warning(f"Ошибка в ohlcv_channel: {e}")  
+            log.warning(f"Ошибка в ohlcv_channel: {e}")
 # 🔸 Точка входа
 async def main():
     setup_logging()
