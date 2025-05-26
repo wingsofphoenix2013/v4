@@ -1,4 +1,4 @@
-# indicators_v4_main.py (временная отладочная версия с точной загрузкой precision)
+# indicators_v4_main.py (финальная отладочная версия с main)
 
 import asyncio
 import logging
@@ -46,7 +46,7 @@ async def load_initial_indicators(pg):
             log.info(f"[DEBUG] Loaded instance id={inst['id']} → {inst['indicator']} {param_map}")
 
 # 🔸 Подписка на обновления тикеров
-async def watch_ticker_updates(redis):
+async def watch_ticker_updates(pg, redis):
     log = logging.getLogger("TICKER_UPDATES")
     pubsub = redis.pubsub()
     await pubsub.subscribe("tickers_v4_events")
@@ -62,8 +62,7 @@ async def watch_ticker_updates(redis):
 
             if field in ("status", "tradepermission"):
                 if action == "enabled":
-                    # 🔸 При включении тикера — загрузка precision из PG
-                    async with redis.connection_pool.get_connection() as conn:
+                    async with pg.acquire() as conn:
                         row = await conn.fetchrow("""
                             SELECT precision_price FROM tickers_v4
                             WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
@@ -121,7 +120,8 @@ async def watch_indicator_updates(pg, redis):
                 log.info(f"🔁 stream_publish обновлён: id={iid} → {action}")
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
-            
+
+# 🔸 Точка входа
 async def main():
     setup_logging()
     pg = await init_pg_pool()
@@ -131,7 +131,7 @@ async def main():
     await load_initial_indicators(pg)
 
     await asyncio.gather(
-        watch_ticker_updates(redis),
+        watch_ticker_updates(pg, redis),
         watch_indicator_updates(pg, redis)
     )
 
