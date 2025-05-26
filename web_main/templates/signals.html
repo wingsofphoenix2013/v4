@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Индикаторы</title>
+    <title>Сигналы</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
       body {
@@ -48,42 +48,26 @@
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+      {% for s in signals %}
       <tr>
-        <td class="px-4 py-3">1</td>
-        <td class="px-4 py-3 font-semibold uppercase">VL_M5_FL</td>
-        <td class="px-4 py-3 text-slate-700">Сигнал по паттерну восход</td>
-        <td class="px-4 py-3 whitespace-pre-line">price > ema
-volume > avg</td>
-        <td class="px-4 py-3">M5</td>
-        <td class="px-4 py-3">tradingview</td>
+        <td class="px-4 py-3">{{ loop.index }}</td>
+        <td class="px-4 py-3 font-semibold uppercase">{{ s.name }}</td>
+        <td class="px-4 py-3 text-slate-700">{{ s.description }}</td>
+        <td class="px-4 py-3 whitespace-pre-line">{{ s.phrase }}</td>
+        <td class="px-4 py-3">{{ s.timeframe }}</td>
+        <td class="px-4 py-3">{{ s.source }}</td>
         <td class="px-4 py-3">
           <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-green-500"></div>
-            <form method="post" action="/signals/1/disable">
-              <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+            <div class="h-3 w-3 rounded-full {{ 'bg-green-500' if s.enabled else 'bg-red-500' }}"></div>
+            <form method="post" action="/signals/{{ s.id }}/{{ 'disable' if s.enabled else 'enable' }}">
+              <button class="text-sm text-blue-600 hover:underline">{{ 'Выключить' if s.enabled else 'Включить' }}</button>
             </form>
           </div>
         </td>
       </tr>
-      <tr>
-        <td class="px-4 py-3">2</td>
-        <td class="px-4 py-3 font-semibold uppercase">RV_M1_BR</td>
-        <td class="px-4 py-3 text-slate-700">Сигнал на разворот тренда</td>
-        <td class="px-4 py-3 whitespace-pre-line">rsi < 30
-crossover: lr_center</td>
-        <td class="px-4 py-3">M1</td>
-        <td class="px-4 py-3">core</td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500"></div>
-            <form method="post" action="/signals/2/enable">
-              <button class="text-sm text-blue-600 hover:underline">Включить</button>
-            </form>
-          </div>
-        </td>
-      </tr>
+      {% endfor %}
     </tbody>
   </table>
 </main>
-  </body>
+</body>
 </html>

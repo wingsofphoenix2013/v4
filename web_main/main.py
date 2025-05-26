@@ -8,6 +8,7 @@ import logging
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi import status
 from starlette.status import HTTP_303_SEE_OTHER
 import asyncpg
 
@@ -286,4 +287,48 @@ async def create_indicator(
 # 🔸 Страница сигналов
 @app.get("/signals", response_class=HTMLResponse)
 async def signals_page(request: Request):
-    return templates.TemplateResponse("signals.html", {"request": request})
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, name, timeframe, long_phrase, short_phrase, description, enabled, source
+            FROM signals_v4
+            ORDER BY id
+        """)
+        signals = []
+        for row in rows:
+            signals.append({
+                "id": row["id"],
+                "name": row["name"],
+                "description": row["description"],
+                "phrase": f"{row['long_phrase']}\n{row['short_phrase']}",
+                "timeframe": row["timeframe"].upper(),
+                "source": row["source"],
+                "enabled": row["enabled"],
+            })
+    return templates.TemplateResponse("signals.html", {"request": request, "signals": signals})
+# 🔸 POST: включение/отключение сигнала
+@app.post("/signals/{signal_id}/enable")
+async def enable_signal(signal_id: int):
+    await update_signal_status(signal_id, True)
+    return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/signals/{signal_id}/disable")
+async def disable_signal(signal_id: int):
+    await update_signal_status(signal_id, False)
+    return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 Обновление статуса сигнала и отправка уведомления в Redis
+async def update_signal_status(signal_id: int, new_value: bool):
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE signals_v4 SET enabled = $1 WHERE id = $2",
+            new_value, signal_id
+        )
+
+    event = {
+        "id": signal_id,
+        "type": "enabled",
+        "action": str(new_value).lower(),
+        "source": "web_ui"
+    }
+
+    await redis_client.publish("signals_v4_events", json.dumps(event))
+    logging.info(f"[PubSub] {event}")
