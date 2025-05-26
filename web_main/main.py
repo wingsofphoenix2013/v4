@@ -13,15 +13,22 @@ from starlette.status import HTTP_303_SEE_OTHER
 import asyncpg
 from fastapi import Form
 
-# 🔸 Настройка логирования
-logging.basicConfig(level=logging.INFO)
+# 🔸 Режим отладки
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-# 🔸 Переменные окружения
-DATABASE_URL = os.getenv("DATABASE_URL")
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
-REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
+# 🔸 Централизованная настройка логирования
+def setup_logging():
+    """
+    Централизованная настройка логирования.
+    DEBUG_MODE=True → debug/info/warning/error
+    DEBUG_MODE=False → info/warning/error
+    """
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
 # 🔸 Подключение к PostgreSQL (асинхронный пул)
 pg_pool: asyncpg.Pool = None
@@ -47,6 +54,7 @@ templates = Jinja2Templates(directory="templates")
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
+    setup_logging()
     global pg_pool, redis_client
     pg_pool = await init_pg_pool()
     redis_client = init_redis_client()
@@ -145,8 +153,9 @@ async def create_ticker(
     })
     return RedirectResponse(url="/tickers", status_code=HTTP_303_SEE_OTHER)
 # 🔸 Обновление поля тикера и отправка уведомления в Redis
+log = logging.getLogger("TICKERS")
+
 async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
-    # Обновление поля в PostgreSQL
     async with pg_pool.acquire() as conn:
         await conn.execute(
             f"UPDATE tickers_v4 SET {field} = $1 WHERE id = $2",
@@ -154,7 +163,6 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
         )
         symbol = await conn.fetchval("SELECT symbol FROM tickers_v4 WHERE id = $1", ticker_id)
 
-    # Формирование события
     event = {
         "type": field,
         "action": new_value,
@@ -162,14 +170,9 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
         "source": "web_ui"
     }
 
-    # Отправка в Redis Pub/Sub
+    # 🔹 Публикация события
     await redis_client.publish("tickers_v4_events", json.dumps(event))
-    logging.info(f"[PubSub] {event}")
-
-    # Отправка в Redis Stream
-    stream_name = f"tickers_{field}_stream"
-    await redis_client.xadd(stream_name, event)
-    logging.info(f"[Stream:{stream_name}] {event}")
+    log.info(f"[PubSub] {event}")
 # 🔸 Страница со списком всех расчётов индикаторов и их параметрами
 @app.get("/indicators", response_class=HTMLResponse)
 async def indicators_page(request: Request):
@@ -217,8 +220,9 @@ async def disable_indicator_stream(indicator_id: int):
     await update_indicator_and_notify(indicator_id, field="stream_publish", new_value="false")
     return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
 # 🔸 Обновление поля индикатора и отправка уведомления в Redis
+log = logging.getLogger("INDICATORS")
+
 async def update_indicator_and_notify(indicator_id: int, field: str, new_value: str):
-    # Обновление поля в базе
     async with pg_pool.acquire() as conn:
         await conn.execute(
             f"UPDATE indicator_instances_v4 SET {field} = $1 WHERE id = $2",
@@ -226,7 +230,6 @@ async def update_indicator_and_notify(indicator_id: int, field: str, new_value: 
             indicator_id
         )
 
-    # Формирование события
     event = {
         "id": indicator_id,
         "type": field,
@@ -234,14 +237,8 @@ async def update_indicator_and_notify(indicator_id: int, field: str, new_value: 
         "source": "web_ui"
     }
 
-    # Отправка в Redis Pub/Sub
     await redis_client.publish("indicators_v4_events", json.dumps(event))
-    logging.info(f"[PubSub] {event}")
-
-    # Отправка в Redis Stream
-    stream_name = f"indicators_{field}_stream"
-    await redis_client.xadd(stream_name, event)
-    logging.info(f"[Stream:{stream_name}] {event}")
+    log.info(f"[PubSub] {event}")
 # 🔸 GET: отрисовка формы создания нового индикатора
 @app.get("/indicators/create", response_class=HTMLResponse)
 async def indicators_create_form(request: Request):
@@ -317,6 +314,8 @@ async def disable_signal(signal_id: int):
     await update_signal_status(signal_id, False)
     return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 Обновление статуса сигнала и отправка уведомления в Redis
+log = logging.getLogger("SIGNALS")
+
 async def update_signal_status(signal_id: int, new_value: bool):
     async with pg_pool.acquire() as conn:
         await conn.execute(
@@ -332,7 +331,7 @@ async def update_signal_status(signal_id: int, new_value: bool):
     }
 
     await redis_client.publish("signals_v4_events", json.dumps(event))
-    logging.info(f"[PubSub] {event}")
+    log.info(f"[PubSub] {event}")
 # 🔸 GET: форма создания нового сигнала
 @app.get("/signals/create", response_class=HTMLResponse)
 async def signals_create_form(request: Request):
@@ -372,6 +371,8 @@ async def create_signal(
 
     return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 Приём сигналов от TradingView (формат JSON, v4)
+log = logging.getLogger("WEBHOOK")
+
 @app.post("/webhook_v4")
 async def webhook_v4(request: Request):
     try:
@@ -393,8 +394,10 @@ async def webhook_v4(request: Request):
 
     received_at = datetime.utcnow().isoformat()
 
-    logging.info(f"Webhook V4: {message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
+    # 🔹 Отладочный лог сигнала
+    log.debug(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
+    # 🔹 Публикация в Redis Stream
     await redis_client.xadd("signals_stream", {
         "message": message,
         "symbol": symbol,
