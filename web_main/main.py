@@ -415,3 +415,55 @@ async def webhook_v4(request: Request):
 @app.get("/strategies", response_class=HTMLResponse)
 async def strategies_page(request: Request):
     return templates.TemplateResponse("strategies.html", {"request": request})
+# 🔸 GET: форма создания новой стратегии
+@app.get("/strategies/create", response_class=HTMLResponse)
+async def strategies_create_form(request: Request):
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name FROM signals_v4 ORDER BY id")
+        signals = [{"id": r["id"], "name": r["name"]} for r in rows]
+
+    return templates.TemplateResponse("strategies_create.html", {
+        "request": request,
+        "signals": signals,
+        "error": None
+    })
+# 🔸 POST: создание новой стратегии
+@app.post("/strategies/create", response_class=HTMLResponse)
+async def create_strategy(
+    request: Request,
+    name: str = Form(...),
+    human_name: str = Form(...),
+    signal_id: int = Form(...),
+    timeframe: str = Form(...),
+    enabled: str = Form(...)
+):
+    enabled_bool = enabled == "enabled"
+    timeframe = timeframe.lower()
+
+    async with pg_pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name)
+        if exists:
+            rows = await conn.fetch("SELECT id, name FROM signals_v4 ORDER BY id")
+            signals = [{"id": r["id"], "name": r["name"]} for r in rows]
+            return templates.TemplateResponse("strategies_create.html", {
+                "request": request,
+                "signals": signals,
+                "error": f"Стратегия с кодом '{name}' уже существует"
+            })
+
+        await conn.execute("""
+            INSERT INTO strategies_v4 (
+                name, human_name, signal_id, timeframe, enabled,
+                archived, use_all_tickers, allow_open, deposit,
+                position_limit, use_stoploss, sl_type, sl_value,
+                leverage, reverse, max_risk, created_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5,
+                false, true, true, 10000,
+                1000, true, 'atr', 2,
+                10, false, 2, NOW()
+            )
+        """, name, human_name, signal_id, timeframe, enabled_bool)
+
+    return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
