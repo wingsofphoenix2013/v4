@@ -39,7 +39,7 @@ async def run_core_io(pg, redis):
                                 DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                             """, instance_id, symbol, open_time, param_name, value)
 
-                        log.info(f"PG ← {symbol}/{interval} {param_name}={value} @ {open_time}")
+                        log.debug(f"PG ← {symbol}/{interval} {param_name}={value} @ {open_time}")
 
                     except Exception as e:
                         log.error(f"Ошибка при записи: {e}")
