@@ -75,7 +75,8 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
             "instance_id": str(instance_id),
             "open_time": open_time_iso,
             "param_name": param_name,
-            "value": str(value)
+            "value": str(value),
+            "precision": str(precision)
         }))
 
     # Stream для сигнала "готово" (по расчёту)

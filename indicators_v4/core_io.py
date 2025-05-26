@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 # 🔸 Асинхронный воркер для чтения из Redis Stream и записи в PG
 async def run_core_io(pg, redis):
@@ -26,7 +26,9 @@ async def run_core_io(pg, redis):
                         instance_id = int(data["instance_id"])
                         open_time = datetime.fromisoformat(data["open_time"])
                         param_name = data["param_name"]
-                        value = Decimal(data["value"])
+                        precision = int(data.get("precision", 8))
+                        quantize_str = "1." + "0" * precision
+                        value = Decimal(data["value"]).quantize(Decimal(quantize_str), rounding=ROUND_HALF_UP)
 
                         async with pg.acquire() as conn:
                             await conn.execute("""
@@ -37,7 +39,7 @@ async def run_core_io(pg, redis):
                                 DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                             """, instance_id, symbol, open_time, param_name, value)
 
-                        log.debug(f"PG ← {symbol}/{interval} {param_name}={value} @ {open_time}")
+                        log.info(f"PG ← {symbol}/{interval} {param_name}={value} @ {open_time}")
 
                     except Exception as e:
                         log.error(f"Ошибка при записи: {e}")
