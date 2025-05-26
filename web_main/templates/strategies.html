@@ -47,38 +47,26 @@
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+      {% for s in strategies %}
       <tr>
-        <td class="px-4 py-3">1</td>
-        <td class="px-4 py-3 font-mono">scalp_rv_1</td>
-        <td class="px-4 py-3">Скальпер по регрессии</td>
-        <td class="px-4 py-3">RV_M5_BASE</td>
-        <td class="px-4 py-3">M5</td>
+        <td class="px-4 py-3">{{ loop.index }}</td>
+        <td class="px-4 py-3 font-mono">{{ s.name }}</td>
+        <td class="px-4 py-3">{{ s.human_name }}</td>
+        <td class="px-4 py-3">{{ s.signal_name }}</td>
+        <td class="px-4 py-3">{{ s.timeframe }}</td>
         <td class="px-4 py-3">
           <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-green-500"></div>
-            <form method="post" action="/strategies/1/disable">
-              <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+            <div class="h-3 w-3 rounded-full {{ 'bg-green-500' if s.enabled else 'bg-red-500' }}"></div>
+            <form method="post" action="/strategies/{{ s.id }}/{{ 'disable' if s.enabled else 'enable' }}">
+              <button class="text-sm text-blue-600 hover:underline">
+                {{ 'Выключить' if s.enabled else 'Включить' }}
+              </button>
             </form>
           </div>
         </td>
       </tr>
-      <tr>
-        <td class="px-4 py-3">2</td>
-        <td class="px-4 py-3 font-mono">vl_exit_2</td>
-        <td class="px-4 py-3">Выход по Vilarso</td>
-        <td class="px-4 py-3">VL_M1_EXIT</td>
-        <td class="px-4 py-3">M1</td>
-        <td class="px-4 py-3">
-          <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500"></div>
-            <form method="post" action="/strategies/2/enable">
-              <button class="text-sm text-blue-600 hover:underline">Включить</button>
-            </form>
-          </div>
-        </td>
-      </tr>
+      {% endfor %}
     </tbody>
   </table>
-</main>
-</body>
+</main></body>
 </html>
