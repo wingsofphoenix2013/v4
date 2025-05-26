@@ -37,10 +37,16 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
     base_price = closes.mean()
     norm = (closes - base_price) / base_price
     slope_norm = np.polyfit(x, norm, deg=1)[0]
+
     import logging
     log = logging.getLogger("CALC")
-    log.info(f"[DEBUG] slope_norm = {slope_norm}")
+    log.debug(f"[DEBUG] slope_norm = {slope_norm}")
+
     angle = float(np.degrees(np.arctan(slope_norm)))
+
+    # 🔸 подавление близких к нулю значений
+    if abs(angle) < 1e-5:
+        angle = 0.0
 
     return {
         "angle": angle,
