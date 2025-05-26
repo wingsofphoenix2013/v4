@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi import status
 from starlette.status import HTTP_303_SEE_OTHER
 import asyncpg
+from fastapi import Form
 
 # 🔸 Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -332,3 +333,41 @@ async def update_signal_status(signal_id: int, new_value: bool):
 
     await redis_client.publish("signals_v4_events", json.dumps(event))
     logging.info(f"[PubSub] {event}")
+# 🔸 GET: форма создания нового сигнала
+@app.get("/signals/create", response_class=HTMLResponse)
+async def signals_create_form(request: Request):
+    return templates.TemplateResponse("signals_create.html", {"request": request, "error": None})
+# 🔸 POST: создание нового сигнала
+@app.post("/signals/create", response_class=HTMLResponse)
+async def create_signal(
+    request: Request,
+    name: str = Form(...),
+    long_phrase: str = Form(...),
+    short_phrase: str = Form(...),
+    timeframe: str = Form(...),
+    source: str = Form(...),
+    description: str = Form(...),
+    enabled: str = Form(...)
+):
+    name = name.upper()
+    long_phrase = long_phrase.upper()
+    short_phrase = short_phrase.upper()
+    timeframe = timeframe.lower()
+    enabled_bool = enabled == "enabled"
+
+    async with pg_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM signals_v4 WHERE name = $1)", name
+        )
+        if exists:
+            return templates.TemplateResponse("signals_create.html", {
+                "request": request,
+                "error": f"Сигнал с именем '{name}' уже существует"
+            })
+
+        await conn.execute("""
+            INSERT INTO signals_v4 (name, long_phrase, short_phrase, timeframe, source, description, enabled, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        """, name, long_phrase, short_phrase, timeframe, source, description, enabled_bool)
+
+    return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
