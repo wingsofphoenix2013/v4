@@ -1,13 +1,17 @@
-# indicators_v4_main.py (финальная отладочная версия с main)
-
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4
 import asyncio
-import logging
 import json
+import logging
+import pandas as pd
+from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
+from core_io import run_core_io
+
 from indicators.compute_and_store import compute_and_store
 
-active_tickers = {}
-indicator_instances = {}
+active_tickers = {}         # symbol -> precision_price
+indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
+required_candles = defaultdict(lambda: 200)  # tf -> сколько свечей загружать
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
@@ -120,7 +124,73 @@ async def watch_indicator_updates(pg, redis):
                 log.info(f"🔁 stream_publish обновлён: id={iid} → {action}")
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
-# 🔸 Подписка на ohlcv_channel — проверка передачи precision
+# 🔸 Загрузка свечей через параллельные TS.RANGE по каждому ключу
+async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
+    log = logging.getLogger("REDIS_LOAD")
+
+    step_ms = {
+        "m1": 60_000,
+        "m5": 300_000,
+        "m15": 900_000
+    }[interval]
+    start_ts = end_ts - (count - 1) * step_ms
+
+    fields = ["o", "h", "l", "c", "v"]
+    keys = {field: f"ts:{symbol}:{interval}:{field}" for field in fields}
+
+    log.debug(f"🔍 Запрос TS.RANGE по ключам: {list(keys.values())}, from={start_ts}, to={end_ts}")
+
+    # Параллельная отправка запросов
+    tasks = {
+        field: redis.execute_command("TS.RANGE", key, start_ts, end_ts)
+        for field, key in keys.items()
+    }
+
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    series = {}
+    for field, result in zip(tasks.keys(), results):
+        if isinstance(result, Exception):
+            log.warning(f"Ошибка чтения {keys[field]}: {result}")
+            continue
+        log.debug(f"▶️ {keys[field]} — {len(result)} точек")
+        try:
+            if result:
+                series[field] = {
+                    int(ts): float(val)
+                    for ts, val in result if val is not None
+                }
+        except Exception as e:
+            log.warning(f"Ошибка при обработке значений {keys[field]}: {e}")
+
+    df = None
+    for field, values in series.items():
+        s = pd.Series(values)
+        s.index = pd.to_datetime(s.index, unit='ms')
+        s.name = field
+        if df is None:
+            df = s.to_frame()
+        else:
+            df = df.join(s, how="outer")
+
+    if df is None or df.empty:
+        log.warning(f"⛔ DataFrame пустой — расчёт пропущен")
+        return None
+
+    df.index.name = "open_time"
+    df = df.sort_index()
+
+    if "c" in df:
+        log.debug(f"Пример значений 'c': {df['c'].dropna().head().tolist()}")
+
+    if len(df) < count:
+        log.warning(f"⛔ Недостаточно данных для {symbol}/{interval}: {len(df)} из {count} требуемых — расчёт пропущен")
+        return None
+    else:
+        log.debug(f"🔹 Загружено {len(df)} свечей для {symbol}/{interval} (ожидалось {count})")
+
+    return df 
+# 🔸 Подписка на ohlcv_channel — восстановленный расчёт
 async def watch_ohlcv_events(pg, redis):
     log = logging.getLogger("OHLCV_EVENTS")
     pubsub = redis.pubsub()
@@ -143,14 +213,20 @@ async def watch_ohlcv_events(pg, redis):
             precision = active_tickers.get(symbol, 8)
             log.info(f"[TRACE] preparing compute for {symbol} → precision={precision}")
 
+            # 🔸 загрузка свечей
+            depth = required_candles.get(interval, 200)
+            df = await load_ohlcv_from_redis(redis, symbol, interval, int(timestamp), depth)
+            if df is None:
+                log.warning(f"Пропуск расчёта: нет данных для {symbol} / {interval}")
+                continue
+
             for iid, inst in indicator_instances.items():
                 if inst["timeframe"] != interval:
                     continue
-                await compute_and_store(iid, inst, symbol, None, int(timestamp), pg, redis, precision)
+                await compute_and_store(iid, inst, symbol, df, int(timestamp), pg, redis, precision)
 
         except Exception as e:
-            log.warning(f"Ошибка в ohlcv_channel: {e}")
-            
+            log.warning(f"Ошибка в ohlcv_channel: {e}")  
 # 🔸 Точка входа
 async def main():
     setup_logging()
