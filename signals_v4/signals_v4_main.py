@@ -108,6 +108,35 @@ async def handle_ticker_event(data: dict):
         if symbol in ENABLED_TICKERS:
             ENABLED_TICKERS.pop(symbol, None)
             log.info(f"Тикер {symbol} удалён из ENABLED_TICKERS")
+# 🔸 Обработка события активации/деактивации сигнала
+async def handle_signal_event(data: dict):
+    log = logging.getLogger("PUBSUB_WATCHER")
+    signal_id = data.get("id")
+    action = data.get("action")
+
+    if not signal_id or action not in {"true", "false"}:
+        log.warning(f"Игнорировано событие сигнала: {data}")
+        return
+
+    if action == "true":
+        async with infra.PG_POOL.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, long_phrase, short_phrase
+                FROM signals_v4
+                WHERE id = $1 AND enabled = true
+            """, signal_id)
+            if row:
+                ENABLED_SIGNALS[row["id"]] = {
+                    "long": row["long_phrase"],
+                    "short": row["short_phrase"]
+                }
+                log.info(f"Сигнал {row['id']} добавлен в ENABLED_SIGNALS")
+            else:
+                log.warning(f"Сигнал {signal_id} не прошёл фильтр enabled")
+    else:
+        if signal_id in ENABLED_SIGNALS:
+            ENABLED_SIGNALS.pop(signal_id, None)
+            log.info(f"Сигнал {signal_id} удалён из ENABLED_SIGNALS")
 # 🔸 Подписка на Pub/Sub обновления
 async def subscribe_and_watch_pubsub():
     log = logging.getLogger("PUBSUB_WATCHER")
