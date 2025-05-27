@@ -1,5 +1,5 @@
 import logging
-from infra import ENABLED_SIGNALS, ENABLED_TICKERS
+from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
 
 # 🔸 Обработка одного сигнала из Redis Stream
 async def process_signal(data: dict):
@@ -34,4 +34,16 @@ async def process_signal(data: dict):
         log.warning(f"Тикер {symbol} не входит в ENABLED_TICKERS — сигнал отклонён")
         return
 
-    log.info(f"Сигнал принят к обработке: {symbol} | {direction} | signal_id={signal_id}")
+    # 🔍 Фильтрация подходящих стратегий
+    matched_strategies = []
+    for strategy_id, strategy in ENABLED_STRATEGIES.items():
+        if strategy["signal_id"] != signal_id:
+            continue
+        if strategy["allow_open"] or strategy["reverse"]:
+            matched_strategies.append(strategy_id)
+
+    if not matched_strategies:
+        log.info(f"Нет подходящих стратегий для сигнала: {symbol} | {direction}")
+        return
+
+    log.info(f"Сигнал принят к обработке: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
