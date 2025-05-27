@@ -35,7 +35,7 @@ async def init_redis_client():
 async def init_pg_pool():
     global PG_POOL
     log = logging.getLogger("PG_INIT")
-    log.info(f"Попытка подключения. DATABASE_URL = {DATABASE_URL}")
+    log.info("Попытка подключения к PostgreSQL")
     PG_POOL = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=10,
