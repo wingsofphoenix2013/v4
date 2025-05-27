@@ -48,7 +48,7 @@ async def insert_signal_log(data: dict):
         data["status"],
         data["uid"])
 
-    log.info(f"Лог записан в БД: {data['uid']}")
+    log.debug(f"Лог записан в БД: {data['uid']}")
 # 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
 async def run_core_io():
     log = logging.getLogger("CORE_IO")

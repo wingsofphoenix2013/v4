@@ -75,7 +75,7 @@ async def process_signal(data: dict):
             matched_strategies.append(strategy_id)
 
     if not matched_strategies:
-        log.info(f"Нет подходящих стратегий для сигнала: {symbol} | {direction}")
+        log.debug(f"Нет подходящих стратегий для сигнала: {symbol} | {direction}")
         await publish_signal_log(data, signal_id=signal_id, direction=direction, status="ignored")
         return
 
@@ -92,4 +92,4 @@ async def process_signal(data: dict):
     ])
 
     await publish_signal_log(data, signal_id=signal_id, direction=direction, status="dispatched")
-    log.info(f"Сигнал передан стратегиям: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
+    log.debug(f"Сигнал передан стратегиям: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
