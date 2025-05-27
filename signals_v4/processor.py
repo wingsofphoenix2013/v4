@@ -2,6 +2,7 @@ import logging
 from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
 import infra
 import json
+import asyncio
 
 # 🔸 Публикация сигнала в Redis Stream стратегии
 async def publish_to_strategy_stream(strategy_id, signal_id, symbol, direction, bar_time, received_at):
