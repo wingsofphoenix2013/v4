@@ -82,7 +82,32 @@ async def load_initial_state():
     await load_enabled_tickers()
     await load_enabled_signals()
     await load_enabled_strategies()
+# 🔸 Обработка события активации/деактивации тикера
+async def handle_ticker_event(data: dict):
+    log = logging.getLogger("PUBSUB_WATCHER")
+    symbol = data.get("symbol")
+    action = data.get("action")
 
+    if not symbol or action not in {"enabled", "disabled"}:
+        log.warning(f"Игнорировано событие тикера: {data}")
+        return
+
+    if action == "enabled":
+        async with infra.PG_POOL.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT symbol
+                FROM tickers_v4
+                WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
+            """, symbol)
+            if row:
+                ENABLED_TICKERS[symbol] = True
+                log.info(f"Тикер {symbol} добавлен в ENABLED_TICKERS")
+            else:
+                log.warning(f"Тикер {symbol} не прошёл фильтр enabled/tradepermission")
+    else:
+        if symbol in ENABLED_TICKERS:
+            ENABLED_TICKERS.pop(symbol, None)
+            log.info(f"Тикер {symbol} удалён из ENABLED_TICKERS")
 # 🔸 Подписка на Pub/Sub обновления
 async def subscribe_and_watch_pubsub():
     log = logging.getLogger("PUBSUB_WATCHER")
