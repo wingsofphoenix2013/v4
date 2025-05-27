@@ -34,8 +34,11 @@ async def init_redis_client():
 # 🔸 Инициализация PostgreSQL пула
 async def init_pg_pool():
     global PG_POOL
+    log = logging.getLogger("PG_INIT")
+    log.info(f"Попытка подключения. DATABASE_URL = {DATABASE_URL}")
     PG_POOL = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=10,
         max_size=20
     )
+    log.info("PG_POOL успешно инициализирован")
