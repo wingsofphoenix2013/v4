@@ -137,6 +137,36 @@ async def handle_signal_event(data: dict):
         if signal_id in ENABLED_SIGNALS:
             ENABLED_SIGNALS.pop(signal_id, None)
             log.info(f"Сигнал {signal_id} удалён из ENABLED_SIGNALS")
+# 🔸 Обработка события активации/деактивации стратегии
+async def handle_strategy_event(data: dict):
+    log = logging.getLogger("PUBSUB_WATCHER")
+    strategy_id = data.get("id")
+    action = data.get("action")
+
+    if not strategy_id or action not in {"true", "false"}:
+        log.warning(f"Игнорировано событие стратегии: {data}")
+        return
+
+    if action == "true":
+        async with infra.PG_POOL.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, signal_id, allow_open, reverse
+                FROM strategies_v4
+                WHERE id = $1 AND enabled = true AND archived = false
+            """, strategy_id)
+            if row:
+                ENABLED_STRATEGIES[row["id"]] = {
+                    "signal_id": row["signal_id"],
+                    "allow_open": row["allow_open"],
+                    "reverse": row["reverse"]
+                }
+                log.info(f"Стратегия {row['id']} добавлена в ENABLED_STRATEGIES")
+            else:
+                log.warning(f"Стратегия {strategy_id} не прошла фильтр enabled/archived")
+    else:
+        if strategy_id in ENABLED_STRATEGIES:
+            ENABLED_STRATEGIES.pop(strategy_id, None)
+            log.info(f"Стратегия {strategy_id} удалена из ENABLED_STRATEGIES")
 # 🔸 Подписка на Pub/Sub обновления
 async def subscribe_and_watch_pubsub():
     log = logging.getLogger("PUBSUB_WATCHER")
