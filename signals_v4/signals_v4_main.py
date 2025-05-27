@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 import infra  # используем как модуль
 
 from infra import (
@@ -8,7 +9,8 @@ from infra import (
     init_redis_client,
     ENABLED_TICKERS,
     ENABLED_SIGNALS,
-    ENABLED_STRATEGIES
+    ENABLED_STRATEGIES,
+    REDIS
 )
 
 log = logging.getLogger("SIGNALS_COORDINATOR")
@@ -85,8 +87,27 @@ async def load_initial_state():
 # 🔸 Подписка на Pub/Sub обновления
 async def subscribe_and_watch_pubsub():
     log = logging.getLogger("PUBSUB_WATCHER")
-    log.info("Подписка на каналы Pub/Sub...")
-    await asyncio.sleep(999999)
+    pubsub = REDIS.pubsub()
+    await pubsub.subscribe("tickers_v4_events", "signals_v4_events", "strategies_v4_events")
+    log.info("Подписка на каналы Pub/Sub активна")
+
+    async for message in pubsub.listen():
+        if message["type"] != "message":
+            continue
+
+        try:
+            data = json.loads(message["data"])
+            channel = message["channel"]
+
+            if channel == "tickers_v4_events":
+                await handle_ticker_event(data)
+            elif channel == "signals_v4_events":
+                await handle_signal_event(data)
+            elif channel == "strategies_v4_events":
+                await handle_strategy_event(data)
+
+        except Exception as e:
+            log.exception(f"Ошибка при обработке Pub/Sub события: {e}")
 
 # 🔸 Чтение из Redis Stream
 async def read_and_process_signals():
