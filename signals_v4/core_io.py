@@ -2,10 +2,21 @@ import asyncio
 import logging
 import json
 import infra
+from dateutil import parser
 
 # 🔸 Вставка записи в таблицу signals_v4_log
 async def insert_signal_log(data: dict):
     log = logging.getLogger("CORE_IO")
+
+    required_fields = [
+        "signal_id", "symbol", "direction", "source", "message", "raw_message",
+        "bar_time", "sent_at", "received_at", "status", "uid"
+    ]
+    for field in required_fields:
+        if field not in data:
+            log.warning(f"Пропущен лог: отсутствует поле {field} в {data}")
+            return
+
     async with infra.PG_POOL.acquire() as conn:
         await conn.execute("""
             INSERT INTO signals_v4_log (
@@ -31,9 +42,9 @@ async def insert_signal_log(data: dict):
         data["source"],
         data["message"],
         data["raw_message"],
-        data["bar_time"],
-        data["sent_at"],
-        data["received_at"],
+        parser.isoparse(data["bar_time"]),
+        parser.isoparse(data["sent_at"]),
+        parser.isoparse(data["received_at"]),
         data["status"],
         data["uid"])
 
