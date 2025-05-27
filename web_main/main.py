@@ -11,6 +11,7 @@ from fastapi import status
 from starlette.status import HTTP_303_SEE_OTHER
 import asyncpg
 from fastapi import Form
+from datetime import datetime
 
 # 🔸 Переменные окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -566,6 +567,8 @@ async def testsignals_page(request: Request):
             } for r in signals_active
         ]
     })
+from datetime import datetime  # убедись, что импорт добавлен выше
+
 # 🔸 POST: сохранение тестового сигнала в журнал
 log = logging.getLogger("TESTSIGNALS")
 
@@ -575,12 +578,18 @@ async def save_testsignal(request: Request):
 
     symbol = data.get("symbol")
     message = data.get("message")
-    time = data.get("time")
-    sent_at = data.get("sent_at")
+    time_raw = data.get("time")
+    sent_raw = data.get("sent_at")
     mode = data.get("mode")
 
-    if not all([symbol, message, time, sent_at, mode]):
+    if not all([symbol, message, time_raw, sent_raw, mode]):
         raise HTTPException(status_code=400, detail="Missing required fields")
+
+    try:
+        time = datetime.fromisoformat(time_raw.replace("Z", "+00:00"))
+        sent_at = datetime.fromisoformat(sent_raw.replace("Z", "+00:00"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {e}")
 
     async with pg_pool.acquire() as conn:
         await conn.execute("""
