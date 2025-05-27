@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import infra  # <— используем как модуль
+import infra  # используем как модуль
 
 from infra import (
     setup_logging,
@@ -80,8 +80,6 @@ async def load_initial_state():
     await load_enabled_tickers()
     await load_enabled_signals()
     await load_enabled_strategies()
-
-    await asyncio.sleep(999999)
 
 # 🔸 Подписка на Pub/Sub обновления
 async def subscribe_and_watch_pubsub():
