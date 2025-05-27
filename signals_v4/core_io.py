@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import json
-from infra import PG_POOL, REDIS
+import infra
 
 # 🔸 Вставка записи в таблицу signals_v4_log
 async def insert_signal_log(data: dict):
     log = logging.getLogger("CORE_IO")
-    async with PG_POOL.acquire() as conn:
+    async with infra.PG_POOL.acquire() as conn:
         await conn.execute("""
             INSERT INTO signals_v4_log (
                 signal_id,
@@ -38,6 +38,7 @@ async def insert_signal_log(data: dict):
         data["uid"])
 
     log.info(f"Лог записан в БД: {data['uid']}")
+
 # 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
 async def run_core_io():
     log = logging.getLogger("CORE_IO")
@@ -46,14 +47,14 @@ async def run_core_io():
     consumer = "writer-1"
 
     try:
-        await REDIS.xgroup_create(stream, group, id="0", mkstream=True)
+        await infra.REDIS.xgroup_create(stream, group, id="0", mkstream=True)
         log.info(f"Группа {group} создана для {stream}")
     except Exception:
         pass  # группа уже существует
 
     while True:
         try:
-            messages = await REDIS.xreadgroup(
+            messages = await infra.REDIS.xreadgroup(
                 groupname=group,
                 consumername=consumer,
                 streams={stream: ">"},
@@ -64,7 +65,7 @@ async def run_core_io():
                 for _, entries in messages:
                     for entry_id, entry_data in entries:
                         await insert_signal_log(dict(entry_data))
-                        await REDIS.xack(stream, group, entry_id)
+                        await infra.REDIS.xack(stream, group, entry_id)
         except Exception as e:
             log.exception(f"Ошибка в run_core_io: {e}")
             await asyncio.sleep(1)
