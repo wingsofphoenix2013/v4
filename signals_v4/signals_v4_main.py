@@ -9,8 +9,7 @@ from infra import (
     init_redis_client,
     ENABLED_TICKERS,
     ENABLED_SIGNALS,
-    ENABLED_STRATEGIES,
-    REDIS
+    ENABLED_STRATEGIES
 )
 
 log = logging.getLogger("SIGNALS_COORDINATOR")
@@ -87,7 +86,7 @@ async def load_initial_state():
 # 🔸 Подписка на Pub/Sub обновления
 async def subscribe_and_watch_pubsub():
     log = logging.getLogger("PUBSUB_WATCHER")
-    pubsub = REDIS.pubsub()
+    pubsub = infra.REDIS.pubsub()
     await pubsub.subscribe("tickers_v4_events", "signals_v4_events", "strategies_v4_events")
     log.info("Подписка на каналы Pub/Sub активна")
 
