@@ -519,3 +519,74 @@ async def create_strategy(
         """, name, human_name, signal_id, timeframe, enabled_bool)
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+@app.get("/testsignals", response_class=HTMLResponse)
+async def testsignals_page(request: Request):
+    async with pg_pool.acquire() as conn:
+        # Все тикеры с включённым статусом
+        tickers_all = await conn.fetch("""
+            SELECT symbol FROM tickers_v4
+            WHERE status = 'enabled'
+        """)
+
+        # Только активные тикеры (status=enabled и tradepermission=enabled)
+        tickers_active = await conn.fetch("""
+            SELECT symbol FROM tickers_v4
+            WHERE status = 'enabled' AND tradepermission = 'enabled'
+        """)
+
+        # Все сигналы
+        signals_all = await conn.fetch("""
+            SELECT id, name, long_phrase, short_phrase FROM signals_v4
+        """)
+
+        # Только активные сигналы
+        signals_active = await conn.fetch("""
+            SELECT id, name, long_phrase, short_phrase FROM signals_v4
+            WHERE enabled = true
+        """)
+
+    return templates.TemplateResponse("testsignals.html", {
+        "request": request,
+        "tickers_all": [r["symbol"] for r in tickers_all],
+        "tickers_active": [r["symbol"] for r in tickers_active],
+        "signals_all": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "long_phrase": r["long_phrase"],
+                "short_phrase": r["short_phrase"]
+            } for r in signals_all
+        ],
+        "signals_active": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "long_phrase": r["long_phrase"],
+                "short_phrase": r["short_phrase"]
+            } for r in signals_active
+        ]
+    })
+# 🔸 POST: сохранение тестового сигнала в журнал
+log = logging.getLogger("TESTSIGNALS")
+
+@app.post("/testsignals/save")
+async def save_testsignal(request: Request):
+    data = await request.json()
+
+    symbol = data.get("symbol")
+    message = data.get("message")
+    time = data.get("time")
+    sent_at = data.get("sent_at")
+    mode = data.get("mode")
+
+    if not all([symbol, message, time, sent_at, mode]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    async with pg_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO testsignals_v4 (symbol, message, time, sent_at, mode)
+            VALUES ($1, $2, $3, $4, $5)
+        """, symbol, message, time, sent_at, mode)
+
+    log.info(f"Тестовый сигнал записан: {symbol} | {message} | {mode}")
+    return JSONResponse({"status": "ok"})
