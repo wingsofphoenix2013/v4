@@ -572,6 +572,9 @@ from datetime import datetime  # убедись, что импорт добав�
 # 🔸 POST: сохранение тестового сигнала в журнал
 log = logging.getLogger("TESTSIGNALS")
 
+def to_naive_utc(dt_str):
+    return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).replace(tzinfo=None)
+
 @app.post("/testsignals/save")
 async def save_testsignal(request: Request):
     data = await request.json()
@@ -585,11 +588,8 @@ async def save_testsignal(request: Request):
     if not all([symbol, message, time_raw, sent_raw, mode]):
         raise HTTPException(status_code=400, detail="Missing required fields")
 
-    try:
-        time = datetime.fromisoformat(time_raw.replace("Z", "+00:00"))
-        sent_at = datetime.fromisoformat(sent_raw.replace("Z", "+00:00"))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {e}")
+    time = to_naive_utc(time_raw)
+    sent_at = to_naive_utc(sent_raw)
 
     async with pg_pool.acquire() as conn:
         await conn.execute("""
