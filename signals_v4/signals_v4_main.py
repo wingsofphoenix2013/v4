@@ -97,14 +97,15 @@ async def main():
     setup_logging()
     log.info("Инициализация signals_v4")
 
-    # Инициализация подключений
     await init_pg_pool()
     await init_redis_client()
     log.info("Подключения Redis и PostgreSQL установлены")
 
-    # Параллельный запуск всех воркеров
+    # Важно: сначала загружаем справочники
+    await load_initial_state()
+
+    # Затем запускаем фоновые задачи
     await asyncio.gather(
-        run_safe_loop(load_initial_state, "STATE_LOADER"),
         run_safe_loop(subscribe_and_watch_pubsub, "PUBSUB_WATCHER"),
         run_safe_loop(read_and_process_signals, "SIGNAL_STREAM_READER")
     )
