@@ -1,5 +1,5 @@
 import logging
-from infra import ENABLED_SIGNALS
+from infra import ENABLED_SIGNALS, ENABLED_TICKERS
 
 # 🔸 Обработка одного сигнала из Redis Stream
 async def process_signal(data: dict):
@@ -12,10 +12,9 @@ async def process_signal(data: dict):
         log.warning(f"Пропущен сигнал без symbol/message: {data}")
         return
 
-    # 🔍 Определение направления сигнала
+    # 🔍 Определение направления
     direction = None
     signal_id = None
-
     for sid, phrases in ENABLED_SIGNALS.items():
         if message == phrases["long"]:
             direction = "long"
@@ -30,4 +29,9 @@ async def process_signal(data: dict):
         log.warning(f"Не удалось определить направление сигнала: {message}")
         return
 
-    log.info(f"Распознан сигнал: {symbol} | {direction} | signal_id={signal_id}")
+    # 🔍 Проверка разрешённого тикера
+    if symbol not in ENABLED_TICKERS:
+        log.warning(f"Тикер {symbol} не входит в ENABLED_TICKERS — сигнал отклонён")
+        return
+
+    log.info(f"Сигнал принят к обработке: {symbol} | {direction} | signal_id={signal_id}")
