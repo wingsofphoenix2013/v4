@@ -80,8 +80,8 @@ async def process_signal(data: dict):
         await publish_signal_log(data, signal_id=signal_id, direction=direction, status="ignored")
         return
 
-    for strategy_id in matched_strategies:
-        await publish_to_strategy_stream(
+    await asyncio.gather(*[
+        publish_to_strategy_stream(
             strategy_id=strategy_id,
             signal_id=signal_id,
             symbol=symbol,
@@ -89,6 +89,8 @@ async def process_signal(data: dict):
             bar_time=data.get("bar_time"),
             received_at=data.get("received_at")
         )
+        for strategy_id in matched_strategies
+    ])
 
     await publish_signal_log(data, signal_id=signal_id, direction=direction, status="dispatched")
     log.info(f"Сигнал передан стратегиям: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
