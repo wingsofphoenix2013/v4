@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import json
-import infra  # используем как модуль
+import infra
 
 from infra import (
     setup_logging,
@@ -12,6 +12,7 @@ from infra import (
     ENABLED_STRATEGIES
 )
 
+from processor import process_signal
 log = logging.getLogger("SIGNALS_COORDINATOR")
 
 # 🔸 Обёртка безопасного запуска задач
@@ -191,12 +192,42 @@ async def subscribe_and_watch_pubsub():
 
         except Exception as e:
             log.exception(f"Ошибка при обработке Pub/Sub события: {e}")
-
-# 🔸 Чтение из Redis Stream
+            
+# 🔸 Чтение сигналов из Redis Stream и передача в обработку
 async def read_and_process_signals():
     log = logging.getLogger("SIGNAL_STREAM_READER")
-    log.info("Чтение сигналов из Redis Stream...")
-    await asyncio.sleep(999999)
+    redis = infra.REDIS
+    group = "signal_processor"
+    consumer = "worker-1"
+    stream = "signals_stream"
+
+    try:
+        await redis.xgroup_create(stream, group, id="$", mkstream=True)
+        log.info(f"Группа {group} создана для {stream}")
+    except Exception:
+        pass  # группа уже существует
+
+    while True:
+        try:
+            messages = await redis.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=100,
+                block=3000  # мс
+            )
+            if messages:
+                for _, entries in messages:
+                    for entry in entries:
+                        log.debug(f"Входящий сигнал: {dict(entry[1])}")
+                    await asyncio.gather(*[
+                        process_signal(dict(entry[1])) for entry in entries
+                    ])
+                    for entry_id, _ in entries:
+                        await redis.xack(stream, group, entry_id)
+        except Exception as e:
+            log.exception(f"Ошибка при чтении из Redis Stream: {e}")
+            await asyncio.sleep(1)
 
 # 🔸 Основной запуск
 async def main():
