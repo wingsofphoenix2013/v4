@@ -35,7 +35,7 @@ async def load_enabled_tickers():
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
         for row in rows:
-            ENABLED_TICKERS.add(row["symbol"])
+            ENABLED_TICKERS[row["symbol"]] = True
     log.info(f"Загружено {len(ENABLED_TICKERS)} активных тикеров")
 
 # 🔸 Загрузка активных сигналов из БД
