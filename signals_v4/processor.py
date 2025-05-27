@@ -60,13 +60,11 @@ async def process_signal(data: dict):
             break
 
     if not direction:
-        log.warning(f"Не удалось определить направление сигнала: {message}")
-        await publish_signal_log(data, signal_id=0, direction="unknown", status="ignored")
+        log.warning(f"Не удалось определить направление сигнала: {message} — сигнал проигнорирован")
         return
 
     if symbol not in ENABLED_TICKERS:
-        log.warning(f"Тикер {symbol} не входит в ENABLED_TICKERS — сигнал отклонён")
-        await publish_signal_log(data, signal_id=signal_id, direction=direction, status="ignored")
+        log.warning(f"Тикер {symbol} не входит в ENABLED_TICKERS — сигнал отброшен")
         return
 
     matched_strategies = []
