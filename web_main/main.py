@@ -1,17 +1,16 @@
-# main.py — стартовая точка FastAPI приложения для UI движка v4
 import os
-from decimal import Decimal
-import redis.asyncio as aioredis
 import json
 import logging
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
-from fastapi import status
-from starlette.status import HTTP_303_SEE_OTHER
-import asyncpg
-from fastapi import Form
+from decimal import Decimal
 from datetime import datetime
+
+import asyncpg
+import redis.asyncio as aioredis
+
+from fastapi import FastAPI, Request, Form, HTTPException, status
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from starlette.status import HTTP_303_SEE_OTHER
 
 # 🔸 Переменные окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
