@@ -13,6 +13,8 @@ from infra import (
 )
 
 from processor import process_signal
+from core_io import run_core_io
+
 log = logging.getLogger("SIGNALS_COORDINATOR")
 
 # 🔸 Обёртка безопасного запуска задач
@@ -242,7 +244,8 @@ async def main():
 
     await asyncio.gather(
         run_safe_loop(subscribe_and_watch_pubsub, "PUBSUB_WATCHER"),
-        run_safe_loop(read_and_process_signals, "SIGNAL_STREAM_READER")
+        run_safe_loop(read_and_process_signals, "SIGNAL_STREAM_READER"),
+        run_safe_loop(run_core_io, "CORE_IO")
     )
 
 if __name__ == "__main__":

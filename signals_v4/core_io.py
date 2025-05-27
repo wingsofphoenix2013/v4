@@ -1,0 +1,70 @@
+import asyncio
+import logging
+import json
+from infra import PG_POOL, REDIS
+
+# 🔸 Вставка записи в таблицу signals_v4_log
+async def insert_signal_log(data: dict):
+    log = logging.getLogger("CORE_IO")
+    async with PG_POOL.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO signals_v4_log (
+                signal_id,
+                symbol,
+                direction,
+                source,
+                message,
+                raw_message,
+                bar_time,
+                sent_at,
+                received_at,
+                status,
+                uid
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            )
+            ON CONFLICT (uid) DO NOTHING
+        """,
+        int(data["signal_id"]),
+        data["symbol"],
+        data["direction"],
+        data["source"],
+        data["message"],
+        data["raw_message"],
+        data["bar_time"],
+        data["sent_at"],
+        data["received_at"],
+        data["status"],
+        data["uid"])
+
+    log.info(f"Лог записан в БД: {data['uid']}")
+# 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
+async def run_core_io():
+    log = logging.getLogger("CORE_IO")
+    stream = "signals_log_stream"
+    group = "core_io"
+    consumer = "writer-1"
+
+    try:
+        await REDIS.xgroup_create(stream, group, id="0", mkstream=True)
+        log.info(f"Группа {group} создана для {stream}")
+    except Exception:
+        pass  # группа уже существует
+
+    while True:
+        try:
+            messages = await REDIS.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=100,
+                block=3000
+            )
+            if messages:
+                for _, entries in messages:
+                    for entry_id, entry_data in entries:
+                        await insert_signal_log(dict(entry_data))
+                        await REDIS.xack(stream, group, entry_id)
+        except Exception as e:
+            log.exception(f"Ошибка в run_core_io: {e}")
+            await asyncio.sleep(1)
