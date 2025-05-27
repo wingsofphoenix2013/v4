@@ -219,7 +219,7 @@ async def read_and_process_signals():
             if messages:
                 for _, entries in messages:
                     for entry in entries:
-                        log.debug(f"Входящий сигнал: {dict(entry[1])}")
+                        log.info(f"Входящий сигнал: {dict(entry[1])}")
                     await asyncio.gather(*[
                         process_signal(dict(entry[1])) for entry in entries
                     ])
