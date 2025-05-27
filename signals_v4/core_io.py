@@ -42,14 +42,13 @@ async def insert_signal_log(data: dict):
         data["source"],
         data["message"],
         data["raw_message"],
-        parser.isoparse(data["bar_time"]),
-        parser.isoparse(data["sent_at"]),
-        parser.isoparse(data["received_at"]),
+        parser.isoparse(data["bar_time"]).replace(tzinfo=None),
+        parser.isoparse(data["sent_at"]).replace(tzinfo=None),
+        parser.isoparse(data["received_at"]).replace(tzinfo=None),
         data["status"],
         data["uid"])
 
     log.info(f"Лог записан в БД: {data['uid']}")
-
 # 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
 async def run_core_io():
     log = logging.getLogger("CORE_IO")
