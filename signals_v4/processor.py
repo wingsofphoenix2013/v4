@@ -1,6 +1,20 @@
 import logging
 from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
+import infra
 
+# 🔸 Публикация сигнала в Redis Stream стратегии
+async def publish_to_strategy_stream(strategy_id, signal_id, symbol, direction, bar_time, received_at):
+    await infra.REDIS.xadd(
+        "strategy_input_stream",
+        {
+            "strategy_id": str(strategy_id),
+            "signal_id": str(signal_id),
+            "symbol": symbol,
+            "direction": direction,
+            "time": bar_time,
+            "received_at": received_at,
+        }
+    )
 # 🔸 Обработка одного сигнала из Redis Stream
 async def process_signal(data: dict):
     log = logging.getLogger("PROCESSOR")
@@ -46,4 +60,14 @@ async def process_signal(data: dict):
         log.info(f"Нет подходящих стратегий для сигнала: {symbol} | {direction}")
         return
 
-    log.info(f"Сигнал принят к обработке: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
+    for strategy_id in matched_strategies:
+        await publish_to_strategy_stream(
+            strategy_id=strategy_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            direction=direction,
+            bar_time=data.get("bar_time"),
+            received_at=data.get("received_at")
+        )
+
+    log.info(f"Сигнал передан стратегиям: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
