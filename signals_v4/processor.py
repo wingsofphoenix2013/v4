@@ -1,6 +1,7 @@
 import logging
 from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
 import infra
+import json
 
 # 🔸 Публикация сигнала в Redis Stream стратегии
 async def publish_to_strategy_stream(strategy_id, signal_id, symbol, direction, bar_time, received_at):
@@ -15,6 +16,24 @@ async def publish_to_strategy_stream(strategy_id, signal_id, symbol, direction, 
             "received_at": received_at,
         }
     )
+# 🔸 Публикация лога сигнала в Redis Stream для core_io
+async def publish_signal_log(data: dict, signal_id: int, direction: str, status: str):
+    await infra.REDIS.xadd(
+        "signals_log_stream",
+        {
+            "signal_id": str(signal_id),
+            "symbol": data.get("symbol"),
+            "direction": direction,
+            "source": "stream",
+            "message": data.get("message"),
+            "raw_message": json.dumps(data),
+            "bar_time": data.get("bar_time"),
+            "sent_at": data.get("sent_at"),
+            "received_at": data.get("received_at"),
+            "status": status,
+            "uid": f"{data.get('symbol')}_{data.get('bar_time')}",
+        }
+    )
 # 🔸 Обработка одного сигнала из Redis Stream
 async def process_signal(data: dict):
     log = logging.getLogger("PROCESSOR")
@@ -26,7 +45,7 @@ async def process_signal(data: dict):
         log.warning(f"Пропущен сигнал без symbol/message: {data}")
         return
 
-    # 🔍 Определение направления
+    # Определение направления
     direction = None
     signal_id = None
     for sid, phrases in ENABLED_SIGNALS.items():
@@ -41,14 +60,14 @@ async def process_signal(data: dict):
 
     if not direction:
         log.warning(f"Не удалось определить направление сигнала: {message}")
+        await publish_signal_log(data, signal_id=0, direction="unknown", status="ignored")
         return
 
-    # 🔍 Проверка разрешённого тикера
     if symbol not in ENABLED_TICKERS:
         log.warning(f"Тикер {symbol} не входит в ENABLED_TICKERS — сигнал отклонён")
+        await publish_signal_log(data, signal_id=signal_id, direction=direction, status="ignored")
         return
 
-    # 🔍 Фильтрация подходящих стратегий
     matched_strategies = []
     for strategy_id, strategy in ENABLED_STRATEGIES.items():
         if strategy["signal_id"] != signal_id:
@@ -58,6 +77,7 @@ async def process_signal(data: dict):
 
     if not matched_strategies:
         log.info(f"Нет подходящих стратегий для сигнала: {symbol} | {direction}")
+        await publish_signal_log(data, signal_id=signal_id, direction=direction, status="ignored")
         return
 
     for strategy_id in matched_strategies:
@@ -70,4 +90,5 @@ async def process_signal(data: dict):
             received_at=data.get("received_at")
         )
 
+    await publish_signal_log(data, signal_id=signal_id, direction=direction, status="dispatched")
     log.info(f"Сигнал передан стратегиям: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
