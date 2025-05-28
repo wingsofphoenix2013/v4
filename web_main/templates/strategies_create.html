@@ -374,6 +374,78 @@
     renderSLBehavior(tpCount);
   });
 </script>
+<!-- Зона 7 -->
+<div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-4">
+  <h2 class="text-lg font-semibold text-blue-800">Выбор тикеров</h2>
+
+  <!-- Главный переключатель -->
+  <label class="flex items-center space-x-2">
+    <input type="checkbox" name="use_all_tickers" id="use-all-tickers" class="h-5 w-5" checked>
+    <span>Использовать все тикеры</span>
+  </label>
+
+  <!-- Контейнер для таблицы -->
+  <div id="ticker-table" class="hidden space-y-2 pt-2"></div>
+</div>
+
+<div class="h-1"></div>
+
+<script>
+  const useAllCheckbox = document.getElementById('use-all-tickers');
+  const tickerTable = document.getElementById('ticker-table');
+
+  useAllCheckbox.addEventListener('change', async () => {
+    if (useAllCheckbox.checked) {
+      tickerTable.classList.add('hidden');
+      tickerTable.innerHTML = '';
+      return;
+    }
+
+    // Показываем таблицу
+    tickerTable.classList.remove('hidden');
+    tickerTable.innerHTML = '<div class="text-sm text-slate-600">Загрузка тикеров...</div>';
+
+    try {
+      const res = await fetch('/tickers/enabled');
+      const data = await res.json();
+
+      const sorted = data.sort((a, b) => a.symbol.localeCompare(b.symbol));
+      const rows = [];
+
+      for (let i = 0; i < sorted.length; i += 3) {
+        const row = document.createElement('div');
+        row.className = "grid grid-cols-1 sm:grid-cols-3 gap-4";
+
+        for (let j = 0; j < 3; j++) {
+          const t = sorted[i + j];
+          if (!t) break;
+
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.name = 'ticker_id[]';
+          checkbox.value = t.id;
+          checkbox.className = 'mr-2';
+
+          const label = document.createElement('label');
+          label.className = 'flex items-center space-x-2 text-sm';
+          label.appendChild(checkbox);
+          label.appendChild(document.createTextNode(t.symbol));
+
+          row.appendChild(label);
+        }
+
+        rows.push(row);
+      }
+
+      tickerTable.innerHTML = '';
+      rows.forEach(r => tickerTable.appendChild(r));
+
+    } catch (err) {
+      tickerTable.innerHTML = '<div class="text-red-600 text-sm">Ошибка загрузки тикеров</div>';
+      console.error("Ошибка загрузки тикеров:", err);
+    }
+  });
+</script>
 <!-- Submit -->
 <div class="pt-6">
   <button type="submit" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg">

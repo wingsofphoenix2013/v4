@@ -489,7 +489,7 @@ async def get_signals_by_tf(tf: str):
             ORDER BY name
         """, tf)
         return [{"id": r["id"], "name": r["name"]} for r in rows]
-# 🔸 POST: создание стратегии + TP + SL-настройки
+# 🔸 POST: создание стратегии + TP + SL-настройки + привязка тикеров
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
     request: Request,
@@ -513,8 +513,12 @@ async def create_strategy(
 
     form_data = await request.form()
 
+    # Читаем чекбокс use_all_tickers
+    use_all_flag = form_data.get("use_all_tickers")
+    use_all_tickers = use_all_flag == "on"
+
     async with pg_pool.acquire() as conn:
-        # Проверка имени
+        # 🔸 Проверка имени на уникальность
         exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name)
         if exists:
             rows = await conn.fetch("SELECT id, name, enabled FROM signals_v4 ORDER BY id")
@@ -525,7 +529,7 @@ async def create_strategy(
                 "error": f"Стратегия с кодом '{name}' уже существует"
             })
 
-        # Сохраняем стратегию
+        # 🔸 Сохраняем стратегию
         result = await conn.fetchrow("""
             INSERT INTO strategies_v4 (
                 name, human_name, description, signal_id,
@@ -539,19 +543,19 @@ async def create_strategy(
                 $1, $2, $3, $4,
                 $5, $6, $7, $8,
                 $9, $10, $11, $12,
-                false, true, true,
-                true, $13, $14,
+                false, $13, true,
+                true, $14, $15,
                 NOW()
             )
             RETURNING id
         """, name, human_name, description, signal_id,
              deposit, position_limit, leverage, max_risk,
              timeframe.lower(), enabled_bool, reverse, sl_protection,
-             sl_type, sl_value)
+             use_all_tickers, sl_type, sl_value)
 
         strategy_id = result['id']
 
-        # Вставка TP-уровней
+        # 🔸 Вставка TP-уровней
         tp_level_ids = []
         level = 1
         while f"tp_{level}_volume" in form_data:
@@ -570,7 +574,7 @@ async def create_strategy(
             tp_level_ids.append(row["id"])
             level += 1
 
-        # Вставка SL-настроек для TP уровней (начиная с 1..n-1)
+        # 🔸 Вставка SL-настроек для TP уровней (начиная с 1..n-1)
         for i in range(1, len(tp_level_ids)):
             mode = form_data.get(f"sl_tp_{i}_mode")
             val = form_data.get(f"sl_tp_{i}_value")
@@ -582,6 +586,15 @@ async def create_strategy(
                 )
                 VALUES ($1, $2, $3, $4, NOW())
             """, strategy_id, tp_level_ids[i - 1], mode, sl_val)
+
+        # 🔸 Сохраняем выбранные тикеры, если use_all_tickers отключён
+        if not use_all_tickers:
+            selected_ids = form_data.getlist("ticker_id[]")
+            for tid in selected_ids:
+                await conn.execute("""
+                    INSERT INTO strategy_tickers_v4 (strategy_id, ticker_id, enabled)
+                    VALUES ($1, $2, true)
+                """, strategy_id, int(tid))
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
