@@ -479,7 +479,16 @@ async def strategies_create_form(request: Request):
         "signals": signals,
         "error": None
     })
-# 🔸 POST: создание стратегии + TP + SL-настройки
+# 🔸 GET: сигналы по таймфрейму
+@app.get("/strategies/signals_by_timeframe")
+async def get_signals_by_tf(tf: str):
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, name FROM signals_v4
+            WHERE enabled = true AND LOWER(timeframe) = LOWER($1)
+            ORDER BY name
+        """, tf)
+        return [{"id": r["id"], "name": r["name"]} for r in rows]
 # 🔸 POST: создание стратегии + TP + SL-настройки
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
