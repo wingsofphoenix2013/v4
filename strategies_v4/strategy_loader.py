@@ -16,7 +16,7 @@ def load_strategies():
             continue
 
         try:
-            module = importlib.import_module(f"strategies_v4.strategies.{modname}")
+            module = importlib.import_module(f"strategies.{modname}")
 
             expected_class = modname.title().replace("_", "")
             for name, obj in inspect.getmembers(module, inspect.isclass):
