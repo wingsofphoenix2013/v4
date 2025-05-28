@@ -520,7 +520,7 @@ async def create_strategy(
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
-@router.get("/strategies/check_name")
+@app.get("/strategies/check_name")
 async def check_strategy_name(name: str, db: asyncpg.Pool = Depends(get_db)):
     """
     Проверка уникальности кода стратегии (name) — вызывается из UI через AJAX
