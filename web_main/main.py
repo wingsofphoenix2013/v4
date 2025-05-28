@@ -479,7 +479,7 @@ async def strategies_create_form(request: Request):
         "signals": signals,
         "error": None
     })
-# 🔸 POST: создание новой стратегии (обновлённый — UI отправляет timeframe, enabled жёстко false)
+# 🔸 POST: создание новой стратегии
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
     request: Request,
@@ -495,24 +495,30 @@ async def create_strategy(
     reverse: bool = Form(False),
     sl_protection: bool = Form(False),
 ):
-    enabled_bool = False  # по умолчанию отключена
+    # Стратегия по умолчанию выключена
+    enabled_bool = False
 
+    # SL-защита включается автоматически при реверсе
     if reverse:
         sl_protection = True
 
     async with pg_pool.acquire() as conn:
+        # Проверка уникальности имени стратегии
         exists = await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name
         )
         if exists:
-            rows = await conn.fetch("SELECT id, name FROM signals_v4 ORDER BY id")
-            signals = [{"id": r["id"], "name": r["name"]} for r in rows]
+            # Загружаем список сигналов с полем enabled для отображения
+            rows = await conn.fetch("SELECT id, name, enabled FROM signals_v4 ORDER BY id")
+            signals = [{"id": r["id"], "name": r["name"], "enabled": r["enabled"]} for r in rows]
+
             return templates.TemplateResponse("strategies_create.html", {
                 "request": request,
                 "signals": signals,
                 "error": f"Стратегия с кодом '{name}' уже существует"
             })
 
+        # Сохраняем стратегию
         await conn.execute("""
             INSERT INTO strategies_v4 (
                 name, human_name, description, signal_id,

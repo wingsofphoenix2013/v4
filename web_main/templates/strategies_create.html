@@ -54,7 +54,7 @@
   <a href="/strategies" class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">
     Назад к стратегиям
   </a>
-<form method="post" action="/strategies/create" class="space-y-8 bg-white/80 p-6 rounded-2xl shadow">
+<form method="post" action="/strategies/create" class="space-y-6 px-2">
 <!-- Зона 1 -->
 <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-4">
   <h2 class="text-xl font-semibold text-blue-800">Основные поля</h2>
@@ -76,28 +76,31 @@
     <textarea name="description" required rows="3" class="w-full px-4 py-2 border rounded"></textarea>
   </div>
 
-  <div>
-    <label class="block mb-1 font-medium">Управляющий сигнал</label>
-    <select name="signal_id" required class="w-full px-4 py-2 rounded border border-slate-300">
-      <option value="" disabled selected>Выбрать сигнал</option>
-      {% for s in signals %}
-        <option value="{{ s.id }}">{{ s.name }}</option>
-      {% endfor %}
-    </select>
-  </div>
-
-  <div>
-    <label class="block mb-1 font-medium">Таймфрейм</label>
-    <select name="timeframe" required class="w-full px-4 py-2 rounded border border-slate-300">
-      <option value="" disabled selected>Выбрать</option>
-      <option value="m1">M1</option>
-      <option value="m5">M5</option>
-      <option value="m15">M15</option>
-    </select>
+  <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+    <div>
+      <label class="block mb-1 font-medium">Управляющий сигнал</label>
+      <select name="signal_id" required class="w-full px-4 py-2 rounded border border-slate-300">
+        <option value="" disabled selected>Выбрать сигнал</option>
+        {% for s in signals %}
+          <option value="{{ s.id }}">
+            {{ s.name }} [{% if s.enabled %}enabled{% else %}disabled{% endif %}]
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block mb-1 font-medium">Таймфрейм</label>
+      <select name="timeframe" required class="w-full px-4 py-2 rounded border border-slate-300">
+        <option value="" disabled selected>Выбрать</option>
+        <option value="m1">M1</option>
+        <option value="m5">M5</option>
+        <option value="m15">M15</option>
+      </select>
+    </div>
   </div>
 </div>
 
-<div class="h-6"></div>
+<div class="h-3"></div>
 
 <!-- Зона 2 -->
 <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-4">
@@ -123,7 +126,7 @@
   </div>
 </div>
 
-<div class="h-6"></div>
+<div class="h-3"></div>
 
 <!-- Зона 3 -->
 <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-4">
