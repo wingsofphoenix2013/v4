@@ -479,7 +479,7 @@ async def strategies_create_form(request: Request):
         "signals": signals,
         "error": None
     })
-# 🔸 POST: создание новой стратегии (с учётом текущего UI и хардкодов для обязательных полей)
+# 🔸 POST: создание новой стратегии (обновлённый — UI отправляет timeframe, enabled жёстко false)
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
     request: Request,
@@ -491,12 +491,11 @@ async def create_strategy(
     position_limit: int = Form(...),
     leverage: int = Form(...),
     max_risk: int = Form(...),
+    timeframe: str = Form(...),
     reverse: bool = Form(False),
     sl_protection: bool = Form(False),
 ):
-    # Жёсткие значения для отсутствующих полей UI
-    timeframe = "m5"
-    enabled_bool = True
+    enabled_bool = False  # по умолчанию отключена
 
     if reverse:
         sl_protection = True
@@ -533,7 +532,7 @@ async def create_strategy(
             )
         """, name, human_name, description, signal_id,
              deposit, position_limit, leverage, max_risk,
-             timeframe, enabled_bool, reverse, sl_protection)
+             timeframe.lower(), enabled_bool, reverse, sl_protection)
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
