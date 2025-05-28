@@ -597,6 +597,17 @@ async def create_strategy(
                 """, strategy_id, int(tid))
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 GET: список включённых тикеров (для выбора в стратегии)
+@app.get("/tickers/enabled")
+async def get_enabled_tickers():
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, symbol
+            FROM tickers_v4
+            WHERE enabled = true
+            ORDER BY symbol
+        """)
+        return [{"id": r["id"], "symbol": r["symbol"]} for r in rows]
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
 @app.get("/strategies/check_name")
 async def check_strategy_name(name: str):
