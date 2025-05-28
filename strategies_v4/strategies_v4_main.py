@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from infra import setup_logging, setup_pg, setup_redis_client
-from config_loader import init_config_state
+from config_loader import init_config_state, config_event_listener
 from signal_processor import run_signal_loop
 from position_handler import run_position_loop
 from config_loader import config_event_listener

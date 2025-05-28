@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from infra import pg_pool, redis_client
+from infra import infra
 
 log = logging.getLogger("CONFIG_LOADER")
 
@@ -10,7 +10,7 @@ class ConfigState:
         self.strategies: dict[int, dict] = {}
 
     async def reload_ticker(self, symbol: str):
-        async with pg_pool.acquire() as conn:
+        async with infra.pg_pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT id, symbol FROM tickers_v4
                 WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
@@ -27,7 +27,7 @@ class ConfigState:
             log.info(f"🧹 [TICKERS] {symbol} удалён")
 
     async def reload_strategy(self, strategy_id: int):
-        async with pg_pool.acquire() as conn:
+        async with infra.pg_pool.acquire() as conn:
             strategy = await conn.fetchrow("""
                 SELECT * FROM strategies_v4 WHERE id = $1 AND enabled = true
             """, strategy_id)
@@ -57,7 +57,7 @@ class ConfigState:
             log.info(f"🧹 [STRATEGIES] ID={strategy_id} отключена и удалена из памяти")
 
     async def reload_all(self):
-        async with pg_pool.acquire() as conn:
+        async with infra.pg_pool.acquire() as conn:
             tickers = await conn.fetch("""
                 SELECT id, symbol FROM tickers_v4
                 WHERE status = 'enabled' AND tradepermission = 'enabled'
@@ -94,7 +94,7 @@ async def init_config_state():
 
 # 🔸 Слушатель Pub/Sub Redis
 async def config_event_listener():
-    pubsub = redis_client.pubsub()
+    pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe("tickers_v4_events", "strategies_v4_events")
 
     log.info("📡 [CONFIG_LOADER] Подписка на tickers_v4_events и strategies_v4_events")
