@@ -100,7 +100,7 @@
   </div>
 </div>
 
-<div class="h-3"></div>
+<div class="h-1"></div>
 
 <!-- Зона 2 -->
 <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-4">
@@ -126,7 +126,7 @@
   </div>
 </div>
 
-<div class="h-3"></div>
+<div class="h-1"></div>
 
 <!-- Зона 3 -->
 <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-4">
@@ -143,7 +143,147 @@
     </label>
   </div>
 </div>
+<div class="h-1"></div>
+<!-- Зона 4 -->
+<div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-4">
+  <h2 class="text-lg font-semibold text-blue-800">Уровни Take-Profit</h2>
 
+  <!-- Выбор количества уровней -->
+  <div>
+    <label class="block mb-1 font-medium">Количество TP-уровней</label>
+    <select id="tp-level-count" class="w-full px-4 py-2 border rounded" required>
+      <option value="" disabled selected>Выбрать</option>
+      <option value="1">1</option>
+      <option value="2">2</option>
+      <option value="3">3</option>
+    </select>
+  </div>
+
+  <!-- Контейнер уровней -->
+  <div id="tp-levels-container" class="space-y-2"></div>
+</div>
+
+<div class="h-1"></div>
+
+<script>
+  const tpCountSelect = document.getElementById('tp-level-count');
+  const container = document.getElementById('tp-levels-container');
+  const form = document.querySelector('form');
+  let currentTpType = null;
+
+  tpCountSelect.addEventListener('change', () => {
+    const count = parseInt(tpCountSelect.value);
+    container.innerHTML = "";
+
+    for (let i = 1; i <= count; i++) {
+      const row = document.createElement('div');
+      row.className = "grid grid-cols-4 gap-2 items-center";
+
+      // Объём
+      const volumeInput = document.createElement('input');
+      volumeInput.type = "number";
+      volumeInput.name = `tp_${i}_volume`;
+      volumeInput.min = 1;
+      volumeInput.max = 100;
+      volumeInput.required = true;
+      volumeInput.className = "px-2 py-1 border rounded w-full";
+      volumeInput.placeholder = "%";
+      volumeInput.addEventListener('input', validateTpVolumeSum);
+
+      // Тип
+      const typeSelect = document.createElement('select');
+      typeSelect.name = `tp_${i}_type`;
+      typeSelect.required = true;
+      typeSelect.className = "px-2 py-1 border rounded w-full";
+
+      const typeOptions = (count === 1 || i === count) ? ['percent', 'atr', 'signal'] : ['percent', 'atr'];
+      typeOptions.forEach(type => {
+        const opt = document.createElement('option');
+        opt.value = type;
+        opt.innerText = type;
+        typeSelect.appendChild(opt);
+      });
+
+      // Значение
+      const valueInput = document.createElement('input');
+      valueInput.type = 'number';
+      valueInput.name = `tp_${i}_value`;
+      valueInput.step = "any";
+      valueInput.required = true;
+      valueInput.className = "px-2 py-1 border rounded w-full";
+      valueInput.placeholder = "Значение";
+
+      typeSelect.addEventListener('change', () => {
+        const selectedType = typeSelect.value;
+
+        if (selectedType === 'percent' || selectedType === 'atr') {
+          currentTpType = selectedType;
+          syncAllTpTypes(selectedType, count);
+        }
+
+        valueInput.style.display = (selectedType === 'signal') ? 'none' : 'block';
+      });
+
+      // Сборка строки
+      row.innerHTML = `
+        <div class="text-center font-medium">${i}</div>
+        <div></div>
+        <div></div>
+        <div></div>
+      `;
+      row.children[1].appendChild(volumeInput);
+      row.children[2].appendChild(typeSelect);
+      row.children[3].appendChild(valueInput);
+
+      container.appendChild(row);
+    }
+
+    validateTpVolumeSum(); // сразу после генерации
+  });
+
+  function syncAllTpTypes(forceType, count) {
+    for (let i = 1; i <= count; i++) {
+      const sel = document.querySelector(`select[name="tp_${i}_type"]`);
+      const val = document.querySelector(`input[name="tp_${i}_value"]`);
+      if (sel) sel.value = forceType;
+      if (val && sel.value !== 'signal') val.style.display = 'block';
+    }
+  }
+
+  function validateTpVolumeSum() {
+    const inputs = container.querySelectorAll('input[name^="tp_"][name$="_volume"]');
+    let sum = 0;
+
+    inputs.forEach(input => {
+      const val = parseFloat(input.value);
+      if (!isNaN(val)) sum += val;
+    });
+
+    let errorEl = document.getElementById('tp-volume-error');
+    if (!errorEl) {
+      errorEl = document.createElement('div');
+      errorEl.id = 'tp-volume-error';
+      errorEl.className = 'text-red-600 text-sm mt-1';
+      container.appendChild(errorEl);
+    }
+
+    if (sum !== 100) {
+      errorEl.textContent = `Сумма объёмов TP должна быть 100%. Сейчас: ${sum}%`;
+      errorEl.style.display = 'block';
+      return false;
+    } else {
+      errorEl.textContent = '';
+      errorEl.style.display = 'none';
+      return true;
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    if (!validateTpVolumeSum()) {
+      e.preventDefault();
+    }
+  });
+</script>
 <!-- Submit -->
 <div class="pt-6">
   <button type="submit" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg">
