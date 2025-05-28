@@ -479,7 +479,7 @@ async def strategies_create_form(request: Request):
         "signals": signals,
         "error": None
     })
-# 🔸 POST: создание новой стратегии
+# 🔸 POST: создание новой стратегии (с учётом текущего UI и хардкодов для обязательных полей)
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
     request: Request,
@@ -491,13 +491,12 @@ async def create_strategy(
     position_limit: int = Form(...),
     leverage: int = Form(...),
     max_risk: int = Form(...),
-    timeframe: str = Form(...),
-    enabled: str = Form(...),
     reverse: bool = Form(False),
     sl_protection: bool = Form(False),
 ):
-    enabled_bool = enabled == "enabled"
-    timeframe = timeframe.lower()
+    # Жёсткие значения для отсутствующих полей UI
+    timeframe = "m5"
+    enabled_bool = True
 
     if reverse:
         sl_protection = True
