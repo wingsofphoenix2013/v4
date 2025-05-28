@@ -519,6 +519,15 @@ async def create_strategy(
         """, name, human_name, signal_id, timeframe, enabled_bool)
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
+@router.get("/strategies/check_name")
+async def check_strategy_name(name: str, db: asyncpg.Pool = Depends(get_db)):
+    """
+    Проверка уникальности кода стратегии (name) — вызывается из UI через AJAX
+    """
+    query = "SELECT 1 FROM strategies_v4 WHERE name = $1"
+    row = await db.fetchrow(query, name)
+    return {"exists": row is not None}
 @app.get("/testsignals", response_class=HTMLResponse)
 async def testsignals_page(request: Request):
     async with pg_pool.acquire() as conn:
