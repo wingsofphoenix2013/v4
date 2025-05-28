@@ -1,6 +1,7 @@
 # config_loader.py
 
 import logging
+import asyncio
 log = logging.getLogger("CONFIG_LOADER")
 
 # Заглушка для инициализации in-memory состояния
