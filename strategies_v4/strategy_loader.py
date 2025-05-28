@@ -4,7 +4,7 @@ import inspect
 import logging
 
 # Папка с реализациями стратегий — как Python-пакет
-import strategies_v4.strategies as strategies_pkg
+from . import strategies as strategies_pkg
 
 log = logging.getLogger("STRATEGY_LOADER")
 
