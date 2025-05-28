@@ -485,15 +485,27 @@ async def create_strategy(
     request: Request,
     name: str = Form(...),
     human_name: str = Form(...),
+    description: str = Form(...),
     signal_id: int = Form(...),
+    deposit: int = Form(...),
+    position_limit: int = Form(...),
+    leverage: int = Form(...),
+    max_risk: int = Form(...),
     timeframe: str = Form(...),
-    enabled: str = Form(...)
+    enabled: str = Form(...),
+    reverse: bool = Form(False),
+    sl_protection: bool = Form(False),
 ):
     enabled_bool = enabled == "enabled"
     timeframe = timeframe.lower()
 
+    if reverse:
+        sl_protection = True
+
     async with pg_pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name)
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name
+        )
         if exists:
             rows = await conn.fetch("SELECT id, name FROM signals_v4 ORDER BY id")
             signals = [{"id": r["id"], "name": r["name"]} for r in rows]
@@ -505,18 +517,24 @@ async def create_strategy(
 
         await conn.execute("""
             INSERT INTO strategies_v4 (
-                name, human_name, signal_id, timeframe, enabled,
-                archived, use_all_tickers, allow_open, deposit,
-                position_limit, use_stoploss, sl_type, sl_value,
-                leverage, reverse, max_risk, created_at
+                name, human_name, description, signal_id,
+                deposit, position_limit, leverage, max_risk,
+                timeframe, enabled, reverse, sl_protection,
+                archived, use_all_tickers, allow_open,
+                use_stoploss, sl_type, sl_value,
+                created_at
             )
             VALUES (
-                $1, $2, $3, $4, $5,
-                false, true, true, 10000,
-                1000, true, 'atr', 2,
-                10, false, 2, NOW()
+                $1, $2, $3, $4,
+                $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                false, true, true,
+                true, 'atr', 2,
+                NOW()
             )
-        """, name, human_name, signal_id, timeframe, enabled_bool)
+        """, name, human_name, description, signal_id,
+             deposit, position_limit, leverage, max_risk,
+             timeframe, enabled_bool, reverse, sl_protection)
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
