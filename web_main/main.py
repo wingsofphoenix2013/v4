@@ -480,6 +480,7 @@ async def strategies_create_form(request: Request):
         "error": None
     })
 # 🔸 POST: создание стратегии + TP + SL-настройки
+# 🔸 POST: создание стратегии + TP + SL-настройки
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
     request: Request,
@@ -495,14 +496,14 @@ async def create_strategy(
     sl_type: str = Form(...),
     sl_value: float = Form(...),
     reverse: bool = Form(False),
-    sl_protection: bool = Form(False),
-    request_form: dict = Depends(lambda request: request.form()),
+    sl_protection: bool = Form(False)
 ):
     enabled_bool = False
     if reverse:
         sl_protection = True
 
-    form_data = await request_form
+    form_data = await request.form()
+
     async with pg_pool.acquire() as conn:
         # Проверка имени
         exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name)
