@@ -479,7 +479,7 @@ async def strategies_create_form(request: Request):
         "signals": signals,
         "error": None
     })
-# 🔸 POST: создание новой стратегии + TP-уровни
+# 🔸 POST: создание стратегии + TP + SL-настройки
 @app.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
     request: Request,
@@ -492,6 +492,8 @@ async def create_strategy(
     leverage: int = Form(...),
     max_risk: int = Form(...),
     timeframe: str = Form(...),
+    sl_type: str = Form(...),
+    sl_value: float = Form(...),
     reverse: bool = Form(False),
     sl_protection: bool = Form(False),
     request_form: dict = Depends(lambda request: request.form()),
@@ -502,18 +504,18 @@ async def create_strategy(
 
     form_data = await request_form
     async with pg_pool.acquire() as conn:
-        # Проверка уникальности
+        # Проверка имени
         exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)", name)
         if exists:
             rows = await conn.fetch("SELECT id, name, enabled FROM signals_v4 ORDER BY id")
-            signals = [{"id": r["id"], "name": r["name"], "enabled": r["enabled"]} for r in rows]
+            signals = [{"id": r["id"], "name": r["name"], "enabled": bool(r["enabled"])} for r in rows]
             return templates.TemplateResponse("strategies_create.html", {
                 "request": request,
                 "signals": signals,
                 "error": f"Стратегия с кодом '{name}' уже существует"
             })
 
-        # Вставка стратегии
+        # Сохраняем стратегию
         result = await conn.fetchrow("""
             INSERT INTO strategies_v4 (
                 name, human_name, description, signal_id,
@@ -528,33 +530,48 @@ async def create_strategy(
                 $5, $6, $7, $8,
                 $9, $10, $11, $12,
                 false, true, true,
-                true, 'atr', 2,
+                true, $13, $14,
                 NOW()
             )
             RETURNING id
         """, name, human_name, description, signal_id,
              deposit, position_limit, leverage, max_risk,
-             timeframe.lower(), enabled_bool, reverse, sl_protection)
+             timeframe.lower(), enabled_bool, reverse, sl_protection,
+             sl_type, sl_value)
 
         strategy_id = result['id']
 
         # Вставка TP-уровней
+        tp_level_ids = []
         level = 1
         while f"tp_{level}_volume" in form_data:
             volume = int(form_data.get(f"tp_{level}_volume"))
             tp_type = form_data.get(f"tp_{level}_type")
             tp_value = form_data.get(f"tp_{level}_value")
-
             value = float(tp_value) if tp_type != 'signal' else None
 
-            await conn.execute("""
+            row = await conn.fetchrow("""
                 INSERT INTO strategy_tp_levels_v4 (
                     strategy_id, level, tp_type, tp_value, volume_percent, created_at
                 )
                 VALUES ($1, $2, $3, $4, $5, NOW())
+                RETURNING id
             """, strategy_id, level, tp_type, value, volume)
-
+            tp_level_ids.append(row["id"])
             level += 1
+
+        # Вставка SL-настроек для TP уровней (начиная с 1..n-1)
+        for i in range(1, len(tp_level_ids)):
+            mode = form_data.get(f"sl_tp_{i}_mode")
+            val = form_data.get(f"sl_tp_{i}_value")
+            sl_val = float(val) if mode in ("percent", "atr") else None
+
+            await conn.execute("""
+                INSERT INTO strategy_tp_sl_v4 (
+                    strategy_id, tp_level_id, sl_mode, sl_value, created_at
+                )
+                VALUES ($1, $2, $3, $4, NOW())
+            """, strategy_id, tp_level_ids[i - 1], mode, sl_val)
 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
