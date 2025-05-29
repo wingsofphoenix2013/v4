@@ -92,26 +92,26 @@ async def run_signal_loop(strategy_registry):
                             route = "ignore"
                             note = f"strategy_registry: '{strategy_name}' не найдена"
                         else:
-                            context = {}  # пока пусто
+                            context = {"redis": redis}
                             if not strategy_obj.validate_signal(msg_data, context):
                                 route = "ignore"
                                 note = "отклонено стратегией: validate_signal() = False"
 
                     if route == "ignore":
                         log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
+
+                        log_record = {
+                            "log_id": signal_id,
+                            "strategy_id": strategy_id,
+                            "status": route,
+                            "position_id": None,
+                            "note": note,
+                            "logged_at": datetime.utcnow().isoformat()
+                        }
+
+                        await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
                     else:
                         log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
-
-                    log_record = {
-                        "log_id": signal_id,
-                        "strategy_id": strategy_id,
-                        "status": route,
-                        "position_id": None,
-                        "note": note,
-                        "logged_at": datetime.utcnow().isoformat()
-                    }
-
-                    await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
 
         except Exception as e:
             log.exception("❌ Ошибка при чтении из Redis — повтор через 5 секунд")
