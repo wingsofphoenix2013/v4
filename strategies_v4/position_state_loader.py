@@ -119,7 +119,7 @@ async def load_position_state():
             sl_targets=sl_targets,
         )
 
-        position_registry[pos_id] = position
-        position_index[(position.strategy_id, position.symbol)] = pos_id
+        # 🔸 Индексация по (strategy_id, symbol)
+        position_registry[(position.strategy_id, position.symbol)] = position
 
     log.info(f"✅ Загружено и проиндексировано {len(position_registry)} позиций")
