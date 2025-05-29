@@ -1,22 +1,9 @@
 import logging
-from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
-import infra
 import json
 import asyncio
+import infra
+from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
 
-# 🔸 Публикация сигнала в Redis Stream стратегии
-async def publish_to_strategy_stream(strategy_id, signal_id, symbol, direction, bar_time, received_at):
-    await infra.REDIS.xadd(
-        "strategy_input_stream",
-        {
-            "strategy_id": str(strategy_id),
-            "signal_id": str(signal_id),
-            "symbol": symbol,
-            "direction": direction,
-            "time": bar_time,
-            "received_at": received_at,
-        }
-    )
 # 🔸 Публикация лога сигнала в Redis Stream для core_io
 async def publish_signal_log(data: dict, signal_id: int, direction: str, status: str):
     await infra.REDIS.xadd(
@@ -35,6 +22,7 @@ async def publish_signal_log(data: dict, signal_id: int, direction: str, status:
             "uid": f"{data.get('symbol')}_{data.get('bar_time')}",
         }
     )
+
 # 🔸 Обработка одного сигнала из Redis Stream
 async def process_signal(data: dict):
     log = logging.getLogger("PROCESSOR")
@@ -46,7 +34,6 @@ async def process_signal(data: dict):
         log.warning(f"Пропущен сигнал без symbol/message: {data}")
         return
 
-    # Определение направления
     direction = None
     signal_id = None
     for sid, phrases in ENABLED_SIGNALS.items():
@@ -74,22 +61,21 @@ async def process_signal(data: dict):
         if strategy["allow_open"] or strategy["reverse"]:
             matched_strategies.append(strategy_id)
 
-    if not matched_strategies:
-        log.debug(f"Нет подходящих стратегий для сигнала: {symbol} | {direction}")
-        await publish_signal_log(data, signal_id=signal_id, direction=direction, status="ignored")
-        return
+    status = "ignored" if not matched_strategies else "dispatched"
 
-    await asyncio.gather(*[
-        publish_to_strategy_stream(
-            strategy_id=strategy_id,
-            signal_id=signal_id,
-            symbol=symbol,
-            direction=direction,
-            bar_time=data.get("bar_time"),
-            received_at=data.get("received_at")
-        )
-        for strategy_id in matched_strategies
-    ])
+    # Добавляем matched_strategies только если они есть
+    log_data = {**data}
+    if status == "dispatched":
+        log_data["strategies"] = matched_strategies
 
-    await publish_signal_log(data, signal_id=signal_id, direction=direction, status="dispatched")
-    log.debug(f"Сигнал передан стратегиям: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
+    await publish_signal_log(
+        log_data,
+        signal_id=signal_id,
+        direction=direction,
+        status=status
+    )
+
+    if status == "dispatched":
+        log.debug(f"Сигнал принят для стратегий: {symbol} | {direction} | signal_id={signal_id} | стратегии: {matched_strategies}")
+    else:
+        log.debug(f"Сигнал проигнорирован: {symbol} | {direction} | signal_id={signal_id}")

@@ -4,7 +4,7 @@ import json
 import infra
 from dateutil import parser
 
-# 🔸 Вставка записи в таблицу signals_v4_log
+# 🔸 Вставка записи в таблицу signals_v4_log и отправка в стратегии
 async def insert_signal_log(data: dict):
     log = logging.getLogger("CORE_IO")
 
@@ -18,7 +18,7 @@ async def insert_signal_log(data: dict):
             return
 
     async with infra.PG_POOL.acquire() as conn:
-        await conn.execute("""
+        result = await conn.fetchrow("""
             INSERT INTO signals_v4_log (
                 signal_id,
                 symbol,
@@ -35,6 +35,7 @@ async def insert_signal_log(data: dict):
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
             )
             ON CONFLICT (uid) DO NOTHING
+            RETURNING id
         """,
         int(data["signal_id"]),
         data["symbol"],
@@ -48,7 +49,24 @@ async def insert_signal_log(data: dict):
         data["status"],
         data["uid"])
 
-    log.debug(f"Лог записан в БД: {data['uid']}")
+    log_id = result["id"] if result else None
+    log.debug(f"Лог записан в БД: {data['uid']} (log_id={log_id})")
+
+    # 🔁 Публикация в стратегии (только если status == dispatched)
+    if data["status"] == "dispatched" and "strategies" in data:
+        for strategy_id in data["strategies"]:
+            await infra.REDIS.xadd(
+                "strategy_input_stream",
+                {
+                    "strategy_id": str(strategy_id),
+                    "signal_id": str(data["signal_id"]),
+                    "symbol": data["symbol"],
+                    "direction": data["direction"],
+                    "time": data["bar_time"],
+                    "received_at": data["received_at"],
+                    "log_id": str(log_id) if log_id else ""
+                }
+            )
 # 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
 async def run_core_io():
     log = logging.getLogger("CORE_IO")
