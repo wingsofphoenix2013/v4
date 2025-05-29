@@ -52,10 +52,10 @@ async def write_log_entry(pool, record: dict):
         VALUES ($1, $2, $3, $4, $5, $6)
     """
     values = (
-        record.get("log_id"),
-        record.get("strategy_id"),
+        int(record.get("log_id")),
+        int(record.get("strategy_id")),
         record.get("status"),
-        record.get("position_id"),
+        int(record["position_id"]) if record.get("position_id") is not None else None,
         record.get("note"),
         datetime.fromisoformat(record.get("logged_at"))
     )
