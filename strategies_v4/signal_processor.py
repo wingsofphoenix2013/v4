@@ -111,12 +111,12 @@ async def run_signal_loop(strategy_registry):
 
                         if note is not None:
                             log_record = {
-                                "log_id": log_id,
                                 "strategy_id": strategy_id,
                                 "status": route,
                                 "position_id": None,
                                 "note": note,
-                                "logged_at": datetime.utcnow().isoformat()
+                                "logged_at": datetime.utcnow().isoformat(),
+                                "raw_message": json.dumps(msg_data)  # 🔸 нужен для восстановления log_id
                             }
 
                             await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
