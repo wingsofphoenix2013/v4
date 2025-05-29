@@ -59,14 +59,13 @@ async def run_signal_loop(strategy_registry):
                 for msg_id, msg_data in messages:
                     last_id = msg_id
 
-                    log_id = int(msg_data.get("log_id"))
                     strategy_id = int(msg_data.get("strategy_id"))
                     signal_id = int(msg_data.get("signal_id"))
                     symbol = msg_data.get("symbol")
                     direction = msg_data.get("direction")
                     time = msg_data.get("time")
 
-                    if not all([log_id, strategy_id, signal_id, symbol, direction, time]):
+                    if not all([strategy_id, signal_id, symbol, direction, time]):
                         log.warning(f"⚠️ Неполный сигнал: {msg_data}")
                         continue
 
