@@ -97,23 +97,28 @@ async def run_signal_loop(strategy_registry):
                             if asyncio.iscoroutine(result):
                                 result = await result
 
-                            if not result:
-                                route = "ignore"
-                                note = "отклонено стратегией: validate_signal() = False"
+                            if result != True:
+                                if result == "logged":
+                                    route = "ignore"
+                                    note = None  # стратегия уже записала лог
+                                else:
+                                    route = "ignore"
+                                    note = "отклонено стратегией: validate_signal() = False"
 
                     if route == "ignore":
                         log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
 
-                        log_record = {
-                            "log_id": signal_id,
-                            "strategy_id": strategy_id,
-                            "status": route,
-                            "position_id": None,
-                            "note": note,
-                            "logged_at": datetime.utcnow().isoformat()
-                        }
+                        if note is not None:
+                            log_record = {
+                                "log_id": signal_id,
+                                "strategy_id": strategy_id,
+                                "status": route,
+                                "position_id": None,
+                                "note": note,
+                                "logged_at": datetime.utcnow().isoformat()
+                            }
 
-                        await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
+                            await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
                     else:
                         log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 

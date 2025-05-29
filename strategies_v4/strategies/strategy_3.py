@@ -8,7 +8,7 @@ log = logging.getLogger("STRATEGY_3")
 
 class Strategy3:
     # 🔸 Метод валидации сигнала перед входом
-    async def validate_signal(self, signal, context) -> bool:
+    async def validate_signal(self, signal, context) -> bool | str:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
         strategy_id = signal.get("strategy_id")
@@ -34,7 +34,7 @@ class Strategy3:
                 except Exception as e:
                     log.warning(f"⚠️ [Strategy3] Ошибка записи в Redis log_queue: {e}")
 
-            return False
+            return "logged"
 
         return True
 
