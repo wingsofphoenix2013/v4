@@ -33,8 +33,8 @@ async def write_log_entry(pool, record: dict):
                         raise ValueError("Недостаточно данных для восстановления log_id")
 
                     # 🔸 Преобразование ISO строк в datetime объекты
-                    bar_time = datetime.fromisoformat(bar_time.replace("Z", "+00:00"))
-                    received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+                    bar_time = datetime.fromisoformat(bar_time.replace("Z", "+00:00")).replace(tzinfo=None)
+                    received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00")).replace(tzinfo=None)
 
                     log_id = await conn.fetchval(
                         """
