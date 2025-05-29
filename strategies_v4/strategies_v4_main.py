@@ -8,7 +8,8 @@ from config_loader import init_config_state, config_event_listener
 from signal_processor import run_signal_loop
 from position_handler import run_position_loop
 from strategy_loader import load_strategies
-from position_state_loader import load_position_state, position_registry  # 🔸 добавлено
+from position_state_loader import load_position_state, position_registry
+from core_io import run_signal_log_writer
 
 # 🔸 Настройка логгера для главного воркера
 log = logging.getLogger("STRATEGY_MAIN")
