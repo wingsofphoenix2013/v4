@@ -115,6 +115,7 @@ async def run_signal_loop(strategy_registry):
                                 "position_id": None,
                                 "note": note,
                                 "logged_at": datetime.utcnow().isoformat(),
+                                "uid": f"{symbol}_{time}",
                                 "raw_message": json.dumps({
                                     "symbol": symbol,
                                     "bar_time": time,  # из msg_data["time"]
