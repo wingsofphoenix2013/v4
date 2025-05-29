@@ -3,6 +3,7 @@ import logging
 import json
 import infra
 from dateutil import parser
+import ast
 
 # 🔸 Вставка записи в таблицу signals_v4_log и отправка в стратегии
 async def insert_signal_log(data: dict):
@@ -52,9 +53,15 @@ async def insert_signal_log(data: dict):
     log_id = result["id"] if result else None
     log.debug(f"Лог записан в БД: {data['uid']} (log_id={log_id})")
 
-    # 🔁 Публикация в стратегии (только если status == dispatched)
+    # 🔁 Публикация в стратегии
     if data["status"] == "dispatched" and "strategies" in data:
-        for strategy_id in data["strategies"]:
+        try:
+            strategy_ids = ast.literal_eval(data["strategies"])
+        except Exception as e:
+            log.warning(f"Не удалось распарсить strategies: {data['strategies']} — {e}")
+            return
+
+        for strategy_id in strategy_ids:
             await infra.REDIS.xadd(
                 "strategy_input_stream",
                 {
