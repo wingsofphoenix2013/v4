@@ -7,8 +7,8 @@ from infra import setup_logging, setup_pg, setup_redis_client
 from config_loader import init_config_state, config_event_listener
 from signal_processor import run_signal_loop
 from position_handler import run_position_loop
-from config_loader import config_event_listener
 from strategy_loader import load_strategies
+from position_state_loader import load_position_state, position_registry  # 🔸 добавлено
 
 # 🔸 Настройка логгера для главного воркера
 log = logging.getLogger("STRATEGY_MAIN")
@@ -26,18 +26,19 @@ async def run_safe_loop(coro_factory, label: str):
 # 🔸 Основная точка входа
 async def main():
     setup_logging()
-    await setup_pg()
+    pool = await setup_pg()  # 🔸 сохраняем пул
     setup_redis_client()
     await init_config_state()
 
-    from strategy_loader import load_strategies
+    await load_position_state(pool)  # 🔸 загрузка активных позиций
+
     strategy_registry = load_strategies()
 
     log.info("🚀 Воркеры стратегий v4 запущены")
 
     await asyncio.gather(
         run_safe_loop(lambda: run_signal_loop(strategy_registry), "SIGNAL_PROCESSOR"),
-        run_safe_loop(lambda: run_position_loop(), "POSITION_HANDLER"),
+        run_safe_loop(lambda: run_position_loop(position_registry), "POSITION_HANDLER"),  # 🔸 передаём позиции
         run_safe_loop(lambda: config_event_listener(), "CONFIG_LOADER"),
     )
 
