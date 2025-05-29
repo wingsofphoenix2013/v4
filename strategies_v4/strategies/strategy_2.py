@@ -12,7 +12,7 @@ class Strategy2:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
         strategy_id = signal.get("strategy_id")
-        signal_id = signal.get("signal_id")
+        log_id = signal.get("log_id")  # ✅ корректный идентификатор для логов
 
         log.info(f"⚙️ [Strategy2] Валидация сигнала: symbol={symbol}, direction={direction}")
 
@@ -22,7 +22,7 @@ class Strategy2:
             redis = context.get("redis")
             if redis:
                 log_record = {
-                    "log_id": signal_id,
+                    "log_id": log_id,
                     "strategy_id": strategy_id,
                     "status": "ignore",
                     "position_id": None,
