@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime
-import asyncpg
+
+from infra import infra  # 🔸 доступ к infra.pg_pool
 
 # 🔸 Логгер для загрузчика состояния позиций
 log = logging.getLogger("POSITION_LOADER")
@@ -47,7 +48,11 @@ position_registry: Dict[int, PositionState] = {}
 position_index: Dict[Tuple[int, str], int] = {}
 
 # 🔸 Загрузка активных позиций и целей из базы данных
-async def load_position_state(pool: asyncpg.Pool):
+async def load_position_state():
+    pool = infra.pg_pool
+    if pool is None:
+        raise RuntimeError("❌ PostgreSQL pool не инициализирован")
+
     async with pool.acquire() as conn:
         log.info("📥 Загрузка активных позиций из PG")
 
