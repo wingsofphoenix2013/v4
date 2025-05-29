@@ -1,13 +1,17 @@
+# config_loader.py
+
 import asyncio
 import logging
 from infra import infra
 
 log = logging.getLogger("CONFIG_LOADER")
 
+# 🔸 Глобальное состояние конфигурации
 class ConfigState:
     def __init__(self):
         self.tickers: dict[str, dict] = {}
         self.strategies: dict[int, dict] = {}
+        self.strategy_tickers: dict[int, set[str]] = {}
 
     async def reload_ticker(self, symbol: str):
         async with infra.pg_pool.acquire() as conn:
@@ -49,12 +53,23 @@ class ConfigState:
                 "sl_rules": [dict(r) for r in sl_rules]
             }
 
+            # 🔸 Обновим разрешённые тикеры для этой стратегии
+            rows = await conn.fetch("""
+                SELECT t.symbol
+                FROM strategy_tickers_v4 st
+                JOIN tickers_v4 t ON t.id = st.ticker_id
+                WHERE st.enabled = true AND st.strategy_id = $1
+            """, strategy_id)
+            self.strategy_tickers[strategy_id] = {r["symbol"] for r in rows}
+
             log.info(f"✅ [STRATEGIES] ID={strategy_id} успешно загружена: name={strategy['name']}")
 
     async def remove_strategy(self, strategy_id: int):
         if strategy_id in self.strategies:
             del self.strategies[strategy_id]
-            log.info(f"🧹 [STRATEGIES] ID={strategy_id} отключена и удалена из памяти")
+        if strategy_id in self.strategy_tickers:
+            del self.strategy_tickers[strategy_id]
+        log.info(f"🧹 [STRATEGIES] ID={strategy_id} отключена и удалена из памяти")
 
     async def reload_all(self):
         async with infra.pg_pool.acquire() as conn:
@@ -68,20 +83,32 @@ class ConfigState:
                 SELECT * FROM strategies_v4 WHERE enabled = true
             """)
             self.strategies = {}
+            self.strategy_tickers = {}
 
             for row in strategies:
                 strategy_id = row["id"]
+
                 tp_levels = await conn.fetch("""
                     SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level
                 """, strategy_id)
+
                 sl_rules = await conn.fetch("""
                     SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1 ORDER BY tp_level_id
                 """, strategy_id)
+
                 self.strategies[strategy_id] = {
                     "meta": dict(row),
                     "tp_levels": [dict(r) for r in tp_levels],
                     "sl_rules": [dict(r) for r in sl_rules]
                 }
+
+                rows = await conn.fetch("""
+                    SELECT t.symbol
+                    FROM strategy_tickers_v4 st
+                    JOIN tickers_v4 t ON t.id = st.ticker_id
+                    WHERE st.enabled = true AND st.strategy_id = $1
+                """, strategy_id)
+                self.strategy_tickers[strategy_id] = {r["symbol"] for r in rows}
 
         log.info(f"⚙️ [CONFIG] Загружено: {len(self.strategies)} стратегий, {len(self.tickers)} тикеров")
 
@@ -104,7 +131,7 @@ async def config_event_listener():
             continue
 
         try:
-            data = eval(msg["data"])  # или json.loads, если строка в JSON
+            data = eval(msg["data"])
             channel = msg["channel"]
 
             if channel == "tickers_v4_events":
