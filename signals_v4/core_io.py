@@ -3,9 +3,9 @@ import logging
 import json
 import infra
 from dateutil import parser
-import ast
+import json
 
-# 🔸 Вставка записи в таблицу signals_v4_log и отправка в стратегии
+# 🔸 Вставка записи в таблицу signals_v4_log и публикация в стратегии
 async def insert_signal_log(data: dict):
     log = logging.getLogger("CORE_IO")
 
@@ -53,12 +53,13 @@ async def insert_signal_log(data: dict):
     log_id = result["id"] if result else None
     log.debug(f"Лог записан в БД: {data['uid']} (log_id={log_id})")
 
-    # 🔁 Публикация в стратегии
-    if data["status"] == "dispatched" and "strategies" in data:
+    # Публикация сигнала в стратегии
+    if data["status"] == "dispatched":
         try:
-            strategy_ids = ast.literal_eval(data["strategies"])
+            raw = json.loads(data["raw_message"])
+            strategy_ids = raw.get("strategies", [])
         except Exception as e:
-            log.warning(f"Не удалось распарсить strategies: {data['strategies']} — {e}")
+            log.warning(f"Ошибка разбора raw_message: {e}")
             return
 
         for strategy_id in strategy_ids:
