@@ -7,6 +7,7 @@ import json
 
 from infra import infra
 from position_state_loader import position_registry
+from config_loader import config
 
 log = logging.getLogger("SIGNAL_PROCESSOR")
 
@@ -15,34 +16,33 @@ STRATEGY_INPUT_STREAM = "strategy_input_stream"
 SIGNAL_LOG_STREAM = "signal_log_queue"
 
 # 🔸 Проверка базовой маршрутизации сигнала
-def route_signal_base(strategy, signal_direction, symbol):
-    key = (strategy.id, symbol)
+def route_signal_base(meta, signal_direction, symbol):
+    key = (meta["id"], symbol)
     position = position_registry.get(key)
 
     if position and position.direction == signal_direction:
         return "ignore", "уже есть позиция в этом направлении"
 
     if position is None:
-        if strategy.allow_open:
+        if meta["allow_open"]:
             return "new_entry", "вход разрешён"
         return "ignore", "вход запрещён (allow_open = false)"
 
-    # позиция есть, но направление противоположное
-    if not strategy.reverse and not strategy.sl_protection:
+    if not meta["reverse"] and not meta["sl_protection"]:
         return "ignore", "вход запрещён, защита выключена"
-    if not strategy.reverse and strategy.sl_protection:
+    if not meta["reverse"] and meta["sl_protection"]:
         return "protect", "включена SL-защита"
-    if strategy.reverse and strategy.sl_protection:
+    if meta["reverse"] and meta["sl_protection"]:
         return "reverse", "разрешён реверс"
 
     return "ignore", "неизвестное состояние"
 
 # 🔸 Основной цикл обработки сигналов
-async def run_signal_loop(strategy_registry):
+async def run_signal_loop():
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
 
     redis = infra.redis_client
-    last_id = "$"  # начинаем с конца
+    last_id = "$"
 
     while True:
         try:
@@ -69,19 +69,25 @@ async def run_signal_loop(strategy_registry):
                         log.warning(f"⚠️ Неполный сигнал: {msg_data}")
                         continue
 
-                    strategy = strategy_registry.get(strategy_id)
+                    strategy = config.strategies.get(strategy_id)
                     if not strategy:
-                        log.warning(f"⚠️ Стратегия {strategy_id} не найдена")
+                        log.warning(f"⚠️ Стратегия {strategy_id} не найдена в config.strategies")
                         continue
 
-                    route, note = route_signal_base(strategy, direction, symbol)
+                    meta = strategy["meta"]
+                    route, note = route_signal_base(meta, direction, symbol)
+
+                    if route == "new_entry" and not meta["use_all_tickers"]:
+                        allowed = config.strategy_tickers.get(strategy_id, set())
+                        if symbol not in allowed:
+                            route = "ignore"
+                            note = "тикер не разрешён для стратегии"
 
                     if route == "ignore":
                         log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
                     else:
                         log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
-                    # 🔸 Формируем лог-запись
                     log_record = {
                         "log_id": signal_id,
                         "strategy_id": strategy_id,
