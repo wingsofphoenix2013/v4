@@ -23,15 +23,31 @@ async def write_log_entry(pool, record: dict):
         try:
             # 🔸 Восстановление log_id, если отсутствует
             if record.get("log_id") is None and record.get("raw_message"):
-                msg = json.loads(record["raw_message"])
-                log_id = await conn.fetchval(
-                    """
-                    SELECT id FROM signals_v4_log
-                    WHERE symbol = $1 AND bar_time = $2 AND received_at = $3
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    msg["symbol"], msg["bar_time"], msg["received_at"]
-                )
+                try:
+                    msg = json.loads(record["raw_message"])
+                    symbol = msg.get("symbol")
+                    bar_time = msg.get("bar_time")
+                    received_at = msg.get("received_at")
+
+                    if not all([symbol, bar_time, received_at]):
+                        raise ValueError("Недостаточно данных для восстановления log_id")
+
+                    log_id = await conn.fetchval(
+                        """
+                        SELECT id FROM signals_v4_log
+                        WHERE symbol = $1 AND bar_time = $2 AND received_at = $3
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        symbol, bar_time, received_at
+                    )
+
+                    if log_id is None:
+                        raise LookupError("log_id не найден в signals_v4_log")
+
+                except Exception as e:
+                    log.warning(f"⚠️ Не удалось восстановить log_id из raw_message: {e}")
+                    return  # пропустить запись, не создавать ошибочную строку
+
             else:
                 log_id = int(record.get("log_id"))
 
