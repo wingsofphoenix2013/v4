@@ -123,6 +123,12 @@ async def run_signal_loop(strategy_registry):
                     else:
                         log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
+                        # 🔸 Запуск стратегии после допуска
+                        context = {"redis": redis}
+                        result = strategy_obj.run(msg_data, context)
+                        if asyncio.iscoroutine(result):
+                            await result
+                            
         except Exception as e:
             log.exception("❌ Ошибка при чтении из Redis — повтор через 5 секунд")
             await asyncio.sleep(5)
