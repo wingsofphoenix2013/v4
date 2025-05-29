@@ -30,7 +30,7 @@ async def main():
     setup_redis_client()
     await init_config_state()
 
-    await load_position_state(pool)  # 🔸 загрузка активных позиций
+    await load_position_state()  # 🔸 загрузка активных позиций
 
     strategy_registry = load_strategies()
 
