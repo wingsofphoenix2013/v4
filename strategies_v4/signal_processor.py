@@ -38,7 +38,7 @@ def route_signal_base(meta, signal_direction, symbol):
     return "ignore", "неизвестное состояние"
 
 # 🔸 Основной цикл обработки сигналов
-async def run_signal_loop():
+async def run_signal_loop(strategy_registry):
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
 
     redis = infra.redis_client
@@ -82,6 +82,20 @@ async def run_signal_loop():
                         if symbol not in allowed:
                             route = "ignore"
                             note = "тикер не разрешён для стратегии"
+
+                    # 🔸 Валидация стратегии (если допущен new_entry)
+                    if route == "new_entry":
+                        strategy_name = meta["name"]
+                        strategy_obj = strategy_registry.get(strategy_name)
+
+                        if not strategy_obj:
+                            route = "ignore"
+                            note = f"strategy_registry: '{strategy_name}' не найдена"
+                        else:
+                            context = {}  # пока пусто
+                            if not strategy_obj.validate_signal(msg_data, context):
+                                route = "ignore"
+                                note = "отклонено стратегией: validate_signal() = False"
 
                     if route == "ignore":
                         log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
