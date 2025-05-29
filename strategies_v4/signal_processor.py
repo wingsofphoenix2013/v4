@@ -115,7 +115,11 @@ async def run_signal_loop(strategy_registry):
                                 "position_id": None,
                                 "note": note,
                                 "logged_at": datetime.utcnow().isoformat(),
-                                "raw_message": json.dumps(msg_data)  # 🔸 нужен для восстановления log_id
+                                "raw_message": json.dumps({
+                                    "symbol": symbol,
+                                    "bar_time": time,  # из msg_data["time"]
+                                    "received_at": msg_data.get("received_at")
+                                })
                             }
 
                             await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
