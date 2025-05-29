@@ -38,8 +38,9 @@ async def main():
 
     await asyncio.gather(
         run_safe_loop(lambda: run_signal_loop(strategy_registry), "SIGNAL_PROCESSOR"),
-        run_safe_loop(lambda: run_position_loop(position_registry), "POSITION_HANDLER"),  # 🔸 передаём позиции
+        run_safe_loop(lambda: run_position_loop(position_registry), "POSITION_HANDLER"),
         run_safe_loop(lambda: config_event_listener(), "CONFIG_LOADER"),
+        run_safe_loop(lambda: run_signal_log_writer(), "CORE_IO")
     )
 
 if __name__ == "__main__":
