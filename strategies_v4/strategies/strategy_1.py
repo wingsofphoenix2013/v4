@@ -3,6 +3,7 @@
 import logging
 import json
 from datetime import datetime
+from position_opener import open_position  # ✅ корректный импорт с учётом Root Directory = strategies_v4
 
 log = logging.getLogger("STRATEGY_1")
 
@@ -12,7 +13,7 @@ class Strategy1:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
         strategy_id = signal.get("strategy_id")
-        log_id = signal.get("log_id")  # ✅ корректный идентификатор для логов
+        log_id = signal.get("log_id")
 
         log.info(f"⚙️ [Strategy1] Валидация сигнала: symbol={symbol}, direction={direction}")
 
@@ -26,7 +27,7 @@ class Strategy1:
                     "strategy_id": strategy_id,
                     "status": "ignore",
                     "position_id": None,
-                    "note": "отклонено: только short разрешён",
+                    "note": "отклонено: только long разрешён",
                     "logged_at": datetime.utcnow().isoformat()
                 }
                 try:
@@ -39,6 +40,7 @@ class Strategy1:
         return True
 
     # 🔸 Основной метод запуска стратегии
-    def run(self, signal, context):
+    async def run(self, signal, context):
         log.info("🚀 [Strategy1] Я — тестовая стратегия 1")
-        return {"status": "ok"}
+        result = await open_position(signal, self, context)
+        return result
