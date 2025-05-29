@@ -32,6 +32,10 @@ async def write_log_entry(pool, record: dict):
                     if not all([symbol, bar_time, received_at]):
                         raise ValueError("Недостаточно данных для восстановления log_id")
 
+                    # 🔸 Преобразование ISO строк в datetime объекты
+                    bar_time = datetime.fromisoformat(bar_time.replace("Z", "+00:00"))
+                    received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+
                     log_id = await conn.fetchval(
                         """
                         SELECT id FROM signals_v4_log
