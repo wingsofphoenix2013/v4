@@ -16,23 +16,13 @@ async def run_signal_loop(strategy_registry):
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
 
     redis = infra.redis_client
-    group = "strategy_workers"
-    consumer = "strategy_consumer_1"
-
-    # 🔸 Убедимся, что группа существует (создаём при первом запуске)
-    try:
-        await redis.xgroup_create(STRATEGY_INPUT_STREAM, group, id="$", mkstream=True)
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            raise
+    last_id = "$"  # 🔸 начинаем с конца стрима
 
     while True:
         try:
-            # 🔸 Чтение сигналов из Redis (batch)
-            response = await redis.xread_group(
-                groupname=group,
-                consumername=consumer,
-                streams={STRATEGY_INPUT_STREAM: ">"},
+            # 🔸 Чтение сигналов из Redis (без групп)
+            response = await redis.xread(
+                streams={STRATEGY_INPUT_STREAM: last_id},
                 count=10,
                 block=1000
             )
@@ -42,6 +32,7 @@ async def run_signal_loop(strategy_registry):
 
             for stream_name, messages in response:
                 for msg_id, msg_data in messages:
+                    last_id = msg_id
                     raw = msg_data.get("data")
                     if not raw:
                         continue
