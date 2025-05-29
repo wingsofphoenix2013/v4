@@ -93,7 +93,11 @@ async def run_signal_loop(strategy_registry):
                             note = f"strategy_registry: '{strategy_name}' не найдена"
                         else:
                             context = {"redis": redis}
-                            if not strategy_obj.validate_signal(msg_data, context):
+                            result = strategy_obj.validate_signal(msg_data, context)
+                            if asyncio.iscoroutine(result):
+                                result = await result
+
+                            if not result:
                                 route = "ignore"
                                 note = "отклонено стратегией: validate_signal() = False"
 

@@ -8,7 +8,7 @@ log = logging.getLogger("STRATEGY_2")
 
 class Strategy2:
     # 🔸 Метод валидации сигнала перед входом
-    def validate_signal(self, signal, context) -> bool:
+    async def validate_signal(self, signal, context) -> bool:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
         strategy_id = signal.get("strategy_id")
@@ -26,13 +26,13 @@ class Strategy2:
                     "strategy_id": strategy_id,
                     "status": "ignore",
                     "position_id": None,
-                    "note": "отклонено: только long разрешён",
+                    "note": "отклонено: только short разрешён",
                     "logged_at": datetime.utcnow().isoformat()
                 }
                 try:
-                    redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+                    await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
                 except Exception as e:
-                    log.warning(f"⚠️ Ошибка записи в Redis log_queue: {e}")
+                    log.warning(f"⚠️ [Strategy2] Ошибка записи в Redis log_queue: {e}")
 
             return False
 
