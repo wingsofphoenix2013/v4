@@ -41,7 +41,7 @@ class Strategy3:
         return True
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.info("🚀 [Strategy3] Я — тестовая стратегия 1")
+        log.info("🚀 [Strategy3] Я — тестовая стратегия 3")
 
         redis = context.get("redis")
         if redis:

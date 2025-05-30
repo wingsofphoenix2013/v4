@@ -38,6 +38,7 @@ def route_signal_base(meta, signal_direction, symbol):
     return "ignore", "неизвестное состояние"
 # 🔸 Обработчик сигнала защиты (заглушка)
 async def handle_protect_signal(msg_data):
+    log.info("🧪 Вход в handle_protect_signal")
     log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}")
 
 # 🔸 Обработчик сигнала реверса (заглушка)
