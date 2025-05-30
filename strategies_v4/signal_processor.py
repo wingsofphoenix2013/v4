@@ -40,12 +40,11 @@ def route_signal_base(meta, signal_direction, symbol):
 # 🔸 Обработчик сигнала защиты (заглушка)
 async def handle_protect_signal(msg_data):
     log.info("🧪 Вход в handle_protect_signal")
-    log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}")
+    log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_id={msg_data.get('position_id')}")
 
 # 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
-    log.info("🧪 Вход в handle_reverse_signal")
-    log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}")
+    log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_id={msg_data.get('position_id')}")
 
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
@@ -76,7 +75,7 @@ async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
 
     else:
         log.warning(f"⚠️ Неизвестный маршрут в dispatch: {route}")
-
+        
 # 🔸 Основной цикл обработки сигналов
 async def run_signal_loop(strategy_registry):
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
@@ -163,9 +162,15 @@ async def run_signal_loop(strategy_registry):
                     else:
                         log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
-                        # 🔸 Диспетчеризация маршрута обработки
-                        msg_data["route"] = route
-                        await route_and_dispatch_signal(msg_data, strategy_registry, redis)
+                    # 🔸 Если есть активная позиция, сохраняем её id для маршрутов protect/reverse
+                    key = (strategy_id, symbol)
+                    position = position_registry.get(key)
+                    if position:
+                        msg_data["position_id"] = position.id
+
+                    # 🔸 Диспетчеризация маршрута обработки
+                    msg_data["route"] = route
+                    await route_and_dispatch_signal(msg_data, strategy_registry, redis)
                             
         except Exception as e:
             log.exception("❌ Ошибка при чтении из Redis — повтор через 5 секунд")
