@@ -14,7 +14,7 @@ class Strategy3:
     async def validate_signal(self, signal, context) -> bool | str:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
-        strategy_id = signal.get("strategy_id")
+        strategy_id = int(signal.get("strategy_id"))
         log_id = signal.get("log_id")
 
         log.info(f"⚙️ [Strategy3] Валидация сигнала: symbol={symbol}, direction={direction}")
