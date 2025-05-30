@@ -18,7 +18,8 @@ class Strategy3:
         log.info(f"⚙️ [Strategy3] Валидация сигнала: symbol={symbol}, direction={direction}")
 
         if direction != "long":
-            log.info(f"🚫 [Strategy3] Отклонено: только 'long' разрешён")
+            note = "отклонено: только long разрешён"
+            log.info(f"🚫 [Strategy3] {note}")
 
             redis = context.get("redis")
             if redis:
@@ -27,7 +28,7 @@ class Strategy3:
                     "strategy_id": strategy_id,
                     "status": "ignore",
                     "position_id": None,
-                    "note": "отклонено: только long разрешён",
+                    "note": note,
                     "logged_at": datetime.utcnow().isoformat()
                 }
                 try:
@@ -38,7 +39,6 @@ class Strategy3:
             return "logged"
 
         return True
-
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
         log.info("🚀 [Strategy3] Я — тестовая стратегия 1")
