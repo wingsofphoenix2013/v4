@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from position_opener import open_position
 from infra import load_indicators
+from config_loader import config
 
 log = logging.getLogger("STRATEGY_3")
 
