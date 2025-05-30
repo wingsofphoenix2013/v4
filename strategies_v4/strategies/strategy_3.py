@@ -41,6 +41,19 @@ class Strategy3:
 
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.info("🚀 [Strategy3] Я — тестовая стратегия 3")
-        result = await open_position(signal, self, context)
-        return result
+        log.info("🚀 [Strategy3] Я — тестовая стратегия 1")
+
+        redis = context.get("redis")
+        if redis:
+            payload = {
+                "strategy_id": signal["strategy_id"],
+                "symbol": signal["symbol"],
+                "direction": signal["direction"],
+                "log_id": signal["log_id"],
+                "route": "new_entry"
+            }
+            try:
+                await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
+                log.info(f"📤 [Strategy3] Сигнал отправлен в strategy_opener_stream")
+            except Exception as e:
+                log.warning(f"⚠️ [Strategy3] Ошибка при отправке в stream: {e}")
