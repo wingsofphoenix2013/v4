@@ -3,7 +3,8 @@
 import logging
 import json
 from datetime import datetime
-from position_opener import open_position  # ✅ корректный импорт с учётом Root Directory = strategies_v4
+from position_opener import open_position
+from infra import load_indicators
 
 log = logging.getLogger("STRATEGY_3")
 
@@ -17,26 +18,44 @@ class Strategy3:
 
         log.info(f"⚙️ [Strategy3] Валидация сигнала: symbol={symbol}, direction={direction}")
 
-        if direction != "long":
-            note = "отклонено: только long разрешён"
-            log.info(f"🚫 [Strategy3] {note}")
+        redis = context.get("redis")
+        try:
+            # 🔹 Получаем таймфрейм из конфигурации стратегии
+            timeframe = config.strategies[strategy_id]["meta"]["timeframe"]
 
-            redis = context.get("redis")
-            if redis:
-                log_record = {
-                    "log_id": log_id,
-                    "strategy_id": strategy_id,
-                    "status": "ignore",
-                    "position_id": None,
-                    "note": note,
-                    "logged_at": datetime.utcnow().isoformat()
-                }
-                try:
-                    await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
-                except Exception as e:
-                    log.warning(f"⚠️ [Strategy3] Ошибка записи в Redis log_queue: {e}")
+            # 🔹 Загружаем rsi14 из Redis
+            ind = await load_indicators(symbol, ["rsi14"], timeframe)
+            rsi = ind.get("rsi14")
 
-            return "logged"
+            if rsi is None:
+                note = "не удалось получить rsi14"
+            elif direction == "long" and rsi >= 55:
+                return True
+            elif direction == "short" and rsi <= 35:
+                return True
+            else:
+                note = f"rsi={rsi:.2f} не соответствует направлению: {direction}"
+
+        except Exception as e:
+            note = f"ошибка при получении индикатора: {e}"
+
+        # 🔹 Логируем отклонение
+        log.info(f"🚫 [Strategy3] {note}")
+        if redis:
+            log_record = {
+                "log_id": log_id,
+                "strategy_id": strategy_id,
+                "status": "ignore",
+                "position_id": None,
+                "note": note,
+                "logged_at": datetime.utcnow().isoformat()
+            }
+            try:
+                await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+            except Exception as e:
+                log.warning(f"⚠️ [Strategy3] Ошибка записи в Redis log_queue: {e}")
+
+        return "logged"
 
         return True
     # 🔸 Основной метод запуска стратегии

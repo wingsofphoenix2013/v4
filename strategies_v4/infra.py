@@ -51,3 +51,18 @@ def setup_redis_client():
         password=password,
         decode_responses=True
     )
+# 🔸 Загрузка значений индикаторов из Redis
+async def load_indicators(symbol: str, params: list[str], timeframe: str) -> dict:
+    redis = infra.redis_client
+    result = {}
+
+    if not redis:
+        raise RuntimeError("❌ Redis клиент не инициализирован")
+
+    keys = [f"ind:{symbol}:{timeframe}:{param}" for param in params]
+    values = await redis.mget(*keys)
+
+    for param, value in zip(params, values):
+        result[param] = float(value) if value is not None else None
+
+    return result
