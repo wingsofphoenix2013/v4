@@ -36,7 +36,44 @@ def route_signal_base(meta, signal_direction, symbol):
         return "reverse", "разрешён реверс"
 
     return "ignore", "неизвестное состояние"
+# 🔸 Обработчик сигнала защиты (заглушка)
+async def handle_protect_signal(msg_data):
+    log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}")
 
+# 🔸 Обработчик сигнала реверса (заглушка)
+async def handle_reverse_signal(msg_data):
+    log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}")
+    
+# 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
+async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
+    route = msg_data.get("route")
+    strategy_id = msg_data.get("strategy_id")
+    symbol = msg_data.get("symbol")
+
+    if route == "new_entry":
+        strategy_name = config.strategies[strategy_id]["meta"]["name"]
+        strategy_obj = strategy_registry.get(strategy_name)
+        if not strategy_obj:
+            log.warning(f"⚠️ Strategy not found in registry: {strategy_name}")
+            return
+
+        context = {"redis": redis}
+        result = strategy_obj.run(msg_data, context)
+        if asyncio.iscoroutine(result):
+            await result
+
+    elif route == "protect":
+        await handle_protect_signal(msg_data)
+
+    elif route == "reverse":
+        await handle_reverse_signal(msg_data)
+
+    elif route == "ignore":
+        pass  # уже обработано ранее
+
+    else:
+        log.warning(f"⚠️ Неизвестный маршрут в dispatch: {route}")
+        
 # 🔸 Основной цикл обработки сигналов
 async def run_signal_loop(strategy_registry):
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
