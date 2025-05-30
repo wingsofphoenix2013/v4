@@ -36,6 +36,7 @@ def route_signal_base(meta, signal_direction, symbol):
         return "reverse", "разрешён реверс"
 
     return "ignore", "неизвестное состояние"
+
 # 🔸 Обработчик сигнала защиты (заглушка)
 async def handle_protect_signal(msg_data):
     log.info("🧪 Вход в handle_protect_signal")
@@ -43,12 +44,13 @@ async def handle_protect_signal(msg_data):
 
 # 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
+    log.info("🧪 Вход в handle_reverse_signal")
     log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}")
-    
+
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
     route = msg_data.get("route")
-    strategy_id = msg_data.get("strategy_id")
+    strategy_id = int(msg_data.get("strategy_id"))
     symbol = msg_data.get("symbol")
 
     if route == "new_entry":
@@ -74,7 +76,7 @@ async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
 
     else:
         log.warning(f"⚠️ Неизвестный маршрут в dispatch: {route}")
-        
+
 # 🔸 Основной цикл обработки сигналов
 async def run_signal_loop(strategy_registry):
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
