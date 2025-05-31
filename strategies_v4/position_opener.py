@@ -115,7 +115,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
         # Расчет максимального объема позиции
         qty_by_risk = available_risk / risk_per_unit
-        qty_by_margin = (deposit * leverage) / entry_price
+        qty_by_margin = (position_limit * leverage) / entry_price  # ← ключевое изменение
         quantity = min(qty_by_risk, qty_by_margin)
 
         quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"))
