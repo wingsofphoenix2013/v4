@@ -3,7 +3,7 @@
 import logging
 import json
 import asyncio
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime
 
 from infra import infra
@@ -118,7 +118,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         qty_by_margin = (position_limit * leverage) / entry_price  # ← ключевое изменение
         quantity = min(qty_by_risk, qty_by_margin)
 
-        quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"))
+        quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
         if quantity < min_qty:
             return {"route": route, "status": "skip", "reason": "объем меньше минимального"}
 
