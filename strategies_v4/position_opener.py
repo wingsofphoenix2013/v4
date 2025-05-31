@@ -103,32 +103,54 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
             tp_prices.append(round(tp_price, precision_price))
 
-        # Подсчет используемого риска по уже открытым позициям стратегии
-        used_risk = sum(
-            p.planned_risk for p in position_registry.values()
-            if p.strategy_id == strategy_id and p.status in ("open", "partial")
-        )
+        # Подсчет используемого риска и маржи по открытым позициям стратегии
+        used_risk = Decimal("0")
+        used_margin_sum = Decimal("0")
+
+        for p in position_registry.values():
+            if p.strategy_id == strategy_id and p.status in ("open", "partial"):
+                used_risk += p.planned_risk
+                notional = p.entry_price * p.quantity
+                used_margin_sum += notional / leverage
 
         available_risk = deposit * max_risk_pct / Decimal("100") - used_risk
         if available_risk <= 0:
             return {"route": route, "status": "skip", "reason": "доступный риск <= 0"}
 
-        # Расчет максимального объема позиции
+        # Расчет максимально допустимого объема по риску и марже на сделку
         qty_by_risk = available_risk / risk_per_unit
-        qty_by_margin = (position_limit * leverage) / entry_price  # ← ключевое изменение
+        qty_by_margin = (position_limit * leverage) / entry_price
         quantity = min(qty_by_risk, qty_by_margin)
 
-        quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
+        # Расчет предварительных итогов
+        notional_value = entry_price * quantity
+        used_margin = notional_value / leverage
+        total_margin = used_margin_sum + used_margin
+
+        # Корректировка объема, если превышен общий лимит депозита
+        if total_margin > deposit:
+            adjusted_margin = deposit - used_margin_sum
+            if adjusted_margin <= 0:
+                return {"route": route, "status": "skip", "reason": "депозит полностью занят другими позициями"}
+
+            adjusted_notional = adjusted_margin * leverage
+            adjusted_qty_by_margin = adjusted_notional / entry_price
+            quantity = min(qty_by_risk, adjusted_qty_by_margin)
+
+            quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
+            notional_value = entry_price * quantity
+            used_margin = notional_value / leverage
+
+            if used_margin < position_limit * Decimal("0.75"):
+                return {"route": route, "status": "skip", "reason": "остаток маржи меньше допустимого порога"}
+
+        else:
+            quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
+
         if quantity < min_qty:
             return {"route": route, "status": "skip", "reason": "объем меньше минимального"}
 
-        # Расчет итоговых показателей позиции
-        notional_value = entry_price * quantity
-        used_margin = notional_value / leverage
         planned_risk = risk_per_unit * quantity
-
-        if used_margin < position_limit * Decimal("0.75"):
-            return {"route": route, "status": "skip", "reason": "используемая маржа слишком мала"}
 
         # Возврат итогового расчета
         return {
@@ -145,7 +167,6 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
     except Exception as e:
         log.exception("❌ Ошибка в calculate_position_size")
         return {"route": signal.get("route"), "status": "skip", "reason": "внутренняя ошибка"}
-
 # 🔸 Основная функция открытия позиции
 async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     result = await calculate_position_size(signal, context)
