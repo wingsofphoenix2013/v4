@@ -16,7 +16,7 @@ class ConfigState:
     async def reload_ticker(self, symbol: str):
         async with infra.pg_pool.acquire() as conn:
             row = await conn.fetchrow("""
-                SELECT id, symbol FROM tickers_v4
+                SELECT * FROM tickers_v4
                 WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
             """, symbol)
             if row:
@@ -74,7 +74,7 @@ class ConfigState:
     async def reload_all(self):
         async with infra.pg_pool.acquire() as conn:
             tickers = await conn.fetch("""
-                SELECT id, symbol FROM tickers_v4
+                SELECT * FROM tickers_v4
                 WHERE status = 'enabled' AND tradepermission = 'enabled'
             """)
             self.tickers = {r["symbol"]: dict(r) for r in tickers}
