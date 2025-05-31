@@ -176,15 +176,23 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         log.info(f"🚫 [POSITION_OPENER] Открытие позиции отменено: {reason}")
         return {"status": "skipped", "reason": reason}
 
-    # Здесь позже будет: создание записи в БД, обновление состояния
+    # Логирование итогов расчета
     log.info(
         f"✅ [POSITION_OPENER] Открытие позиции: "
         f"strategy={signal['strategy_id']} symbol={signal['symbol']} "
         f"qty={result['quantity']} price={result['entry_price']}"
     )
 
-    return {"status": "opened", **result}
+    # Логирование SL и TP
+    stop_price = result["stop_loss_price"]
+    tp_prices = result["tp_prices"]
 
+    log.info(f"🔔 [POSITION_OPENER] SL: {stop_price}")
+    for i, tp in enumerate(tp_prices, start=1):
+        log.info(f"🎯 [POSITION_OPENER] TP{i}: {tp}")
+
+    return {"status": "opened", **result}
+    
 # 🔸 Слушатель потока strategy_opener_stream
 async def run_position_opener_loop():
     log.info("🧭 [POSITION_OPENER] Запуск слушателя strategy_opener_stream")
