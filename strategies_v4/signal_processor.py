@@ -153,7 +153,7 @@ async def run_signal_loop(strategy_registry):
                                 "log_id": log_id,
                                 "strategy_id": strategy_id,
                                 "status": route,
-                                "position_uid": None,
+                                "position_uid": msg_data.get("position_uid"),
                                 "note": note,
                                 "logged_at": datetime.utcnow().isoformat()
                             }
@@ -166,7 +166,7 @@ async def run_signal_loop(strategy_registry):
                     key = (strategy_id, symbol)
                     position = position_registry.get(key)
                     if position:
-                        msg_data["position_uid"] = position.id
+                        msg_data["position_uid"] = position.uid
 
                     # 🔸 Диспетчеризация маршрута обработки
                     msg_data["route"] = route
