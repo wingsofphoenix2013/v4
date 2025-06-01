@@ -194,6 +194,25 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     if result.get("status") == "skip":
         reason = result.get("reason", "неизвестная причина отказа")
         log.info(f"🚫 [POSITION_OPENER] Открытие позиции отменено: {reason}")
+
+        redis = context.get("redis")
+        log_id = signal.get("log_id")
+        strategy_id = signal.get("strategy_id")
+
+        if redis and log_id is not None:
+            log_record = {
+                "log_id": log_id,
+                "strategy_id": strategy_id,
+                "status": "skip",
+                "position_id": None,
+                "note": reason,
+                "logged_at": datetime.utcnow().isoformat()
+            }
+            try:
+                await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+            except Exception as e:
+                log.warning(f"⚠️ [POSITION_OPENER] Ошибка записи в Redis log_queue: {e}")
+
         return {"status": "skipped", "reason": reason}
 
     # Логирование итогов расчета
