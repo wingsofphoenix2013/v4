@@ -13,6 +13,7 @@ from position_state_loader import position_registry
 log = logging.getLogger("POSITION_OPENER")
 
 # 🔸 Расчет позиции на основе параметров стратегии, цены и текущих рисков
+# Расчет позиции на основе параметров стратегии, цены и текущих рисков
 async def calculate_position_size(signal: dict, context: dict) -> dict:
     try:
         redis = context["redis"]
@@ -152,6 +153,24 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
         planned_risk = risk_per_unit * quantity
 
+        # Расчет объемов по TP
+        tp_targets = []
+        total_allocated = Decimal("0")
+        for i, level in enumerate(tp_levels):
+            volume_percent = Decimal(level["volume_percent"])
+            if i < len(tp_levels) - 1:
+                qty = (quantity * volume_percent / 100).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
+                total_allocated += qty
+            else:
+                qty = quantity - total_allocated  # последний уровень — остаток
+            tp_targets.append({
+                "level": level["level"],
+                "price": tp_prices[i],
+                "quantity": qty,
+                "type": "tp"
+            })
+            log.info(f"🎯 [POSITION_OPENER] TP{level['level']}: price={tp_prices[i]} quantity={qty}")
+
         # Возврат итогового расчета
         return {
             "route": route,
@@ -161,7 +180,8 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
             "planned_risk": planned_risk,
             "entry_price": entry_price,
             "stop_loss_price": stop_loss_price,
-            "tp_prices": tp_prices
+            "tp_prices": tp_prices,
+            "tp_targets": tp_targets
         }
 
     except Exception as e:
