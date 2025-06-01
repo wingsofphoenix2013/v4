@@ -3,7 +3,7 @@
 import logging
 import json
 from datetime import datetime
-from position_opener import open_position  # ✅ корректный импорт с учётом Root Directory = strategies_v4
+from position_opener import open_position
 
 log = logging.getLogger("STRATEGY_1")
 
@@ -15,11 +15,11 @@ class Strategy1:
         strategy_id = signal.get("strategy_id")
         log_id = signal.get("log_id")
 
-        log.info(f"⚙️ [Strategy1] Валидация сигнала: symbol={symbol}, direction={direction}")
+        log.debug(f"⚙️ [Strategy1] Валидация сигнала: symbol={symbol}, direction={direction}")
 
         if direction != "long":
             note = "отклонено: только long разрешён"
-            log.info(f"🚫 [Strategy1] {note}")
+            log.debug(f"🚫 [Strategy1] {note}")
 
             redis = context.get("redis")
             if redis:
@@ -41,7 +41,7 @@ class Strategy1:
         return True
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.info("🚀 [Strategy1] Я — тестовая стратегия 1")
+        log.debug("🚀 [Strategy1] Я — тестовая стратегия 1")
 
         redis = context.get("redis")
         if redis:
@@ -54,6 +54,6 @@ class Strategy1:
             }
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.info(f"📤 [Strategy1] Сигнал отправлен в strategy_opener_stream")
+                log.debug(f"📤 [Strategy1] Сигнал отправлен в strategy_opener_stream")
             except Exception as e:
                 log.warning(f"⚠️ [Strategy1] Ошибка при отправке в stream: {e}")

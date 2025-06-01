@@ -57,7 +57,7 @@ async def load_position_state():
         raise RuntimeError("❌ PostgreSQL pool не инициализирован")
 
     async with pool.acquire() as conn:
-        log.info("📥 Загрузка активных позиций из PG")
+        log.debug("📥 Загрузка активных позиций из PG")
 
         positions = await conn.fetch(
             """
@@ -68,10 +68,10 @@ async def load_position_state():
         position_uids = [r['position_uid'] for r in positions]
 
         if not position_uids:
-            log.info("ℹ️ Нет активных позиций для восстановления")
+            log.debug("ℹ️ Нет активных позиций для восстановления")
             return
 
-        log.info(f"🔍 Найдено позиций: {len(position_uids)}")
+        log.debug(f"🔍 Найдено позиций: {len(position_uids)}")
 
         targets = await conn.fetch(
             """

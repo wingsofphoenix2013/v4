@@ -17,12 +17,12 @@ class Strategy4:
         strategy_id = int(signal.get("strategy_id"))
         log_id = signal.get("log_id")
 
-        log.info(f"⚙️ [Strategy4] Валидация сигнала: symbol={symbol}, direction={direction}")
+        log.debug(f"⚙️ [Strategy4] Валидация сигнала: symbol={symbol}, direction={direction}")
 
         # 🔹 Проверка направления
         if direction != "long":
             note = "отклонено: только long разрешён"
-            log.info(f"🚫 [Strategy4] {note}")
+            log.debug(f"🚫 [Strategy4] {note}")
 
             redis = context.get("redis")
             if redis:
@@ -45,7 +45,7 @@ class Strategy4:
 
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.info("🚀 [Strategy4] Я — тестовая стратегия 4")
+        log.debug("🚀 [Strategy4] Я — тестовая стратегия 4")
 
         redis = context.get("redis")
         if redis:
@@ -58,6 +58,6 @@ class Strategy4:
             }
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.info(f"📤 [Strategy4] Сигнал отправлен в strategy_opener_stream")
+                log.debug(f"📤 [Strategy4] Сигнал отправлен в strategy_opener_stream")
             except Exception as e:
                 log.warning(f"⚠️ [Strategy4] Ошибка при отправке в stream: {e}")

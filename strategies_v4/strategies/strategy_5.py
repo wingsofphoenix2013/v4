@@ -17,12 +17,12 @@ class Strategy5:
         strategy_id = int(signal.get("strategy_id"))
         log_id = signal.get("log_id")
 
-        log.info(f"⚙️ [Strategy5] Валидация сигнала: symbol={symbol}, direction={direction}")
+        log.debug(f"⚙️ [Strategy5] Валидация сигнала: symbol={symbol}, direction={direction}")
 
         # 🔹 Проверка направления
         if direction != "long":
             note = "отклонено: только long разрешён"
-            log.info(f"🚫 [Strategy5] {note}")
+            log.debug(f"🚫 [Strategy5] {note}")
 
             redis = context.get("redis")
             if redis:
@@ -45,7 +45,7 @@ class Strategy5:
 
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.info("🚀 [Strategy5] Я — тестовая стратегия 5")
+        log.debug("🚀 [Strategy5] Я — тестовая стратегия 5")
 
         redis = context.get("redis")
         if redis:
@@ -58,6 +58,6 @@ class Strategy5:
             }
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.info(f"📤 [Strategy5] Сигнал отправлен в strategy_opener_stream")
+                log.debug(f"📤 [Strategy5] Сигнал отправлен в strategy_opener_stream")
             except Exception as e:
                 log.warning(f"⚠️ [Strategy5] Ошибка при отправке в stream: {e}")

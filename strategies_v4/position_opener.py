@@ -156,7 +156,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
                 "hit_at": None,
                 "canceled": False
             })
-            log.info(f"🎯 [POSITION_OPENER] TP{level['level']}: price={tp_prices[i]} quantity={qty}")
+            log.debug(f"🎯 [POSITION_OPENER] TP{level['level']}: price={tp_prices[i]} quantity={qty}")
 
         return {
             "route": route,
@@ -180,7 +180,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
 
     if result.get("status") == "skip":
         reason = result.get("reason", "неизвестная причина отказа")
-        log.info(f"🚫 [POSITION_OPENER] Открытие позиции отменено: {reason}")
+        log.debug(f"🚫 [POSITION_OPENER] Открытие позиции отменено: {reason}")
 
         redis = context.get("redis")
         log_id = signal.get("log_id")
@@ -206,7 +206,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     position_uid = str(uuid.uuid4())
 
     # 🔹 Логирование итогов расчета
-    log.info(
+    log.debug(
         f"✅ [POSITION_OPENER] Открытие позиции: "
         f"strategy={signal['strategy_id']} symbol={signal['symbol']} "
         f"qty={result['quantity']} price={result['entry_price']} uid={position_uid}"
@@ -216,9 +216,9 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     stop_price = result["stop_loss_price"]
     tp_prices = result["tp_prices"]
 
-    log.info(f"🔔 [POSITION_OPENER] SL: {stop_price}")
+    log.debug(f"🔔 [POSITION_OPENER] SL: {stop_price}")
     for i, tp in enumerate(tp_prices, start=1):
-        log.info(f"🎯 [POSITION_OPENER] TP{i}: {tp}")
+        log.debug(f"🎯 [POSITION_OPENER] TP{i}: {tp}")
 
     # 🔹 Расчёт комиссии и PnL
     notional = result["entry_price"] * result["quantity"]
@@ -256,7 +256,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     )
 
     position_registry[(position.strategy_id, position.symbol)] = position
-    log.info(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
+    log.debug(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
 
     # 🔹 Подготовка Redis-логов
     redis = context.get("redis")
@@ -314,15 +314,15 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         }
         try:
             await redis.xadd("positions_stream", {"data": json.dumps(position_data)})
-            log.info(f"[DEBUG] position_data for Redis: {position_data}")
-            log.info(f"📤 [POSITION_OPENER] Позиция отправлена в Redis для записи в БД")
+            log.debug(f"[DEBUG] position_data for Redis: {position_data}")
+            log.debug(f"📤 [POSITION_OPENER] Позиция отправлена в Redis для записи в БД")
         except Exception as e:
             log.warning(f"⚠️ [POSITION_OPENER] Ошибка отправки позиции в Redis: {e}")
 
     return {"status": "opened", "position_uid": position_uid, **result}
 # 🔸 Слушатель потока strategy_opener_stream
 async def run_position_opener_loop():
-    log.info("🧭 [POSITION_OPENER] Запуск слушателя strategy_opener_stream")
+    log.debug("🧭 [POSITION_OPENER] Запуск слушателя strategy_opener_stream")
 
     redis = infra.redis_client
     last_id = "$"
@@ -351,10 +351,10 @@ async def run_position_opener_loop():
                         # 🔸 Логирование результата
                         if result.get("status") == "skipped":
                             reason = result.get("reason", "неизвестная причина")
-                            log.info(f"🚫 [POSITION_OPENER] Команда отклонена: {reason}")
+                            log.debug(f"🚫 [POSITION_OPENER] Команда отклонена: {reason}")
 
                         elif result.get("status") == "opened":
-                            log.info(f"📥 [POSITION_OPENER] Позиция открыта: "
+                            log.debug(f"📥 [POSITION_OPENER] Позиция открыта: "
                                      f"qty={result['quantity']} price={result['entry_price']}")
 
                     except Exception as e:

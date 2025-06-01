@@ -39,12 +39,12 @@ def route_signal_base(meta, signal_direction, symbol):
 
 # 🔸 Обработчик сигнала защиты (заглушка)
 async def handle_protect_signal(msg_data):
-    log.info("🧪 Вход в handle_protect_signal")
-    log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
+    log.debug("🧪 Вход в handle_protect_signal")
+    log.debug(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
 
 # 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
-    log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
+    log.debug(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
 
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
@@ -146,7 +146,7 @@ async def run_signal_loop(strategy_registry):
                                     note = "отклонено стратегией: validate_signal() = False"
 
                     if route == "ignore":
-                        log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
+                        log.debug(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
 
                         if note is not None:
                             log_record = {
@@ -160,7 +160,7 @@ async def run_signal_loop(strategy_registry):
 
                             await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
                     else:
-                        log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
+                        log.debug(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
                     # 🔸 Если есть активная позиция, сохраняем её id для маршрутов protect/reverse
                     key = (strategy_id, symbol)

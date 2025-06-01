@@ -31,7 +31,7 @@ async def write_log_entry(pool, record: dict):
                 datetime.fromisoformat(record["logged_at"])
             )
             await conn.execute(query, *values)
-            log.info(f"💾 Записан лог сигнала: strategy={values[1]}, status={values[2]}")
+            log.debug(f"💾 Записан лог сигнала: strategy={values[1]}, status={values[2]}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка обработки лог-записи: {e}")
 
@@ -91,7 +91,7 @@ async def write_position_and_targets(pool, record: dict):
                 )
 
             await tx.commit()
-            log.info(f"💾 Позиция записана в БД: uid={record['position_uid']}")
+            log.debug(f"💾 Позиция записана в БД: uid={record['position_uid']}")
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка записи позиции: {e}")

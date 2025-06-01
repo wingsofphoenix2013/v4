@@ -22,7 +22,7 @@ def load_strategies():
             for name, obj in inspect.getmembers(module, inspect.isclass):
                 if name.lower() == expected_class.lower():
                     strategies[modname] = obj()
-                    log.info(f"✅ Загрузка стратегии: {modname} → {name}")
+                    log.debug(f"✅ Загрузка стратегии: {modname} → {name}")
                     break
             else:
                 log.warning(f"⚠️ Стратегия {modname} — класс не найден")
