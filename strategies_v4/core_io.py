@@ -26,7 +26,7 @@ async def write_log_entry(pool, record: dict):
                 int(record["log_id"]),
                 int(record["strategy_id"]),
                 record["status"],
-                record["position_uid"],
+                record.get("position_uid"),  # ← безопасно
                 record.get("note"),
                 datetime.fromisoformat(record["logged_at"])
             )
@@ -34,7 +34,7 @@ async def write_log_entry(pool, record: dict):
             log.debug(f"💾 Записан лог сигнала: strategy={values[1]}, status={values[2]}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка обработки лог-записи: {e}")
-
+            
 # 🔸 Запись позиции и целей
 async def write_position_and_targets(pool, record: dict):
     async with pool.acquire() as conn:
