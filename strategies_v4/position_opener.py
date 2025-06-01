@@ -296,6 +296,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "direction": position.direction,
             "entry_price": str(position.entry_price),
             "quantity": str(position.quantity),
+            "notional_value": str(notional),
             "quantity_left": str(position.quantity_left),
             "status": position.status,
             "created_at": position.created_at.isoformat(),
