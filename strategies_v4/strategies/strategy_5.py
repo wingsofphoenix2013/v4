@@ -1,25 +1,28 @@
-# strategies/strategy_2.py
+# strategies/strategy_5.py
 
 import logging
 import json
 from datetime import datetime
-from position_opener import open_position  # ✅ корректный импорт с учётом Root Directory = strategies_v4
+from position_opener import open_position
+from infra import load_indicators
+from config_loader import config
 
-log = logging.getLogger("STRATEGY_2")
+log = logging.getLogger("STRATEGY_5")
 
-class Strategy2:
+class Strategy5:
     # 🔸 Метод валидации сигнала перед входом
     async def validate_signal(self, signal, context) -> bool | str:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
-        strategy_id = signal.get("strategy_id")
+        strategy_id = int(signal.get("strategy_id"))
         log_id = signal.get("log_id")
 
-        log.info(f"⚙️ [Strategy2] Валидация сигнала: symbol={symbol}, direction={direction}")
+        log.info(f"⚙️ [Strategy5] Валидация сигнала: symbol={symbol}, direction={direction}")
 
-        if direction != "short":
-            note = "отклонено: только short разрешён"
-            log.info(f"🚫 [Strategy2] {note}")
+        # 🔹 Проверка направления
+        if direction != "long":
+            note = "отклонено: только long разрешён"
+            log.info(f"🚫 [Strategy5] {note}")
 
             redis = context.get("redis")
             if redis:
@@ -34,14 +37,15 @@ class Strategy2:
                 try:
                     await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
                 except Exception as e:
-                    log.warning(f"⚠️ [Strategy2] Ошибка записи в Redis log_queue: {e}")
+                    log.warning(f"⚠️ [Strategy5] Ошибка записи в Redis log_queue: {e}")
 
             return "logged"
 
         return True
+
     # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.info("🚀 [Strategy2] Я — тестовая стратегия 2")
+        log.info("🚀 [Strategy5] Я — тестовая стратегия 5")
 
         redis = context.get("redis")
         if redis:
@@ -54,6 +58,6 @@ class Strategy2:
             }
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.info(f"📤 [Strategy2] Сигнал отправлен в strategy_opener_stream")
+                log.info(f"📤 [Strategy5] Сигнал отправлен в strategy_opener_stream")
             except Exception as e:
-                log.warning(f"⚠️ [Strategy2] Ошибка при отправке в stream: {e}")
+                log.warning(f"⚠️ [Strategy5] Ошибка при отправке в stream: {e}")
