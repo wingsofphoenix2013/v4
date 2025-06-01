@@ -265,13 +265,13 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     def normalize_targets(targets):
         return [
             {
-                "level": t["level"],
+                "level": int(t["level"]),
                 "price": str(t["price"]),
                 "quantity": str(t["quantity"]),
                 "type": t["type"],
-                "hit": t["hit"],
-                "hit_at": t["hit_at"],
-                "canceled": t["canceled"]
+                "hit": bool(t["hit"]),
+                "hit_at": t["hit_at"].isoformat() if t["hit_at"] else None,
+                "canceled": bool(t["canceled"])
             }
             for t in targets
         ]
