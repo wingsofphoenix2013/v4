@@ -9,7 +9,7 @@ from signal_processor import run_signal_loop
 from position_handler import run_position_loop
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state, position_registry
-from core_io import run_signal_log_writer
+from core_io import run_signal_log_writer, run_position_writer  # 🔹 добавлен импорт
 from position_opener import run_position_opener_loop
 
 # 🔸 Настройка логгера для главного воркера
@@ -43,7 +43,8 @@ async def main():
         run_safe_loop(lambda: run_position_loop(position_registry), "POSITION_HANDLER"),
         run_safe_loop(lambda: config_event_listener(), "CONFIG_LOADER"),
         run_safe_loop(lambda: run_signal_log_writer(), "CORE_IO"),
-        run_safe_loop(lambda: run_position_opener_loop(), "POSITION_OPENER")
+        run_safe_loop(lambda: run_position_opener_loop(), "POSITION_OPENER"),
+        run_safe_loop(lambda: run_position_writer(), "POSITION_WRITER")  # 🔹 добавлено
     )
 
 if __name__ == "__main__":

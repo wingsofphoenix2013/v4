@@ -189,7 +189,6 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         log.exception("❌ Ошибка в calculate_position_size")
         return {"route": signal.get("route"), "status": "skip", "reason": "внутренняя ошибка"}
 # 🔸 Основная функция открытия позиции
-# 🔸 Основная функция открытия позиции
 async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     result = await calculate_position_size(signal, context)
 
@@ -206,7 +205,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
                 "log_id": log_id,
                 "strategy_id": strategy_id,
                 "status": "skip",
-                "position_id": None,
+                "position_uid": None,
                 "note": reason,
                 "logged_at": datetime.utcnow().isoformat()
             }
@@ -269,8 +268,48 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
 
     log.info(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
 
+    # 🔹 Логирование факта открытия позиции в Redis
+    redis = context.get("redis")
+    log_id = signal.get("log_id")
+    strategy_id = signal.get("strategy_id")
+
+    if redis and log_id is not None:
+        log_record = {
+            "log_id": log_id,
+            "strategy_id": strategy_id,
+            "status": "opened",
+            "position_uid": position_uid,
+            "note": "позиция открыта",
+            "logged_at": datetime.utcnow().isoformat()
+        }
+        try:
+            await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+        except Exception as e:
+            log.warning(f"⚠️ [POSITION_OPENER] Ошибка записи успешного открытия в Redis log_queue: {e}")
+
+        # 🔹 Передача позиции в Redis Stream для записи в БД
+        position_data = {
+            "position_uid": position_uid,
+            "strategy_id": position.strategy_id,
+            "symbol": position.symbol,
+            "direction": position.direction,
+            "entry_price": str(position.entry_price),
+            "quantity": str(position.quantity),
+            "quantity_left": str(position.quantity_left),
+            "status": position.status,
+            "created_at": position.created_at.isoformat(),
+            "planned_risk": str(position.planned_risk),
+            "log_id": position.log_id,
+            "tp_targets": [t.__dict__ for t in position.tp_targets],
+            "sl_targets": [t.__dict__ for t in position.sl_targets]
+        }
+        try:
+            await redis.xadd("positions_stream", {"data": json.dumps(position_data)})
+            log.info(f"📤 [POSITION_OPENER] Позиция отправлена в Redis для записи в БД")
+        except Exception as e:
+            log.warning(f"⚠️ [POSITION_OPENER] Ошибка отправки позиции в Redis: {e}")
+
     return {"status": "opened", "position_uid": position_uid, **result}
-    
 # 🔸 Слушатель потока strategy_opener_stream
 async def run_position_opener_loop():
     log.info("🧭 [POSITION_OPENER] Запуск слушателя strategy_opener_stream")

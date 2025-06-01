@@ -4,41 +4,91 @@ import asyncio
 import logging
 import json
 from datetime import datetime
+from decimal import Decimal
 
 from infra import infra
 
 log = logging.getLogger("CORE_IO")
 
 SIGNAL_LOG_STREAM = "signal_log_queue"
+POSITIONS_STREAM = "positions_stream"
 
-# 🔸 Функция записи одной строки в таблицу signal_log_entries_v4
+# 🔸 Запись лога сигнала
 async def write_log_entry(pool, record: dict):
     query = """
         INSERT INTO signal_log_entries_v4
-        (log_id, strategy_id, status, position_id, note, logged_at)
+        (log_id, strategy_id, status, position_uid, note, logged_at)
         VALUES ($1, $2, $3, $4, $5, $6)
     """
-
     async with pool.acquire() as conn:
         try:
-            log_id = int(record.get("log_id"))
-
             values = (
-                log_id,
-                int(record.get("strategy_id")),
-                record.get("status"),
-                int(record["position_id"]) if record.get("position_id") is not None else None,
+                int(record["log_id"]),
+                int(record["strategy_id"]),
+                record["status"],
+                record["position_uid"],
                 record.get("note"),
-                datetime.fromisoformat(record.get("logged_at"))
+                datetime.fromisoformat(record["logged_at"])
             )
-
             await conn.execute(query, *values)
             log.info(f"💾 Записан лог сигнала: strategy={values[1]}, status={values[2]}")
-
         except Exception as e:
             log.warning(f"⚠️ Ошибка обработки лог-записи: {e}")
 
-# 🔸 Обработка сигналов из очереди Redis
+# 🔸 Запись позиции и целей
+async def write_position_and_targets(pool, record: dict):
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+
+        try:
+            await conn.execute(
+                """
+                INSERT INTO positions_v4 (
+                    position_uid, strategy_id, symbol, direction, entry_price,
+                    quantity, quantity_left, status, created_at, planned_risk, log_id
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                """,
+                record["position_uid"],
+                int(record["strategy_id"]),
+                record["symbol"],
+                record["direction"],
+                Decimal(record["entry_price"]),
+                Decimal(record["quantity"]),
+                Decimal(record["quantity_left"]),
+                record["status"],
+                datetime.fromisoformat(record["created_at"]),
+                Decimal(record["planned_risk"]),
+                int(record["log_id"])
+            )
+
+            for target in record.get("tp_targets", []) + record.get("sl_targets", []):
+                await conn.execute(
+                    """
+                    INSERT INTO position_targets_v4 (
+                        position_uid, type, level, price, quantity,
+                        hit, hit_at, canceled
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    """,
+                    record["position_uid"],
+                    target["type"],
+                    int(target["level"]),
+                    Decimal(target["price"]),
+                    Decimal(target["quantity"]),
+                    target["hit"],
+                    datetime.fromisoformat(target["hit_at"]) if target["hit_at"] else None,
+                    target["canceled"]
+                )
+
+            await tx.commit()
+            log.info(f"💾 Позиция записана в БД: uid={record['position_uid']}")
+        except Exception as e:
+            await tx.rollback()
+            log.warning(f"❌ Ошибка записи позиции: {e}")
+
+# 🔸 Чтение логов сигналов
 async def run_signal_log_writer():
     log.info("📝 [CORE_IO] Запуск логгера сигналов")
 
@@ -67,4 +117,35 @@ async def run_signal_log_writer():
                         log.warning(f"⚠️ Ошибка обработки записи: {e}")
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream")
+            await asyncio.sleep(5)
+
+# 🔸 Чтение позиций из Redis и запись в БД
+async def run_position_writer():
+    log.info("📝 [CORE_IO] Запуск воркера записи позиций")
+
+    redis = infra.redis_client
+    pool = infra.pg_pool
+    last_id = "$"
+
+    while True:
+        try:
+            response = await redis.xread(
+                streams={POSITIONS_STREAM: last_id},
+                count=10,
+                block=1000
+            )
+
+            if not response:
+                continue
+
+            for stream_name, messages in response:
+                for msg_id, msg_data in messages:
+                    last_id = msg_id
+                    try:
+                        record = json.loads(msg_data["data"])
+                        await write_position_and_targets(pool, record)
+                    except Exception as e:
+                        log.warning(f"⚠️ Ошибка обработки позиции: {e}")
+        except Exception:
+            log.exception("❌ Ошибка чтения из Redis Stream (positions)")
             await asyncio.sleep(5)
