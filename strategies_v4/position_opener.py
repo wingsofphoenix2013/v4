@@ -5,10 +5,11 @@ import json
 import asyncio
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime
+import uuid
 
 from infra import infra
 from config_loader import config
-from position_state_loader import position_registry
+from position_state_loader import PositionState, position_registry, Target
 
 log = logging.getLogger("POSITION_OPENER")
 
@@ -188,6 +189,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         log.exception("❌ Ошибка в calculate_position_size")
         return {"route": signal.get("route"), "status": "skip", "reason": "внутренняя ошибка"}
 # 🔸 Основная функция открытия позиции
+# 🔸 Основная функция открытия позиции
 async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     result = await calculate_position_size(signal, context)
 
@@ -215,14 +217,17 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
 
         return {"status": "skipped", "reason": reason}
 
-    # Логирование итогов расчета
+    # 🔹 Генерация уникального идентификатора позиции
+    position_uid = str(uuid.uuid4())
+
+    # 🔹 Логирование итогов расчета
     log.info(
         f"✅ [POSITION_OPENER] Открытие позиции: "
         f"strategy={signal['strategy_id']} symbol={signal['symbol']} "
-        f"qty={result['quantity']} price={result['entry_price']}"
+        f"qty={result['quantity']} price={result['entry_price']} uid={position_uid}"
     )
 
-    # Логирование SL и TP
+    # 🔹 Логирование SL и TP
     stop_price = result["stop_loss_price"]
     tp_prices = result["tp_prices"]
 
@@ -230,7 +235,41 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     for i, tp in enumerate(tp_prices, start=1):
         log.info(f"🎯 [POSITION_OPENER] TP{i}: {tp}")
 
-    return {"status": "opened", **result}
+    # 🔹 Создание объекта PositionState и сохранение в память
+    position = PositionState(
+        uid=position_uid,
+        strategy_id=int(signal["strategy_id"]),
+        symbol=signal["symbol"],
+        direction=signal["direction"],
+        entry_price=result["entry_price"],
+        quantity=result["quantity"],
+        quantity_left=result["quantity"],
+        status="open",
+        created_at=datetime.utcnow(),
+        exit_price=None,
+        closed_at=None,
+        close_reason=None,
+        pnl=Decimal("0"),
+        planned_risk=result["planned_risk"],
+        tp_targets=result["tp_targets"],
+        sl_targets=[Target(
+            id=-1,
+            type="sl",
+            level=1,
+            price=result["stop_loss_price"],
+            quantity=result["quantity"],
+            hit=False,
+            hit_at=None,
+            canceled=False
+        )],
+        log_id=signal["log_id"]
+    )
+
+    position_registry[(position.strategy_id, position.symbol)] = position
+
+    log.info(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
+
+    return {"status": "opened", "position_uid": position_uid, **result}
     
 # 🔸 Слушатель потока strategy_opener_stream
 async def run_position_opener_loop():

@@ -1,7 +1,8 @@
 # position_state_loader.py
 
 import logging
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime
@@ -26,7 +27,7 @@ class Target:
 # 🔸 Структура позиции с вложенными целями
 @dataclass
 class PositionState:
-    id: int
+    uid: str
     strategy_id: int
     symbol: str
     direction: str
@@ -42,10 +43,11 @@ class PositionState:
     planned_risk: Decimal
     tp_targets: List[Target]
     sl_targets: List[Target]
+    log_id: int
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 # 🔸 Глобальные in-memory хранилища состояний
-position_registry: Dict[int, PositionState] = {}
-position_index: Dict[Tuple[int, str], int] = {}
+position_registry: Dict[Tuple[int, str], PositionState] = {}
 
 # 🔸 Загрузка активных позиций и целей из базы данных
 async def load_position_state():
@@ -62,24 +64,24 @@ async def load_position_state():
             WHERE status IN ('open', 'partial')
             """
         )
-        position_ids = [r['id'] for r in positions]
+        position_uids = [r['position_uid'] for r in positions]
 
-        if not position_ids:
+        if not position_uids:
             log.info("ℹ️ Нет активных позиций для восстановления")
             return
 
-        log.info(f"🔍 Найдено позиций: {len(position_ids)}")
+        log.info(f"🔍 Найдено позиций: {len(position_uids)}")
 
         targets = await conn.fetch(
             """
             SELECT * FROM position_targets_v4
-            WHERE position_id = ANY($1)
+            WHERE position_uid = ANY($1)
             """,
-            position_ids
+            position_uids
         )
 
     # 🔸 Группировка целей по позиции
-    target_map: Dict[int, List[Target]] = {}
+    target_map: Dict[str, List[Target]] = {}
     for row in targets:
         target = Target(
             id=row['id'],
@@ -91,17 +93,17 @@ async def load_position_state():
             hit_at=row['hit_at'],
             canceled=row['canceled'],
         )
-        target_map.setdefault(row['position_id'], []).append(target)
+        target_map.setdefault(row['position_uid'], []).append(target)
 
     # 🔸 Построение объектов PositionState
     for row in positions:
-        pos_id = row['id']
-        all_targets = target_map.get(pos_id, [])
+        uid = row['position_uid']
+        all_targets = target_map.get(uid, [])
         tp_targets = [t for t in all_targets if t.type == 'tp']
         sl_targets = [t for t in all_targets if t.type == 'sl']
 
         position = PositionState(
-            id=pos_id,
+            uid=uid,
             strategy_id=row['strategy_id'],
             symbol=row['symbol'],
             direction=row['direction'],
@@ -117,6 +119,7 @@ async def load_position_state():
             planned_risk=row['planned_risk'],
             tp_targets=tp_targets,
             sl_targets=sl_targets,
+            log_id=row['log_id']
         )
 
         # 🔸 Индексация по (strategy_id, symbol)
