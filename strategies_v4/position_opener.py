@@ -123,11 +123,14 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
             notional_value = entry_price * quantity
             used_margin = notional_value / leverage
-
-            if used_margin < position_limit * Decimal("0.75"):
-                return {"route": route, "status": "skip", "reason": "остаток маржи меньше допустимого порога"}
         else:
             quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
+            notional_value = entry_price * quantity
+            used_margin = notional_value / leverage
+
+        # 🔒 Глобальная проверка на минимальную маржу позиции
+        if used_margin < position_limit * Decimal("0.75"):
+            return {"route": route, "status": "skip", "reason": "маржа позиции меньше 75% от лимита"}
 
         if quantity < min_qty:
             return {"route": route, "status": "skip", "reason": "объем меньше минимального"}
