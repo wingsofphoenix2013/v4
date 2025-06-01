@@ -40,11 +40,11 @@ def route_signal_base(meta, signal_direction, symbol):
 # 🔸 Обработчик сигнала защиты (заглушка)
 async def handle_protect_signal(msg_data):
     log.info("🧪 Вход в handle_protect_signal")
-    log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_id={msg_data.get('position_id')}")
+    log.info(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
 
 # 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
-    log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_id={msg_data.get('position_id')}")
+    log.info(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
 
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
@@ -153,7 +153,7 @@ async def run_signal_loop(strategy_registry):
                                 "log_id": log_id,
                                 "strategy_id": strategy_id,
                                 "status": route,
-                                "position_id": None,
+                                "position_uid": None,
                                 "note": note,
                                 "logged_at": datetime.utcnow().isoformat()
                             }
@@ -166,7 +166,7 @@ async def run_signal_loop(strategy_registry):
                     key = (strategy_id, symbol)
                     position = position_registry.get(key)
                     if position:
-                        msg_data["position_id"] = position.id
+                        msg_data["position_uid"] = position.id
 
                     # 🔸 Диспетчеризация маршрута обработки
                     msg_data["route"] = route
