@@ -241,6 +241,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         close_reason="в работе",
         pnl=pnl,
         planned_risk=result["planned_risk"],
+        route=signal["route"],
         tp_targets=result["tp_targets"],
         sl_targets=[{
             "level": 1,
@@ -304,6 +305,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "status": position.status,
             "created_at": position.created_at.isoformat(),
             "planned_risk": str(position.planned_risk),
+            "route": signal["route"],
             "log_id": position.log_id,
             "pnl": str(pnl),
             "close_reason": "в работе",
@@ -312,6 +314,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         }
         try:
             await redis.xadd("positions_stream", {"data": json.dumps(position_data)})
+            log.info(f"[DEBUG] position_data for Redis: {position_data}")
             log.info(f"📤 [POSITION_OPENER] Позиция отправлена в Redis для записи в БД")
         except Exception as e:
             log.warning(f"⚠️ [POSITION_OPENER] Ошибка отправки позиции в Redis: {e}")

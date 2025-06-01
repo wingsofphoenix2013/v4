@@ -48,9 +48,9 @@ async def write_position_and_targets(pool, record: dict):
                     position_uid, strategy_id, symbol, direction, entry_price,
                     quantity, quantity_left, status, created_at,
                     exit_price, closed_at, close_reason, pnl,
-                    planned_risk, notional_value, log_id
+                    planned_risk, notional_value, route, log_id
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                 """,
                 record["position_uid"],
                 int(record["strategy_id"]),
@@ -66,7 +66,8 @@ async def write_position_and_targets(pool, record: dict):
                 record.get("close_reason"),
                 Decimal(record.get("pnl", "0")),
                 Decimal(record["planned_risk"]),
-                Decimal(record["notional_value"]),  # ✅ Новое поле
+                Decimal(record["notional_value"]),
+                record["route"],
                 int(record["log_id"])
             )
 

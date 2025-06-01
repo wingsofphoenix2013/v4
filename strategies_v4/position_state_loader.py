@@ -41,6 +41,7 @@ class PositionState:
     close_reason: Optional[str]
     pnl: Decimal
     planned_risk: Decimal
+    route: str
     tp_targets: List[Target]
     sl_targets: List[Target]
     log_id: int
@@ -117,6 +118,7 @@ async def load_position_state():
             close_reason=row['close_reason'],
             pnl=row['pnl'],
             planned_risk=row['planned_risk'],
+            route=row['route'],
             tp_targets=tp_targets,
             sl_targets=sl_targets,
             log_id=row['log_id']
