@@ -14,7 +14,6 @@ from position_state_loader import PositionState, position_registry, Target
 log = logging.getLogger("POSITION_OPENER")
 
 # 🔸 Расчет позиции на основе параметров стратегии, цены и текущих рисков
-# Расчет позиции на основе параметров стратегии, цены и текущих рисков
 async def calculate_position_size(signal: dict, context: dict) -> dict:
     try:
         redis = context["redis"]
@@ -23,7 +22,6 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         direction = signal["direction"]
         route = signal["route"]
 
-        # Получение конфигурации стратегии и тикера
         strategy = config.strategies[strategy_id]
         meta = strategy["meta"]
         tp_levels = strategy.get("tp_levels", [])
@@ -32,7 +30,6 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         if not ticker:
             return {"route": route, "status": "skip", "reason": "тикер не найден в config"}
 
-        # Извлечение параметров стратегии и тикера
         leverage = Decimal(meta["leverage"])
         deposit = Decimal(meta["deposit"])
         position_limit = Decimal(meta["position_limit"])
@@ -45,7 +42,6 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         precision_qty = int(ticker["precision_qty"])
         min_qty = Decimal(ticker["min_qty"])
 
-        # Получение текущей цены актива
         mark_price_raw = await redis.get(f"price:{symbol}")
         if not mark_price_raw:
             return {"route": route, "status": "skip", "reason": "нет цены актива"}
@@ -55,7 +51,6 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         except InvalidOperation:
             return {"route": route, "status": "skip", "reason": "некорректная цена актива"}
 
-        # Расчет уровня стоп-лосса
         if sl_type == "percent":
             offset = entry_price * sl_value / Decimal("100")
         elif sl_type == "atr":
@@ -67,18 +62,13 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         else:
             return {"route": route, "status": "skip", "reason": f"неизвестный sl_type: {sl_type}"}
 
-        if direction == "long":
-            stop_loss_price = entry_price - offset
-        else:
-            stop_loss_price = entry_price + offset
-
+        stop_loss_price = entry_price - offset if direction == "long" else entry_price + offset
         stop_loss_price = round(stop_loss_price, precision_price)
         risk_per_unit = abs(entry_price - stop_loss_price)
 
         if risk_per_unit == 0:
             return {"route": route, "status": "skip", "reason": "нулевой риск на единицу"}
 
-        # Расчет уровней тейк-профита
         tp_prices = []
         for level in tp_levels:
             tp_type = level["tp_type"]
@@ -98,17 +88,11 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
             else:
                 return {"route": route, "status": "skip", "reason": f"неизвестный tp_type: {tp_type}"}
 
-            if direction == "long":
-                tp_price = entry_price + offset
-            else:
-                tp_price = entry_price - offset
-
+            tp_price = entry_price + offset if direction == "long" else entry_price - offset
             tp_prices.append(round(tp_price, precision_price))
 
-        # Подсчет используемого риска и маржи по открытым позициям стратегии
         used_risk = Decimal("0")
         used_margin_sum = Decimal("0")
-
         for p in position_registry.values():
             if p.strategy_id == strategy_id and p.status in ("open", "partial"):
                 used_risk += p.planned_risk
@@ -119,17 +103,14 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         if available_risk <= 0:
             return {"route": route, "status": "skip", "reason": "доступный риск <= 0"}
 
-        # Расчет максимально допустимого объема по риску и марже на сделку
         qty_by_risk = available_risk / risk_per_unit
         qty_by_margin = (position_limit * leverage) / entry_price
         quantity = min(qty_by_risk, qty_by_margin)
 
-        # Расчет предварительных итогов
         notional_value = entry_price * quantity
         used_margin = notional_value / leverage
         total_margin = used_margin_sum + used_margin
 
-        # Корректировка объема, если превышен общий лимит депозита
         if total_margin > deposit:
             adjusted_margin = deposit - used_margin_sum
             if adjusted_margin <= 0:
@@ -138,14 +119,13 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
             adjusted_notional = adjusted_margin * leverage
             adjusted_qty_by_margin = adjusted_notional / entry_price
             quantity = min(qty_by_risk, adjusted_qty_by_margin)
-
             quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
+
             notional_value = entry_price * quantity
             used_margin = notional_value / leverage
 
             if used_margin < position_limit * Decimal("0.75"):
                 return {"route": route, "status": "skip", "reason": "остаток маржи меньше допустимого порога"}
-
         else:
             quantity = quantity.quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
 
@@ -154,7 +134,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
         planned_risk = risk_per_unit * quantity
 
-        # Расчет объемов по TP
+        # 📌 Формирование целей TP с полным набором полей
         tp_targets = []
         total_allocated = Decimal("0")
         for i, level in enumerate(tp_levels):
@@ -163,16 +143,18 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
                 qty = (quantity * volume_percent / 100).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
                 total_allocated += qty
             else:
-                qty = quantity - total_allocated  # последний уровень — остаток
+                qty = quantity - total_allocated
             tp_targets.append({
                 "level": level["level"],
                 "price": tp_prices[i],
                 "quantity": qty,
-                "type": "tp"
+                "type": "tp",
+                "hit": False,
+                "hit_at": None,
+                "canceled": False
             })
             log.info(f"🎯 [POSITION_OPENER] TP{level['level']}: price={tp_prices[i]} quantity={qty}")
 
-        # Возврат итогового расчета
         return {
             "route": route,
             "quantity": quantity,
@@ -188,6 +170,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
     except Exception as e:
         log.exception("❌ Ошибка в calculate_position_size")
         return {"route": signal.get("route"), "status": "skip", "reason": "внутренняя ошибка"}
+
 # 🔸 Основная функция открытия позиции
 async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     result = await calculate_position_size(signal, context)
