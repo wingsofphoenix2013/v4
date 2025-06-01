@@ -234,6 +234,11 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     for i, tp in enumerate(tp_prices, start=1):
         log.info(f"🎯 [POSITION_OPENER] TP{i}: {tp}")
 
+    # 🔹 Расчёт комиссии и PnL
+    notional = result["entry_price"] * result["quantity"]
+    fee = notional * Decimal("0.001")
+    pnl = -fee
+
     # 🔹 Создание объекта PositionState и сохранение в память
     position = PositionState(
         uid=position_uid,
@@ -247,28 +252,26 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         created_at=datetime.utcnow(),
         exit_price=None,
         closed_at=None,
-        close_reason=None,
-        pnl=Decimal("0"),
+        close_reason="в работе",
+        pnl=pnl,
         planned_risk=result["planned_risk"],
         tp_targets=result["tp_targets"],
-        sl_targets=[Target(
-            id=-1,
-            type="sl",
-            level=1,
-            price=result["stop_loss_price"],
-            quantity=result["quantity"],
-            hit=False,
-            hit_at=None,
-            canceled=False
-        )],
+        sl_targets=[{
+            "level": 1,
+            "price": result["stop_loss_price"],
+            "quantity": result["quantity"],
+            "type": "sl",
+            "hit": False,
+            "hit_at": None,
+            "canceled": False
+        }],
         log_id=signal["log_id"]
     )
 
     position_registry[(position.strategy_id, position.symbol)] = position
-
     log.info(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
 
-    # 🔹 Логирование факта открытия позиции в Redis
+    # 🔹 Подготовка Redis-логов
     redis = context.get("redis")
     log_id = signal.get("log_id")
     strategy_id = signal.get("strategy_id")
@@ -288,6 +291,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         ]
 
     if redis and log_id is not None:
+        # 🔹 Лог открытия
         log_record = {
             "log_id": log_id,
             "strategy_id": strategy_id,
@@ -301,7 +305,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         except Exception as e:
             log.warning(f"⚠️ [POSITION_OPENER] Ошибка записи успешного открытия в Redis log_queue: {e}")
 
-        # 🔹 Передача позиции в Redis Stream для записи в БД
+        # 🔹 Данные позиции для записи в БД
         position_data = {
             "position_uid": position_uid,
             "strategy_id": position.strategy_id,
@@ -314,6 +318,8 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "created_at": position.created_at.isoformat(),
             "planned_risk": str(position.planned_risk),
             "log_id": position.log_id,
+            "pnl": str(pnl),
+            "close_reason": "в работе",
             "tp_targets": normalize_targets(position.tp_targets),
             "sl_targets": normalize_targets(position.sl_targets)
         }

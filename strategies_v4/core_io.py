@@ -46,9 +46,11 @@ async def write_position_and_targets(pool, record: dict):
                 """
                 INSERT INTO positions_v4 (
                     position_uid, strategy_id, symbol, direction, entry_price,
-                    quantity, quantity_left, status, created_at, planned_risk, log_id
+                    quantity, quantity_left, status, created_at,
+                    exit_price, closed_at, close_reason, pnl,
+                    planned_risk, log_id
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                 """,
                 record["position_uid"],
                 int(record["strategy_id"]),
@@ -59,6 +61,10 @@ async def write_position_and_targets(pool, record: dict):
                 Decimal(record["quantity_left"]),
                 record["status"],
                 datetime.fromisoformat(record["created_at"]),
+                None,  # exit_price
+                None,  # closed_at
+                record.get("close_reason"),
+                Decimal(record.get("pnl", "0")),
                 Decimal(record["planned_risk"]),
                 int(record["log_id"])
             )
@@ -87,7 +93,6 @@ async def write_position_and_targets(pool, record: dict):
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка записи позиции: {e}")
-
 # 🔸 Чтение логов сигналов
 async def run_signal_log_writer():
     log.info("📝 [CORE_IO] Запуск логгера сигналов")
