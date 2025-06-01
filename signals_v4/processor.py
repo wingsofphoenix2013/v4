@@ -3,6 +3,7 @@ import json
 import asyncio
 import infra
 from infra import ENABLED_SIGNALS, ENABLED_TICKERS, ENABLED_STRATEGIES
+import uuid
 
 # 🔸 Публикация лога сигнала в Redis Stream для core_io
 async def publish_signal_log(data: dict, signal_id: int, direction: str, status: str):
@@ -19,7 +20,7 @@ async def publish_signal_log(data: dict, signal_id: int, direction: str, status:
             "sent_at": data.get("sent_at"),
             "received_at": data.get("received_at"),
             "status": status,
-            "uid": f"{data.get('symbol')}_{data.get('bar_time')}_{data.get('message')}",
+            "uid": str(uuid.uuid4()),
         }
     )
 
