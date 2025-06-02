@@ -32,7 +32,7 @@ async def check_tp(position):
     active_tp = sorted(
         [
             t for t in position.tp_targets
-            if t.type == "tp" and t.source == "price" and not t.hit and not t.canceled
+            if t["type"] == "tp" and t["source"] == "price" and not t["hit"] and not t["canceled"]
         ],
         key=lambda t: t.level
     )
