@@ -76,7 +76,7 @@ async def load_position_state():
 
         targets = await conn.fetch(
             """
-            SELECT id, type, level, price, quantity, hit, hit_at, canceled, source
+            SELECT id, type, level, price, quantity, hit, hit_at, canceled, source, position_uid
             FROM position_targets_v4
             WHERE position_uid = ANY($1)
             """,
