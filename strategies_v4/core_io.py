@@ -76,9 +76,9 @@ async def write_position_and_targets(pool, record: dict):
                     """
                     INSERT INTO position_targets_v4 (
                         position_uid, type, level, price, quantity,
-                        hit, hit_at, canceled
+                        hit, hit_at, canceled, source
                     )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                     """,
                     record["position_uid"],
                     target["type"],
@@ -87,7 +87,8 @@ async def write_position_and_targets(pool, record: dict):
                     Decimal(target["quantity"]),
                     target["hit"],
                     datetime.fromisoformat(target["hit_at"]) if target["hit_at"] else None,
-                    target["canceled"]
+                    target["canceled"],
+                    target["source"]
                 )
 
             await tx.commit()

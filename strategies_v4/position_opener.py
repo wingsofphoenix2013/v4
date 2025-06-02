@@ -167,7 +167,8 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
             "entry_price": entry_price,
             "stop_loss_price": stop_loss_price,
             "tp_prices": tp_prices,
-            "tp_targets": tp_targets
+            "tp_targets": tp_targets,
+            "source": "signal" if tp_type == "signal" else "price"
         }
 
     except Exception as e:
@@ -250,7 +251,8 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "type": "sl",
             "hit": False,
             "hit_at": None,
-            "canceled": False
+            "canceled": False,
+            "source": "price"
         }],
         log_id=signal["log_id"]
     )
@@ -272,7 +274,8 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
                 "type": t["type"],
                 "hit": bool(t["hit"]),
                 "hit_at": t["hit_at"].isoformat() if t["hit_at"] else None,
-                "canceled": bool(t["canceled"])
+                "canceled": bool(t["canceled"]),
+                "source": t["source"]
             }
             for t in targets
         ]

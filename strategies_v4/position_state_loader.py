@@ -22,6 +22,7 @@ class Target:
     quantity: Decimal
     hit: bool
     hit_at: Optional[datetime]
+    source: str = "price"
     canceled: bool
 
 # 🔸 Структура позиции с вложенными целями
@@ -75,7 +76,8 @@ async def load_position_state():
 
         targets = await conn.fetch(
             """
-            SELECT * FROM position_targets_v4
+            SELECT id, type, level, price, quantity, hit, hit_at, canceled, source
+            FROM position_targets_v4
             WHERE position_uid = ANY($1)
             """,
             position_uids
@@ -93,6 +95,7 @@ async def load_position_state():
             hit=row['hit'],
             hit_at=row['hit_at'],
             canceled=row['canceled'],
+            source=row["source"]
         )
         target_map.setdefault(row['position_uid'], []).append(target)
 
