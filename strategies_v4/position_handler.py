@@ -65,7 +65,7 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = get_field(tp, "level")
 
-    log.debug(
+    log.info(
         f"[TP-CHECK] Позиция {position.uid} | symbol={position.symbol} | mark={mark} "
         f"vs target={tp_price} (level {tp_level})"
     )
@@ -100,6 +100,8 @@ async def check_tp(position):
         for sl in position.sl_targets:
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
                 sl["canceled"] = True
+                sl_level = get_field(sl, "level")
+                log.info(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
         log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
 
 # 🔸 Заглушка: проверка SL

@@ -3,46 +3,17 @@
 import logging
 import json
 from datetime import datetime
-from position_opener import open_position
 
 log = logging.getLogger("STRATEGY_1")
 
+
 class Strategy1:
-    # 🔸 Метод валидации сигнала перед входом
-    async def validate_signal(self, signal, context) -> bool | str:
-        symbol = signal.get("symbol")
-        direction = signal.get("direction")
-        strategy_id = signal.get("strategy_id")
-        log_id = signal.get("log_id")
-
-        log.debug(f"⚙️ [Strategy1] Валидация сигнала: symbol={symbol}, direction={direction}")
-
-        if direction != "long":
-            note = "отклонено: только long разрешён"
-            log.debug(f"🚫 [Strategy1] {note}")
-
-            redis = context.get("redis")
-            if redis:
-                log_record = {
-                    "log_id": log_id,
-                    "strategy_id": strategy_id,
-                    "status": "ignore",
-                    "position_id": None,
-                    "note": note,
-                    "logged_at": datetime.utcnow().isoformat()
-                }
-                try:
-                    await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
-                except Exception as e:
-                    log.warning(f"⚠️ [Strategy1] Ошибка записи в Redis log_queue: {e}")
-
-            return "logged"
-
+    # 🔸 Валидация сигнала — всегда True (пропускаем)
+    async def validate_signal(self, signal, context) -> bool:
         return True
-    # 🔸 Основной метод запуска стратегии
-    async def run(self, signal, context):
-        log.debug("🚀 [Strategy1] Я — тестовая стратегия 1")
 
+    # 🔸 Отправка сигнала на открытие позиции
+    async def run(self, signal, context):
         redis = context.get("redis")
         if redis:
             payload = {
@@ -54,6 +25,8 @@ class Strategy1:
             }
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.debug(f"📤 [Strategy1] Сигнал отправлен в strategy_opener_stream")
+                log.debug(
+                    f"📤 [Strategy1] Сигнал передан в strategy_opener_stream: {payload}"
+                )
             except Exception as e:
-                log.warning(f"⚠️ [Strategy1] Ошибка при отправке в stream: {e}")
+                log.warning(f"⚠️ [Strategy1] Ошибка при отправке сигнала: {e}")
