@@ -269,7 +269,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         return [
             {
                 "level": int(t["level"]),
-                "price": str(t["price"]),
+                "price": str(t["price"]) if t["price"] is not None else None,
                 "quantity": str(t["quantity"]),
                 "type": t["type"],
                 "hit": bool(t["hit"]),

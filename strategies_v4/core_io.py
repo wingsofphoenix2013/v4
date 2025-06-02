@@ -83,7 +83,7 @@ async def write_position_and_targets(pool, record: dict):
                     record["position_uid"],
                     target["type"],
                     int(target["level"]),
-                    Decimal(target["price"]),
+                    Decimal(target["price"]) if target["price"] is not None else None,
                     Decimal(target["quantity"]),
                     target["hit"],
                     datetime.fromisoformat(target["hit_at"]) if target["hit_at"] else None,
