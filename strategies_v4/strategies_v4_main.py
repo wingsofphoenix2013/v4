@@ -6,10 +6,10 @@ import logging
 from infra import setup_logging, setup_pg, setup_redis_client
 from config_loader import init_config_state, config_event_listener
 from signal_processor import run_signal_loop
-from position_handler import run_position_monitor_loop  # 🔹 актуальный обработчик
+from position_handler import run_position_monitor_loop
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state, position_registry
-from core_io import run_signal_log_writer, run_position_writer
+from core_io import run_signal_log_writer, run_position_writer, run_position_update_writer
 from position_opener import run_position_opener_loop
 
 # 🔸 Логгер для главного процесса
