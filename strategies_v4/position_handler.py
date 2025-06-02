@@ -36,7 +36,6 @@ async def process_position(position):
         await check_sl(position)
         await check_protect(position)
 
-
 # 🔸 Проверка TP-уровней позиции (по цене)
 async def check_tp(position):
     active_tp = sorted(
@@ -70,6 +69,37 @@ async def check_tp(position):
         f"vs target={tp_price} (level {tp_level})"
     )
 
+    if position.direction == "long" and mark < tp_price:
+        return
+    if position.direction == "short" and mark > tp_price:
+        return
+
+    # TP сработал
+    qty = get_field(tp, "quantity")
+    entry_price = position.entry_price
+    pnl_gain = (tp_price - entry_price) * qty if position.direction == "long" else (entry_price - tp_price) * qty
+
+    tp["hit"] = True
+    tp["hit_at"] = datetime.utcnow()
+
+    position.quantity_left -= qty
+    position.planned_risk = Decimal("0")
+    position.close_reason = f"tp-{tp_level}-hit"
+    position.pnl += pnl_gain
+
+    log.info(
+        f"🎯 TP сработал: позиция {position.uid} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
+    )
+    log.info(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
+
+    if position.quantity_left <= 0:
+        position.status = "closed"
+        position.exit_price = mark
+        position.close_reason = "full-tp-hit"
+        for sl in position.sl_targets:
+            if not get_field(sl, "hit") and not get_field(sl, "canceled"):
+                sl["canceled"] = True
+        log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
 
 # 🔸 Заглушка: проверка SL
 async def check_sl(position):
