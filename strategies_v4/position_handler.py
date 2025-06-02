@@ -26,23 +26,26 @@ async def process_position(position):
         await check_sl(position)
         await check_protect(position)
 
-# 🔹 Проверка TP-уровней позиции (по цене)
+# 🔸 Проверка TP-уровней позиции (по цене)
 async def check_tp(position):
-    # 🔸 Отбираем активные TP с source='price'
+    # Отбираем активные TP-цели с source='price', не hit и не canceled
     active_tp = sorted(
         [
             t for t in position.tp_targets
-            if t["type"] == "tp" and t["source"] == "price" and not t["hit"] and not t["canceled"]
+            if (getattr(t, "type", None) or t.get("type")) == "tp"
+            and (getattr(t, "source", None) or t.get("source")) == "price"
+            and not (getattr(t, "hit", False) or t.get("hit"))
+            and not (getattr(t, "canceled", False) or t.get("canceled"))
         ],
-        key=lambda t: t.level
+        key=lambda t: getattr(t, "level", t.get("level"))
     )
 
     if not active_tp:
         return
 
-    tp = active_tp[0]  # младший активный TP
+    tp = active_tp[0]
 
-    # 🔸 Получаем текущую цену из Redis
+    # Получаем текущую цену из Redis
     redis = infra.redis_client
     mark_str = await redis.get(f"price:{position.symbol}")
     if not mark_str:
@@ -50,11 +53,13 @@ async def check_tp(position):
         return
 
     mark = Decimal(mark_str)
+    tp_price = getattr(tp, "price", tp.get("price"))
+    tp_level = getattr(tp, "level", tp.get("level"))
 
-    # 🔸 Сравнение и лог
+    # Сравнение текущей цены и TP-уровня
     log.info(
         f"[TP-CHECK] Позиция {position.uid} | symbol={position.symbol} | mark={mark} "
-        f"vs target={tp.price} (level {tp.level})"
+        f"vs target={tp_price} (level {tp_level})"
     )
 
 # 🔹 Заглушка: проверка SL
