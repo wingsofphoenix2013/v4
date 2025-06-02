@@ -44,7 +44,8 @@ async def main():
         run_safe_loop(lambda: run_signal_log_writer(), "CORE_IO"),
         run_safe_loop(lambda: run_position_opener_loop(), "POSITION_OPENER"),
         run_safe_loop(lambda: run_position_writer(), "POSITION_WRITER"),
-        run_safe_loop(run_position_monitor_loop, "POSITION_HANDLER"),  # 🔹 новый наблюдатель
+        run_safe_loop(run_position_monitor_loop, "POSITION_HANDLER"),
+        run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER")
     )
 
 

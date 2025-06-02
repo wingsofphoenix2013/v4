@@ -96,6 +96,58 @@ async def write_position_and_targets(pool, record: dict):
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка записи позиции: {e}")
+# 🔸 Обновление позиции и целей в БД по потоку обновлений
+async def update_position_and_targets(pool, record: dict):
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            # Обновление основной информации о позиции
+            await conn.execute(
+                """
+                UPDATE positions_v4
+                SET
+                    quantity_left = $1,
+                    status = $2,
+                    exit_price = $3,
+                    close_reason = $4,
+                    pnl = $5,
+                    closed_at = $6
+                WHERE position_uid = $7
+                """,
+                Decimal(record["quantity_left"]),
+                record["status"],
+                Decimal(record["exit_price"]) if record.get("exit_price") else None,
+                record.get("close_reason"),
+                Decimal(record["pnl"]),
+                datetime.fromisoformat(record["closed_at"]) if record.get("closed_at") else None,
+                record["position_uid"]
+            )
+
+            # Обновление TP и SL целей
+            for target in record.get("tp_targets", []) + record.get("sl_targets", []):
+                await conn.execute(
+                    """
+                    UPDATE position_targets_v4
+                    SET
+                        hit = $1,
+                        hit_at = $2,
+                        canceled = $3
+                    WHERE position_uid = $4 AND level = $5 AND type = $6
+                    """,
+                    target["hit"],
+                    datetime.fromisoformat(target["hit_at"]) if target.get("hit_at") else None,
+                    target["canceled"],
+                    record["position_uid"],
+                    int(target["level"]),
+                    target["type"]
+                )
+
+            await tx.commit()
+            log.info(f"💾 Обновление позиции завершено: uid={record['position_uid']}")
+        except Exception as e:
+            await tx.rollback()
+            log.warning(f"❌ Ошибка обновления позиции: {e}")
 # 🔸 Чтение логов сигналов
 async def run_signal_log_writer():
     log.info("📝 [CORE_IO] Запуск логгера сигналов")
@@ -156,4 +208,34 @@ async def run_position_writer():
                         log.warning(f"⚠️ Ошибка обработки позиции: {e}")
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream (positions)")
+            await asyncio.sleep(5)
+# 🔸 Воркер обновлений позиции из Redis-потока
+async def run_position_update_writer():
+    log.info("🛠 [CORE_IO] Запуск обработчика обновлений позиций")
+
+    redis = infra.redis_client
+    pool = infra.pg_pool
+    last_id = "$"
+
+    while True:
+        try:
+            response = await redis.xread(
+                streams={"positions_update_stream": last_id},
+                count=10,
+                block=1000
+            )
+
+            if not response:
+                continue
+
+            for stream_name, messages in response:
+                for msg_id, msg_data in messages:
+                    last_id = msg_id
+                    try:
+                        record = json.loads(msg_data["data"])
+                        await update_position_and_targets(pool, record)
+                    except Exception as e:
+                        log.warning(f"⚠️ [CORE_IO] Ошибка обработки обновления позиции: {e}")
+        except Exception:
+            log.exception("❌ [CORE_IO] Ошибка чтения из Redis Stream (positions_update_stream)")
             await asyncio.sleep(5)
