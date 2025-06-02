@@ -112,8 +112,9 @@ async def update_position_and_targets(pool, record: dict):
                     exit_price = $3,
                     close_reason = $4,
                     pnl = $5,
-                    closed_at = $6
-                WHERE position_uid = $7
+                    closed_at = $6,
+                    planned_risk = $7
+                WHERE position_uid = $8
                 """,
                 Decimal(record["quantity_left"]),
                 record["status"],
@@ -121,6 +122,7 @@ async def update_position_and_targets(pool, record: dict):
                 record.get("close_reason"),
                 Decimal(record["pnl"]),
                 datetime.fromisoformat(record["closed_at"]) if record.get("closed_at") else None,
+                Decimal(record["planned_risk"]),
                 record["position_uid"]
             )
 

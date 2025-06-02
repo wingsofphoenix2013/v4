@@ -41,6 +41,7 @@ async def push_position_update(position, redis):
         "exit_price": str(position.exit_price) if position.exit_price else None,
         "close_reason": position.close_reason,
         "pnl": str(position.pnl),
+        "planned_risk": str(position.planned_risk),
         "closed_at": position.closed_at.isoformat() if position.closed_at else None,
         "tp_targets": serialize_targets(position.tp_targets),
         "sl_targets": serialize_targets(position.sl_targets)
