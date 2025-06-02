@@ -31,7 +31,7 @@ async def run_position_monitor_loop():
 # 🔸 Обработка одной позиции под lock
 async def process_position(position):
     async with position.lock:
-        log.info(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.uid}")
+        log.debug(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.uid}")
         await check_tp(position)
         await check_sl(position)
         await check_protect(position)
@@ -64,7 +64,7 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = get_field(tp, "level")
 
-    log.info(
+    log.debug(
         f"[TP-CHECK] Позиция {position.uid} | symbol={position.symbol} | mark={mark} "
         f"vs target={tp_price} (level {tp_level})"
     )
@@ -103,9 +103,9 @@ async def check_tp(position):
 
 # 🔸 Заглушка: проверка SL
 async def check_sl(position):
-    log.info(f"[SL] Позиция {position.uid}: проверка SL (заглушка)")
+    log.debug(f"[SL] Позиция {position.uid}: проверка SL (заглушка)")
 
 
 # 🔸 Заглушка: проверка защитной логики
 async def check_protect(position):
-    log.info(f"[PROTECT] Позиция {position.uid}: проверка защиты (заглушка)")
+    log.debug(f"[PROTECT] Позиция {position.uid}: проверка защиты (заглушка)")
