@@ -22,8 +22,8 @@ class Target:
     quantity: Decimal
     hit: bool
     hit_at: Optional[datetime]
+    canceled: bool = False
     source: str = "price"
-    canceled: bool
 
 # 🔸 Структура позиции с вложенными целями
 @dataclass
