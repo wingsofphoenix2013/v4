@@ -83,16 +83,18 @@ async def handle_protect_signal(msg_data):
     sl = active_sl[0]
     sl_price = get_field(sl, "price")
 
-    if sl_price < entry:
+    if (
+        (position.direction == "long" and sl_price < entry) or
+        (position.direction == "short" and sl_price > entry)
+    ):
         log.info(
-            f"[PROTECT] SL ниже entry (sl={sl_price} < entry={entry}) → перемещаем"
+            f"[PROTECT] SL ниже entry (sl={sl_price} {'<' if position.direction == 'long' else '>'} entry={entry}) → перемещаем"
         )
         await raise_sl_to_entry(position, sl)
     else:
         log.info(
-            f"[PROTECT] SL уже на уровне entry или выше (sl={sl_price} ≥ entry={entry}) → ничего не делаем"
+            f"[PROTECT] SL уже на уровне entry или лучше: sl={sl_price}, entry={entry}, direction={position.direction} → ничего не делаем"
         )
-
 # 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
     log.debug(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
