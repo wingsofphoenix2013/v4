@@ -58,13 +58,18 @@ async def handle_protect_signal(msg_data):
     mark = Decimal(mark_str)
     entry = position.entry_price
 
-    # 🔹 Вариант 1: цена <= вход → полное закрытие
-    if mark <= entry:
-        log.info(f"[PROTECT] mark={mark} ниже или равен entry={entry} → вызов full_protect_stop")
+    # 🔹 Вариант 1: позиция в зоне убытка → полное защитное закрытие
+    if (
+        (position.direction == "long" and mark <= entry) or
+        (position.direction == "short" and mark >= entry)
+    ):
+        log.info(
+            f"[PROTECT] Позиция в зоне убытка (mark={mark}, entry={entry}, direction={position.direction}) → вызов full_protect_stop"
+        )
         await full_protect_stop(position)
         return
 
-    # 🔹 Вариант 2: цена > entry → проверка SL
+    # 🔹 Вариант 2: позиция в плюсе → проверка SL
     active_sl = sorted(
         [
             sl for sl in position.sl_targets
@@ -83,12 +88,13 @@ async def handle_protect_signal(msg_data):
     sl = active_sl[0]
     sl_price = get_field(sl, "price")
 
+    # Нужно ли перемещать SL на entry
     if (
         (position.direction == "long" and sl_price < entry) or
         (position.direction == "short" and sl_price > entry)
     ):
         log.info(
-            f"[PROTECT] SL ниже entry (sl={sl_price} {'<' if position.direction == 'long' else '>'} entry={entry}) → перемещаем"
+            f"[PROTECT] SL ниже безопасного уровня: sl={sl_price}, entry={entry}, direction={position.direction} → перемещаем"
         )
         await raise_sl_to_entry(position, sl)
     else:
