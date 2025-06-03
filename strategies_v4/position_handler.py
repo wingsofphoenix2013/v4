@@ -182,7 +182,7 @@ async def check_tp(position):
             "canceled": False
         })
 
-        log.info(
+        log.debug(
             f"🛡️ Новый SL создан: позиция {position.uid} | цена {new_sl_price:.8f} | режим {sl_mode} | уровень {max_level + 1}"
         )
 
@@ -206,10 +206,86 @@ async def check_tp(position):
 
     # Отправка обновления в Redis
     await push_position_update(position, redis)
-# 🔸 Заглушка: проверка SL
+# 🔸 Обработка SL-уровня позиции (по цене)
 async def check_sl(position):
-    log.debug(f"[SL] Позиция {position.uid}: проверка SL (заглушка)")
+    active_sl = sorted(
+        [
+            sl for sl in position.sl_targets
+            if get_field(sl, "type") == "sl"
+            and get_field(sl, "source") == "price"
+            and not get_field(sl, "hit")
+            and not get_field(sl, "canceled")
+        ],
+        key=lambda sl: get_field(sl, "level")
+    )
 
+    if not active_sl:
+        return
+
+    sl = active_sl[0]
+
+    redis = infra.redis_client
+    mark_str = await redis.get(f"price:{position.symbol}")
+    if not mark_str:
+        log.warning(f"[SL] Позиция {position.uid}: не удалось получить цену markprice")
+        return
+
+    mark = Decimal(mark_str)
+    sl_price = get_field(sl, "price")
+    sl_level = get_field(sl, "level")
+
+    log.info(
+        f"[SL-CHECK] Позиция symbol={position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
+    )
+
+    triggered = False
+    if position.direction == "long" and mark <= sl_price:
+        triggered = True
+    elif position.direction == "short" and mark >= sl_price:
+        triggered = True
+
+    if not triggered:
+        return
+
+    # SL сработал
+    sl["hit"] = True
+    sl["hit_at"] = datetime.utcnow()
+
+    # Отмена всех активных TP целей
+    for tp in position.tp_targets:
+        if not get_field(tp, "hit") and not get_field(tp, "canceled"):
+            tp["canceled"] = True
+            tp_level = get_field(tp, "level")
+            log.info(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
+
+    # Закрытие позиции
+    qty = get_field(sl, "quantity")
+    entry_price = position.entry_price
+    pnl_loss = (mark - entry_price) * qty if position.direction == "long" else (entry_price - mark) * qty
+
+    position.quantity_left = Decimal("0")
+    position.planned_risk = Decimal("0")
+    position.status = "closed"
+    position.exit_price = mark
+    position.closed_at = datetime.utcnow()
+    position.pnl += pnl_loss
+
+    # Причина закрытия
+    if sl_level == 1:
+        position.close_reason = "sl-full-hit"
+    else:
+        position.close_reason = "sl-tp-hit"
+
+    log.info(
+        f"🛑 SL сработал: позиция {position.uid} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
+    )
+    log.info(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
+
+    # Удаление позиции из памяти
+    del position_registry[(position.strategy_id, position.symbol)]
+
+    # Отправка обновления в Redis
+    await push_position_update(position, redis)
 
 # 🔸 Заглушка: проверка защитной логики
 async def check_protect(position):
