@@ -72,7 +72,6 @@ async def process_position(position):
         await check_tp(position)
         await check_sl(position)
         await check_protect(position)
-
 # 🔸 Проверка TP-уровней позиции (по цене)
 async def check_tp(position):
     active_tp = sorted(
@@ -99,7 +98,7 @@ async def check_tp(position):
 
     mark = Decimal(mark_str)
     tp_price = get_field(tp, "price")
-    tp_level = get_field(tp, "level")
+    tp_level = int(get_field(tp, "level"))
 
     log.info(
         f"[TP-CHECK] Позиция symbol={position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
@@ -128,6 +127,64 @@ async def check_tp(position):
     )
     log.info(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
 
+    # 🔄 Применение SL-политики после TP
+    strategy = config.strategies.get(position.strategy_id)
+    level_to_id = {int(lvl["level"]): lvl["id"] for lvl in strategy.get("tp_levels", [])}
+    tp_level_id = level_to_id.get(tp_level)
+
+    if not tp_level_id:
+        log.debug(f"[SL-POLICY] Не найден tp_level_id для strategy={position.strategy_id}, level={tp_level}")
+
+    sl_policy = next(
+        (rule for rule in strategy.get("sl_rules", []) if rule["tp_level_id"] == tp_level_id),
+        None
+    )
+
+    if sl_policy and sl_policy["sl_mode"] != "none" and position.quantity_left > 0:
+        # Отмена текущих SL целей
+        for sl in position.sl_targets:
+            if not get_field(sl, "hit") and not get_field(sl, "canceled"):
+                sl["canceled"] = True
+
+        # Расчёт новой SL цены
+        sl_mode = sl_policy["sl_mode"]
+        sl_value = sl_policy.get("sl_value")
+        new_sl_price = None
+
+        if sl_mode == "entry":
+            new_sl_price = position.entry_price
+        elif sl_mode == "percent":
+            offset = tp_price * Decimal(sl_value) / Decimal("100")
+            new_sl_price = tp_price - offset if position.direction == "long" else tp_price + offset
+        elif sl_mode == "atr":
+            atr_key = f"ind:{position.symbol}:{strategy['meta']['timeframe']}:atr14"
+            atr_raw = await redis.get(atr_key)
+            if not atr_raw:
+                log.warning(f"[SL-POLICY] Не удалось получить ATR для {position.symbol}")
+                return
+            offset = Decimal(atr_raw) * Decimal(sl_value)
+            new_sl_price = tp_price - offset if position.direction == "long" else tp_price + offset
+        else:
+            log.warning(f"[SL-POLICY] Неизвестный sl_mode: {sl_mode}")
+            return
+
+        # Добавление новой SL цели
+        max_level = max((get_field(sl, "level", 0) for sl in position.sl_targets), default=0)
+        position.sl_targets.append({
+            "level": max_level + 1,
+            "price": new_sl_price,
+            "quantity": position.quantity_left,
+            "type": "sl",
+            "source": "price",
+            "hit": False,
+            "hit_at": None,
+            "canceled": False
+        })
+
+        log.info(
+            f"🛡️ Новый SL создан: позиция {position.uid} | цена {new_sl_price:.8f} | режим {sl_mode} | уровень {max_level + 1}"
+        )
+
     if position.quantity_left <= 0:
         position.status = "closed"
         position.exit_price = mark
@@ -147,9 +204,7 @@ async def check_tp(position):
         del position_registry[(position.strategy_id, position.symbol)]
 
     # Отправка обновления в Redis
-    redis = infra.redis_client
     await push_position_update(position, redis)
-
 # 🔸 Заглушка: проверка SL
 async def check_sl(position):
     log.debug(f"[SL] Позиция {position.uid}: проверка SL (заглушка)")
