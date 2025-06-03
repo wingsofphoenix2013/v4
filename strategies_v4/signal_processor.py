@@ -126,7 +126,7 @@ async def handle_reverse_signal(msg_data):
     )
 
     if not active_tp:
-        log.debug(f"[REVERSE] Нет активных TP у позиции {position.uid}")
+        log.debug(f"[REVERSE] Нет активных TP у позиции symbol={symbol}")
         return
 
     tp = active_tp[0]
@@ -135,16 +135,22 @@ async def handle_reverse_signal(msg_data):
     if tp_source == "price":
         log.info(f"[REVERSE] TP source = price → делегируем в защиту")
         await handle_protect_signal(msg_data)
+
+        # Проверка: была ли позиция закрыта защитой
+        position = position_registry.get((strategy_id, symbol))
+        if position is None:
+            log.info(
+                f"📉 Позиция symbol={symbol} закрыта по SL-защите, повторная обработка как reverse_entry"
+            )
+            msg_data["route"] = "reverse_entry"
+            await route_and_dispatch_signal(msg_data, config.strategies, infra.redis_client)
         return
 
     if tp_source == "signal":
         log.info(f"[REVERSE] TP source = signal → закрываем и повторно обрабатываем сигнал")
         await full_reverse_stop(position)
 
-        # Маркируем сигнал как reverse_entry
         msg_data["route"] = "reverse_entry"
-
-        # Повторная маршрутизация
         await route_and_dispatch_signal(msg_data, config.strategies, infra.redis_client)
         
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
