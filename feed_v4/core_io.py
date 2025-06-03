@@ -11,7 +11,39 @@ TABLE_MAP = {
     "m15": "ohlcv4_m15",
     "h1": "ohlcv4_h1",
 }
+# 🔸 Подписка на Redis PubSub: обновление activated_at при активации тикера
+async def listen_ticker_activations(pg, redis):
+    log = logging.getLogger("CORE_IO")
 
+    # Инициализация PubSub и подписка на канал
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("tickers_v4_events")
+    log.info("Подписка на Redis PubSub: tickers_v4_events")
+
+    # Прослушка сообщений
+    async for msg in pubsub.listen():
+        if msg["type"] != "message":
+            continue
+
+        try:
+            data = json.loads(msg["data"])
+
+            # Обработка только события активации статуса
+            if data.get("type") == "status" and data.get("action") == "enabled":
+                symbol = data.get("symbol")
+                if symbol:
+                    # Обновление поля activated_at в tickers_v4
+                    async with pg.acquire() as conn:
+                        await conn.execute("""
+                            UPDATE tickers_v4
+                            SET activated_at = NOW()
+                            WHERE symbol = $1
+                        """, symbol)
+                        log.info(f"[{symbol}] activated_at обновлён → NOW()")
+
+        except Exception as e:
+            log.warning(f"Ошибка в обработке tickers_v4_events: {e}", exc_info=True)
+            
 # 🔸 Основной воркер: чтение из Redis и запись в PostgreSQL
 async def run_core_io(pg, redis):
     log = logging.getLogger("CORE_IO")

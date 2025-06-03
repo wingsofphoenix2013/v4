@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from infra import init_pg_pool, init_redis_client, run_safe_loop, setup_logging
-from core_io import run_core_io
+from core_io import run_core_io, listen_ticker_activations
 from markprice_watcher import run_markprice_watcher
 from feed_and_aggregate import (
     run_feed_and_aggregator,
@@ -43,13 +43,33 @@ async def main():
 
     # 🔸 Запуск всех воркеров с защитой
     await asyncio.gather(
-        run_safe_loop(lambda: handle_ticker_events(redis, state, pg, refresh_queue_m1, refresh_queue_m5, refresh_queue_m15, refresh_queue_h1), "TICKER_EVENTS"),
-        run_safe_loop(lambda: run_feed_and_aggregator(state, redis, pg, refresh_queue_m1), "FEED+AGGREGATOR"),
-        run_safe_loop(lambda: run_feed_and_aggregator_m5(state, redis, pg, refresh_queue_m5), "FEED+AGGREGATOR:M5"),
-        run_safe_loop(lambda: run_feed_and_aggregator_m15(state, redis, pg, refresh_queue_m15), "FEED+AGGREGATOR:M15"),
-        run_safe_loop(lambda: run_feed_and_aggregator_h1(state, redis, pg, refresh_queue_h1), "FEED+AGGREGATOR:H1"),
+        run_safe_loop(lambda: handle_ticker_events(
+            redis, state, pg,
+            refresh_queue_m1, refresh_queue_m5,
+            refresh_queue_m15, refresh_queue_h1
+        ), "TICKER_EVENTS"),
+
+        run_safe_loop(lambda: run_feed_and_aggregator(
+            state, redis, pg, refresh_queue_m1
+        ), "FEED+AGGREGATOR"),
+
+        run_safe_loop(lambda: run_feed_and_aggregator_m5(
+            state, redis, pg, refresh_queue_m5
+        ), "FEED+AGGREGATOR:M5"),
+
+        run_safe_loop(lambda: run_feed_and_aggregator_m15(
+            state, redis, pg, refresh_queue_m15
+        ), "FEED+AGGREGATOR:M15"),
+
+        run_safe_loop(lambda: run_feed_and_aggregator_h1(
+            state, redis, pg, refresh_queue_h1
+        ), "FEED+AGGREGATOR:H1"),
+
         run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
-        run_safe_loop(lambda: run_markprice_watcher(state, redis), "MARKPRICE")
+
+        run_safe_loop(lambda: run_markprice_watcher(state, redis), "MARKPRICE"),
+
+        run_safe_loop(lambda: listen_ticker_activations(pg, redis), "TICKER_ACTIVATIONS")
     )
 
 if __name__ == "__main__":
