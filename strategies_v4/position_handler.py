@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from infra import infra
 from position_state_loader import position_registry
+from config_loader import config
 
 # 🔸 Логгер для обработчика позиций
 log = logging.getLogger("POSITION_HANDLER")
