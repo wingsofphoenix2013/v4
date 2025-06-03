@@ -9,6 +9,7 @@ from feed_and_aggregate import (
     run_feed_and_aggregator,
     run_feed_and_aggregator_m5,
     run_feed_and_aggregator_m15,
+    run_feed_and_aggregator_h1,
     load_all_tickers,
     handle_ticker_events
 )
@@ -30,19 +31,22 @@ async def main():
         "kline_tasks": {},
         "m5_tasks": {},
         "m15_tasks": {},
+        "h1_tasks": {},
     }
 
     # 🔸 Независимые очереди для каждого интервала
     refresh_queue_m1 = asyncio.Queue()
     refresh_queue_m5 = asyncio.Queue()
     refresh_queue_m15 = asyncio.Queue()
+    refresh_queue_h1 = asyncio.Queue()
 
     # 🔸 Запуск всех воркеров с защитой
     await asyncio.gather(
-        run_safe_loop(lambda: handle_ticker_events(redis, state, pg, refresh_queue_m1, refresh_queue_m5, refresh_queue_m15), "TICKER_EVENTS"),
+        run_safe_loop(lambda: handle_ticker_events(redis, state, pg, refresh_queue_m1, refresh_queue_m5, refresh_queue_m15, refresh_queue_h1), "TICKER_EVENTS"),
         run_safe_loop(lambda: run_feed_and_aggregator(state, redis, pg, refresh_queue_m1), "FEED+AGGREGATOR"),
         run_safe_loop(lambda: run_feed_and_aggregator_m5(state, redis, pg, refresh_queue_m5), "FEED+AGGREGATOR:M5"),
         run_safe_loop(lambda: run_feed_and_aggregator_m15(state, redis, pg, refresh_queue_m15), "FEED+AGGREGATOR:M15"),
+        run_safe_loop(lambda: run_feed_and_aggregator_h1(state, redis, pg, refresh_queue_h1), "FEED+AGGREGATOR:H1"),
         run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
         run_safe_loop(lambda: run_markprice_watcher(state, redis), "MARKPRICE")
     )

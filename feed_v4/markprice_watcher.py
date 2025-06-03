@@ -15,33 +15,55 @@ async def watch_mark_price(symbol, redis, state):
 
     while True:
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=None,  # отключаем внутренние ping/pong
+                close_timeout=5
+            ) as ws:
                 log.info(f"[{symbol}] Подключено к потоку markPrice")
-                async for msg in ws:
-                    # Проверка: если тикер отключён — остановить поток
-                    if symbol not in state["active"]:
-                        log.info(f"[{symbol}] Поток markPrice остановлен — тикер деактивирован")
-                        return
 
+                # 🔁 Явная отправка pong
+                async def keep_alive():
                     try:
-                        data = json.loads(msg)
-                        price = data.get("p")
-                        if not price:
-                            continue
+                        while True:
+                            await ws.pong()
+                            log.debug(f"[{symbol}] → pong (keepalive)")
+                            await asyncio.sleep(180)
+                    except asyncio.CancelledError:
+                        log.debug(f"[{symbol}] keep_alive завершён")
+                    except Exception as e:
+                        log.warning(f"[{symbol}] Ошибка keep_alive: {e}")
 
-                        now = time.time()
-                        if now - last_update < 1:
-                            continue
-                        last_update = now
+                pong_task = asyncio.create_task(keep_alive())
 
-                        precision = state["tickers"][symbol]["precision_price"]
-                        rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+                try:
+                    async for msg in ws:
+                        if symbol not in state["active"]:
+                            log.info(f"[{symbol}] Поток markPrice остановлен — тикер деактивирован")
+                            return
 
-                        await redis.set(f"price:{symbol}", rounded)
-                        log.debug(f"[{symbol}] Обновление markPrice: {rounded}")
+                        try:
+                            data = json.loads(msg)
+                            price = data.get("p")
+                            if not price:
+                                continue
 
-                    except (InvalidOperation, ValueError, TypeError) as e:
-                        log.warning(f"[{symbol}] Ошибка обработки markPrice: {type(e)}")
+                            now = time.time()
+                            if now - last_update < 1:
+                                continue
+                            last_update = now
+
+                            precision = state["tickers"][symbol]["precision_price"]
+                            rounded = str(Decimal(price).quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
+
+                            await redis.set(f"price:{symbol}", rounded)
+                            log.debug(f"[{symbol}] Обновление markPrice: {rounded}")
+
+                        except (InvalidOperation, ValueError, TypeError) as e:
+                            log.warning(f"[{symbol}] Ошибка обработки markPrice: {type(e)}")
+                finally:
+                    pong_task.cancel()
+
         except Exception as e:
             log.error(f"[{symbol}] Ошибка WebSocket markPrice: {e}", exc_info=True)
             log.info(f"[{symbol}] Переподключение через 5 секунд...")

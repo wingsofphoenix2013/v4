@@ -45,7 +45,8 @@ async def handle_ticker_events(
     pg: Pool,
     refresh_queue_m1: asyncio.Queue,
     refresh_queue_m5: asyncio.Queue,
-    refresh_queue_m15: asyncio.Queue
+    refresh_queue_m15: asyncio.Queue,
+    refresh_queue_h1: asyncio.Queue
 ):
     group = "aggregator_group"
     stream = "tickers_status_stream"
@@ -86,6 +87,7 @@ async def handle_ticker_events(
                     await refresh_queue_m1.put("refresh")
                     await refresh_queue_m5.put("refresh")
                     await refresh_queue_m15.put("refresh")
+                    await refresh_queue_h1.put("refresh")
 
                 elif action == "disabled" and symbol in state["active"]:
                     state["active"].remove(symbol)
@@ -93,6 +95,7 @@ async def handle_ticker_events(
                     await refresh_queue_m1.put("refresh")
                     await refresh_queue_m5.put("refresh")
                     await refresh_queue_m15.put("refresh")
+                    await refresh_queue_h1.put("refresh")
 
 # 🔸 Разбиение тикеров на группы
 def chunked(iterable, size):
@@ -105,17 +108,43 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
     stream_names = [f"{s.lower()}@kline_{interval}" for s in symbols]
     stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(stream_names)}"
 
-    try:
-        async with connect(stream_url) as ws:
-            log.debug(f"[KLINE:{group_key}] Подключено к WebSocket: {stream_url}")
-            async for msg in ws:
-                data = json.loads(msg)
-                kline = data.get("data", {}).get("k")
-                if not kline or not kline.get("x"):
-                    continue
-                await queue.put(kline)
-    except Exception as e:
-        log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
+    while True:
+        try:
+            async with connect(
+                stream_url,
+                ping_interval=None,  # отключаем встроенные ping/pong
+                close_timeout=5
+            ) as ws:
+                log.info(f"[KLINE:{group_key}] Подключено к WebSocket: {stream_url}")
+
+                # 🟡 Keep-alive через ручной pong
+                async def keep_alive():
+                    try:
+                        while True:
+                            await ws.pong()
+                            log.debug(f"[KLINE:{group_key}] → pong (keepalive)")
+                            await asyncio.sleep(180)
+                    except asyncio.CancelledError:
+                        log.debug(f"[KLINE:{group_key}] keep_alive завершён")
+                    except Exception as e:
+                        log.warning(f"[KLINE:{group_key}] Ошибка keep_alive: {e}")
+
+                pong_task = asyncio.create_task(keep_alive())
+
+                try:
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        kline = data.get("data", {}).get("k")
+                        if not kline or not kline.get("x"):
+                            continue
+                        await queue.put(kline)
+                finally:
+                    pong_task.cancel()
+
+        except Exception as e:
+            log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
+            log.info(f"[KLINE:{group_key}] Переподключение через 5 секунд...")
+            await asyncio.sleep(5)
 
 # 🔸 Воркер для обработки свечей
 async def kline_worker(queue, state, redis, interval="M1"):
@@ -133,30 +162,30 @@ async def kline_worker(queue, state, redis, interval="M1"):
                 symbol=symbol,
                 open_time=open_time,
                 kline=kline,
-                interval=interval.lower(),  # для key/stream
+                interval=interval.lower(),
                 precision_price=precision_price,
                 precision_qty=precision_qty
             )
         except Exception as e:
             log.warning(f"[{interval}] Ошибка обработки свечи {symbol}: {e}", exc_info=True)
+
 # 🔸 Универсальная функция сохранения в Redis
 async def store_and_publish_kline(redis, symbol, open_time, kline, interval, precision_price, precision_qty):
     ts = int(open_time.timestamp() * 1000)
-    
-    # Цены используем как есть (уже округлены), просто приводим к float
+
     o = float(kline["o"])
     h = float(kline["h"])
     l = float(kline["l"])
     c = float(kline["c"])
-    
-    # Объём округляем вручную по precision_qty
     v = float(Decimal(kline["v"]).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN))
 
     async def safe_ts_add(field_key, value, field_name):
         try:
-            await redis.execute_command("TS.ADD", field_key, ts, value)
-        except Exception as e:
-            if "TSDB: the key does not exist" in str(e):
+            # Проверяем: существует ли ключ
+            try:
+                await redis.execute_command("TS.INFO", field_key)
+            except Exception:
+                # Если нет — создаём
                 await redis.execute_command(
                     "TS.CREATE", field_key,
                     "RETENTION", 604800000,  # 7 дней
@@ -166,11 +195,14 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
                     "interval", interval,
                     "field", field_name
                 )
-                await redis.execute_command("TS.ADD", field_key, ts, value)
-            else:
-                raise
 
-    # Параллельная запись 5 полей в TS
+            # Добавление значения
+            await redis.execute_command("TS.ADD", field_key, ts, value)
+
+        except Exception as e:
+            log.warning(f"[{symbol}] Ошибка записи TS.ADD {field_key}: {e}")
+
+    # Параллельная запись всех полей
     await asyncio.gather(
         safe_ts_add(f"ts:{symbol}:{interval}:o", o, "o"),
         safe_ts_add(f"ts:{symbol}:{interval}:h", h, "h"),
@@ -181,8 +213,8 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
 
     log.debug(f"[{symbol}] {interval.upper()} TS записана: open_time={open_time}, завершено={datetime.utcnow()}")
 
-    # Публикация в Redis Stream (для core_io)
-    stream_event = {
+    # Публикация в Redis Stream
+    await redis.xadd("ohlcv_stream", {
         "symbol": symbol,
         "interval": interval,
         "timestamp": str(ts),
@@ -191,17 +223,15 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
         "l": str(l),
         "c": str(c),
         "v": str(v),
-    }
-    await redis.xadd("ohlcv_stream", stream_event)
+    })
     log.debug(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
 
     # Уведомление через Pub/Sub
-    pubsub_event = {
+    await redis.publish("ohlcv_channel", json.dumps({
         "symbol": symbol,
         "interval": interval,
         "timestamp": str(ts)
-    }
-    await redis.publish("ohlcv_channel", json.dumps(pubsub_event))
+    }))
 # 🔸 M1: Реактивный запуск и управление WebSocket-группами
 async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.debug("🔸 Запуск приёма M1 свечей с реактивным управлением")
@@ -269,6 +299,7 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
             task = state["m5_tasks"].pop(group_key)
             task.cancel()
             log.debug(f"[KLINE:M5:{group_key}] Поток остановлен — тикеры неактивны")
+
 # 🔸 M15: Реактивный запуск и логирование M15 свечей
 async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.debug("🔸 Запуск приёма M15 свечей")
@@ -303,3 +334,38 @@ async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_que
             task = state["m15_tasks"].pop(group_key)
             task.cancel()
             log.debug(f"[KLINE:M15:{group_key}] Поток остановлен — тикеры неактивны")
+# 🔸 H1: Реактивный запуск и логирование H1 свечей
+async def run_feed_and_aggregator_h1(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
+    log.debug("🔸 Запуск приёма H1 свечей")
+    queue = asyncio.Queue()
+    state["h1_tasks"] = {}
+
+    for _ in range(2):
+        asyncio.create_task(kline_worker(queue, state, redis, interval="H1"))
+
+    await refresh_queue.put("initial-h1")
+
+    while True:
+        await refresh_queue.get()
+        log.debug("🔁 [H1] Пересборка групп WebSocket")
+
+        active_symbols = sorted(state["active"])
+        log.info(f"[H1] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
+
+        new_groups = {
+            f"H1:{','.join(group)}": group
+            for group in chunked(active_symbols, 3)
+        }
+        current_groups = set(state["h1_tasks"].keys())
+        desired_groups = set(new_groups.keys())
+
+        for group_key in desired_groups - current_groups:
+            group_symbols = new_groups[group_key]
+            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue, interval="1h"))
+            state["h1_tasks"][group_key] = task
+
+        for group_key in current_groups - desired_groups:
+            task = state["h1_tasks"].pop(group_key)
+            task.cancel()
+            log.debug(f"[KLINE:H1:{group_key}] Поток остановлен — тикеры неактивны")
+            
