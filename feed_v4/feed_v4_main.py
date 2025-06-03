@@ -1,4 +1,5 @@
 # feed_v4_main.py — управляющий модуль системы v4
+
 import asyncio
 import logging
 
