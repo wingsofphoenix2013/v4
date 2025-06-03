@@ -126,9 +126,9 @@ async def update_position_and_targets(pool, record: dict):
                 record["position_uid"]
             )
 
-            # Обновление TP и SL целей
+            # Обновление или вставка TP и SL целей
             for target in record.get("tp_targets", []) + record.get("sl_targets", []):
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE position_targets_v4
                     SET
@@ -144,6 +144,25 @@ async def update_position_and_targets(pool, record: dict):
                     int(target["level"]),
                     target["type"]
                 )
+
+                if result == "UPDATE 0":
+                    await conn.execute(
+                        """
+                        INSERT INTO position_targets_v4 (
+                            position_uid, type, level, price, quantity,
+                            hit, hit_at, canceled, source
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                        """,
+                        record["position_uid"],
+                        target["type"],
+                        int(target["level"]),
+                        Decimal(target["price"]) if target.get("price") is not None else None,
+                        Decimal(target["quantity"]),
+                        target["hit"],
+                        datetime.fromisoformat(target["hit_at"]) if target.get("hit_at") else None,
+                        target["canceled"],
+                        target["source"]
+                    )
 
             await tx.commit()
             log.info(f"💾 Обновление позиции завершено: uid={record['position_uid']}")
