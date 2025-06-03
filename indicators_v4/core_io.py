@@ -13,9 +13,11 @@ async def run_core_io(pg, redis):
 
     while True:
         try:
-            response = await redis.xread({stream: last_id}, block=5000, count=1)
+            response = await redis.xread({stream: last_id}, count=50, block=1000)
             if not response:
                 continue
+
+            records = []
 
             for _, messages in response:
                 for msg_id, data in messages:
@@ -30,19 +32,22 @@ async def run_core_io(pg, redis):
                         quantize_str = "1." + "0" * precision
                         value = Decimal(data["value"]).quantize(Decimal(quantize_str), rounding=ROUND_HALF_UP)
 
-                        async with pg.acquire() as conn:
-                            await conn.execute("""
-                                INSERT INTO indicator_values_v4
-                                (instance_id, symbol, open_time, param_name, value)
-                                VALUES ($1, $2, $3, $4, $5)
-                                ON CONFLICT (instance_id, symbol, open_time, param_name)
-                                DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
-                            """, instance_id, symbol, open_time, param_name, value)
-
-                        log.debug(f"PG ← {symbol}/{interval} {param_name}={value} @ {open_time}")
-
+                        records.append((instance_id, symbol, open_time, param_name, value))
                     except Exception as e:
-                        log.error(f"Ошибка при записи: {e}")
+                        log.error(f"Ошибка при обработке записи из Stream: {e}")
+
+            if records:
+                async with pg.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.executemany("""
+                            INSERT INTO indicator_values_v4
+                            (instance_id, symbol, open_time, param_name, value)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (instance_id, symbol, open_time, param_name)
+                            DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                        """, records)
+
+                log.debug(f"PG ← записано {len(records)} параметров")
 
         except Exception as stream_err:
             log.error(f"Ошибка чтения из Redis Stream: {stream_err}")

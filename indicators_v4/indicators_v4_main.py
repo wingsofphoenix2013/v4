@@ -229,9 +229,11 @@ async def watch_ohlcv_events(pg, redis):
                 log.warning(f"Пропуск расчёта: нет данных для {symbol} / {interval}")
                 continue
 
-            for iid in relevant_instances:
-                inst = indicator_instances[iid]
-                await compute_and_store(iid, inst, symbol, df, int(timestamp), pg, redis, precision)
+            # 🔸 параллельный запуск всех расчётов
+            await asyncio.gather(*[
+                compute_and_store(iid, indicator_instances[iid], symbol, df, int(timestamp), pg, redis, precision)
+                for iid in relevant_instances
+            ])
 
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
