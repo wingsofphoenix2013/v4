@@ -375,3 +375,51 @@ async def raise_sl_to_entry(position, sl):
         # Отправка обновления в Redis
         redis = infra.redis_client
         await push_position_update(position, redis)
+# 🔸 Принудительное закрытие позиции перед реверсом (reverse stop)
+async def full_reverse_stop(position):
+    async with position.lock:
+        redis = infra.redis_client
+        mark_str = await redis.get(f"price:{position.symbol}")
+        if not mark_str:
+            log.warning(f"[REVERSE] Позиция {position.uid}: не удалось получить цену markprice")
+            return
+
+        mark = Decimal(mark_str)
+
+        # Отмена всех TP и SL целей
+        for t in position.tp_targets + position.sl_targets:
+            if not get_field(t, "hit") and not get_field(t, "canceled"):
+                t["canceled"] = True
+                t_type = get_field(t, "type")
+                t_level = get_field(t, "level")
+                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+
+        # Расчёт PnL
+        qty = position.quantity_left
+        entry_price = position.entry_price
+        if position.direction == "long":
+            pnl = (mark - entry_price) * qty
+        else:
+            pnl = (entry_price - mark) * qty
+
+        # Закрытие позиции
+        position.status = "closed"
+        position.exit_price = mark
+        position.closed_at = datetime.utcnow()
+        position.close_reason = "tp-signal-stop"
+        position.planned_risk = Decimal("0")
+        position.quantity_left = Decimal("0")
+        position.pnl += pnl
+
+        log.info(
+            f"📉 Позиция symbol={position.symbol} закрыта по реверсу, сигнал будет обработан как reverse_entry"
+        )
+        log.info(
+            f"✅ Позиция symbol={position.symbol} закрыта для реверса: статус={position.status}, причина={position.close_reason}"
+        )
+
+        # Отправка в Redis
+        await push_position_update(position, redis)
+
+        # Удаление из памяти
+        del position_registry[(position.strategy_id, position.symbol)]
