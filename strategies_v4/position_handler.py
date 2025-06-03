@@ -365,6 +365,9 @@ async def raise_sl_to_entry(position, sl):
             "canceled": False
         })
 
+        # Обнуление запланированного риска
+        position.planned_risk = Decimal("0")
+
         log.info(
             f"🛡️ SL перенесён на entry: позиция {position.uid} | новая цена {entry_price:.8f} | уровень {max_level + 1}"
         )
