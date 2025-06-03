@@ -1,13 +1,13 @@
-# strategies/strategy_1.py
+# strategies/strategy_10.py
 
 import logging
 import json
 from datetime import datetime
 
-log = logging.getLogger("STRATEGY_1")
+log = logging.getLogger("STRATEGY_10")
 
 
-class Strategy1:
+class Strategy10:
     # 🔸 Валидация сигнала — всегда True (пропускаем)
     async def validate_signal(self, signal, context) -> bool:
         return True
@@ -26,7 +26,7 @@ class Strategy1:
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
                 log.debug(
-                    f"📤 [Strategy1] Сигнал передан в strategy_opener_stream: {payload}"
+                    f"📤 [Strategy10] Сигнал передан в strategy_opener_stream: {payload}"
                 )
             except Exception as e:
-                log.warning(f"⚠️ [Strategy1] Ошибка при отправке сигнала: {e}")
+                log.warning(f"⚠️ [Strategy10] Ошибка при отправке сигнала: {e}")

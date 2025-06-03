@@ -165,7 +165,7 @@ async def update_position_and_targets(pool, record: dict):
                     )
 
             await tx.commit()
-            log.info(f"💾 Обновление позиции завершено: uid={record['position_uid']}")
+            log.debug(f"💾 Обновление позиции завершено: uid={record['position_uid']}")
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка обновления позиции: {e}")

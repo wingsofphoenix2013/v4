@@ -259,7 +259,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     )
 
     position_registry[(position.strategy_id, position.symbol)] = position
-    log.debug(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
+    log.info(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
 
     # 🔹 Подготовка Redis-логов
     redis = context.get("redis")

@@ -50,7 +50,7 @@ async def push_position_update(position, redis):
 
     try:
         await redis.xadd("positions_update_stream", {"data": json.dumps(payload)})
-        log.info(f"📤 Обновление позиции отправлено в Redis: uid={position.uid}")
+        log.debug(f"📤 Обновление позиции отправлено в Redis: uid={position.uid}")
     except Exception as e:
         log.warning(f"⚠️ Ошибка отправки обновления позиции: {e}")
 
@@ -101,7 +101,7 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = int(get_field(tp, "level"))
 
-    log.info(
+    log.debug(
         f"[TP-CHECK] Позиция symbol={position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
     )
 
@@ -126,7 +126,7 @@ async def check_tp(position):
     log.info(
         f"🎯 TP сработал: позиция {position.uid} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
     )
-    log.info(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
+    log.debug(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
 
     # 🔄 Применение SL-политики после TP
     strategy = config.strategies.get(position.strategy_id)
@@ -197,7 +197,7 @@ async def check_tp(position):
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
                 sl["canceled"] = True
                 sl_level = get_field(sl, "level")
-                log.info(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
+                log.debug(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
 
         log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
 
@@ -234,7 +234,7 @@ async def check_sl(position):
     sl_price = get_field(sl, "price")
     sl_level = get_field(sl, "level")
 
-    log.info(
+    log.debug(
         f"[SL-CHECK] Позиция symbol={position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
     )
 
@@ -256,7 +256,7 @@ async def check_sl(position):
         if not get_field(tp, "hit") and not get_field(tp, "canceled"):
             tp["canceled"] = True
             tp_level = get_field(tp, "level")
-            log.info(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
+            log.debug(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
 
     # Закрытие позиции
     qty = get_field(sl, "quantity")
@@ -276,7 +276,7 @@ async def check_sl(position):
     else:
         position.close_reason = "sl-tp-hit"
 
-    log.info(
+    log.debug(
         f"🛑 SL сработал: позиция {position.uid} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
     )
     log.info(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
@@ -304,7 +304,7 @@ async def full_protect_stop(position):
                 t["canceled"] = True
                 t_type = get_field(t, "type")
                 t_level = get_field(t, "level")
-                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+                log.debug(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
 
         # Расчёт PnL
         qty = position.quantity_left
@@ -323,7 +323,7 @@ async def full_protect_stop(position):
         position.quantity_left = Decimal("0")
         position.pnl += pnl
 
-        log.info(
+        log.debug(
             f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}"
         )
         log.info(
@@ -346,7 +346,7 @@ async def raise_sl_to_entry(position, sl):
         # Отмена текущего SL
         sl["canceled"] = True
         sl_level = get_field(sl, "level")
-        log.info(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
+        log.debug(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
 
         # Создание нового SL на уровне entry
         entry_price = position.entry_price
@@ -392,7 +392,7 @@ async def full_reverse_stop(position):
                 t["canceled"] = True
                 t_type = get_field(t, "type")
                 t_level = get_field(t, "level")
-                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+                log.debug(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
 
         # Расчёт PnL
         qty = position.quantity_left
