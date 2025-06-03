@@ -3,11 +3,13 @@
 import asyncio
 import logging
 from datetime import datetime
+from decimal import Decimal
 import json
 
 from infra import infra
 from position_state_loader import position_registry
 from config_loader import config
+from position_handler import full_protect_stop, raise_sl_to_entry, get_field
 
 log = logging.getLogger("SIGNAL_PROCESSOR")
 
@@ -37,10 +39,59 @@ def route_signal_base(meta, signal_direction, symbol):
 
     return "ignore", "неизвестное состояние"
 
-# 🔸 Обработчик сигнала защиты (заглушка)
+# 🔸 Обработчик сигнала защиты позиции (protect)
 async def handle_protect_signal(msg_data):
-    log.debug("🧪 Вход в handle_protect_signal")
-    log.debug(f"🛡️ [PROTECT] Обработка сигнала защиты: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
+    strategy_id = int(msg_data.get("strategy_id"))
+    symbol = msg_data.get("symbol")
+
+    position = position_registry.get((strategy_id, symbol))
+    if not position:
+        log.debug(f"[PROTECT] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
+        return
+
+    redis = infra.redis_client
+    mark_str = await redis.get(f"price:{symbol}")
+    if not mark_str:
+        log.warning(f"[PROTECT] Не удалось получить markprice для {symbol}")
+        return
+
+    mark = Decimal(mark_str)
+    entry = position.entry_price
+
+    # 🔹 Вариант 1: цена <= вход → полное закрытие
+    if mark <= entry:
+        log.info(f"[PROTECT] mark={mark} ниже или равен entry={entry} → вызов full_protect_stop")
+        await full_protect_stop(position)
+        return
+
+    # 🔹 Вариант 2: цена > entry → проверка SL
+    active_sl = sorted(
+        [
+            sl for sl in position.sl_targets
+            if get_field(sl, "type") == "sl"
+            and get_field(sl, "source") == "price"
+            and not get_field(sl, "hit")
+            and not get_field(sl, "canceled")
+        ],
+        key=lambda sl: get_field(sl, "level")
+    )
+
+    if not active_sl:
+        log.debug(f"[PROTECT] Нет активных SL для позиции {position.uid}")
+        return
+
+    sl = active_sl[0]
+    sl_price = get_field(sl, "price")
+
+    if sl_price < entry:
+        log.info(
+            f"[PROTECT] SL ниже entry (sl={sl_price} < entry={entry}) → перемещаем"
+        )
+        await raise_sl_to_entry(position, sl)
+    else:
+        log.info(
+            f"[PROTECT] SL уже на уровне entry или выше (sl={sl_price} ≥ entry={entry}) → ничего не делаем"
+        )
 
 # 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
