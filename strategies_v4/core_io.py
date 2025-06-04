@@ -201,27 +201,29 @@ async def run_signal_log_writer():
             await asyncio.sleep(5)
 # 🔸 Повторная маршрутизация сигнала после закрытия позиции по реверсу
 async def reverse_entry(position_uid: str):
+    log = logging.getLogger("REVERSE_ENTRY")
+
     try:
         # 1. Получить log_id из позиции
-        row = await infra.pg.fetchrow("""
+        row = await infra.pg_pool.fetchrow("""
             SELECT log_id FROM positions_v4
             WHERE position_uid = $1
         """, position_uid)
 
         if not row or not row["log_id"]:
-            infra.log.warning(f"[REVERSE_ENTRY] Не найден log_id для позиции uid={position_uid}")
+            log.warning(f"[REVERSE_ENTRY] Не найден log_id для позиции uid={position_uid}")
             return
 
         log_id = row["log_id"]
 
         # 2. Получить raw_message из signals_v4_log
-        row = await infra.pg.fetchrow("""
+        row = await infra.pg_pool.fetchrow("""
             SELECT raw_message FROM signals_v4_log
             WHERE id = $1
         """, log_id)
 
         if not row or not row["raw_message"]:
-            infra.log.warning(f"[REVERSE_ENTRY] Не найден raw_message для log_id={log_id}")
+            log.warning(f"[REVERSE_ENTRY] Не найден raw_message для log_id={log_id}")
             return
 
         raw_data = json.loads(row["raw_message"])
@@ -238,12 +240,12 @@ async def reverse_entry(position_uid: str):
         # 4. Отправить в signals_stream
         await infra.redis_client.xadd("signals_stream", payload)
 
-        infra.log.info(
+        log.info(
             f"[REVERSE_ENTRY] Повторно отправлен сигнал: symbol={payload['symbol']}, message={payload['message']}"
         )
 
     except Exception as e:
-        infra.log.exception(f"[REVERSE_ENTRY] Ошибка обработки позиции uid={position_uid}: {e}")
+        log.exception(f"[REVERSE_ENTRY] Ошибка обработки позиции uid={position_uid}: {e}")
 # 🔸 Чтение позиций из Redis и запись в БД
 async def run_position_writer():
     log.info("📝 [CORE_IO] Запуск воркера записи позиций")
