@@ -9,10 +9,7 @@ import json
 from infra import infra
 from position_state_loader import position_registry
 from config_loader import config
-from position_handler import (
-    full_protect_stop,
-    raise_sl_to_entry,
-    full_reverse_stop,)
+from position_handler import full_protect_stop, raise_sl_to_entry, get_field
 
 log = logging.getLogger("SIGNAL_PROCESSOR")
 
@@ -70,32 +67,26 @@ async def handle_protect_signal(msg_data):
             f"[PROTECT] Позиция в зоне убытка (mark={mark}, entry={entry}, direction={position.direction}) → вызов full_protect_stop"
         )
         await full_protect_stop(position)
-
-        # Если вызов был инициирован реверсом — запустить reverse_entry
-        if msg_data.get("from_reverse"):
-            from core_io import reverse_entry
-            await reverse_entry(position.uid)
-
         return
 
     # 🔹 Вариант 2: позиция в плюсе → проверка SL
     active_sl = sorted(
         [
             sl for sl in position.sl_targets
-            if(sl, "type") == "sl"
-            and(sl, "source") == "price"
-            and not(sl, "hit")
-            and not(sl, "canceled")
+            if get_field(sl, "type") == "sl"
+            and get_field(sl, "source") == "price"
+            and not get_field(sl, "hit")
+            and not get_field(sl, "canceled")
         ],
-        key=lambda sl:(sl, "level")
+        key=lambda sl: get_field(sl, "level")
     )
 
     if not active_sl:
-        log.info(f"[PROTECT] Нет активных SL для позиции {position.uid}")
+        log.debug(f"[PROTECT] Нет активных SL для позиции {position.uid}")
         return
 
     sl = active_sl[0]
-    sl_price =(sl, "price")
+    sl_price = get_field(sl, "price")
 
     # Нужно ли перемещать SL на entry
     if (
@@ -110,43 +101,10 @@ async def handle_protect_signal(msg_data):
         log.info(
             f"[PROTECT] SL уже на уровне entry или лучше: sl={sl_price}, entry={entry}, direction={position.direction} → ничего не делаем"
         )
-# 🔸 Обработчик сигнала реверса (reverse)
+# 🔸 Обработчик сигнала реверса (заглушка)
 async def handle_reverse_signal(msg_data):
-    strategy_id = int(msg_data.get("strategy_id"))
-    symbol = msg_data.get("symbol")
+    log.debug(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
 
-    position = position_registry.get((strategy_id, symbol))
-    if not position:
-        log.info(f"[REVERSE] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
-        return
-
-    # Найти активный TP
-    active_tp = sorted(
-        [
-            tp for tp in position.tp_targets
-            if not(tp, "hit") and not(tp, "canceled")
-        ],
-        key=lambda tp:(tp, "level")
-    )
-
-    if not active_tp:
-        log.info(f"[REVERSE] Нет активных TP у позиции symbol={symbol}")
-        return
-
-    tp = active_tp[0]
-    tp_source =(tp, "source")
-
-    if tp_source == "price":
-        log.info(f"[REVERSE] TP source = price → делегируем в защиту")
-        msg_data["from_reverse"] = True
-        await handle_protect_signal(msg_data)
-        return
-
-    if tp_source == "signal":
-        log.info(f"[REVERSE] TP source = signal → закрываем позицию и запускаем reverse_entry")
-        await full_reverse_stop(position)
-        return
-        
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
     route = msg_data.get("route")

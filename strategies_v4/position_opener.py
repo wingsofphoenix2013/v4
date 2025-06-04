@@ -9,7 +9,7 @@ import uuid
 
 from infra import infra
 from config_loader import config
-from position_state_loader import PositionState, position_registry
+from position_state_loader import PositionState, position_registry, Target
 
 log = logging.getLogger("POSITION_OPENER")
 
@@ -207,12 +207,6 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     # 🔹 Генерация уникального идентификатора позиции
     position_uid = str(uuid.uuid4())
 
-    # 🔹 Проверка: позиция уже существует
-    key = (int(signal["strategy_id"]), signal["symbol"])
-    if key in position_registry:
-        log.warning(f"⚠️ Позиция уже существует в памяти: strategy={key[0]} symbol={key[1]}")
-        return {"status": "duplicate", "reason": "позиция уже есть в памяти"}
-
     # 🔹 Логирование итогов расчета
     log.debug(
         f"✅ [POSITION_OPENER] Открытие позиции: "
@@ -265,8 +259,8 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     )
 
     position_registry[(position.strategy_id, position.symbol)] = position
-    log.info(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
-    
+    log.debug(f"📌 [POSITION_OPENER] Позиция сохранена в память: uid={position_uid}")
+
     # 🔹 Подготовка Redis-логов
     redis = context.get("redis")
     log_id = signal.get("log_id")

@@ -66,14 +66,3 @@ async def load_indicators(symbol: str, params: list[str], timeframe: str) -> dic
         result[param] = float(value) if value is not None else None
 
     return result
-# 🔸 Универсальный доступ к полям цели (dict или объект)
-def get_field(obj, field, default=None):
-    if isinstance(obj, dict):
-        return obj.get(field, default)
-    return getattr(obj, field, default)
-
-def set_field(obj, field, value):
-    if isinstance(obj, dict):
-        obj[field] = value
-    else:
-        setattr(obj, field, value)
