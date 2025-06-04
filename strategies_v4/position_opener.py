@@ -9,7 +9,7 @@ import uuid
 
 from infra import infra
 from config_loader import config
-from position_state_loader import PositionState, position_registry, Target
+from position_state_loader import PositionState, position_registry
 
 log = logging.getLogger("POSITION_OPENER")
 

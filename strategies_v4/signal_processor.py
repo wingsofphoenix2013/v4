@@ -7,15 +7,12 @@ from decimal import Decimal
 import json
 
 from infra import infra
-from infra import get_field, set_field
 from position_state_loader import position_registry
 from config_loader import config
 from position_handler import (
     full_protect_stop,
     raise_sl_to_entry,
-    full_reverse_stop,
-    get_field
-)
+    full_reverse_stop,)
 
 log = logging.getLogger("SIGNAL_PROCESSOR")
 
@@ -85,12 +82,12 @@ async def handle_protect_signal(msg_data):
     active_sl = sorted(
         [
             sl for sl in position.sl_targets
-            if get_field(sl, "type") == "sl"
-            and get_field(sl, "source") == "price"
-            and not get_field(sl, "hit")
-            and not get_field(sl, "canceled")
+            if(sl, "type") == "sl"
+            and(sl, "source") == "price"
+            and not(sl, "hit")
+            and not(sl, "canceled")
         ],
-        key=lambda sl: get_field(sl, "level")
+        key=lambda sl:(sl, "level")
     )
 
     if not active_sl:
@@ -98,7 +95,7 @@ async def handle_protect_signal(msg_data):
         return
 
     sl = active_sl[0]
-    sl_price = get_field(sl, "price")
+    sl_price =(sl, "price")
 
     # Нужно ли перемещать SL на entry
     if (
@@ -127,9 +124,9 @@ async def handle_reverse_signal(msg_data):
     active_tp = sorted(
         [
             tp for tp in position.tp_targets
-            if not get_field(tp, "hit") and not get_field(tp, "canceled")
+            if not(tp, "hit") and not(tp, "canceled")
         ],
-        key=lambda tp: get_field(tp, "level")
+        key=lambda tp:(tp, "level")
     )
 
     if not active_tp:
@@ -137,7 +134,7 @@ async def handle_reverse_signal(msg_data):
         return
 
     tp = active_tp[0]
-    tp_source = get_field(tp, "source")
+    tp_source =(tp, "source")
 
     if tp_source == "price":
         log.info(f"[REVERSE] TP source = price → делегируем в защиту")
