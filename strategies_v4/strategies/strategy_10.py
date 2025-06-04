@@ -3,13 +3,69 @@
 import logging
 import json
 from datetime import datetime
+from infra import load_indicators
+from config_loader import config
 
 log = logging.getLogger("STRATEGY_10")
 
 
 class Strategy10:
-    # 🔸 Валидация сигнала — всегда True (пропускаем)
-    async def validate_signal(self, signal, context) -> bool:
+    # 🔸 Метод валидации сигнала: фильтрация по EMA(50)
+    async def validate_signal(self, signal, context) -> bool | str:
+        symbol = signal.get("symbol")
+        direction = signal.get("direction")
+        strategy_id = int(signal.get("strategy_id"))
+        log_id = signal.get("log_id")
+
+        log.debug(f"⚙️ [Strategy10] Валидация сигнала: symbol={symbol}, direction={direction}")
+
+        redis = context.get("redis")
+        note = None
+
+        try:
+            # Таймфрейм стратегии
+            timeframe = config.strategies[strategy_id]["meta"]["timeframe"]
+
+            # Получение EMA(50)
+            ind = await load_indicators(redis, symbol, timeframe)
+            ema = ind.get("ema", {}).get("50")
+
+            if ema is None:
+                note = "отклонено: отсутствует ema50"
+            else:
+                # Получение текущей цены (mark price)
+                price_raw = await redis.get(f"price:{symbol}")
+                if price_raw is None:
+                    note = "отклонено: отсутствует mark price"
+                else:
+                    price = float(price_raw)
+                    ema = float(ema)
+
+                    if direction == "long" and price <= ema:
+                        note = f"отклонено: цена ниже EMA50 (price={price}, ema={ema})"
+                    elif direction == "short" and price >= ema:
+                        note = f"отклонено: цена выше EMA50 (price={price}, ema={ema})"
+
+        except Exception as e:
+            note = f"ошибка при валидации фильтра EMA: {e}"
+
+        if note:
+            log.debug(f"🚫 [Strategy10] {note}")
+            if redis:
+                log_record = {
+                    "log_id": log_id,
+                    "strategy_id": strategy_id,
+                    "status": "ignore",
+                    "position_id": None,
+                    "note": note,
+                    "logged_at": datetime.utcnow().isoformat()
+                }
+                try:
+                    await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+                except Exception as e:
+                    log.warning(f"⚠️ [Strategy10] Ошибка записи в Redis log_queue: {e}")
+            return "logged"
+
         return True
 
     # 🔸 Отправка сигнала на открытие позиции
