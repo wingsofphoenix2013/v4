@@ -13,7 +13,6 @@ from position_handler import (
     full_protect_stop,
     raise_sl_to_entry,
     full_reverse_stop,
-    handle_protect_signal,
     get_field
 )
 
