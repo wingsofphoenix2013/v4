@@ -3,12 +3,13 @@
 import asyncio
 import logging
 from datetime import datetime
-import json
 from decimal import Decimal
+import json
 
 from infra import infra
 from position_state_loader import position_registry
 from config_loader import config
+from core_io import reverse_entry
 
 # 🔸 Логгер для обработчика позиций
 log = logging.getLogger("POSITION_HANDLER")
@@ -287,54 +288,51 @@ async def check_sl(position):
     # Отправка обновления в Redis
     await push_position_update(position, redis)
 
-# 🔸 Принудительное закрытие позиции по SL-защите (protect)
-async def full_protect_stop(position):
+# 🔸 Принудительное закрытие позиции по SL-защите
+async def full_protect_stop(position, from_reverse=False):
     async with position.lock:
+        log.debug(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.symbol} → full protect stop")
+
+        # 1. Отмена всех активных целей
+        for target in position.tp_targets + position.sl_targets:
+            if not get_field(target, "hit") and not get_field(target, "canceled"):
+                target["canceled"] = True
+
+        # 2. Получение текущей цены
         redis = infra.redis_client
         mark_str = await redis.get(f"price:{position.symbol}")
         if not mark_str:
-            log.warning(f"[PROTECT] Позиция {position.uid}: не удалось получить цену markprice")
+            log.warning(f"[PROTECT] Не удалось получить цену для {position.symbol}")
             return
-
         mark = Decimal(mark_str)
 
-        # Отмена всех TP и SL целей
-        for t in position.tp_targets + position.sl_targets:
-            if not get_field(t, "hit") and not get_field(t, "canceled"):
-                t["canceled"] = True
-                t_type = get_field(t, "type")
-                t_level = get_field(t, "level")
-                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
-
-        # Расчёт PnL
-        qty = position.quantity_left
-        entry_price = position.entry_price
-        if position.direction == "long":
-            pnl = (mark - entry_price) * qty
-        else:
-            pnl = (entry_price - mark) * qty
-
-        # Закрытие позиции
+        # 3–7. Закрытие позиции
         position.status = "closed"
         position.exit_price = mark
-        position.closed_at = datetime.utcnow()
         position.close_reason = "sl-protect-stop"
-        position.planned_risk = Decimal("0")
-        position.quantity_left = Decimal("0")
+        position.closed_at = datetime.utcnow()
+
+        qty = position.quantity_left
+        entry_price = position.entry_price
+        pnl = (mark - entry_price) * qty if position.direction == "long" else (entry_price - mark) * qty
         position.pnl += pnl
 
-        log.info(
-            f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}"
-        )
-        log.info(
-            f"✅ Позиция {position.uid} закрыта через защиту SL: статус={position.status}, причина={position.close_reason}"
-        )
+        position.planned_risk = Decimal("0")
+        position.quantity_left = Decimal("0")
 
-        # Отправка в Redis
+        # 8. Обновление в БД
         await push_position_update(position, redis)
 
-        # Удаление из памяти
+        # 9. Удаление из памяти
         del position_registry[(position.strategy_id, position.symbol)]
+
+        log.info(
+            f"✅ Позиция {position.symbol} закрыта через защиту SL: статус=closed, причина=sl-protect-stop"
+        )
+
+        # 🔟 Если вызов пришёл из реверса — запускаем повторный вход
+        if from_reverse:
+            await reverse_entry(position.uid)
         
 # 🔸 Перемещение SL на уровень entry (для SL-защиты)
 async def raise_sl_to_entry(position, sl):
@@ -375,3 +373,48 @@ async def raise_sl_to_entry(position, sl):
         # Отправка обновления в Redis
         redis = infra.redis_client
         await push_position_update(position, redis)
+# 🔸 Закрытие позиции по TP-сигналу в рамках реверса
+async def full_reverse_stop(position):
+    async with position.lock:
+
+        log.debug(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.symbol} → reverse stop")
+
+        # 1. Отмена всех активных целей
+        for target in position.tp_targets + position.sl_targets:
+            if not get_field(target, "hit") and not get_field(target, "canceled"):
+                target["canceled"] = True
+
+        # 2. Получение текущей цены
+        redis = infra.redis_client
+        mark_str = await redis.get(f"price:{position.symbol}")
+        if not mark_str:
+            log.warning(f"[REVERSE] Не удалось получить цену для {position.symbol}")
+            return
+        mark = Decimal(mark_str)
+
+        # 3–7. Закрытие позиции и финализация
+        position.status = "closed"
+        position.exit_price = mark
+        position.close_reason = "tp-signal-stop"
+        position.closed_at = datetime.utcnow()
+
+        qty = position.quantity_left
+        entry_price = position.entry_price
+        pnl = (mark - entry_price) * qty if position.direction == "long" else (entry_price - mark) * qty
+        position.pnl += pnl
+
+        position.planned_risk = Decimal("0")
+        position.quantity_left = Decimal("0")
+
+        # 8. Обновление в БД
+        await push_position_update(position, redis)
+
+        # 9. Удаление из памяти
+        del position_registry[(position.strategy_id, position.symbol)]
+
+        log.info(
+            f"📉 Позиция symbol={position.symbol} закрыта по reverse: статус=closed, причина=tp-signal-stop, pnl={pnl:.6f}"
+        )
+
+        # 10. Вызов reverse_entry
+        await reverse_entry(position.uid)
