@@ -23,13 +23,13 @@ async def push_position_update(position, redis):
     def serialize_targets(targets):
         return [
             {
-                "level": t["level"],
-                "price": str(t["price"]) if t["price"] is not None else None,
-                "quantity": str(t["quantity"]),
-                "type": t["type"],
-                "hit": bool(t["hit"]),
-                "hit_at": t["hit_at"].isoformat() if t["hit_at"] else None,
-                "canceled": bool(t["canceled"]),
+                "level": t.level,
+                "price": str(t.price) if t.price is not None else None,
+                "quantity": str(t.quantity),
+                "type": t.type,
+                "hit": bool(t.hit),
+                "hit_at": t.hit_at.isoformat() if t.hit_at else None,
+                "canceled": bool(t.canceled),
                 "source": t.get("source", "price")
             }
             for t in targets
@@ -116,8 +116,8 @@ async def check_tp(position):
     entry_price = position.entry_price
     pnl_gain = (tp_price - entry_price) * qty if position.direction == "long" else (entry_price - tp_price) * qty
 
-    tp["hit"] = True
-    tp["hit_at"] = datetime.utcnow()
+    tp.hit = True
+    tp.hit_at = datetime.utcnow()
 
     position.quantity_left -= qty
     position.planned_risk = Decimal("0")
@@ -131,25 +131,25 @@ async def check_tp(position):
 
     # 🔄 Применение SL-политики после TP
     strategy = config.strategies.get(position.strategy_id)
-    level_to_id = {int(lvl["level"]): lvl["id"] for lvl in strategy.get("tp_levels", [])}
+    level_to_id = {int(lvl.level): lvl.id for lvl in strategy.get("tp_levels", [])}
     tp_level_id = level_to_id.get(tp_level)
 
     if not tp_level_id:
         log.debug(f"[SL-POLICY] Не найден tp_level_id для strategy={position.strategy_id}, level={tp_level}")
 
     sl_policy = next(
-        (rule for rule in strategy.get("sl_rules", []) if rule["tp_level_id"] == tp_level_id),
+        (rule for rule in strategy.get("sl_rules", []) if rule.tp_level_id == tp_level_id),
         None
     )
 
-    if sl_policy and sl_policy["sl_mode"] != "none" and position.quantity_left > 0:
+    if sl_policy and sl_policy.sl_mode != "none" and position.quantity_left > 0:
         # Отмена текущих SL целей
         for sl in position.sl_targets:
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
-                sl["canceled"] = True
+                sl.canceled = True
 
         # Расчёт новой SL цены
-        sl_mode = sl_policy["sl_mode"]
+        sl_mode = sl_policy.sl_mode
         sl_value = sl_policy.get("sl_value")
         new_sl_price = None
 
@@ -159,7 +159,7 @@ async def check_tp(position):
             offset = tp_price * Decimal(sl_value) / Decimal("100")
             new_sl_price = tp_price - offset if position.direction == "long" else tp_price + offset
         elif sl_mode == "atr":
-            atr_key = f"ind:{position.symbol}:{strategy['meta']['timeframe']}:atr14"
+            atr_key = f"ind:{position.symbol}:{strategy.meta['timeframe']}:atr14"
             atr_raw = await redis.get(atr_key)
             if not atr_raw:
                 log.warning(f"[SL-POLICY] Не удалось получить ATR для {position.symbol}")
@@ -196,7 +196,7 @@ async def check_tp(position):
         # Отмена всех активных SL целей
         for sl in position.sl_targets:
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
-                sl["canceled"] = True
+                sl.canceled = True
                 sl_level = get_field(sl, "level")
                 log.debug(f"⚠️ SL отменён: позиция {position.symbol} | уровень {sl_level}")
 
@@ -249,13 +249,13 @@ async def check_sl(position):
         return
 
     # SL сработал
-    sl["hit"] = True
-    sl["hit_at"] = datetime.utcnow()
+    sl.hit = True
+    sl.hit_at = datetime.utcnow()
 
     # Отмена всех активных TP целей
     for tp in position.tp_targets:
         if not get_field(tp, "hit") and not get_field(tp, "canceled"):
-            tp["canceled"] = True
+            tp.canceled = True
             tp_level = get_field(tp, "level")
             log.debug(f"⚠️ TP отменён: позиция {position.symbol} | уровень {tp_level}")
 
@@ -296,7 +296,7 @@ async def full_protect_stop(position, from_reverse=False):
         # 1. Отмена всех активных целей
         for target in position.tp_targets + position.sl_targets:
             if not get_field(target, "hit") and not get_field(target, "canceled"):
-                target["canceled"] = True
+                target.canceled = True
 
         # 2. Получение текущей цены
         redis = infra.redis_client
@@ -342,7 +342,7 @@ async def raise_sl_to_entry(position, sl):
             return
 
         # Отмена текущего SL
-        sl["canceled"] = True
+        sl.canceled = True
         sl_level = get_field(sl, "level")
         log.info(f"⚠️ SL отменён для переноса: позиция {position.symbol} | уровень {sl_level}")
 
@@ -382,7 +382,7 @@ async def full_reverse_stop(position):
         # 1. Отмена всех активных целей
         for target in position.tp_targets + position.sl_targets:
             if not get_field(target, "hit") and not get_field(target, "canceled"):
-                target["canceled"] = True
+                target.canceled = True
 
         # 2. Получение текущей цены
         redis = infra.redis_client
