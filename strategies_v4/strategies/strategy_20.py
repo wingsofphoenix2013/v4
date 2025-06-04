@@ -25,8 +25,8 @@ class Strategy20:
             timeframe = config.strategies[strategy_id]["meta"]["timeframe"]
 
             # Получение EMA(50)
-            ind = await load_indicators(redis, symbol, timeframe)
-            ema = ind.get("ema", {}).get("50")
+            ind = await load_indicators(symbol, ["ema50"], timeframe)
+            ema = ind.get("ema50")
 
             if ema is None:
                 note = "отклонено: отсутствует ema50"
