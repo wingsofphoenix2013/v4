@@ -50,7 +50,7 @@ async def push_position_update(position, redis):
 
     try:
         await redis.xadd("positions_update_stream", {"data": json.dumps(payload)})
-        log.debug(f"📤 Обновление позиции отправлено в Redis: uid={position.uid}")
+        log.info(f"📤 Обновление позиции отправлено в Redis: uid={position.uid}")
     except Exception as e:
         log.warning(f"⚠️ Ошибка отправки обновления позиции: {e}")
 
@@ -101,7 +101,7 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = int(get_field(tp, "level"))
 
-    log.debug(
+    log.info(
         f"[TP-CHECK] Позиция symbol={position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
     )
 
@@ -126,7 +126,7 @@ async def check_tp(position):
     log.info(
         f"🎯 TP сработал: позиция {position.uid} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
     )
-    log.debug(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
+    log.info(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
 
     # 🔄 Применение SL-политики после TP
     strategy = config.strategies.get(position.strategy_id)
@@ -197,7 +197,7 @@ async def check_tp(position):
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
                 sl["canceled"] = True
                 sl_level = get_field(sl, "level")
-                log.debug(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
+                log.info(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
 
         log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
 
@@ -234,7 +234,7 @@ async def check_sl(position):
     sl_price = get_field(sl, "price")
     sl_level = get_field(sl, "level")
 
-    log.debug(
+    log.info(
         f"[SL-CHECK] Позиция symbol={position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
     )
 
@@ -256,7 +256,7 @@ async def check_sl(position):
         if not get_field(tp, "hit") and not get_field(tp, "canceled"):
             tp["canceled"] = True
             tp_level = get_field(tp, "level")
-            log.debug(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
+            log.info(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
 
     # Закрытие позиции
     qty = get_field(sl, "quantity")
@@ -276,7 +276,7 @@ async def check_sl(position):
     else:
         position.close_reason = "sl-tp-hit"
 
-    log.debug(
+    log.info(
         f"🛑 SL сработал: позиция {position.uid} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
     )
     log.info(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
@@ -304,7 +304,7 @@ async def full_protect_stop(position):
                 t["canceled"] = True
                 t_type = get_field(t, "type")
                 t_level = get_field(t, "level")
-                log.debug(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
 
         # Расчёт PnL
         qty = position.quantity_left
@@ -323,7 +323,7 @@ async def full_protect_stop(position):
         position.quantity_left = Decimal("0")
         position.pnl += pnl
 
-        log.debug(
+        log.info(
             f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}"
         )
         log.info(
@@ -346,7 +346,7 @@ async def raise_sl_to_entry(position, sl):
         # Отмена текущего SL
         sl["canceled"] = True
         sl_level = get_field(sl, "level")
-        log.debug(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
+        log.info(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
 
         # Создание нового SL на уровне entry
         entry_price = position.entry_price
@@ -375,51 +375,3 @@ async def raise_sl_to_entry(position, sl):
         # Отправка обновления в Redis
         redis = infra.redis_client
         await push_position_update(position, redis)
-# 🔸 Принудительное закрытие позиции перед реверсом (reverse stop)
-async def full_reverse_stop(position):
-    async with position.lock:
-        redis = infra.redis_client
-        mark_str = await redis.get(f"price:{position.symbol}")
-        if not mark_str:
-            log.warning(f"[REVERSE] Позиция {position.uid}: не удалось получить цену markprice")
-            return
-
-        mark = Decimal(mark_str)
-
-        # Отмена всех TP и SL целей
-        for t in position.tp_targets + position.sl_targets:
-            if not get_field(t, "hit") and not get_field(t, "canceled"):
-                t["canceled"] = True
-                t_type = get_field(t, "type")
-                t_level = get_field(t, "level")
-                log.debug(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
-
-        # Расчёт PnL
-        qty = position.quantity_left
-        entry_price = position.entry_price
-        if position.direction == "long":
-            pnl = (mark - entry_price) * qty
-        else:
-            pnl = (entry_price - mark) * qty
-
-        # Закрытие позиции
-        position.status = "closed"
-        position.exit_price = mark
-        position.closed_at = datetime.utcnow()
-        position.close_reason = "tp-signal-stop"
-        position.planned_risk = Decimal("0")
-        position.quantity_left = Decimal("0")
-        position.pnl += pnl
-
-        log.info(
-            f"📉 Позиция symbol={position.symbol} закрыта по реверсу, сигнал будет обработан как reverse_entry"
-        )
-        log.info(
-            f"✅ Позиция symbol={position.symbol} закрыта для реверса: статус={position.status}, причина={position.close_reason}"
-        )
-
-        # Отправка в Redis
-        await push_position_update(position, redis)
-
-        # Удаление из памяти
-        del position_registry[(position.strategy_id, position.symbol)]
