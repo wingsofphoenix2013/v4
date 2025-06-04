@@ -199,36 +199,67 @@ async def run_signal_log_writer():
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream")
             await asyncio.sleep(5)
-# 🔸 Повторная маршрутизация сигнала после закрытия позиции по реверсу
+# 🔸 Повторная маршрутизация противоположного сигнала после реверса
 async def reverse_entry(position_uid: str):
+    from infra import infra
+    import logging
+    import json
+    from datetime import datetime
+
     log = logging.getLogger("REVERSE_ENTRY")
 
     try:
-        # 1. Получить log_id из позиции
-        row = await infra.pg_pool.fetchrow("""
-            SELECT log_id FROM positions_v4
+        # 1. Получить параметры закрытой позиции
+        pos = await infra.pg_pool.fetchrow("""
+            SELECT strategy_id, symbol, direction, closed_at
+            FROM positions_v4
             WHERE position_uid = $1
         """, position_uid)
 
-        if not row or not row["log_id"]:
-            log.warning(f"[REVERSE_ENTRY] Не найден log_id для позиции uid={position_uid}")
+        if not pos:
+            log.warning(f"[REVERSE_ENTRY] Позиция не найдена: uid={position_uid}")
             return
 
-        log_id = row["log_id"]
+        strategy_id = pos["strategy_id"]
+        symbol = pos["symbol"]
+        direction = pos["direction"]
+        closed_at = pos["closed_at"]
 
-        # 2. Получить raw_message из signals_v4_log
-        row = await infra.pg_pool.fetchrow("""
-            SELECT raw_message FROM signals_v4_log
+        # 2. Получить сигнальные фразы стратегии
+        strategy_row = await infra.pg_pool.fetchrow("""
+            SELECT long_phrase, short_phrase
+            FROM signals_v4
             WHERE id = $1
-        """, log_id)
+        """, strategy_id)
+
+        if not strategy_row:
+            log.warning(f"[REVERSE_ENTRY] Не найдены фразы для стратегии id={strategy_id}")
+            return
+
+        long_phrase = strategy_row["long_phrase"]
+        short_phrase = strategy_row["short_phrase"]
+
+        # 3. Определить противоположную фразу
+        opposite_phrase = short_phrase if direction == "long" else long_phrase
+
+        # 4. Найти последний противоположный сигнал
+        row = await infra.pg_pool.fetchrow("""
+            SELECT raw_message
+            FROM signals_v4_log
+            WHERE raw_message->>'symbol' = $1
+              AND raw_message->>'message' LIKE $2
+              AND created_at <= $3
+            ORDER BY id DESC
+            LIMIT 1
+        """, symbol, f"%{opposite_phrase}", closed_at)
 
         if not row or not row["raw_message"]:
-            log.warning(f"[REVERSE_ENTRY] Не найден raw_message для log_id={log_id}")
+            log.warning(f"[REVERSE_ENTRY] Не найден противоположный сигнал для {symbol}")
             return
 
         raw_data = json.loads(row["raw_message"])
 
-        # 3. Сформировать новый сигнал (только нужные поля)
+        # 5. Сформировать и отправить новый сигнал
         payload = {
             "message": raw_data.get("message"),
             "symbol": raw_data.get("symbol"),
@@ -237,12 +268,9 @@ async def reverse_entry(position_uid: str):
             "received_at": datetime.utcnow().isoformat()
         }
 
-        # 4. Отправить в signals_stream
         await infra.redis_client.xadd("signals_stream", payload)
 
-        log.info(
-            f"[REVERSE_ENTRY] Повторно отправлен сигнал: symbol={payload['symbol']}, message={payload['message']}"
-        )
+        log.info(f"[REVERSE_ENTRY] Повторно отправлен сигнал: symbol={payload['symbol']}, message={payload['message']}")
 
     except Exception as e:
         log.exception(f"[REVERSE_ENTRY] Ошибка обработки позиции uid={position_uid}: {e}")
