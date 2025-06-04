@@ -179,7 +179,7 @@ async def check_tp(position):
             "canceled": False
         })
 
-        log.debug(
+        log.info(
             f"🛡️ Новый SL создан: позиция {position.uid} | цена {new_sl_price:.8f} | режим {sl_mode} | уровень {max_level + 1}"
         )
 
@@ -287,7 +287,7 @@ async def check_sl(position):
 # 🔸 Принудительное закрытие позиции по SL-защите
 async def full_protect_stop(position, from_reverse=False):
     async with position.lock:
-        log.debug(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.symbol} → full protect stop")
+        log.info(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.symbol} → full protect stop")
 
         # 1. Отмена всех активных целей
         for target in position.tp_targets + position.sl_targets:
@@ -334,7 +334,7 @@ async def full_protect_stop(position, from_reverse=False):
 async def raise_sl_to_entry(position, sl):
     async with position.lock:
         if sl["hit"] or sl["canceled"]:
-            log.debug(f"[PROTECT] SL уже неактивен: позиция {position.uid} | уровень {get_field(sl, 'level')}")
+            log.info(f"[PROTECT] SL уже неактивен: позиция {position.uid} | уровень {get_field(sl, 'level')}")
             return
 
         # Отмена текущего SL
@@ -373,7 +373,7 @@ async def raise_sl_to_entry(position, sl):
 async def full_reverse_stop(position):
     async with position.lock:
 
-        log.debug(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.symbol} → reverse stop")
+        log.info(f"🔒 [POSITION_HANDLER] LOCK: позиция {position.symbol} → reverse stop")
 
         # 1. Отмена всех активных целей
         for target in position.tp_targets + position.sl_targets:

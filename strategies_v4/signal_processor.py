@@ -91,7 +91,7 @@ async def handle_protect_signal(msg_data):
     )
 
     if not active_sl:
-        log.debug(f"[PROTECT] Нет активных SL для позиции {position.uid}")
+        log.info(f"[PROTECT] Нет активных SL для позиции {position.uid}")
         return
 
     sl = active_sl[0]
@@ -117,7 +117,7 @@ async def handle_reverse_signal(msg_data):
 
     position = position_registry.get((strategy_id, symbol))
     if not position:
-        log.debug(f"[REVERSE] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
+        log.info(f"[REVERSE] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
         return
 
     # Найти активный TP
@@ -130,7 +130,7 @@ async def handle_reverse_signal(msg_data):
     )
 
     if not active_tp:
-        log.debug(f"[REVERSE] Нет активных TP у позиции symbol={symbol}")
+        log.info(f"[REVERSE] Нет активных TP у позиции symbol={symbol}")
         return
 
     tp = active_tp[0]
