@@ -102,8 +102,8 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = int(get_field(tp, "level"))
 
-    log.info(
-        f"[TP-CHECK] Позиция symbol={position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
+    log.debug(
+        f"[TP-CHECK] Позиция {position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
     )
 
     if position.direction == "long" and mark < tp_price:
@@ -125,9 +125,9 @@ async def check_tp(position):
     position.pnl += pnl_gain
 
     log.info(
-        f"🎯 TP сработал: позиция {position.uid} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
+        f"🎯 TP сработал: позиция {position.symbol} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
     )
-    log.info(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
+    log.debug(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
 
     # 🔄 Применение SL-политики после TP
     strategy = config.strategies.get(position.strategy_id)
@@ -198,9 +198,9 @@ async def check_tp(position):
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
                 sl["canceled"] = True
                 sl_level = get_field(sl, "level")
-                log.info(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
+                log.debug(f"⚠️ SL отменён: позиция {position.symbol} | уровень {sl_level}")
 
-        log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
+        log.info(f"✅ Позиция {position.symbol} полностью закрыта по TP")
 
         # Удаление позиции из памяти
         del position_registry[(position.strategy_id, position.symbol)]
@@ -235,8 +235,8 @@ async def check_sl(position):
     sl_price = get_field(sl, "price")
     sl_level = get_field(sl, "level")
 
-    log.info(
-        f"[SL-CHECK] Позиция symbol={position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
+    log.debug(
+        f"[SL-CHECK] Позиция {position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
     )
 
     triggered = False
@@ -257,7 +257,7 @@ async def check_sl(position):
         if not get_field(tp, "hit") and not get_field(tp, "canceled"):
             tp["canceled"] = True
             tp_level = get_field(tp, "level")
-            log.info(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
+            log.debug(f"⚠️ TP отменён: позиция {position.symbol} | уровень {tp_level}")
 
     # Закрытие позиции
     qty = get_field(sl, "quantity")
@@ -278,9 +278,9 @@ async def check_sl(position):
         position.close_reason = "sl-tp-hit"
 
     log.info(
-        f"🛑 SL сработал: позиция {position.uid} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
+        f"🛑 SL сработал: позиция {position.symbol} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
     )
-    log.info(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
+    log.debug(f"✅ Позиция {position.symbol} закрыта по SL: статус={position.status}, причина={position.close_reason}")
 
     # Удаление позиции из памяти
     del position_registry[(position.strategy_id, position.symbol)]
@@ -344,7 +344,7 @@ async def raise_sl_to_entry(position, sl):
         # Отмена текущего SL
         sl["canceled"] = True
         sl_level = get_field(sl, "level")
-        log.info(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
+        log.info(f"⚠️ SL отменён для переноса: позиция {position.symbol} | уровень {sl_level}")
 
         # Создание нового SL на уровне entry
         entry_price = position.entry_price
@@ -367,7 +367,7 @@ async def raise_sl_to_entry(position, sl):
         position.planned_risk = Decimal("0")
 
         log.info(
-            f"🛡️ SL перенесён на entry: позиция {position.uid} | новая цена {entry_price:.8f} | уровень {max_level + 1}"
+            f"🛡️ SL перенесён на entry: {position.symbol} | новая цена {entry_price:.8f} | уровень {max_level + 1}"
         )
 
         # Отправка обновления в Redis
@@ -413,7 +413,7 @@ async def full_reverse_stop(position):
         del position_registry[(position.strategy_id, position.symbol)]
 
         log.info(
-            f"📉 Позиция symbol={position.symbol} закрыта по reverse: статус=closed, причина=tp-signal-stop, pnl={pnl:.6f}"
+            f"📉 Позиция {position.symbol} закрыта по reverse: статус=closed, причина=tp-signal-stop, pnl={pnl:.6f}"
         )
 
         # 10. Вызов reverse_entry
