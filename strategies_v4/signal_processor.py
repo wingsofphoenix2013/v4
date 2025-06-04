@@ -143,6 +143,9 @@ async def handle_reverse_signal(msg_data):
                 f"📉 Позиция symbol={symbol} закрыта по SL-защите, повторная обработка как reverse_entry"
             )
             msg_data["route"] = "reverse_entry"
+            strategy = config.strategies.get(strategy_id)
+            if strategy:
+                msg_data["strategy_name"] = strategy["meta"]["name"]
             await route_and_dispatch_signal(msg_data, config.strategies, infra.redis_client)
         return
 
@@ -151,8 +154,10 @@ async def handle_reverse_signal(msg_data):
         await full_reverse_stop(position)
 
         msg_data["route"] = "reverse_entry"
-        await route_and_dispatch_signal(msg_data, config.strategies, infra.redis_client)
-        
+        strategy = config.strategies.get(strategy_id)
+        if strategy:
+            msg_data["strategy_name"] = strategy["meta"]["name"]
+        await route_and_dispatch_signal(msg_data, config.strategies, infra.redis_client)        
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
     route = msg_data.get("route")
@@ -160,7 +165,7 @@ async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
     symbol = msg_data.get("symbol")
 
     if route in ("new_entry", "reverse_entry"):
-        strategy_name = config.strategies[strategy_id]["meta"]["name"]
+        strategy_name = msg_data.get("strategy_name") or config.strategies[strategy_id]["meta"]["name"]
         strategy_obj = strategy_registry.get(strategy_name)
         if not strategy_obj:
             log.warning(f"⚠️ Strategy not found in registry: {strategy_name}")
@@ -182,7 +187,6 @@ async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
 
     else:
         log.warning(f"⚠️ Неизвестный маршрут в dispatch: {route}")
-        
 # 🔸 Основной цикл обработки сигналов
 async def run_signal_loop(strategy_registry):
     log.info("🚦 [SIGNAL_PROCESSOR] Запуск цикла обработки сигналов")
