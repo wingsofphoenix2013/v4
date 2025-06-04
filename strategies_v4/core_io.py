@@ -7,6 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from infra import infra
+from infra import get_field, set_field
 
 log = logging.getLogger("CORE_IO")
 

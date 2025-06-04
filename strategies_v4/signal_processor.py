@@ -7,6 +7,7 @@ from decimal import Decimal
 import json
 
 from infra import infra
+from infra import get_field, set_field
 from position_state_loader import position_registry
 from config_loader import config
 from position_handler import (
