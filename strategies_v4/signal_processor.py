@@ -46,7 +46,7 @@ async def handle_protect_signal(msg_data):
 
     position = position_registry.get((strategy_id, symbol))
     if not position:
-        log.debug(f"[PROTECT] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
+        log.info(f"[PROTECT] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
         return
 
     redis = infra.redis_client
@@ -82,7 +82,7 @@ async def handle_protect_signal(msg_data):
     )
 
     if not active_sl:
-        log.debug(f"[PROTECT] Нет активных SL для позиции {position.uid}")
+        log.info(f"[PROTECT] Нет активных SL для позиции {position.uid}")
         return
 
     sl = active_sl[0]
@@ -108,7 +108,7 @@ async def handle_reverse_signal(msg_data):
 
     position = position_registry.get((strategy_id, symbol))
     if not position:
-        log.debug(f"[REVERSE] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
+        log.info(f"[REVERSE] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
         return
 
     # 🔍 Находим активный TP (source может быть price или signal)
@@ -123,7 +123,7 @@ async def handle_reverse_signal(msg_data):
     )
 
     if not active_tp:
-        log.debug(f"[REVERSE] Нет активных TP для позиции {position.uid}")
+        log.info(f"[REVERSE] Нет активных TP для позиции {position.uid}")
         return
 
     tp = active_tp[0]
@@ -131,10 +131,10 @@ async def handle_reverse_signal(msg_data):
 
     # 🧭 Выбор пути: SL-защита или закрытие с реверсом
     if tp_source == "price":
-        log.debug(f"[REVERSE] Активный TP через цену → route: protect")
+        log.info(f"[REVERSE] Активный TP через цену → route: protect")
         await handle_protect_signal({**msg_data, "is_reverse": True})  # передаём флаг логически
     elif tp_source == "signal":
-        log.debug(f"[REVERSE] Активный TP со стороны сигнала → route: full_reverse_stop")
+        log.info(f"[REVERSE] Активный TP со стороны сигнала → route: full_reverse_stop")
         from position_handler import full_reverse_stop
         await full_reverse_stop(position, msg_data)
     else:
@@ -145,6 +145,8 @@ async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
     route = msg_data.get("route")
     strategy_id = int(msg_data.get("strategy_id"))
     symbol = msg_data.get("symbol")
+
+    log.info(f"[ROUTER] Начало обработки: symbol={symbol}, strategy={strategy_id}, route={route}")
 
     if route == "new_entry":
         strategy_name = config.strategies[strategy_id]["meta"]["name"]
@@ -157,12 +159,15 @@ async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
         result = strategy_obj.run(msg_data, context)
         if asyncio.iscoroutine(result):
             await result
+        log.info(f"[ROUTER] Обработка завершена: new_entry {symbol} ({strategy_id})")
 
     elif route == "protect":
         await handle_protect_signal(msg_data)
+        log.info(f"[ROUTER] Обработка завершена: protect {symbol} ({strategy_id})")
 
     elif route == "reverse":
         await handle_reverse_signal(msg_data)
+        log.info(f"[ROUTER] Обработка завершена: reverse {symbol} ({strategy_id})")
 
     elif route == "ignore":
         pass  # уже обработано ранее
@@ -192,8 +197,10 @@ async def run_signal_loop(strategy_registry):
                 for msg_id, msg_data in messages:
                     last_id = msg_id
 
-                    strategy_id = int(msg_data.get("strategy_id"))
-                    signal_id = int(msg_data.get("signal_id"))
+                    log.info(f"[SIGNAL_LOOP] 📨 Сигнал из потока: {msg_data}")
+
+                    strategy_id = int(msg_data.get("strategy_id", 0) or 0)
+                    signal_id = int(msg_data.get("signal_id", 0) or 0)
                     symbol = msg_data.get("symbol")
                     direction = msg_data.get("direction")
                     time = msg_data.get("time")
@@ -240,7 +247,7 @@ async def run_signal_loop(strategy_registry):
                                     note = "отклонено стратегией: validate_signal() = False"
 
                     if route == "ignore":
-                        log.debug(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
+                        log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
 
                         if note is not None:
                             log_record = {
@@ -254,18 +261,18 @@ async def run_signal_loop(strategy_registry):
 
                             await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
                     else:
-                        log.debug(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
+                        log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
-                    # 🔸 Если есть активная позиция, сохраняем её id для маршрутов protect/reverse
-                    key = (strategy_id, symbol)
-                    position = position_registry.get(key)
-                    if position:
-                        msg_data["position_uid"] = position.uid
+                        # 🔸 Если есть активная позиция, сохраняем её id для маршрутов protect/reverse
+                        key = (strategy_id, symbol)
+                        position = position_registry.get(key)
+                        if position:
+                            msg_data["position_uid"] = position.uid
 
-                    # 🔸 Диспетчеризация маршрута обработки
-                    msg_data["route"] = route
-                    await route_and_dispatch_signal(msg_data, strategy_registry, redis)
-                            
+                        # 🔸 Диспетчеризация маршрута обработки
+                        msg_data["route"] = route
+                        await route_and_dispatch_signal(msg_data, strategy_registry, redis)
+
         except Exception as e:
             log.exception("❌ Ошибка при чтении из Redis — повтор через 5 секунд")
             await asyncio.sleep(5)

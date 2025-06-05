@@ -130,10 +130,10 @@ async def check_tp(position):
     position.close_reason = f"tp-{tp_level}-hit"
     position.pnl += pnl_gain
 
-    log.info(
+    log.debug(
         f"🎯 TP сработал: позиция {position.uid} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
     )
-    log.info(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
+    log.debug(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
 
     # 🔄 Применение SL-политики после TP
     strategy = config.strategies.get(position.strategy_id)
@@ -204,9 +204,9 @@ async def check_tp(position):
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
                 set_field(sl, "canceled", True)
                 sl_level = get_field(sl, "level")
-                log.info(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
+                log.debug(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
 
-        log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
+        log.debug(f"✅ Позиция {position.uid} полностью закрыта по TP")
 
         # Удаление позиции из памяти
         del position_registry[(position.strategy_id, position.symbol)]
@@ -264,7 +264,7 @@ async def check_sl(position):
         if not get_field(tp, "hit") and not get_field(tp, "canceled"):
             set_field(tp, "canceled", True)
             tp_level = get_field(tp, "level")
-            log.info(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
+            log.debug(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
 
     # Закрытие позиции
     qty = get_field(sl, "quantity")
@@ -284,10 +284,10 @@ async def check_sl(position):
     else:
         position.close_reason = "sl-tp-hit"
 
-    log.info(
+    log.debug(
         f"🛑 SL сработал: позиция {position.uid} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
     )
-    log.info(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
+    log.debug(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
 
     # Удаление позиции из памяти
     del position_registry[(position.strategy_id, position.symbol)]
@@ -312,7 +312,7 @@ async def full_protect_stop(position, *, is_reverse: bool = False):
                 set_field(t, "canceled", True)
                 t_type = get_field(t, "type")
                 t_level = get_field(t, "level")
-                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+                log.debug(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
 
         # Расчёт PnL
         qty = position.quantity_left
@@ -357,7 +357,7 @@ async def raise_sl_to_entry(position, sl):
         # Отмена текущего SL
         set_field(sl, "canceled", True)
         sl_level = get_field(sl, "level")
-        log.info(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
+        log.debug(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
 
         # Создание нового SL на уровне entry
         entry_price = position.entry_price
@@ -379,7 +379,7 @@ async def raise_sl_to_entry(position, sl):
         # Обнуление запланированного риска
         position.planned_risk = Decimal("0")
 
-        log.info(
+        log.debug(
             f"🛡️ SL перенесён на entry: позиция {position.uid} | новая цена {entry_price:.8f} | уровень {max_level + 1}"
         )
 
@@ -404,7 +404,7 @@ async def full_reverse_stop(position, msg_data):
                 set_field(t, "canceled", True)
                 t_type = get_field(t, "type")
                 t_level = get_field(t, "level")
-                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+                log.debug(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
 
         # Расчёт PnL
         qty = position.quantity_left
