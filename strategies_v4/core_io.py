@@ -201,6 +201,11 @@ async def reverse_entry(payload: dict):
 
         log_id = row["log_id"]
         closed_at = row["closed_at"]
+
+        if closed_at is None:
+            closed_at = datetime.utcnow()
+            log.warning(f"[REVERSE_ENTRY] closed_at был None — заменён на now(): {closed_at.isoformat()}")
+
         log.info(f"[REVERSE_ENTRY] closed_at={closed_at}, log_id={log_id}")
 
         # Получаем все нужные поля напрямую из signals_v4_log

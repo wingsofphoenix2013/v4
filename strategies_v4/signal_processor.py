@@ -247,7 +247,10 @@ async def run_signal_loop(strategy_registry):
                                     note = "отклонено стратегией: validate_signal() = False"
 
                     if route == "ignore":
-                        log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
+                        if note is None:
+                            log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason=handled by strategy")
+                        else:
+                            log.info(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
 
                         if note is not None:
                             log_record = {
