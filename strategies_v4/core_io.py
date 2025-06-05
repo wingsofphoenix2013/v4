@@ -185,6 +185,8 @@ async def reverse_entry(payload: dict):
     redis = infra.redis_client
     pool = infra.pg_pool
 
+    log.info(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
+
     async with pool.acquire() as conn:
         # Получаем log_id и закрытие позиции
         row = await conn.fetchrow("""
@@ -194,11 +196,12 @@ async def reverse_entry(payload: dict):
         """, position_uid)
 
         if not row:
-            log.warning(f"[REVERSE_ENTRY] Позиция {position_uid} не найдена в БД")
+            log.warning(f"[REVERSE_ENTRY] Позиция {position_uid} не найдена в БД — выход")
             return
 
         log_id = row["log_id"]
         closed_at = row["closed_at"]
+        log.info(f"[REVERSE_ENTRY] closed_at={closed_at}, log_id={log_id}")
 
         # Получаем raw_message исходного сигнала
         origin = await conn.fetchrow("""
@@ -208,13 +211,13 @@ async def reverse_entry(payload: dict):
         """, log_id)
 
         if not origin:
-            log.warning(f"[REVERSE_ENTRY] log_id {log_id} не найден в signals_v4_log")
+            log.warning(f"[REVERSE_ENTRY] log_id {log_id} не найден в signals_v4_log — выход")
             return
 
         try:
             original_data = json.loads(origin["raw_message"])
         except Exception as e:
-            log.warning(f"[REVERSE_ENTRY] Ошибка парсинга raw_message: {e}")
+            log.warning(f"[REVERSE_ENTRY] Ошибка парсинга raw_message: {e} — выход")
             return
 
         symbol = original_data.get("symbol")
@@ -222,8 +225,10 @@ async def reverse_entry(payload: dict):
         signal_id = original_data.get("signal_id")
 
         if not all([symbol, direction, signal_id]):
-            log.warning(f"[REVERSE_ENTRY] Недостаточно данных в raw_message: {original_data}")
+            log.warning(f"[REVERSE_ENTRY] Недостаточно данных в raw_message: {original_data} — выход")
             return
+
+        log.info(f"[REVERSE_ENTRY] Ищем противоположный сигнал: symbol={symbol}, direction={direction}, signal_id={signal_id}")
 
         # Ищем противоположный сигнал до закрытия позиции
         opposite = await conn.fetchrow("""
@@ -239,10 +244,11 @@ async def reverse_entry(payload: dict):
         """, symbol, direction, signal_id, closed_at)
 
         if not opposite:
-            log.warning(f"[REVERSE_ENTRY] Нет сигнала противоположного направления для {symbol} до {closed_at}")
+            log.warning(f"[REVERSE_ENTRY] Нет сигнала противоположного направления для {symbol} до {closed_at} — выход")
             return
 
         raw_msg = opposite["raw_message"]
+        log.info(f"[REVERSE_ENTRY] Найден сигнал: {raw_msg[:200]}...")  # лог первых 200 символов для контекста
 
         # Публикация в signals_stream
         try:
