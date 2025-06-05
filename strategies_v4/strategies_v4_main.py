@@ -9,7 +9,7 @@ from signal_processor import run_signal_loop
 from position_handler import run_position_monitor_loop
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state, position_registry
-from core_io import run_signal_log_writer, run_position_writer, run_position_update_writer
+from core_io import run_signal_log_writer, run_position_writer, run_position_update_writer, run_reverse_trigger_loop
 from position_opener import run_position_opener_loop
 
 # 🔸 Логгер для главного процесса
@@ -45,7 +45,8 @@ async def main():
         run_safe_loop(lambda: run_position_opener_loop(), "POSITION_OPENER"),
         run_safe_loop(lambda: run_position_writer(), "POSITION_WRITER"),
         run_safe_loop(run_position_monitor_loop, "POSITION_HANDLER"),
-        run_safe_loop(lambda: run_position_update_writer(), "POSITION_UPDATE_WRITER")
+        run_safe_loop(lambda: run_position_update_writer(), "POSITION_UPDATE_WRITER"),
+        run_safe_loop(lambda: run_reverse_trigger_loop(), "REVERSE_TRIGGER")
     )
 
 

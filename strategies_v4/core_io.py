@@ -341,3 +341,35 @@ async def run_position_update_writer():
         except Exception:
             log.exception("❌ [CORE_IO] Ошибка чтения из Redis Stream (positions_update_stream)")
             await asyncio.sleep(5)
+# 🔄 Воркер: обрабатывает задачи реверса из Redis Stream
+async def run_reverse_trigger_loop():
+    log.info("🌀 [CORE_IO] Запуск воркера реверса")
+
+    redis = infra.redis_client
+    last_id = "$"
+
+    while True:
+        try:
+            response = await redis.xread(
+                streams={"reverse_trigger_stream": last_id},
+                count=10,
+                block=1000
+            )
+
+            if not response:
+                continue
+
+            for _, messages in response:
+                for msg_id, msg_data in messages:
+                    last_id = msg_id
+                    try:
+                        payload = json.loads(msg_data["data"])
+                        position_uid = payload["position_uid"]
+                        log.info(f"[REVERSE_TRIGGER] Получен UID позиции: {position_uid}")
+                        await reverse_entry({"position_uid": position_uid})
+                    except Exception as e:
+                        log.warning(f"[REVERSE_TRIGGER] Ошибка обработки задачи: {e}")
+
+        except Exception:
+            log.exception("❌ [REVERSE_TRIGGER] Ошибка чтения из Redis Stream")
+            await asyncio.sleep(5)

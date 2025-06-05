@@ -337,10 +337,15 @@ async def full_protect_stop(position, *, is_reverse: bool = False):
         # Удаление из памяти
         del position_registry[(position.strategy_id, position.symbol)]
 
-        # 🔁 Если запущено из реверса — инициировать реверс
+        # 🔁 Если запущено из реверса — поставить задачу в Redis Stream
         if is_reverse:
-            from core_io import reverse_entry
-            await reverse_entry({"position_uid": position.uid})
+            try:
+                await redis.xadd("reverse_trigger_stream", {
+                    "data": json.dumps({"position_uid": position.uid})
+                })
+                log.info(f"[REVERSE_TRIGGER] Поставлена задача реверса: {position.uid}")
+            except Exception as e:
+                log.warning(f"[REVERSE_TRIGGER] Не удалось записать задачу реверса: {e}")
                                 
 # 🔸 Перемещение SL на уровень entry (для SL-защиты)
 async def raise_sl_to_entry(position, sl):
@@ -424,6 +429,11 @@ async def full_reverse_stop(position, msg_data):
         # Удаление из памяти
         del position_registry[(position.strategy_id, position.symbol)]
 
-        # 🔁 Инициируем реверс
-        from core_io import reverse_entry
-        await reverse_entry({"position_uid": position.uid})
+        # 🔁 Отложенная задача реверса через Redis Stream
+        try:
+            await redis.xadd("reverse_trigger_stream", {
+                "data": json.dumps({"position_uid": position.uid})
+            })
+            log.info(f"[REVERSE_TRIGGER] Поставлена задача реверса: {position.uid}")
+        except Exception as e:
+            log.warning(f"[REVERSE_TRIGGER] Не удалось записать задачу реверса: {e}")
