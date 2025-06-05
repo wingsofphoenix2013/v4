@@ -9,6 +9,7 @@ from decimal import Decimal
 from infra import infra
 from position_state_loader import position_registry
 from config_loader import config
+from position_state_loader import Target
 
 # 🔸 Логгер для обработчика позиций
 log = logging.getLogger("POSITION_HANDLER")
@@ -22,14 +23,14 @@ async def push_position_update(position, redis):
     def serialize_targets(targets):
         return [
             {
-                "level": t["level"],
-                "price": str(t["price"]) if t["price"] is not None else None,
-                "quantity": str(t["quantity"]),
-                "type": t["type"],
-                "hit": bool(t["hit"]),
-                "hit_at": t["hit_at"].isoformat() if t["hit_at"] else None,
-                "canceled": bool(t["canceled"]),
-                "source": t.get("source", "price")
+                "level": int(get_field(t, "level")),
+                "price": str(get_field(t, "price")) if get_field(t, "price") is not None else None,
+                "quantity": str(get_field(t, "quantity")),
+                "type": get_field(t, "type"),
+                "hit": bool(get_field(t, "hit")),
+                "hit_at": get_field(t, "hit_at").isoformat() if get_field(t, "hit_at") else None,
+                "canceled": bool(get_field(t, "canceled")),
+                "source": get_field(t, "source", "price")
             }
             for t in targets
         ]
@@ -101,7 +102,7 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = int(get_field(tp, "level"))
 
-    log.debug(
+    log.info(
         f"[TP-CHECK] Позиция symbol={position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
     )
 
@@ -115,8 +116,8 @@ async def check_tp(position):
     entry_price = position.entry_price
     pnl_gain = (tp_price - entry_price) * qty if position.direction == "long" else (entry_price - tp_price) * qty
 
-    tp["hit"] = True
-    tp["hit_at"] = datetime.utcnow()
+    set_field(tp, "hit", True)
+    set_field(tp, "hit_at", datetime.utcnow())
 
     position.quantity_left -= qty
     position.planned_risk = Decimal("0")
@@ -130,7 +131,7 @@ async def check_tp(position):
 
     # 🔄 Применение SL-политики после TP
     strategy = config.strategies.get(position.strategy_id)
-    level_to_id = {int(lvl["level"]): lvl["id"] for lvl in strategy.get("tp_levels", [])}
+    level_to_id = {int(get_field(lvl, "level")): get_field(lvl, "id") for lvl in strategy.get("tp_levels", [])}
     tp_level_id = level_to_id.get(tp_level)
 
     if not tp_level_id:
@@ -145,7 +146,7 @@ async def check_tp(position):
         # Отмена текущих SL целей
         for sl in position.sl_targets:
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
-                sl["canceled"] = True
+                set_field(sl, "canceled", True)
 
         # Расчёт новой SL цены
         sl_mode = sl_policy["sl_mode"]
@@ -171,18 +172,18 @@ async def check_tp(position):
 
         # Добавление новой SL цели
         max_level = max((get_field(sl, "level", 0) for sl in position.sl_targets), default=0)
-        position.sl_targets.append({
-            "level": max_level + 1,
-            "price": new_sl_price,
-            "quantity": position.quantity_left,
-            "type": "sl",
-            "source": "price",
-            "hit": False,
-            "hit_at": None,
-            "canceled": False
-        })
+        position.sl_targets.append(Target(
+            type="sl",
+            level=max_level + 1,
+            price=new_sl_price,
+            quantity=position.quantity_left,
+            hit=False,
+            hit_at=None,
+            canceled=False,
+            source="price"
+        ))
 
-        log.info(
+        log.debug(
             f"🛡️ Новый SL создан: позиция {position.uid} | цена {new_sl_price:.8f} | режим {sl_mode} | уровень {max_level + 1}"
         )
 
@@ -195,7 +196,7 @@ async def check_tp(position):
         # Отмена всех активных SL целей
         for sl in position.sl_targets:
             if not get_field(sl, "hit") and not get_field(sl, "canceled"):
-                sl["canceled"] = True
+                set_field(sl, "canceled", True)
                 sl_level = get_field(sl, "level")
                 log.info(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
 
@@ -206,6 +207,7 @@ async def check_tp(position):
 
     # Отправка обновления в Redis
     await push_position_update(position, redis)
+
 # 🔸 Обработка SL-уровня позиции (по цене)
 async def check_sl(position):
     active_sl = sorted(
@@ -234,7 +236,7 @@ async def check_sl(position):
     sl_price = get_field(sl, "price")
     sl_level = get_field(sl, "level")
 
-    log.debug(
+    log.info(
         f"[SL-CHECK] Позиция symbol={position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
     )
 
@@ -248,13 +250,13 @@ async def check_sl(position):
         return
 
     # SL сработал
-    sl["hit"] = True
-    sl["hit_at"] = datetime.utcnow()
+    set_field(sl, "hit", True)
+    set_field(sl, "hit_at", datetime.utcnow())
 
     # Отмена всех активных TP целей
     for tp in position.tp_targets:
         if not get_field(tp, "hit") and not get_field(tp, "canceled"):
-            tp["canceled"] = True
+            set_field(tp, "canceled", True)
             tp_level = get_field(tp, "level")
             log.info(f"⚠️ TP отменён: позиция {position.uid} | уровень {tp_level}")
 
@@ -286,9 +288,9 @@ async def check_sl(position):
 
     # Отправка обновления в Redis
     await push_position_update(position, redis)
-
+    
 # 🔸 Принудительное закрытие позиции по SL-защите (protect)
-async def full_protect_stop(position):
+async def full_protect_stop(position, *, is_reverse: bool = False):
     async with position.lock:
         redis = infra.redis_client
         mark_str = await redis.get(f"price:{position.symbol}")
@@ -301,7 +303,7 @@ async def full_protect_stop(position):
         # Отмена всех TP и SL целей
         for t in position.tp_targets + position.sl_targets:
             if not get_field(t, "hit") and not get_field(t, "canceled"):
-                t["canceled"] = True
+                set_field(t, "canceled", True)
                 t_type = get_field(t, "type")
                 t_level = get_field(t, "level")
                 log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
@@ -309,10 +311,7 @@ async def full_protect_stop(position):
         # Расчёт PnL
         qty = position.quantity_left
         entry_price = position.entry_price
-        if position.direction == "long":
-            pnl = (mark - entry_price) * qty
-        else:
-            pnl = (entry_price - mark) * qty
+        pnl = (mark - entry_price) * qty if position.direction == "long" else (entry_price - mark) * qty
 
         # Закрытие позиции
         position.status = "closed"
@@ -323,28 +322,29 @@ async def full_protect_stop(position):
         position.quantity_left = Decimal("0")
         position.pnl += pnl
 
-        log.info(
-            f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}"
-        )
-        log.info(
-            f"✅ Позиция {position.uid} закрыта через защиту SL: статус={position.status}, причина={position.close_reason}"
-        )
+        log.info(f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}")
+        log.info(f"✅ Позиция {position.uid} закрыта через защиту SL: статус={position.status}, причина={position.close_reason}")
 
         # Отправка в Redis
         await push_position_update(position, redis)
 
         # Удаление из памяти
         del position_registry[(position.strategy_id, position.symbol)]
-        
+
+        # 🔁 Если запущено из реверса — инициировать реверс
+        if is_reverse:
+            from core_io import reverse_entry
+            await reverse_entry({"position_uid": position.uid})
+                                
 # 🔸 Перемещение SL на уровень entry (для SL-защиты)
 async def raise_sl_to_entry(position, sl):
     async with position.lock:
         if get_field(sl, "hit") or get_field(sl, "canceled"):
-            log.info(f"[PROTECT] SL уже неактивен: позиция {position.uid} | уровень {get_field(sl, 'level')}")
+            log.debug(f"[PROTECT] SL уже неактивен: позиция {position.uid} | уровень {get_field(sl, 'level')}")
             return
 
         # Отмена текущего SL
-        sl["canceled"] = True
+        set_field(sl, "canceled", True)
         sl_level = get_field(sl, "level")
         log.info(f"⚠️ SL отменён для переноса: позиция {position.uid} | уровень {sl_level}")
 
@@ -354,16 +354,16 @@ async def raise_sl_to_entry(position, sl):
 
         max_level = max((get_field(t, "level", 0) for t in position.sl_targets), default=0)
 
-        position.sl_targets.append({
-            "level": max_level + 1,
-            "price": entry_price,
-            "quantity": qty,
-            "type": "sl",
-            "source": "price",
-            "hit": False,
-            "hit_at": None,
-            "canceled": False
-        })
+        position.sl_targets.append(Target(
+            type="sl",
+            level=max_level + 1,
+            price=entry_price,
+            quantity=qty,
+            hit=False,
+            hit_at=None,
+            canceled=False,
+            source="price"
+        ))
 
         # Обнуление запланированного риска
         position.planned_risk = Decimal("0")
@@ -375,3 +375,49 @@ async def raise_sl_to_entry(position, sl):
         # Отправка обновления в Redis
         redis = infra.redis_client
         await push_position_update(position, redis)
+        
+# 🔸 Принудительное закрытие позиции по TP/сигнальному реверсу
+async def full_reverse_stop(position, msg_data):
+    async with position.lock:
+        redis = infra.redis_client
+        mark_str = await redis.get(f"price:{position.symbol}")
+        if not mark_str:
+            log.warning(f"[REVERSE] Позиция {position.uid}: не удалось получить цену markprice")
+            return
+
+        mark = Decimal(mark_str)
+
+        # Отмена всех TP и SL целей
+        for t in position.tp_targets + position.sl_targets:
+            if not get_field(t, "hit") and not get_field(t, "canceled"):
+                set_field(t, "canceled", True)
+                t_type = get_field(t, "type")
+                t_level = get_field(t, "level")
+                log.info(f"⚠️ {t_type.upper()} отменён: позиция {position.uid} | уровень {t_level}")
+
+        # Расчёт PnL
+        qty = position.quantity_left
+        entry_price = position.entry_price
+        pnl = (mark - entry_price) * qty if position.direction == "long" else (entry_price - mark) * qty
+
+        # Закрытие позиции
+        position.status = "closed"
+        position.exit_price = mark
+        position.closed_at = datetime.utcnow()
+        position.close_reason = "tp-signal-stop"
+        position.planned_risk = Decimal("0")
+        position.quantity_left = Decimal("0")
+        position.pnl += pnl
+
+        log.info(f"🛑 Реверсное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}")
+        log.info(f"✅ Позиция {position.uid} закрыта через reverse: статус={position.status}, причина={position.close_reason}")
+
+        # Отправка в Redis
+        await push_position_update(position, redis)
+
+        # Удаление из памяти
+        del position_registry[(position.strategy_id, position.symbol)]
+
+        # 🔁 Инициируем реверс
+        from core_io import reverse_entry
+        await reverse_entry({"position_uid": position.uid})

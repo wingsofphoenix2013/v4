@@ -143,7 +143,7 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
         total_allocated = Decimal("0")
 
         for i, level in enumerate(tp_levels):
-            volume_percent = Decimal(level["volume_percent"])
+            volume_percent = Decimal(get_field(level, "volume_percent"))
             if i < len(tp_levels) - 1:
                 qty = (quantity * volume_percent / 100).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN)
                 total_allocated += qty
@@ -152,17 +152,17 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
             tp_targets.append(Target(
                 type="tp",
-                level=level["level"],
+                level=get_field(level, "level"),
                 price=tp_prices[i],
                 quantity=qty,
                 hit=False,
                 hit_at=None,
                 canceled=False,
-                source="signal" if level["tp_type"] == "signal" else "price"
+                source="signal" if get_field(level, "tp_type") == "signal" else "price"
             ))
 
-            log.debug(f"🎯 [POSITION_OPENER] TP{level['level']}: price={tp_prices[i]} quantity={qty}")
-
+            log.debug(f"🎯 [POSITION_OPENER] TP{get_field(level, 'level')}: price={tp_prices[i]} quantity={qty}")
+            
         return {
             "route": route,
             "quantity": quantity,
@@ -212,11 +212,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     position_uid = str(uuid.uuid4())
 
     # 🔹 Логирование итогов расчета
-    log.debug(
-        f"✅ [POSITION_OPENER] Открытие позиции: "
-        f"strategy={signal['strategy_id']} symbol={signal['symbol']} "
-        f"qty={result['quantity']} price={result['entry_price']} uid={position_uid}"
-    )
+    log.debug(f"✅ [POSITION_OPENER] Открытие позиции: strategy={signal['strategy_id']} symbol={signal['symbol']} qty={get_field(result, 'quantity')} price={get_field(result, 'entry_price')} uid={position_uid}")
 
     # 🔹 Логирование SL и TP
     stop_price = result["stop_loss_price"]
@@ -227,7 +223,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         log.debug(f"🎯 [POSITION_OPENER] TP{i}: {tp}")
 
     # 🔹 Расчёт комиссии и PnL
-    notional = result["entry_price"] * result["quantity"]
+    notional = get_field(result, "entry_price") * get_field(result, "quantity")
     fee = notional * Decimal("0.001")
     pnl = -fee
 
@@ -237,23 +233,23 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         strategy_id=int(signal["strategy_id"]),
         symbol=signal["symbol"],
         direction=signal["direction"],
-        entry_price=result["entry_price"],
-        quantity=result["quantity"],
-        quantity_left=result["quantity"],
+        entry_price=get_field(result, "entry_price"),
+        quantity=get_field(result, "quantity"),
+        quantity_left=get_field(result, "quantity"),
         status="open",
         created_at=datetime.utcnow(),
         exit_price=None,
         closed_at=None,
         close_reason="в работе",
         pnl=pnl,
-        planned_risk=result["planned_risk"],
+        planned_risk=get_field(result, "planned_risk"),
         route=signal["route"],
-        tp_targets=result["tp_targets"],
+        tp_targets=get_field(result, "tp_targets"),
         sl_targets=[Target(
             type="sl",
             level=1,
-            price=result["stop_loss_price"],
-            quantity=result["quantity"],
+            price=get_field(result, "stop_loss_price"),
+            quantity=get_field(result, "quantity"),
             hit=False,
             hit_at=None,
             canceled=False,
@@ -363,8 +359,7 @@ async def run_position_opener_loop():
                             log.debug(f"🚫 [POSITION_OPENER] Команда отклонена: {reason}")
 
                         elif result.get("status") == "opened":
-                            log.debug(f"📥 [POSITION_OPENER] Позиция открыта: "
-                                     f"qty={result['quantity']} price={result['entry_price']}")
+                            log.debug(f"📥 [POSITION_OPENER] Позиция открыта: qty={get_field(result, 'quantity')} price={get_field(result, 'entry_price')}")
 
                     except Exception as e:
                         log.warning(f"⚠️ [POSITION_OPENER] Ошибка обработки команды: {e}")

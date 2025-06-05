@@ -13,6 +13,16 @@ log = logging.getLogger("CORE_IO")
 SIGNAL_LOG_STREAM = "signal_log_queue"
 POSITIONS_STREAM = "positions_stream"
 
+# 📌 Универсальный доступ к полям TP/SL цели
+def get_field(obj, field, default=None):
+    return obj.get(field, default) if isinstance(obj, dict) else getattr(obj, field, default)
+
+def set_field(obj, field, value):
+    if isinstance(obj, dict):
+        obj[field] = value
+    else:
+        setattr(obj, field, value)
+        
 # 🔸 Запись лога сигнала
 async def write_log_entry(pool, record: dict):
     query = """
@@ -81,14 +91,14 @@ async def write_position_and_targets(pool, record: dict):
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                     """,
                     record["position_uid"],
-                    target["type"],
-                    int(target["level"]),
-                    Decimal(target["price"]) if target["price"] is not None else None,
-                    Decimal(target["quantity"]),
-                    target["hit"],
-                    datetime.fromisoformat(target["hit_at"]) if target["hit_at"] else None,
-                    target["canceled"],
-                    target["source"]
+                    get_field(target, "type"),
+                    int(get_field(target, "level")),
+                    Decimal(get_field(target, "price")) if get_field(target, "price") is not None else None,
+                    Decimal(get_field(target, "quantity")),
+                    get_field(target, "hit"),
+                    datetime.fromisoformat(get_field(target, "hit_at")) if get_field(target, "hit_at") else None,
+                    get_field(target, "canceled"),
+                    get_field(target, "source")
                 )
 
             await tx.commit()
@@ -137,12 +147,12 @@ async def update_position_and_targets(pool, record: dict):
                         canceled = $3
                     WHERE position_uid = $4 AND level = $5 AND type = $6
                     """,
-                    target["hit"],
-                    datetime.fromisoformat(target["hit_at"]) if target.get("hit_at") else None,
-                    target["canceled"],
+                    get_field(target, "hit"),
+                    datetime.fromisoformat(get_field(target, "hit_at")) if get_field(target, "hit_at") else None,
+                    get_field(target, "canceled"),
                     record["position_uid"],
-                    int(target["level"]),
-                    target["type"]
+                    int(get_field(target, "level")),
+                    get_field(target, "type")
                 )
 
                 if result == "UPDATE 0":
@@ -154,14 +164,14 @@ async def update_position_and_targets(pool, record: dict):
                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                         """,
                         record["position_uid"],
-                        target["type"],
-                        int(target["level"]),
-                        Decimal(target["price"]) if target.get("price") is not None else None,
-                        Decimal(target["quantity"]),
-                        target["hit"],
-                        datetime.fromisoformat(target["hit_at"]) if target.get("hit_at") else None,
-                        target["canceled"],
-                        target["source"]
+                        get_field(target, "type"),
+                        int(get_field(target, "level")),
+                        Decimal(get_field(target, "price")) if get_field(target, "price") is not None else None,
+                        Decimal(get_field(target, "quantity")),
+                        get_field(target, "hit"),
+                        datetime.fromisoformat(get_field(target, "hit_at")) if get_field(target, "hit_at") else None,
+                        get_field(target, "canceled"),
+                        get_field(target, "source")
                     )
 
             await tx.commit()
@@ -169,6 +179,77 @@ async def update_position_and_targets(pool, record: dict):
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка обновления позиции: {e}")
+# 🔸 Повторная активация сигнала реверса через signals_stream
+async def reverse_entry(payload: dict):
+    position_uid = payload["position_uid"]
+    redis = infra.redis_client
+    pool = infra.pg_pool
+
+    async with pool.acquire() as conn:
+        # Получаем log_id и закрытие позиции
+        row = await conn.fetchrow("""
+            SELECT log_id, strategy_id, closed_at
+            FROM positions_v4
+            WHERE position_uid = $1
+        """, position_uid)
+
+        if not row:
+            log.warning(f"[REVERSE_ENTRY] Позиция {position_uid} не найдена в БД")
+            return
+
+        log_id = row["log_id"]
+        closed_at = row["closed_at"]
+
+        # Получаем raw_message исходного сигнала
+        origin = await conn.fetchrow("""
+            SELECT raw_message
+            FROM signals_v4_log
+            WHERE id = $1
+        """, log_id)
+
+        if not origin:
+            log.warning(f"[REVERSE_ENTRY] log_id {log_id} не найден в signals_v4_log")
+            return
+
+        try:
+            original_data = json.loads(origin["raw_message"])
+        except Exception as e:
+            log.warning(f"[REVERSE_ENTRY] Ошибка парсинга raw_message: {e}")
+            return
+
+        symbol = original_data.get("symbol")
+        direction = original_data.get("direction")
+        signal_id = original_data.get("signal_id")
+
+        if not all([symbol, direction, signal_id]):
+            log.warning(f"[REVERSE_ENTRY] Недостаточно данных в raw_message: {original_data}")
+            return
+
+        # Ищем противоположный сигнал до закрытия позиции
+        opposite = await conn.fetchrow("""
+            SELECT raw_message
+            FROM signals_v4_log
+            WHERE
+                symbol = $1 AND
+                direction != $2 AND
+                signal_id = $3 AND
+                bar_time <= $4
+            ORDER BY bar_time DESC
+            LIMIT 1
+        """, symbol, direction, signal_id, closed_at)
+
+        if not opposite:
+            log.warning(f"[REVERSE_ENTRY] Нет сигнала противоположного направления для {symbol} до {closed_at}")
+            return
+
+        raw_msg = opposite["raw_message"]
+
+        # Публикация в signals_stream
+        try:
+            await redis.xadd("signals_stream", {"data": raw_msg})
+            log.info(f"📨 [REVERSE_ENTRY] Сигнал отправлен в signals_stream для {symbol}")
+        except Exception as e:
+            log.warning(f"[REVERSE_ENTRY] Ошибка отправки в Redis: {e}")
 # 🔸 Чтение логов сигналов
 async def run_signal_log_writer():
     log.info("📝 [CORE_IO] Запуск логгера сигналов")

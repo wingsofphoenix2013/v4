@@ -101,9 +101,44 @@ async def handle_protect_signal(msg_data):
         log.info(
             f"[PROTECT] SL уже на уровне entry или лучше: sl={sl_price}, entry={entry}, direction={position.direction} → ничего не делаем"
         )
-# 🔸 Обработчик сигнала реверса (заглушка)
+# 🔸 Обработчик сигнала реверса (reverse)
 async def handle_reverse_signal(msg_data):
-    log.debug(f"🔁 [REVERSE] Обработка сигнала реверса: strategy={msg_data.get('strategy_id')}, symbol={msg_data.get('symbol')}, position_uid={msg_data.get('position_uid')}")
+    strategy_id = int(msg_data.get("strategy_id"))
+    symbol = msg_data.get("symbol")
+
+    position = position_registry.get((strategy_id, symbol))
+    if not position:
+        log.debug(f"[REVERSE] Позиция не найдена: strategy={strategy_id}, symbol={symbol}")
+        return
+
+    # 🔍 Находим активный TP (source может быть price или signal)
+    active_tp = sorted(
+        [
+            t for t in position.tp_targets
+            if get_field(t, "type") == "tp"
+            and not get_field(t, "hit")
+            and not get_field(t, "canceled")
+        ],
+        key=lambda t: get_field(t, "level")
+    )
+
+    if not active_tp:
+        log.debug(f"[REVERSE] Нет активных TP для позиции {position.uid}")
+        return
+
+    tp = active_tp[0]
+    tp_source = get_field(tp, "source")
+
+    # 🧭 Выбор пути: SL-защита или закрытие с реверсом
+    if tp_source == "price":
+        log.debug(f"[REVERSE] Активный TP через цену → route: protect")
+        await handle_protect_signal({**msg_data, "is_reverse": True})  # передаём флаг логически
+    elif tp_source == "signal":
+        log.debug(f"[REVERSE] Активный TP со стороны сигнала → route: full_reverse_stop")
+        from position_handler import full_reverse_stop
+        await full_reverse_stop(position, msg_data)
+    else:
+        log.warning(f"[REVERSE] Неизвестный тип source в TP: {tp_source}")
 
 # 🔸 Диспетчер маршрутов: вызывает нужную обработку по route
 async def route_and_dispatch_signal(msg_data, strategy_registry, redis):
