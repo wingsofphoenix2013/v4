@@ -175,7 +175,7 @@ async def update_position_and_targets(pool, record: dict):
                     )
 
             await tx.commit()
-            log.info(f"💾 Обновление позиции завершено: uid={record['position_uid']}")
+            log.debug(f"💾 Обновление позиции завершено: uid={record['position_uid']}")
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка обновления позиции: {e}")
@@ -185,7 +185,7 @@ async def reverse_entry(payload: dict):
     redis = infra.redis_client
     pool = infra.pg_pool
 
-    log.info(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
+    log.debug(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
 
     async with pool.acquire() as conn:
         # Получаем log_id, closed_at и symbol из позиции
@@ -204,8 +204,22 @@ async def reverse_entry(payload: dict):
         symbol = row["symbol"]
 
         if closed_at is None:
-            closed_at = datetime.utcnow()
-            log.warning(f"[REVERSE_ENTRY] closed_at был None — заменён на now(): {closed_at.isoformat()}")
+            log.warning(f"[REVERSE_ENTRY] closed_at is None — ожидание 1 сек перед повторной попыткой")
+            await asyncio.sleep(1)
+
+            row_retry = await conn.fetchrow("""
+                SELECT closed_at
+                FROM positions_v4
+                WHERE position_uid = $1
+            """, position_uid)
+
+            closed_at = row_retry["closed_at"] if row_retry else None
+
+            if closed_at is None:
+                closed_at = datetime.utcnow()
+                log.warning(f"[REVERSE_ENTRY] closed_at всё ещё None — принудительно установлено now(): {closed_at.isoformat()}")
+            else:
+                log.debug(f"[REVERSE_ENTRY] closed_at успешно получен после ожидания: {closed_at.isoformat()}")
 
         # Получаем направление сигнала, открывшего позицию
         sig = await conn.fetchrow("""
@@ -249,12 +263,11 @@ async def reverse_entry(payload: dict):
             "received_at": received_at
         }
 
-        log.info(f"[REVERSE_ENTRY] 📤 Публикация сигнала в signals_stream: {json.dumps(new_signal)}")
+        log.debug(f"[REVERSE_ENTRY] 📤 Публикация сигнала в signals_stream: {json.dumps(new_signal)}")
 
         try:
-            # Отправка в Redis по полям, а не через data/json
             await redis.xadd("signals_stream", new_signal)
-            log.info(f"📨 [REVERSE_ENTRY] Контр-сигнал отправлен для {symbol}")
+            log.debug(f"📨 [REVERSE_ENTRY] Контр-сигнал отправлен для {symbol}")
         except Exception as e:
             log.warning(f"[REVERSE_ENTRY] Ошибка отправки в Redis: {e}")
 # 🔸 Чтение логов сигналов
@@ -372,7 +385,7 @@ async def run_reverse_trigger_loop():
                     try:
                         payload = json.loads(msg_data["data"])
                         position_uid = payload["position_uid"]
-                        log.info(f"[REVERSE_TRIGGER] Получен UID позиции: {position_uid}")
+                        log.debug(f"[REVERSE_TRIGGER] Получен UID позиции: {position_uid}")
                         await reverse_entry({"position_uid": position_uid})
                     except Exception as e:
                         log.warning(f"[REVERSE_TRIGGER] Ошибка обработки задачи: {e}")
