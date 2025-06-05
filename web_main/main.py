@@ -692,3 +692,10 @@ async def save_testsignal(request: Request):
 
     log.info(f"Тестовый сигнал записан: {symbol} | {message} | {mode}")
     return JSONResponse({"status": "ok"})
+@app.get("/trades", response_class=HTMLResponse)
+async def trades_page(request: Request):
+    return templates.TemplateResponse("trades.html", {
+        "request": request,
+        "strategies": [],  # пока пусто
+        "filter": "today"  # значение для шаблона (если используется)
+    })

@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Стратегии</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body {
+        background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
+      }
+    </style>
+  </head>
+  <body class="min-h-screen font-sans text-slate-800">
+    <!-- Верхнее меню навигации -->
+    <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
+      <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+        <h1 class="text-2xl font-semibold text-blue-900 tracking-wide">Торговый Движок v4</h1>
+        <nav class="space-x-4 text-sm font-medium text-slate-700">
+          <a href="/" class="hover:text-blue-600 transition-colors">Главная</a>
+          <a href="/tickers" class="hover:text-blue-600 transition-colors">Тикеры</a>
+          <a href="/indicators" class="hover:text-blue-600 transition-colors">Индикаторы</a>
+          <a href="/signals" class="hover:text-blue-600 transition-colors">Сигналы</a>
+          <a href="/strategies" class="hover:text-blue-600 transition-colors">Стратегии</a>
+          <a href="/trades" class="hover:text-blue-600 transition-colors">Торги</a>
+          <a href="/status" class="hover:text-blue-600 transition-colors">Статус</a>
+        </nav>
+      </div>
+    </header>
+<!-- Контейнер кнопок и таблицы -->
+<main class="max-w-7xl mx-auto px-4 py-10">
+
+  <!-- Панель кнопок фильтра -->
+  <div class="flex justify-start items-center mb-6 space-x-3">
+    <a href="#" class="px-4 py-2 bg-blue-600 text-white font-semibold rounded-lg shadow hover:bg-blue-700 transition">Сегодня</a>
+    <a href="#" class="px-4 py-2 bg-slate-200 text-slate-800 font-medium rounded-lg hover:bg-slate-300 transition">Вчера</a>
+    <a href="#" class="px-4 py-2 bg-slate-200 text-slate-800 font-medium rounded-lg hover:bg-slate-300 transition">7 дней</a>
+    <a href="#" class="px-4 py-2 bg-slate-200 text-slate-800 font-medium rounded-lg hover:bg-slate-300 transition">Всего</a>
+  </div>
+
+  <!-- Таблица активных стратегий -->
+  <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
+    <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+      <tr>
+        <th class="px-4 py-3">№</th>
+        <th class="px-4 py-3">Код</th>
+        <th class="px-4 py-3">Название стратегии</th>
+        <th class="px-4 py-3">Сделки</th>
+        <th class="px-4 py-3">Winrate</th>
+        <th class="px-4 py-3">ROI</th>
+      </tr>
+    </thead>
+    <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+      <tr>
+        <td class="px-4 py-3">1</td>
+        <td class="px-4 py-3 font-mono">STRAT001</td>
+        <td class="px-4 py-3">
+          <a href="/trades/1" class="text-blue-600 hover:underline">Лонг BTC (дневной)</a>
+        </td>
+        <td class="px-4 py-3">3/7</td>
+        <td class="px-4 py-3 text-green-600">71.4%</td>
+        <td class="px-4 py-3 text-green-600">+12.3%</td>
+      </tr>
+      <tr>
+        <td class="px-4 py-3">2</td>
+        <td class="px-4 py-3 font-mono">STRAT002</td>
+        <td class="px-4 py-3">
+          <a href="/trades/2" class="text-blue-600 hover:underline">Short ETH (часовой)</a>
+        </td>
+        <td class="px-4 py-3">1/4</td>
+        <td class="px-4 py-3 text-red-600">25.0%</td>
+        <td class="px-4 py-3 text-red-600">−5.8%</td>
+      </tr>
+      <tr>
+        <td class="px-4 py-3">3</td>
+        <td class="px-4 py-3 font-mono">STRAT003</td>
+        <td class="px-4 py-3">
+          <a href="/trades/3" class="text-blue-600 hover:underline">Флет USDT</a>
+        </td>
+        <td class="px-4 py-3">0/0</td>
+        <td class="px-4 py-3">N/A</td>
+        <td class="px-4 py-3">N/A</td>
+      </tr>
+      <tr>
+        <td class="px-4 py-3">4</td>
+        <td class="px-4 py-3 font-mono">STRAT004</td>
+        <td class="px-4 py-3">
+          <a href="/trades/4" class="text-blue-600 hover:underline">DCA DOGE</a>
+        </td>
+        <td class="px-4 py-3">2/5</td>
+        <td class="px-4 py-3 text-green-600">60.0%</td>
+        <td class="px-4 py-3 text-green-600">+4.1%</td>
+      </tr>
+      <tr>
+        <td class="px-4 py-3">5</td>
+        <td class="px-4 py-3 font-mono">STRAT005</td>
+        <td class="px-4 py-3">
+          <a href="/trades/5" class="text-blue-600 hover:underline">Scalp SOL</a>
+        </td>
+        <td class="px-4 py-3">1/6</td>
+        <td class="px-4 py-3 text-red-600">16.7%</td>
+        <td class="px-4 py-3 text-red-600">−10.2%</td>
+      </tr>
+      <tr>
+        <td class="px-4 py-3">6</td>
+        <td class="px-4 py-3 font-mono">STRAT006</td>
+        <td class="px-4 py-3">
+          <a href="/trades/6" class="text-blue-600 hover:underline">Лонг LTC (4ч)</a>
+        </td>
+        <td class="px-4 py-3">0/2</td>
+        <td class="px-4 py-3 text-red-600">0.0%</td>
+        <td class="px-4 py-3 text-red-600">−3.5%</td>
+      </tr>
+    </tbody>
+  </table>
+</main>
+	</body>
+</html>
