@@ -43,6 +43,7 @@ def route_signal_base(meta, signal_direction, symbol):
 async def handle_protect_signal(msg_data):
     strategy_id = int(msg_data.get("strategy_id"))
     symbol = msg_data.get("symbol")
+    is_reverse = msg_data.get("is_reverse", False)  # 🔹 передаётся только при реверсе
 
     position = position_registry.get((strategy_id, symbol))
     if not position:
@@ -66,7 +67,7 @@ async def handle_protect_signal(msg_data):
         log.info(
             f"[PROTECT] Позиция в зоне убытка (mark={mark}, entry={entry}, direction={position.direction}) → вызов full_protect_stop"
         )
-        await full_protect_stop(position)
+        await full_protect_stop(position, is_reverse=is_reverse)
         return
 
     # 🔹 Вариант 2: позиция в плюсе → проверка SL
@@ -88,7 +89,6 @@ async def handle_protect_signal(msg_data):
     sl = active_sl[0]
     sl_price = get_field(sl, "price")
 
-    # Нужно ли перемещать SL на entry
     if (
         (position.direction == "long" and sl_price < entry) or
         (position.direction == "short" and sl_price > entry)
