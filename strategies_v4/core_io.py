@@ -239,19 +239,21 @@ async def reverse_entry(payload: dict):
         message = counter_sig["message"]
         bar_time = counter_sig["bar_time"]
         sent_at = counter_sig["sent_at"]
+        received_at = datetime.utcnow().isoformat()
 
         new_signal = {
             "symbol": symbol,
             "message": message,
             "bar_time": bar_time.isoformat(),
             "sent_at": sent_at.isoformat(),
-            "received_at": datetime.utcnow().isoformat()
+            "received_at": received_at
         }
 
         log.info(f"[REVERSE_ENTRY] 📤 Публикация сигнала в signals_stream: {json.dumps(new_signal)}")
 
         try:
-            await redis.xadd("signals_stream", {"data": json.dumps(new_signal)})
+            # Отправка в Redis по полям, а не через data/json
+            await redis.xadd("signals_stream", new_signal)
             log.info(f"📨 [REVERSE_ENTRY] Контр-сигнал отправлен для {symbol}")
         except Exception as e:
             log.warning(f"[REVERSE_ENTRY] Ошибка отправки в Redis: {e}")
