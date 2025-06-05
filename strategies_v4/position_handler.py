@@ -102,7 +102,7 @@ async def check_tp(position):
     tp_price = get_field(tp, "price")
     tp_level = int(get_field(tp, "level"))
 
-    log.info(
+    log.debug(
         f"[TP-CHECK] Позиция symbol={position.symbol} | mark={mark} vs target={tp_price} (level {tp_level})"
     )
 
@@ -236,7 +236,7 @@ async def check_sl(position):
     sl_price = get_field(sl, "price")
     sl_level = get_field(sl, "level")
 
-    log.info(
+    log.debug(
         f"[SL-CHECK] Позиция symbol={position.symbol} | mark={mark} vs sl_price={sl_price} (level {sl_level})"
     )
 
