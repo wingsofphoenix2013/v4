@@ -190,7 +190,7 @@ async def reverse_entry(payload: dict):
     async with pool.acquire() as conn:
         # Получаем log_id и закрытие позиции
         row = await conn.fetchrow("""
-            SELECT log_id, strategy_id, closed_at
+            SELECT log_id, closed_at
             FROM positions_v4
             WHERE position_uid = $1
         """, position_uid)
@@ -203,32 +203,27 @@ async def reverse_entry(payload: dict):
         closed_at = row["closed_at"]
         log.info(f"[REVERSE_ENTRY] closed_at={closed_at}, log_id={log_id}")
 
-        # Получаем raw_message исходного сигнала
-        origin = await conn.fetchrow("""
-            SELECT raw_message
+        # Получаем все нужные поля напрямую из signals_v4_log
+        sig = await conn.fetchrow("""
+            SELECT symbol, direction, signal_id, raw_message
             FROM signals_v4_log
             WHERE id = $1
         """, log_id)
 
-        if not origin:
-            log.warning(f"[REVERSE_ENTRY] log_id {log_id} не найден в signals_v4_log — выход")
+        if not sig:
+            log.warning(f"[REVERSE_ENTRY] signals_v4_log не содержит запись с id={log_id} — выход")
             return
 
-        try:
-            original_data = json.loads(origin["raw_message"])
-        except Exception as e:
-            log.warning(f"[REVERSE_ENTRY] Ошибка парсинга raw_message: {e} — выход")
+        symbol = sig["symbol"]
+        direction = sig["direction"]
+        signal_id = sig["signal_id"]
+        raw_msg = sig["raw_message"]
+
+        if not all([symbol, direction, signal_id, raw_msg]):
+            log.warning(f"[REVERSE_ENTRY] Данные неполные: {dict(sig)} — выход")
             return
 
-        symbol = original_data.get("symbol")
-        direction = original_data.get("direction")
-        signal_id = original_data.get("signal_id")
-
-        if not all([symbol, direction, signal_id]):
-            log.warning(f"[REVERSE_ENTRY] Недостаточно данных в raw_message: {original_data} — выход")
-            return
-
-        log.info(f"[REVERSE_ENTRY] Ищем противоположный сигнал: symbol={symbol}, direction={direction}, signal_id={signal_id}")
+        log.info(f"[REVERSE_ENTRY] Ищем обратный сигнал: symbol={symbol}, direction={direction}, signal_id={signal_id}")
 
         # Ищем противоположный сигнал до закрытия позиции
         opposite = await conn.fetchrow("""
@@ -247,12 +242,11 @@ async def reverse_entry(payload: dict):
             log.warning(f"[REVERSE_ENTRY] Нет сигнала противоположного направления для {symbol} до {closed_at} — выход")
             return
 
-        raw_msg = opposite["raw_message"]
-        log.info(f"[REVERSE_ENTRY] Найден сигнал: {raw_msg[:200]}...")  # лог первых 200 символов для контекста
+        reverse_raw = opposite["raw_message"]
+        log.info(f"[REVERSE_ENTRY] Найден сигнал для повторной отправки: {reverse_raw[:200]}...")
 
-        # Публикация в signals_stream
         try:
-            await redis.xadd("signals_stream", {"data": raw_msg})
+            await redis.xadd("signals_stream", {"data": reverse_raw})
             log.info(f"📨 [REVERSE_ENTRY] Сигнал отправлен в signals_stream для {symbol}")
         except Exception as e:
             log.warning(f"[REVERSE_ENTRY] Ошибка отправки в Redis: {e}")
