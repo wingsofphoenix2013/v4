@@ -18,6 +18,12 @@ log = logging.getLogger("POSITION_HANDLER")
 def get_field(obj, field, default=None):
     return obj.get(field, default) if isinstance(obj, dict) else getattr(obj, field, default)
 
+def set_field(obj, field, value):
+    if isinstance(obj, dict):
+        obj[field] = value
+    else:
+        setattr(obj, field, value)
+
 # 🔸 Отправка обновлённой позиции в Redis-поток
 async def push_position_update(position, redis):
     def serialize_targets(targets):

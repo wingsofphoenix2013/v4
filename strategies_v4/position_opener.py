@@ -8,7 +8,7 @@ from datetime import datetime
 import uuid
 
 from infra import infra
-from position_handler import get_field
+from position_handler import get_field, set_field
 from config_loader import config
 from position_state_loader import PositionState, position_registry, Target
 

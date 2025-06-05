@@ -9,7 +9,7 @@ import json
 from infra import infra
 from position_state_loader import position_registry
 from config_loader import config
-from position_handler import full_protect_stop, raise_sl_to_entry, get_field
+from position_handler import full_protect_stop, raise_sl_to_entry, get_field, set_field
 
 log = logging.getLogger("SIGNAL_PROCESSOR")
 
