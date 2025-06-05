@@ -15,13 +15,13 @@ log = logging.getLogger("POSITION_LOADER")
 # 🔸 Структура цели позиции (TP/SL)
 @dataclass
 class Target:
-    id: Optional[int] = None
     type: str  # 'tp' or 'sl'
     level: int
     price: Decimal
     quantity: Decimal
     hit: bool
     hit_at: Optional[datetime]
+    id: Optional[int] = None
     canceled: bool = False
     source: str = "price"
 
