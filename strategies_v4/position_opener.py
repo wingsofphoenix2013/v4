@@ -8,6 +8,7 @@ from datetime import datetime
 import uuid
 
 from infra import infra
+from position_handler import get_field
 from config_loader import config
 from position_state_loader import PositionState, position_registry, Target
 
@@ -137,9 +138,10 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
 
         planned_risk = risk_per_unit * quantity
 
-        # 📌 Формирование целей TP с полным набором полей
+        # 📌 Формирование целей TP как объектов Target
         tp_targets = []
         total_allocated = Decimal("0")
+
         for i, level in enumerate(tp_levels):
             volume_percent = Decimal(level["volume_percent"])
             if i < len(tp_levels) - 1:
@@ -147,16 +149,18 @@ async def calculate_position_size(signal: dict, context: dict) -> dict:
                 total_allocated += qty
             else:
                 qty = quantity - total_allocated
-            tp_targets.append({
-                "level": level["level"],
-                "price": tp_prices[i],
-                "quantity": qty,
-                "type": "tp",
-                "hit": False,
-                "hit_at": None,
-                "canceled": False,
-                "source": "signal" if level["tp_type"] == "signal" else "price"
-            })
+
+            tp_targets.append(Target(
+                type="tp",
+                level=level["level"],
+                price=tp_prices[i],
+                quantity=qty,
+                hit=False,
+                hit_at=None,
+                canceled=False,
+                source="signal" if level["tp_type"] == "signal" else "price"
+            ))
+
             log.debug(f"🎯 [POSITION_OPENER] TP{level['level']}: price={tp_prices[i]} quantity={qty}")
 
         return {
@@ -245,16 +249,16 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         planned_risk=result["planned_risk"],
         route=signal["route"],
         tp_targets=result["tp_targets"],
-        sl_targets=[{
-            "level": 1,
-            "price": result["stop_loss_price"],
-            "quantity": result["quantity"],
-            "type": "sl",
-            "hit": False,
-            "hit_at": None,
-            "canceled": False,
-            "source": "price"
-        }],
+        sl_targets=[Target(
+            type="sl",
+            level=1,
+            price=result["stop_loss_price"],
+            quantity=result["quantity"],
+            hit=False,
+            hit_at=None,
+            canceled=False,
+            source="price"
+        )],
         log_id=signal["log_id"]
     )
 
@@ -266,17 +270,18 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     log_id = signal.get("log_id")
     strategy_id = signal.get("strategy_id")
 
+    # 📌 Сериализация списка целей в формат dict для Redis/БД
     def normalize_targets(targets):
         return [
             {
-                "level": int(t["level"]),
-                "price": str(t["price"]) if t["price"] is not None else None,
-                "quantity": str(t["quantity"]),
-                "type": t["type"],
-                "hit": bool(t["hit"]),
-                "hit_at": t["hit_at"].isoformat() if t["hit_at"] else None,
-                "canceled": bool(t["canceled"]),
-                "source": t.get("source", "price")
+                "level": int(get_field(t, "level")),
+                "price": str(get_field(t, "price")) if get_field(t, "price") is not None else None,
+                "quantity": str(get_field(t, "quantity")),
+                "type": get_field(t, "type"),
+                "hit": bool(get_field(t, "hit")),
+                "hit_at": get_field(t, "hit_at").isoformat() if get_field(t, "hit_at") else None,
+                "canceled": bool(get_field(t, "canceled")),
+                "source": get_field(t, "source", "price")
             }
             for t in targets
         ]
