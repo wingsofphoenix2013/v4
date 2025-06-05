@@ -188,9 +188,9 @@ async def reverse_entry(payload: dict):
     log.info(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
 
     async with pool.acquire() as conn:
-        # Получаем log_id и закрытие позиции
+        # Получаем log_id, closed_at и symbol из позиции
         row = await conn.fetchrow("""
-            SELECT log_id, closed_at
+            SELECT log_id, closed_at, symbol
             FROM positions_v4
             WHERE position_uid = $1
         """, position_uid)
@@ -201,58 +201,58 @@ async def reverse_entry(payload: dict):
 
         log_id = row["log_id"]
         closed_at = row["closed_at"]
+        symbol = row["symbol"]
 
         if closed_at is None:
             closed_at = datetime.utcnow()
             log.warning(f"[REVERSE_ENTRY] closed_at был None — заменён на now(): {closed_at.isoformat()}")
 
-        log.info(f"[REVERSE_ENTRY] closed_at={closed_at}, log_id={log_id}")
-
-        # Получаем все нужные поля напрямую из signals_v4_log
+        # Получаем направление сигнала, открывшего позицию
         sig = await conn.fetchrow("""
-            SELECT symbol, direction, signal_id, raw_message
+            SELECT direction
             FROM signals_v4_log
             WHERE id = $1
         """, log_id)
 
-        if not sig:
-            log.warning(f"[REVERSE_ENTRY] signals_v4_log не содержит запись с id={log_id} — выход")
+        if not sig or not sig["direction"]:
+            log.warning(f"[REVERSE_ENTRY] Не удалось получить direction по log_id={log_id}")
             return
 
-        symbol = sig["symbol"]
         direction = sig["direction"]
-        signal_id = sig["signal_id"]
-        raw_msg = sig["raw_message"]
+        reverse_direction = "short" if direction == "long" else "long"
 
-        if not all([symbol, direction, signal_id, raw_msg]):
-            log.warning(f"[REVERSE_ENTRY] Данные неполные: {dict(sig)} — выход")
-            return
-
-        log.info(f"[REVERSE_ENTRY] Ищем обратный сигнал: symbol={symbol}, direction={direction}, signal_id={signal_id}")
-
-        # Ищем противоположный сигнал до закрытия позиции
-        opposite = await conn.fetchrow("""
-            SELECT raw_message
+        # Ищем последний сигнал обратного направления до закрытия позиции
+        counter_sig = await conn.fetchrow("""
+            SELECT message, bar_time, sent_at
             FROM signals_v4_log
-            WHERE
-                symbol = $1 AND
-                direction != $2 AND
-                signal_id = $3 AND
-                bar_time <= $4
-            ORDER BY bar_time DESC
+            WHERE symbol = $1
+              AND direction = $2
+              AND received_at <= $3
+            ORDER BY received_at DESC
             LIMIT 1
-        """, symbol, direction, signal_id, closed_at)
+        """, symbol, reverse_direction, closed_at)
 
-        if not opposite:
-            log.warning(f"[REVERSE_ENTRY] Нет сигнала противоположного направления для {symbol} до {closed_at} — выход")
+        if not counter_sig:
+            log.warning(f"[REVERSE_ENTRY] Контр-сигнал не найден для {symbol} ({reverse_direction}) до {closed_at}")
             return
 
-        reverse_raw = opposite["raw_message"]
-        log.info(f"[REVERSE_ENTRY] Найден сигнал для повторной отправки: {reverse_raw[:200]}...")
+        message = counter_sig["message"]
+        bar_time = counter_sig["bar_time"]
+        sent_at = counter_sig["sent_at"]
+
+        new_signal = {
+            "symbol": symbol,
+            "message": message,
+            "bar_time": bar_time.isoformat(),
+            "sent_at": sent_at.isoformat(),
+            "received_at": datetime.utcnow().isoformat()
+        }
+
+        log.info(f"[REVERSE_ENTRY] 📤 Публикация сигнала в signals_stream: {json.dumps(new_signal)}")
 
         try:
-            await redis.xadd("signals_stream", {"data": reverse_raw})
-            log.info(f"📨 [REVERSE_ENTRY] Сигнал отправлен в signals_stream для {symbol}")
+            await redis.xadd("signals_stream", {"data": json.dumps(new_signal)})
+            log.info(f"📨 [REVERSE_ENTRY] Контр-сигнал отправлен для {symbol}")
         except Exception as e:
             log.warning(f"[REVERSE_ENTRY] Ошибка отправки в Redis: {e}")
 # 🔸 Чтение логов сигналов
