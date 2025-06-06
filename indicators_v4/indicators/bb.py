@@ -7,12 +7,13 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
 
     Параметры:
         length: окно скользящей средней (по умолчанию 20)
+        std: множитель стандартного отклонения (по умолчанию 2.0)
 
     Возвращает:
         center (SMA), upper, lower
     """
     length = int(params.get("length", 20))
-    std_mult = 2.0  # фиксированное значение по стандарту BB
+    std_mult = float(params.get("std", 2.0))
 
     close = df["c"].astype(float)
 
