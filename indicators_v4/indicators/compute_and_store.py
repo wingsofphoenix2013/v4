@@ -12,6 +12,7 @@ INDICATOR_DISPATCH = {
     "lr": lr.compute,
     "mfi": mfi.compute,
     "rsi": rsi.compute,
+    "adx_dmi": adx_dmi.compute,
 }
 
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
