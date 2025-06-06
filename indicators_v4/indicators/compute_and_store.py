@@ -46,11 +46,13 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
     log.debug(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
 
     # 🔸 Построение базового имени (label)
-    if "length" in params:
+    if indicator == "macd":
+        base = f"{indicator}{params['fast']}"
+    elif "length" in params:
         base = f"{indicator}{params['length']}"
     else:
         base = indicator
-
+        
     tasks = []
     open_time_iso = pd.to_datetime(ts, unit="ms").isoformat()
 
