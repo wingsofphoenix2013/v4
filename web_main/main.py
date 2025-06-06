@@ -2,7 +2,8 @@ import os
 import json
 import logging
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import redis.asyncio as aioredis
@@ -55,6 +56,40 @@ def init_redis_client():
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
+# 🔸 Временная зона и фильтрация по локальному времени (Киев)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def get_kyiv_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
+    """
+    Возвращает границы дня по Киеву в UTC.
+
+    days_ago:
+        0 → сегодня
+        1 → вчера
+        и т.д.
+
+    Пример:
+        get_kyiv_day_bounds(0) → (2025-06-05 21:00:00+00:00, 2025-06-06 20:59:59+00:00)
+    """
+    now_kyiv = datetime.now(KYIV_TZ)
+    target_day = now_kyiv.date() - timedelta(days=days_ago)
+
+    start_kyiv = datetime.combine(target_day, time.min, tzinfo=KYIV_TZ)
+    end_kyiv = datetime.combine(target_day, time.max, tzinfo=KYIV_TZ)
+
+    return start_kyiv.astimezone(ZoneInfo("UTC")), end_kyiv.astimezone(ZoneInfo("UTC"))
+
+def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
+    """
+    Возвращает диапазон UTC от текущего времени - N суток до текущего времени, с учётом Киева.
+
+    Пример:
+        get_kyiv_range_backwards(7)
+    """
+    now_kyiv = datetime.now(KYIV_TZ)
+    start_kyiv = now_kyiv - timedelta(days=days)
+    return start_kyiv.astimezone(ZoneInfo("UTC")), now_kyiv.astimezone(ZoneInfo("UTC"))
+    
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
@@ -692,10 +727,102 @@ async def save_testsignal(request: Request):
 
     log.info(f"Тестовый сигнал записан: {symbol} | {message} | {mode}")
     return JSONResponse({"status": "ok"})
+
+# 🔸 Страница /trades — список активных стратегий с фильтрацией
 @app.get("/trades", response_class=HTMLResponse)
-async def trades_page(request: Request):
+async def trades_page(request: Request, filter: str = "today"):
+    """
+    Выводит таблицу активных стратегий и статистику по фильтру:
+    - filter = today / yesterday / 7days / all
+    """
+    strategies = await get_trading_summary(filter)
     return templates.TemplateResponse("trades.html", {
         "request": request,
-        "strategies": [],  # пока пусто
-        "filter": "today"  # значение для шаблона (если используется)
+        "strategies": strategies,
+        "filter": filter
     })
+    
+# 🔸 Расчёт статистики стратегий под /trades
+async def get_trading_summary(filter: str) -> list[dict]:
+    """
+    Возвращает список активных стратегий и их статистику:
+    - открытые/закрытые сделки
+    - winrate (в %) и roi (в %) — по закрытым сделкам
+    """
+    async with pg_pool.acquire() as conn:
+        strategies = await conn.fetch("""
+            SELECT id, name, human_name, deposit
+            FROM strategies_v4
+            WHERE enabled = true
+            ORDER BY id
+        """)
+
+        # 🔹 Временные рамки (UTC)
+        if filter == "today":
+            start, end = get_kyiv_day_bounds(0)
+        elif filter == "yesterday":
+            start, end = get_kyiv_day_bounds(1)
+        elif filter == "7days":
+            start, end = get_kyiv_range_backwards(7)
+        else:
+            start, end = None, None
+
+        result = []
+
+        for strat in strategies:
+            sid = strat["id"]
+            deposit = strat["deposit"]
+
+            # 🔹 Закрытые сделки — общее число и победные
+            if start and end:
+                closed_rows = await conn.fetch("""
+                    SELECT pnl FROM positions_v4
+                    WHERE strategy_id = $1 AND status = 'closed'
+                      AND closed_at BETWEEN $2 AND $3
+                """, sid, start, end)
+            else:
+                closed_rows = await conn.fetch("""
+                    SELECT pnl FROM positions_v4
+                    WHERE strategy_id = $1 AND status = 'closed'
+                """, sid)
+
+            pnl_list = [r["pnl"] for r in closed_rows if r["pnl"] is not None]
+            closed_count = len(pnl_list)
+            win_count = sum(1 for pnl in pnl_list if pnl >= 0)
+            pnl_sum = sum(pnl_list)
+
+            # 🔹 Winrate (%)
+            if closed_count > 0:
+                winrate = round(win_count / closed_count * 100, 2)
+            else:
+                winrate = None
+
+            # 🔹 ROI (%)
+            if deposit and deposit != 0:
+                roi = round(pnl_sum / deposit * 100, 2)
+            else:
+                roi = None
+
+            # 🔹 Открытые сделки — только для "today"
+            if filter == "today":
+                open_count = await conn.fetchval("""
+                    SELECT COUNT(*) FROM positions_v4
+                    WHERE strategy_id = $1 AND status = 'open'
+                      AND created_at BETWEEN $2 AND $3
+                """, sid, start, end)
+            else:
+                open_count = 0
+
+            result.append({
+                "id": sid,
+                "name": strat["name"],
+                "human_name": strat["human_name"],
+                "open": open_count,
+                "closed": closed_count,
+                "winrate": winrate,
+                "roi": roi
+            })
+
+        # 🔹 Сортировка по ROI (по убыванию, None — в конец)
+        result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
+        return result

@@ -32,13 +32,25 @@
 
   <!-- Панель кнопок фильтра -->
   <div class="flex justify-start items-center mb-6 space-x-3">
-    <a href="#" class="px-4 py-2 bg-blue-600 text-white font-semibold rounded-lg shadow hover:bg-blue-700 transition">Сегодня</a>
-    <a href="#" class="px-4 py-2 bg-slate-200 text-slate-800 font-medium rounded-lg hover:bg-slate-300 transition">Вчера</a>
-    <a href="#" class="px-4 py-2 bg-slate-200 text-slate-800 font-medium rounded-lg hover:bg-slate-300 transition">7 дней</a>
-    <a href="#" class="px-4 py-2 bg-slate-200 text-slate-800 font-medium rounded-lg hover:bg-slate-300 transition">Всего</a>
+    <a href="/trades?filter=today" class="px-4 py-2 rounded-lg font-semibold transition
+      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == 'today' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      Сегодня
+    </a>
+    <a href="/trades?filter=yesterday" class="px-4 py-2 rounded-lg font-semibold transition
+      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == 'yesterday' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      Вчера
+    </a>
+    <a href="/trades?filter=7days" class="px-4 py-2 rounded-lg font-semibold transition
+      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == '7days' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      7 дней
+    </a>
+    <a href="/trades?filter=all" class="px-4 py-2 rounded-lg font-semibold transition
+      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == 'all' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      Всего
+    </a>
   </div>
 
-  <!-- Таблица активных стратегий -->
+  <!-- Таблица стратегий -->
   <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
     <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
       <tr>
@@ -51,66 +63,40 @@
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+      {% for s in strategies %}
       <tr>
-        <td class="px-4 py-3">1</td>
-        <td class="px-4 py-3 font-mono">STRAT001</td>
+        <td class="px-4 py-3">{{ loop.index }}</td>
+        <td class="px-4 py-3 font-mono">{{ s.name }}</td>
         <td class="px-4 py-3">
-          <a href="/trades/1" class="text-blue-600 hover:underline">Лонг BTC (дневной)</a>
+          <a href="/trades/{{ s.id }}" class="text-blue-600 hover:underline">{{ s.human_name }}</a>
         </td>
-        <td class="px-4 py-3">3/7</td>
-        <td class="px-4 py-3 text-green-600">71.4%</td>
-        <td class="px-4 py-3 text-green-600">+12.3%</td>
-      </tr>
-      <tr>
-        <td class="px-4 py-3">2</td>
-        <td class="px-4 py-3 font-mono">STRAT002</td>
         <td class="px-4 py-3">
-          <a href="/trades/2" class="text-blue-600 hover:underline">Short ETH (часовой)</a>
+          {% if filter == "today" %}
+            {{ s.open }}/{{ s.closed }}
+          {% else %}
+            {{ s.closed }}
+          {% endif %}
         </td>
-        <td class="px-4 py-3">1/4</td>
-        <td class="px-4 py-3 text-red-600">25.0%</td>
-        <td class="px-4 py-3 text-red-600">−5.8%</td>
-      </tr>
-      <tr>
-        <td class="px-4 py-3">3</td>
-        <td class="px-4 py-3 font-mono">STRAT003</td>
         <td class="px-4 py-3">
-          <a href="/trades/3" class="text-blue-600 hover:underline">Флет USDT</a>
+          {% if s.winrate is not none %}
+            <span class="{{ 'text-green-600' if s.winrate >= 0 else 'text-red-600' }}">
+              {{ "%.2f" | format(s.winrate) }}%
+            </span>
+          {% else %}
+            N/A
+          {% endif %}
         </td>
-        <td class="px-4 py-3">0/0</td>
-        <td class="px-4 py-3">N/A</td>
-        <td class="px-4 py-3">N/A</td>
-      </tr>
-      <tr>
-        <td class="px-4 py-3">4</td>
-        <td class="px-4 py-3 font-mono">STRAT004</td>
         <td class="px-4 py-3">
-          <a href="/trades/4" class="text-blue-600 hover:underline">DCA DOGE</a>
+          {% if s.roi is not none %}
+            <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
+              {{ "%.2f" | format(s.roi) }}%
+            </span>
+          {% else %}
+            N/A
+          {% endif %}
         </td>
-        <td class="px-4 py-3">2/5</td>
-        <td class="px-4 py-3 text-green-600">60.0%</td>
-        <td class="px-4 py-3 text-green-600">+4.1%</td>
       </tr>
-      <tr>
-        <td class="px-4 py-3">5</td>
-        <td class="px-4 py-3 font-mono">STRAT005</td>
-        <td class="px-4 py-3">
-          <a href="/trades/5" class="text-blue-600 hover:underline">Scalp SOL</a>
-        </td>
-        <td class="px-4 py-3">1/6</td>
-        <td class="px-4 py-3 text-red-600">16.7%</td>
-        <td class="px-4 py-3 text-red-600">−10.2%</td>
-      </tr>
-      <tr>
-        <td class="px-4 py-3">6</td>
-        <td class="px-4 py-3 font-mono">STRAT006</td>
-        <td class="px-4 py-3">
-          <a href="/trades/6" class="text-blue-600 hover:underline">Лонг LTC (4ч)</a>
-        </td>
-        <td class="px-4 py-3">0/2</td>
-        <td class="px-4 py-3 text-red-600">0.0%</td>
-        <td class="px-4 py-3 text-red-600">−3.5%</td>
-      </tr>
+      {% endfor %}
     </tbody>
   </table>
 </main>
