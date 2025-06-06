@@ -20,7 +20,7 @@ INDICATOR_DISPATCH = {
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
     log = logging.getLogger("CALC")
     log.debug(f"[TRACE] compute_and_store received precision={precision} for {symbol} (instance_id={instance_id})")
-    
+
     indicator = instance["indicator"]
     timeframe = instance["timeframe"]
     params = instance["params"]
@@ -55,7 +55,10 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
     open_time_iso = pd.to_datetime(ts, unit="ms").isoformat()
 
     for param, value in result.items():
-        param_name = f"{base}_{param}" if param != "value" else base
+        if param.startswith(f"{base}_") or param == base:
+            param_name = param
+        else:
+            param_name = f"{base}_{param}" if param != "value" else base
 
         # 🔸 Форматирование строкового значения строго по precision
         if "angle" in param:
