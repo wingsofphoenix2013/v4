@@ -25,10 +25,11 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
     macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
     macd_hist = macd_line - macd_signal
 
+    base = f"macd{fast}"
     result = {
-        "macd": round(float(macd_line.dropna().iloc[-1]), 5),
-        "macd_signal": round(float(macd_signal.dropna().iloc[-1]), 5),
-        "macd_hist": round(float(macd_hist.dropna().iloc[-1]), 5)
+        f"{base}_macd": round(float(macd_line.dropna().iloc[-1]), 5),
+        f"{base}_macd_signal": round(float(macd_signal.dropna().iloc[-1]), 5),
+        f"{base}_macd_hist": round(float(macd_hist.dropna().iloc[-1]), 5)
     }
 
     return result
