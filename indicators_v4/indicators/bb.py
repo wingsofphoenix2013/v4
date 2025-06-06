@@ -24,8 +24,11 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
     upper = (sma + std_mult * std).iloc[-1]
     lower = (sma - std_mult * std).iloc[-1]
 
+    std_s = str(round(std_mult, 2)).replace('.', '_')
+    base = f"bb{length}_{std_s}"
+
     return {
-        "center": float(center),
-        "upper": float(upper),
-        "lower": float(lower)
+        f"{base}_center": float(center),
+        f"{base}_upper": float(upper),
+        f"{base}_lower": float(lower)
     }
