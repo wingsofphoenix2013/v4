@@ -57,7 +57,7 @@ async def push_position_update(position, redis):
 
     try:
         await redis.xadd("positions_update_stream", {"data": json.dumps(payload)})
-        log.info(f"📤 Обновление позиции отправлено в Redis: uid={position.uid}")
+        log.debug(f"📤 Обновление позиции отправлено в Redis: uid={position.uid}")
     except Exception as e:
         log.warning(f"⚠️ Ошибка отправки обновления позиции: {e}")
 
