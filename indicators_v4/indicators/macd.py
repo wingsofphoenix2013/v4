@@ -27,9 +27,9 @@ def compute(df: pd.DataFrame, params: dict) -> dict[str, float]:
 
     base = f"macd{fast}"
     result = {
-        f"{base}_macd": round(float(macd_line.dropna().iloc[-1]), 5),
-        f"{base}_macd_signal": round(float(macd_signal.dropna().iloc[-1]), 5),
-        f"{base}_macd_hist": round(float(macd_hist.dropna().iloc[-1]), 5)
+        f"{base}_macd": float(macd_line.dropna().iloc[-1]),
+        f"{base}_macd_signal": float(macd_signal.dropna().iloc[-1]),
+        f"{base}_macd_hist": float(macd_hist.dropna().iloc[-1])
     }
 
     return result
