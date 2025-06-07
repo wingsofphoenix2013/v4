@@ -1,13 +1,13 @@
-# strategies/strategy_52.py
+# strategies/strategy_117.py
 import logging
 import json
 from datetime import datetime
 from infra import load_indicators
 from config_loader import config
 
-log = logging.getLogger("STRATEGY_52")
+log = logging.getLogger("STRATEGY_117")
 
-class Strategy52:
+class Strategy117:
     # 🔸 Метод валидации сигнала перед входом
     async def validate_signal(self, signal, context) -> bool | str:
         symbol = signal.get("symbol")
@@ -15,7 +15,7 @@ class Strategy52:
         strategy_id = int(signal.get("strategy_id"))
         log_id = signal.get("log_id")
 
-        log.debug(f"⚙️ [Strategy52] Валидация сигнала: symbol={symbol}, direction={direction}")
+        log.debug(f"⚙️ [Strategy117] Валидация сигнала: symbol={symbol}, direction={direction}")
 
         redis = context.get("redis")
         note = None
@@ -24,8 +24,7 @@ class Strategy52:
             timeframe = "m5"
             indicators = await load_indicators(symbol, [
                 "rsi14",
-                "mfi14",
-                "adx_dmi14_adx"
+                "mfi14"
             ], timeframe)
 
             price_raw = await redis.get(f"price:{symbol}")
@@ -34,36 +33,30 @@ class Strategy52:
             else:
                 rsi = indicators.get("rsi14")
                 mfi = indicators.get("mfi14")
-                adx = indicators.get("adx_dmi14_adx")
 
-                if None in [rsi, mfi, adx]:
+                if None in [rsi, mfi]:
                     note = "отклонено: недостаточно данных индикаторов"
                 else:
                     rsi = float(rsi)
                     mfi = float(mfi)
-                    adx = float(adx)
 
                     if direction == "long":
-                        if not (rsi < 30):
-                            note = f"отклонено: RSI14 >= 30 (rsi={rsi})"
-                        elif not (mfi < 25):
-                            note = f"отклонено: MFI14 >= 25 (mfi={mfi})"
-                        elif not (adx < 25):
-                            note = f"отклонено: ADX >= 25 (adx={adx})"
+                        if not (rsi < 33):
+                            note = f"отклонено: RSI14 >= 33 (rsi={rsi})"
+                        elif not (mfi < 20):
+                            note = f"отклонено: MFI14 >= 20 (mfi={mfi})"
 
                     elif direction == "short":
-                        if not (rsi > 70):
-                            note = f"отклонено: RSI14 <= 70 (rsi={rsi})"
-                        elif not (mfi > 75):
-                            note = f"отклонено: MFI14 <= 75 (mfi={mfi})"
-                        elif not (adx < 25):
-                            note = f"отклонено: ADX >= 25 (adx={adx})"
+                        if not (rsi > 67):
+                            note = f"отклонено: RSI14 <= 67 (rsi={rsi})"
+                        elif not (mfi > 80):
+                            note = f"отклонено: MFI14 <= 80 (mfi={mfi})"
 
         except Exception as e:
             note = f"ошибка при валидации фильтров: {e}"
 
         if note:
-            log.debug(f"🚫 [Strategy52] {note}")
+            log.debug(f"🚫 [Strategy117] {note}")
             if redis:
                 log_record = {
                     "log_id": log_id,
@@ -76,13 +69,13 @@ class Strategy52:
                 try:
                     await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
                 except Exception as e:
-                    log.warning(f"⚠️ [Strategy52] Ошибка записи в Redis log_queue: {e}")
+                    log.warning(f"⚠️ [Strategy117] Ошибка записи в Redis log_queue: {e}")
             return "logged"
 
         return True
-    # 🔸 Основной метод запуска стратегии
+# 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
-        log.debug(f"🚀 [Strategy52] Запуск стратегии на сигнале: symbol={signal['symbol']}, direction={signal['direction']}")
+        log.debug(f"🚀 [Strategy117] Запуск стратегии на сигнале: symbol={signal['symbol']}, direction={signal['direction']}")
 
         redis = context.get("redis")
         if redis:
@@ -95,6 +88,6 @@ class Strategy52:
             }
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.debug(f"📤 [Strategy52] Сигнал отправлен в strategy_opener_stream")
+                log.debug(f"📤 [Strategy117] Сигнал отправлен в strategy_opener_stream")
             except Exception as e:
-                log.warning(f"⚠️ [Strategy52] Ошибка при отправке в stream: {e}")
+                log.warning(f"⚠️ [Strategy117] Ошибка при отправке в stream: {e}")
