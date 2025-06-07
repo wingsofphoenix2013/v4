@@ -130,7 +130,7 @@ async def check_tp(position):
     position.close_reason = f"tp-{tp_level}-hit"
     position.pnl += pnl_gain
 
-    log.info(
+    log.debug(
         f"🎯 TP сработал: позиция {position.uid} | уровень {tp_level} | объём {qty} | pnl += {pnl_gain:.6f}"
     )
     log.debug(f"📉 Остаток позиции: quantity_left = {position.quantity_left}")
@@ -206,7 +206,7 @@ async def check_tp(position):
                 sl_level = get_field(sl, "level")
                 log.debug(f"⚠️ SL отменён: позиция {position.uid} | уровень {sl_level}")
 
-        log.info(f"✅ Позиция {position.uid} полностью закрыта по TP")
+        log.debug(f"✅ Позиция {position.uid} полностью закрыта по TP")
 
         # Удаление позиции из памяти
         del position_registry[(position.strategy_id, position.symbol)]
@@ -284,7 +284,7 @@ async def check_sl(position):
     else:
         position.close_reason = "sl-tp-hit"
 
-    log.info(
+    log.debug(
         f"🛑 SL сработал: позиция {position.uid} | уровень {sl_level} | объём {qty} | pnl += {pnl_loss:.6f}"
     )
     log.debug(f"✅ Позиция {position.uid} закрыта по SL: статус={position.status}, причина={position.close_reason}")
@@ -328,7 +328,7 @@ async def full_protect_stop(position, *, is_reverse: bool = False):
         position.quantity_left = Decimal("0")
         position.pnl += pnl
 
-        log.info(f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}")
+        log.debug(f"🛑 Защитное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}")
         log.debug(f"✅ Позиция {position.uid} закрыта через защиту SL: статус={position.status}, причина={position.close_reason}")
 
         # Отправка в Redis
@@ -420,7 +420,7 @@ async def full_reverse_stop(position, msg_data):
         position.quantity_left = Decimal("0")
         position.pnl += pnl
 
-        log.info(f"🛑 Реверсное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}")
+        log.debug(f"🛑 Реверсное закрытие: позиция {position.uid} | объём {qty} | pnl += {pnl:.6f}")
         log.debug(f"✅ Позиция {position.uid} закрыта через reverse: статус={position.status}, причина={position.close_reason}")
 
         # Отправка в Redis
