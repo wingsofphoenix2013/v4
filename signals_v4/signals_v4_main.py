@@ -235,7 +235,7 @@ async def read_and_process_signals():
 # 🔸 Основной запуск
 async def main():
     setup_logging()
-    print("signals_v4: старт main()")  # В Render появится даже если logging не работает
+    print("signals_v4: старт main()")  # Render выведет в лог даже без logging
     import sys
     sys.stdout.flush()
 
@@ -278,4 +278,8 @@ async def main():
 
     except Exception as fatal:
         log.exception(f"FATAL: исключение в main(): {fatal}")
-        await asyncio.sleep(5)  # Чтобы Render не ушёл сразу в цикл
+        await asyncio.sleep(5)  # чтобы Render не упал сразу
+
+# 🔸 Точка входа
+if __name__ == "__main__":
+    asyncio.run(main())
