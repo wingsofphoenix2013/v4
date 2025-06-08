@@ -870,3 +870,23 @@ async def metrics():
         logging.getLogger("METRICS").warning("Ошибка при обновлении метрик")
 
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+@app.get("/status", response_class=HTMLResponse)
+async def status_page(request: Request):
+    stats = await redis_client.hgetall("metrics:signals")
+
+    # Приводим значения к строкам (или 0)
+    for key in [
+        "signals_processed_total",
+        "signals_dispatched_total",
+        "signals_ignored_total",
+        "processing_latency_ms"
+    ]:
+        stats.setdefault(key, "0")
+
+    return templates.TemplateResponse(
+        "strategies.html",
+        {
+            "request": request,
+            "stats": stats
+        }
+    )
