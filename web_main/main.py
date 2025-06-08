@@ -875,7 +875,7 @@ async def metrics():
 async def status_page(request: Request):
     stats = await redis_client.hgetall("metrics:signals")
 
-    # Подстановка значений по умолчанию
+    # 🔹 Подстановка значений по умолчанию
     for key in [
         "signals_processed_total",
         "signals_dispatched_total",
@@ -884,10 +884,11 @@ async def status_page(request: Request):
     ]:
         stats.setdefault(key, "0")
 
-    # Отдаём шаблон status.html
+    # 🔹 Отдаём шаблон status.html
     return templates.TemplateResponse(
         "status.html",
         {
             "request": request,
             "stats": stats
-       
+        }
+    )
