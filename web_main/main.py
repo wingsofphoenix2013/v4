@@ -870,7 +870,7 @@ async def metrics():
         logging.getLogger("METRICS").warning("Ошибка при обновлении метрик")
 
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-@# 🔸 Эндпоинт: статус signals_v4
+# 🔸 Эндпоинт: статус signals_v4
 @app.get("/status", response_class=HTMLResponse)
 async def status_page(request: Request):
     stats = await redis_client.hgetall("metrics:signals")
