@@ -217,7 +217,7 @@ async def read_and_process_signals():
                 consumername=consumer,
                 streams={stream: ">"},
                 count=100,
-                block=3000  # мс
+                block=500  # мс
             )
             if messages:
                 for _, entries in messages:

@@ -133,7 +133,7 @@ async def run_core_io():
                 consumername=consumer,
                 streams={stream: ">"},
                 count=100,
-                block=1000
+                block=500
             )
             if messages:
                 for _, entries in messages:
