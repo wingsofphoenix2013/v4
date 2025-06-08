@@ -870,11 +870,12 @@ async def metrics():
         logging.getLogger("METRICS").warning("Ошибка при обновлении метрик")
 
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+@# 🔸 Эндпоинт: статус signals_v4
 @app.get("/status", response_class=HTMLResponse)
 async def status_page(request: Request):
     stats = await redis_client.hgetall("metrics:signals")
 
-    # Приводим значения к строкам (или 0)
+    # Подстановка значений по умолчанию
     for key in [
         "signals_processed_total",
         "signals_dispatched_total",
@@ -883,10 +884,10 @@ async def status_page(request: Request):
     ]:
         stats.setdefault(key, "0")
 
+    # Отдаём шаблон status.html
     return templates.TemplateResponse(
-        "strategies.html",
+        "status.html",
         {
             "request": request,
             "stats": stats
-        }
-    )
+       
