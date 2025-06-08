@@ -3,6 +3,8 @@ import logging
 import json
 import infra
 from dateutil import parser
+from collections import deque
+from datetime import datetime
 import json
 
 # 🔸 Вставка записи в таблицу signals_v4_log и публикация в стратегии
@@ -18,42 +20,10 @@ async def insert_signal_log(data: dict):
             log.warning(f"Пропущен лог: отсутствует поле {field} в {data}")
             return
 
-    async with infra.PG_POOL.acquire() as conn:
-        result = await conn.fetchrow("""
-            INSERT INTO signals_v4_log (
-                signal_id,
-                symbol,
-                direction,
-                source,
-                message,
-                raw_message,
-                bar_time,
-                sent_at,
-                received_at,
-                status,
-                uid
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
-            )
-            ON CONFLICT (uid) DO NOTHING
-            RETURNING id
-        """,
-        int(data["signal_id"]),
-        data["symbol"],
-        data["direction"],
-        data["source"],
-        data["message"],
-        data["raw_message"],
-        parser.isoparse(data["bar_time"]).replace(tzinfo=None),
-        parser.isoparse(data["sent_at"]).replace(tzinfo=None),
-        parser.isoparse(data["received_at"]).replace(tzinfo=None),
-        data["status"],
-        data["uid"])
+    # 🔹 Добавление в буфер
+    signal_log_buffer.append(data)
 
-    log_id = result["id"] if result else None
-    log.debug(f"Лог записан в БД: {data['uid']} (log_id={log_id})")
-
-    # Публикация сигнала в стратегии
+    # 🔹 Рассылка по стратегиям
     if data["status"] == "dispatched":
         try:
             raw = json.loads(data["raw_message"])
@@ -63,18 +33,74 @@ async def insert_signal_log(data: dict):
             return
 
         for strategy_id in strategy_ids:
-            await infra.REDIS.xadd(
-                "strategy_input_stream",
-                {
-                    "strategy_id": str(strategy_id),
-                    "signal_id": str(data["signal_id"]),
-                    "symbol": data["symbol"],
-                    "direction": data["direction"],
-                    "time": data["bar_time"],
-                    "received_at": data["received_at"],
-                    "log_id": str(log_id) if log_id else ""
-                }
-            )
+            try:
+                await infra.REDIS.xadd(
+                    "strategy_input_stream",
+                    {
+                        "strategy_id": str(strategy_id),
+                        "signal_id": str(data["signal_id"]),
+                        "symbol": data["symbol"],
+                        "direction": data["direction"],
+                        "time": data["bar_time"],
+                        "received_at": data["received_at"],
+                        "log_id": ""  # log_id будет добавлен позже при flush
+                    }
+                )
+                await infra.record_counter("strategies_dispatched_total")
+            except Exception as e:
+                log.warning(f"xadd в strategy_input_stream не удался: {e}")
+# 🔸 Буфер логов сигналов
+signal_log_buffer = deque()
+BUFFER_SIZE = 25         # Максимум логов за одну вставку
+FLUSH_INTERVAL = 1.0     # Интервал проверки (секунды)
+
+# 🔸 Пакетная вставка логов в signals_v4_log
+async def flush_signal_logs():
+    if not signal_log_buffer:
+        return
+
+    log = logging.getLogger("CORE_IO")
+    batch = []
+    while signal_log_buffer and len(batch) < BUFFER_SIZE:
+        batch.append(signal_log_buffer.popleft())
+
+    try:
+        # 🔹 Задержка: считаем по последнему сигналу
+        try:
+            last_sent_at = parser.isoparse(batch[-1]["sent_at"]).replace(tzinfo=None)
+            latency_ms = (datetime.utcnow() - last_sent_at).total_seconds() * 1000
+            await infra.record_gauge("processing_latency_ms", latency_ms)
+        except Exception:
+            pass
+
+        async with infra.PG_POOL.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO signals_v4_log (
+                    signal_id, symbol, direction, source, message, raw_message,
+                    bar_time, sent_at, received_at, status, uid
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+                )
+                ON CONFLICT (uid) DO NOTHING
+            """, [
+                (
+                    int(d["signal_id"]),
+                    d["symbol"],
+                    d["direction"],
+                    d["source"],
+                    d["message"],
+                    d["raw_message"],
+                    parser.isoparse(d["bar_time"]).replace(tzinfo=None),
+                    parser.isoparse(d["sent_at"]).replace(tzinfo=None),
+                    parser.isoparse(d["received_at"]).replace(tzinfo=None),
+                    d["status"],
+                    d["uid"]
+                ) for d in batch
+            ])
+        log.debug(f"Записан batch логов: {len(batch)}")
+    except Exception as e:
+        log.warning(f"Ошибка при batch insert: {e}")
+        
 # 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
 async def run_core_io():
     log = logging.getLogger("CORE_IO")
@@ -88,6 +114,9 @@ async def run_core_io():
     except Exception:
         pass  # группа уже существует
 
+    # 🔸 Фоновый запуск flusher
+    asyncio.create_task(run_flusher())
+
     while True:
         try:
             messages = await infra.REDIS.xreadgroup(
@@ -95,7 +124,7 @@ async def run_core_io():
                 consumername=consumer,
                 streams={stream: ">"},
                 count=100,
-                block=3000
+                block=1000
             )
             if messages:
                 for _, entries in messages:

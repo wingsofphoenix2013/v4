@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import infra
+from time import perf_counter
 
 from infra import (
     setup_logging,
@@ -236,17 +237,36 @@ async def main():
     setup_logging()
     log.info("Инициализация signals_v4")
 
+    # 🔹 Подключение к БД и Redis
+    t0 = perf_counter()
     await init_pg_pool()
     await init_redis_client()
-    log.info("Подключения Redis и PostgreSQL установлены")
+    t1 = perf_counter()
+    log.info(f"Подключения Redis и PostgreSQL установлены за {t1 - t0:.2f} сек")
 
+    # 🔹 Проверка соединений
+    try:
+        pong = await infra.REDIS.ping()
+        log.info(f"Redis ответил: {pong}")
+    except Exception as e:
+        log.warning(f"Redis недоступен: {e}")
+
+    try:
+        async with infra.PG_POOL.acquire() as conn:
+            await conn.execute("SELECT 1")
+        log.info("PostgreSQL соединение проверено")
+    except Exception as e:
+        log.warning(f"PostgreSQL недоступен: {e}")
+
+    # 🔹 Загрузка справочников
+    t2 = perf_counter()
     await load_initial_state()
+    t3 = perf_counter()
+    log.info(f"Справочники загружены за {t3 - t2:.2f} сек")
 
+    # 🔹 Запуск всех компонентов
     await asyncio.gather(
         run_safe_loop(subscribe_and_watch_pubsub, "PUBSUB_WATCHER"),
         run_safe_loop(read_and_process_signals, "SIGNAL_STREAM_READER"),
         run_safe_loop(run_core_io, "CORE_IO")
     )
-
-if __name__ == "__main__":
-    asyncio.run(main())

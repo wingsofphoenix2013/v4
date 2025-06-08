@@ -42,3 +42,18 @@ async def init_pg_pool():
         max_size=20
     )
     log.info("PG_POOL успешно инициализирован")
+    
+# 🔸 Запись метрик в Redis
+async def record_counter(metric: str, delta: int = 1):
+    try:
+        if REDIS:
+            await REDIS.hincrby("metrics:signals", metric, delta)
+    except Exception as e:
+        logging.getLogger("METRICS").warning(f"Ошибка обновления счетчика {metric}: {e}")
+
+async def record_gauge(metric: str, value: float):
+    try:
+        if REDIS:
+            await REDIS.hset("metrics:signals", metric, value)
+    except Exception as e:
+        logging.getLogger("METRICS").warning(f"Ошибка обновления gauge {metric}: {e}")
