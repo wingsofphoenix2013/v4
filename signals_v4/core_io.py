@@ -101,6 +101,15 @@ async def flush_signal_logs():
     except Exception as e:
         log.warning(f"Ошибка при batch insert: {e}")
         
+# 🔸 Фоновая задача: флаш логов сигналов
+async def run_flusher():
+    while True:
+        try:
+            await flush_signal_logs()
+        except Exception as e:
+            logging.getLogger("CORE_IO").warning(f"Ошибка во flusher: {e}")
+        await asyncio.sleep(FLUSH_INTERVAL)
+        
 # 🔸 Запуск логгера сигналов: чтение из Redis Stream и запись в БД
 async def run_core_io():
     log = logging.getLogger("CORE_IO")
