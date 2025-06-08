@@ -235,38 +235,47 @@ async def read_and_process_signals():
 # 🔸 Основной запуск
 async def main():
     setup_logging()
-    log.info("Инициализация signals_v4")
+    print("signals_v4: старт main()")  # В Render появится даже если logging не работает
+    import sys
+    sys.stdout.flush()
 
-    # 🔹 Подключение к БД и Redis
-    t0 = perf_counter()
-    await init_pg_pool()
-    await init_redis_client()
-    t1 = perf_counter()
-    log.info(f"Подключения Redis и PostgreSQL установлены за {t1 - t0:.2f} сек")
-
-    # 🔹 Проверка соединений
-    try:
-        pong = await infra.REDIS.ping()
-        log.info(f"Redis ответил: {pong}")
-    except Exception as e:
-        log.warning(f"Redis недоступен: {e}")
+    log = logging.getLogger("SIGNALS_COORDINATOR")
 
     try:
-        async with infra.PG_POOL.acquire() as conn:
-            await conn.execute("SELECT 1")
-        log.info("PostgreSQL соединение проверено")
-    except Exception as e:
-        log.warning(f"PostgreSQL недоступен: {e}")
+        # 🔹 Подключение к БД и Redis
+        t0 = perf_counter()
+        await init_pg_pool()
+        await init_redis_client()
+        t1 = perf_counter()
+        log.info(f"Подключения Redis и PostgreSQL установлены за {t1 - t0:.2f} сек")
 
-    # 🔹 Загрузка справочников
-    t2 = perf_counter()
-    await load_initial_state()
-    t3 = perf_counter()
-    log.info(f"Справочники загружены за {t3 - t2:.2f} сек")
+        # 🔹 Проверка соединений
+        try:
+            pong = await infra.REDIS.ping()
+            log.info(f"Redis ответил: {pong}")
+        except Exception as e:
+            log.warning(f"Redis недоступен: {e}")
 
-    # 🔹 Запуск всех компонентов
-    await asyncio.gather(
-        run_safe_loop(subscribe_and_watch_pubsub, "PUBSUB_WATCHER"),
-        run_safe_loop(read_and_process_signals, "SIGNAL_STREAM_READER"),
-        run_safe_loop(run_core_io, "CORE_IO")
-    )
+        try:
+            async with infra.PG_POOL.acquire() as conn:
+                await conn.execute("SELECT 1")
+            log.info("PostgreSQL соединение проверено")
+        except Exception as e:
+            log.warning(f"PostgreSQL недоступен: {e}")
+
+        # 🔹 Загрузка справочников
+        t2 = perf_counter()
+        await load_initial_state()
+        t3 = perf_counter()
+        log.info(f"Справочники загружены за {t3 - t2:.2f} сек")
+
+        # 🔹 Запуск всех компонентов
+        await asyncio.gather(
+            run_safe_loop(subscribe_and_watch_pubsub, "PUBSUB_WATCHER"),
+            run_safe_loop(read_and_process_signals, "SIGNAL_STREAM_READER"),
+            run_safe_loop(run_core_io, "CORE_IO")
+        )
+
+    except Exception as fatal:
+        log.exception(f"FATAL: исключение в main(): {fatal}")
+        await asyncio.sleep(5)  # Чтобы Render не ушёл сразу в цикл
