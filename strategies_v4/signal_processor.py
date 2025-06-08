@@ -186,8 +186,8 @@ async def run_signal_loop(strategy_registry):
         try:
             response = await redis.xread(
                 streams={STRATEGY_INPUT_STREAM: last_id},
-                count=10,
-                block=1000
+                count=50,
+                block=500
             )
 
             if not response:
@@ -199,83 +199,83 @@ async def run_signal_loop(strategy_registry):
 
                     log.debug(f"[SIGNAL_LOOP] 📨 Сигнал из потока: {msg_data}")
 
+                    strategy_id = int(msg_data.get("strategy_id", 0) or 0)
+                    signal_id = int(msg_data.get("signal_id", 0) or 0)
                     symbol = msg_data.get("symbol")
                     direction = msg_data.get("direction")
                     time = msg_data.get("time")
                     log_id = msg_data.get("log_id")
-                    signal_id = int(msg_data.get("signal_id", 0) or 0)
 
-                    if not all([symbol, direction, time, log_id, signal_id]):
+                    if not all([strategy_id, signal_id, symbol, direction, time, log_id]):
                         log.warning(f"⚠️ Неполный сигнал: {msg_data}")
                         continue
 
-                    seen_keys = set()
-                    tasks = []
+                    strategy = config.strategies.get(strategy_id)
+                    if not strategy:
+                        log.warning(f"⚠️ Стратегия {strategy_id} не найдена в config.strategies")
+                        continue
 
-                    for strategy_id, strategy in config.strategies.items():
-                        meta = strategy["meta"]
-                        key = (strategy_id, symbol)
+                    meta = strategy["meta"]
+                    route, note = route_signal_base(meta, direction, symbol)
 
-                        if key in seen_keys:
-                            continue  # исключаем дубликаты
-                        seen_keys.add(key)
+                    if route == "new_entry" and not meta["use_all_tickers"]:
+                        allowed = config.strategy_tickers.get(strategy_id, set())
+                        if symbol not in allowed:
+                            route = "ignore"
+                            note = "тикер не разрешён для стратегии"
 
-                        route, note = route_signal_base(meta, direction, symbol)
-
-                        if route == "new_entry" and not meta.get("use_all_tickers", False):
-                            allowed = config.strategy_tickers.get(strategy_id, set())
-                            if symbol not in allowed:
-                                route = "ignore"
-                                note = "тикер не разрешён для стратегии"
-
+                    # 🔸 Валидация стратегии (если допущен new_entry)
+                    if route == "new_entry":
                         strategy_name = meta["name"]
                         strategy_obj = strategy_registry.get(strategy_name)
 
-                        async def process_strategy(strategy_id=strategy_id, meta=meta, route=route, note=note):
+                        if not strategy_obj:
+                            route = "ignore"
+                            note = f"strategy_registry: '{strategy_name}' не найдена"
+                        else:
                             context = {"redis": redis}
-                            local_msg = msg_data.copy()
-                            local_msg["strategy_id"] = strategy_id
-                            local_msg["route"] = route
+                            result = strategy_obj.validate_signal(msg_data, context)
+                            if asyncio.iscoroutine(result):
+                                result = await result
 
-                            if route == "new_entry":
-                                if not strategy_obj:
-                                    return await log_ignore(strategy_id, log_id, None, "strategy not found")
+                            if result != True:
+                                if result == "logged":
+                                    route = "ignore"
+                                    note = None
+                                else:
+                                    route = "ignore"
+                                    note = "отклонено стратегией: validate_signal() = False"
 
-                                result = strategy_obj.validate_signal(local_msg, context)
-                                if asyncio.iscoroutine(result):
-                                    result = await result
+                    if route == "ignore":
+                        if note is None:
+                            log.debug(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason=handled by strategy")
+                        else:
+                            log.debug(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
 
-                                if result != True:
-                                    if result == "logged":
-                                        return  # уже залогировано
-                                    return await log_ignore(strategy_id, log_id, None, "отклонено стратегией")
+                        if note is not None:
+                            log_record = {
+                                "log_id": log_id,
+                                "strategy_id": strategy_id,
+                                "status": route,
+                                "position_uid": msg_data.get("position_uid"),
+                                "note": note,
+                                "logged_at": datetime.utcnow().isoformat()
+                            }
 
-                            # ДОПУЩЕНО
-                            key = (strategy_id, symbol)
-                            position = position_registry.get(key)
-                            if position:
-                                local_msg["position_uid"] = position.uid
+                            await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
+                    else:
+                        log.debug(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
-                            await route_and_dispatch_signal(local_msg, strategy_registry, redis)
+                        # 🔸 Если есть активная позиция, сохраняем её id для маршрутов protect/reverse
+                        key = (strategy_id, symbol)
+                        position = position_registry.get(key)
+                        if position:
+                            msg_data["position_uid"] = position.uid
 
-                        async def log_ignore(strategy_id, log_id, position_uid, note):
-                            if note:
-                                log.debug(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason={note}")
-                                log_record = {
-                                    "log_id": log_id,
-                                    "strategy_id": strategy_id,
-                                    "status": "ignore",
-                                    "position_uid": position_uid,
-                                    "note": note,
-                                    "logged_at": datetime.utcnow().isoformat()
-                                }
-                                await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
+                        # 🔸 Диспетчеризация маршрута обработки
+                        msg_data["route"] = route
+                        await route_and_dispatch_signal(msg_data, strategy_registry, redis)
 
-                        tasks.append(process_strategy())
-
-                    if tasks:
-                        await asyncio.gather(*tasks)
-
-        except Exception:
+        except Exception as e:
             log.exception("❌ Ошибка при чтении из Redis — повтор через 5 секунд")
             await asyncio.sleep(5)
