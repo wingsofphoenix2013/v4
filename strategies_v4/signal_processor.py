@@ -187,7 +187,7 @@ async def run_signal_loop(strategy_registry):
             response = await redis.xread(
                 streams={STRATEGY_INPUT_STREAM: last_id},
                 count=10,
-                block=500
+                block=1000
             )
 
             if not response:
@@ -199,23 +199,30 @@ async def run_signal_loop(strategy_registry):
 
                     log.debug(f"[SIGNAL_LOOP] 📨 Сигнал из потока: {msg_data}")
 
-                    signal_id = int(msg_data.get("signal_id", 0) or 0)
                     symbol = msg_data.get("symbol")
                     direction = msg_data.get("direction")
                     time = msg_data.get("time")
                     log_id = msg_data.get("log_id")
+                    signal_id = int(msg_data.get("signal_id", 0) or 0)
 
                     if not all([symbol, direction, time, log_id, signal_id]):
                         log.warning(f"⚠️ Неполный сигнал: {msg_data}")
                         continue
 
+                    seen_keys = set()
                     tasks = []
 
                     for strategy_id, strategy in config.strategies.items():
                         meta = strategy["meta"]
+                        key = (strategy_id, symbol)
+
+                        if key in seen_keys:
+                            continue  # исключаем дубликаты
+                        seen_keys.add(key)
+
                         route, note = route_signal_base(meta, direction, symbol)
 
-                        if route == "new_entry" and not meta["use_all_tickers"]:
+                        if route == "new_entry" and not meta.get("use_all_tickers", False):
                             allowed = config.strategy_tickers.get(strategy_id, set())
                             if symbol not in allowed:
                                 route = "ignore"
@@ -225,29 +232,27 @@ async def run_signal_loop(strategy_registry):
                         strategy_obj = strategy_registry.get(strategy_name)
 
                         async def process_strategy(strategy_id=strategy_id, meta=meta, route=route, note=note):
-                            nonlocal msg_data
+                            context = {"redis": redis}
+                            local_msg = msg_data.copy()
+                            local_msg["strategy_id"] = strategy_id
+                            local_msg["route"] = route
 
                             if route == "new_entry":
                                 if not strategy_obj:
-                                    log.debug(f"🚫 ОТКЛОНЕНО: strategy={strategy_id}, symbol={symbol}, reason=не найдена в strategy_registry")
-                                    return await log_ignore(strategy_id, log_id, msg_data.get("position_uid"), "strategy not found")
+                                    return await log_ignore(strategy_id, log_id, None, "strategy not found")
 
-                                context = {"redis": redis}
-                                result = strategy_obj.validate_signal(msg_data.copy(), context)
+                                result = strategy_obj.validate_signal(local_msg, context)
                                 if asyncio.iscoroutine(result):
                                     result = await result
 
                                 if result != True:
-                                    reason = None if result == "logged" else "отклонено стратегией: validate_signal() = False"
-                                    return await log_ignore(strategy_id, log_id, msg_data.get("position_uid"), reason)
+                                    if result == "logged":
+                                        return  # уже залогировано
+                                    return await log_ignore(strategy_id, log_id, None, "отклонено стратегией")
 
-                            log.debug(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
-
+                            # ДОПУЩЕНО
                             key = (strategy_id, symbol)
                             position = position_registry.get(key)
-                            local_msg = msg_data.copy()
-                            local_msg["strategy_id"] = strategy_id
-                            local_msg["route"] = route
                             if position:
                                 local_msg["position_uid"] = position.uid
 
