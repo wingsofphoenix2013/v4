@@ -9,9 +9,16 @@ import asyncpg
 import redis.asyncio as aioredis
 
 from fastapi import FastAPI, Request, Form, HTTPException, status, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from starlette.status import HTTP_303_SEE_OTHER
+
+from prometheus_client import (
+    Counter,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST
+)
 
 # 🔸 Переменные окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -827,3 +834,39 @@ async def get_trading_summary(filter: str) -> list[dict]:
         # 🔹 Сортировка по ROI (по убыванию, None — в конец)
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
         return result
+# 🔸 Прометей-метрики
+signals_processed_total = Counter(
+    "signals_processed_total", "Обработано сигналов (всего)"
+)
+signals_dispatched_total = Counter(
+    "signals_dispatched_total", "Отправлено в стратегии"
+)
+signals_ignored_total = Counter(
+    "signals_ignored_total", "Проигнорировано"
+)
+processing_latency = Gauge(
+    "processing_latency_ms", "Задержка обработки сигнала (мс)"
+)
+
+# 🔸 Эндпоинт Prometheus метрик
+@app.get("/metrics")
+async def metrics():
+    stats = await redis_client.hgetall("metrics:signals")
+
+    try:
+        signals_processed_total._value.set(
+            int(stats.get("signals_processed_total", 0))
+        )
+        signals_dispatched_total._value.set(
+            int(stats.get("signals_dispatched_total", 0))
+        )
+        signals_ignored_total._value.set(
+            int(stats.get("signals_ignored_total", 0))
+        )
+        processing_latency.set(
+            float(stats.get("processing_latency_ms", 0))
+        )
+    except Exception:
+        logging.getLogger("METRICS").warning("Ошибка при обновлении метрик")
+
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

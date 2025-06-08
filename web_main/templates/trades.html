@@ -79,7 +79,7 @@
         </td>
         <td class="px-4 py-3">
           {% if s.winrate is not none %}
-            <span class="{{ 'text-green-600' if s.winrate >= 0 else 'text-red-600' }}">
+            <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
               {{ "%.2f" | format(s.winrate) }}%
             </span>
           {% else %}
