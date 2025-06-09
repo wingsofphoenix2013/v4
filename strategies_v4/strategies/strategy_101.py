@@ -8,75 +8,9 @@ from config_loader import config
 log = logging.getLogger("STRATEGY_101")
 
 class Strategy101:
-    # 🔸 Метод валидации сигнала перед входом
+    # 🔸 Метод валидации сигнала перед входом (пропускает всё)
     async def validate_signal(self, signal, context) -> bool | str:
-        symbol = signal.get("symbol")
-        direction = signal.get("direction")
-        strategy_id = int(signal.get("strategy_id"))
-        log_uid = signal.get("log_uid")
-
-        log.debug(f"⚙️ [Strategy101] Валидация сигнала: symbol={symbol}, direction={direction}")
-
-        redis = context.get("redis")
-        note = None
-
-        try:
-            timeframe = "m5"
-            indicators = await load_indicators(symbol, [
-                "rsi14",
-                "mfi14"
-            ], timeframe)
-
-            price_raw = await redis.get(f"price:{symbol}")
-            if price_raw is None:
-                note = "отклонено: отсутствует цена"
-            else:
-                rsi = indicators.get("rsi14")
-                mfi = indicators.get("mfi14")
-
-                if None in [rsi, mfi]:
-                    note = "отклонено: недостаточно данных индикаторов"
-                else:
-                    rsi = float(rsi)
-                    mfi = float(mfi)
-
-                    if direction == "long":
-                        if not (rsi < 25):
-                            note = f"отклонено: RSI14 >= 25 (rsi={rsi})"
-                        elif not (mfi < 15):
-                            note = f"отклонено: MFI14 >= 15 (mfi={mfi})"
-
-                    elif direction == "short":
-                        if not (rsi > 75):
-                            note = f"отклонено: RSI14 <= 75 (rsi={rsi})"
-                        elif not (mfi > 85):
-                            note = f"отклонено: MFI14 <= 85 (mfi={mfi})"
-
-        except Exception as e:
-            note = f"ошибка при валидации фильтров: {e}"
-
-        if note:
-            log.debug(f"🚫 [Strategy101] {note}")
-            if redis:
-                log_record = {
-                    "log_uid": log_uid,
-                    "strategy_id": strategy_id,
-                    "status": "ignore",
-                    "position_id": None,
-                    "note": note,
-                    "logged_at": datetime.utcnow().isoformat()
-                }
-
-                # 🔸 Удаляем все поля со значением None (например, position_id)
-                clean_record = {k: v for k, v in log_record.items() if v is not None}
-
-                try:
-                    await redis.xadd("signal_log_queue", clean_record)
-                except Exception as e:
-                    log.warning(f"⚠️ [Strategy101] Ошибка записи в Redis log_queue: {e}")
-            return "logged"
-
-        return True    
+        return True
 # 🔸 Основной метод запуска стратегии
     async def run(self, signal, context):
         log.debug(f"🚀 [Strategy101] Запуск стратегии на сигнале: symbol={signal['symbol']}, direction={signal['direction']}")
