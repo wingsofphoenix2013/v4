@@ -9,7 +9,6 @@ log = logging.getLogger("STRATEGY_101")
 
 class Strategy101:
     # 🔸 Метод валидации сигнала перед входом
-    # 🔸 Метод валидации сигнала перед входом
     async def validate_signal(self, signal, context) -> bool | str:
         symbol = signal.get("symbol")
         direction = signal.get("direction")

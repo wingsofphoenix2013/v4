@@ -13,7 +13,7 @@ class Strategy213:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
         strategy_id = int(signal.get("strategy_id"))
-        log_id = signal.get("log_id")
+        log_uid = signal.get("log_uid")
 
         log.debug(f"⚙️ [Strategy213] Валидация сигнала: symbol={symbol}, direction={direction}")
 
@@ -59,7 +59,7 @@ class Strategy213:
             log.debug(f"🚫 [Strategy213] {note}")
             if redis:
                 log_record = {
-                    "log_id": log_id,
+                    "log_uid": log_uid,
                     "strategy_id": strategy_id,
                     "status": "ignore",
                     "position_id": None,
@@ -83,7 +83,7 @@ class Strategy213:
                 "strategy_id": signal["strategy_id"],
                 "symbol": signal["symbol"],
                 "direction": signal["direction"],
-                "log_id": signal["log_id"],
+                "log_uid": signal["log_uid"],
                 "route": "new_entry"
             }
             try:
