@@ -44,7 +44,7 @@ async def write_log_entry_batch(pool, records: list[dict]):
                 log_uid = record.get("log_uid")
                 if not isinstance(log_uid, str):
                     log_uid = str(log_uid)
-                    log.debug(f"🔁 Приведён log_uid к строке: {log_uid}")
+                    log.info(f"🔁 Приведён log_uid к строке: {log_uid}")
 
                 try:
                     values_list.append((
@@ -62,7 +62,7 @@ async def write_log_entry_batch(pool, records: list[dict]):
                 await conn.executemany(query, values_list)
                 log.info(f"💾 Записано логов сигналов: {len(values_list)}")
             else:
-                log.debug("ℹ️ Нет корректных логов сигналов для записи")
+                log.info("ℹ️ Нет корректных логов сигналов для записи")
 
         except Exception as e:
             log.warning(f"⚠️ Ошибка батч-записи логов сигналов: {e}")

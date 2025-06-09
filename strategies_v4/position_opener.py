@@ -190,6 +190,8 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
 
         redis = context.get("redis")
         log_uid = signal.get("log_uid")
+        if not log_uid:
+            log.warning(f"❗ log_uid отсутствует или пуст: {signal}")
         strategy_id = signal.get("strategy_id")
 
         if redis and log_uid is not None:
@@ -264,6 +266,8 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
     # 🔹 Подготовка Redis-логов
     redis = context.get("redis")
     log_uid = signal.get("log_uid")
+    if not log_uid:
+        log.warning(f"❗ log_uid отсутствует или пуст: {signal}")
     strategy_id = signal.get("strategy_id")
 
     # 📌 Сериализация списка целей в формат dict для Redis/БД
