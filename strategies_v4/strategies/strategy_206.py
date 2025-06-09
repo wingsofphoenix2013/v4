@@ -13,7 +13,7 @@ class Strategy206:
         symbol = signal.get("symbol")
         direction = signal.get("direction")
         strategy_id = int(signal.get("strategy_id"))
-        log_id = signal.get("log_id")
+        log_uid = signal.get("log_uid")
 
         log.debug(f"⚙️ [Strategy206] Валидация сигнала: symbol={symbol}, direction={direction}")
 
@@ -59,15 +59,19 @@ class Strategy206:
             log.debug(f"🚫 [Strategy206] {note}")
             if redis:
                 log_record = {
-                    "log_id": log_id,
+                    "log_uid": log_uid,
                     "strategy_id": strategy_id,
                     "status": "ignore",
                     "position_id": None,
                     "note": note,
                     "logged_at": datetime.utcnow().isoformat()
                 }
+
+                # 🔸 Удаляем все поля со значением None (например, position_id)
+                clean_record = {k: v for k, v in log_record.items() if v is not None}
+
                 try:
-                    await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+                    await redis.xadd("signal_log_queue", clean_record)
                 except Exception as e:
                     log.warning(f"⚠️ [Strategy206] Ошибка записи в Redis log_queue: {e}")
             return "logged"
@@ -83,7 +87,7 @@ class Strategy206:
                 "strategy_id": signal["strategy_id"],
                 "symbol": signal["symbol"],
                 "direction": signal["direction"],
-                "log_id": signal["log_id"],
+                "log_uid": signal["log_uid"],
                 "route": "new_entry"
             }
             try:
