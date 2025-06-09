@@ -204,9 +204,9 @@ async def run_signal_loop(strategy_registry):
                     symbol = msg_data.get("symbol")
                     direction = msg_data.get("direction")
                     time = msg_data.get("time")
-                    log_id = msg_data.get("log_id")
+                    log_uid = msg_data.get("log_uid")
 
-                    if not all([strategy_id, signal_id, symbol, direction, time, log_id]):
+                    if not all([strategy_id, signal_id, symbol, direction, time, log_uid]):
                         log.warning(f"⚠️ Неполный сигнал: {msg_data}")
                         continue
 
@@ -254,7 +254,7 @@ async def run_signal_loop(strategy_registry):
 
                         if note is not None:
                             log_record = {
-                                "log_id": log_id,
+                                "log_uid": log_uid,
                                 "strategy_id": strategy_id,
                                 "status": route,
                                 "position_uid": msg_data.get("position_uid"),

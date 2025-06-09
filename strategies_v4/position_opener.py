@@ -189,12 +189,12 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
         log.debug(f"🚫 [POSITION_OPENER] Открытие позиции отменено: {reason}")
 
         redis = context.get("redis")
-        log_id = signal.get("log_id")
+        log_uid = signal.get("log_uid")
         strategy_id = signal.get("strategy_id")
 
-        if redis and log_id is not None:
+        if redis and log_uid is not None:
             log_record = {
-                "log_id": log_id,
+                "log_uid": log_uid,
                 "strategy_id": strategy_id,
                 "status": "skip",
                 "position_uid": None,
@@ -255,7 +255,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             canceled=False,
             source="price"
         )],
-        log_id=signal["log_id"]
+        log_uid=signal["log_uid"]
     )
 
     position_registry[(position.strategy_id, position.symbol)] = position
@@ -263,7 +263,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
 
     # 🔹 Подготовка Redis-логов
     redis = context.get("redis")
-    log_id = signal.get("log_id")
+    log_uid = signal.get("log_uid")
     strategy_id = signal.get("strategy_id")
 
     # 📌 Сериализация списка целей в формат dict для Redis/БД
@@ -282,10 +282,10 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             for t in targets
         ]
 
-    if redis and log_id is not None:
+    if redis and log_uid is not None:
         # 🔹 Лог открытия
         log_record = {
-            "log_id": log_id,
+            "log_uid": log_uid,
             "strategy_id": strategy_id,
             "status": "opened",
             "position_uid": position_uid,
@@ -311,7 +311,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "created_at": position.created_at.isoformat(),
             "planned_risk": str(position.planned_risk),
             "route": signal["route"],
-            "log_id": position.log_id,
+            "log_uid": position.log_uid,
             "pnl": str(pnl),
             "close_reason": "в работе",
             "tp_targets": normalize_targets(position.tp_targets),

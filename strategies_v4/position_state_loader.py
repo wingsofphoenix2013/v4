@@ -45,7 +45,7 @@ class PositionState:
     route: str
     tp_targets: List[Target]
     sl_targets: List[Target]
-    log_id: int
+    log_uid: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 # 🔸 Глобальные in-memory хранилища состояний
@@ -124,7 +124,7 @@ async def load_position_state():
             route=row['route'],
             tp_targets=tp_targets,
             sl_targets=sl_targets,
-            log_id=row['log_id']
+            log_uid=row['log_uid']
         )
 
         # 🔸 Индексация по (strategy_id, symbol)

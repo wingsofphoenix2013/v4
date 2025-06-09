@@ -28,7 +28,7 @@ def set_field(obj, field, value):
 async def write_log_entry_batch(pool, records: list[dict]):
     query = """
         INSERT INTO signal_log_entries_v4
-        (log_id, strategy_id, status, position_uid, note, logged_at)
+        (log_uid, strategy_id, status, position_uid, note, logged_at)
         VALUES ($1, $2, $3, $4, $5, $6)
     """
     async with pool.acquire() as conn:
@@ -36,7 +36,7 @@ async def write_log_entry_batch(pool, records: list[dict]):
             values_list = []
             for record in records:
                 values_list.append((
-                    int(record["log_id"]),
+                    int(record["log_uid"]),
                     int(record["strategy_id"]),
                     record["status"],
                     record.get("position_uid"),
@@ -75,7 +75,7 @@ async def write_position_and_targets_batch(pool, records: list[dict]):
                     Decimal(record["planned_risk"]),
                     Decimal(record["notional_value"]),
                     record["route"],
-                    int(record["log_id"])
+                    int(record["log_uid"])
                 ))
 
                 for target in record.get("tp_targets", []) + record.get("sl_targets", []):
@@ -97,7 +97,7 @@ async def write_position_and_targets_batch(pool, records: list[dict]):
                     position_uid, strategy_id, symbol, direction, entry_price,
                     quantity, quantity_left, status, created_at,
                     exit_price, closed_at, close_reason, pnl,
-                    planned_risk, notional_value, route, log_id
+                    planned_risk, notional_value, route, log_uid
                 )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                 """,
@@ -204,9 +204,9 @@ async def reverse_entry(payload: dict):
     log.debug(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
 
     async with pool.acquire() as conn:
-        # Получаем log_id, closed_at и symbol из позиции
+        # Получаем log_uid, closed_at и symbol из позиции
         row = await conn.fetchrow("""
-            SELECT log_id, closed_at, symbol
+            SELECT log_uid, closed_at, symbol
             FROM positions_v4
             WHERE position_uid = $1
         """, position_uid)
@@ -215,7 +215,7 @@ async def reverse_entry(payload: dict):
             log.warning(f"[REVERSE_ENTRY] Позиция {position_uid} не найдена в БД — выход")
             return
 
-        log_id = row["log_id"]
+        log_uid = row["log_uid"]
         closed_at = row["closed_at"]
         symbol = row["symbol"]
 
@@ -242,10 +242,10 @@ async def reverse_entry(payload: dict):
             SELECT direction
             FROM signals_v4_log
             WHERE id = $1
-        """, log_id)
+        """, log_uid)
 
         if not sig or not sig["direction"]:
-            log.warning(f"[REVERSE_ENTRY] Не удалось получить direction по log_id={log_id}")
+            log.warning(f"[REVERSE_ENTRY] Не удалось получить direction по log_uid={log_uid}")
             return
 
         direction = sig["direction"]
