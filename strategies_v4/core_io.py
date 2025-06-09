@@ -45,7 +45,7 @@ async def write_log_entry_batch(pool, records: list[dict]):
                 ))
 
             await conn.executemany(query, values_list)
-            log.debug(f"💾 Записано логов сигналов: {len(values_list)}")
+            log.info(f"💾 Записано логов сигналов: {len(values_list)}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка батч-записи логов сигналов: {e}")
 # 🔸 Запись позиции и целей
@@ -58,6 +58,9 @@ async def write_position_and_targets_batch(pool, records: list[dict]):
             target_values = []
 
             for record in records:
+                if "log_uid" not in record:
+                    log.warning(f"❗ Нет log_uid в записи позиции: {record}")
+                
                 position_values.append((
                     record["position_uid"],
                     int(record["strategy_id"]),
@@ -117,7 +120,7 @@ async def write_position_and_targets_batch(pool, records: list[dict]):
                 )
 
             await tx.commit()
-            log.debug(f"💾 Записано позиций: {len(position_values)}, целей: {len(target_values)}")
+            log.info(f"💾 Записано позиций: {len(position_values)}, целей: {len(target_values)}")
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка батч-записи позиций: {e}")
@@ -191,7 +194,7 @@ async def update_position_and_targets_batch(pool, records: list[dict]):
                         )
 
             await tx.commit()
-            log.debug(f"🔄 Обновлено позиций: {len(records)}")
+            log.info(f"🔄 Обновлено позиций: {len(records)}")
         except Exception as e:
             await tx.rollback()
             log.warning(f"❌ Ошибка батч-обновления позиций: {e}")
@@ -201,7 +204,7 @@ async def reverse_entry(payload: dict):
     redis = infra.redis_client
     pool = infra.pg_pool
 
-    log.debug(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
+    log.info(f"[REVERSE_ENTRY] Запуск реверса для позиции {position_uid}")
 
     async with pool.acquire() as conn:
         # Получаем log_uid, closed_at и symbol из позиции
@@ -235,7 +238,7 @@ async def reverse_entry(payload: dict):
                 closed_at = datetime.utcnow()
                 log.warning(f"[REVERSE_ENTRY] closed_at всё ещё None — принудительно установлено now(): {closed_at.isoformat()}")
             else:
-                log.debug(f"[REVERSE_ENTRY] closed_at успешно получен после ожидания: {closed_at.isoformat()}")
+                log.info(f"[REVERSE_ENTRY] closed_at успешно получен после ожидания: {closed_at.isoformat()}")
 
         # Получаем направление сигнала, открывшего позицию
         sig = await conn.fetchrow("""
@@ -279,16 +282,16 @@ async def reverse_entry(payload: dict):
             "received_at": received_at
         }
 
-        log.debug(f"[REVERSE_ENTRY] 📤 Публикация сигнала в signals_stream: {json.dumps(new_signal)}")
+        log.info(f"[REVERSE_ENTRY] 📤 Публикация сигнала в signals_stream: {json.dumps(new_signal)}")
 
         try:
             await redis.xadd("signals_stream", new_signal)
-            log.debug(f"📨 [REVERSE_ENTRY] Контр-сигнал отправлен для {symbol}")
+            log.info(f"📨 [REVERSE_ENTRY] Контр-сигнал отправлен для {symbol}")
         except Exception as e:
             log.warning(f"[REVERSE_ENTRY] Ошибка отправки в Redis: {e}")
 # 🔸 Чтение логов сигналов
 async def run_signal_log_writer():
-    log.debug("📝 [CORE_IO] Запуск логгера сигналов")
+    log.info("📝 [CORE_IO] Запуск логгера сигналов")
 
     redis = infra.redis_client
     pool = infra.pg_pool
@@ -321,7 +324,7 @@ async def run_signal_log_writer():
             # Условие флаша: по объёму или по времени
             if buffer and (len(buffer) >= buffer_limit or (now - last_flush) > flush_interval_sec):
                 await write_log_entry_batch(pool, buffer)
-                log.debug(f"📝 [CORE_IO] Записано логов: {len(buffer)}")
+                log.info(f"📝 [CORE_IO] Записано логов: {len(buffer)}")
                 buffer.clear()
                 last_flush = now
 
@@ -330,7 +333,7 @@ async def run_signal_log_writer():
             await asyncio.sleep(5)
 # 🔸 Чтение позиций из Redis и запись в БД
 async def run_position_writer():
-    log.debug("📝 [CORE_IO] Запуск воркера записи позиций")
+    log.info("📝 [CORE_IO] Запуск воркера записи позиций")
     redis = infra.redis_client
     pool = infra.pg_pool
     last_id = "$"
@@ -365,7 +368,7 @@ async def run_position_writer():
             await asyncio.sleep(5)
 # 🔸 Воркер обновлений позиции из Redis-потока
 async def run_position_update_writer():
-    log.debug("🛠 [CORE_IO] Запуск обработчика обновлений позиций")
+    log.info("🛠 [CORE_IO] Запуск обработчика обновлений позиций")
 
     redis = infra.redis_client
     pool = infra.pg_pool
@@ -402,7 +405,7 @@ async def run_position_update_writer():
             await asyncio.sleep(5)
 # 🔄 Воркер: обрабатывает задачи реверса из Redis Stream
 async def run_reverse_trigger_loop():
-    log.debug("🌀 [CORE_IO] Запуск воркера реверса")
+    log.info("🌀 [CORE_IO] Запуск воркера реверса")
 
     redis = infra.redis_client
     last_id = "$"
@@ -427,7 +430,7 @@ async def run_reverse_trigger_loop():
                     try:
                         payload = json.loads(msg_data["data"])
                         position_uid = payload["position_uid"]
-                        log.debug(f"[REVERSE_TRIGGER] Получен UID позиции: {position_uid}")
+                        log.info(f"[REVERSE_TRIGGER] Получен UID позиции: {position_uid}")
                         tasks.append(reverse_entry({"position_uid": position_uid}))
                     except Exception as e:
                         log.warning(f"[REVERSE_TRIGGER] Ошибка обработки задачи: {e}")
