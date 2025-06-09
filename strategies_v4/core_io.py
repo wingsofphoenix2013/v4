@@ -311,6 +311,7 @@ async def run_signal_log_writer():
                 for msg_id, msg_data in messages:
                     last_id = msg_id
                     try:
+                        log.warning(f"📦 msg_data: {msg_data}")
                         record = msg_data
                         buffer.append(record)
                     except Exception as e:
