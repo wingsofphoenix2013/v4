@@ -204,7 +204,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
                 "logged_at": datetime.utcnow().isoformat()
             }
             try:
-                await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+                await redis.xadd("signal_log_queue", log_record)
             except Exception as e:
                 log.warning(f"⚠️ [POSITION_OPENER] Ошибка записи в Redis log_queue: {e}")
 
@@ -297,7 +297,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "logged_at": datetime.utcnow().isoformat()
         }
         try:
-            await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+            await redis.xadd("signal_log_queue", log_record)
         except Exception as e:
             log.warning(f"⚠️ [POSITION_OPENER] Ошибка записи успешного открытия в Redis log_queue: {e}")
 
@@ -322,7 +322,7 @@ async def open_position(signal: dict, strategy_obj, context: dict) -> dict:
             "sl_targets": normalize_targets(position.sl_targets)
         }
         try:
-            await redis.xadd("positions_stream", {"data": json.dumps(position_data)})
+            await redis.xadd("positions_stream", position_data)
             log.debug(f"[DEBUG] position_data for Redis: {position_data}")
             log.debug(f"📤 [POSITION_OPENER] Позиция отправлена в Redis для записи в БД")
         except Exception as e:

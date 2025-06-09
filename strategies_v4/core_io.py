@@ -36,13 +36,12 @@ async def write_log_entry_batch(pool, records: list[dict]):
             values_list = []
 
             for record in records:
-                parsed = record  # ✅ Уже готовый словарь, без .get("data")
-
-                if "log_uid" not in parsed:
-                    log.warning(f"❗ log_uid отсутствует в записи сигнала: {parsed}")
+                # Данные уже приходят в виде плоского словаря
+                if "log_uid" not in record:
+                    log.warning(f"❗ log_uid отсутствует в записи сигнала: {record}")
                     continue
 
-                log_uid = parsed.get("log_uid")
+                log_uid = record.get("log_uid")
                 if not isinstance(log_uid, str):
                     log_uid = str(log_uid)
                     log.debug(f"🔁 Приведён log_uid к строке: {log_uid}")
@@ -50,14 +49,14 @@ async def write_log_entry_batch(pool, records: list[dict]):
                 try:
                     values_list.append((
                         log_uid,
-                        int(parsed["strategy_id"]),
-                        parsed["status"],
-                        parsed.get("position_uid"),
-                        parsed.get("note"),
-                        datetime.fromisoformat(parsed["logged_at"])
+                        int(record["strategy_id"]),
+                        record["status"],
+                        record.get("position_uid"),
+                        record.get("note"),
+                        datetime.fromisoformat(record["logged_at"])
                     ))
                 except Exception as e:
-                    log.warning(f"⚠️ Ошибка подготовки записи для логов сигналов: {e}, data: {parsed}")
+                    log.warning(f"⚠️ Ошибка подготовки записи для логов сигналов: {e}, data: {record}")
                     continue
 
             if values_list:
@@ -358,6 +357,7 @@ async def run_signal_log_writer():
 # 🔸 Чтение позиций из Redis и запись в БД
 async def run_position_writer():
     log.debug("📝 [CORE_IO] Запуск воркера записи позиций")
+
     redis = infra.redis_client
     pool = infra.pg_pool
     last_id = "$"
@@ -371,6 +371,7 @@ async def run_position_writer():
                 count=buffer_limit,
                 block=1000
             )
+
             if not response:
                 continue
 
@@ -378,7 +379,7 @@ async def run_position_writer():
                 for msg_id, msg_data in messages:
                     last_id = msg_id
                     try:
-                        record = json.loads(msg_data["data"])
+                        record = msg_data  # ✅ больше не парсим JSON вручную
                         buffer.append(record)
                     except Exception as e:
                         log.warning(f"⚠️ Ошибка обработки позиции: {e}")
@@ -415,7 +416,7 @@ async def run_position_update_writer():
                 for msg_id, msg_data in messages:
                     last_id = msg_id
                     try:
-                        record = json.loads(msg_data["data"])
+                        record = msg_data
                         buffer.append(record)
                     except Exception as e:
                         log.warning(f"⚠️ [CORE_IO] Ошибка обработки обновления позиции: {e}")
@@ -452,7 +453,7 @@ async def run_reverse_trigger_loop():
                 for msg_id, msg_data in messages:
                     last_id = msg_id
                     try:
-                        payload = json.loads(msg_data["data"])
+                        payload = msg_data
                         position_uid = payload["position_uid"]
                         log.debug(f"[REVERSE_TRIGGER] Получен UID позиции: {position_uid}")
                         tasks.append(reverse_entry({"position_uid": position_uid}))
