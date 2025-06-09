@@ -246,6 +246,10 @@ async def reverse_entry(payload: dict):
         closed_at = row["closed_at"]
         symbol = row["symbol"]
 
+        if not log_uid:
+            log.warning(f"[REVERSE_ENTRY] log_uid отсутствует в позиции {position_uid}")
+            return
+
         if closed_at is None:
             log.warning(f"[REVERSE_ENTRY] closed_at is None — ожидание 1 сек перед повторной попыткой")
             await asyncio.sleep(1)
@@ -264,14 +268,14 @@ async def reverse_entry(payload: dict):
             else:
                 log.info(f"[REVERSE_ENTRY] closed_at успешно получен после ожидания: {closed_at.isoformat()}")
 
-        # Получаем направление сигнала, открывшего позицию
+        # Получаем направление сигнала, открывшего позицию — 🔧 фикс: uid вместо id
         sig = await conn.fetchrow("""
             SELECT direction
             FROM signals_v4_log
-            WHERE id = $1
+            WHERE uid = $1
         """, log_uid)
 
-        if not sig or not sig["direction"]:
+        if not sig or not sig.get("direction"):
             log.warning(f"[REVERSE_ENTRY] Не удалось получить direction по log_uid={log_uid}")
             return
 
