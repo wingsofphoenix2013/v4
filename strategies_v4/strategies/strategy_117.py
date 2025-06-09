@@ -58,7 +58,6 @@ class Strategy117:
         if note:
             log.debug(f"🚫 [Strategy117] {note}")
             if redis:
-            if redis:
                 log_record = {
                     "log_uid": log_uid,
                     "strategy_id": strategy_id,
