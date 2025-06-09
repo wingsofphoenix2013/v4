@@ -36,12 +36,17 @@ async def write_log_entry_batch(pool, records: list[dict]):
             values_list = []
 
             for record in records:
-                # 🔍 Отладка и защита
-                if "log_uid" not in record:
-                    log.warning(f"❗ log_uid отсутствует в записи сигнала: {record}")
-                    continue  # пропускаем некорректную запись
+                try:
+                    parsed = json.loads(record["data"])
+                except Exception as e:
+                    log.warning(f"❗ Ошибка парсинга JSON в сигнале: {e}, raw={record}")
+                    continue
 
-                log_uid = record.get("log_uid")
+                if "log_uid" not in parsed:
+                    log.warning(f"❗ log_uid отсутствует в записи сигнала: {parsed}")
+                    continue
+
+                log_uid = parsed.get("log_uid")
                 if not isinstance(log_uid, str):
                     log_uid = str(log_uid)
                     log.info(f"🔁 Приведён log_uid к строке: {log_uid}")
@@ -49,14 +54,15 @@ async def write_log_entry_batch(pool, records: list[dict]):
                 try:
                     values_list.append((
                         log_uid,
-                        int(record["strategy_id"]),
-                        record["status"],
-                        record.get("position_uid"),
-                        record.get("note"),
-                        datetime.fromisoformat(record["logged_at"])
+                        int(parsed["strategy_id"]),
+                        parsed["status"],
+                        parsed.get("position_uid"),
+                        parsed.get("note"),
+                        datetime.fromisoformat(parsed["logged_at"])
                     ))
                 except Exception as e:
-                    log.warning(f"⚠️ Ошибка подготовки записи для логов сигналов: {e}, data: {record}")
+                    log.warning(f"⚠️ Ошибка подготовки записи для логов сигналов: {e}, data: {parsed}")
+                    continue
 
             if values_list:
                 await conn.executemany(query, values_list)
