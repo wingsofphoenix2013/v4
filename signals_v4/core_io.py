@@ -43,7 +43,7 @@ async def insert_signal_log(data: dict):
                         "direction": data["direction"],
                         "time": data["bar_time"],
                         "received_at": data["received_at"],
-                        "log_id": ""  # log_id будет добавлен позже при flush
+                        "log_uid": data["uid"]  # вместо log_id
                     }
                 )
                 await infra.record_counter("strategies_dispatched_total")
