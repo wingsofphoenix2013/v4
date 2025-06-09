@@ -193,6 +193,8 @@ async def run_signal_loop(strategy_registry):
             if not response:
                 continue
 
+            pending_log_tasks = []
+
             for stream_name, messages in response:
                 for msg_id, msg_data in messages:
                     last_id = msg_id
@@ -234,9 +236,18 @@ async def run_signal_loop(strategy_registry):
                             note = f"strategy_registry: '{strategy_name}' не найдена"
                         else:
                             context = {"redis": redis}
-                            result = strategy_obj.validate_signal(msg_data, context)
-                            if asyncio.iscoroutine(result):
-                                result = await result
+
+                            async def validated():
+                                result = strategy_obj.validate_signal(msg_data, context)
+                                if asyncio.iscoroutine(result):
+                                    result = await result
+                                return result
+
+                            try:
+                                result = await validated()
+                            except Exception:
+                                log.warning(f"[VALIDATE] Ошибка в стратегии {strategy_name}", exc_info=True)
+                                result = False
 
                             if result != True:
                                 if result == "logged":
@@ -262,9 +273,11 @@ async def run_signal_loop(strategy_registry):
                                 "logged_at": datetime.utcnow().isoformat()
                             }
 
-                            # 🔸 Пишем плоский dict — без json.dumps
-                            await redis.xadd(SIGNAL_LOG_STREAM, log_record)
-                            
+                            # 🔸 Добавляем в отложенные задачи логирования
+                            pending_log_tasks.append(
+                                redis.xadd(SIGNAL_LOG_STREAM, log_record)
+                            )
+
                     else:
                         log.debug(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
@@ -277,6 +290,10 @@ async def run_signal_loop(strategy_registry):
                         # 🔸 Диспетчеризация маршрута обработки
                         msg_data["route"] = route
                         await route_and_dispatch_signal(msg_data, strategy_registry, redis)
+
+            if pending_log_tasks:
+                await asyncio.gather(*pending_log_tasks)
+                pending_log_tasks.clear()
 
         except Exception as e:
             log.exception("❌ Ошибка при чтении из Redis — повтор через 5 секунд")

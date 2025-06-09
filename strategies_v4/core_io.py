@@ -295,6 +295,8 @@ async def run_signal_log_writer():
     last_id = "$"
     buffer = []
     buffer_limit = 100
+    flush_interval_sec = 0.5
+    last_flush = time.monotonic()
 
     while True:
         try:
@@ -304,22 +306,24 @@ async def run_signal_log_writer():
                 block=1000
             )
 
-            if not response:
-                continue
+            now = time.monotonic()
 
-            for stream_name, messages in response:
-                for msg_id, msg_data in messages:
-                    last_id = msg_id
-                    try:
-                        log.warning(f"📦 msg_data: {msg_data}")
-                        record = msg_data
-                        buffer.append(record)
-                    except Exception as e:
-                        log.warning(f"⚠️ Ошибка обработки записи: {e}")
+            if response:
+                for stream_name, messages in response:
+                    for msg_id, msg_data in messages:
+                        last_id = msg_id
+                        try:
+                            record = msg_data
+                            buffer.append(record)
+                        except Exception as e:
+                            log.warning(f"⚠️ Ошибка обработки записи: {e}")
 
-            if buffer:
+            # Условие флаша: по объёму или по времени
+            if buffer and (len(buffer) >= buffer_limit or (now - last_flush) > flush_interval_sec):
                 await write_log_entry_batch(pool, buffer)
+                log.debug(f"📝 [CORE_IO] Записано логов: {len(buffer)}")
                 buffer.clear()
+                last_flush = now
 
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream")
