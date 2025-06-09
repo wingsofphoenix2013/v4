@@ -311,7 +311,7 @@ async def run_signal_log_writer():
                 for msg_id, msg_data in messages:
                     last_id = msg_id
                     try:
-                        record = json.loads(msg_data["data"])
+                        record = msg_data
                         buffer.append(record)
                     except Exception as e:
                         log.warning(f"⚠️ Ошибка обработки записи: {e}")

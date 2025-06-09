@@ -262,7 +262,9 @@ async def run_signal_loop(strategy_registry):
                                 "logged_at": datetime.utcnow().isoformat()
                             }
 
-                            await redis.xadd(SIGNAL_LOG_STREAM, {"data": json.dumps(log_record)})
+                            # 🔸 Пишем плоский dict — без json.dumps
+                            await redis.xadd(SIGNAL_LOG_STREAM, log_record)
+                            
                     else:
                         log.info(f"✅ ДОПУЩЕНО: strategy={strategy_id}, symbol={symbol}, route={route}, note={note}")
 
