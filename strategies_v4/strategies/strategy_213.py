@@ -66,11 +66,15 @@ class Strategy213:
                     "note": note,
                     "logged_at": datetime.utcnow().isoformat()
                 }
+
+                # 🔸 Удаляем все поля со значением None (например, position_id)
+                clean_record = {k: v for k, v in log_record.items() if v is not None}
+
                 try:
-                    # 🔸 Пишем плоский dict, без json.dumps
-                    await redis.xadd("signal_log_queue", log_record)
+                    await redis.xadd("signal_log_queue", clean_record)
                 except Exception as e:
                     log.warning(f"⚠️ [Strategy213] Ошибка записи в Redis log_queue: {e}")
+
             return "logged"
 
         return True
