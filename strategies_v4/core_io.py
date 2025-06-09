@@ -34,18 +34,36 @@ async def write_log_entry_batch(pool, records: list[dict]):
     async with pool.acquire() as conn:
         try:
             values_list = []
-            for record in records:
-                values_list.append((
-                    record["log_uid"],
-                    int(record["strategy_id"]),
-                    record["status"],
-                    record.get("position_uid"),
-                    record.get("note"),
-                    datetime.fromisoformat(record["logged_at"])
-                ))
 
-            await conn.executemany(query, values_list)
-            log.info(f"💾 Записано логов сигналов: {len(values_list)}")
+            for record in records:
+                # 🔍 Отладка и защита
+                if "log_uid" not in record:
+                    log.warning(f"❗ log_uid отсутствует в записи сигнала: {record}")
+                    continue  # пропускаем некорректную запись
+
+                log_uid = record.get("log_uid")
+                if not isinstance(log_uid, str):
+                    log_uid = str(log_uid)
+                    log.debug(f"🔁 Приведён log_uid к строке: {log_uid}")
+
+                try:
+                    values_list.append((
+                        log_uid,
+                        int(record["strategy_id"]),
+                        record["status"],
+                        record.get("position_uid"),
+                        record.get("note"),
+                        datetime.fromisoformat(record["logged_at"])
+                    ))
+                except Exception as e:
+                    log.warning(f"⚠️ Ошибка подготовки записи для логов сигналов: {e}, data: {record}")
+
+            if values_list:
+                await conn.executemany(query, values_list)
+                log.info(f"💾 Записано логов сигналов: {len(values_list)}")
+            else:
+                log.debug("ℹ️ Нет корректных логов сигналов для записи")
+
         except Exception as e:
             log.warning(f"⚠️ Ошибка батч-записи логов сигналов: {e}")
 # 🔸 Запись позиции и целей
