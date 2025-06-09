@@ -67,7 +67,8 @@ class Strategy213:
                     "logged_at": datetime.utcnow().isoformat()
                 }
                 try:
-                    await redis.xadd("signal_log_queue", {"data": json.dumps(log_record)})
+                    # 🔸 Пишем плоский dict, без json.dumps
+                    await redis.xadd("signal_log_queue", log_record)
                 except Exception as e:
                     log.warning(f"⚠️ [Strategy213] Ошибка записи в Redis log_queue: {e}")
             return "logged"
