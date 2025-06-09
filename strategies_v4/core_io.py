@@ -36,11 +36,7 @@ async def write_log_entry_batch(pool, records: list[dict]):
             values_list = []
 
             for record in records:
-                try:
-                    parsed = json.loads(record["data"])
-                except Exception as e:
-                    log.warning(f"❗ Ошибка парсинга JSON в сигнале: {e}, raw={record}")
-                    continue
+                parsed = record  # ✅ Уже готовый словарь, без .get("data")
 
                 if "log_uid" not in parsed:
                     log.warning(f"❗ log_uid отсутствует в записи сигнала: {parsed}")
