@@ -273,9 +273,12 @@ async def run_signal_loop(strategy_registry):
                                 "logged_at": datetime.utcnow().isoformat()
                             }
 
+                            # 🔸 Удаляем ключи с None перед xadd
+                            sanitized = {k: v for k, v in log_record.items() if v is not None}
+
                             # 🔸 Добавляем в отложенные задачи логирования
                             pending_log_tasks.append(
-                                redis.xadd(SIGNAL_LOG_STREAM, log_record)
+                                redis.xadd(SIGNAL_LOG_STREAM, sanitized)
                             )
 
                     else:
