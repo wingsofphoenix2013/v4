@@ -36,7 +36,7 @@ async def write_log_entry_batch(pool, records: list[dict]):
             values_list = []
             for record in records:
                 values_list.append((
-                    int(record["log_uid"]),
+                    record["log_uid"],
                     int(record["strategy_id"]),
                     record["status"],
                     record.get("position_uid"),
@@ -75,7 +75,7 @@ async def write_position_and_targets_batch(pool, records: list[dict]):
                     Decimal(record["planned_risk"]),
                     Decimal(record["notional_value"]),
                     record["route"],
-                    int(record["log_uid"])
+                    record["log_uid"]
                 ))
 
                 for target in record.get("tp_targets", []) + record.get("sl_targets", []):
