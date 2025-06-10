@@ -1,15 +1,11 @@
-# strategies_v4_main.py
-
 import asyncio
 import logging
 
-from infra import setup_logging, setup_pg, setup_redis_client
+from infra import setup_logging, setup_pg, setup_redis_client, infra
 
-# 🔸 Логгер для главного процесса
 log = logging.getLogger("STRATEGY_MAIN")
 
 
-# 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
     while True:
         try:
@@ -20,63 +16,34 @@ async def run_safe_loop(coro_factory, label: str):
             await asyncio.sleep(5)
 
 
-# 🔸 Заглушки (временно, до новой реализации)
-async def stub_signal_processor():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_config_loader():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_core_io_signal_log_writer():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_position_opener():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_position_writer():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_position_handler():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_position_update_writer():
-    while True:
-        await asyncio.sleep(3600)
-
-async def stub_reverse_trigger():
-    while True:
-        await asyncio.sleep(3600)
+# 🔸 Заглушки (временно)
+async def stub_signal_processor(): await asyncio.sleep(3600)
+async def stub_config_loader(): await asyncio.sleep(3600)
+async def stub_core_io_signal_log_writer(): await asyncio.sleep(3600)
+async def stub_position_opener(): await asyncio.sleep(3600)
+async def stub_position_writer(): await asyncio.sleep(3600)
+async def stub_position_handler(): await asyncio.sleep(3600)
+async def stub_position_update_writer(): await asyncio.sleep(3600)
+async def stub_reverse_trigger(): await asyncio.sleep(3600)
 
 
 # 🔸 Главная точка входа
 async def main():
-    # Инициализация логирования
     setup_logging()
-    log.info("🛠️ Логирование настроено")
+    log.info("📦 Запуск системы стратегий v4")
 
-    # Инициализация внешних сервисов
-    await setup_pg()
-    log.info("🛢️ Подключение к PostgreSQL установлено")
+    try:
+        await setup_pg()
+        await setup_redis_client()
+    except Exception:
+        log.exception("❌ Ошибка инициализации внешних сервисов")
+        return
 
-    setup_redis_client()
-    log.info("📡 Подключение к Redis установлено")
-
-    # TODO: init_config_state()  — загрузка конфигурации стратегий
-    # TODO: load_position_state() — восстановление позиций из БД
-    # TODO: load_strategies()     — регистрация стратегий
-
-    # Временная заглушка для strategy_registry
+    # TODO: init_config_state(), load_position_state(), load_strategies()
     strategy_registry = {}
 
     log.info("🚀 Запуск asyncio-воркеров")
 
-    # Запуск воркеров
     await asyncio.gather(
         run_safe_loop(stub_signal_processor, "SIGNAL_PROCESSOR"),
         run_safe_loop(stub_config_loader, "CONFIG_LOADER"),
@@ -87,7 +54,6 @@ async def main():
         run_safe_loop(stub_position_update_writer, "POSITION_UPDATE_WRITER"),
         run_safe_loop(stub_reverse_trigger, "REVERSE_TRIGGER")
     )
-
 
 if __name__ == "__main__":
     try:

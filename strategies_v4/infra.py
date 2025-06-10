@@ -1,25 +1,22 @@
 import os
-import json
 import logging
 import asyncio
 import asyncpg
 import redis.asyncio as aioredis
 
-# 🔸 Контейнер глобального состояния
+# 🔸 Глобальное состояние
 class Infra:
     pg_pool: asyncpg.Pool = None
     redis_client: aioredis.Redis = None
 
 infra = Infra()
 
-# 🔸 Константы Redis
+# 🔸 Константы
 SIGNAL_STREAM = "signals_stream"
 EVENT_STREAM = "strategy_events"
-
-# 🔸 DEBUG режим
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-# 🔸 Настройка логирования
+# 🔸 Логирование
 def setup_logging():
     level = logging.DEBUG if DEBUG_MODE else logging.INFO
     logging.basicConfig(
@@ -28,16 +25,19 @@ def setup_logging():
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-# 🔸 Подключение к PostgreSQL
+# 🔸 PostgreSQL
 async def setup_pg():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise RuntimeError("❌ DATABASE_URL не задан")
 
-    infra.pg_pool = await asyncpg.create_pool(db_url)
+    pool = await asyncpg.create_pool(db_url)
+    await pool.execute("SELECT 1")  # Проверка соединения
+    infra.pg_pool = pool
+    logging.getLogger("INFRA").info("🛢️ Подключение к PostgreSQL установлено")
 
-# 🔸 Подключение к Redis
-def setup_redis_client():
+# 🔸 Redis
+async def setup_redis_client():
     host = os.getenv("REDIS_HOST", "localhost")
     port = int(os.getenv("REDIS_PORT", 6379))
     password = os.getenv("REDIS_PASSWORD")
@@ -46,12 +46,17 @@ def setup_redis_client():
     protocol = "rediss" if use_tls else "redis"
     redis_url = f"{protocol}://{host}:{port}"
 
-    infra.redis_client = aioredis.from_url(
+    client = aioredis.from_url(
         redis_url,
         password=password,
         decode_responses=True
     )
-# 🔸 Загрузка значений индикаторов из Redis
+
+    await client.ping()
+    infra.redis_client = client
+    logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
+
+# 🔸 Чтение индикаторов из Redis
 async def load_indicators(symbol: str, params: list[str], timeframe: str) -> dict:
     redis = infra.redis_client
     result = {}
