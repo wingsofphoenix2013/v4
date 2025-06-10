@@ -10,7 +10,7 @@ log = logging.getLogger("STRATEGY_LOADER")
 
 # 🔸 Загрузка всех стратегий из папки strategies/
 def load_strategies():
-    from strategies_v4 import strategies  # ensures 'strategies' is treated as a package
+    import strategies  # используется как пакет внутри текущей директории
 
     strategy_registry = {}
 
@@ -18,7 +18,7 @@ def load_strategies():
         if not modname.startswith("strategy_"):
             continue
 
-        full_module_name = f"strategies_v4.strategies.{modname}"
+        full_module_name = f"strategies.{modname}"
 
         try:
             module = importlib.import_module(full_module_name)
@@ -47,7 +47,7 @@ def load_strategies():
         except Exception as e:
             log.exception(f"❌ Ошибка загрузки стратегии {modname}: {e}")
 
-    # 🔸 Финальный лог — общее количество
+    # 🔸 Финальный лог
     log.info(f"✅ Загружено стратегий: {len(strategy_registry)}")
     return strategy_registry
 
