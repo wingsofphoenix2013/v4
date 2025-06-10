@@ -1,31 +1,30 @@
 # position_state_loader.py
 
-import logging
 import asyncio
+import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
+from typing import Optional
 from datetime import datetime
 
-from infra import infra  # 🔸 доступ к infra.pg_pool
+from infra import infra
 
-# 🔸 Логгер для загрузчика состояния позиций
-log = logging.getLogger("POSITION_LOADER")
+# 🔸 Логгер состояния позиций
+log = logging.getLogger("POSITION_STATE")
 
-# 🔸 Структура цели позиции (TP/SL)
+# 🔸 Структура цели TP или SL
 @dataclass
 class Target:
-    type: str  # 'tp' or 'sl'
+    type: str
     level: int
-    price: Decimal
+    price: Optional[Decimal]
     quantity: Decimal
     hit: bool
     hit_at: Optional[datetime]
     id: Optional[int] = None
     canceled: bool = False
-    source: str = "price"
 
-# 🔸 Структура позиции с вложенными целями
+# 🔸 Структура позиции
 @dataclass
 class PositionState:
     uid: str
@@ -40,94 +39,88 @@ class PositionState:
     exit_price: Optional[Decimal]
     closed_at: Optional[datetime]
     close_reason: Optional[str]
-    pnl: Decimal
-    planned_risk: Decimal
+    pnl: Optional[Decimal]
+    planned_risk: Optional[Decimal]
     route: str
-    tp_targets: List[Target]
-    sl_targets: List[Target]
-    log_uid: str
+    tp_targets: list[Target]
+    sl_targets: list[Target]
+    log_uid: Optional[str]
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
-# 🔸 Глобальные in-memory хранилища состояний
-position_registry: Dict[Tuple[int, str], PositionState] = {}
+# 🔸 Глобальный реестр позиций
+position_registry: dict[tuple[int, str], PositionState] = {}
 
-# 🔸 Загрузка активных позиций и целей из базы данных
+# 🔸 Загрузка всех открытых позиций и их целей
 async def load_position_state():
-    pool = infra.pg_pool
-    if pool is None:
-        raise RuntimeError("❌ PostgreSQL pool не инициализирован")
+    log.info("📥 Загрузка открытых позиций из БД")
 
-    async with pool.acquire() as conn:
-        log.debug("📥 Загрузка активных позиций из PG")
+    positions = await infra.pg_pool.fetch(
+        "SELECT * FROM positions_v4 WHERE status IN ('open', 'partial')"
+    )
 
-        positions = await conn.fetch(
-            """
-            SELECT * FROM positions_v4
-            WHERE status IN ('open', 'partial')
-            """
-        )
-        position_uids = [r['position_uid'] for r in positions]
+    if not positions:
+        log.info("ℹ️ Открытых позиций не найдено")
+        return
 
-        if not position_uids:
-            log.debug("ℹ️ Нет активных позиций для восстановления")
-            return
+    uids = [p["position_uid"] for p in positions]
+    targets_raw = await infra.pg_pool.fetch(
+        "SELECT * FROM position_targets_v4 WHERE position_uid = ANY($1)", uids
+    )
 
-        log.debug(f"🔍 Найдено позиций: {len(position_uids)}")
-
-        targets = await conn.fetch(
-            """
-            SELECT id, type, level, price, quantity, hit, hit_at, canceled, source, position_uid
-            FROM position_targets_v4
-            WHERE position_uid = ANY($1)
-            """,
-            position_uids
-        )
-
-    # 🔸 Группировка целей по позиции
-    target_map: Dict[str, List[Target]] = {}
-    for row in targets:
+    # Группировка целей по позиции
+    targets_by_uid = {}
+    for t in targets_raw:
         target = Target(
-            id=row['id'],
-            type=row['type'],
-            level=row['level'],
-            price=row['price'],
-            quantity=row['quantity'],
-            hit=row['hit'],
-            hit_at=row['hit_at'],
-            canceled=row['canceled'],
-            source=row["source"]
+            type=t["type"],
+            level=t["level"],
+            price=t["price"],
+            quantity=t["quantity"],
+            hit=t["hit"] or False,
+            hit_at=t["hit_at"],
+            id=t["id"],
+            canceled=t["canceled"] or False
         )
-        target_map.setdefault(row['position_uid'], []).append(target)
+        targets_by_uid.setdefault(t["position_uid"], []).append(target)
 
-    # 🔸 Построение объектов PositionState
-    for row in positions:
-        uid = row['position_uid']
-        all_targets = target_map.get(uid, [])
-        tp_targets = [t for t in all_targets if t.type == 'tp']
-        sl_targets = [t for t in all_targets if t.type == 'sl']
+    loaded, skipped = 0, 0
 
-        position = PositionState(
+    for p in positions:
+        uid = p["position_uid"]
+        strategy_id = p["strategy_id"]
+        symbol = p["symbol"]
+
+        t_all = targets_by_uid.get(uid, [])
+
+        tp = [t for t in t_all if t.type == "tp"]
+        sl = [t for t in t_all if t.type == "sl"]
+
+        if not tp and not sl:
+            log.error(f"❌ Пропущена позиция без целей: {uid} ({symbol})")
+            skipped += 1
+            continue
+
+        state = PositionState(
             uid=uid,
-            strategy_id=row['strategy_id'],
-            symbol=row['symbol'],
-            direction=row['direction'],
-            entry_price=row['entry_price'],
-            quantity=row['quantity'],
-            quantity_left=row['quantity_left'],
-            status=row['status'],
-            created_at=row['created_at'],
-            exit_price=row['exit_price'],
-            closed_at=row['closed_at'],
-            close_reason=row['close_reason'],
-            pnl=row['pnl'],
-            planned_risk=row['planned_risk'],
-            route=row['route'],
-            tp_targets=tp_targets,
-            sl_targets=sl_targets,
-            log_uid=row['log_uid']
+            strategy_id=strategy_id,
+            symbol=symbol,
+            direction=p["direction"],
+            entry_price=p["entry_price"],
+            quantity=p["quantity"],
+            quantity_left=p["quantity_left"],
+            status=p["status"],
+            created_at=p["created_at"],
+            exit_price=p["exit_price"],
+            closed_at=p["closed_at"],
+            close_reason=p["close_reason"],
+            pnl=p["pnl"],
+            planned_risk=p["planned_risk"],
+            route=p["route"],
+            tp_targets=tp,
+            sl_targets=sl,
+            log_uid=p["log_uid"]
         )
 
-        # 🔸 Индексация по (strategy_id, symbol)
-        position_registry[(position.strategy_id, position.symbol)] = position
+        position_registry[(strategy_id, symbol)] = state
+        loaded += 1
 
-    log.info(f"✅ Загружено и проиндексировано {len(position_registry)} позиций")
+    log.info(f"✅ Загружено позиций: {loaded}, пропущено (без целей): {skipped}")
