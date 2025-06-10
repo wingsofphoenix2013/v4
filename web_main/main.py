@@ -440,13 +440,14 @@ async def webhook_v4(request: Request):
     # 🔹 Отладочный лог сигнала
     log.debug(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
-    # 🔹 Публикация в Redis Stream
+    # 🔹 Публикация в Redis Stream с источником
     await redis_client.xadd("signals_stream", {
         "message": message,
         "symbol": symbol,
         "bar_time": bar_time or "",
         "sent_at": sent_at or "",
-        "received_at": received_at
+        "received_at": received_at,
+        "source": "external_signal"
     })
 
     return JSONResponse({"status": "ok", "received_at": received_at})
