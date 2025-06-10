@@ -1,33 +1,57 @@
-import importlib
+# strategy_loader.py
+
 import pkgutil
+import importlib
 import inspect
 import logging
 
-# Папка с реализациями стратегий — как Python-пакет
-import strategies as strategies_pkg
-
+# 🔸 Логгер загрузчика стратегий
 log = logging.getLogger("STRATEGY_LOADER")
 
+# 🔸 Загрузка всех стратегий из папки strategies/
 def load_strategies():
-    strategies = {}
+    from strategies_v4 import strategies  # ensures 'strategies' is treated as a package
 
-    for _, modname, _ in pkgutil.iter_modules(strategies_pkg.__path__):
+    strategy_registry = {}
+
+    for finder, modname, ispkg in pkgutil.iter_modules(strategies.__path__):
         if not modname.startswith("strategy_"):
             continue
 
+        full_module_name = f"strategies_v4.strategies.{modname}"
+
         try:
-            module = importlib.import_module(f"strategies.{modname}")
+            module = importlib.import_module(full_module_name)
+            expected_class_name = _derive_class_name(modname)
 
-            expected_class = modname.title().replace("_", "")
+            strategy_class = None
             for name, obj in inspect.getmembers(module, inspect.isclass):
-                if name.lower() == expected_class.lower():
-                    strategies[modname] = obj()
-                    log.debug(f"✅ Загрузка стратегии: {modname} → {name}")
+                if name == expected_class_name and obj.__module__ == full_module_name:
+                    strategy_class = obj
                     break
-            else:
-                log.warning(f"⚠️ Стратегия {modname} — класс не найден")
 
-        except Exception:
-            log.exception(f"❌ Ошибка при загрузке {modname}")
+            if strategy_class is None:
+                log.warning(f"⚠️ Класс {expected_class_name} не найден в модуле {modname}")
+                continue
 
-    return strategies
+            if not all(hasattr(strategy_class, method) for method in ["validate_signal", "run"]):
+                log.warning(f"⚠️ Стратегия {modname} не реализует обязательные методы")
+                continue
+
+            if modname in strategy_registry:
+                log.warning(f"⚠️ Конфликт: стратегия {modname} уже загружена, пропускаем")
+                continue
+
+            strategy_registry[modname] = strategy_class()
+
+        except Exception as e:
+            log.exception(f"❌ Ошибка загрузки стратегии {modname}: {e}")
+
+    # 🔸 Финальный лог — общее количество
+    log.info(f"✅ Загружено стратегий: {len(strategy_registry)}")
+    return strategy_registry
+
+# 🔸 Преобразование имени модуля в имя класса
+def _derive_class_name(modname: str) -> str:
+    parts = modname.replace("strategy_", "").split("_")
+    return "Strategy" + "".join(p.capitalize() for p in parts)

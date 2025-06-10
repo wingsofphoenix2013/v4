@@ -1,12 +1,16 @@
+# strategies_v4_main.py
+
 import asyncio
 import logging
 
-from infra import setup_logging, setup_pg, setup_redis_client, infra
+from infra import setup_logging, setup_pg, setup_redis_client
 from config_loader import init_config_state, config_event_listener
+from strategy_loader import load_strategies
 
+# 🔸 Логгер для главного процесса
 log = logging.getLogger("STRATEGY_MAIN")
 
-
+# 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
     while True:
         try:
@@ -16,7 +20,7 @@ async def run_safe_loop(coro_factory, label: str):
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Заглушки (временно)
+# 🔸 Заглушки (временно, до полной реализации)
 async def stub_signal_processor(): await asyncio.sleep(3600)
 async def stub_core_io_signal_log_writer(): await asyncio.sleep(3600)
 async def stub_position_opener(): await asyncio.sleep(3600)
@@ -44,8 +48,12 @@ async def main():
         log.exception("❌ Ошибка инициализации конфигурации")
         return
 
-    # TODO: load_position_state(), load_strategies()
-    strategy_registry = {}
+    try:
+        strategy_registry = load_strategies()
+        log.info("🧠 Регистр стратегий загружен")
+    except Exception:
+        log.exception("❌ Ошибка при загрузке стратегий")
+        return
 
     log.info("🚀 Запуск asyncio-воркеров")
 
