@@ -14,7 +14,7 @@ async def publish_signal_log(data: dict, signal_id: int, direction: str, status:
                 "signal_id": str(signal_id),
                 "symbol": data.get("symbol"),
                 "direction": direction,
-                "source": "stream",
+                "source": data.get("source", "unknown"),
                 "message": data.get("message"),
                 "raw_message": json.dumps(data),
                 "bar_time": data.get("bar_time"),
@@ -67,8 +67,9 @@ async def process_signal(data: dict):
 
     status = "ignored" if not matched_strategies else "dispatched"
 
-    # Добавляем matched_strategies только если они есть
+    # Добавляем matched_strategies и source, если они есть
     log_data = {**data}
+    log_data["source"] = data.get("source", "unknown")
     if status == "dispatched":
         log_data["strategies"] = matched_strategies
 
