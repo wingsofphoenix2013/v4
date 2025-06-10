@@ -200,12 +200,29 @@ log = logging.getLogger("TICKERS")
 
 async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
     async with pg_pool.acquire() as conn:
+        # 🔹 Обновление основного поля
         await conn.execute(
             f"UPDATE tickers_v4 SET {field} = $1 WHERE id = $2",
             new_value, ticker_id
         )
+
+        # 🔹 Дополнительно: управление activated_at
+        if field == "status":
+            if new_value == "enabled":
+                await conn.execute(
+                    "UPDATE tickers_v4 SET activated_at = NOW() WHERE id = $1",
+                    ticker_id
+                )
+            elif new_value == "disabled":
+                await conn.execute(
+                    "UPDATE tickers_v4 SET activated_at = NULL WHERE id = $1",
+                    ticker_id
+                )
+
+        # 🔹 Получение символа тикера
         symbol = await conn.fetchval("SELECT symbol FROM tickers_v4 WHERE id = $1", ticker_id)
 
+    # 🔹 Публикация события
     event = {
         "type": field,
         "action": new_value,
@@ -213,7 +230,6 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
         "source": "web_ui"
     }
 
-    # 🔹 Публикация события
     await redis_client.publish("tickers_v4_events", json.dumps(event))
     log.info(f"[PubSub] {event}")
 # 🔸 Страница со списком всех расчётов индикаторов и их параметрами
