@@ -50,6 +50,13 @@ async def main():
         return
 
     try:
+        await load_position_state()
+        log.info("📦 Позиции восстановлены из БД")
+    except Exception:
+        log.exception("❌ Ошибка при восстановлении позиций")
+        return
+
+    try:
         strategy_registry = load_strategies()
         log.info("🧠 Регистр стратегий загружен")
     except Exception:
