@@ -13,7 +13,7 @@ async def run_signal_log_writer():
     stream_name = "signal_log_queue"
     redis = infra.redis_client
     pg = infra.pg_pool
-    last_id = "0"
+    last_id = "$"
     buffer = []
     buffer_limit = 100
     flush_interval_sec = 1.0
