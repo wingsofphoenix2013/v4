@@ -102,17 +102,23 @@ class ConfigState:
         rows = await infra.pg_pool.fetch(
             "SELECT * FROM strategies_v4 WHERE enabled = true AND archived = false"
         )
-        self.strategies = {r["id"]: dict(r) for r in rows}
 
-        for strategy_id in self.strategies:
-            self.strategies[strategy_id]["tp_levels"] = await infra.pg_pool.fetch(
+        self.strategies = {}
+        for row in rows:
+            strategy_id = row["id"]
+            strategy = dict(row)
+            strategy["module_name"] = strategy["name"]
+
+            strategy["tp_levels"] = await infra.pg_pool.fetch(
                 "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
                 strategy_id
             )
-            self.strategies[strategy_id]["sl_rules"] = await infra.pg_pool.fetch(
+            strategy["sl_rules"] = await infra.pg_pool.fetch(
                 "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
                 strategy_id
             )
+
+            self.strategies[strategy_id] = strategy
 
     # 🔸 Загрузка связей стратегия ↔ тикеры
     async def _load_strategy_tickers(self):
