@@ -7,6 +7,8 @@ from infra import setup_logging, setup_pg, setup_redis_client
 from config_loader import init_config_state, config_event_listener
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state
+from signal_processor import run_signal_loop
+from core_io import run_signal_log_writer
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("STRATEGY_MAIN")
@@ -22,8 +24,6 @@ async def run_safe_loop(coro_factory, label: str):
             await asyncio.sleep(5)
 
 # 🔸 Заглушки (временно, до полной реализации)
-async def stub_signal_processor(): await asyncio.sleep(3600)
-async def stub_core_io_signal_log_writer(): await asyncio.sleep(3600)
 async def stub_position_opener(): await asyncio.sleep(3600)
 async def stub_position_writer(): await asyncio.sleep(3600)
 async def stub_position_handler(): await asyncio.sleep(3600)
@@ -66,9 +66,9 @@ async def main():
     log.info("🚀 Запуск asyncio-воркеров")
 
     await asyncio.gather(
-        run_safe_loop(stub_signal_processor, "SIGNAL_PROCESSOR"),
+        run_safe_loop(run_signal_loop, "SIGNAL_PROCESSOR"),
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
-        run_safe_loop(stub_core_io_signal_log_writer, "CORE_IO"),
+        run_safe_loop(run_signal_log_writer, "CORE_IO"),
         run_safe_loop(stub_position_opener, "POSITION_OPENER"),
         run_safe_loop(stub_position_writer, "POSITION_WRITER"),
         run_safe_loop(stub_position_handler, "POSITION_HANDLER"),
