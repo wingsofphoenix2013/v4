@@ -101,11 +101,13 @@ async def process_signal(data: dict):
                 )
 
         # 🔸 Обработка new_entry — стратегия готова к вызову
-        strategy_instance = strategy_registry.get(f"strategy_{strategy_id}")
+        modname = strategy.get("module_name", f"strategy_{strategy_id}")
+        strategy_instance = strategy_registry.get(modname)
+
         if not strategy_instance:
             return await route_ignore(
                 strategy_id, symbol, direction, log_uid,
-                "класс стратегии не найден"
+                f"класс стратегии '{modname}' не найден"
             )
 
         context = {"redis": infra.redis_client}
