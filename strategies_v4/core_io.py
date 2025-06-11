@@ -8,22 +8,35 @@ from infra import infra
 # 🔸 Логгер для I/O-операций
 log = logging.getLogger("CORE_IO")
 
-# 🔸 Воркер: запись логов сигналов из Redis в PostgreSQL
+# 🔸 Воркер: запись логов сигналов с использованием Consumer Group
 async def run_signal_log_writer():
     stream_name = "signal_log_queue"
-    redis = infra.redis_client
-    pg = infra.pg_pool
-    last_id = "$"
-    buffer = []
+    group_name = "core_io_group"
+    consumer_name = "core_io_1"
     buffer_limit = 100
     flush_interval_sec = 1.0
+    redis = infra.redis_client
+    pg = infra.pg_pool
 
-    log.info(f"📡 Подписка на Redis Stream: {stream_name}")
+    # 🔹 Попытка создать группу (один раз при запуске)
+    try:
+        await redis.xgroup_create(stream_name, group_name, id="$", mkstream=True)
+        log.info(f"🔧 Группа {group_name} создана для {stream_name}")
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.info(f"ℹ️ Группа {group_name} уже существует")
+        else:
+            log.exception("❌ Ошибка создания Consumer Group")
+            return
+
+    log.info(f"📡 Подписка через Consumer Group: {stream_name} → {group_name}")
 
     while True:
         try:
-            entries = await redis.xread(
-                {stream_name: last_id},
+            entries = await redis.xread_group(
+                group_name=group_name,
+                consumer_name=consumer_name,
+                streams={stream_name: ">"},
                 count=buffer_limit,
                 block=int(flush_interval_sec * 1000)
             )
@@ -32,21 +45,25 @@ async def run_signal_log_writer():
                 continue
 
             for stream_key, records in entries:
+                buffer = []
+                ack_ids = []
+
                 for record_id, data in records:
                     try:
-                        last_id = record_id
                         buffer.append(_parse_signal_log_data(data))
+                        ack_ids.append(record_id)
                     except Exception:
-                        log.exception("❌ Ошибка парсинга записи лога сигнала")
+                        log.exception(f"❌ Ошибка парсинга записи (id={record_id})")
 
-            if buffer:
-                await write_log_entry_batch(buffer)
-                buffer.clear()
+                if buffer:
+                    await write_log_entry_batch(buffer)
+                    for rid in ack_ids:
+                        await redis.xack(stream_name, group_name, rid)
 
         except Exception:
-            log.exception("❌ Ошибка при обработке Redis Stream")
+            log.exception("❌ Ошибка в loop Consumer Group")
             await asyncio.sleep(5)
-
+            
 # 🔸 Преобразование данных из Redis Stream
 def _parse_signal_log_data(data: dict) -> tuple:
     return (
