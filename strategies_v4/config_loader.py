@@ -59,7 +59,8 @@ class ConfigState:
                 return
 
             strategy = dict(row)
-            strategy["module_name"] = f"strategy_{strategy_id}"
+            strategy["module_name"] = strategy["name"]
+            
             strategy["tp_levels"] = await infra.pg_pool.fetch(
                 "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
                 strategy_id
