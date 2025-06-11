@@ -13,7 +13,7 @@ log = logging.getLogger("SIGNAL_PROCESSOR")
 # 🔸 Главный воркер: слушает Redis Stream и обрабатывает сигналы
 async def run_signal_loop():
     stream = "strategy_input_stream"
-    last_id = "0"
+    last_id = "$"
 
     log.info(f"📡 Подписка на Redis Stream: {stream}")
 
