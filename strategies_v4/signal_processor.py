@@ -10,6 +10,13 @@ from position_state_loader import position_registry
 # 🔸 Логгер маршрутизатора сигналов
 log = logging.getLogger("SIGNAL_PROCESSOR")
 
+# 🔸 Глобальная инициализация стратегий
+strategy_registry = {}
+
+def set_strategy_registry(registry: dict):
+    global strategy_registry
+    strategy_registry = registry
+
 # 🔸 Главный воркер: слушает Redis Stream и обрабатывает сигналы
 async def run_signal_loop():
     stream = "strategy_input_stream"

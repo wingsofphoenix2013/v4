@@ -7,7 +7,7 @@ from infra import setup_logging, setup_pg, setup_redis_client
 from config_loader import init_config_state, config_event_listener
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state
-from signal_processor import run_signal_loop
+from signal_processor import run_signal_loop, set_strategy_registry
 from core_io import run_signal_log_writer
 
 # 🔸 Логгер для главного процесса
@@ -58,6 +58,7 @@ async def main():
 
     try:
         strategy_registry = load_strategies()
+        set_strategy_registry(strategy_registry)
         log.info("🧠 Регистр стратегий загружен")
     except Exception:
         log.exception("❌ Ошибка при загрузке стратегий")
