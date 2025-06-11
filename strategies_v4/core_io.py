@@ -33,9 +33,9 @@ async def run_signal_log_writer():
 
     while True:
         try:
-            entries = await redis.xread_group(
-                group_name=group_name,
-                consumer_name=consumer_name,
+            entries = await redis.xreadgroup(
+                groupname=group_name,
+                consumername=consumer_name,
                 streams={stream_name: ">"},
                 count=buffer_limit,
                 block=int(flush_interval_sec * 1000)
@@ -62,8 +62,7 @@ async def run_signal_log_writer():
 
         except Exception:
             log.exception("❌ Ошибка в loop Consumer Group")
-            await asyncio.sleep(5)
-            
+            await asyncio.sleep(5)  
 # 🔸 Преобразование данных из Redis Stream
 def _parse_signal_log_data(data: dict) -> tuple:
     return (
