@@ -26,6 +26,8 @@ def load_strategies():
 
             strategy_class = None
             for name, obj in inspect.getmembers(module, inspect.isclass):
+                log.debug(f"🧪 Модуль: {modname}, класс: {name}, obj.__module__ = {obj.__module__}")
+                
                 if name == expected_class_name and obj.__module__ == full_module_name:
                     strategy_class = obj
                     break
@@ -43,6 +45,7 @@ def load_strategies():
                 continue
 
             strategy_registry[modname] = strategy_class()
+            log.info(f"✅ Стратегия загружена: {modname} → {expected_class_name}")
 
         except Exception as e:
             log.exception(f"❌ Ошибка загрузки стратегии {modname}: {e}")
