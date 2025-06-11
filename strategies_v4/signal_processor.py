@@ -68,12 +68,56 @@ async def process_signal(data: dict):
                     strategy_id, symbol, direction, log_uid,
                     "тикер не разрешён для этой стратегии"
                 )
+                
+        # 🔸 Проверка позиции
+        position = position_registry.get((strategy_id, symbol))
+        if position:
+            if position.direction == direction:
+                return await route_ignore(
+                    strategy_id, symbol, direction, log_uid,
+                    "повтор сигнала в ту же сторону"
+                )
+            if not strategy["reverse"] and not strategy["sl_protect"]:
+                return await route_ignore(
+                    strategy_id, symbol, direction, log_uid,
+                    "реверс и SL защита отключены"
+                )
+            if not strategy["reverse"] and strategy["sl_protect"]:
+                return await route_ignore(
+                    strategy_id, symbol, direction, log_uid,
+                    "маршрут protect не реализован"
+                )
+            if strategy["reverse"] and strategy["sl_protect"]:
+                return await route_ignore(
+                    strategy_id, symbol, direction, log_uid,
+                    "маршрут reverse не реализован"
+                )
 
-        # ... здесь будет продолжение: проверка позиции и другие маршруты
-        return await route_ignore(
-            strategy_id, symbol, direction, log_uid,
-            "маршрутизация не завершена (временный stub)"
-        )
+        # 🔸 Обработка new_entry — стратегия готова к вызову
+        strategy_instance = strategy_registry.get(f"strategy_{strategy_id}")
+        if not strategy_instance:
+            return await route_ignore(
+                strategy_id, symbol, direction, log_uid,
+                "класс стратегии не найден"
+            )
+
+        context = {"redis": infra.redis_client}
+        result = await strategy_instance.validate_signal(data, context)
+
+        if result is True:
+            # пока открытие позиции не реализовано
+            return await route_ignore(
+                strategy_id, symbol, direction, log_uid,
+                "позиция не открыта: маршрут new_entry пока не реализован"
+            )
+        elif isinstance(result, tuple) and result[0] == "ignore":
+            note = result[1]
+            return await route_ignore(strategy_id, symbol, direction, log_uid, note)
+        else:
+            return await route_ignore(
+                strategy_id, symbol, direction, log_uid,
+                "некорректный ответ от validate_signal()"
+            )
 
     except Exception:
         log.exception("❌ Ошибка обработки сигнала")
