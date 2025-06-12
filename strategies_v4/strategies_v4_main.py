@@ -70,6 +70,7 @@ async def main():
         run_safe_loop(run_signal_loop, "SIGNAL_PROCESSOR"),
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(run_signal_log_writer, "CORE_IO"),
+        run_safe_loop(listen_indicator_stream, "INDICATOR_CACHE"),
         run_safe_loop(stub_position_opener, "POSITION_OPENER"),
         run_safe_loop(stub_position_writer, "POSITION_WRITER"),
         run_safe_loop(stub_position_handler, "POSITION_HANDLER"),

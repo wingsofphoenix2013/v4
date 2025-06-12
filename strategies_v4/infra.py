@@ -1,4 +1,7 @@
+# infra.py
+
 import os
+import time
 import logging
 import asyncio
 import asyncpg
@@ -16,6 +19,12 @@ SIGNAL_STREAM = "signals_stream"
 EVENT_STREAM = "strategy_events"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
+# 🔸 Кеши markprice и индикаторов
+_price_cache: dict[str, float] = {}
+_price_ts: dict[str, float] = {}
+
+_indicator_cache: dict[tuple[str, str, str], float] = {}
+
 # 🔸 Логирование
 def setup_logging():
     level = logging.DEBUG if DEBUG_MODE else logging.INFO
@@ -32,7 +41,7 @@ async def setup_pg():
         raise RuntimeError("❌ DATABASE_URL не задан")
 
     pool = await asyncpg.create_pool(db_url)
-    await pool.execute("SELECT 1")  # Проверка соединения
+    await pool.execute("SELECT 1")
     infra.pg_pool = pool
     logging.getLogger("INFRA").info("🛢️ Подключение к PostgreSQL установлено")
 
@@ -56,7 +65,7 @@ async def setup_redis_client():
     infra.redis_client = client
     logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
 
-# 🔸 Чтение индикаторов из Redis
+# 🔸 Загрузка индикаторов (bulk)
 async def load_indicators(symbol: str, params: list[str], timeframe: str) -> dict:
     redis = infra.redis_client
     result = {}
@@ -71,3 +80,69 @@ async def load_indicators(symbol: str, params: list[str], timeframe: str) -> dic
         result[param] = float(value) if value is not None else None
 
     return result
+
+# 🔸 Получение цены (markprice) с TTL = 1 секунда
+async def get_price(symbol: str) -> float | None:
+    now = time.monotonic()
+    if symbol in _price_cache and now - _price_ts[symbol] < 1.0:
+        return _price_cache[symbol]
+
+    raw = await infra.redis_client.get(f"price:{symbol}")
+    if raw:
+        try:
+            price = float(raw)
+            _price_cache[symbol] = price
+            _price_ts[symbol] = now
+            return price
+        except ValueError:
+            logging.getLogger("INFRA").warning(f"⚠️ Неверный формат цены: {raw}")
+    return None
+
+# 🔸 Получение индикатора из кеша
+async def get_indicator(symbol: str, tf: str, param: str) -> float | None:
+    return _indicator_cache.get((symbol, tf, param))
+
+# 🔸 Подписка на поток готовых индикаторов
+async def listen_indicator_stream():
+    stream = "indicator_stream_core"
+    group = "infra_cache"
+    consumer = "worker_1"
+    redis = infra.redis_client
+    log = logging.getLogger("INFRA")
+
+    try:
+        await redis.xgroup_create(stream, group, id="$", mkstream=True)
+        log.info(f"📡 Группа {group} создана для {stream}")
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.info(f"ℹ️ Группа {group} уже существует")
+        else:
+            log.exception("❌ Ошибка создания Consumer Group")
+            return
+
+    log.info(f"📥 Подписка на индикаторы: {stream} → {group}")
+
+    while True:
+        try:
+            entries = await redis.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=100,
+                block=1000
+            )
+            for _, records in entries:
+                for record_id, data in records:
+                    try:
+                        symbol = data["symbol"]
+                        tf = data["interval"]
+                        param = data["param_name"]
+                        value = float(data["value"])
+
+                        _indicator_cache[(symbol, tf, param)] = value
+                        await redis.xack(stream, group, record_id)
+                    except Exception:
+                        log.exception("❌ Ошибка при обработке записи индикатора")
+        except Exception:
+            log.exception("❌ Ошибка в потоке подписки индикаторов")
+            await asyncio.sleep(2)
