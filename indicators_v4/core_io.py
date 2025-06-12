@@ -8,20 +8,35 @@ from decimal import Decimal, ROUND_HALF_UP
 async def run_core_io(pg, redis):
     log = logging.getLogger("CORE_IO")
 
-    last_id = "$"  # читать только новые записи
     stream = "indicator_stream_core"
+    group = "group_core_io"
+    consumer = "core_io_1"
+
+    # Попытка создать группу (если уже существует — игнорировать)
+    try:
+        await redis.xgroup_create(stream, group, id="$", mkstream=True)
+        log.info(f"Consumer group '{group}' создана")
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            log.error(f"Ошибка при создании группы: {e}")
 
     while True:
         try:
-            response = await redis.xread({stream: last_id}, count=50, block=1000)
+            response = await redis.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=50,
+                block=1000
+            )
             if not response:
                 continue
 
             records = []
+            to_ack = []
 
             for _, messages in response:
                 for msg_id, data in messages:
-                    last_id = msg_id
                     try:
                         symbol = data["symbol"]
                         interval = data["interval"]
@@ -33,6 +48,7 @@ async def run_core_io(pg, redis):
                         value = Decimal(data["value"]).quantize(Decimal(quantize_str), rounding=ROUND_HALF_UP)
 
                         records.append((instance_id, symbol, open_time, param_name, value))
+                        to_ack.append(msg_id)
                     except Exception as e:
                         log.error(f"Ошибка при обработке записи из Stream: {e}")
 
@@ -48,6 +64,10 @@ async def run_core_io(pg, redis):
                         """, records)
 
                 log.debug(f"PG ← записано {len(records)} параметров")
+
+            # Подтверждение обработки сообщений
+            if to_ack:
+                await redis.xack(stream, group, *to_ack)
 
         except Exception as stream_err:
             log.error(f"Ошибка чтения из Redis Stream: {stream_err}")
