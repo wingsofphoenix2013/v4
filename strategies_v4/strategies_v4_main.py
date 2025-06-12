@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from infra import setup_logging, setup_pg, setup_redis_client
+from infra import setup_logging, setup_pg, setup_redis_client, listen_indicator_stream
 from config_loader import init_config_state, config_event_listener
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state
