@@ -163,6 +163,19 @@ async def calculate_position_size(data: dict):
         return "skip", "quantity below min_qty"
 
     log.info(f"[STAGE 5] qty_by_risk={qty_by_risk} qty_by_margin={qty_by_margin} quantity={quantity}")
+    
+    # === Этап 6: Финальные валидации ===
+    used_margin = (entry_price * quantity) / leverage
+    margin_threshold = 0.75 * position_limit
+
+    if used_margin < margin_threshold:
+        return "skip", f"used margin {used_margin:.4f} below 75% of position limit {margin_threshold:.4f}"
+
+    if quantity < min_qty:
+        return "skip", "final quantity below min_qty"
+
+    log.info(f"[STAGE 6] used_margin={used_margin} (threshold={margin_threshold}) — OK")
+    
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     # TODO: регистрация позиции и публикация события в Redis
