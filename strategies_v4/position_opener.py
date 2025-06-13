@@ -1,30 +1,58 @@
 # position_opener.py
 
-import json
-import logging
 import asyncio
+import logging
+import uuid
+import json
+from datetime import datetime
+from dataclasses import dataclass, asdict
 
-from infra import infra
-from position_state_loader import position_registry
+from infra import infra, get_price, get_indicator
+from config_loader import config
+from position_state_loader import position_registry, PositionState, Target
 
-# 🔸 Логгер модуля
 log = logging.getLogger("POSITION_OPENER")
 
-# 🔸 Открытие позиции (заглушка)
-async def open_position(signal: dict, context: dict):
-    strategy_id = signal["strategy_id"]
-    symbol = signal["symbol"]
-    direction = signal["direction"]
+@dataclass
+class PositionCalculation:
+    entry_price: float
+    quantity: float
+    planned_risk: float
+    tp_targets: list
+    sl_target: dict
+    route: str
+    log_uid: str
 
-    log.info(f"📥 Получен сигнал на открытие: {symbol} {direction} (strategy {strategy_id})")
-    # TODO: реализация расчётов и открытия
-    return
+# 🔹 Расчёт параметров позиции, TP и SL
+async def calculate_position_size(data: dict):
+    # TODO: реализовать расчёт всех параметров позиции
+    return "skip", "not implemented"
 
-# 🔸 Воркер: слушает Redis Stream strategy_opener_stream
+# 🔹 Открытие позиции и публикация события
+async def open_position(calc_result: PositionCalculation, signal_data: dict):
+    # TODO: регистрация позиции и публикация события в Redis
+    pass
+
+# 🔹 Логгирование skip-события в Redis Stream
+async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
+    try:
+        record = {
+            "log_uid": log_uid,
+            "strategy_id": str(strategy_id),
+            "status": "skip",
+            "note": reason,
+            "position_uid": "",
+            "logged_at": datetime.utcnow().isoformat()
+        }
+        await infra.redis_client.xadd("signal_log_queue", record)
+    except Exception:
+        log.exception("❌ Ошибка при записи skip-события в Redis")
+
+# 🔹 Основной воркер
 async def run_position_opener_loop():
     stream = "strategy_opener_stream"
-    group = "position_opener"
-    consumer = "opener_1"
+    group = "position_opener_group"
+    consumer = "position_opener_1"
     redis = infra.redis_client
 
     try:
@@ -37,26 +65,26 @@ async def run_position_opener_loop():
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info(f"📥 Подписка на открытия: {stream} → {group}")
-
     while True:
         try:
-            entries = await redis.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={stream: ">"},
-                count=50,
-                block=1000
-            )
+            entries = await redis.xreadgroup(groupname=group, consumername=consumer, streams={stream: ">"}, count=10, block=1000)
+            if not entries:
+                continue
 
             for _, records in entries:
                 for record_id, data in records:
-                    try:
-                        payload = json.loads(data["data"])
-                        await open_position(payload, context={"redis": redis})
+                    strategy_id = int(data["strategy_id"])
+                    log_uid = data["log_uid"]
+
+                    result = await calculate_position_size(data)
+                    if isinstance(result, tuple) and result[0] == "skip":
+                        reason = result[1]
+                        await publish_skip_reason(log_uid, strategy_id, reason)
                         await redis.xack(stream, group, record_id)
-                    except Exception:
-                        log.exception("❌ Ошибка обработки команды на открытие позиции")
+                        continue
+
+                    # TODO: реализация open_position и дальнейшая обработка
+
         except Exception:
-            log.exception("❌ Ошибка чтения из потока открытия позиции")
-            await asyncio.sleep(2)
+            log.exception("❌ Ошибка в основном цикле position_opener_loop")
+            await asyncio.sleep(5)
