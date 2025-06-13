@@ -27,6 +27,7 @@ class PositionCalculation:
 async def calculate_position_size(data: dict):
     strategy_id = int(data["strategy_id"])
     symbol = data["symbol"]
+    direction = data["direction"]
 
     strategy = config.strategies.get(strategy_id)
     if not strategy:
@@ -42,7 +43,7 @@ async def calculate_position_size(data: dict):
     try:
         precision_price = int(ticker["precision_price"])
         precision_qty = int(ticker["precision_qty"])
-        min_qty = 10 ** (-precision_qty)
+        min_qty = float(ticker.get("min_qty") or 10 ** (-precision_qty))
     except Exception:
         return "skip", "invalid precision in ticker"
 
@@ -51,6 +52,35 @@ async def calculate_position_size(data: dict):
         return "skip", "entry price not available"
 
     log.info(f"[STAGE 1] entry_price={entry_price} precision_price={precision_price} precision_qty={precision_qty}")
+
+    # === Этап 2: Расчёт SL ===
+    sl_type = strategy.get("sl_type")
+    sl_value = strategy.get("sl_value")
+
+    if not sl_type or sl_value is None:
+        return "skip", "SL settings not defined"
+
+    if sl_type == "percent":
+        delta = entry_price * (sl_value / 100)
+    elif sl_type == "atr":
+        tf = strategy.get("timeframe")
+        atr = await get_indicator(symbol, tf, "atr")
+        if atr is None:
+            return "skip", "ATR not available"
+        delta = atr * sl_value
+    else:
+        return "skip", f"unknown sl_type: {sl_type}"
+
+    if direction == "long":
+        stop_loss_price = entry_price - delta
+    else:
+        stop_loss_price = entry_price + delta
+
+    risk_per_unit = abs(entry_price - stop_loss_price)
+    if risk_per_unit == 0:
+        return "skip", "risk_per_unit is zero"
+
+    log.info(f"[STAGE 2] sl_type={sl_type} stop_price={stop_loss_price} risk_per_unit={risk_per_unit}")
 
     return "skip", "not implemented"
 
@@ -94,38 +124,14 @@ async def run_position_opener_loop():
 
     while True:
         try:
-            entries = await redis.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={stream: ">"},
-                count=10,
-                block=1000
-            )
+            entries = await redis.xreadgroup(groupname=group, consumername=consumer, streams={stream: ">"}, count=10, block=1000)
             if not entries:
                 continue
 
             for _, records in entries:
-                for record_id, raw in records:
-                    raw_data = raw.get(b"data") or raw.get("data")
-                    if isinstance(raw_data, bytes):
-                        raw_data = raw_data.decode()
-
-                    try:
-                        data = json.loads(raw_data)
-                    except Exception:
-                        log.exception("❌ Невозможно распарсить JSON из поля 'data'")
-                        await redis.xack(stream, group, record_id)
-                        continue
-
-                    log.info(f"[RAW DATA] {data}")
-
-                    try:
-                        strategy_id = int(data["strategy_id"])
-                        log_uid = data["log_uid"]
-                    except KeyError as e:
-                        log.exception(f"❌ Отсутствует ключ в данных: {e}")
-                        await redis.xack(stream, group, record_id)
-                        continue
+                for record_id, data in records:
+                    strategy_id = int(data["strategy_id"])
+                    log_uid = data["log_uid"]
 
                     result = await calculate_position_size(data)
                     if isinstance(result, tuple) and result[0] == "skip":
