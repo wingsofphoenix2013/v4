@@ -132,7 +132,22 @@ async def calculate_position_size(data: dict):
 
     log.info(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
 
-    return "skip", "not implemented"
+    # === Этап 4: Учёт открытых позиций и доступного риска ===
+    used_risk = sum(
+        p.planned_risk for p in position_registry.values()
+        if p.strategy_id == strategy_id
+    )
+
+    deposit = float(strategy["deposit"])
+    max_risk_pct = float(strategy["max_risk"])
+    max_allowed_risk = deposit * max_risk_pct / 100
+    available_risk = max(0, max_allowed_risk - used_risk)
+
+    if available_risk <= 0:
+        return "skip", "available risk exhausted"
+
+    log.info(f"[STAGE 4] used_risk={used_risk} max_allowed_risk={max_allowed_risk} available_risk={available_risk}")
+    
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     # TODO: регистрация позиции и публикация события в Redis
