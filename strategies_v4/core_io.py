@@ -153,6 +153,8 @@ async def _handle_open_position(data: dict):
     entry_price = Decimal(data["entry_price"])
     quantity = Decimal(data["quantity"])
     quantity_left = Decimal(data["quantity_left"])
+    notional_value = Decimal(data["notional_value"])
+    pnl = Decimal(data["pnl"])
     created_at = datetime.fromisoformat(data["created_at"])
     planned_risk = Decimal(data["planned_risk"])
     route = data["route"]
@@ -181,11 +183,13 @@ async def _handle_open_position(data: dict):
         INSERT INTO positions_v4 (
             position_uid, strategy_id, symbol, direction, entry_price,
             quantity, quantity_left, status, created_at, planned_risk,
+            notional_value, pnl,
             route, log_uid
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8,$9,$10,$11)
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8,$9,$10,$11,$12,$13,$14)
         ''',
         position_uid, strategy_id, symbol, direction, entry_price,
         quantity, quantity_left, created_at, planned_risk,
+        notional_value, pnl,
         route, log_uid
     )
 
