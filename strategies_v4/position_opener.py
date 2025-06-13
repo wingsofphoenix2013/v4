@@ -133,10 +133,10 @@ async def calculate_position_size(data: dict):
     log.info(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
 
     # === Этап 4: Учёт открытых позиций и доступного риска ===
-    used_risk = sum(
+    used_risk = float(sum(
         p.planned_risk for p in position_registry.values()
         if p.strategy_id == strategy_id
-    )
+    ))
 
     deposit = float(strategy["deposit"])
     max_risk_pct = float(strategy["max_risk"])
