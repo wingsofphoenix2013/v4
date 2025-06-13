@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from infra import infra
 import json
+from decimal import Decimal
 
 # 🔸 Логгер для I/O-операций
 log = logging.getLogger("CORE_IO")
@@ -137,6 +138,7 @@ async def run_position_open_writer():
         except Exception:
             log.exception("❌ Ошибка в loop обработки позиций")
             await asyncio.sleep(5)
+
 # 🔹 Обработка одной позиции из Redis Stream
 async def _handle_open_position(data: dict):
     # 🔸 Декодирование TP/SL целей
@@ -148,11 +150,11 @@ async def _handle_open_position(data: dict):
     strategy_id = int(data["strategy_id"])
     symbol = data["symbol"]
     direction = data["direction"]
-    entry_price = float(data["entry_price"])
-    quantity = float(data["quantity"])
-    quantity_left = float(data["quantity_left"])
+    entry_price = Decimal(data["entry_price"])
+    quantity = Decimal(data["quantity"])
+    quantity_left = Decimal(data["quantity_left"])
     created_at = datetime.fromisoformat(data["created_at"])
-    planned_risk = float(data["planned_risk"])
+    planned_risk = Decimal(data["planned_risk"])
     route = data["route"]
     log_uid = data["log_uid"]
     event_type = data["event_type"]
@@ -191,9 +193,13 @@ async def _handle_open_position(data: dict):
     targets = []
     for t in tp_targets + sl_targets:
         targets.append((
-            t["type"], t["level"], t["price"],
-            t["quantity"], t["hit"],
-            t.get("hit_at"), t["canceled"],
+            t["type"],
+            t["level"],
+            Decimal(t["price"]) if t["price"] is not None else None,
+            Decimal(t["quantity"]),
+            t["hit"],
+            t.get("hit_at"),
+            t["canceled"],
             position_uid
         ))
 

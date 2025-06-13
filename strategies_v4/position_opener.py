@@ -6,6 +6,7 @@ import uuid
 import json
 from datetime import datetime
 from dataclasses import dataclass, asdict
+from decimal import Decimal, ROUND_DOWN
 
 from infra import infra, get_price, get_indicator
 from config_loader import config
@@ -15,11 +16,11 @@ log = logging.getLogger("POSITION_OPENER")
 
 @dataclass
 class PositionCalculation:
-    entry_price: float
-    quantity: float
-    planned_risk: float
-    tp_targets: list
-    sl_target: dict
+    entry_price: Decimal
+    quantity: Decimal
+    planned_risk: Decimal
+    tp_targets: list[Target]
+    sl_target: Target
     route: str
     log_uid: str
 
@@ -43,52 +44,49 @@ async def calculate_position_size(data: dict):
     try:
         precision_price = int(ticker["precision_price"])
         precision_qty = int(ticker["precision_qty"])
-        min_qty = float(ticker.get("min_qty") or 10 ** (-precision_qty))
+        min_qty = Decimal(str(ticker.get("min_qty") or 10 ** (-precision_qty)))
     except Exception:
         return "skip", "invalid precision in ticker"
 
-    entry_price = await get_price(symbol)
-    if entry_price is None:
+    factor_price = Decimal(f"1e-{precision_price}")
+    factor_qty = Decimal(f"1e-{precision_qty}")
+
+    entry_price_raw = await get_price(symbol)
+    if entry_price_raw is None:
         return "skip", "entry price not available"
 
+    entry_price = Decimal(str(entry_price_raw)).quantize(factor_price, rounding=ROUND_DOWN)
     log.info(f"[STAGE 1] entry_price={entry_price} precision_price={precision_price} precision_qty={precision_qty}")
 
     # === Этап 2: Расчёт SL ===
     sl_type = strategy.get("sl_type")
-    sl_value = strategy.get("sl_value")
+    sl_value_raw = strategy.get("sl_value")
 
-    if not sl_type or sl_value is None:
+    if not sl_type or sl_value_raw is None:
         return "skip", "SL settings not defined"
 
+    sl_value = Decimal(str(sl_value_raw))
+
     if sl_type == "percent":
-        delta = float(entry_price) * float(sl_value) / 100
+        delta = (entry_price * sl_value / Decimal("100")).quantize(factor_price, rounding=ROUND_DOWN)
     elif sl_type == "atr":
         tf = strategy.get("timeframe").lower()
         log.info(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
-        atr = await get_indicator(symbol, tf, "atr14")
-        if atr is None:
+        atr_raw = await get_indicator(symbol, tf, "atr14")
+        if atr_raw is None:
             return "skip", "ATR not available"
-        delta = float(atr) * float(sl_value)
+        atr = Decimal(str(atr_raw))
+        delta = (atr * sl_value).quantize(factor_price, rounding=ROUND_DOWN)
     else:
         return "skip", f"unknown sl_type: {sl_type}"
 
-    if direction == "long":
-        stop_loss_price = entry_price - delta
-    else:
-        stop_loss_price = entry_price + delta
+    stop_loss_price = (entry_price - delta) if direction == "long" else (entry_price + delta)
+    risk_per_unit = abs(entry_price - stop_loss_price).quantize(factor_price, rounding=ROUND_DOWN)
 
-    risk_per_unit = abs(entry_price - stop_loss_price)
-
-    # Округление
-    factor = 10 ** precision_price
-    stop_loss_price = round(stop_loss_price * factor) / factor
-    risk_per_unit = round(risk_per_unit * factor) / factor
-
-    if risk_per_unit == 0:
+    if risk_per_unit == Decimal("0"):
         return "skip", "risk_per_unit is zero"
 
     log.info(f"[STAGE 2] sl_type={sl_type} stop_price={stop_loss_price} risk_per_unit={risk_per_unit}")
-
     # === Этап 3: Расчёт TP ===
     tp_targets = []
     atr = None
@@ -96,27 +94,28 @@ async def calculate_position_size(data: dict):
     for level_conf in strategy["tp_levels"]:
         level = level_conf["level"]
         tp_type = level_conf["tp_type"]
-        tp_value = level_conf["tp_value"]
+        tp_value = Decimal(str(level_conf["tp_value"]))
 
         if tp_type == "signal":
             price = None
         elif tp_type == "percent":
-            delta = float(entry_price) * float(tp_value) / 100
+            delta = (entry_price * tp_value / Decimal("100")).quantize(factor_price, rounding=ROUND_DOWN)
             price = entry_price + delta if direction == "long" else entry_price - delta
         elif tp_type == "atr":
             if atr is None:
                 tf = strategy.get("timeframe").lower()
                 log.info(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
-                atr = await get_indicator(symbol, tf, "atr14")
-                if atr is None:
+                atr_raw = await get_indicator(symbol, tf, "atr14")
+                if atr_raw is None:
                     return "skip", "ATR not available for TP"
-            delta = float(atr) * float(tp_value)
+                atr = Decimal(str(atr_raw))
+            delta = (atr * tp_value).quantize(factor_price, rounding=ROUND_DOWN)
             price = entry_price + delta if direction == "long" else entry_price - delta
         else:
             return "skip", f"unknown tp_type: {tp_type}"
 
         if price is not None:
-            price = round(price * factor) / factor
+            price = price.quantize(factor_price, rounding=ROUND_DOWN)
 
         tp_targets.append(Target(
             type="tp",
@@ -133,15 +132,15 @@ async def calculate_position_size(data: dict):
     log.info(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
 
     # === Этап 4: Учёт открытых позиций и доступного риска ===
-    used_risk = float(sum(
+    used_risk = sum(
         p.planned_risk for p in position_registry.values()
         if p.strategy_id == strategy_id
-    ))
+    )
 
-    deposit = float(strategy["deposit"])
-    max_risk_pct = float(strategy["max_risk"])
-    max_allowed_risk = deposit * max_risk_pct / 100
-    available_risk = max(0, max_allowed_risk - used_risk)
+    deposit = Decimal(str(strategy["deposit"]))
+    max_risk_pct = Decimal(str(strategy["max_risk"]))
+    max_allowed_risk = deposit * max_risk_pct / Decimal("100")
+    available_risk = max(Decimal("0"), max_allowed_risk - used_risk)
 
     if available_risk <= 0:
         return "skip", "available risk exhausted"
@@ -149,15 +148,14 @@ async def calculate_position_size(data: dict):
     log.info(f"[STAGE 4] used_risk={used_risk} max_allowed_risk={max_allowed_risk} available_risk={available_risk}")
 
     # === Этап 5: Расчёт объёма позиции ===
-    leverage = float(strategy["leverage"])
-    position_limit = float(strategy["position_limit"])
+    leverage = Decimal(str(strategy["leverage"]))
+    position_limit = Decimal(str(strategy["position_limit"]))
 
     qty_by_risk = available_risk / risk_per_unit
     qty_by_margin = (position_limit * leverage) / entry_price
 
     quantity_raw = min(qty_by_risk, qty_by_margin)
-    factor_qty = 10 ** precision_qty
-    quantity = int(quantity_raw * factor_qty) / factor_qty
+    quantity = (quantity_raw // factor_qty) * factor_qty
 
     if quantity < min_qty:
         return "skip", "quantity below min_qty"
@@ -166,7 +164,7 @@ async def calculate_position_size(data: dict):
     
     # === Этап 6: Финальные валидации ===
     used_margin = (entry_price * quantity) / leverage
-    margin_threshold = 0.75 * position_limit
+    margin_threshold = position_limit * Decimal("0.75")
 
     if used_margin < margin_threshold:
         return "skip", f"used margin {used_margin:.4f} below 75% of position limit {margin_threshold:.4f}"
@@ -175,31 +173,29 @@ async def calculate_position_size(data: dict):
         return "skip", "final quantity below min_qty"
 
     log.info(f"[STAGE 6] used_margin={used_margin} (threshold={margin_threshold}) — OK")
-
     # === Этап 7: Формирование TP с quantity ===
-    volume_percents = [lvl["volume_percent"] for lvl in strategy["tp_levels"]]
+    volume_percents = [Decimal(str(lvl["volume_percent"])) for lvl in strategy["tp_levels"]]
     quantities = []
-    total_assigned = 0.0
+    total_assigned = Decimal("0")
 
     for i, percent in enumerate(volume_percents):
-        percent = float(percent)
         if i < len(volume_percents) - 1:
-            q = quantity * (percent / 100)
-            q = int(q * factor_qty) / factor_qty
+            q = (quantity * percent / Decimal("100"))
+            q = (q // factor_qty) * factor_qty
             quantities.append(q)
             total_assigned += q
         else:
             q = quantity - total_assigned
-            q = round(q * factor_qty) / factor_qty
+            q = q.quantize(factor_qty, rounding=ROUND_DOWN)
             quantities.append(q)
 
     for tp, q in zip(tp_targets, quantities):
         tp.quantity = q
 
     log.info(f"[STAGE 7] TP quantities: {[tp.quantity for tp in tp_targets]} (total={sum(quantities)})")
-    
+
     # === Этап 8: Расчёт planned_risk и SL Target ===
-    planned_risk = round(risk_per_unit * quantity * factor) / factor
+    planned_risk = (risk_per_unit * quantity).quantize(factor_price, rounding=ROUND_DOWN)
 
     sl_target = Target(
         type="sl",
@@ -229,8 +225,10 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
 
     # 🔸 Расчёт notional_value и комиссии (pnl)
     precision_price = int(config.tickers[signal_data["symbol"]]["precision_price"])
-    notional_value = round(calc_result.entry_price * calc_result.quantity, precision_price)
-    pnl = round(-notional_value * 0.001, precision_price)
+    factor_price = Decimal(f"1e-{precision_price}")
+
+    notional_value = (calc_result.entry_price * calc_result.quantity).quantize(factor_price, rounding=ROUND_DOWN)
+    pnl = (-notional_value * Decimal("0.001")).quantize(factor_price, rounding=ROUND_DOWN)
 
     # Создание позиции в оперативной памяти
     state = PositionState(
@@ -272,8 +270,8 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         "planned_risk": str(state.planned_risk),
         "route": state.route,
         "log_uid": state.log_uid,
-        "tp_targets": json.dumps([asdict(t) for t in state.tp_targets]),
-        "sl_targets": json.dumps([asdict(t) for t in state.sl_targets]),
+        "tp_targets": json.dumps([asdict(t) for t in state.tp_targets], default=str),
+        "sl_targets": json.dumps([asdict(t) for t in state.sl_targets], default=str),
         "event_type": "opened",
         "received_at": signal_data.get("received_at", datetime.utcnow().isoformat()),
         "latency_ms": "0"
@@ -298,7 +296,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         await infra.redis_client.xadd("signal_log_queue", log_entry)
     except Exception:
         log.exception("❌ Ошибка при логировании opened в signal_log_queue")
-        
+                
 # 🔹 Логгирование skip-события в Redis Stream
 async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
     try:

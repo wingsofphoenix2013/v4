@@ -40,12 +40,12 @@ class PositionState:
     closed_at: Optional[datetime]
     close_reason: Optional[str]
     pnl: Optional[Decimal]
-    planned_risk: Optional[Decimal]
-    notional_value: float
+    planned_risk: Decimal
+    notional_value: Decimal
     route: str
     tp_targets: list[Target]
     sl_targets: list[Target]
-    log_uid: Optional[str]
+    log_uid: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 # 🔸 Глобальный реестр позиций
@@ -74,8 +74,8 @@ async def load_position_state():
         target = Target(
             type=t["type"],
             level=t["level"],
-            price=t["price"],
-            quantity=t["quantity"],
+            price=Decimal(t["price"]),
+            quantity=Decimal(t["quantity"]),
             hit=t["hit"] or False,
             hit_at=t["hit_at"],
             id=t["id"],
@@ -105,17 +105,17 @@ async def load_position_state():
             strategy_id=strategy_id,
             symbol=symbol,
             direction=p["direction"],
-            entry_price=p["entry_price"],
-            quantity=p["quantity"],
-            quantity_left=p["quantity_left"],
+            entry_price=Decimal(p["entry_price"]),
+            quantity=Decimal(p["quantity"]),
+            quantity_left=Decimal(p["quantity_left"]),
             status=p["status"],
             created_at=p["created_at"],
-            exit_price=p["exit_price"],
+            exit_price=Decimal(p["exit_price"]) if p["exit_price"] is not None else None,
             closed_at=p["closed_at"],
             close_reason=p["close_reason"],
-            pnl=p["pnl"],
-            planned_risk=p["planned_risk"],
-            notional_value=p["notional_value"],
+            pnl=Decimal(p["pnl"]) if p["pnl"] is not None else None,
+            planned_risk=Decimal(p["planned_risk"]),
+            notional_value=Decimal(p["notional_value"]),
             route=p["route"],
             tp_targets=tp,
             sl_targets=sl,
