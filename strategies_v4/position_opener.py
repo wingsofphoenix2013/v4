@@ -79,18 +79,27 @@ async def run_position_opener_loop():
                 continue
 
             for _, records in entries:
-                for record_id, data in records:
-                    # Декодирование ключей и значений
-                    data = {
-                        k.decode() if isinstance(k, bytes) else k:
-                        v.decode() if isinstance(v, bytes) else v
-                        for k, v in data.items()
-                    }
-                    
+                for record_id, raw in records:
+                    raw_data = raw.get(b"data") or raw.get("data")
+                    if isinstance(raw_data, bytes):
+                        raw_data = raw_data.decode()
+
+                    try:
+                        data = json.loads(raw_data)
+                    except Exception:
+                        log.exception("❌ Невозможно распарсить JSON из поля 'data'")
+                        await redis.xack(stream, group, record_id)
+                        continue
+
                     log.info(f"[RAW DATA] {data}")
 
-                    strategy_id = int(data["strategy_id"])
-                    log_uid = data["log_uid"]
+                    try:
+                        strategy_id = int(data["strategy_id"])
+                        log_uid = data["log_uid"]
+                    except KeyError as e:
+                        log.exception(f"❌ Отсутствует ключ в данных: {e}")
+                        await redis.xack(stream, group, record_id)
+                        continue
 
                     result = await calculate_position_size(data)
                     if isinstance(result, tuple) and result[0] == "skip":
