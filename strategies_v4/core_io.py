@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime
 from infra import infra
+import json
 
 # 🔸 Логгер для I/O-операций
 log = logging.getLogger("CORE_IO")
