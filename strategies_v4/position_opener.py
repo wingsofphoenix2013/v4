@@ -68,12 +68,25 @@ async def run_position_opener_loop():
 
     while True:
         try:
-            entries = await redis.xreadgroup(groupname=group, consumername=consumer, streams={stream: ">"}, count=10, block=1000)
+            entries = await redis.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=10,
+                block=1000
+            )
             if not entries:
                 continue
 
             for _, records in entries:
                 for record_id, data in records:
+                    # Декодирование ключей и значений
+                    data = {
+                        k.decode() if isinstance(k, bytes) else k:
+                        v.decode() if isinstance(v, bytes) else v
+                        for k, v in data.items()
+                    }
+
                     strategy_id = int(data["strategy_id"])
                     log_uid = data["log_uid"]
 
