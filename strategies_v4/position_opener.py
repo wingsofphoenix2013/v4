@@ -25,7 +25,33 @@ class PositionCalculation:
 
 # 🔹 Расчёт параметров позиции, TP и SL
 async def calculate_position_size(data: dict):
-    # TODO: реализовать расчёт всех параметров позиции
+    strategy_id = int(data["strategy_id"])
+    symbol = data["symbol"]
+
+    strategy = config.strategies.get(strategy_id)
+    if not strategy:
+        return "skip", "strategy not found"
+
+    if not strategy.get("tp_levels"):
+        return "skip", "strategy has no TP levels"
+
+    ticker = config.tickers.get(symbol)
+    if not ticker:
+        return "skip", "ticker not found"
+
+    try:
+        precision_price = int(ticker["precision_price"])
+        precision_qty = int(ticker["precision_qty"])
+        min_qty = 10 ** (-precision_qty)
+    except Exception:
+        return "skip", "invalid precision in ticker"
+
+    entry_price = await get_price(symbol)
+    if entry_price is None:
+        return "skip", "entry price not available"
+
+    log.info(f"[STAGE 1] entry_price={entry_price} precision_price={precision_price} precision_qty={precision_qty}")
+
     return "skip", "not implemented"
 
 # 🔹 Открытие позиции и публикация события
