@@ -34,16 +34,16 @@ class ConfigState:
             )
             if row:
                 self.tickers[symbol] = dict(row)
-                log.info(f"🔄 Тикер обновлён: {symbol}")
+                log.debug(f"🔄 Тикер обновлён: {symbol}")
             else:
                 self.tickers.pop(symbol, None)
-                log.info(f"❌ Тикер удалён (не найден): {symbol}")
+                log.debug(f"❌ Тикер удалён (не найден): {symbol}")
 
     # 🔸 Удаление тикера
     async def remove_ticker(self, symbol: str):
         async with self._lock:
             self.tickers.pop(symbol, None)
-            log.info(f"🗑️ Тикер удалён: {symbol}")
+            log.debug(f"🗑️ Тикер удалён: {symbol}")
 
     # 🔸 Обновление стратегии
     async def reload_strategy(self, strategy_id: int):
@@ -55,7 +55,7 @@ class ConfigState:
             if not row:
                 self.strategies.pop(strategy_id, None)
                 self.strategy_tickers.pop(strategy_id, None)
-                log.info(f"🗑️ Стратегия удалена: id={strategy_id}")
+                log.debug(f"🗑️ Стратегия удалена: id={strategy_id}")
                 return
 
             strategy = dict(row)
@@ -81,14 +81,14 @@ class ConfigState:
                 strategy_id
             )
             self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers}
-            log.info(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
+            log.debug(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
 
     # 🔸 Удаление стратегии
     async def remove_strategy(self, strategy_id: int):
         async with self._lock:
             self.strategies.pop(strategy_id, None)
             self.strategy_tickers.pop(strategy_id, None)
-            log.info(f"🗑️ Стратегия удалена: id={strategy_id}")
+            log.debug(f"🗑️ Стратегия удалена: id={strategy_id}")
 
     # 🔸 Загрузка всех тикеров (только активных с разрешением)
     async def _load_tickers(self):
@@ -142,7 +142,7 @@ config = ConfigState()
 # 🔸 Первичная инициализация конфигурации
 async def init_config_state():
     await config.reload_all()
-    log.info("✅ Конфигурация инициализирована")
+    log.debug("✅ Конфигурация инициализирована")
 
 # 🔸 Слушатель событий из Redis Pub/Sub
 async def config_event_listener():
@@ -150,7 +150,7 @@ async def config_event_listener():
     pubsub = redis.pubsub()
     await pubsub.subscribe("tickers_v4_events", "strategies_v4_events")
 
-    log.info("📡 Подписка на каналы Redis запущена")
+    log.debug("📡 Подписка на каналы Redis запущена")
 
     async for msg in pubsub.listen():
         if msg["type"] != "message":

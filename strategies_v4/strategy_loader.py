@@ -45,13 +45,13 @@ def load_strategies():
                 continue
 
             strategy_registry[modname] = strategy_class()
-            log.info(f"✅ Стратегия загружена: {modname} → {expected_class_name}")
+            log.debug(f"✅ Стратегия загружена: {modname} → {expected_class_name}")
 
         except Exception as e:
             log.exception(f"❌ Ошибка загрузки стратегии {modname}: {e}")
 
     # 🔸 Финальный лог
-    log.info(f"✅ Загружено стратегий: {len(strategy_registry)}")
+    log.debug(f"✅ Загружено стратегий: {len(strategy_registry)}")
     return strategy_registry
 
 # 🔸 Преобразование имени модуля в имя класса

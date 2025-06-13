@@ -112,15 +112,15 @@ async def listen_indicator_stream():
 
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
-        log.info(f"📡 Группа {group} создана для {stream}")
+        log.debug(f"📡 Группа {group} создана для {stream}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"ℹ️ Группа {group} уже существует")
+            log.debug(f"ℹ️ Группа {group} уже существует")
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info(f"📥 Подписка на индикаторы: {stream} → {group}")
+    log.debug(f"📥 Подписка на индикаторы: {stream} → {group}")
 
     while True:
         try:

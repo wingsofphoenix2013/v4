@@ -53,14 +53,14 @@ position_registry: dict[tuple[int, str], PositionState] = {}
 
 # 🔸 Загрузка всех открытых позиций и их целей
 async def load_position_state():
-    log.info("📥 Загрузка открытых позиций из БД")
+    log.debug("📥 Загрузка открытых позиций из БД")
 
     positions = await infra.pg_pool.fetch(
         "SELECT * FROM positions_v4 WHERE status IN ('open', 'partial')"
     )
 
     if not positions:
-        log.info("ℹ️ Открытых позиций не найдено")
+        log.debug("ℹ️ Открытых позиций не найдено")
         return
 
     uids = [p["position_uid"] for p in positions]
@@ -125,4 +125,4 @@ async def load_position_state():
         position_registry[(strategy_id, symbol)] = state
         loaded += 1
 
-    log.info(f"✅ Загружено позиций: {loaded}, пропущено (без целей): {skipped}")
+    log.debug(f"✅ Загружено позиций: {loaded}, пропущено (без целей): {skipped}")

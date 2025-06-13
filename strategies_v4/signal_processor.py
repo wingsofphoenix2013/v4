@@ -22,7 +22,7 @@ async def run_signal_loop():
     stream = "strategy_input_stream"
     last_id = "$"
 
-    log.info(f"📡 Подписка на Redis Stream: {stream}")
+    log.debug(f"📡 Подписка на Redis Stream: {stream}")
 
     while True:
         try:
@@ -131,7 +131,7 @@ async def process_signal(data: dict):
 
 # 🔸 Маршрут ignore: логируем отказ
 async def route_ignore(strategy_id, symbol, direction, log_uid, reason: str):
-    log.info(f"⚠️ [IGNORE] {symbol} (strategy {strategy_id}, {direction}): {reason}")
+    log.debug(f"⚠️ [IGNORE] {symbol} (strategy {strategy_id}, {direction}): {reason}")
 
     record = {
         "log_uid": log_uid,
