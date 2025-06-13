@@ -140,6 +140,7 @@ async def listen_indicator_stream():
                         value = float(data["value"])
 
                         _indicator_cache[(symbol, tf, param)] = value
+                        log.info(f"[INDICATOR] cached: {symbol} {tf} {param} = {value}")
                         await redis.xack(stream, group, record_id)
                     except Exception:
                         log.exception("❌ Ошибка при обработке записи индикатора")
