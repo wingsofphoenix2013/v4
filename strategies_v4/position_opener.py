@@ -61,13 +61,13 @@ async def calculate_position_size(data: dict):
         return "skip", "SL settings not defined"
 
     if sl_type == "percent":
-        delta = entry_price * (sl_value / 100)
+        delta = float(entry_price) * float(sl_value) / 100
     elif sl_type == "atr":
         tf = strategy.get("timeframe")
         atr = await get_indicator(symbol, tf, "atr")
         if atr is None:
             return "skip", "ATR not available"
-        delta = atr * sl_value
+        delta = float(atr) * float(sl_value)
     else:
         return "skip", f"unknown sl_type: {sl_type}"
 
