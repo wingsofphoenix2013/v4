@@ -78,7 +78,7 @@ async def calculate_position_size(data: dict):
 
     risk_per_unit = abs(entry_price - stop_loss_price)
 
-    # Округление по precision_price
+    # Округление
     factor = 10 ** precision_price
     stop_loss_price = round(stop_loss_price * factor) / factor
     risk_per_unit = round(risk_per_unit * factor) / factor
@@ -88,8 +88,47 @@ async def calculate_position_size(data: dict):
 
     log.info(f"[STAGE 2] sl_type={sl_type} stop_price={stop_loss_price} risk_per_unit={risk_per_unit}")
 
-    return "skip", "not implemented"
+    # === Этап 3: Расчёт TP ===
+    tp_targets = []
+    atr = None
 
+    for level_conf in strategy["tp_levels"]:
+        level = level_conf["level"]
+        tp_type = level_conf["tp_type"]
+        tp_value = level_conf["tp_value"]
+
+        if tp_type == "signal":
+            price = None
+        elif tp_type == "percent":
+            delta = float(entry_price) * float(tp_value) / 100
+            price = entry_price + delta if direction == "long" else entry_price - delta
+        elif tp_type == "atr":
+            if atr is None:
+                tf = strategy.get("timeframe")
+                atr = await get_indicator(symbol, tf, "atr")
+                if atr is None:
+                    return "skip", "ATR not available for TP"
+            delta = float(atr) * float(tp_value)
+            price = entry_price + delta if direction == "long" else entry_price - delta
+        else:
+            return "skip", f"unknown tp_type: {tp_type}"
+
+        if price is not None:
+            price = round(price * factor) / factor
+
+        tp_targets.append(Target(
+            type="tp",
+            level=level,
+            price=price,
+            quantity=None,
+            hit=False,
+            hit_at=None,
+            canceled=False
+        ))
+
+    log.info(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
+
+    return "skip", "not implemented"
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     # TODO: регистрация позиции и публикация события в Redis
