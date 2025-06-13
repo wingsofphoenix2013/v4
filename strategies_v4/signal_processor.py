@@ -114,11 +114,9 @@ async def process_signal(data: dict):
         result = await strategy_instance.validate_signal(data, context)
 
         if result is True:
-            # пока открытие позиции не реализовано
-            return await route_ignore(
-                strategy_id, symbol, direction, log_uid,
-                "позиция не открыта: маршрут new_entry пока не реализован"
-            )
+            await strategy_instance.run(data, context)
+            return
+            
         elif isinstance(result, tuple) and result[0] == "ignore":
             note = result[1]
             return await route_ignore(strategy_id, symbol, direction, log_uid, note)

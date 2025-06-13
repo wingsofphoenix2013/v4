@@ -17,6 +17,8 @@ class Strategy104:
 
     # 🔸 Запуск стратегии (отправка команды на открытие позиции)
     async def run(self, signal, context):
+        log.info(f"🚀 [Strategy104] run() вызван для {signal['symbol']}")
+
         redis = context.get("redis")
 
         payload = {
