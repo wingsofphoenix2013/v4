@@ -63,7 +63,7 @@ async def calculate_position_size(data: dict):
     if sl_type == "percent":
         delta = float(entry_price) * float(sl_value) / 100
     elif sl_type == "atr":
-        tf = strategy.get("timeframe")
+        tf = strategy.get("timeframe").lower()
         log.info(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
         atr = await get_indicator(symbol, tf, "atr14")
         if atr is None:
@@ -105,7 +105,7 @@ async def calculate_position_size(data: dict):
             price = entry_price + delta if direction == "long" else entry_price - delta
         elif tp_type == "atr":
             if atr is None:
-                tf = strategy.get("timeframe")
+                tf = strategy.get("timeframe").lower()
                 log.info(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
                 atr = await get_indicator(symbol, tf, "atr14")
                 if atr is None:
