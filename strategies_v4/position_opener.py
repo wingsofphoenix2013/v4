@@ -77,6 +77,12 @@ async def calculate_position_size(data: dict):
         stop_loss_price = entry_price + delta
 
     risk_per_unit = abs(entry_price - stop_loss_price)
+
+    # Округление по precision_price
+    factor = 10 ** precision_price
+    stop_loss_price = round(stop_loss_price * factor) / factor
+    risk_per_unit = round(risk_per_unit * factor) / factor
+
     if risk_per_unit == 0:
         return "skip", "risk_per_unit is zero"
 
