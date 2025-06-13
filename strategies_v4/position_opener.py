@@ -227,6 +227,11 @@ async def calculate_position_size(data: dict):
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     position_uid = str(uuid.uuid4())
 
+    # 🔸 Расчёт notional_value и комиссии (pnl)
+    precision_price = int(config.tickers[signal_data["symbol"]]["precision_price"])
+    notional_value = round(calc_result.entry_price * calc_result.quantity, precision_price)
+    pnl = round(-notional_value * 0.001, precision_price)
+
     # Создание позиции в оперативной памяти
     state = PositionState(
         uid=position_uid,
@@ -241,12 +246,13 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         exit_price=None,
         closed_at=None,
         close_reason=None,
-        pnl=None,
+        pnl=pnl,
         planned_risk=calc_result.planned_risk,
         route=calc_result.route,
         tp_targets=calc_result.tp_targets,
         sl_targets=[calc_result.sl_target],
-        log_uid=calc_result.log_uid
+        log_uid=calc_result.log_uid,
+        notional_value=notional_value
     )
 
     position_registry[(state.strategy_id, state.symbol)] = state
@@ -260,6 +266,8 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         "entry_price": str(state.entry_price),
         "quantity": str(state.quantity),
         "quantity_left": str(state.quantity_left),
+        "notional_value": str(state.notional_value),
+        "pnl": str(state.pnl),
         "created_at": state.created_at.isoformat(),
         "planned_risk": str(state.planned_risk),
         "route": state.route,
@@ -268,7 +276,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         "sl_targets": json.dumps([asdict(t) for t in state.sl_targets]),
         "event_type": "opened",
         "received_at": signal_data.get("received_at", datetime.utcnow().isoformat()),
-        "latency_ms": "0"  # будет рассчитываться в core_io
+        "latency_ms": "0"
     }
 
     try:
@@ -290,7 +298,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         await infra.redis_client.xadd("signal_log_queue", log_entry)
     except Exception:
         log.exception("❌ Ошибка при логировании opened в signal_log_queue")
-
+        
 # 🔹 Логгирование skip-события в Redis Stream
 async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
     try:
