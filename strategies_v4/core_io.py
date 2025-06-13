@@ -22,15 +22,15 @@ async def run_signal_log_writer():
     # 🔹 Попытка создать группу (один раз при запуске)
     try:
         await redis.xgroup_create(stream_name, group_name, id="$", mkstream=True)
-        log.info(f"🔧 Группа {group_name} создана для {stream_name}")
+        log.debug(f"🔧 Группа {group_name} создана для {stream_name}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"ℹ️ Группа {group_name} уже существует")
+            log.debug(f"ℹ️ Группа {group_name} уже существует")
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info(f"📡 Подписка через Consumer Group: {stream_name} → {group_name}")
+    log.debug(f"📡 Подписка через Consumer Group: {stream_name} → {group_name}")
 
     while True:
         try:
@@ -90,7 +90,7 @@ async def write_log_entry_batch(batch: list[tuple]):
             ''',
             batch
         )
-        log.info(f"✅ Записано логов сигналов: {len(batch)}")
+        log.debug(f"✅ Записано логов сигналов: {len(batch)}")
     except Exception:
         log.exception("❌ Ошибка записи логов сигналов в БД")
 # 🔹 Воркер: запись открытых позиций из positions_open_stream
@@ -103,15 +103,15 @@ async def run_position_open_writer():
 
     try:
         await redis.xgroup_create(stream_name, group_name, id="$", mkstream=True)
-        log.info(f"🔧 Группа {group_name} создана для {stream_name}")
+        log.debug(f"🔧 Группа {group_name} создана для {stream_name}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"ℹ️ Группа {group_name} уже существует")
+            log.debug(f"ℹ️ Группа {group_name} уже существует")
         else:
             log.exception("❌ Ошибка создания Consumer Group для позиций")
             return
 
-    log.info(f"📡 Подписка через Consumer Group: {stream_name} → {group_name}")
+    log.debug(f"📡 Подписка через Consumer Group: {stream_name} → {group_name}")
 
     while True:
         try:
@@ -164,9 +164,13 @@ async def _handle_open_position(data: dict):
             "SELECT received_at FROM signals_v4_log WHERE uid = $1",
             log_uid
         )
-        received_at_dt = row["received_at"] if row else logged_at
+        if row and row["received_at"]:
+            dt = row["received_at"]
+            received_at_dt = dt.replace(microsecond=(dt.microsecond // 1000) * 1000)
+        else:
+            received_at_dt = logged_at
     except Exception:
-        log.warning(f"⚠️ Не удалось получить received_at из signals_v4_log для log_uid={log_uid}")
+        log.warning(f"⚠️ Не удалось получить received_at из signals_v4_log для uid={log_uid}")
         received_at_dt = logged_at
 
     # 🔹 INSERT: positions_v4
@@ -217,4 +221,4 @@ async def _handle_open_position(data: dict):
         int((logged_at - received_at_dt).total_seconds() * 1000)
     )
 
-    log.info(f"✅ Позиция {position_uid} записана в БД")
+    log.debug(f"✅ Позиция {position_uid} записана в БД")
