@@ -41,6 +41,7 @@ class PositionState:
     close_reason: Optional[str]
     pnl: Optional[Decimal]
     planned_risk: Optional[Decimal]
+    notional_value: float
     route: str
     tp_targets: list[Target]
     sl_targets: list[Target]
@@ -114,6 +115,7 @@ async def load_position_state():
             close_reason=p["close_reason"],
             pnl=p["pnl"],
             planned_risk=p["planned_risk"],
+            notional_value=p["notional_value"],
             route=p["route"],
             tp_targets=tp,
             sl_targets=sl,
