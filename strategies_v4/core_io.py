@@ -7,6 +7,7 @@ from infra import infra
 import json
 from decimal import Decimal
 
+
 # 🔸 Логгер для I/O-операций
 log = logging.getLogger("CORE_IO")
 
