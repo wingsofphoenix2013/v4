@@ -147,7 +147,22 @@ async def calculate_position_size(data: dict):
         return "skip", "available risk exhausted"
 
     log.info(f"[STAGE 4] used_risk={used_risk} max_allowed_risk={max_allowed_risk} available_risk={available_risk}")
-    
+
+    # === Этап 5: Расчёт объёма позиции ===
+    leverage = float(strategy["leverage"])
+    position_limit = float(strategy["position_limit"])
+
+    qty_by_risk = available_risk / risk_per_unit
+    qty_by_margin = (position_limit * leverage) / entry_price
+
+    quantity_raw = min(qty_by_risk, qty_by_margin)
+    factor_qty = 10 ** precision_qty
+    quantity = int(quantity_raw * factor_qty) / factor_qty
+
+    if quantity < min_qty:
+        return "skip", "quantity below min_qty"
+
+    log.info(f"[STAGE 5] qty_by_risk={qty_by_risk} qty_by_margin={qty_by_margin} quantity={quantity}")
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     # TODO: регистрация позиции и публикация события в Redis
