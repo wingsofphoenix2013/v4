@@ -126,6 +126,8 @@ async def calculate_position_size(data: dict):
             canceled=False
         ))
 
+        log.info(f"[TP] level={level} type={tp_type} price={price}")
+
     log.info(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
 
     return "skip", "not implemented"
