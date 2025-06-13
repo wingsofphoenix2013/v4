@@ -213,10 +213,69 @@ async def calculate_position_size(data: dict):
 
     log.info(f"[STAGE 8] planned_risk={planned_risk} SL quantity={quantity} SL price={stop_loss_price}")
     
+    return PositionCalculation(
+        entry_price=entry_price,
+        quantity=quantity,
+        planned_risk=planned_risk,
+        tp_targets=tp_targets,
+        sl_target=sl_target,
+        route=data["route"],
+        log_uid=data["log_uid"]
+    )
+    
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
-    # TODO: регистрация позиции и публикация события в Redis
-    pass
+    position_uid = str(uuid.uuid4())
+
+    # Создание позиции в оперативной памяти
+    state = PositionState(
+        uid=position_uid,
+        strategy_id=int(signal_data["strategy_id"]),
+        symbol=signal_data["symbol"],
+        direction=signal_data["direction"],
+        entry_price=calc_result.entry_price,
+        quantity=calc_result.quantity,
+        quantity_left=calc_result.quantity,
+        status="open",
+        created_at=datetime.utcnow(),
+        exit_price=None,
+        closed_at=None,
+        close_reason=None,
+        pnl=None,
+        planned_risk=calc_result.planned_risk,
+        route=calc_result.route,
+        tp_targets=calc_result.tp_targets,
+        sl_targets=[calc_result.sl_target],
+        log_uid=calc_result.log_uid
+    )
+
+    position_registry[(state.strategy_id, state.symbol)] = state
+
+    # Подготовка события для Redis
+    payload = {
+        "position_uid": position_uid,
+        "strategy_id": str(state.strategy_id),
+        "symbol": state.symbol,
+        "direction": state.direction,
+        "entry_price": str(state.entry_price),
+        "quantity": str(state.quantity),
+        "quantity_left": str(state.quantity_left),
+        "created_at": state.created_at.isoformat(),
+        "planned_risk": str(state.planned_risk),
+        "route": state.route,
+        "log_uid": state.log_uid,
+        "tp_targets": json.dumps([asdict(t) for t in state.tp_targets]),
+        "sl_targets": json.dumps([asdict(t) for t in state.sl_targets]),
+        "event_type": "opened",
+        "received_at": signal_data.get("received_at", datetime.utcnow().isoformat()),
+        "latency_ms": "0"  # будет рассчитываться в core_io
+    }
+
+    try:
+        await infra.redis_client.xadd("positions_open_stream", payload)
+        log.info(f"📬 Позиция создана и отправлена в Redis: {position_uid}")
+    except Exception:
+        log.exception("❌ Ошибка отправки позиции в Redis")
 
 # 🔹 Логгирование skip-события в Redis Stream
 async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
@@ -292,8 +351,9 @@ async def run_position_opener_loop():
                         await publish_skip_reason(log_uid, strategy_id, reason)
                         await redis.xack(stream, group, record_id)
                         continue
-
-                    # TODO: реализация open_position и дальнейшая обработка
+                    else:
+                        await open_position(result, data)
+                        await redis.xack(stream, group, record_id)
 
         except Exception:
             log.exception("❌ Ошибка в основном цикле position_opener_loop")
