@@ -198,6 +198,21 @@ async def calculate_position_size(data: dict):
 
     log.info(f"[STAGE 7] TP quantities: {[tp.quantity for tp in tp_targets]} (total={sum(quantities)})")
     
+    # === Этап 8: Расчёт planned_risk и SL Target ===
+    planned_risk = round(risk_per_unit * quantity * factor) / factor
+
+    sl_target = Target(
+        type="sl",
+        level=1,
+        price=stop_loss_price,
+        quantity=quantity,
+        hit=False,
+        hit_at=None,
+        canceled=False
+    )
+
+    log.info(f"[STAGE 8] planned_risk={planned_risk} SL quantity={quantity} SL price={stop_loss_price}")
+    
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     # TODO: регистрация позиции и публикация события в Redis
