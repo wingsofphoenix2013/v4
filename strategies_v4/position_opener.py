@@ -45,6 +45,7 @@ async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
             "logged_at": datetime.utcnow().isoformat()
         }
         await infra.redis_client.xadd("signal_log_queue", record)
+        log.info(f"⚠️ [SKIP] strategy_id={strategy_id} log_uid={log_uid} reason=\"{reason}\"")
     except Exception:
         log.exception("❌ Ошибка при записи skip-события в Redis")
 
