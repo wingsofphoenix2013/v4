@@ -222,7 +222,7 @@ async def calculate_position_size(data: dict):
         route=data["route"],
         log_uid=data["log_uid"]
     )
-    
+
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
     position_uid = str(uuid.uuid4())
@@ -276,6 +276,20 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
         log.info(f"📬 Позиция создана и отправлена в Redis: {position_uid}")
     except Exception:
         log.exception("❌ Ошибка отправки позиции в Redis")
+
+    # 🔸 Логгирование факта открытия позиции
+    try:
+        log_entry = {
+            "log_uid": calc_result.log_uid,
+            "strategy_id": str(signal_data["strategy_id"]),
+            "status": "opened",
+            "note": "",
+            "position_uid": position_uid,
+            "logged_at": datetime.utcnow().isoformat()
+        }
+        await infra.redis_client.xadd("signal_log_queue", log_entry)
+    except Exception:
+        log.exception("❌ Ошибка при логировании opened в signal_log_queue")
 
 # 🔹 Логгирование skip-события в Redis Stream
 async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
