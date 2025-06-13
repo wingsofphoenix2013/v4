@@ -86,6 +86,8 @@ async def run_position_opener_loop():
                         v.decode() if isinstance(v, bytes) else v
                         for k, v in data.items()
                     }
+                    
+                    log.info(f"[RAW DATA] {data}")
 
                     strategy_id = int(data["strategy_id"])
                     log_uid = data["log_uid"]
