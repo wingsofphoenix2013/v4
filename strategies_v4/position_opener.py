@@ -175,6 +175,27 @@ async def calculate_position_size(data: dict):
         return "skip", "final quantity below min_qty"
 
     log.info(f"[STAGE 6] used_margin={used_margin} (threshold={margin_threshold}) — OK")
+
+    # === Этап 7: Формирование TP с quantity ===
+    volume_percents = [lvl["volume_percent"] for lvl in strategy["tp_levels"]]
+    quantities = []
+    total_assigned = 0.0
+
+    for i, percent in enumerate(volume_percents):
+        if i < len(volume_percents) - 1:
+            q = quantity * (percent / 100)
+            q = int(q * factor_qty) / factor_qty
+            quantities.append(q)
+            total_assigned += q
+        else:
+            q = quantity - total_assigned
+            q = round(q * factor_qty) / factor_qty  # финальное округление
+            quantities.append(q)
+
+    for tp, q in zip(tp_targets, quantities):
+        tp.quantity = q
+
+    log.info(f"[STAGE 7] TP quantities: {[tp.quantity for tp in tp_targets]} (total={sum(quantities)})")
     
 # 🔹 Открытие позиции и публикация события
 async def open_position(calc_result: PositionCalculation, signal_data: dict):
