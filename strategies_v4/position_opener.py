@@ -182,6 +182,7 @@ async def calculate_position_size(data: dict):
     total_assigned = 0.0
 
     for i, percent in enumerate(volume_percents):
+        percent = float(percent)
         if i < len(volume_percents) - 1:
             q = quantity * (percent / 100)
             q = int(q * factor_qty) / factor_qty
@@ -189,7 +190,7 @@ async def calculate_position_size(data: dict):
             total_assigned += q
         else:
             q = quantity - total_assigned
-            q = round(q * factor_qty) / factor_qty  # финальное округление
+            q = round(q * factor_qty) / factor_qty
             quantities.append(q)
 
     for tp, q in zip(tp_targets, quantities):
