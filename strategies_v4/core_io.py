@@ -161,7 +161,7 @@ async def _handle_open_position(data: dict):
     # 🔸 Получение точного received_at из signals_v4_log
     try:
         row = await infra.pg_pool.fetchrow(
-            "SELECT received_at FROM signals_v4_log WHERE log_uid = $1",
+            "SELECT received_at FROM signals_v4_log WHERE uid = $1",
             log_uid
         )
         received_at_dt = row["received_at"] if row else logged_at
