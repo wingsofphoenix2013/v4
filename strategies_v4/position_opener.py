@@ -291,7 +291,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
             "log_uid": calc_result.log_uid,
             "strategy_id": str(signal_data["strategy_id"]),
             "status": "opened",
-            "note": "",
+            "note": "открытие позиции",
             "position_uid": position_uid,
             "logged_at": datetime.utcnow().isoformat()
         }

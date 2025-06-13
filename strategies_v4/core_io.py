@@ -155,11 +155,19 @@ async def _handle_open_position(data: dict):
     planned_risk = float(data["planned_risk"])
     route = data["route"]
     log_uid = data["log_uid"]
-
-    # 🔸 Служебные поля для логов
-    received_at = data.get("received_at")
-    logged_at = datetime.utcnow()
     event_type = data["event_type"]
+    logged_at = datetime.utcnow()
+
+    # 🔸 Получение точного received_at из signals_v4_log
+    try:
+        row = await infra.pg_pool.fetchrow(
+            "SELECT received_at FROM signals_v4_log WHERE log_uid = $1",
+            log_uid
+        )
+        received_at_dt = row["received_at"] if row else logged_at
+    except Exception:
+        log.warning(f"⚠️ Не удалось получить received_at из signals_v4_log для log_uid={log_uid}")
+        received_at_dt = logged_at
 
     # 🔹 INSERT: positions_v4
     await infra.pg_pool.execute(
@@ -199,13 +207,14 @@ async def _handle_open_position(data: dict):
         '''
         INSERT INTO positions_log_v4 (
             position_uid, strategy_id, symbol, event_type,
-            received_at, logged_at, latency_ms
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+            note, received_at, logged_at, latency_ms
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         ''',
         position_uid, strategy_id, symbol, event_type,
-        datetime.fromisoformat(received_at) if received_at else logged_at,
+        "открытие позиции",
+        received_at_dt,
         logged_at,
-        int((logged_at - datetime.fromisoformat(received_at)).total_seconds() * 1000) if received_at else 0
+        int((logged_at - received_at_dt).total_seconds() * 1000)
     )
 
     log.info(f"✅ Позиция {position_uid} записана в БД")
