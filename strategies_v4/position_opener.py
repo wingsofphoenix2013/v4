@@ -64,7 +64,7 @@ async def calculate_position_size(data: dict):
         delta = float(entry_price) * float(sl_value) / 100
     elif sl_type == "atr":
         tf = strategy.get("timeframe")
-        atr = await get_indicator(symbol, tf, "atr")
+        atr = await get_indicator(symbol, tf, "atr14")
         if atr is None:
             return "skip", "ATR not available"
         delta = float(atr) * float(sl_value)
@@ -105,7 +105,7 @@ async def calculate_position_size(data: dict):
         elif tp_type == "atr":
             if atr is None:
                 tf = strategy.get("timeframe")
-                atr = await get_indicator(symbol, tf, "atr")
+                atr = await get_indicator(symbol, tf, "atr14")
                 if atr is None:
                     return "skip", "ATR not available for TP"
             delta = float(atr) * float(tp_value)
