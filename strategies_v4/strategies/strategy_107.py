@@ -17,7 +17,7 @@ class Strategy107:
 
     # 🔸 Запуск стратегии (отправка команды на открытие позиции)
     async def run(self, signal, context):
-        log.info(f"🚀 [Strategy107] run() вызван для {signal['symbol']}")
+        log.debug(f"🚀 [Strategy107] run() вызван для {signal['symbol']}")
 
         redis = context.get("redis")
 
@@ -32,6 +32,6 @@ class Strategy107:
 
         try:
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.info(f"📤 [Strategy107] Сигнал отправлен в strategy_opener_stream: {payload}")
+            log.debug(f"📤 [Strategy107] Сигнал отправлен в strategy_opener_stream: {payload}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка отправки сигнала в strategy_opener_stream: {e}")

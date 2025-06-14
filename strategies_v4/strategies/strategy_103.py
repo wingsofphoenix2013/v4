@@ -33,6 +33,6 @@ class Strategy103:
 
         try:
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.info(f"📤 [Strategy103] Сигнал отправлен в strategy_opener_stream: {payload}")
+            log.debug(f"📤 [Strategy103] Сигнал отправлен в strategy_opener_stream: {payload}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка отправки сигнала в strategy_opener_stream: {e}")
