@@ -312,8 +312,37 @@ async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
         log.debug(f"⚠️ [SKIP] strategy_id={strategy_id} log_uid={log_uid} reason=\"{reason}\"")
     except Exception:
         log.exception("❌ Ошибка при записи skip-события в Redis")
+# 🔸 Обработка одной записи из потока
+async def handle_open_request(record_id: str, raw: dict, redis):
+    async with sem:
+        try:
+            raw_data = raw.get(b"data") or raw.get("data")
+            if isinstance(raw_data, bytes):
+                raw_data = raw_data.decode()
+            data = json.loads(raw_data)
 
+            strategy_id = int(data["strategy_id"])
+            log_uid = data["log_uid"]
+
+            result = await calculate_position_size(data)
+            if isinstance(result, tuple) and result[0] == "skip":
+                reason = result[1]
+                await publish_skip_reason(log_uid, strategy_id, reason)
+            else:
+                key = (int(data["strategy_id"]), data["symbol"])
+                if key in position_registry:
+                    log.warning(f"⚠️ Позиция уже существует, повторное открытие заблокировано: {key}")
+                    return
+                await open_position(result, data)
+
+        except Exception:
+            log.exception("❌ Ошибка при обработке записи позиции")
+        finally:
+            await redis.xack("strategy_opener_stream", "position_opener_group", record_id)
 # 🔹 Основной воркер
+MAX_PARALLEL_OPENS = 10
+sem = asyncio.Semaphore(MAX_PARALLEL_OPENS)
+
 async def run_position_opener_loop():
     stream = "strategy_opener_stream"
     group = "position_opener_group"
@@ -344,36 +373,7 @@ async def run_position_opener_loop():
 
             for _, records in entries:
                 for record_id, raw in records:
-                    raw_data = raw.get(b"data") or raw.get("data")
-                    if isinstance(raw_data, bytes):
-                        raw_data = raw_data.decode()
-
-                    try:
-                        data = json.loads(raw_data)
-                    except Exception:
-                        log.exception("❌ Невозможно распарсить JSON из поля 'data'")
-                        await redis.xack(stream, group, record_id)
-                        continue
-
-                    log.debug(f"[RAW DATA] {data}")
-
-                    try:
-                        strategy_id = int(data["strategy_id"])
-                        log_uid = data["log_uid"]
-                    except KeyError as e:
-                        log.exception(f"❌ Отсутствует ключ в данных: {e}")
-                        await redis.xack(stream, group, record_id)
-                        continue
-
-                    result = await calculate_position_size(data)
-                    if isinstance(result, tuple) and result[0] == "skip":
-                        reason = result[1]
-                        await publish_skip_reason(log_uid, strategy_id, reason)
-                        await redis.xack(stream, group, record_id)
-                        continue
-                    else:
-                        await open_position(result, data)
-                        await redis.xack(stream, group, record_id)
+                    asyncio.create_task(handle_open_request(record_id, raw, redis))
 
         except Exception:
             log.exception("❌ Ошибка в основном цикле position_opener_loop")
