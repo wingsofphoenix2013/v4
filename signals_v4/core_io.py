@@ -32,9 +32,9 @@ async def insert_signal_log(data: dict):
             log.warning(f"Ошибка разбора raw_message: {e}")
             return
 
-        for strategy_id in strategy_ids:
-            try:
-                await infra.REDIS.xadd(
+        try:
+            await asyncio.gather(*[
+                infra.REDIS.xadd(
                     "strategy_input_stream",
                     {
                         "strategy_id": str(strategy_id),
@@ -45,12 +45,13 @@ async def insert_signal_log(data: dict):
                         "received_at": data["received_at"],
                         "log_uid": data["uid"],
                         "source": data.get("source", "unknown")
-                        
                     }
                 )
-                await infra.record_counter("strategies_dispatched_total")
-            except Exception as e:
-                log.warning(f"xadd в strategy_input_stream не удался: {e}")
+                for strategy_id in strategy_ids
+            ])
+            await infra.record_counter("strategies_dispatched_total")
+        except Exception as e:
+            log.warning(f"Ошибка при массовой отправке в strategy_input_stream: {e}")
 # 🔸 Буфер логов сигналов
 signal_log_buffer = deque()
 BUFFER_SIZE = 25         # Максимум логов за одну вставку
