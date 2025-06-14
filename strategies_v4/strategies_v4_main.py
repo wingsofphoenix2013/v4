@@ -9,7 +9,7 @@ from strategy_loader import load_strategies
 from position_state_loader import load_position_state
 from signal_processor import run_signal_loop, set_strategy_registry
 from position_opener import run_position_opener_loop
-from position_handler import run_position_handler
+from position_handler import run_position_handler, run_position_update_writer
 from core_io import run_signal_log_writer, run_position_open_writer
 
 # 🔸 Логгер для главного процесса
@@ -26,8 +26,6 @@ async def run_safe_loop(coro_factory, label: str):
             await asyncio.sleep(5)
 
 # 🔸 Заглушки (временно, до полной реализации)
-async def stub_position_writer(): await asyncio.sleep(3600)
-async def stub_position_update_writer(): await asyncio.sleep(3600)
 async def stub_reverse_trigger(): await asyncio.sleep(3600)
 
 # 🔸 Главная точка входа
@@ -74,9 +72,8 @@ async def main():
         run_safe_loop(listen_indicator_stream, "INDICATOR_CACHE"),
         run_safe_loop(run_position_opener_loop, "POSITION_OPENER"),
         run_safe_loop(run_position_open_writer, "POSITION_DB_WRITER"),
-        run_safe_loop(stub_position_writer, "POSITION_WRITER"),
         run_safe_loop(run_position_handler, "POSITION_HANDLER"),
-        run_safe_loop(stub_position_update_writer, "POSITION_UPDATE_WRITER"),
+        run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER"),
         run_safe_loop(stub_reverse_trigger, "REVERSE_TRIGGER")
     )
     

@@ -230,3 +230,87 @@ async def _handle_open_position(data: dict):
     )
 
     log.debug(f"✅ Позиция {position_uid} записана в БД")
+# 🔸 Обработка события позиции
+async def _handle_position_update_event(event: dict):
+    if event.get("event_type") != "tp_hit":
+        log.warning(f"⚠️ Неизвестный тип события: {event.get('event_type')}")
+        return
+
+    query = """
+        INSERT INTO positions_log_v4 (
+            position_uid,
+            strategy_id,
+            symbol,
+            event_type,
+            note,
+            logged_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+    """
+
+    await infra.pg_pool.execute(
+        query,
+        event["position_uid"],
+        event["strategy_id"],
+        event["symbol"],
+        event["event_type"],
+        event["note"],
+        event["logged_at"]
+    )
+
+    log.info(f"📝 Событие tp_hit записано в positions_log_v4 для {event['position_uid']}")
+# 🔸 Воркер: обработка событий из positions_update_stream
+async def run_position_update_writer():
+    stream_name = "positions_update_stream"
+    group_name = "core_io_update_group"
+    consumer_name = "core_io_update_1"
+    redis = infra.redis_client
+    pg = infra.pg_pool
+
+    try:
+        await redis.xgroup_create(stream_name, group_name, id="$", mkstream=True)
+        log.debug(f"🔧 Группа {group_name} создана для {stream_name}")
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.debug(f"ℹ️ Группа {group_name} уже существует")
+        else:
+            log.exception("❌ Ошибка создания Consumer Group")
+            return
+
+    log.info(f"📡 Подписка на {stream_name} через {group_name}")
+
+    while True:
+        try:
+            entries = await redis.xreadgroup(
+                groupname=group_name,
+                consumername=consumer_name,
+                streams={stream_name: ">"},
+                count=10,
+                block=1000
+            )
+
+            if not entries:
+                continue
+
+            for _, records in entries:
+                for record_id, raw in records:
+                    raw_data = raw.get("data")
+                    if isinstance(raw_data, bytes):
+                        raw_data = raw_data.decode()
+
+                    try:
+                        event = json.loads(raw_data)
+                    except Exception:
+                        log.exception("❌ Ошибка парсинга события")
+                        await redis.xack(stream_name, group_name, record_id)
+                        continue
+
+                    try:
+                        await _handle_position_update_event(event)
+                    except Exception:
+                        log.exception("❌ Ошибка обработки события")
+
+                    await redis.xack(stream_name, group_name, record_id)
+
+        except Exception:
+            log.exception("❌ Ошибка в цикле run_position_update_writer")
+            await asyncio.sleep(5)

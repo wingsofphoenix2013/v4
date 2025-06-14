@@ -1,11 +1,12 @@
 # position_handler.py
 
+import json
 import asyncio
 import logging
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
-from infra import get_price
+from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry, Target
 
@@ -53,6 +54,11 @@ async def _process_tp_for_position(position, price: Decimal):
                 await _handle_tp_hit(position, tp, price)
 
             break  # проверяем только один TP
+# 🔸 Формирование текста события TP для логов и сериализации
+def format_tp_hit_note(tp_level: int, price: Decimal, pnl: Decimal) -> str:
+    price_str = f"{price:.4f}"
+    pnl_str = f"{pnl:+.2f}"
+    return f"сработал TP-{tp_level} по цене {price_str}, PnL = {pnl_str}"
 # 🔸 Обработка достижения TP
 async def _handle_tp_hit(position, tp, price: Decimal):
     async with position.lock:
@@ -123,6 +129,24 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             position.sl_targets.append(new_sl)
 
             log.info(f"🛡️ Новый SL установлен: {new_sl_price} для {position.uid}")
+
+        # 🔸 Отправка события в Redis
+        note = format_tp_hit_note(tp.level, price, pnl_delta)
+
+        event_data = {
+            "event_type": "tp_hit",
+            "position_uid": str(position.uid),
+            "strategy_id": position.strategy_id,
+            "symbol": position.symbol,
+            "note": note,
+            "received_at": position.opened_at.isoformat(),
+            "logged_at": now.isoformat(),
+            "latency_ms": int((now - position.opened_at).total_seconds() * 1000)
+        }
+
+        await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
+
+        log.info(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:
