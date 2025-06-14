@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from infra import setup_logging, setup_pg, setup_redis_client, listen_indicator_stream
+from infra import setup_logging, setup_pg, setup_redis_client, listen_indicator_stream, init_indicator_cache_via_redis
 from config_loader import init_config_state, config_event_listener
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state
@@ -38,6 +38,7 @@ async def main():
     try:
         await setup_pg()
         await setup_redis_client()
+        await init_indicator_cache_via_redis()
     except Exception:
         log.exception("❌ Ошибка инициализации внешних сервисов")
         return
@@ -78,7 +79,7 @@ async def main():
         run_safe_loop(stub_position_update_writer, "POSITION_UPDATE_WRITER"),
         run_safe_loop(stub_reverse_trigger, "REVERSE_TRIGGER")
     )
-
+    
 # 🔸 Запуск через CLI
 if __name__ == "__main__":
     try:

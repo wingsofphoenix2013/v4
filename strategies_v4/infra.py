@@ -146,3 +146,38 @@ async def listen_indicator_stream():
         except Exception:
             log.exception("❌ Ошибка в потоке подписки индикаторов")
             await asyncio.sleep(2)
+# 🔸 Инициализация кеша индикаторов из Redis (по ключам ind:*)
+log = logging.getLogger("INFRA")
+
+async def init_indicator_cache_via_redis():
+    redis = infra.redis_client
+    if not redis:
+        raise RuntimeError("❌ Redis клиент не инициализирован")
+
+    log.info("🔍 Начало инициализации кеша индикаторов из Redis")
+    cursor = 0
+    key_groups: dict[tuple[str, str], list[str]] = {}
+
+    while True:
+        cursor, keys = await redis.scan(cursor=cursor, match="ind:*", count=500)
+        for key in keys:
+            parts = key.split(":")
+            if len(parts) != 4:
+                continue
+            _, symbol, interval, param = parts
+            key_groups.setdefault((symbol, interval), []).append(param)
+
+        if cursor == 0:
+            break
+
+    for (symbol, interval), params in key_groups.items():
+        try:
+            result = await load_indicators(symbol, params, interval)
+            for param, value in result.items():
+                if value is not None:
+                    _indicator_cache[(symbol, interval, param)] = value
+            log.info(f"✅ Кеш загружен: {symbol} {interval} ({len(params)} параметров)")
+        except Exception:
+            log.exception(f"❌ Ошибка при инициализации кеша для {symbol}-{interval}")
+
+    log.info("✅ Инициализация кеша индикаторов завершена")
