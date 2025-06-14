@@ -142,9 +142,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             "strategy_id": position.strategy_id,
             "symbol": position.symbol,
             "note": note,
-            "received_at": position.opened_at.isoformat(),
             "logged_at": now.isoformat(),
-            "latency_ms": int((now - position.opened_at).total_seconds() * 1000)
         }
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
