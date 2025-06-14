@@ -94,7 +94,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         # 🔸 Обновление SL по политике
         sl_policy = next(
             (row for row in config.strategies[position.strategy_id]["sl_rules"]
-             if row["tp_level"] == tp.level),
+             if row["tp_level_id"] == tp.level),
             None
         )
 
