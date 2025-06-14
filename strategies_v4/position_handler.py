@@ -38,21 +38,21 @@ async def _process_positions():
         await _process_tp_for_position(position, price)
 # 🔸 Обработка TP для одной позиции
 async def _process_tp_for_position(position, price: Decimal):
-    active_tp = next((
-        tp for tp in sorted(position.tp_targets, key=lambda t: t.level)
-        if not tp.hit and not tp.canceled and tp.price is not None
-    ), None)
+    for tp in sorted(position.tp_targets, key=lambda t: t.level):
+        if not tp.hit and not tp.canceled:
+            if tp.price is None:
+                log.info(f"⏸️ TP-{tp.level} активен без цены — ожидание: {position.uid}")
+                return
 
-    if not active_tp:
-        return
+            if position.direction == "long" and price >= tp.price:
+                log.info(f"✅ TP-{tp.level} достигнут (long) {position.symbol}: цена {price} ≥ {tp.price}")
+                await _handle_tp_hit(position, tp, price)
 
-    if position.direction == "long" and price >= active_tp.price:
-        log.info(f"✅ TP-{active_tp.level} достигнут (long) {position.symbol}: цена {price} ≥ {active_tp.price}")
-        await _handle_tp_hit(position, active_tp, price)
+            elif position.direction == "short" and price <= tp.price:
+                log.info(f"✅ TP-{tp.level} достигнут (short) {position.symbol}: цена {price} ≤ {tp.price}")
+                await _handle_tp_hit(position, tp, price)
 
-    elif position.direction == "short" and price <= active_tp.price:
-        log.info(f"✅ TP-{active_tp.level} достигнут (short) {position.symbol}: цена {price} ≤ {active_tp.price}")
-        await _handle_tp_hit(position, active_tp, price)
+            break  # проверяем только один TP
 # 🔸 Обработка достижения TP
 async def _handle_tp_hit(position, tp, price: Decimal):
     async with position.lock:
@@ -67,7 +67,6 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         precision_qty = config.tickers[position.symbol]["precision_qty"]
         quantize_mask = Decimal("1").scaleb(-precision_qty)
 
-        # Округляем количество
         closed_qty = tp.quantity.quantize(quantize_mask, rounding=ROUND_DOWN)
         position.quantity_left = (position.quantity_left - closed_qty).quantize(quantize_mask, rounding=ROUND_DOWN)
 
@@ -112,7 +111,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                 log.warning(f"⚠️ SL режим {sl_mode} пока не поддерживается")
                 return
 
-            new_sl = position.sl_target_type(
+            new_sl = Target(
                 type="sl",
                 level=1,
                 price=new_sl_price,
