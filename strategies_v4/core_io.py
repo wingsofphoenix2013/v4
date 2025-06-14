@@ -163,19 +163,11 @@ async def _handle_open_position(data: dict):
     event_type = data["event_type"]
     logged_at = datetime.utcnow()
 
-    # 🔸 Получение точного received_at из signals_v4_log
+    # 🔸 Получение received_at из входящих данных
     try:
-        row = await infra.pg_pool.fetchrow(
-            "SELECT received_at::timestamp AS received_at FROM signals_v4_log WHERE uid = $1",
-            log_uid
-        )
-        if row and row["received_at"]:
-            dt = row["received_at"]
-            received_at_dt = dt.replace(microsecond=(dt.microsecond // 1000) * 1000)
-        else:
-            received_at_dt = logged_at
+        received_at_dt = datetime.fromisoformat(data["received_at"])
+        received_at_dt = received_at_dt.replace(microsecond=(received_at_dt.microsecond // 1000) * 1000)
     except Exception:
-        log.warning(f"⚠️ Не удалось получить received_at из signals_v4_log для uid={log_uid}")
         received_at_dt = logged_at
 
     # 🔹 INSERT: positions_v4
@@ -187,7 +179,7 @@ async def _handle_open_position(data: dict):
             notional_value, pnl,
             route, log_uid
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-        ''' ,
+        ''',
         position_uid, strategy_id, symbol, direction, entry_price,
         quantity, quantity_left, 'open', created_at, planned_risk,
         notional_value, pnl,

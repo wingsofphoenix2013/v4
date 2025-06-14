@@ -26,7 +26,8 @@ class Strategy105:
             "symbol": signal["symbol"],
             "direction": signal["direction"],
             "log_uid": signal["log_uid"],
-            "route": "new_entry"
+            "route": "new_entry",
+            "received_at": signal.get("received_at")      
         }
 
         try:
