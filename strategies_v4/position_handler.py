@@ -37,30 +37,25 @@ async def _process_positions():
         await _process_tp_for_position(position, price)
 # 🔸 Обработка TP для одной позиции
 async def _process_tp_for_position(position, price: Decimal):
-    log.info(f"📊 Проверка TP: {position.symbol} (позиция {position.uid}) при цене {price}")
-
     active_tp = next((
         tp for tp in sorted(position.tp_targets, key=lambda t: t.level)
         if not tp.hit and not tp.canceled and tp.price is not None
     ), None)
 
     if not active_tp:
-        log.info(f"ℹ️ Нет активных TP для позиции {position.uid}")
         return
 
-    log.info(f"🎯 Активный TP-{active_tp.level}: {active_tp.price} для {position.uid}")
-
-    # Проверка условия достижения TP
     if position.direction == "long" and price >= active_tp.price:
-        log.info(f"✅ TP-{active_tp.level} достигнут (long): цена {price} ≥ {active_tp.price}")
+        log.info(f"✅ TP-{active_tp.level} достигнут (long) {position.symbol}: цена {price} ≥ {active_tp.price}")
         await _handle_tp_hit(position, active_tp, price)
 
     elif position.direction == "short" and price <= active_tp.price:
-        log.info(f"✅ TP-{active_tp.level} достигнут (short): цена {price} ≤ {active_tp.price}")
+        log.info(f"✅ TP-{active_tp.level} достигнут (short) {position.symbol}: цена {price} ≤ {active_tp.price}")
         await _handle_tp_hit(position, active_tp, price)
-
-    else:
-        log.info(f"🔸 TP-{active_tp.level} не достигнут: текущая цена {price}")
+# 🔸 Заглушка обработки TP-срабатывания
+async def _handle_tp_hit(position, tp, price: Decimal):
+    log.info(f"🟡 [ЗАГЛУШКА] TP-{tp.level} достигнут для позиции {position.uid}, цена: {price}")
+    await asyncio.sleep(0)  # заглушка на async совместимость
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:
