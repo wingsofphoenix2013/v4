@@ -328,7 +328,7 @@ async def handle_open_request(record_id: str, raw: dict, redis):
             strategy_id = int(data["strategy_id"])
             log_uid = data["log_uid"]
 
-            log.info(f"▶ START open_request log_uid={log_uid} t={start:.3f}")
+            log.debug(f"▶ START open_request log_uid={log_uid} t={start:.3f}")
 
             result = await calculate_position_size(data)
             if isinstance(result, tuple) and result[0] == "skip":
@@ -346,7 +346,7 @@ async def handle_open_request(record_id: str, raw: dict, redis):
         finally:
             end = time.monotonic()
             duration_ms = (end - start) * 1000
-            log.info(f"⏹ END   open_request log_uid={log_uid} t={end:.3f} Δ={duration_ms:.1f}ms")
+            log.debug(f"⏹ END   open_request log_uid={log_uid} t={end:.3f} Δ={duration_ms:.1f}ms")
             await redis.xack("strategy_opener_stream", "position_opener_group", record_id)
 # 🔹 Основной воркер
 MAX_PARALLEL_OPENS = 10
