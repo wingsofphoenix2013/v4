@@ -84,22 +84,22 @@ async def process_signal(data: dict):
                     strategy_id, symbol, direction, log_uid,
                     "повтор сигнала в ту же сторону"
                 )
-            if not strategy["reverse"] and not strategy["sl_protect"]:
+            if not strategy.get("reverse", False) and not strategy.get("sl_protect", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "реверс и SL защита отключены"
                 )
-            if not strategy["reverse"] and strategy["sl_protect"]:
+            if not strategy.get("reverse", False) and strategy.get("sl_protect", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "маршрут protect не реализован"
                 )
-            if strategy["reverse"] and strategy["sl_protect"]:
+            if strategy.get("reverse", False) and strategy.get("sl_protect", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "маршрут reverse не реализован"
                 )
-
+                
         # 🔸 Обработка new_entry — стратегия готова к вызову
         modname = strategy.get("module_name", f"strategy_{strategy_id}")
         strategy_instance = strategy_registry.get(modname)
