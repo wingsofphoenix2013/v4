@@ -92,7 +92,11 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         log.info(f"💰 Обновление позиции {position.uid}: закрыто {closed_qty}, PnL = {pnl_delta:+.2f}")
 
         # 🔸 Обновление SL по политике
-        sl_policy = get_tp_sl_config(position.strategy_id, tp.level)
+        sl_policy = next(
+            (row for row in config.strategies[position.strategy_id]["sl_rules"]
+             if row["tp_level"] == tp.level),
+            None
+        )
 
         if sl_policy and sl_policy["sl_mode"] != "none":
             for sl in position.sl_targets:
@@ -129,7 +133,6 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             position.sl_targets.append(new_sl)
 
             log.info(f"🛡️ Новый SL установлен: {new_sl_price} для {position.uid}")
-
         # 🔸 Отправка события в Redis
         note = format_tp_hit_note(tp.level, price, pnl_delta)
 
