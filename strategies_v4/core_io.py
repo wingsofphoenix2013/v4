@@ -254,7 +254,7 @@ async def _handle_position_update_event(event: dict):
         event["symbol"],
         event["event_type"],
         event["note"],
-        event["logged_at"]
+        datetime.utcnow()
     )
 
     log.info(f"📝 Событие tp_hit записано в positions_log_v4 для {event['position_uid']}")
