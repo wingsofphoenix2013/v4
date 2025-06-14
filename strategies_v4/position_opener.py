@@ -56,7 +56,7 @@ async def calculate_position_size(data: dict):
         return "skip", "entry price not available"
 
     entry_price = Decimal(str(entry_price_raw)).quantize(factor_price, rounding=ROUND_DOWN)
-    log.info(f"[STAGE 1] entry_price={entry_price} precision_price={precision_price} precision_qty={precision_qty}")
+    log.debug(f"[STAGE 1] entry_price={entry_price} precision_price={precision_price} precision_qty={precision_qty}")
 
     # === Этап 2: Расчёт SL ===
     sl_type = strategy.get("sl_type")
@@ -71,7 +71,7 @@ async def calculate_position_size(data: dict):
         delta = (entry_price * sl_value / Decimal("100")).quantize(factor_price, rounding=ROUND_DOWN)
     elif sl_type == "atr":
         tf = strategy.get("timeframe").lower()
-        log.info(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
+        log.debug(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
         atr_raw = await get_indicator(symbol, tf, "atr14")
         if atr_raw is None:
             return "skip", "ATR not available"
@@ -86,7 +86,7 @@ async def calculate_position_size(data: dict):
     if risk_per_unit == Decimal("0"):
         return "skip", "risk_per_unit is zero"
 
-    log.info(f"[STAGE 2] sl_type={sl_type} stop_price={stop_loss_price} risk_per_unit={risk_per_unit}")
+    log.debug(f"[STAGE 2] sl_type={sl_type} stop_price={stop_loss_price} risk_per_unit={risk_per_unit}")
     # === Этап 3: Расчёт TP ===
     tp_targets = []
     atr = None
@@ -104,7 +104,7 @@ async def calculate_position_size(data: dict):
         elif tp_type == "atr":
             if atr is None:
                 tf = strategy.get("timeframe").lower()
-                log.info(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
+                log.debug(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
                 atr_raw = await get_indicator(symbol, tf, "atr14")
                 if atr_raw is None:
                     return "skip", "ATR not available for TP"
@@ -127,9 +127,9 @@ async def calculate_position_size(data: dict):
             canceled=False
         ))
 
-        log.info(f"[TP] level={level} type={tp_type} price={price}")
+        log.debug(f"[TP] level={level} type={tp_type} price={price}")
 
-    log.info(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
+    log.debug(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
 
     # === Этап 4: Учёт открытых позиций и доступного риска ===
     used_risk = sum(
@@ -145,7 +145,7 @@ async def calculate_position_size(data: dict):
     if available_risk <= 0:
         return "skip", "available risk exhausted"
 
-    log.info(f"[STAGE 4] used_risk={used_risk} max_allowed_risk={max_allowed_risk} available_risk={available_risk}")
+    log.debug(f"[STAGE 4] used_risk={used_risk} max_allowed_risk={max_allowed_risk} available_risk={available_risk}")
 
     # === Этап 5: Расчёт объёма позиции ===
     leverage = Decimal(str(strategy["leverage"]))
@@ -160,7 +160,7 @@ async def calculate_position_size(data: dict):
     if quantity < min_qty:
         return "skip", "quantity below min_qty"
 
-    log.info(f"[STAGE 5] qty_by_risk={qty_by_risk} qty_by_margin={qty_by_margin} quantity={quantity}")
+    log.debug(f"[STAGE 5] qty_by_risk={qty_by_risk} qty_by_margin={qty_by_margin} quantity={quantity}")
     
     # === Этап 6: Финальные валидации ===
     used_margin = (entry_price * quantity) / leverage
@@ -172,7 +172,7 @@ async def calculate_position_size(data: dict):
     if quantity < min_qty:
         return "skip", "final quantity below min_qty"
 
-    log.info(f"[STAGE 6] used_margin={used_margin} (threshold={margin_threshold}) — OK")
+    log.debug(f"[STAGE 6] used_margin={used_margin} (threshold={margin_threshold}) — OK")
     # === Этап 7: Формирование TP с quantity ===
     volume_percents = [Decimal(str(lvl["volume_percent"])) for lvl in strategy["tp_levels"]]
     quantities = []
@@ -192,7 +192,7 @@ async def calculate_position_size(data: dict):
     for tp, q in zip(tp_targets, quantities):
         tp.quantity = q
 
-    log.info(f"[STAGE 7] TP quantities: {[tp.quantity for tp in tp_targets]} (total={sum(quantities)})")
+    log.debug(f"[STAGE 7] TP quantities: {[tp.quantity for tp in tp_targets]} (total={sum(quantities)})")
 
     # === Этап 8: Расчёт planned_risk и SL Target ===
     planned_risk = (risk_per_unit * quantity).quantize(factor_price, rounding=ROUND_DOWN)
@@ -207,7 +207,7 @@ async def calculate_position_size(data: dict):
         canceled=False
     )
 
-    log.info(f"[STAGE 8] planned_risk={planned_risk} SL quantity={quantity} SL price={stop_loss_price}")
+    log.debug(f"[STAGE 8] planned_risk={planned_risk} SL quantity={quantity} SL price={stop_loss_price}")
     
     return PositionCalculation(
         entry_price=entry_price,
@@ -279,7 +279,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
 
     try:
         await infra.redis_client.xadd("positions_open_stream", payload)
-        log.info(f"📬 Позиция создана и отправлена в Redis: {position_uid}")
+        log.debug(f"📬 Позиция создана и отправлена в Redis: {position_uid}")
     except Exception:
         log.exception("❌ Ошибка отправки позиции в Redis")
 
@@ -309,7 +309,7 @@ async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
             "logged_at": datetime.utcnow().isoformat()
         }
         await infra.redis_client.xadd("signal_log_queue", record)
-        log.info(f"⚠️ [SKIP] strategy_id={strategy_id} log_uid={log_uid} reason=\"{reason}\"")
+        log.debug(f"⚠️ [SKIP] strategy_id={strategy_id} log_uid={log_uid} reason=\"{reason}\"")
     except Exception:
         log.exception("❌ Ошибка при записи skip-события в Redis")
 
@@ -322,10 +322,10 @@ async def run_position_opener_loop():
 
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
-        log.info(f"📡 Группа {group} создана для {stream}")
+        log.debug(f"📡 Группа {group} создана для {stream}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"ℹ️ Группа {group} уже существует")
+            log.debug(f"ℹ️ Группа {group} уже существует")
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
@@ -355,7 +355,7 @@ async def run_position_opener_loop():
                         await redis.xack(stream, group, record_id)
                         continue
 
-                    log.info(f"[RAW DATA] {data}")
+                    log.debug(f"[RAW DATA] {data}")
 
                     try:
                         strategy_id = int(data["strategy_id"])
