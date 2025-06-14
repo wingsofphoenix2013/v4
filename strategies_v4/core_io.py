@@ -130,16 +130,21 @@ async def run_position_open_writer():
 
             for _, records in entries:
                 for record_id, data in records:
-                    try:
-                        await _handle_open_position(data)
-                        await redis.xack(stream_name, group_name, record_id)
-                    except Exception:
-                        log.exception(f"❌ Ошибка обработки позиции (id={record_id})")
+                    asyncio.create_task(_wrap_open_position(data, redis, record_id))
 
         except Exception:
             log.exception("❌ Ошибка в loop обработки позиций")
             await asyncio.sleep(5)
 
+
+# 🔸 Обёртка для параллельной обработки и ack
+async def _wrap_open_position(data, redis, record_id):
+    try:
+        await _handle_open_position(data)
+        await redis.xack("positions_open_stream", "core_io_position_group", record_id)
+    except Exception:
+        log.exception(f"❌ Ошибка обработки позиции (id={record_id})")
+        
 # 🔹 Обработка одной позиции из Redis Stream
 async def _handle_open_position(data: dict):
     # 🔸 Декодирование TP/SL целей
