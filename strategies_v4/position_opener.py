@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from decimal import Decimal, ROUND_DOWN
+import time
 
 from infra import infra, get_price, get_indicator
 from config_loader import config
@@ -315,6 +316,9 @@ async def publish_skip_reason(log_uid: str, strategy_id: int, reason: str):
 # 🔸 Обработка одной записи из потока
 async def handle_open_request(record_id: str, raw: dict, redis):
     async with sem:
+        import time
+        start = time.monotonic()
+
         try:
             raw_data = raw.get(b"data") or raw.get("data")
             if isinstance(raw_data, bytes):
@@ -324,12 +328,14 @@ async def handle_open_request(record_id: str, raw: dict, redis):
             strategy_id = int(data["strategy_id"])
             log_uid = data["log_uid"]
 
+            log.info(f"▶ START open_request log_uid={log_uid} t={start:.3f}")
+
             result = await calculate_position_size(data)
             if isinstance(result, tuple) and result[0] == "skip":
                 reason = result[1]
                 await publish_skip_reason(log_uid, strategy_id, reason)
             else:
-                key = (int(data["strategy_id"]), data["symbol"])
+                key = (strategy_id, data["symbol"])
                 if key in position_registry:
                     log.warning(f"⚠️ Позиция уже существует, повторное открытие заблокировано: {key}")
                     return
@@ -338,6 +344,9 @@ async def handle_open_request(record_id: str, raw: dict, redis):
         except Exception:
             log.exception("❌ Ошибка при обработке записи позиции")
         finally:
+            end = time.monotonic()
+            duration_ms = (end - start) * 1000
+            log.info(f"⏹ END   open_request log_uid={log_uid} t={end:.3f} Δ={duration_ms:.1f}ms")
             await redis.xack("strategy_opener_stream", "position_opener_group", record_id)
 # 🔹 Основной воркер
 MAX_PARALLEL_OPENS = 10
