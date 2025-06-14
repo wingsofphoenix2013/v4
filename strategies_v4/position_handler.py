@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
 from infra import get_price
-from config_loader import get_ticker_config, get_tp_sl_config
+from config_loader import config
 from position_state_loader import position_registry, Target
 
 log = logging.getLogger("POSITION_HANDLER")
@@ -64,7 +64,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         log.info(f"📍 TP-{tp.level} отмечен как выполненный для {position.uid} (цель: {tp.price}, исполнение: {price})")
 
         # 🔸 Обновление позиции
-        precision_qty = get_ticker_config(position.symbol)["precision_qty"]
+        precision_qty = config.tickers[position.symbol]["precision_qty"]
         quantize_mask = Decimal("1").scaleb(-precision_qty)
 
         # Округляем количество
