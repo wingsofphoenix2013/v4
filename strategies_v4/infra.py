@@ -176,7 +176,7 @@ async def init_indicator_cache_via_redis():
             for param, value in result.items():
                 if value is not None:
                     _indicator_cache[(symbol, interval, param)] = value
-            log.info(f"✅ Кеш загружен: {symbol} {interval} ({len(params)} параметров)")
+            log.debug(f"✅ Кеш загружен: {symbol} {interval} ({len(params)} параметров)")
         except Exception:
             log.exception(f"❌ Ошибка при инициализации кеша для {symbol}-{interval}")
 

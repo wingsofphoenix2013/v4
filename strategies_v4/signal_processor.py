@@ -33,7 +33,7 @@ async def run_signal_loop():
             for stream_name, records in entries:
                 for record_id, data in records:
                     last_id = record_id
-                    await process_signal(data)
+                    asyncio.create_task(process_signal(data))
 
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream")
