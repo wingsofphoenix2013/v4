@@ -1,5 +1,3 @@
-# config_loader.py
-
 import asyncio
 import logging
 import json
@@ -45,43 +43,58 @@ class ConfigState:
             self.tickers.pop(symbol, None)
             log.debug(f"🗑️ Тикер удалён: {symbol}")
 
-    # 🔸 Обновление стратегии
-    async def reload_strategy(self, strategy_id: int):
-        async with self._lock:
-            row = await infra.pg_pool.fetchrow(
-                "SELECT * FROM strategies_v4 WHERE id = $1 AND enabled = true AND archived = false",
-                strategy_id
-            )
-            if not row:
-                self.strategies.pop(strategy_id, None)
-                self.strategy_tickers.pop(strategy_id, None)
-                log.debug(f"🗑️ Стратегия удалена: id={strategy_id}")
-                return
+# 🔸 Обновление стратегии
+async def reload_strategy(self, strategy_id: int):
+    async with self._lock:
+        row = await infra.pg_pool.fetchrow(
+            "SELECT * FROM strategies_v4 WHERE id = $1 AND enabled = true AND archived = false",
+            strategy_id
+        )
+        if not row:
+            self.strategies.pop(strategy_id, None)
+            self.strategy_tickers.pop(strategy_id, None)
+            log.debug(f"🗑️ Стратегия удалена: id={strategy_id}")
+            return
 
-            strategy = dict(row)
-            strategy["module_name"] = strategy["name"]
-            
-            strategy["tp_levels"] = await infra.pg_pool.fetch(
-                "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
-                strategy_id
-            )
-            strategy["sl_rules"] = await infra.pg_pool.fetch(
-                "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
-                strategy_id
-            )
-            self.strategies[strategy_id] = strategy
+        strategy = dict(row)
+        strategy["module_name"] = strategy["name"]
 
-            tickers = await infra.pg_pool.fetch(
-                '''
-                SELECT t.symbol
-                FROM strategy_tickers_v4 st
-                JOIN tickers_v4 t ON st.ticker_id = t.id
-                WHERE st.strategy_id = $1 AND st.enabled = true AND t.status = 'enabled' AND t.tradepermission = 'enabled'
-                ''',
-                strategy_id
-            )
-            self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers}
-            log.debug(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
+        strategy["tp_levels"] = await infra.pg_pool.fetch(
+            "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
+            strategy_id
+        )
+        strategy["sl_rules"] = await infra.pg_pool.fetch(
+            "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
+            strategy_id
+        )
+
+        # 🔹 Обогащение sl_rules полем level
+        level_map = {lvl["id"]: lvl["level"] for lvl in strategy["tp_levels"]}
+        for rule in strategy["sl_rules"]:
+            rule["level"] = level_map.get(rule["tp_level_id"])
+
+        self.strategies[strategy_id] = strategy
+
+        tickers = await infra.pg_pool.fetch(
+            '''
+            SELECT t.symbol
+            FROM strategy_tickers_v4 st
+            JOIN tickers_v4 t ON st.ticker_id = t.id
+            WHERE st.strategy_id = $1 AND st.enabled = true AND t.status = 'enabled' AND t.tradepermission = 'enabled'
+            ''',
+            strategy_id
+        )
+        self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers}
+
+        log.debug(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
+
+        # 🔸 Дополнительный лог с деталями загрузки
+        log.info(
+            f"🧠 Стратегия {strategy_id} загружена | "
+            f"TP={[{'level': r['level'], 'value': r['value']} for r in strategy['tp_levels']]}, "
+            f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}, "
+            f"Tickers={list(self.strategy_tickers[strategy_id])}"
+        )
 
     # 🔸 Удаление стратегии
     async def remove_strategy(self, strategy_id: int):
@@ -118,7 +131,19 @@ class ConfigState:
                 strategy_id
             )
 
+            # 🔹 Обогащение sl_rules полем level
+            level_map = {lvl["id"]: lvl["level"] for lvl in strategy["tp_levels"]}
+            for rule in strategy["sl_rules"]:
+                rule["level"] = level_map.get(rule["tp_level_id"])
+
             self.strategies[strategy_id] = strategy
+
+            # 🔸 Лог: детали загруженной стратегии
+            log.info(
+                f"🧠 Загружена стратегия {strategy_id} | "
+                f"TP={[{'level': r['level'], 'value': r['value']} for r in strategy['tp_levels']]}, "
+                f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
+            )
 
     # 🔸 Загрузка связей стратегия ↔ тикеры
     async def _load_strategy_tickers(self):

@@ -94,7 +94,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         # 🔸 Обновление SL по политике
         sl_policy = next(
             (row for row in config.strategies[position.strategy_id]["sl_rules"]
-             if row["tp_level_id"] == tp.id),  # фикс: сравнение по tp.id
+             if row["level"] == tp.level),
             None
         )
 
@@ -112,7 +112,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
 
             if sl_mode == "entry":
                 new_sl_price = position.entry_price
-                log.info(f"🧮 SL-режим: entry → новая цена SL = {new_sl_price}")
+                log.info(f"🧮 SL-режим entry → цена = {new_sl_price}")
 
             elif sl_mode == "percent":
                 delta = (position.entry_price * sl_value / 100).quantize(Decimal("0.0001"))
@@ -120,10 +120,10 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                     new_sl_price = (position.entry_price - delta)
                 else:
                     new_sl_price = (position.entry_price + delta)
-                log.info(f"🧮 SL-режим: percent → delta = {delta}, новая цена SL = {new_sl_price}")
+                log.info(f"🧮 SL-режим percent → delta = {delta}, цена = {new_sl_price}")
 
             else:
-                log.warning(f"⚠️ SL режим {sl_mode} пока не поддерживается")
+                log.warning(f"⚠️ SL-режим {sl_mode} не поддерживается")
                 return
 
             new_sl = Target(
@@ -137,7 +137,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             )
             position.sl_targets.append(new_sl)
 
-            log.info(f"🛡️ Новый SL установлен: {new_sl_price} для {position.uid}, объём: {position.quantity_left}")
+            log.info(f"🛡️ SL установлен: {new_sl_price} для {position.uid}, объём: {position.quantity_left}")
 
         # 🔸 Отправка события в Redis
         note = format_tp_hit_note(tp.level, price, pnl_delta)
