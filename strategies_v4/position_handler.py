@@ -93,11 +93,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
 
         # 🔸 Расчёт PnL
         entry = position.entry_price
-        if position.direction == "long":
-            pnl_delta = (price - entry) * closed_qty
-        else:
-            pnl_delta = (entry - price) * closed_qty
-
+        pnl_delta = (entry - price if position.direction == "short" else price - entry) * closed_qty
         pnl_delta = pnl_delta.quantize(Decimal("1.00"))
         position.pnl += pnl_delta
 
@@ -111,8 +107,8 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         )
 
         log.info(f"📐 SL-политика для TP-{tp.level}: {sl_policy}")
-
         new_sl_price = None
+
         if sl_policy and sl_policy["sl_mode"] != "none":
             for sl in position.sl_targets:
                 if not sl.hit and not sl.canceled:
@@ -128,10 +124,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             elif sl_mode == "percent":
                 sl_value = Decimal(str(sl_policy["sl_value"]))
                 delta = (position.entry_price * sl_value / 100).quantize(Decimal("0.0001"))
-                if position.direction == "long":
-                    new_sl_price = (position.entry_price - delta)
-                else:
-                    new_sl_price = (position.entry_price + delta)
+                new_sl_price = position.entry_price - delta if position.direction == "long" else position.entry_price + delta
                 log.info(f"🧮 SL-режим percent → delta = {delta}, цена = {new_sl_price}")
 
             else:
@@ -170,7 +163,6 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             event_data["new_sl_price"] = str(new_sl_price)
             event_data["new_sl_quantity"] = str(position.quantity_left)
 
-        # 🔸 Закрытие позиции при 0
         if position.quantity_left == 0:
             log.info(f"🏁 Позиция полностью закрыта TP-{tp.level}: {position.uid}")
             sl_canceled_count = 0
@@ -179,7 +171,6 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                     sl.canceled = True
                     sl_canceled_count += 1
                     log.info(f"🛑 SL отменён (закрытие): {position.uid} (цель: {sl.price})")
-
             if sl_canceled_count > 0:
                 event_data["sl_replaced"] = True
                 event_data["sl_canceled_on_close"] = True
@@ -187,10 +178,6 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         # 🔸 Публикация события TP
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
         log.info(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
-
-        # 🔸 Финальное закрытие
-        if position.quantity_left == 0:
-            await _finalize_position_close(position, price, reason="full-tp-hit")
 # 🔸 Финальное закрытие позиции
 async def _finalize_position_close(position, price: Decimal, reason: str):
     now = datetime.utcnow()
