@@ -243,7 +243,7 @@ async def _handle_position_update_event(event: dict):
                         pnl = $2,
                         planned_risk = $3,
                         close_reason = $4
-                    WHERE uid = $5
+                    WHERE position_uid = $5
                 """, Decimal(event["quantity_left"]), Decimal(event["pnl"]), Decimal("0"),
                      event["close_reason"], event["position_uid"])
 
