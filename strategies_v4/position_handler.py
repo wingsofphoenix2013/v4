@@ -28,7 +28,9 @@ async def _process_positions():
             price_snapshot[symbol] = Decimal(str(price))
 
     # Обработка позиций
-    for position in position_registry.values():
+    to_remove = []
+
+    for position in list(position_registry.values()):
         if position.status != "open" or position.quantity_left <= 0:
             continue
 
@@ -37,6 +39,12 @@ async def _process_positions():
             continue
 
         await _process_tp_for_position(position, price)
+
+        if position.quantity_left == 0:
+            to_remove.append((position.strategy_id, position.symbol))
+
+    for key in to_remove:
+        del position_registry[key]
 # 🔸 Обработка TP для одной позиции
 async def _process_tp_for_position(position, price: Decimal):
     for tp in sorted(position.tp_targets, key=lambda t: t.level):
