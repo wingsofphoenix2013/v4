@@ -147,8 +147,17 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             "position_uid": str(position.uid),
             "strategy_id": position.strategy_id,
             "symbol": position.symbol,
+            "tp_level": tp.level,
+            "quantity_left": str(position.quantity_left),
+            "pnl": str(position.pnl),
+            "close_reason": position.close_reason,
             "note": note,
         }
+
+        if sl_policy and sl_policy["sl_mode"] != "none":
+            event_data["sl_replaced"] = True
+            event_data["new_sl_price"] = str(new_sl_price)
+            event_data["new_sl_quantity"] = str(position.quantity_left)
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
 

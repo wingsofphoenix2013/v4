@@ -232,32 +232,66 @@ async def _handle_open_position(data: dict):
     log.debug(f"✅ Позиция {position_uid} записана в БД")
 # 🔸 Обработка события позиции
 async def _handle_position_update_event(event: dict):
-    if event.get("event_type") != "tp_hit":
+    if event.get("event_type") == "tp_hit":
+        async with infra.pg_pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Обновление позиции
+                await conn.execute("""
+                    UPDATE positions_v4
+                    SET
+                        quantity_left = $1,
+                        pnl = $2,
+                        planned_risk = $3,
+                        close_reason = $4
+                    WHERE uid = $5
+                """, Decimal(event["quantity_left"]), Decimal(event["pnl"]), Decimal("0"),
+                     event["close_reason"], event["position_uid"])
+
+                # 2. Обновление цели TP
+                await conn.execute("""
+                    UPDATE position_targets_v4
+                    SET hit = TRUE, hit_at = NOW()
+                    WHERE position_uid = $1 AND type = 'tp' AND level = $2
+                """, event["position_uid"], event["tp_level"])
+
+                # 3. Обработка SL-политики (если есть)
+                if event.get("sl_replaced"):
+                    await conn.execute("""
+                        UPDATE position_targets_v4
+                        SET canceled = TRUE
+                        WHERE position_uid = $1 AND type = 'sl' AND hit = FALSE AND canceled = FALSE
+                    """, event["position_uid"])
+
+                    await conn.execute("""
+                        INSERT INTO position_targets_v4 (
+                            position_uid, type, level, price, quantity,
+                            hit, hit_at, canceled
+                        ) VALUES ($1, 'sl', 1, $2, $3, FALSE, NULL, FALSE)
+                    """, event["position_uid"],
+                         Decimal(event["new_sl_price"]),
+                         Decimal(event["new_sl_quantity"]))
+
+                # 4. Лог
+                await conn.execute("""
+                    INSERT INTO positions_log_v4 (
+                        position_uid,
+                        strategy_id,
+                        symbol,
+                        event_type,
+                        note,
+                        logged_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                """, event["position_uid"],
+                     event["strategy_id"],
+                     event["symbol"],
+                     "tp_hit",
+                     event["note"],
+                     datetime.utcnow())
+
+        log.info(f"📝 Событие tp_hit обработано и записано для {event['position_uid']}")
+
+    else:
         log.warning(f"⚠️ Неизвестный тип события: {event.get('event_type')}")
-        return
-
-    query = """
-        INSERT INTO positions_log_v4 (
-            position_uid,
-            strategy_id,
-            symbol,
-            event_type,
-            note,
-            logged_at
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-    """
-
-    await infra.pg_pool.execute(
-        query,
-        event["position_uid"],
-        event["strategy_id"],
-        event["symbol"],
-        event["event_type"],
-        event["note"],
-        datetime.utcnow()
-    )
-
-    log.info(f"📝 Событие tp_hit записано в positions_log_v4 для {event['position_uid']}")
 # 🔸 Воркер: обработка событий из positions_update_stream
 async def run_position_update_writer():
     stream_name = "positions_update_stream"
