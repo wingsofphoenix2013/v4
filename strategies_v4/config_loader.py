@@ -59,15 +59,19 @@ class ConfigState:
             strategy = dict(row)
             strategy["module_name"] = strategy["name"]
 
-            strategy["tp_levels"] = await infra.pg_pool.fetch(
-                "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
-                strategy_id
-            )
-            strategy["sl_rules"] = await infra.pg_pool.fetch(
-                "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
-                strategy_id
-            )
-
+            strategy["tp_levels"] = [
+                dict(r) for r in await infra.pg_pool.fetch(
+                    "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
+                    strategy_id
+                )
+            ]
+            strategy["sl_rules"] = [
+                dict(r) for r in await infra.pg_pool.fetch(
+                    "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
+                    strategy_id
+                )
+            ]
+            
             # 🔹 Обогащение sl_rules полем level
             level_map = {lvl["id"]: lvl["level"] for lvl in strategy["tp_levels"]}
             for rule in strategy["sl_rules"]:
@@ -121,14 +125,18 @@ class ConfigState:
             strategy = dict(row)
             strategy["module_name"] = strategy["name"]
 
-            strategy["tp_levels"] = await infra.pg_pool.fetch(
-                "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
-                strategy_id
-            )
-            strategy["sl_rules"] = await infra.pg_pool.fetch(
-                "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
-                strategy_id
-            )
+            strategy["tp_levels"] = [
+                dict(r) for r in await infra.pg_pool.fetch(
+                    "SELECT * FROM strategy_tp_levels_v4 WHERE strategy_id = $1 ORDER BY level",
+                    strategy_id
+                )
+            ]
+            strategy["sl_rules"] = [
+                dict(r) for r in await infra.pg_pool.fetch(
+                    "SELECT * FROM strategy_tp_sl_v4 WHERE strategy_id = $1",
+                    strategy_id
+                )
+            ]
 
             # 🔹 Обогащение sl_rules полем level
             level_map = {lvl["id"]: lvl["level"] for lvl in strategy["tp_levels"]}
@@ -143,7 +151,7 @@ class ConfigState:
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
             )
-
+            
     # 🔸 Загрузка связей стратегия ↔ тикеры
     async def _load_strategy_tickers(self):
         rows = await infra.pg_pool.fetch(
