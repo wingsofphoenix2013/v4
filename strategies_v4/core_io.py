@@ -271,7 +271,7 @@ async def _handle_position_update_event(event: dict):
                          Decimal(event["new_sl_price"]),
                          Decimal(event["new_sl_quantity"]))
 
-                # 4. Лог
+                # 4. Лог TP
                 await conn.execute("""
                     INSERT INTO positions_log_v4 (
                         position_uid,
@@ -280,15 +280,44 @@ async def _handle_position_update_event(event: dict):
                         event_type,
                         note,
                         logged_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                    ) VALUES ($1, $2, $3, 'tp_hit', $4, $5)
                 """, event["position_uid"],
                      event["strategy_id"],
                      event["symbol"],
-                     "tp_hit",
                      event["note"],
                      datetime.utcnow())
 
         log.info(f"📝 Событие tp_hit обработано и записано для {event['position_uid']}")
+
+    elif event.get("event_type") == "closed":
+        async with infra.pg_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("""
+                    UPDATE positions_v4
+                    SET
+                        status = 'closed',
+                        exit_price = $1,
+                        closed_at = NOW(),
+                        close_reason = $2
+                    WHERE position_uid = $3
+                """, Decimal(event["exit_price"]), event["close_reason"], event["position_uid"])
+
+                await conn.execute("""
+                    INSERT INTO positions_log_v4 (
+                        position_uid,
+                        strategy_id,
+                        symbol,
+                        event_type,
+                        note,
+                        logged_at
+                    ) VALUES ($1, $2, $3, 'closed', $4, $5)
+                """, event["position_uid"],
+                     event["strategy_id"],
+                     event["symbol"],
+                     event["note"],
+                     datetime.utcnow())
+
+        log.info(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
 
     else:
         log.warning(f"⚠️ Неизвестный тип события: {event.get('event_type')}")

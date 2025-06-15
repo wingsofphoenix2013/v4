@@ -53,6 +53,10 @@ async def _process_tp_for_position(position, price: Decimal):
                 log.info(f"✅ TP-{tp.level} достигнут (short) {position.symbol}: цена {price} ≤ {tp.price}")
                 await _handle_tp_hit(position, tp, price)
 
+            # 🔸 Проверка на полное закрытие
+            if position.quantity_left == 0:
+                await _finalize_position_close(position, price, reason="full-tp-hit")
+
             break  # проверяем только один TP
 # 🔸 Формирование текста события TP для логов и сериализации
 def format_tp_hit_note(tp_level: int, price: Decimal, pnl: Decimal) -> str:
@@ -162,6 +166,36 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
 
         log.info(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
+# 🔸 Финальное закрытие позиции
+async def _finalize_position_close(position, price: Decimal, reason: str):
+    now = datetime.utcnow()
+
+    position.status = "closed"
+    position.exit_price = price
+    position.closed_at = now
+    position.close_reason = reason
+
+    # Удаляем из памяти
+    key = (position.strategy_id, position.symbol)
+    if key in position_registry:
+        del position_registry[key]
+
+    log.info(f"🔒 Позиция закрыта {position.uid}: причина={reason}, цена={price}, pnl={position.pnl}")
+
+    # Формируем событие для core_io
+    event_data = {
+        "event_type": "closed",
+        "position_uid": str(position.uid),
+        "strategy_id": position.strategy_id,
+        "symbol": position.symbol,
+        "exit_price": str(price),
+        "pnl": str(position.pnl),
+        "close_reason": reason,
+        "note": f"позиция закрыта по {reason} по цене {price}"
+    }
+
+    await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
+    log.info(f"📤 Событие closed отправлено в positions_update_stream для {position.uid}")
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:
