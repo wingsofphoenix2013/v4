@@ -255,7 +255,7 @@ async def _handle_position_update_event(event: dict):
                 """, event["position_uid"], event["tp_level"])
 
                 # 3. Обработка SL-политики (если есть)
-                if event.get("sl_replaced"):
+                if event.get("sl_replaced") and event.get("new_sl_price"):
                     await conn.execute("""
                         UPDATE position_targets_v4
                         SET canceled = TRUE
@@ -292,6 +292,7 @@ async def _handle_position_update_event(event: dict):
     elif event.get("event_type") == "closed":
         async with infra.pg_pool.acquire() as conn:
             async with conn.transaction():
+                # 1. Обновление позиции
                 await conn.execute("""
                     UPDATE positions_v4
                     SET
@@ -302,6 +303,14 @@ async def _handle_position_update_event(event: dict):
                     WHERE position_uid = $3
                 """, Decimal(event["exit_price"]), event["close_reason"], event["position_uid"])
 
+                # 2. Отмена всех SL-целей (если остались)
+                await conn.execute("""
+                    UPDATE position_targets_v4
+                    SET canceled = TRUE
+                    WHERE position_uid = $1 AND type = 'sl' AND hit = FALSE AND canceled = FALSE
+                """, event["position_uid"])
+
+                # 3. Лог закрытия
                 await conn.execute("""
                     INSERT INTO positions_log_v4 (
                         position_uid,

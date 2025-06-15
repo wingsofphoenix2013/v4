@@ -112,8 +112,8 @@ async def _handle_tp_hit(position, tp, price: Decimal):
 
         log.info(f"📐 SL-политика для TP-{tp.level}: {sl_policy}")
 
+        new_sl_price = None
         if sl_policy and sl_policy["sl_mode"] != "none":
-            # Отмена всех активных SL
             for sl in position.sl_targets:
                 if not sl.hit and not sl.canceled:
                     sl.canceled = True
@@ -148,10 +148,9 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                 canceled=False
             )
             position.sl_targets.append(new_sl)
-
             log.info(f"🛡️ SL установлен: {new_sl_price} для {position.uid}, объём: {position.quantity_left}")
 
-        # 🔸 Отправка события в Redis
+        # 🔸 Подготовка события
         note = format_tp_hit_note(tp.level, price, pnl_delta)
 
         event_data = {
@@ -166,14 +165,32 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             "note": note,
         }
 
-        if sl_policy and sl_policy["sl_mode"] != "none":
+        if new_sl_price is not None:
             event_data["sl_replaced"] = True
             event_data["new_sl_price"] = str(new_sl_price)
             event_data["new_sl_quantity"] = str(position.quantity_left)
 
-        await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
+        # 🔸 Закрытие позиции при 0
+        if position.quantity_left == 0:
+            log.info(f"🏁 Позиция полностью закрыта TP-{tp.level}: {position.uid}")
+            sl_canceled_count = 0
+            for sl in position.sl_targets:
+                if not sl.hit and not sl.canceled:
+                    sl.canceled = True
+                    sl_canceled_count += 1
+                    log.info(f"🛑 SL отменён (закрытие): {position.uid} (цель: {sl.price})")
 
+            if sl_canceled_count > 0:
+                event_data["sl_replaced"] = True
+                event_data["sl_canceled_on_close"] = True
+
+        # 🔸 Публикация события TP
+        await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
         log.info(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
+
+        # 🔸 Финальное закрытие
+        if position.quantity_left == 0:
+            await _finalize_position_close(position, price, reason="full-tp-hit")
 # 🔸 Финальное закрытие позиции
 async def _finalize_position_close(position, price: Decimal, reason: str):
     now = datetime.utcnow()
