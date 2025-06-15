@@ -256,6 +256,16 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
 
     position_registry[(state.strategy_id, state.symbol)] = state
 
+    # 🔸 Логирование полной информации о позиции
+    log.info(
+        f"🧾 Позиция создана в памяти: {state.uid} | "
+        f"strategy={state.strategy_id}, symbol={state.symbol}, side={state.direction}, "
+        f"entry={state.entry_price}, qty={state.quantity}, leverage={calc_result.leverage}, "
+        f"planned_risk={state.planned_risk}, pnl={state.pnl}, "
+        f"TP={[{'level': t.level, 'price': t.price, 'qty': t.quantity} for t in state.tp_targets]}, "
+        f"SL={[{'price': s.price, 'qty': s.quantity} for s in state.sl_targets]}"
+    )
+
     # Подготовка события для Redis
     payload = {
         "position_uid": position_uid,

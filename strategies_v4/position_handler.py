@@ -94,21 +94,25 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         # 🔸 Обновление SL по политике
         sl_policy = next(
             (row for row in config.strategies[position.strategy_id]["sl_rules"]
-             if row["tp_level_id"] == tp.level),
+             if row["tp_level_id"] == tp.id),  # фикс: сравнение по tp.id
             None
         )
 
+        log.info(f"📐 SL-политика для TP-{tp.level}: {sl_policy}")
+
         if sl_policy and sl_policy["sl_mode"] != "none":
+            # Отмена всех активных SL
             for sl in position.sl_targets:
                 if not sl.hit and not sl.canceled:
                     sl.canceled = True
-                    log.info(f"🛑 SL отменён для {position.uid}")
+                    log.info(f"🛑 SL отменён для {position.uid} (цель: {sl.price})")
 
             sl_mode = sl_policy["sl_mode"]
             sl_value = Decimal(str(sl_policy["sl_value"]))
 
             if sl_mode == "entry":
                 new_sl_price = position.entry_price
+                log.info(f"🧮 SL-режим: entry → новая цена SL = {new_sl_price}")
 
             elif sl_mode == "percent":
                 delta = (position.entry_price * sl_value / 100).quantize(Decimal("0.0001"))
@@ -116,6 +120,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                     new_sl_price = (position.entry_price - delta)
                 else:
                     new_sl_price = (position.entry_price + delta)
+                log.info(f"🧮 SL-режим: percent → delta = {delta}, новая цена SL = {new_sl_price}")
 
             else:
                 log.warning(f"⚠️ SL режим {sl_mode} пока не поддерживается")
@@ -132,7 +137,8 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             )
             position.sl_targets.append(new_sl)
 
-            log.info(f"🛡️ Новый SL установлен: {new_sl_price} для {position.uid}")
+            log.info(f"🛡️ Новый SL установлен: {new_sl_price} для {position.uid}, объём: {position.quantity_left}")
+
         # 🔸 Отправка события в Redis
         note = format_tp_hit_note(tp.level, price, pnl_delta)
 
