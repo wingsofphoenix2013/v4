@@ -108,13 +108,13 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                     log.info(f"🛑 SL отменён для {position.uid} (цель: {sl.price})")
 
             sl_mode = sl_policy["sl_mode"]
-            sl_value = Decimal(str(sl_policy["sl_value"]))
 
             if sl_mode == "entry":
                 new_sl_price = position.entry_price
                 log.info(f"🧮 SL-режим entry → цена = {new_sl_price}")
 
             elif sl_mode == "percent":
+                sl_value = Decimal(str(sl_policy["sl_value"]))
                 delta = (position.entry_price * sl_value / 100).quantize(Decimal("0.0001"))
                 if position.direction == "long":
                     new_sl_price = (position.entry_price - delta)
