@@ -299,9 +299,13 @@ async def _handle_position_update_event(event: dict):
                         status = 'closed',
                         exit_price = $1,
                         closed_at = NOW(),
-                        close_reason = $2
-                    WHERE position_uid = $3
-                """, Decimal(event["exit_price"]), event["close_reason"], event["position_uid"])
+                        close_reason = $2,
+                        pnl = $3
+                    WHERE position_uid = $4
+                """, Decimal(event["exit_price"]),
+                     event["close_reason"],
+                     Decimal(event["pnl"]),
+                     event["position_uid"])
 
                 # 2. Отмена всех SL-целей (если остались)
                 await conn.execute("""

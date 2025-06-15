@@ -39,12 +39,14 @@ async def _process_positions():
             continue
 
         await _process_tp_for_position(position, price)
+        await _process_sl_for_position(position, price)
 
         if position.quantity_left == 0:
             to_remove.append((position.strategy_id, position.symbol))
 
     for key in to_remove:
-        del position_registry[key]
+        if key in position_registry:
+            del position_registry[key]
 # 🔸 Обработка TP для одной позиции
 async def _process_tp_for_position(position, price: Decimal):
     for tp in sorted(position.tp_targets, key=lambda t: t.level):
@@ -66,6 +68,76 @@ async def _process_tp_for_position(position, price: Decimal):
                 await _finalize_position_close(position, price, reason="full-tp-hit")
 
             break  # проверяем только один TP
+# 🔸 Обработка SL для одной позиции
+async def _process_sl_for_position(position, price: Decimal):
+    active_sl = next(
+        (sl for sl in position.sl_targets
+         if not sl.hit and not sl.canceled and sl.price is not None),
+        None
+    )
+
+    if not active_sl:
+        return
+
+    if position.direction == "long" and price <= active_sl.price:
+        log.info(f"⛔ SL достигнут (long) {position.symbol}: цена {price} ≤ {active_sl.price}")
+    elif position.direction == "short" and price >= active_sl.price:
+        log.info(f"⛔ SL достигнут (short) {position.symbol}: цена {price} ≥ {active_sl.price}")
+    else:
+        return  # SL не достигнут
+
+    async with position.lock:
+        now = datetime.utcnow()
+        active_sl.hit = True
+        active_sl.hit_at = now
+
+        # Определение типа SL
+        is_original_sl = active_sl.quantity == position.quantity
+        reason = "full-sl-hit" if is_original_sl else "sl-tp-hit"
+
+        canceled_tp_count = 0
+        for tp in position.tp_targets:
+            if not tp.hit and not tp.canceled:
+                tp.canceled = True
+                canceled_tp_count += 1
+                log.info(f"🛑 TP отменён (SL-hit): {position.uid} (TP-{tp.level})")
+
+        precision_qty = config.tickers[position.symbol]["precision_qty"]
+        quantize_mask = Decimal("1").scaleb(-precision_qty)
+        position.quantity_left = Decimal("0").quantize(quantize_mask)
+        position.planned_risk = Decimal("0")
+        position.status = "closed"
+        position.close_reason = reason
+        position.exit_price = price
+        position.closed_at = now
+
+        entry = position.entry_price
+        qty = position.quantity
+
+        if position.direction == "long":
+            pnl = (price - entry) * qty
+        else:
+            pnl = (entry - price) * qty
+
+        pnl = pnl.quantize(Decimal("1.00"))
+        position.pnl += pnl
+
+        log.info(f"💀 Позиция закрыта по SL {position.uid}: причина={reason}, цена={price}, pnl={pnl:+.2f}")
+
+        # 🔸 Событие закрытия
+        event_data = {
+            "event_type": "closed",
+            "position_uid": str(position.uid),
+            "strategy_id": position.strategy_id,
+            "symbol": position.symbol,
+            "exit_price": str(price),
+            "pnl": str(position.pnl),
+            "close_reason": reason,
+            "note": f"позиция закрыта по {reason} по цене {price}"
+        }
+
+        await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
+        log.info(f"📤 Событие SL-closed отправлено в positions_update_stream для {position.uid}")
 # 🔸 Формирование текста события TP для логов и сериализации
 def format_tp_hit_note(tp_level: int, price: Decimal, pnl: Decimal) -> str:
     price_str = f"{price:.4f}"
