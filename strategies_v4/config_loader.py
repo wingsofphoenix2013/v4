@@ -90,10 +90,9 @@ class ConfigState:
 
             # 🔸 Дополнительный лог с деталями загрузки
             log.info(
-                f"🧠 Стратегия {strategy_id} загружена | "
+                f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
-                f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}, "
-                f"Tickers={list(self.strategy_tickers[strategy_id])}"
+                f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
             )
 
     # 🔸 Удаление стратегии
@@ -140,10 +139,9 @@ class ConfigState:
 
             # 🔸 Лог: детали загруженной стратегии
             log.info(
-                f"🧠 Стратегия {strategy_id} загружена | "
+                f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
-                f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}, "
-                f"Tickers={list(self.strategy_tickers[strategy_id])}"
+                f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
             )
 
     # 🔸 Загрузка связей стратегия ↔ тикеры
