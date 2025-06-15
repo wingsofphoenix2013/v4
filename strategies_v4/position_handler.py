@@ -183,11 +183,6 @@ async def _finalize_position_close(position, price: Decimal, reason: str):
     position.closed_at = now
     position.close_reason = reason
 
-    # Удаляем из памяти
-    key = (position.strategy_id, position.symbol)
-    if key in position_registry:
-        del position_registry[key]
-
     log.info(f"🔒 Позиция закрыта {position.uid}: причина={reason}, цена={price}, pnl={position.pnl}")
 
     # Формируем событие для core_io
