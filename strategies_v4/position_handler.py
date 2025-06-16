@@ -273,6 +273,7 @@ async def full_protect_stop(position):
             log.warning(f"❌ PROTECT: цена не получена для {position.symbol}, остановка невозможна")
             return
 
+        price = Decimal(str(price))
         now = datetime.utcnow()
 
         # Закрытие позиции и установка финальных атрибутов
