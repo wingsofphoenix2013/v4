@@ -19,13 +19,14 @@ async def _process_positions():
 
     # Сбор уникальных тикеров
     symbols = {p.symbol for p in position_registry.values() if p.status == "open"}
-    price_snapshot: dict[str, Decimal] = {}
 
-    # Получение цен
-    for symbol in symbols:
-        price = await get_price(symbol)
-        if price is not None:
-            price_snapshot[symbol] = Decimal(str(price))
+    # Параллельное получение цен
+    prices_raw = await asyncio.gather(*(get_price(symbol) for symbol in symbols))
+    price_snapshot: dict[str, Decimal] = {
+        symbol: Decimal(str(price))
+        for symbol, price in zip(symbols, prices_raw)
+        if price is not None
+    }
 
     # Обработка позиций
     to_remove = []
