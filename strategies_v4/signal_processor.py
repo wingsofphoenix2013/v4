@@ -85,13 +85,13 @@ async def process_signal(data: dict):
                     "повтор сигнала в ту же сторону"
                 )
 
-            if not strategy.get("reverse", False) and not strategy.get("sl_protect", False):
+            if not strategy.get("reverse", False) and not strategy.get("sl_protection", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "реверс и SL защита отключены"
                 )
 
-            if not strategy.get("reverse", False) and strategy.get("sl_protect", True):
+            if not strategy.get("reverse", False) and strategy.get("sl_protection", True):
                 price = await get_price(symbol)
                 if price is None:
                     log.warning(f"⚠️ PROTECT: нет цены для {symbol}, сигнал пропущен")
@@ -140,7 +140,7 @@ async def process_signal(data: dict):
                         )
                 return
 
-            if strategy.get("reverse", False) and strategy.get("sl_protect", False):
+            if strategy.get("reverse", False) and strategy.get("sl_protection", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "маршрут reverse не реализован"
