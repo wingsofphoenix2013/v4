@@ -229,7 +229,7 @@ async def _handle_open_position(data: dict):
         int((logged_at - received_at_dt).total_seconds() * 1000)
     )
 
-    log.info(f"✅ Позиция {position_uid} записана в БД")
+    log.debug(f"✅ Позиция {position_uid} записана в БД")
 # 🔸 Обработка события позиции
 async def _handle_position_update_event(event: dict):
     if event.get("event_type") == "tp_hit":
@@ -356,7 +356,7 @@ async def _handle_position_update_event(event: dict):
                      event["note"],
                      datetime.utcnow())
 
-        log.info(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
+        log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
 # 🔸 Воркер: обработка событий из positions_update_stream
 async def run_position_update_writer():
     stream_name = "positions_update_stream"
@@ -375,7 +375,7 @@ async def run_position_update_writer():
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info(f"📡 Подписка на {stream_name} через {group_name}")
+    log.debug(f"📡 Подписка на {stream_name} через {group_name}")
 
     while True:
         try:

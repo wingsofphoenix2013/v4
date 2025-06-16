@@ -290,7 +290,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
 
     try:
         await infra.redis_client.xadd("positions_open_stream", payload)
-        log.info(f"📬 Позиция создана и отправлена в Redis: {position_uid}")
+        log.debug(f"📬 Позиция создана и отправлена в Redis: {position_uid}")
     except Exception:
         log.exception("❌ Ошибка отправки позиции в Redis")
 

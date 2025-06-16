@@ -111,7 +111,7 @@ async def _process_sl_for_position(position, price: Decimal):
         pnl = pnl.quantize(Decimal("1.00"))
         position.pnl += pnl
 
-        log.info(f"💀 Позиция закрыта по SL {position.uid}: причина={reason}, цена={price}, pnl={pnl:+.2f}")
+        log.debug(f"💀 Позиция закрыта по SL {position.uid}: причина={reason}, цена={price}, pnl={pnl:+.2f}")
 
         # 🔸 Финализировать закрытие через централизованную функцию
         await _finalize_position_close(position, price, reason)
@@ -128,7 +128,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         tp.hit = True
         tp.hit_at = now
 
-        log.info(f"📍 TP-{tp.level} отмечен как выполненный для {position.uid} (цель: {tp.price}, исполнение: {price})")
+        log.debug(f"📍 TP-{tp.level} отмечен как выполненный для {position.uid} (цель: {tp.price}, исполнение: {price})")
 
         # 🔸 Обновление позиции
         precision_qty = config.tickers[position.symbol]["precision_qty"]
@@ -259,6 +259,66 @@ async def _finalize_position_close(position, exit_price: Decimal, reason: str):
 
     await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
     log.debug(f"📤 Событие closed отправлено в positions_update_stream для {position.uid}")
+# 🔸 Закрытие позиции по SL-защите (protect)
+async def full_protect_stop(position):
+    async with position.lock:
+        # Отмена всех целей TP и SL
+        for t in position.tp_targets + position.sl_targets:
+            if not t.hit and not t.canceled:
+                t.canceled = True
+
+        # Получение текущей цены
+        price = await get_price(position.symbol)
+        if price is None:
+            log.warning(f"❌ PROTECT: цена не получена для {position.symbol}, остановка невозможна")
+            return
+
+        now = datetime.utcnow()
+
+        # Закрытие позиции и установка финальных атрибутов
+        position.status = "closed"
+        position.closed_at = now
+        position.exit_price = price
+        position.close_reason = "sl-protect-stop"
+
+        # Расчёт и фиксация PnL
+        qty = position.quantity_left
+        entry = position.entry_price
+
+        if position.direction == "long":
+            pnl = (price - entry) * qty
+        else:
+            pnl = (entry - price) * qty
+
+        position.pnl += pnl.quantize(Decimal("1.00"))
+
+        # Обнуление остатка и риска
+        position.quantity_left = Decimal("0")
+        position.planned_risk = Decimal("0")
+
+        # Подготовка события для core_io
+        event_data = {
+            "event_type": "closed",
+            "position_uid": str(position.uid),
+            "strategy_id": position.strategy_id,
+            "symbol": position.symbol,
+            "exit_price": str(price),
+            "pnl": str(position.pnl),
+            "close_reason": "sl-protect-stop",
+            "quantity_left": "0",
+            "planned_risk": "0",
+            "note": "позиция закрыта через SL-protect",
+            "sl_targets": json.dumps(
+                [asdict(sl) for sl in position.sl_targets],
+                default=str
+            )
+        }
+
+        await infra.redis_client.xadd("positions_update_stream", {
+            "data": json.dumps(event_data)
+        })
+
+        log.debug(f"🔒 PROTECT: позиция {position.uid} закрыта через SL-protect")
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:

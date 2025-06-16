@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from datetime import datetime
-from infra import infra
+from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry
+from position_handler import Target, full_protect_stop
 
 # 🔸 Логгер маршрутизатора сигналов
 log = logging.getLogger("SIGNAL_PROCESSOR")
@@ -62,7 +63,6 @@ async def process_signal(data: dict):
                     "открытие запрещено, реверсы отключены"
                 )
             else:
-                # Пока не реализовано, логировать отдельно позже
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "открытие запрещено, запуск реверса (не реализовано)"
@@ -75,7 +75,7 @@ async def process_signal(data: dict):
                     strategy_id, symbol, direction, log_uid,
                     "тикер не разрешён для этой стратегии"
                 )
-                
+
         # 🔸 Проверка позиции
         position = position_registry.get((strategy_id, symbol))
         if position:
@@ -84,22 +84,67 @@ async def process_signal(data: dict):
                     strategy_id, symbol, direction, log_uid,
                     "повтор сигнала в ту же сторону"
                 )
+
             if not strategy.get("reverse", False) and not strategy.get("sl_protect", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "реверс и SL защита отключены"
                 )
-            if not strategy.get("reverse", False) and strategy.get("sl_protect", False):
-                return await route_ignore(
-                    strategy_id, symbol, direction, log_uid,
-                    "маршрут protect не реализован"
-                )
+
+            if not strategy.get("reverse", False) and strategy.get("sl_protect", True):
+                price = await get_price(symbol)
+                if price is None:
+                    log.warning(f"⚠️ PROTECT: нет цены для {symbol}, сигнал пропущен")
+                    return
+
+                if price <= position.entry_price:
+                    await full_protect_stop(position)
+                    await route_protect(
+                        strategy_id, symbol, log_uid,
+                        "позиция закрыта через SL-protect",
+                        position.uid
+                    )
+                else:
+                    sl = next((
+                        s for s in position.sl_targets
+                        if not s.hit and not s.canceled and s.price is not None
+                    ), None)
+
+                    if sl and sl.price < position.entry_price:
+                        sl.canceled = True
+
+                        new_sl = Target(
+                            type="sl",
+                            level=1,
+                            price=position.entry_price,
+                            quantity=sl.quantity,
+                            hit=False,
+                            hit_at=None,
+                            canceled=False
+                        )
+                        position.sl_targets.append(new_sl)
+                        log.info(f"🛡️ PROTECT: SL обновлён до цены входа {position.entry_price} для {position.uid}")
+
+                        await route_protect(
+                            strategy_id, symbol, log_uid,
+                            "обновлён SL до уровня entry",
+                            position.uid
+                        )
+                    elif sl:
+                        log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} ≥ {position.entry_price}), пропущено")
+
+                        await route_protect(
+                            strategy_id, symbol, log_uid,
+                            "действий по SL-protect нет, уровень SL выше цены входа",
+                            position.uid
+                        )
+                return
+
             if strategy.get("reverse", False) and strategy.get("sl_protect", False):
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "маршрут reverse не реализован"
                 )
-                
         # 🔸 Обработка new_entry — стратегия готова к вызову
         modname = strategy.get("module_name", f"strategy_{strategy_id}")
         strategy_instance = strategy_registry.get(modname)
@@ -116,10 +161,11 @@ async def process_signal(data: dict):
         if result is True:
             await strategy_instance.run(data, context)
             return
-            
+
         elif isinstance(result, tuple) and result[0] == "ignore":
             note = result[1]
             return await route_ignore(strategy_id, symbol, direction, log_uid, note)
+
         else:
             return await route_ignore(
                 strategy_id, symbol, direction, log_uid,
@@ -128,7 +174,6 @@ async def process_signal(data: dict):
 
     except Exception:
         log.exception("❌ Ошибка обработки сигнала")
-
 # 🔸 Маршрут ignore: логируем отказ
 async def route_ignore(strategy_id, symbol, direction, log_uid, reason: str):
     log.debug(f"⚠️ [IGNORE] {symbol} (strategy {strategy_id}, {direction}): {reason}")
@@ -146,3 +191,17 @@ async def route_ignore(strategy_id, symbol, direction, log_uid, reason: str):
         await infra.redis_client.xadd("signal_log_queue", record)
     except Exception:
         log.exception("❌ Ошибка при записи ignore-лога в Redis")
+# 🔸 Логирование действия маршрута SL-protect
+async def route_protect(strategy_id, symbol, log_uid, note, position_uid):
+    record = {
+        "log_uid": log_uid,
+        "strategy_id": str(strategy_id),
+        "status": "protect",
+        "note": note,
+        "position_uid": str(position_uid),
+        "logged_at": datetime.utcnow().isoformat()
+    }
+    try:
+        await infra.redis_client.xadd("signal_log_queue", record)
+    except Exception:
+        log.exception("❌ Ошибка при логировании protect в signal_log_queue")
