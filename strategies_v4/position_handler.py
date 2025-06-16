@@ -83,34 +83,39 @@ async def _process_sl_for_position(position, price: Decimal):
 
     async with position.lock:
         now = datetime.utcnow()
+
+        # 🔸 Обновить SL-цель как исполненную
         active_sl.hit = True
         active_sl.hit_at = now
 
-        # Определение типа SL
+        # 🔸 Определить тип SL
         is_original_sl = active_sl.quantity == position.quantity
         reason = "full-sl-hit" if is_original_sl else "sl-tp-hit"
 
-        # Отмена оставшихся TP
+        # 🔸 Отменить все неисполненные TP
         for tp in position.tp_targets:
             if not tp.hit and not tp.canceled:
                 tp.canceled = True
                 log.info(f"🛑 TP отменён (SL-hit): {position.uid} (TP-{tp.level})")
 
-        # Расчёт PnL на основе остатка
-        qty = position.quantity_left  # ❗ исправлено
+        # 🔸 Расчёт PnL по текущему остатку
+        qty = position.quantity_left
         entry = position.entry_price
+
         if position.direction == "long":
             pnl = (price - entry) * qty
         else:
             pnl = (entry - price) * qty
-        pnl = pnl.quantize(Decimal("1.00"))
 
+        pnl = pnl.quantize(Decimal("1.00"))
         position.pnl += pnl
+
         log.info(f"💀 Позиция закрыта по SL {position.uid}: причина={reason}, цена={price}, pnl={pnl:+.2f}")
 
-        # Обнуление и финализация состояния
+        # 🔸 Обнуление состояния
         precision_qty = config.tickers[position.symbol]["precision_qty"]
         quantize_mask = Decimal("1").scaleb(-precision_qty)
+
         position.quantity_left = Decimal("0").quantize(quantize_mask)
         position.planned_risk = Decimal("0")
         position.status = "closed"
@@ -118,7 +123,7 @@ async def _process_sl_for_position(position, price: Decimal):
         position.exit_price = price
         position.closed_at = now
 
-        # Публикация события
+        # 🔸 Подготовка события
         event_data = {
             "event_type": "closed",
             "position_uid": str(position.uid),
@@ -128,8 +133,13 @@ async def _process_sl_for_position(position, price: Decimal):
             "pnl": str(position.pnl),
             "close_reason": reason,
             "note": f"позиция закрыта по {reason} по цене {price}",
-            "quantity_left": str(position.quantity_left)  # 🔒 обязательно включить
+            "quantity_left": str(position.quantity_left),
         }
+
+        # 🔸 Включаем полную информацию о SL-целях (включая hit=True)
+        event_data["sl_targets"] = json.dumps(
+            [asdict(sl) for sl in position.sl_targets], default=str
+        )
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
         log.info(f"📤 Событие SL-closed отправлено в positions_update_stream для {position.uid}")

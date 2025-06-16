@@ -314,7 +314,26 @@ async def _handle_position_update_event(event: dict):
                     WHERE position_uid = $1 AND type = 'sl' AND hit = FALSE AND canceled = FALSE
                 """, event["position_uid"])
 
-                # 3. Лог закрытия
+                # 3. Обновление SL-целей с hit=True (если передано)
+                if "sl_targets" in event:
+                    targets = json.loads(event["sl_targets"])
+                    for sl in targets:
+                        if sl["type"] == "sl" and sl.get("hit") is True:
+                            hit_at = (
+                                datetime.fromisoformat(sl["hit_at"])
+                                if sl.get("hit_at") else datetime.utcnow()
+                            )
+                            await conn.execute("""
+                                UPDATE position_targets_v4
+                                SET hit = TRUE, hit_at = $1
+                                WHERE position_uid = $2 AND type = 'sl' AND price = $3 AND quantity = $4
+                            """,
+                                hit_at,
+                                event["position_uid"],
+                                Decimal(sl["price"]),
+                                Decimal(sl["quantity"])
+                            )
+                # 4. Лог закрытия
                 await conn.execute("""
                     INSERT INTO positions_log_v4 (
                         position_uid,
