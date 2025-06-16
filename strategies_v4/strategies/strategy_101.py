@@ -12,40 +12,26 @@ class Strategy101:
         symbol = signal["symbol"]
         direction = signal["direction"]
 
-        log.debug(f"⚙️ [Strategy101] Валидация сигнала: symbol={symbol}, direction={direction}")
-
-        redis = context.get("redis")
-        try:
-            timeframe = "m5"
-            indicators = await load_indicators(symbol, ["rsi14", "mfi14"], timeframe)
-            price_raw = await redis.get(f"price:{symbol}")
-            if price_raw is None:
-                return ("ignore", "отклонено: отсутствует цена")
-
-            rsi = indicators.get("rsi14")
-            mfi = indicators.get("mfi14")
-            if None in [rsi, mfi]:
-                return ("ignore", "отклонено: недостаточно данных индикаторов")
-
-            rsi = float(rsi)
-            mfi = float(mfi)
-
-            if direction == "long":
-                if rsi >= 25:
-                    return ("ignore", f"отклонено: RSI14 >= 25 (rsi={rsi})")
-                if mfi >= 15:
-                    return ("ignore", f"отклонено: MFI14 >= 15 (mfi={mfi})")
-            elif direction == "short":
-                if rsi <= 75:
-                    return ("ignore", f"отклонено: RSI14 <= 75 (rsi={rsi})")
-                if mfi <= 85:
-                    return ("ignore", f"отклонено: MFI14 <= 85 (mfi={mfi})")
-
-        except Exception as e:
-            return ("ignore", f"ошибка при валидации фильтров: {e}")
-
+        log.debug(f"⚙️ [Strategy101] Транзитная стратегия: сигнал принят без проверки: symbol={symbol}, direction={direction}")
         return True
 
-    # 🔸 Запуск стратегии (будет реализовано позже)
+    # 🔸 Запуск стратегии (отправка команды на открытие позиции)
     async def run(self, signal, context):
-        log.debug(f"🚀 [Strategy101] Запуск стратегии на сигнале: {signal['symbol']} {signal['direction']}")
+        log.debug(f"🚀 [Strategy101] run() вызван для {signal['symbol']}")
+
+        redis = context.get("redis")
+
+        payload = {
+            "strategy_id": str(signal["strategy_id"]),
+            "symbol": signal["symbol"],
+            "direction": signal["direction"],
+            "log_uid": signal["log_uid"],
+            "route": "new_entry",
+            "received_at": signal.get("received_at")     
+        }
+
+        try:
+            await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
+            log.debug(f"📤 [Strategy101] Сигнал отправлен в strategy_opener_stream: {payload}")
+        except Exception as e:
+            log.warning(f"⚠️ Ошибка отправки сигнала в strategy_opener_stream: {e}")

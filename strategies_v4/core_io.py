@@ -229,7 +229,7 @@ async def _handle_open_position(data: dict):
         int((logged_at - received_at_dt).total_seconds() * 1000)
     )
 
-    log.debug(f"✅ Позиция {position_uid} записана в БД")
+    log.info(f"✅ Позиция {position_uid} записана в БД")
 # 🔸 Обработка события позиции
 async def _handle_position_update_event(event: dict):
     if event.get("event_type") == "tp_hit":
@@ -287,7 +287,7 @@ async def _handle_position_update_event(event: dict):
                      event["note"],
                      datetime.utcnow())
 
-        log.info(f"📝 Событие tp_hit обработано и записано для {event['position_uid']}")
+        log.debug(f"📝 Событие tp_hit обработано и записано для {event['position_uid']}")
         
     elif event.get("event_type") == "closed":
         async with infra.pg_pool.acquire() as conn:

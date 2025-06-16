@@ -54,15 +54,15 @@ async def _process_tp_for_position(position, price: Decimal):
     for tp in sorted(position.tp_targets, key=lambda t: t.level):
         if not tp.hit and not tp.canceled:
             if tp.price is None:
-                log.info(f"⏸️ TP-{tp.level} активен без цены — ожидание: {position.uid}")
+                log.debug(f"⏸️ TP-{tp.level} активен без цены — ожидание: {position.uid}")
                 return
 
             if position.direction == "long" and price >= tp.price:
-                log.info(f"✅ TP-{tp.level} достигнут (long) {position.symbol}: цена {price} ≥ {tp.price}")
+                log.debug(f"✅ TP-{tp.level} достигнут (long) {position.symbol}: цена {price} ≥ {tp.price}")
                 await _handle_tp_hit(position, tp, price)
 
             elif position.direction == "short" and price <= tp.price:
-                log.info(f"✅ TP-{tp.level} достигнут (short) {position.symbol}: цена {price} ≤ {tp.price}")
+                log.debug(f"✅ TP-{tp.level} достигнут (short) {position.symbol}: цена {price} ≤ {tp.price}")
                 await _handle_tp_hit(position, tp, price)
 
             break  # проверяем только один TP
@@ -97,7 +97,7 @@ async def _process_sl_for_position(position, price: Decimal):
         for tp in position.tp_targets:
             if not tp.hit and not tp.canceled:
                 tp.canceled = True
-                log.info(f"🛑 TP отменён (SL-hit): {position.uid} (TP-{tp.level})")
+                log.debug(f"🛑 TP отменён (SL-hit): {position.uid} (TP-{tp.level})")
 
         # 🔸 Расчёт PnL по текущему остатку
         qty = position.quantity_left
@@ -146,7 +146,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
         pnl_delta = pnl_delta.quantize(Decimal("1.00"))
         position.pnl += pnl_delta
 
-        log.info(f"💰 Обновление позиции {position.uid}: закрыто {closed_qty}, PnL = {pnl_delta:+.2f}")
+        log.debug(f"💰 Обновление позиции {position.uid}: закрыто {closed_qty}, PnL = {pnl_delta:+.2f}")
 
         # 🔸 Обновление SL по политике
         sl_policy = next(
@@ -155,20 +155,20 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             None
         )
 
-        log.info(f"📐 SL-политика для TP-{tp.level}: {sl_policy}")
+        log.debug(f"📐 SL-политика для TP-{tp.level}: {sl_policy}")
         new_sl_price = None
 
         if sl_policy and sl_policy["sl_mode"] != "none":
             for sl in position.sl_targets:
                 if not sl.hit and not sl.canceled:
                     sl.canceled = True
-                    log.info(f"🛑 SL отменён для {position.uid} (цель: {sl.price})")
+                    log.debug(f"🛑 SL отменён для {position.uid} (цель: {sl.price})")
 
             sl_mode = sl_policy["sl_mode"]
 
             if sl_mode == "entry":
                 new_sl_price = position.entry_price
-                log.info(f"🧮 SL-режим entry → цена = {new_sl_price}")
+                log.debug(f"🧮 SL-режим entry → цена = {new_sl_price}")
 
             elif sl_mode == "percent":
                 sl_value = Decimal(str(sl_policy["sl_value"]))
@@ -177,7 +177,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                     position.entry_price - delta if position.direction == "long"
                     else position.entry_price + delta
                 )
-                log.info(f"🧮 SL-режим percent → delta = {delta}, цена = {new_sl_price}")
+                log.debug(f"🧮 SL-режим percent → delta = {delta}, цена = {new_sl_price}")
 
             else:
                 log.warning(f"⚠️ SL-режим {sl_mode} не поддерживается")
@@ -193,7 +193,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
                 canceled=False
             )
             position.sl_targets.append(new_sl)
-            log.info(f"🛡️ SL установлен: {new_sl_price} для {position.uid}, объём: {position.quantity_left}")
+            log.debug(f"🛡️ SL установлен: {new_sl_price} для {position.uid}, объём: {position.quantity_left}")
 
         # 🔸 Подготовка события TP
         note = format_tp_hit_note(tp.level, price, pnl_delta)
@@ -216,7 +216,7 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             event_data["new_sl_quantity"] = str(position.quantity_left)
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-        log.info(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
+        log.debug(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
 
         # 🔸 Финализация позиции, если она полностью закрыта
         if position.quantity_left == 0:
@@ -258,7 +258,7 @@ async def _finalize_position_close(position, exit_price: Decimal, reason: str):
         )
 
     await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-    log.info(f"📤 Событие closed отправлено в positions_update_stream для {position.uid}")
+    log.debug(f"📤 Событие closed отправлено в positions_update_stream для {position.uid}")
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:

@@ -257,7 +257,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
     position_registry[(state.strategy_id, state.symbol)] = state
 
     # 🔸 Логирование полной информации о позиции
-    log.info(
+    log.debug(
         f"🧾 Позиция создана в памяти: {state.uid} | "
         f"strategy={state.strategy_id}, symbol={state.symbol}, side={state.direction}, "
         f"entry={state.entry_price}, qty={state.quantity}, "
