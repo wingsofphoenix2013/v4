@@ -130,11 +130,12 @@ async def _process_sl_for_position(position, price: Decimal):
             "position_uid": str(position.uid),
             "strategy_id": position.strategy_id,
             "symbol": position.symbol,
-            "exit_price": str(price),
+            "exit_price": str(position.exit_price),
             "pnl": str(position.pnl),
-            "close_reason": reason,
-            "note": f"позиция закрыта по {reason} по цене {price}",
+            "close_reason": position.close_reason,
+            "note": f"позиция закрыта по {position.close_reason} по цене {position.exit_price}",
             "quantity_left": str(position.quantity_left),
+            "planned_risk": str(position.planned_risk),  # 🔒 теперь включено
         }
 
         # 🔸 Включаем полную информацию о SL-целях (включая hit=True)

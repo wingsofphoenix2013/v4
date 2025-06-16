@@ -288,11 +288,11 @@ async def _handle_position_update_event(event: dict):
                      datetime.utcnow())
 
         log.info(f"📝 Событие tp_hit обработано и записано для {event['position_uid']}")
-
+        
     elif event.get("event_type") == "closed":
         async with infra.pg_pool.acquire() as conn:
             async with conn.transaction():
-                # 1. Обновление позиции
+                # 1. Обновление позиции с полями quantity_left и planned_risk
                 await conn.execute("""
                     UPDATE positions_v4
                     SET
@@ -300,12 +300,18 @@ async def _handle_position_update_event(event: dict):
                         exit_price = $1,
                         closed_at = NOW(),
                         close_reason = $2,
-                        pnl = $3
-                    WHERE position_uid = $4
-                """, Decimal(event["exit_price"]),
-                     event["close_reason"],
-                     Decimal(event["pnl"]),
-                     event["position_uid"])
+                        pnl = $3,
+                        quantity_left = $4,
+                        planned_risk = $5
+                    WHERE position_uid = $6
+                """,
+                    Decimal(event["exit_price"]),
+                    event["close_reason"],
+                    Decimal(event["pnl"]),
+                    Decimal(event["quantity_left"]),
+                    Decimal(event["planned_risk"]),
+                    event["position_uid"]
+                )
 
                 # 2. Отмена всех SL-целей (если остались)
                 await conn.execute("""
@@ -333,6 +339,7 @@ async def _handle_position_update_event(event: dict):
                                 Decimal(sl["price"]),
                                 Decimal(sl["quantity"])
                             )
+
                 # 4. Лог закрытия
                 await conn.execute("""
                     INSERT INTO positions_log_v4 (
@@ -350,9 +357,6 @@ async def _handle_position_update_event(event: dict):
                      datetime.utcnow())
 
         log.info(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
-
-    else:
-        log.warning(f"⚠️ Неизвестный тип события: {event.get('event_type')}")
 # 🔸 Воркер: обработка событий из positions_update_stream
 async def run_position_update_writer():
     stream_name = "positions_update_stream"
