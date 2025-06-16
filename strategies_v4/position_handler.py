@@ -5,6 +5,7 @@ import asyncio
 import logging
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
+from dataclasses import asdict
 
 from infra import infra, get_price
 from config_loader import config
