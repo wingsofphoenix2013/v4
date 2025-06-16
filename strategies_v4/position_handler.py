@@ -76,12 +76,10 @@ async def _process_sl_for_position(position, price: Decimal):
     if not active_sl:
         return
 
-    if position.direction == "long" and price <= active_sl.price:
-        log.info(f"⛔ SL достигнут (long) {position.symbol}: цена {price} ≤ {active_sl.price}")
-    elif position.direction == "short" and price >= active_sl.price:
-        log.info(f"⛔ SL достигнут (short) {position.symbol}: цена {price} ≥ {active_sl.price}")
-    else:
-        return  # SL не достигнут
+    if position.direction == "long" and price > active_sl.price:
+        return
+    if position.direction == "short" and price < active_sl.price:
+        return
 
     async with position.lock:
         now = datetime.utcnow()
@@ -92,13 +90,25 @@ async def _process_sl_for_position(position, price: Decimal):
         is_original_sl = active_sl.quantity == position.quantity
         reason = "full-sl-hit" if is_original_sl else "sl-tp-hit"
 
-        canceled_tp_count = 0
+        # Отмена оставшихся TP
         for tp in position.tp_targets:
             if not tp.hit and not tp.canceled:
                 tp.canceled = True
-                canceled_tp_count += 1
                 log.info(f"🛑 TP отменён (SL-hit): {position.uid} (TP-{tp.level})")
 
+        # Расчёт PnL на основе остатка
+        qty = position.quantity_left  # ❗ исправлено
+        entry = position.entry_price
+        if position.direction == "long":
+            pnl = (price - entry) * qty
+        else:
+            pnl = (entry - price) * qty
+        pnl = pnl.quantize(Decimal("1.00"))
+
+        position.pnl += pnl
+        log.info(f"💀 Позиция закрыта по SL {position.uid}: причина={reason}, цена={price}, pnl={pnl:+.2f}")
+
+        # Обнуление и финализация состояния
         precision_qty = config.tickers[position.symbol]["precision_qty"]
         quantize_mask = Decimal("1").scaleb(-precision_qty)
         position.quantity_left = Decimal("0").quantize(quantize_mask)
@@ -108,20 +118,7 @@ async def _process_sl_for_position(position, price: Decimal):
         position.exit_price = price
         position.closed_at = now
 
-        entry = position.entry_price
-        qty = position.quantity
-
-        if position.direction == "long":
-            pnl = (price - entry) * qty
-        else:
-            pnl = (entry - price) * qty
-
-        pnl = pnl.quantize(Decimal("1.00"))
-        position.pnl += pnl
-
-        log.info(f"💀 Позиция закрыта по SL {position.uid}: причина={reason}, цена={price}, pnl={pnl:+.2f}")
-
-        # 🔸 Событие закрытия
+        # Публикация события
         event_data = {
             "event_type": "closed",
             "position_uid": str(position.uid),
@@ -130,7 +127,8 @@ async def _process_sl_for_position(position, price: Decimal):
             "exit_price": str(price),
             "pnl": str(position.pnl),
             "close_reason": reason,
-            "note": f"позиция закрыта по {reason} по цене {price}"
+            "note": f"позиция закрыта по {reason} по цене {price}",
+            "quantity_left": str(position.quantity_left)  # 🔒 обязательно включить
         }
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
