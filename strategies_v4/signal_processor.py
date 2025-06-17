@@ -3,10 +3,13 @@
 import asyncio
 import logging
 from datetime import datetime
+from decimal import Decimal
+
 from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry
 from position_handler import Target, full_protect_stop
+
 
 # 🔸 Логгер маршрутизатора сигналов
 log = logging.getLogger("SIGNAL_PROCESSOR")
