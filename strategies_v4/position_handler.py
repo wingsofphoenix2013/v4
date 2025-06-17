@@ -312,6 +312,10 @@ async def full_protect_stop(position):
             "sl_targets": json.dumps(
                 [asdict(sl) for sl in position.sl_targets],
                 default=str
+            ),
+            "tp_targets": json.dumps(
+                [asdict(tp) for tp in position.tp_targets],
+                default=str
             )
         }
 

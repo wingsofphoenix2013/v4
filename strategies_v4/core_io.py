@@ -340,7 +340,18 @@ async def _handle_position_update_event(event: dict):
                                 Decimal(sl["quantity"])
                             )
 
-                # 4. Лог закрытия
+                # 4. Отмена всех TP-целей, если передано
+                if "tp_targets" in event:
+                    targets = json.loads(event["tp_targets"])
+                    for tp in targets:
+                        if tp["type"] == "tp" and not tp.get("hit", False):
+                            await conn.execute("""
+                                UPDATE position_targets_v4
+                                SET canceled = TRUE
+                                WHERE position_uid = $1 AND type = 'tp' AND level = $2
+                            """, event["position_uid"], tp["level"])
+
+                # 5. Лог закрытия
                 await conn.execute("""
                     INSERT INTO positions_log_v4 (
                         position_uid,
