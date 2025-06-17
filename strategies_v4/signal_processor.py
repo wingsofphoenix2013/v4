@@ -114,12 +114,7 @@ async def process_signal(data: dict):
                         position.uid
                     )
                 else:
-                    await apply_sl_replacement(position)
-                    await route_protect(
-                        strategy_id, symbol, log_uid,
-                        "обновлён SL до уровня entry",
-                        position.uid
-                    )
+                    await apply_sl_replacement(position, log_uid, strategy_id, symbol)
                 return
 
             if strategy.get("reverse", False) and strategy.get("sl_protection", False):

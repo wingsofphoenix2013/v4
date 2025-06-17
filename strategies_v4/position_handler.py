@@ -10,6 +10,7 @@ from dataclasses import asdict
 from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry, Target
+from signal_processor import route_protect
 
 log = logging.getLogger("POSITION_HANDLER")
 
@@ -331,7 +332,7 @@ async def full_protect_stop(position):
             del position_registry[key]
             log.debug(f"🧹 POSITION_REGISTRY: позиция удалена {key}")
 # 🔸 Замена SL на цену входа при SL-protect
-async def apply_sl_replacement(position):
+async def apply_sl_replacement(position, log_uid, strategy_id, symbol):
     async with position.lock:
         # Поиск активного SL
         sl = next((
@@ -351,6 +352,14 @@ async def apply_sl_replacement(position):
 
         if not sl_below_entry:
             log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} vs {entry}) — замена не требуется")
+
+            await route_protect(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                log_uid=log_uid,
+                note="действий по SL-protect нет, уровень SL выше цены входа",
+                position_uid=position.uid
+            )
             return
 
         # Отмена текущего SL
@@ -370,6 +379,14 @@ async def apply_sl_replacement(position):
         position.planned_risk = Decimal("0")
 
         log.info(f"🛡️ PROTECT: SL заменён на уровень входа {entry} для позиции {position.uid}")
+
+        await route_protect(
+            strategy_id=strategy_id,
+            symbol=symbol,
+            log_uid=log_uid,
+            note="обновлён SL до уровня entry",
+            position_uid=position.uid
+        )
 
         # Подготовка события для core_io
         event_data = {
