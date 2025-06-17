@@ -174,6 +174,25 @@ async def calculate_position_size(data: dict):
         return "skip", "final quantity below min_qty"
 
     log.debug(f"[STAGE 6] used_margin={used_margin} (threshold={margin_threshold}) — OK")
+
+    # === Этап 6.5: Проверка совокупного notional с учётом плеча ===
+    total_open_notional = sum(
+        p.notional_value for p in position_registry.values()
+        if p.strategy_id == strategy_id
+    )
+    candidate_notional = (entry_price * quantity).quantize(factor_price, rounding=ROUND_DOWN)
+    max_total_notional = deposit * leverage
+
+    if total_open_notional + candidate_notional > max_total_notional:
+        return "skip", (
+            f"total notional {total_open_notional + candidate_notional:.2f} "
+            f"exceeds max allowed {max_total_notional:.2f}"
+        )
+
+    log.debug(f"[STAGE 6.5] total_open_notional={total_open_notional}, "
+              f"candidate_notional={candidate_notional}, "
+              f"max_total_notional={max_total_notional} — OK")
+
     # === Этап 7: Формирование TP с quantity ===
     volume_percents = [Decimal(str(lvl["volume_percent"])) for lvl in strategy["tp_levels"]]
     quantities = []
