@@ -75,7 +75,6 @@ async def process_signal(data: dict):
                     strategy_id, symbol, direction, log_uid,
                     "тикер не разрешён для этой стратегии"
                 )
-
         # 🔸 Проверка позиции
         position = position_registry.get((strategy_id, symbol))
         if position:
@@ -97,7 +96,13 @@ async def process_signal(data: dict):
                     log.warning(f"⚠️ PROTECT: нет цены для {symbol}, сигнал пропущен")
                     return
 
-                if price <= position.entry_price:
+                entry = position.entry_price
+                price_is_worse = (
+                    price < entry if position.direction == "long"
+                    else price > entry
+                )
+
+                if price_is_worse:
                     await full_protect_stop(position)
                     await route_protect(
                         strategy_id, symbol, log_uid,
@@ -110,34 +115,40 @@ async def process_signal(data: dict):
                         if not s.hit and not s.canceled and s.price is not None
                     ), None)
 
-                    if sl and sl.price < position.entry_price:
-                        sl.canceled = True
-
-                        new_sl = Target(
-                            type="sl",
-                            level=1,
-                            price=position.entry_price,
-                            quantity=sl.quantity,
-                            hit=False,
-                            hit_at=None,
-                            canceled=False
+                    if sl:
+                        sl_below_entry = (
+                            sl.price < entry if position.direction == "long"
+                            else sl.price > entry
                         )
-                        position.sl_targets.append(new_sl)
-                        log.info(f"🛡️ PROTECT: SL обновлён до цены входа {position.entry_price} для {position.uid}")
 
-                        await route_protect(
-                            strategy_id, symbol, log_uid,
-                            "обновлён SL до уровня entry",
-                            position.uid
-                        )
-                    elif sl:
-                        log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} ≥ {position.entry_price}), пропущено")
+                        if sl_below_entry:
+                            sl.canceled = True
 
-                        await route_protect(
-                            strategy_id, symbol, log_uid,
-                            "действий по SL-protect нет, уровень SL выше цены входа",
-                            position.uid
-                        )
+                            new_sl = Target(
+                                type="sl",
+                                level=1,
+                                price=entry,
+                                quantity=sl.quantity,
+                                hit=False,
+                                hit_at=None,
+                                canceled=False
+                            )
+                            position.sl_targets.append(new_sl)
+                            log.info(f"🛡️ PROTECT: SL обновлён до цены входа {entry} для {position.uid}")
+
+                            await route_protect(
+                                strategy_id, symbol, log_uid,
+                                "обновлён SL до уровня entry",
+                                position.uid
+                            )
+                        else:
+                            log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} ≥ {entry}), пропущено")
+
+                            await route_protect(
+                                strategy_id, symbol, log_uid,
+                                "действий по SL-protect нет, уровень SL выше цены входа",
+                                position.uid
+                            )
                 return
 
             if strategy.get("reverse", False) and strategy.get("sl_protection", False):
