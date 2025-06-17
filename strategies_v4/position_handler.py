@@ -10,7 +10,7 @@ from dataclasses import asdict
 from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry, Target
-from signal_processor import route_protect
+from log_helpers import route_protect
 
 log = logging.getLogger("POSITION_HANDLER")
 

@@ -10,6 +10,7 @@ from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry
 from position_handler import Target, full_protect_stop, apply_sl_replacement
+from log_helpers import route_protect
 
 
 # 🔸 Логгер маршрутизатора сигналов
