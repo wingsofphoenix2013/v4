@@ -324,6 +324,65 @@ async def full_protect_stop(position):
         })
 
         log.debug(f"🔒 PROTECT: позиция {position.uid} закрыта через SL-protect")
+# 🔸 Замена SL на цену входа при SL-protect
+async def apply_sl_replacement(position):
+    async with position.lock:
+        # Поиск активного SL
+        sl = next((
+            s for s in position.sl_targets
+            if not s.hit and not s.canceled and s.price is not None
+        ), None)
+
+        if not sl:
+            log.warning(f"⚠️ PROTECT: не найден активный SL для позиции {position.uid}")
+            return
+
+        entry = position.entry_price
+        sl_below_entry = (
+            sl.price < entry if position.direction == "long"
+            else sl.price > entry
+        )
+
+        if not sl_below_entry:
+            log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} vs {entry}) — замена не требуется")
+            return
+
+        # Отмена текущего SL
+        sl.canceled = True
+
+        # Создание нового SL на уровне entry
+        new_sl = Target(
+            type="sl",
+            level=1,
+            price=entry,
+            quantity=sl.quantity,
+            hit=False,
+            hit_at=None,
+            canceled=False
+        )
+        position.sl_targets.append(new_sl)
+        position.planned_risk = Decimal("0")
+
+        log.info(f"🛡️ PROTECT: SL заменён на уровень входа {entry} для позиции {position.uid}")
+
+        # Подготовка события для core_io
+        event_data = {
+            "event_type": "sl_replaced",
+            "position_uid": str(position.uid),
+            "strategy_id": position.strategy_id,
+            "symbol": position.symbol,
+            "note": "SL переставлен на уровень entry",
+            "planned_risk": "0",
+            "sl_targets": json.dumps(
+                [asdict(sl) for sl in position.sl_targets],
+                default=str
+            ),
+            "logged_at": datetime.utcnow().isoformat()
+        }
+
+        await infra.redis_client.xadd("positions_update_stream", {
+            "data": json.dumps(event_data)
+        })
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:

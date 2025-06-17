@@ -9,7 +9,7 @@ from decimal import Decimal
 from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry
-from position_handler import Target, full_protect_stop
+from position_handler import Target, full_protect_stop, apply_sl_replacement
 
 
 # 🔸 Логгер маршрутизатора сигналов
@@ -114,50 +114,12 @@ async def process_signal(data: dict):
                         position.uid
                     )
                 else:
-                    sl = next((
-                        s for s in position.sl_targets
-                        if not s.hit and not s.canceled and s.price is not None
-                    ), None)
-
-                    if sl:
-                        sl_below_entry = (
-                            sl.price < entry if position.direction == "long"
-                            else sl.price > entry
-                        )
-
-                        if sl_below_entry:
-                            sl.canceled = True
-
-                            new_sl = Target(
-                                type="sl",
-                                level=1,
-                                price=entry,
-                                quantity=sl.quantity,
-                                hit=False,
-                                hit_at=None,
-                                canceled=False
-                            )
-                            position.sl_targets.append(new_sl)
-
-                            # Обнуление риска — SL стоит на входе
-                            position.planned_risk = Decimal("0")
-
-                            log.info(f"🛡️ PROTECT: SL обновлён до цены входа {entry} для {position.uid}")
-
-                            await route_protect(
-                                strategy_id, symbol, log_uid,
-                                "обновлён SL до уровня entry",
-                                position.uid,
-                                sl_targets=position.sl_targets
-                            )
-                        else:
-                            log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} ≥ {entry}), пропущено")
-
-                            await route_protect(
-                                strategy_id, symbol, log_uid,
-                                "действий по SL-protect нет, уровень SL выше цены входа",
-                                position.uid
-                            )
+                    await apply_sl_replacement(position)
+                    await route_protect(
+                        strategy_id, symbol, log_uid,
+                        "обновлён SL до уровня entry",
+                        position.uid
+                    )
                 return
 
             if strategy.get("reverse", False) and strategy.get("sl_protection", False):

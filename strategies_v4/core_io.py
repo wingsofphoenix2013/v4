@@ -368,6 +368,60 @@ async def _handle_position_update_event(event: dict):
                      datetime.utcnow())
 
         log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
+        
+    elif event.get("event_type") == "sl_replaced":
+        async with infra.pg_pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Отмена всех активных SL
+                await conn.execute("""
+                    UPDATE position_targets_v4
+                    SET canceled = TRUE
+                    WHERE position_uid = $1 AND type = 'sl' AND hit = FALSE AND canceled = FALSE
+                """, event["position_uid"])
+
+                # 2. Добавление нового SL (если передан)
+                if "sl_targets" in event:
+                    targets = json.loads(event["sl_targets"])
+                    for sl in targets:
+                        if sl["type"] == "sl" and not sl.get("hit", False):
+                            await conn.execute("""
+                                INSERT INTO position_targets_v4 (
+                                    position_uid, type, level, price, quantity,
+                                    hit, hit_at, canceled
+                                ) VALUES ($1, 'sl', $2, $3, $4, FALSE, NULL, FALSE)
+                            """,
+                                event["position_uid"],
+                                sl["level"],
+                                Decimal(sl["price"]),
+                                Decimal(sl["quantity"])
+                            )
+
+                # 3. Обновление planned_risk
+                await conn.execute("""
+                    UPDATE positions_v4
+                    SET planned_risk = $1
+                    WHERE position_uid = $2
+                """, Decimal(event["planned_risk"]), event["position_uid"])
+
+                # 4. Лог события
+                await conn.execute("""
+                    INSERT INTO positions_log_v4 (
+                        position_uid,
+                        strategy_id,
+                        symbol,
+                        event_type,
+                        note,
+                        logged_at
+                    ) VALUES ($1, $2, $3, 'sl_replaced', $4, $5)
+                """,
+                    event["position_uid"],
+                    event["strategy_id"],
+                    event["symbol"],
+                    event["note"],
+                    datetime.utcnow())
+
+        log.debug(f"📝 Событие sl_replaced записано для {event['position_uid']}")
+        
 # 🔸 Воркер: обработка событий из positions_update_stream
 async def run_position_update_writer():
     stream_name = "positions_update_stream"
