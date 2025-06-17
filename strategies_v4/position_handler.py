@@ -324,6 +324,12 @@ async def full_protect_stop(position):
         })
 
         log.debug(f"🔒 PROTECT: позиция {position.uid} закрыта через SL-protect")
+
+        # Удаление позиции из памяти
+        key = (position.strategy_id, position.symbol)
+        if key in position_registry:
+            del position_registry[key]
+            log.debug(f"🧹 POSITION_REGISTRY: позиция удалена {key}")
 # 🔸 Замена SL на цену входа при SL-protect
 async def apply_sl_replacement(position):
     async with position.lock:
