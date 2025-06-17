@@ -134,12 +134,17 @@ async def process_signal(data: dict):
                                 canceled=False
                             )
                             position.sl_targets.append(new_sl)
+
+                            # Обнуление риска — SL стоит на входе
+                            position.planned_risk = Decimal("0")
+
                             log.info(f"🛡️ PROTECT: SL обновлён до цены входа {entry} для {position.uid}")
 
                             await route_protect(
                                 strategy_id, symbol, log_uid,
                                 "обновлён SL до уровня entry",
-                                position.uid
+                                position.uid,
+                                sl_targets=position.sl_targets
                             )
                         else:
                             log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} ≥ {entry}), пропущено")
@@ -203,7 +208,7 @@ async def route_ignore(strategy_id, symbol, direction, log_uid, reason: str):
     except Exception:
         log.exception("❌ Ошибка при записи ignore-лога в Redis")
 # 🔸 Логирование действия маршрута SL-protect
-async def route_protect(strategy_id, symbol, log_uid, note, position_uid):
+async def route_protect(strategy_id, symbol, log_uid, note, position_uid, sl_targets=None):
     record = {
         "log_uid": log_uid,
         "strategy_id": str(strategy_id),
@@ -212,6 +217,10 @@ async def route_protect(strategy_id, symbol, log_uid, note, position_uid):
         "position_uid": str(position_uid),
         "logged_at": datetime.utcnow().isoformat()
     }
+
+    if sl_targets:
+        record["sl_targets"] = json.dumps(sl_targets, default=str)
+
     try:
         await infra.redis_client.xadd("signal_log_queue", record)
     except Exception:
