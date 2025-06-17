@@ -379,11 +379,15 @@ async def _handle_position_update_event(event: dict):
                     WHERE position_uid = $1 AND type = 'sl' AND hit = FALSE AND canceled = FALSE
                 """, event["position_uid"])
 
-                # 2. Добавление нового SL (если передан)
+                # 2. Добавление нового SL (если передан и не отменён)
                 if "sl_targets" in event:
                     targets = json.loads(event["sl_targets"])
                     for sl in targets:
-                        if sl["type"] == "sl" and not sl.get("hit", False):
+                        if (
+                            sl["type"] == "sl"
+                            and not sl.get("hit", False)
+                            and not sl.get("canceled", False)
+                        ):
                             await conn.execute("""
                                 INSERT INTO position_targets_v4 (
                                     position_uid, type, level, price, quantity,
@@ -421,7 +425,7 @@ async def _handle_position_update_event(event: dict):
                     datetime.utcnow())
 
         log.debug(f"📝 Событие sl_replaced записано для {event['position_uid']}")
-        
+                
 # 🔸 Воркер: обработка событий из positions_update_stream
 async def run_position_update_writer():
     stream_name = "positions_update_stream"
