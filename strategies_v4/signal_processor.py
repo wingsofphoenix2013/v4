@@ -99,7 +99,7 @@ async def process_signal(data: dict):
 
             # ✅ reverse + sl_protection = True → REVERSE логика
             if strategy.get("reverse", False) and strategy.get("sl_protection", True):
-                log.info(f"[REVERSE-CHECK] reverse + sl_protection активны → проверка TP")
+                log.debug(f"[REVERSE-CHECK] reverse + sl_protection активны → проверка TP")
                 tp = next((
                     t for t in sorted(position.tp_targets, key=lambda t: t.level)
                     if not t.hit and not t.canceled
@@ -113,11 +113,11 @@ async def process_signal(data: dict):
                     )
 
                 if tp.price is not None:
-                    log.info(f"🛡️ REVERSE → TP имеет цену ({tp.price}) — активируется SL-replacement")
+                    log.debug(f"🛡️ REVERSE → TP имеет цену ({tp.price}) — активируется SL-replacement")
                     await apply_sl_replacement(position, log_uid, strategy_id, symbol)
                     return
 
-                log.info("🔁 REVERSE → TP без цены — активируется механизм реверса")
+                log.debug("🔁 REVERSE → TP без цены — активируется механизм реверса")
 
                 signal_id = data["signal_id"]
                 time_value = data.get("time")
