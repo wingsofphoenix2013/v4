@@ -95,14 +95,17 @@ async def calculate_position_size(data: dict):
     for level_conf in strategy["tp_levels"]:
         level = level_conf["level"]
         tp_type = level_conf["tp_type"]
-        tp_value = Decimal(str(level_conf["tp_value"]))
 
         if tp_type == "signal":
             price = None
+
         elif tp_type == "percent":
+            tp_value = Decimal(str(level_conf["tp_value"]))
             delta = (entry_price * tp_value / Decimal("100")).quantize(factor_price, rounding=ROUND_DOWN)
             price = entry_price + delta if direction == "long" else entry_price - delta
+
         elif tp_type == "atr":
+            tp_value = Decimal(str(level_conf["tp_value"]))
             if atr is None:
                 tf = strategy.get("timeframe").lower()
                 log.debug(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
@@ -112,6 +115,7 @@ async def calculate_position_size(data: dict):
                 atr = Decimal(str(atr_raw))
             delta = (atr * tp_value).quantize(factor_price, rounding=ROUND_DOWN)
             price = entry_price + delta if direction == "long" else entry_price - delta
+
         else:
             return "skip", f"unknown tp_type: {tp_type}"
 
@@ -131,7 +135,6 @@ async def calculate_position_size(data: dict):
         log.debug(f"[TP] level={level} type={tp_type} price={price}")
 
     log.debug(f"[STAGE 3] TP targets prepared: {len(tp_targets)}")
-
     # === Этап 4: Учёт открытых позиций и доступного риска ===
     used_risk = sum(
         p.planned_risk for p in position_registry.values()
