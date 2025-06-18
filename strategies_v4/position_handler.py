@@ -248,6 +248,7 @@ async def _finalize_position_close(position, exit_price: Decimal, reason: str):
         "close_reason": reason,
         "quantity_left": str(position.quantity_left),
         "planned_risk": str(position.planned_risk),
+        "log_uid": position.log_uid,
         "note": f"позиция закрыта по {reason} по цене {exit_price}"
     }
 
@@ -310,6 +311,7 @@ async def full_protect_stop(position):
             "quantity_left": "0",
             "planned_risk": "0",
             "note": "позиция закрыта через SL-protect",
+            "log_uid": position.log_uid,
             "sl_targets": json.dumps(
                 [asdict(sl) for sl in position.sl_targets],
                 default=str
