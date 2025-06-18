@@ -118,7 +118,11 @@ async def process_signal(data: dict):
                     return
 
                 log.info("🔁 REVERSE → TP без цены — активируется механизм реверса")
-                await full_reverse_stop(position)
+
+                signal_id = data["signal_id"]
+                time_value = data.get("time")
+
+                await full_reverse_stop(position, signal_id, direction, time_value)
                 return
 
             # ✅ reverse = True, sl_protection = False → reverse не реализован
