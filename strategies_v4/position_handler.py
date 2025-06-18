@@ -406,6 +406,77 @@ async def apply_sl_replacement(position, log_uid, strategy_id, symbol):
         await infra.redis_client.xadd("positions_update_stream", {
             "data": json.dumps(event_data)
         })
+# 🔸 Закрытие позиции по механизму reverse
+async def full_reverse_stop(position, signal_id, direction, time):
+    async with position.lock:
+        # 🔸 Отмена всех TP и SL целей
+        for t in position.tp_targets + position.sl_targets:
+            if not t.hit and not t.canceled:
+                t.canceled = True
+
+        # 🔸 Получение цены закрытия
+        price = await get_price(position.symbol)
+        if price is None:
+            log.warning(f"❌ REVERSE: цена не получена для {position.symbol}, остановка невозможна")
+            return
+
+        price = Decimal(str(price))
+        now = datetime.utcnow()
+
+        # 🔸 Обновление состояния позиции
+        position.status = "closed"
+        position.closed_at = now
+        position.exit_price = price
+        position.close_reason = "reverse-signal-stop"
+
+        # 🔸 Расчёт и фиксация PnL
+        qty = position.quantity_left
+        entry = position.entry_price
+
+        if position.direction == "long":
+            pnl = (price - entry) * qty
+        else:
+            pnl = (entry - price) * qty
+
+        position.pnl += pnl.quantize(Decimal("1.00"))
+        position.quantity_left = Decimal("0")
+        position.planned_risk = Decimal("0")
+
+        # 🔸 Подготовка события для core_io
+        event_data = {
+            "event_type": "closed",
+            "position_uid": str(position.uid),
+            "strategy_id": position.strategy_id,
+            "symbol": position.symbol,
+            "exit_price": str(price),
+            "pnl": str(position.pnl),
+            "close_reason": "reverse-signal-stop",
+            "quantity_left": "0",
+            "planned_risk": "0",
+            "note": "позиция закрыта по сигналу reverse",
+            "log_uid": position.log_uid,
+            "signal_id": str(signal_id),
+            "direction": direction,
+            "time": time,
+            "sl_targets": json.dumps(
+                [asdict(sl) for sl in position.sl_targets], default=str
+            ),
+            "tp_targets": json.dumps(
+                [asdict(tp) for tp in position.tp_targets], default=str
+            )
+        }
+
+        await infra.redis_client.xadd("positions_update_stream", {
+            "data": json.dumps(event_data)
+        })
+
+        log.debug(f"🔁 REVERSE: позиция {position.uid} закрыта по сигналу reverse")
+
+        # 🔸 Удаление позиции из памяти
+        key = (position.strategy_id, position.symbol)
+        if key in position_registry:
+            del position_registry[key]
+            log.debug(f"🧹 POSITION_REGISTRY: позиция удалена {key}")
 # 🔸 Главный воркер: проверка целей TP и SL
 async def run_position_handler():
     while True:

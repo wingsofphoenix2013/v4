@@ -368,6 +368,13 @@ async def _handle_position_update_event(event: dict):
                      datetime.utcnow())
 
         log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
+
+        # 🔁 Если причина закрытия — reverse, отправляем реверсный сигнал
+        if event.get("close_reason") == "reverse-signal-stop":
+            try:
+                await _send_reverse_signal_from_event(event)
+            except Exception:
+                log.exception(f"❌ Ошибка при отправке реверсного сигнала для {event['position_uid']}")
         
     elif event.get("event_type") == "sl_replaced":
         async with infra.pg_pool.acquire() as conn:
@@ -482,3 +489,36 @@ async def run_position_update_writer():
         except Exception:
             log.exception("❌ Ошибка в цикле run_position_update_writer")
             await asyncio.sleep(5)
+# 🔸 Формирование и отправка реверсного сигнала
+async def _send_reverse_signal_from_event(event: dict):
+    try:
+        strategy_id = str(event["strategy_id"])
+        signal_id = str(event["signal_id"])
+        symbol = event["symbol"]
+        log_uid = event["log_uid"]
+        time_value = event["time"]
+        direction = event["direction"]
+
+        if direction not in ("long", "short"):
+            log.warning(f"⚠️ Неверное направление в событии reverse: {direction}")
+            return
+
+        reversed_direction = "short" if direction == "long" else "long"
+
+        signal_data = {
+            "strategy_id": strategy_id,
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "direction": reversed_direction,
+            "log_uid": log_uid,
+            "received_at": datetime.utcnow().isoformat(),
+            "time": time_value,
+            "source": "reverse_signal"
+        }
+
+        await infra.redis_client.xadd("strategy_input_stream", signal_data)
+
+        log.debug(f"🔁 Reverse-сигнал отправлен: {symbol} {reversed_direction} (strategy_id={strategy_id})")
+
+    except Exception:
+        log.exception("❌ Ошибка в _send_reverse_signal_from_event()")

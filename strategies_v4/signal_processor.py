@@ -123,6 +123,28 @@ async def process_signal(data: dict):
                     strategy_id, symbol, direction, log_uid,
                     "маршрут reverse не реализован"
                 )
+
+            if strategy.get("reverse", False) and strategy.get("sl_protection", True):
+                # 🔍 Определение активного TP
+                tp = next((
+                    t for t in sorted(position.tp_targets, key=lambda t: t.level)
+                    if not t.hit and not t.canceled
+                ), None)
+
+                if not tp:
+                    return await route_ignore(
+                        strategy_id, symbol, direction, log_uid,
+                        "нет активных TP целей"
+                    )
+
+                if tp.price is not None:
+                    log.info(f"🛡️ REVERSE → TP имеет цену ({tp.price}) — активируется защита")
+                    await apply_sl_replacement(position, log_uid, strategy_id, symbol)
+                    return
+
+                log.info("🔁 REVERSE → TP без цены — активируется механизм реверса")
+                await full_reverse_stop(position)
+                return
         # 🔸 Обработка new_entry — стратегия готова к вызову
         modname = strategy.get("module_name", f"strategy_{strategy_id}")
         strategy_instance = strategy_registry.get(modname)
