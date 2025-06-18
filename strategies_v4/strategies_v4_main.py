@@ -25,9 +25,6 @@ async def run_safe_loop(coro_factory, label: str):
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Заглушки (временно, до полной реализации)
-async def stub_reverse_trigger(): await asyncio.sleep(3600)
-
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
@@ -73,8 +70,7 @@ async def main():
         run_safe_loop(run_position_opener_loop, "POSITION_OPENER"),
         run_safe_loop(run_position_open_writer, "POSITION_DB_WRITER"),
         run_safe_loop(run_position_handler, "POSITION_HANDLER"),
-        run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER"),
-        run_safe_loop(stub_reverse_trigger, "REVERSE_TRIGGER")
+        run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER")
     )
     
 # 🔸 Запуск через CLI
