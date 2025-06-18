@@ -353,7 +353,7 @@ async def apply_sl_replacement(position, log_uid, strategy_id, symbol):
         )
 
         if not sl_below_entry:
-            log.info(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} vs {entry}) — замена не требуется")
+            log.debug(f"🛡️ PROTECT: SL уже на входе или выше ({sl.price} vs {entry}) — замена не требуется")
 
             await route_protect(
                 strategy_id=strategy_id,
@@ -380,7 +380,7 @@ async def apply_sl_replacement(position, log_uid, strategy_id, symbol):
         position.sl_targets.append(new_sl)
         position.planned_risk = Decimal("0")
 
-        log.info(f"🛡️ PROTECT: SL заменён на уровень входа {entry} для позиции {position.uid}")
+        log.debug(f"🛡️ PROTECT: SL заменён на уровень входа {entry} для позиции {position.uid}")
 
         await route_protect(
             strategy_id=strategy_id,

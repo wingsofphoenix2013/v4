@@ -74,7 +74,7 @@ class ConfigState:
             
             normalize_strategy_flags(strategy)
             
-            log.info(
+            log.debug(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
                 f"reverse={strategy['reverse']} "
@@ -113,7 +113,7 @@ class ConfigState:
             )
             self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers}
 
-            log.info(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
+            log.debug(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
 
             # 🔸 Дополнительный лог с деталями загрузки
             log.debug(
@@ -150,7 +150,7 @@ class ConfigState:
             
             normalize_strategy_flags(strategy)
             
-            log.info(
+            log.debug(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
                 f"reverse={strategy['reverse']} "
