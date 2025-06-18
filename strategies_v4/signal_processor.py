@@ -177,7 +177,10 @@ async def process_signal(data: dict):
                 f"класс стратегии '{modname}' не найден"
             )
 
-        context = {"redis": infra.redis_client}
+        context = {
+            "redis": infra.redis_client,
+            "strategy": strategy
+        }
         result = await strategy_instance.validate_signal(data, context)
 
         if result is True:
