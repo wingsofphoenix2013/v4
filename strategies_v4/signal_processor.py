@@ -97,14 +97,40 @@ async def process_signal(data: dict):
                 f"sl_protection={strategy.get('sl_protection')} ({type(strategy.get('sl_protection'))})"
             )
 
-            if not strategy.get("reverse", False) and not strategy.get("sl_protection", False):
-                log.info(f"[REVERSE-CHECK] Реверс и SL защита отключены → ignore")
+            # ✅ reverse + sl_protection = True → REVERSE логика
+            if strategy.get("reverse", False) and strategy.get("sl_protection", True):
+                log.info(f"[REVERSE-CHECK] reverse + sl_protection активны → проверка TP")
+                tp = next((
+                    t for t in sorted(position.tp_targets, key=lambda t: t.level)
+                    if not t.hit and not t.canceled
+                ), None)
+
+                if not tp:
+                    log.info(f"[REVERSE] Нет активных TP целей → ignore")
+                    return await route_ignore(
+                        strategy_id, symbol, direction, log_uid,
+                        "нет активных TP целей"
+                    )
+
+                if tp.price is not None:
+                    log.info(f"🛡️ REVERSE → TP имеет цену ({tp.price}) — активируется SL-replacement")
+                    await apply_sl_replacement(position, log_uid, strategy_id, symbol)
+                    return
+
+                log.info("🔁 REVERSE → TP без цены — активируется механизм реверса")
+                await full_reverse_stop(position)
+                return
+
+            # ✅ reverse = True, sl_protection = False → reverse не реализован
+            if strategy.get("reverse", False):
+                log.info(f"[REVERSE-CHECK] reverse включён, но sl_protection = False → reverse не реализован")
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
-                    "реверс и SL защита отключены"
+                    "маршрут reverse не реализован"
                 )
 
-            if not strategy.get("reverse", False) and strategy.get("sl_protection", True):
+            # ✅ reverse = False, sl_protection = True → SL-protect
+            if strategy.get("sl_protection", True):
                 log.info(f"[REVERSE-CHECK] Активирован SL-protect без reverse")
                 price = await get_price(symbol)
                 if price is None:
@@ -130,35 +156,12 @@ async def process_signal(data: dict):
                     await apply_sl_replacement(position, log_uid, strategy_id, symbol)
                 return
 
-            if strategy.get("reverse", False) and strategy.get("sl_protection", False):
-                log.info(f"[REVERSE-CHECK] reverse включён, но sl_protection = False → reverse не реализован")
-                return await route_ignore(
-                    strategy_id, symbol, direction, log_uid,
-                    "маршрут reverse не реализован"
-                )
-
-            if strategy.get("reverse", False) and strategy.get("sl_protection", True):
-                log.info(f"[REVERSE-CHECK] reverse + sl_protection активны → проверка TP")
-                tp = next((
-                    t for t in sorted(position.tp_targets, key=lambda t: t.level)
-                    if not t.hit and not t.canceled
-                ), None)
-
-                if not tp:
-                    log.info(f"[REVERSE] Нет активных TP целей → ignore")
-                    return await route_ignore(
-                        strategy_id, symbol, direction, log_uid,
-                        "нет активных TP целей"
-                    )
-
-                if tp.price is not None:
-                    log.info(f"🛡️ REVERSE → TP имеет цену ({tp.price}) — активируется SL-replacement")
-                    await apply_sl_replacement(position, log_uid, strategy_id, symbol)
-                    return
-
-                log.info("🔁 REVERSE → TP без цены — активируется механизм реверса")
-                await full_reverse_stop(position)
-                return
+            # ✅ Ни reverse, ни sl_protection не включены
+            log.info(f"[REVERSE-CHECK] Реверс и SL защита отключены → ignore")
+            return await route_ignore(
+                strategy_id, symbol, direction, log_uid,
+                "реверс и SL защита отключены"
+            )
         # 🔸 Обработка new_entry — стратегия готова к вызову
         modname = strategy.get("module_name", f"strategy_{strategy_id}")
         strategy_instance = strategy_registry.get(modname)
