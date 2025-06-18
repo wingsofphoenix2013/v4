@@ -8,6 +8,19 @@ from infra import infra
 # 🔸 Логгер
 log = logging.getLogger("CONFIG")
 
+# 🔹 Приведение логических флагов стратегии к типу bool
+def normalize_strategy_flags(strategy: dict) -> None:
+    for key in (
+        "enabled",
+        "use_all_tickers",
+        "use_stoploss",
+        "allow_open",
+        "reverse",
+        "sl_protection"
+    ):
+        if key in strategy:
+            strategy[key] = str(strategy[key]).lower() == "true"
+            
 # 🔸 Глобальное состояние конфигурации
 class ConfigState:
     def __init__(self):
@@ -58,6 +71,16 @@ class ConfigState:
 
             strategy = dict(row)
             strategy["module_name"] = strategy["name"]
+            
+            normalize_strategy_flags(strategy)
+            
+            log.info(
+                f"[DEBUG-NORM] Strategy {strategy_id} → "
+                f"enabled={strategy['enabled']} "
+                f"reverse={strategy['reverse']} "
+                f"sl_protection={strategy['sl_protection']} "
+                f"allow_open={strategy['allow_open']}"
+            )
 
             strategy["tp_levels"] = [
                 dict(r) for r in await infra.pg_pool.fetch(
@@ -124,6 +147,16 @@ class ConfigState:
             strategy_id = row["id"]
             strategy = dict(row)
             strategy["module_name"] = strategy["name"]
+            
+            normalize_strategy_flags(strategy)
+            
+            log.info(
+                f"[DEBUG-NORM] Strategy {strategy_id} → "
+                f"enabled={strategy['enabled']} "
+                f"reverse={strategy['reverse']} "
+                f"sl_protection={strategy['sl_protection']} "
+                f"allow_open={strategy['allow_open']}"
+            )
 
             strategy["tp_levels"] = [
                 dict(r) for r in await infra.pg_pool.fetch(
