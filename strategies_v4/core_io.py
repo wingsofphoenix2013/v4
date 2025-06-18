@@ -367,7 +367,17 @@ async def _handle_position_update_event(event: dict):
                      event["note"],
                      datetime.utcnow())
 
-        log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
+            # 🔸 Запись события closed в signal_log_queue для signal_log_entries_v4
+            await infra.redis_client.xadd("signal_log_queue", {
+                "log_uid": event["log_uid"],
+                "strategy_id": str(event["strategy_id"]),
+                "status": "closed",
+                "note": event["note"],
+                "position_uid": event["position_uid"],
+                "logged_at": datetime.utcnow().isoformat()
+            })
+
+            log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
 
         # 🔁 Если причина закрытия — reverse, отправляем реверсный сигнал
         if event.get("close_reason") == "reverse-signal-stop":
@@ -497,7 +507,9 @@ async def _send_reverse_signal_from_event(event: dict):
         symbol = event["symbol"]
         log_uid = event["log_uid"]
         time_value = event["time"]
-        direction = event["direction"]
+
+        # 🔸 Используем направление закрытой позиции, не сигнала
+        direction = str(event.get("original_direction", event["direction"])).lower()
 
         if direction not in ("long", "short"):
             log.warning(f"⚠️ Неверное направление в событии reverse: {direction}")
@@ -518,7 +530,10 @@ async def _send_reverse_signal_from_event(event: dict):
 
         await infra.redis_client.xadd("strategy_input_stream", signal_data)
 
-        log.debug(f"🔁 Reverse-сигнал отправлен: {symbol} {reversed_direction} (strategy_id={strategy_id})")
+        log.debug(
+            f"🔁 Reverse-сигнал отправлен: {symbol} {reversed_direction} "
+            f"(strategy_id={strategy_id}, from original_direction={direction})"
+        )
 
     except Exception:
         log.exception("❌ Ошибка в _send_reverse_signal_from_event()")

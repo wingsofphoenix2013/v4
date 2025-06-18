@@ -457,6 +457,7 @@ async def full_reverse_stop(position, signal_id, direction, time):
             "log_uid": position.log_uid,
             "signal_id": str(signal_id),
             "direction": direction,
+            "original_direction": position.direction,
             "time": time,
             "sl_targets": json.dumps(
                 [asdict(sl) for sl in position.sl_targets], default=str
