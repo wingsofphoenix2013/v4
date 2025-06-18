@@ -1,12 +1,12 @@
-# strategy_207_flat.py
+# strategy_208_slprotect.py
 
 import logging
 import json
 from infra import load_indicators
 
-log = logging.getLogger("STRATEGY_207_FLAT")
+log = logging.getLogger("STRATEGY_208_SLPROTECT")
 
-class Strategy207Flat:
+class Strategy208Slprotect:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
@@ -17,18 +17,18 @@ class Strategy207Flat:
             rsi = indicators.get("rsi14")
             mfi = indicators.get("mfi14")
 
-            log.debug(f"🔍 [207 FLAT] symbol={symbol}, direction={direction}, tf={tf}, rsi={rsi}, mfi={mfi}")
+            log.debug(f"🔍 [208 SLPROTECT] symbol={symbol}, direction={direction}, tf={tf}, rsi={rsi}, mfi={mfi}")
 
             if rsi is None or mfi is None:
                 return ("ignore", "нет значений RSI/MFI")
 
             if direction == "long":
-                if rsi < 28 and mfi < 20:
+                if rsi < 28 and mfi < 25:
                     return True
                 return ("ignore", f"фильтр long не пройден: rsi={rsi}, mfi={mfi}")
 
             elif direction == "short":
-                if rsi > 72 and mfi > 80:
+                if rsi > 72 and mfi > 75:
                     return True
                 return ("ignore", f"фильтр short не пройден: rsi={rsi}, mfi={mfi}")
 
