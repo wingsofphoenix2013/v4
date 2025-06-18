@@ -121,8 +121,9 @@ async def process_signal(data: dict):
 
                 signal_id = data["signal_id"]
                 time_value = data.get("time")
+                log_uid = data["log_uid"]
 
-                await full_reverse_stop(position, signal_id, direction, time_value)
+                await full_reverse_stop(position, signal_id, direction, time_value, log_uid)
                 return
 
             # ✅ reverse = True, sl_protection = False → reverse не реализован

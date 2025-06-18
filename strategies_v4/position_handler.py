@@ -407,7 +407,7 @@ async def apply_sl_replacement(position, log_uid, strategy_id, symbol):
             "data": json.dumps(event_data)
         })
 # 🔸 Закрытие позиции по механизму reverse
-async def full_reverse_stop(position, signal_id, direction, time):
+async def full_reverse_stop(position, signal_id, direction, time, log_uid):
     async with position.lock:
         # 🔸 Отмена всех TP и SL целей
         for t in position.tp_targets + position.sl_targets:
@@ -454,7 +454,7 @@ async def full_reverse_stop(position, signal_id, direction, time):
             "quantity_left": "0",
             "planned_risk": "0",
             "note": "позиция закрыта по сигналу reverse",
-            "log_uid": position.log_uid,
+            "log_uid": log_uid,
             "signal_id": str(signal_id),
             "direction": direction,
             "original_direction": position.direction,
