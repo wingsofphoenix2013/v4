@@ -48,7 +48,7 @@ async def process_log_entry(data: dict):
         signal_id = int(data["signal_id"]) if data.get("signal_id") else None
         direction = data.get("direction") or None
         reason = data.get("reason") or None
-        details = json.loads(data.get("details") or "{}")
+        details = data.get("details") or "{}"  # 👈 оставляем строкой
 
         query = """
             INSERT INTO generator_logs_v4 (
@@ -61,10 +61,10 @@ async def process_log_entry(data: dict):
         await infra.pg_pool.execute(
             query,
             symbol, timeframe, open_time, rule, status,
-            signal_id, direction, reason, details
+            signal_id, direction, reason, details  # ✅ передаём str
         )
 
-        log.info(f"[CORE_IO] ✅ Лог записан: {symbol}/{timeframe} {status}")
+        log.info(f"[GEN_IO] ✅ Лог записан: {symbol}/{timeframe} {status}")
 
     except Exception:
-        log.exception("[CORE_IO] ❌ Ошибка обработки и записи лога")
+        log.exception("[GEN_IO] ❌ Ошибка обработки и записи лога")
