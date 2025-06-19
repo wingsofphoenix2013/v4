@@ -60,9 +60,8 @@ async def handle_ready_event(data: dict):
         except Exception:
             log.exception(f"[RULE_PROCESSOR] ❌ Ошибка в update() правила {rule_name}")
 
-
 # 🔸 Публикация сигнала в Redis Stream signals_stream
-async def publish_signal(result: SignalResult, open_time: datetime, symbol: str):
+async def publish_signal(result, open_time: datetime, symbol: str):
     redis = infra.redis_client
     now = datetime.utcnow().isoformat()
 

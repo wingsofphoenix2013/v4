@@ -57,7 +57,7 @@ class EmaCrossSimple(SignalRule):
                     }
                 )
 
-            log.info(
+            log.debug(
                 f"[EMACROSS_SIMPLE] ℹ️ Пересечения нет для {self.symbol}/{self.timeframe} — "
                 f"prev: 9={prev_ema9} vs 21={prev_ema21}, curr: 9={curr_ema9} vs 21={curr_ema21}"
             )
