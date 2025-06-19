@@ -36,8 +36,6 @@ async def run_rule_processor():
         except Exception:
             log.exception("[RULE_PROCESSOR] ❌ Ошибка чтения потока")
             await asyncio.sleep(1)
-
-
 # 🔸 Обработка одного события готовности индикаторов
 async def handle_ready_event(data: dict):
     try:
@@ -48,12 +46,27 @@ async def handle_ready_event(data: dict):
         log.warning(f"[RULE_PROCESSOR] ⚠️ Невалидные данные из потока: {data}")
         return
 
+    # 🔸 Защита от повторной обработки через Redis-лок
+    LOCK_TTL = {
+        "m1": 45,
+        "m5": 275,
+        "m15": 875,
+    }
+
+    key = f"gen_lock:{symbol}:{tf}:{open_time.isoformat()}"
+    ttl = LOCK_TTL.get(tf, 600)
+
+    was_set = await infra.redis_client.set(key, "1", ex=ttl, nx=True)
+    if not was_set:
+        log.info(f"[RULE_PROCESSOR] ⏩ Пропущен повторный вызов для {symbol}/{tf} @ {open_time}")
+        return
+
     for (rule_name, rule_symbol, rule_tf), rule in RULE_INSTANCES.items():
         if rule_symbol != symbol or rule_tf != tf:
             continue
 
         try:
-            log.debug(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
+            log.info(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
             result = await rule.update(open_time)
 
             if result:
@@ -91,8 +104,6 @@ async def handle_ready_event(data: dict):
                 reason="Ошибка в update()",
                 details={"exception": str(e)}
             )
-
-
 # 🔸 Публикация сигнала в Redis Stream signals_stream
 async def publish_signal(result, open_time: datetime, symbol: str):
     redis = infra.redis_client
