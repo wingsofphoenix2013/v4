@@ -9,4 +9,4 @@ log = logging.getLogger("GEN")
 async def run_core_io():
     while True:
         log.info("[CORE_IO] Заглушка запущена, ожидаю...")
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)

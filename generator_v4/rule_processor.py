@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from infra import infra, ENABLED_TICKERS
 from rule_loader import RULE_INSTANCES
@@ -45,7 +45,7 @@ async def process_indicator_message(data: dict):
     try:
         symbol = data["symbol"]
         tf = data["interval"]
-        open_time = datetime.fromisoformat(data["open_time"])
+        open_time = datetime.fromisoformat(data["open_time"].replace("Z", "+00:00"))
         param = data["param"]
         value = float(data["value"])
     except Exception:
@@ -55,7 +55,6 @@ async def process_indicator_message(data: dict):
     key = (symbol, tf, open_time)
     INDICATOR_BUFFER[key][param] = value
 
-    # Найдём правило для этой пары
     for (rule_name, rule_symbol, rule_tf), rule in RULE_INSTANCES.items():
         if rule_symbol != symbol or rule_tf != tf:
             continue
@@ -69,9 +68,9 @@ async def process_indicator_message(data: dict):
         indicator_values = INDICATOR_BUFFER.pop(key)
 
         try:
+            log.info(f"[RULE_PROCESSOR] 🔍 Вызов update для {symbol}/{tf} ({rule_name}), данные: {indicator_values}")
             result = await rule.update(open_time, indicator_values)
             if result:
                 log.info(f"[RULE_PROCESSOR] ✅ Сигнал {result.direction.upper()} → {symbol}/{tf}")
-                # сюда будет отправка в signals_stream
         except Exception:
             log.exception(f"[RULE_PROCESSOR] ❌ Ошибка выполнения update() для {rule_name} {symbol}/{tf}")

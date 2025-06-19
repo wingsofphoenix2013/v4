@@ -20,7 +20,7 @@ def load_signal_rule_instances():
 
     for signal in SIGNAL_CONFIGS:
         rule_name = signal["rule"]
-        log.info(f"[RULE_LOADER] Обработка сигнала: {signal['name']} → rule={rule_name}")
+        log.debug(f"[RULE_LOADER] Обработка сигнала: {signal['name']} → rule={rule_name}")
 
         if not rule_name or rule_name not in RULE_DEFINITIONS:
             log.warning(f"[RULE_LOADER] Пропущен сигнал '{signal['name']}' — нет правила '{rule_name}'")
@@ -33,7 +33,7 @@ def load_signal_rule_instances():
         try:
             module = importlib.import_module(f"rule_engine.{module_name}")
             rule_class = getattr(module, class_name)
-            log.info(f"[RULE_LOADER] Импортирован класс: {module_name}.{class_name}")
+            log.debug(f"[RULE_LOADER] Импортирован класс: {module_name}.{class_name}")
         except Exception as e:
             log.exception(f"[RULE_LOADER] ❌ Ошибка импорта {module_name}.{class_name}: {e}")
             continue
@@ -43,7 +43,7 @@ def load_signal_rule_instances():
 
         for symbol in ENABLED_TICKERS:
             key = (rule_name, symbol, timeframe)
-            log.info(f"[RULE_LOADER] Создание: {class_name}(symbol='{symbol}', timeframe='{timeframe}', signal_id={signal_id})")
+            log.debug(f"[RULE_LOADER] Создание: {class_name}(symbol='{symbol}', timeframe='{timeframe}', signal_id={signal_id})")
             try:
                 instance = rule_class(symbol=symbol, timeframe=timeframe, signal_id=signal_id)
                 RULE_INSTANCES[key] = instance
