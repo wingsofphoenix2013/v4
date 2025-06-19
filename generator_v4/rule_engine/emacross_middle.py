@@ -21,7 +21,7 @@ class EmaCrossMiddle(SignalRule):
         key_last = f"last_signal:{self.symbol}:ema_cross_middle"
         last_ts = await redis.get(key_last)
         if last_ts:
-            last_dt = datetime.fromisoformat(last_ts.decode())
+            last_dt = datetime.fromisoformat(last_ts)
             if (open_time - last_dt).total_seconds() < 4 * 300:
                 log.info(f"[EMACROSS_MIDDLE] ⏩ Пропущено: последний сигнал был < 4 баров назад")
                 return None

@@ -22,7 +22,7 @@ class EmaCrossLight(SignalRule):
         key_last = f"last_signal:{self.symbol}:ema_cross_light"
         last_ts = await redis.get(key_last)
         if last_ts:
-            last_dt = datetime.fromisoformat(last_ts.decode())
+            last_dt = datetime.fromisoformat(last_ts)
             if (open_time - last_dt).total_seconds() < 2 * 300:
                 log.info(f"[EMACROSS_LIGHT] ⏩ Сигнал пропущен (меньше 2 баров): {self.symbol}")
                 return None
