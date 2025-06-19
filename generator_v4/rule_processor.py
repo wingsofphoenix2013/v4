@@ -3,11 +3,11 @@
 import asyncio
 import logging
 from datetime import datetime
-
 from infra import infra
 from rule_loader import RULE_INSTANCES
 
 log = logging.getLogger("RULE_PROC")
+
 
 # 🔸 Асинхронный воркер обработки потока готовности индикаторов
 async def run_rule_processor():
@@ -52,9 +52,35 @@ async def handle_ready_event(data: dict):
             continue
 
         try:
-            log.debug(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
+            log.info(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
             result = await rule.update(open_time)
             if result:
                 log.info(f"[RULE_PROCESSOR] ✅ Сигнал {result.direction.upper()} по {symbol}/{tf}")
+                await publish_signal(result, open_time, symbol)
         except Exception:
             log.exception(f"[RULE_PROCESSOR] ❌ Ошибка в update() правила {rule_name}")
+
+
+# 🔸 Публикация сигнала в Redis Stream signals_stream
+async def publish_signal(result: SignalResult, open_time: datetime, symbol: str):
+    redis = infra.redis_client
+    now = datetime.utcnow().isoformat()
+
+    try:
+        config = next(s for s in infra.SIGNAL_CONFIGS if s["id"] == result.signal_id)
+        message = config["long_phrase"] if result.direction == "long" else config["short_phrase"]
+    except StopIteration:
+        log.info(f"[RULE_PROCESSOR] ⚠️ Не найдена фраза для signal_id={result.signal_id}")
+        return
+
+    payload = {
+        "symbol": symbol,
+        "message": message,
+        "bar_time": open_time.isoformat(),
+        "sent_at": now,
+        "received_at": now,
+        "source": "generator"
+    }
+
+    await redis.xadd("signals_stream", payload)
+    log.info(f"[RULE_PROCESSOR] 📤 Сигнал опубликован в signals_stream → {symbol} {message}")
