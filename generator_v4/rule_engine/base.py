@@ -50,13 +50,24 @@ class SignalRule(abc.ABC):
     ) -> list[float]:
         """
         Загружает `length` значений индикатора до и включая `open_time`
-        через RedisTimeSeries (TS.RANGE)
+        с учётом реального таймфрейма (m1, m5, m15)
         """
+        TIMEFRAME_MS = {
+            "m1": 60_000,
+            "m5": 300_000,
+            "m15": 900_000,
+        }
+
+        interval_ms = TIMEFRAME_MS.get(self.timeframe)
+        if not interval_ms:
+            log.info(f"[RULE_BASE] ❌ Неизвестный таймфрейм: {self.timeframe}")
+            return []
+
         redis = infra.redis_client
         key = f"ts_ind:{self.symbol}:{self.timeframe}:{param}"
 
         end_ts = int(open_time.timestamp() * 1000)
-        start_ts = end_ts - (length - 1) * 60_000  # предполагается 1 точка = 1 минута
+        start_ts = end_ts - (length - 1) * interval_ms
 
         try:
             points = await redis.execute_command("TS.RANGE", key, start_ts, end_ts)
