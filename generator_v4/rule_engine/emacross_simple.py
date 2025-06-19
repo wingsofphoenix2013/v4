@@ -21,14 +21,15 @@ class EmaCrossSimple(SignalRule):
             ema21 = await self.fetch_indicator_series("ema21", 2, open_time)
 
             if len(ema9) < 2 or len(ema21) < 2:
-                log.info("[EMACROSS_SIMPLE] ⚠️ Недостаточно данных для расчёта пересечения")
+                log.info(f"[EMACROSS_SIMPLE] ⚠️ Недостаточно данных для расчёта пересечения: {self.symbol}/{self.timeframe}")
                 return None
 
             prev_ema9, curr_ema9 = ema9
             prev_ema21, curr_ema21 = ema21
 
             if prev_ema9 < prev_ema21 and curr_ema9 > curr_ema21:
-                log.info(f"[EMACROSS_SIMPLE] ✅ LONG сигнал: EMA9 ({curr_ema9}) пересек EMA21 ({curr_ema21}) снизу вверх")
+                log.info(f"[EMACROSS_SIMPLE] ✅ LONG сигнал для {self.symbol}/{self.timeframe}: "
+                         f"prev_ema9={prev_ema9}, prev_ema21={prev_ema21}, curr_ema9={curr_ema9}, curr_ema21={curr_ema21}")
                 return SignalResult(
                     signal_id=self.signal_id,
                     direction="long",
@@ -42,7 +43,8 @@ class EmaCrossSimple(SignalRule):
                 )
 
             if prev_ema9 > prev_ema21 and curr_ema9 < curr_ema21:
-                log.info(f"[EMACROSS_SIMPLE] ✅ SHORT сигнал: EMA9 ({curr_ema9}) пересек EMA21 ({curr_ema21}) сверху вниз")
+                log.info(f"[EMACROSS_SIMPLE] ✅ SHORT сигнал для {self.symbol}/{self.timeframe}: "
+                         f"prev_ema9={prev_ema9}, prev_ema21={prev_ema21}, curr_ema9={curr_ema9}, curr_ema21={curr_ema21}")
                 return SignalResult(
                     signal_id=self.signal_id,
                     direction="short",
@@ -55,7 +57,10 @@ class EmaCrossSimple(SignalRule):
                     }
                 )
 
-            log.info("[EMACROSS_SIMPLE] ℹ️ Пересечения нет")
+            log.info(
+                f"[EMACROSS_SIMPLE] ℹ️ Пересечения нет для {self.symbol}/{self.timeframe} — "
+                f"prev: 9={prev_ema9} vs 21={prev_ema21}, curr: 9={curr_ema9} vs 21={curr_ema21}"
+            )
             return None
 
         except Exception as e:
