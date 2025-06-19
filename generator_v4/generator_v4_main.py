@@ -6,6 +6,7 @@ import logging
 # 🔸 Импорт базовых компонентов
 from infra import setup_logging, setup_pg, setup_redis_client, load_configs
 
+from rule_loader import load_signal_rule_instances
 from rule_processor import run_rule_processor
 from core_io import run_core_io
 from events_listener import run_event_listener
@@ -31,6 +32,7 @@ async def main():
         await setup_pg()
         await setup_redis_client()
         await load_configs()
+        load_signal_rule_instances()
     except Exception:
         log.exception("❌ Ошибка инициализации сервисов")
         return

@@ -3,6 +3,8 @@
 import asyncio
 import logging
 
+from rule_loader import RULE_INSTANCES
+
 log = logging.getLogger("GEN")
 
 # 🔸 Заглушка воркера обработки правил
