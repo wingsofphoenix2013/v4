@@ -2,7 +2,6 @@
 
 import os
 import logging
-import asyncio
 import asyncpg
 import redis.asyncio as aioredis
 
@@ -72,14 +71,14 @@ async def load_enabled_tickers():
     """
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
-        global ENABLED_TICKERS
-        ENABLED_TICKERS = {
+        ENABLED_TICKERS.clear()
+        ENABLED_TICKERS.update({
             row["symbol"]: {
                 "precision_price": row["precision_price"],
                 "precision_qty": row["precision_qty"]
             }
             for row in rows
-        }
+        })
     log.info(f"[INIT] Загружено тикеров: {len(ENABLED_TICKERS)}")
 
 # 🔸 Загрузка сигналов из signals_v4
@@ -90,17 +89,18 @@ async def load_signal_configs():
         WHERE enabled = true AND source = 'generator'
     """
     async with infra.pg_pool.acquire() as conn:
-        global SIGNAL_CONFIGS
-        SIGNAL_CONFIGS = await conn.fetch(query)
+        rows = await conn.fetch(query)
+        SIGNAL_CONFIGS.clear()
+        SIGNAL_CONFIGS.extend(rows)
     log.info(f"[INIT] Загружено сигналов генератора: {len(SIGNAL_CONFIGS)}")
 
 # 🔸 Загрузка правил из signal_rules_v4
 async def load_rule_definitions():
     query = "SELECT name, class_name, module_name FROM signal_rules_v4"
     async with infra.pg_pool.acquire() as conn:
-        global RULE_DEFINITIONS
         rows = await conn.fetch(query)
-        RULE_DEFINITIONS = {row["name"]: row for row in rows}
+        RULE_DEFINITIONS.clear()
+        RULE_DEFINITIONS.update({row["name"]: row for row in rows})
     log.info(f"[INIT] Загружено правил: {len(RULE_DEFINITIONS)}")
 
 # 🔸 Комплексная загрузка всех конфигураций
