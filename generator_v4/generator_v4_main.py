@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 # 🔸 Импорт базовых компонентов
-from infra import setup_logging, init_pg, init_redis, load_configs
+from infra import setup_logging, setup_pg, setup_redis_client, load_configs
 
 # from rule_processor import run_rule_processor
 # from core_io import run_core_io
@@ -28,8 +28,8 @@ async def main():
     log.info("🚀 Запуск generator_v4")
 
     try:
-        await init_pg()
-        await init_redis()
+        await setup_pg()
+        await setup_redis_client()
         await load_configs()
     except Exception:
         log.exception("❌ Ошибка инициализации сервисов")
