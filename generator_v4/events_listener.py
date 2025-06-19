@@ -9,4 +9,4 @@ log = logging.getLogger("GEN")
 async def run_event_listener():
     while True:
         log.info("[PUBSUB_WATCHER] Заглушка запущена, ожидаю...")
-        await asyncio.sleep(600)
+        await asyncio.sleep(6000)

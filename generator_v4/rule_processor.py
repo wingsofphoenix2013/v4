@@ -58,7 +58,7 @@ async def handle_ready_event(data: dict):
 
     was_set = await infra.redis_client.set(key, "1", ex=ttl, nx=True)
     if not was_set:
-        log.info(f"[RULE_PROCESSOR] ⏩ Пропущен повторный вызов для {symbol}/{tf} @ {open_time}")
+        log.debug(f"[RULE_PROCESSOR] ⏩ Пропущен повторный вызов для {symbol}/{tf} @ {open_time}")
         return
 
     for (rule_name, rule_symbol, rule_tf), rule in RULE_INSTANCES.items():
@@ -66,11 +66,11 @@ async def handle_ready_event(data: dict):
             continue
 
         try:
-            log.info(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
+            log.debug(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
             result = await rule.update(open_time)
 
             if result:
-                log.info(f"[RULE_PROCESSOR] ✅ Сигнал {result.direction.upper()} по {symbol}/{tf}")
+                log.debug(f"[RULE_PROCESSOR] ✅ Сигнал {result.direction.upper()} по {symbol}/{tf}")
                 await publish_signal(result, open_time, symbol)
                 await enqueue_log_to_stream(
                     symbol=symbol,
@@ -113,7 +113,7 @@ async def publish_signal(result, open_time: datetime, symbol: str):
         config = next(s for s in SIGNAL_CONFIGS if s["id"] == result.signal_id)
         message = config["long_phrase"] if result.direction == "long" else config["short_phrase"]
     except StopIteration:
-        log.info(f"[RULE_PROCESSOR] ⚠️ Не найдена фраза для signal_id={result.signal_id}")
+        log.debug(f"[RULE_PROCESSOR] ⚠️ Не найдена фраза для signal_id={result.signal_id}")
         return
 
     payload = {
@@ -126,7 +126,7 @@ async def publish_signal(result, open_time: datetime, symbol: str):
     }
 
     await redis.xadd("signals_stream", payload)
-    log.info(f"[RULE_PROCESSOR] 📤 Сигнал опубликован в signals_stream → {symbol} {message}")
+    log.debug(f"[RULE_PROCESSOR] 📤 Сигнал опубликован в signals_stream → {symbol} {message}")
 
 
 # 🔸 Публикация лога генерации сигнала в Redis Stream generator_log_stream
@@ -156,4 +156,4 @@ async def enqueue_log_to_stream(
     }
 
     await redis.xadd("generator_log_stream", payload)
-    log.info(f"[RULE_PROCESSOR] 🪵 Лог генерации отправлен → {symbol}/{timeframe} {status}")
+    log.debug(f"[RULE_PROCESSOR] 🪵 Лог генерации отправлен → {symbol}/{timeframe} {status}")

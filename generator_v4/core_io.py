@@ -15,7 +15,7 @@ async def run_core_io():
     stream = "generator_log_stream"
     last_id = "$"
 
-    log.info("[CORE_IO] ▶️ Запуск воркера логирования генерации")
+    log.debug("[CORE_IO] ▶️ Запуск воркера логирования генерации")
 
     while True:
         try:
@@ -64,7 +64,7 @@ async def process_log_entry(data: dict):
             signal_id, direction, reason, details  # ✅ передаём str
         )
 
-        log.info(f"[GEN_IO] ✅ Лог записан: {symbol}/{timeframe} {status}")
+        log.debug(f"[GEN_IO] ✅ Лог записан: {symbol}/{timeframe} {status}")
 
     except Exception:
         log.exception("[GEN_IO] ❌ Ошибка обработки и записи лога")
