@@ -8,39 +8,56 @@ from rule_engine.base import SignalRule, SignalResult
 
 log = logging.getLogger("EMACROSS_SIMPLE")
 
-# 🔸 Правило генерации сигнала: EMA9 пересекает EMA21
+
+# 🔸 Правило генерации сигнала: пересечение EMA9 и EMA21
 class EmaCrossSimple(SignalRule):
     def required_indicators(self) -> list[str]:
         return ["ema9", "ema21"]
 
-    async def update(
-        self,
-        open_time: datetime,
-        indicator_values: dict[str, float]
-    ) -> Optional[SignalResult]:
-        if not all(k in indicator_values for k in self.required_indicators()):
-            log.warning(f"[EMACROSS_SIMPLE] ❌ Не хватает параметров: {indicator_values}")
+    # 🔸 Обработка сигнала на заданное open_time
+    async def update(self, open_time: datetime) -> Optional[SignalResult]:
+        try:
+            ema9 = await self.fetch_indicator_series("ema9", 2, open_time)
+            ema21 = await self.fetch_indicator_series("ema21", 2, open_time)
+
+            if len(ema9) < 2 or len(ema21) < 2:
+                log.info("[EMACROSS_SIMPLE] ⚠️ Недостаточно данных для расчёта пересечения")
+                return None
+
+            prev_ema9, curr_ema9 = ema9
+            prev_ema21, curr_ema21 = ema21
+
+            if prev_ema9 < prev_ema21 and curr_ema9 > curr_ema21:
+                log.info(f"[EMACROSS_SIMPLE] ✅ LONG сигнал: EMA9 ({curr_ema9}) пересек EMA21 ({curr_ema21}) снизу вверх")
+                return SignalResult(
+                    signal_id=self.signal_id,
+                    direction="long",
+                    reason="EMA9 пересек EMA21 снизу вверх",
+                    details={
+                        "prev_ema9": prev_ema9,
+                        "prev_ema21": prev_ema21,
+                        "curr_ema9": curr_ema9,
+                        "curr_ema21": curr_ema21
+                    }
+                )
+
+            if prev_ema9 > prev_ema21 and curr_ema9 < curr_ema21:
+                log.info(f"[EMACROSS_SIMPLE] ✅ SHORT сигнал: EMA9 ({curr_ema9}) пересек EMA21 ({curr_ema21}) сверху вниз")
+                return SignalResult(
+                    signal_id=self.signal_id,
+                    direction="short",
+                    reason="EMA9 пересек EMA21 сверху вниз",
+                    details={
+                        "prev_ema9": prev_ema9,
+                        "prev_ema21": prev_ema21,
+                        "curr_ema9": curr_ema9,
+                        "curr_ema21": curr_ema21
+                    }
+                )
+
+            log.info("[EMACROSS_SIMPLE] ℹ️ Пересечения нет")
             return None
 
-        ema9 = indicator_values["ema9"]
-        ema21 = indicator_values["ema21"]
-
-        if ema9 > ema21:
-            log.info(f"[EMACROSS_SIMPLE] ✅ Сигнал LONG: EMA9 ({ema9}) > EMA21 ({ema21})")
-            return SignalResult(
-                signal_id=self.signal_id,
-                direction="long",
-                reason=f"EMA9 ({ema9}) пересёк EMA21 ({ema21}) вверх",
-                details={"ema9": ema9, "ema21": ema21}
-            )
-        elif ema9 < ema21:
-            log.info(f"[EMACROSS_SIMPLE] ✅ Сигнал SHORT: EMA9 ({ema9}) < EMA21 ({ema21})")
-            return SignalResult(
-                signal_id=self.signal_id,
-                direction="short",
-                reason=f"EMA9 ({ema9}) пересёк EMA21 ({ema21}) вниз",
-                details={"ema9": ema9, "ema21": ema21}
-            )
-
-        log.info(f"[EMACROSS_SIMPLE] ℹ️ Пересечения нет: EMA9 = EMA21 = {ema9}")
-        return None
+        except Exception as e:
+            log.info(f"[EMACROSS_SIMPLE] ❌ Ошибка update(): {e}")
+            return None
