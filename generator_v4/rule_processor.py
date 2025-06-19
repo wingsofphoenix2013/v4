@@ -53,13 +53,44 @@ async def handle_ready_event(data: dict):
             continue
 
         try:
-            log.info(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
+            log.debug(f"[RULE_PROCESSOR] 🔍 {rule_name} → {symbol}/{tf}")
             result = await rule.update(open_time)
+
             if result:
                 log.info(f"[RULE_PROCESSOR] ✅ Сигнал {result.direction.upper()} по {symbol}/{tf}")
                 await publish_signal(result, open_time, symbol)
-        except Exception:
+                await enqueue_log_to_stream(
+                    symbol=symbol,
+                    timeframe=tf,
+                    open_time=open_time,
+                    rule=rule_name,
+                    status="success",
+                    signal_id=result.signal_id,
+                    direction=result.direction,
+                    reason=result.reason,
+                    details=result.details,
+                )
+            else:
+                await enqueue_log_to_stream(
+                    symbol=symbol,
+                    timeframe=tf,
+                    open_time=open_time,
+                    rule=rule_name,
+                    status="skipped",
+                    reason="Пересечения не произошло"
+                )
+
+        except Exception as e:
             log.exception(f"[RULE_PROCESSOR] ❌ Ошибка в update() правила {rule_name}")
+            await enqueue_log_to_stream(
+                symbol=symbol,
+                timeframe=tf,
+                open_time=open_time,
+                rule=rule_name,
+                status="error",
+                reason="Ошибка в update()",
+                details={"exception": str(e)}
+            )
 
 
 # 🔸 Публикация сигнала в Redis Stream signals_stream
@@ -85,3 +116,33 @@ async def publish_signal(result, open_time: datetime, symbol: str):
 
     await redis.xadd("signals_stream", payload)
     log.info(f"[RULE_PROCESSOR] 📤 Сигнал опубликован в signals_stream → {symbol} {message}")
+
+
+# 🔸 Публикация лога генерации сигнала в Redis Stream generator_log_stream
+async def enqueue_log_to_stream(
+    symbol: str,
+    timeframe: str,
+    open_time: datetime,
+    rule: str,
+    status: str,
+    signal_id: int = None,
+    direction: str = "",
+    reason: str = "",
+    details: dict = None
+):
+    redis = infra.redis_client
+
+    payload = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "open_time": open_time.isoformat(),
+        "rule": rule,
+        "status": status,
+        "signal_id": str(signal_id) if signal_id is not None else "",
+        "direction": direction or "",
+        "reason": reason or "",
+        "details": json.dumps(details or {}),
+    }
+
+    await redis.xadd("generator_log_stream", payload)
+    log.info(f"[RULE_PROCESSOR] 🪵 Лог генерации отправлен → {symbol}/{timeframe} {status}")
