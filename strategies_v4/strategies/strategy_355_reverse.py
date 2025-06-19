@@ -5,7 +5,7 @@ import json
 
 log = logging.getLogger("STRATEGY_355_REVERSE")
 
-class Strategy355Flat:
+class Strategy355Reverse:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"]
