@@ -50,16 +50,17 @@ class SignalRule(abc.ABC):
     ) -> list[float]:
         """
         Загружает `length` значений индикатора до и включая `open_time`
+        через RedisTimeSeries (TS.RANGE)
         """
         redis = infra.redis_client
         key = f"ts_ind:{self.symbol}:{self.timeframe}:{param}"
 
         end_ts = int(open_time.timestamp() * 1000)
-        start_ts = end_ts - (length - 1) * 60_000  # предположительно 1 точка = 1 минута
+        start_ts = end_ts - (length - 1) * 60_000  # предполагается 1 точка = 1 минута
 
         try:
-            points = await redis.tsrange(key, start_ts, end_ts)
+            points = await redis.execute_command("TS.RANGE", key, start_ts, end_ts)
             return [float(v.decode() if isinstance(v, bytes) else v) for _, v in points]
         except Exception as e:
-            log.warning(f"[RULE_BASE] ⚠️ Ошибка при запросе {key}: {e}")
+            log.info(f"[RULE_BASE] ⚠️ Ошибка при запросе {key}: {e}")
             return []
