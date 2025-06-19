@@ -16,8 +16,12 @@ def load_signal_rule_instances():
     global RULE_INSTANCES
     loaded = 0
 
+    log.info(f"[RULE_LOADER] SIGNAL_CONFIGS: {len(SIGNAL_CONFIGS)}")
+
     for signal in SIGNAL_CONFIGS:
         rule_name = signal["rule"]
+        log.info(f"[RULE_LOADER] Обработка сигнала: {signal['name']} → rule={rule_name}")
+
         if not rule_name or rule_name not in RULE_DEFINITIONS:
             log.warning(f"[RULE_LOADER] Пропущен сигнал '{signal['name']}' — нет правила '{rule_name}'")
             continue
