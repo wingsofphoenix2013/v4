@@ -1,15 +1,16 @@
 # emacross_simple.py
 
+import logging
 from datetime import datetime
 from typing import Optional
 
 from rule_engine.base import SignalRule, SignalResult
 
+log = logging.getLogger("EMACROSS_SIMPLE")
 
 # 🔸 Правило генерации сигнала: EMA9 пересекает EMA21
 class EmaCrossSimple(SignalRule):
     def required_indicators(self) -> list[str]:
-        # Требуемые индикаторы для работы правила
         return ["ema9", "ema21"]
 
     async def update(
@@ -17,15 +18,15 @@ class EmaCrossSimple(SignalRule):
         open_time: datetime,
         indicator_values: dict[str, float]
     ) -> Optional[SignalResult]:
-        # Проверка наличия всех нужных значений
         if not all(k in indicator_values for k in self.required_indicators()):
+            log.warning(f"[EMACROSS_SIMPLE] ❌ Не хватает параметров: {indicator_values}")
             return None
 
         ema9 = indicator_values["ema9"]
         ema21 = indicator_values["ema21"]
 
-        # Простая логика: если ema9 выше ema21 — сигнал на long
         if ema9 > ema21:
+            log.info(f"[EMACROSS_SIMPLE] ✅ Сигнал LONG: EMA9 ({ema9}) > EMA21 ({ema21})")
             return SignalResult(
                 signal_id=self.signal_id,
                 direction="long",
@@ -33,6 +34,7 @@ class EmaCrossSimple(SignalRule):
                 details={"ema9": ema9, "ema21": ema21}
             )
         elif ema9 < ema21:
+            log.info(f"[EMACROSS_SIMPLE] ✅ Сигнал SHORT: EMA9 ({ema9}) < EMA21 ({ema21})")
             return SignalResult(
                 signal_id=self.signal_id,
                 direction="short",
@@ -40,5 +42,5 @@ class EmaCrossSimple(SignalRule):
                 details={"ema9": ema9, "ema21": ema21}
             )
 
-        # Если они равны — нет сигнала
+        log.info(f"[EMACROSS_SIMPLE] ℹ️ Пересечения нет: EMA9 = EMA21 = {ema9}")
         return None
