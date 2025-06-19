@@ -6,9 +6,9 @@ import logging
 # 🔸 Импорт базовых компонентов
 from infra import setup_logging, setup_pg, setup_redis_client, load_configs
 
-# from rule_processor import run_rule_processor
-# from core_io import run_core_io
-# from events_listener import run_event_listener
+from rule_processor import run_rule_processor
+from core_io import run_core_io
+from events_listener import run_event_listener
 
 log = logging.getLogger("GEN")
 
