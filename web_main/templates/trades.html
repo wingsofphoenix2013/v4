@@ -42,16 +42,23 @@
     {% endfor %}
   </div>
 
-  <!-- Фильтр по серии -->
-  <div class="flex space-x-3">
-    {% for s in ['2', '3', '4', '5'] %}
-    <a href="/trades?series={{ s }}{% if filter %}&filter={{ filter }}{% endif %}"
-       class="px-4 py-2 rounded-lg font-semibold transition
-       {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if series == s else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-      {{ s }}XX
-    </a>
-    {% endfor %}
-  </div>
+<!-- Фильтр по серии -->
+<div class="flex space-x-3">
+  <!-- Кнопка "Все серии" -->
+  <a href="/trades{% if filter %}?filter={{ filter }}{% endif %}"
+     class="px-3 py-2 rounded-lg font-semibold transition
+     {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if not series else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+    Все серии
+  </a>
+
+  {% for s in ['2', '3', '4', '5'] %}
+  <a href="/trades?series={{ s }}{% if filter %}&filter={{ filter }}{% endif %}"
+     class="px-3 py-2 rounded-lg font-semibold transition
+     {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if series == s else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+    {{ s }}XX
+  </a>
+  {% endfor %}
+</div>
 </div>
 
   <!-- Таблица стратегий -->
