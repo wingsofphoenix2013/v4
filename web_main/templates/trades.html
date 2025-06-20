@@ -29,26 +29,30 @@
     </header>
 <!-- Контейнер кнопок и таблицы -->
 <main class="max-w-7xl mx-auto px-4 py-10">
-
-  <!-- Панель кнопок фильтра -->
-  <div class="flex justify-start items-center mb-6 space-x-3">
-    <a href="/trades?filter=today" class="px-4 py-2 rounded-lg font-semibold transition
-      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == 'today' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-      Сегодня
+<!-- Панель кнопок фильтрации по дате и серии -->
+<div class="flex justify-between items-center mb-6">
+  <!-- Фильтр по дате -->
+  <div class="flex space-x-3">
+    {% for f in ['today', 'yesterday', '7days', 'all'] %}
+    <a href="/trades?filter={{ f }}{% if series %}&series={{ series }}{% endif %}"
+       class="px-4 py-2 rounded-lg font-semibold transition
+       {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == f else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      {% if f == 'today' %}Сегодня{% elif f == 'yesterday' %}Вчера{% elif f == '7days' %}7 дней{% else %}Всего{% endif %}
     </a>
-    <a href="/trades?filter=yesterday" class="px-4 py-2 rounded-lg font-semibold transition
-      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == 'yesterday' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-      Вчера
-    </a>
-    <a href="/trades?filter=7days" class="px-4 py-2 rounded-lg font-semibold transition
-      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == '7days' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-      7 дней
-    </a>
-    <a href="/trades?filter=all" class="px-4 py-2 rounded-lg font-semibold transition
-      {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == 'all' else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-      Всего
-    </a>
+    {% endfor %}
   </div>
+
+  <!-- Фильтр по серии -->
+  <div class="flex space-x-3">
+    {% for s in ['2', '3', '4', '5'] %}
+    <a href="/trades?series={{ s }}{% if filter %}&filter={{ filter }}{% endif %}"
+       class="px-4 py-2 rounded-lg font-semibold transition
+       {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if series == s else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      {{ s }}XX
+    </a>
+    {% endfor %}
+  </div>
+</div>
 
   <!-- Таблица стратегий -->
   <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">

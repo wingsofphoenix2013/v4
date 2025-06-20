@@ -751,18 +751,24 @@ async def save_testsignal(request: Request):
 
 # 🔸 Страница /trades — список активных стратегий с фильтрацией
 @app.get("/trades", response_class=HTMLResponse)
-async def trades_page(request: Request, filter: str = "today"):
+async def trades_page(request: Request, filter: str = "today", series: str = None):
     """
     Выводит таблицу активных стратегий и статистику по фильтру:
     - filter = today / yesterday / 7days / all
+    - series = "2", "3", "4", ... (по первой цифре кода стратегии, например strategy_2XX)
     """
     strategies = await get_trading_summary(filter)
+
+    if series:
+        prefix = f"strategy_{series}"
+        strategies = [s for s in strategies if s["name"].startswith(prefix)]
+
     return templates.TemplateResponse("trades.html", {
         "request": request,
         "strategies": strategies,
-        "filter": filter
+        "filter": filter,
+        "series": series,
     })
-    
 # 🔸 Расчёт статистики стратегий под /trades
 async def get_trading_summary(filter: str) -> list[dict]:
     """
