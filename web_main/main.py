@@ -1013,7 +1013,7 @@ async def strategy_detail_page(
             "count": 0,
             "positive": 0,
             "negative": 0,
-            "pnl": 0.0
+            "pnl": Decimal("0.0")
         })
 
         for i in range(days):
