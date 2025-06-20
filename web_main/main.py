@@ -934,9 +934,25 @@ async def strategy_detail_page(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
+        open_positions_raw = await conn.fetch("""
+            SELECT *
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'open'
+            ORDER BY created_at DESC
+        """, strategy["id"])
+
+        open_positions = [
+            {
+                **dict(p),
+                "created_at": p["created_at"].astimezone(KYIV_TZ) if p["created_at"] else None
+            }
+            for p in open_positions_raw
+        ]
+
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
         "strategy": dict(strategy),
+        "open_positions": open_positions,
         "filter": filter,
         "series": series,
     })
