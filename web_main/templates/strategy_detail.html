@@ -48,7 +48,7 @@
   <h2 class="text-lg font-semibold text-slate-800 mb-4">Открытые позиции</h2>
 
   <table class="w-full table-auto text-sm text-slate-800">
-    <thead class="text-left border-b border-slate-300">
+    <thead class="text-left bg-slate-100 text-slate-700 text-sm uppercase">
       <tr>
         <th class="pb-2">№</th>
         <th class="pb-2">Дата входа</th>
@@ -56,6 +56,7 @@
         <th class="pb-2">Направление</th>
         <th class="pb-2">Цена входа</th>
         <th class="pb-2">Состояние</th>
+        <th class="pb-2">Удержание</th>
         <th class="pb-2 text-right">Действия</th>
       </tr>
     </thead>
@@ -65,11 +66,19 @@
         <td class="py-2">{{ loop.index }}</td>
         <td class="py-2">{{ p.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
         <td class="py-2 font-bold uppercase">{{ p.symbol }}</td>
-        <td class="py-2">{{ p.direction }}</td>
+<td class="py-2 flex items-center space-x-1">
+  {% if p.direction == "long" %}
+    <span class="text-green-500 text-xs">▲</span>
+  {% elif p.direction == "short" %}
+    <span class="text-red-500 text-xs">▼</span>
+  {% endif %}
+  <span>{{ p.direction }}</span>
+</td>
         <td class="py-2">{{ "%.4f"|format(p.entry_price) if p.entry_price is not none else "—" }}</td>
         <td class="py-2">
           {{ p.close_reason if p.close_reason else "открыта" }}
         </td>
+        <td class="py-2">{{ (now - p.created_at).total_seconds() // 60 | int }} мин</td>
         <td class="py-2 text-right space-x-2">
           <button class="px-3 py-1 text-sm bg-slate-200 hover:bg-slate-300 rounded-md">Детали</button>
           <button class="px-3 py-1 text-sm bg-red-500 text-white hover:bg-red-600 rounded-md">Закрыть</button>

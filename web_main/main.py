@@ -949,10 +949,13 @@ async def strategy_detail_page(
             for p in open_positions_raw
         ]
 
+        now = datetime.now(KYIV_TZ)
+
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
         "strategy": dict(strategy),
         "open_positions": open_positions,
         "filter": filter,
         "series": series,
+        "now": now,
     })
