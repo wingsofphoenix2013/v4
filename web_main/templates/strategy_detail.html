@@ -33,25 +33,54 @@
    class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад к торгам</a>
 <!-- Карточка: Стратегия -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">Стратегия</h2>
-  <!-- Контент временно пуст -->
+  <div class="flex justify-between items-center mb-2">
+    <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
+    <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
+  </div>
+
+  {% if strategy.description %}
+  <div class="text-slate-700 text-base mb-6">
+    {{ strategy.description }}
+  </div>
+  {% endif %}
+
+  <div class="grid grid-cols-6 gap-2">
+    <button class="col-span-2 px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+      Детали
+    </button>
+    <button class="col-span-2 px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+      Статистика
+    </button>
+    <div></div><div></div> <!-- Разрыв -->
+
+    <button class="col-span-2 px-4 py-2 bg-yellow-100 hover:bg-yellow-200 rounded-lg font-medium text-yellow-800">
+      Пауза
+    </button>
+    <button class="col-span-2 px-4 py-2 bg-red-100 hover:bg-red-200 rounded-lg font-medium text-red-700">
+      Выключить
+    </button>
+    <button class="col-span-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium text-slate-600">
+      Архивировать
+    </button>
+  </div>
 </div>
 <!-- Карточка: Статистика -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
   <h2 class="text-lg font-semibold text-slate-800 mb-4">Статистика</h2>
 
   <table class="w-full table-auto text-sm text-slate-800 border-collapse">
-    <thead>
-      <tr class="bg-slate-100 text-slate-700 text-sm uppercase">
-        <th class="px-4 py-3 font-semibold text-left">Метрика</th>
-        <th class="px-4 py-3 font-semibold text-center">Всего</th>
-        {% for date in stat_dates %}
-        <th class="px-4 py-3 text-center {% if date == today_key %}font-semibold{% endif %}">
-          {{ date }}
-        </th>
-        {% endfor %}
-      </tr>
-    </thead>
+<thead>
+  <tr class="bg-slate-100 text-slate-700 text-sm uppercase">
+    <th class="px-4 py-3 font-semibold text-left">Метрика</th>
+    <th class="px-4 py-3 font-semibold text-center">Всего</th>
+    {% for date in stat_dates %}
+      {% set d = date.split('-') %}
+      <th class="px-4 py-3 text-center {% if date == today_key %}font-semibold{% endif %}">
+        {{ d[2] }}/{{ d[1] }}
+      </th>
+    {% endfor %}
+  </tr>
+</thead>
     <tbody class="text-center">
       <!-- Сделки -->
       <tr class="hover:bg-slate-50">
