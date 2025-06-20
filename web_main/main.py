@@ -915,3 +915,20 @@ async def status_page(request: Request):
             "stats": stats
         }
     )
+# 🔸 Детальная страница стратегии по её name
+@app.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
+async def strategy_detail_page(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow(...)
+
+    return templates.TemplateResponse("strategy_detail.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+    })
