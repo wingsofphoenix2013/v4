@@ -116,7 +116,7 @@
         <th class="px-4 py-3">Вход</th>
         <th class="px-4 py-3">Выход</th>
         <th class="px-4 py-3">Статус</th>
-        <th class="px-4 py-3 text-left">Дата выхода</th>
+        <th class="px-4 py-3">Удерж.</th>
         <th class="px-4 py-3">PnL</th>
         <th class="px-4 py-3 text-right">Детали</th>
       </tr>
@@ -138,10 +138,23 @@
         <td class="py-2">{{ p.entry_price if p.entry_price is not none else "—" }}</td>
         <td class="py-2">{{ p.exit_price if p.exit_price is not none else "—" }}</td>
         <td class="py-2">{{ p.close_reason if p.close_reason else "—" }}</td>
-        <td class="py-2 text-left">
-          {{ p.closed_at.strftime('%Y-%m-%d %H:%M:%S') if p.closed_at else "—" }}
-        </td>
-        <td class="py-2">{{ p.pnl if p.pnl is not none else "—" }}</td>
+<td class="py-2">
+  {% set duration = (p.closed_at - p.created_at).total_seconds() | int %}
+  {% set hours = duration // 3600 %}
+  {% set minutes = (duration % 3600) // 60 %}
+  {{ hours }} ч {{ minutes }} мин
+</td>
+<td class="py-2 font-bold">
+  {% if p.pnl is none %}
+    —
+  {% elif p.pnl > 0 %}
+    <span class="text-green-600">{{ p.pnl }}</span>
+  {% elif p.pnl < 0 %}
+    <span class="text-red-600">{{ p.pnl }}</span>
+  {% else %}
+    <span class="text-slate-800">{{ p.pnl }}</span>
+  {% endif %}
+</td>
         <td class="py-2 text-right">
           <button class="px-3 py-1 text-sm bg-slate-200 hover:bg-slate-300 rounded-md">Детали</button>
         </td>
