@@ -49,22 +49,22 @@
   <table class="w-full table-auto text-sm text-slate-800">
     <thead class="text-left bg-slate-100 text-slate-700 text-sm uppercase">
       <tr>
-        <th class="px-4 py-3">№</th>
+        <th class="px-4 py-3 text-center">№</th>
         <th class="px-4 py-3">Дата входа</th>
-        <th class="px-4 py-3">Тикер</th>
-        <th class="px-4 py-3">Направление</th>
-        <th class="px-4 py-3">Цена входа</th>
-        <th class="px-4 py-3">TP</th>
-        <th class="px-4 py-3">SL</th>
-        <th class="px-4 py-3">Состояние</th>
-        <th class="px-4 py-3">Удержание</th>
+        <th class="px-4 py-3 text-center">Тикер</th>
+        <th class="px-4 py-3 text-center">Напр.</th>
+        <th class="px-4 py-3 text-center">Вход</th>
+        <th class="px-4 py-3 text-center">TP</th>
+        <th class="px-4 py-3 text-center">SL</th>
+        <th class="px-4 py-3 text-center">Статус</th>
+        <th class="px-4 py-3 text-center">Удерж.</th>
         <th class="px-4 py-3 text-right">Действия</th>
       </tr>
     </thead>
     <tbody>
       {% for p in open_positions %}
       <tr class="border-b border-slate-100">
-        <td class="py-2">{{ loop.index }}</td>
+        <td class="py-2 text-center">{{ loop.index }}</td>
         <td class="py-2">{{ p.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
         <td class="py-2 font-bold uppercase">{{ p.symbol }}</td>
         <td class="py-2 flex items-center space-x-1">
@@ -75,20 +75,23 @@
           {% endif %}
           <span>{{ p.direction }}</span>
         </td>
-        <td class="py-2">{{ p.entry_price if p.entry_price is not none else "—" }}</td>
-        <td class="py-2">
+        <td class="py-2 text-center">{{ p.entry_price if p.entry_price is not none else "—" }}</td>
+        <td class="py-2 text-center">
           {% set tp = tp_sl_by_uid.get(p.position_uid, {}).get('tp') %}
           {{ tp.price if tp else "—" }}
         </td>
-        <td class="py-2">
+        <td class="py-2 text-center">
           {% set sl = tp_sl_by_uid.get(p.position_uid, {}).get('sl') %}
           {{ sl.price if sl else "—" }}
         </td>
-        <td class="py-2">
+        <td class="py-2 text-center">
           {{ p.close_reason if p.close_reason else "открыта" }}
         </td>
-        <td class="py-2">
-          {{ (now - p.created_at).total_seconds() // 60 | int }} мин
+        <td class="py-2 text-center">
+{% set duration = (now - p.created_at).total_seconds() | int %}
+{% set hours = duration // 3600 %}
+{% set minutes = (duration % 3600) // 60 %}
+{{ hours }} ч {{ minutes }} мин
         </td>
         <td class="py-2 text-right space-x-2">
           <button class="px-3 py-1 text-sm bg-slate-200 hover:bg-slate-300 rounded-md">Детали</button>
