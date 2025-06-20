@@ -916,6 +916,7 @@ async def status_page(request: Request):
         }
     )
 # 🔸 Детальная страница стратегии по её name
+# 🔸 Детальная страница стратегии по её name
 @app.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_detail_page(
     request: Request,
@@ -934,6 +935,7 @@ async def strategy_detail_page(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
+        # Открытые позиции
         open_positions_raw = await conn.fetch("""
             SELECT *
             FROM positions_v4
@@ -949,12 +951,38 @@ async def strategy_detail_page(
             for p in open_positions_raw
         ]
 
+        # Получаем TP/SL цели для открытых позиций
+        position_uids = [p["position_uid"] for p in open_positions]
+        targets_raw = await conn.fetch("""
+            SELECT *
+            FROM position_targets_v4
+            WHERE position_uid = ANY($1::text[])
+              AND hit = false AND canceled = false
+        """, position_uids)
+
+        # Сгруппировать TP/SL по UID
+        targets_by_uid = {}
+        for t in targets_raw:
+            uid = t["position_uid"]
+            targets_by_uid.setdefault(uid, []).append(dict(t))
+
+        # Отобрать только ближайший TP и один SL
+        tp_sl_by_uid = {}
+        for uid, targets in targets_by_uid.items():
+            tp = sorted((t for t in targets if t["type"] == "tp"), key=lambda x: x["level"])
+            sl = [t for t in targets if t["type"] == "sl"]
+            tp_sl_by_uid[uid] = {
+                "tp": tp[0] if tp else None,
+                "sl": sl[0] if sl else None
+            }
+
         now = datetime.now(KYIV_TZ)
 
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
         "strategy": dict(strategy),
         "open_positions": open_positions,
+        "tp_sl_by_uid": tp_sl_by_uid,
         "filter": filter,
         "series": series,
         "now": now,
