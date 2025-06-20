@@ -924,7 +924,15 @@ async def strategy_detail_page(
     series: str = None
 ):
     async with pg_pool.acquire() as conn:
-        strategy = await conn.fetchrow(...)
+        strategy = await conn.fetchrow("""
+            SELECT s.*, sig.name AS signal_name
+            FROM strategies_v4 s
+            LEFT JOIN signals_v4 sig ON sig.id = s.signal_id
+            WHERE s.name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
