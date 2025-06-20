@@ -36,11 +36,115 @@
   <h2 class="text-lg font-semibold text-slate-800 mb-2">Стратегия</h2>
   <!-- Контент временно пуст -->
 </div>
-
 <!-- Карточка: Статистика -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">Статистика</h2>
-  <!-- Контент временно пуст -->
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">Статистика</h2>
+
+  <table class="w-full table-auto text-sm text-slate-800 border-collapse">
+    <thead>
+      <tr class="bg-slate-100 text-slate-700 text-sm uppercase">
+        <th class="px-4 py-3 font-semibold text-left">Метрика</th>
+        <th class="px-4 py-3 font-semibold text-center">Всего</th>
+        {% for date in stat_dates %}
+        <th class="px-4 py-3 text-center {% if date == today_key %}font-semibold{% endif %}">
+          {{ date }}
+        </th>
+        {% endfor %}
+      </tr>
+    </thead>
+    <tbody class="text-center">
+      <!-- Сделки -->
+      <tr class="hover:bg-slate-50">
+        <td class="px-4 py-2 font-semibold text-left">Сделки</td>
+        <td class="py-2 font-semibold">{{ total_stats.count }}</td>
+        {% for date in stat_dates %}
+        {% set d = daily_stats.get(date) %}
+        <td class="py-2">{{ d.count if d and d.count else '—' }}</td>
+        {% endfor %}
+      </tr>
+
+      <!-- Плюс/Минус -->
+      <tr class="hover:bg-slate-50">
+        <td class="px-4 py-2 font-semibold text-left">Плюс/Минус</td>
+        <td class="py-2 font-semibold">
+          +{{ total_stats.positive }} / -{{ total_stats.negative }}
+        </td>
+        {% for date in stat_dates %}
+        {% set d = daily_stats.get(date) %}
+        <td class="py-2">
+          {% if d %}
+            +{{ d.positive }} / -{{ d.negative }}
+          {% else %}—{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+
+      <!-- Winrate -->
+      <tr class="hover:bg-slate-50">
+        <td class="px-4 py-2 font-semibold text-left">Winrate</td>
+        <td class="py-2 font-semibold">
+          {% if total_stats.count %}
+            {{ (total_stats.positive / total_stats.count * 100) | round(1) }}%
+          {% else %}—{% endif %}
+        </td>
+        {% for date in stat_dates %}
+        {% set d = daily_stats.get(date) %}
+        <td class="py-2">
+          {% if d and d.count %}
+            {{ (d.positive / d.count * 100) | round(1) }}%
+          {% else %}—{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+
+      <!-- PnL -->
+      <tr class="hover:bg-slate-50">
+        <td class="px-4 py-2 font-semibold text-left">PnL</td>
+        <td class="py-2 font-semibold">
+          <span class="{% if total_stats.pnl > 0 %}text-green-600{% elif total_stats.pnl < 0 %}text-red-600{% else %}text-slate-800{% endif %}">
+            {{ total_stats.pnl | round(2) }}
+          </span>
+        </td>
+        {% for date in stat_dates %}
+        {% set d = daily_stats.get(date) %}
+        <td class="py-2">
+          {% if d and d.pnl is not none %}
+            <span class="{% if d.pnl > 0 %}text-green-600{% elif d.pnl < 0 %}text-red-600{% else %}text-slate-800{% endif %}">
+              {{ d.pnl | round(2) }}
+            </span>
+          {% else %}—{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+
+      <!-- ROI -->
+      <tr class="hover:bg-slate-50">
+        <td class="px-4 py-2 font-semibold text-left">ROI</td>
+        <td class="py-2 font-semibold">
+          {% if roi is not none %}
+            <span class="{% if roi > 0 %}text-green-600{% elif roi < 0 %}text-red-600{% else %}text-slate-800{% endif %}">
+              {{ roi | round(2) }}%
+            </span>
+          {% else %}—{% endif %}
+        </td>
+        {% for date in stat_dates %}
+        {% set d = daily_stats.get(date) %}
+        {% if strategy.deposit %}
+        <td class="py-2">
+          {% set daily_roi = (d.pnl / strategy.deposit * 100) if d else none %}
+          {% if daily_roi is not none %}
+            <span class="{% if daily_roi > 0 %}text-green-600{% elif daily_roi < 0 %}text-red-600{% else %}text-slate-800{% endif %}">
+              {{ daily_roi | round(2) }}%
+            </span>
+          {% else %}—{% endif %}
+        </td>
+        {% else %}
+        <td class="py-2">—</td>
+        {% endif %}
+        {% endfor %}
+      </tr>
+    </tbody>
+  </table>
 </div>
 <!-- Карточка: Открытые позиции -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">

@@ -4,6 +4,7 @@ import logging
 from decimal import Decimal
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+from collections import defaultdict
 
 import asyncpg
 import redis.asyncio as aioredis
@@ -915,7 +916,6 @@ async def status_page(request: Request):
             "stats": stats
         }
     )
-# 🔸 Детальная страница стратегии по её name
 @app.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_detail_page(
     request: Request,
@@ -925,7 +925,7 @@ async def strategy_detail_page(
     page: int = 1
 ):
     async with pg_pool.acquire() as conn:
-        # Получение стратегии
+        # Стратегия
         strategy = await conn.fetchrow("""
             SELECT s.*, sig.name AS signal_name
             FROM strategies_v4 s
@@ -938,7 +938,7 @@ async def strategy_detail_page(
 
         strategy_id = strategy["id"]
 
-        # 🔹 Открытые позиции
+        # Открытые позиции
         open_positions_raw = await conn.fetch("""
             SELECT *
             FROM positions_v4
@@ -954,7 +954,7 @@ async def strategy_detail_page(
             for p in open_positions_raw
         ]
 
-        # 🔹 TP/SL цели
+        # TP/SL цели
         position_uids = [p["position_uid"] for p in open_positions]
         targets_raw = await conn.fetch("""
             SELECT *
@@ -977,7 +977,7 @@ async def strategy_detail_page(
                 "sl": sl[0] if sl else None
             }
 
-        # 🔹 Закрытые позиции (история торгов)
+        # Закрытые позиции (история)
         page_size = 50
         offset = (page - 1) * page_size
 
@@ -998,7 +998,7 @@ async def strategy_detail_page(
             for p in closed_positions_raw
         ]
 
-        # Общее количество записей
+        # Общее количество закрытых сделок
         total_closed = await conn.fetchval("""
             SELECT COUNT(*)
             FROM positions_v4
@@ -1006,6 +1006,50 @@ async def strategy_detail_page(
         """, strategy_id)
 
         total_pages = (total_closed + page_size - 1) // page_size
+
+        # Статистика по 10 дням (включая сегодня)
+        days = 10
+        daily_stats = defaultdict(lambda: {
+            "count": 0,
+            "positive": 0,
+            "negative": 0,
+            "pnl": 0.0
+        })
+
+        for i in range(days):
+            day_start, day_end = get_kyiv_day_bounds(i)
+            rows = await conn.fetch("""
+                SELECT pnl
+                FROM positions_v4
+                WHERE strategy_id = $1 AND status = 'closed'
+                  AND closed_at BETWEEN $2 AND $3
+            """, strategy_id, day_start, day_end)
+
+            date_key = day_start.strftime('%Y-%m-%d')
+            for row in rows:
+                pnl = row["pnl"]
+                daily_stats[date_key]["count"] += 1
+                daily_stats[date_key]["pnl"] += pnl
+                if pnl >= 0:
+                    daily_stats[date_key]["positive"] += 1
+                else:
+                    daily_stats[date_key]["negative"] += 1
+
+        total_stats = {
+            "count": sum(d["count"] for d in daily_stats.values()),
+            "positive": sum(d["positive"] for d in daily_stats.values()),
+            "negative": sum(d["negative"] for d in daily_stats.values()),
+            "pnl": sum(d["pnl"] for d in daily_stats.values())
+        }
+
+        deposit = strategy["deposit"] or 0
+        roi = (total_stats["pnl"] / deposit * 100) if deposit else None
+
+        stat_dates = [
+            get_kyiv_day_bounds(i)[0].strftime('%Y-%m-%d')
+            for i in reversed(range(days))
+        ]
+        today_key = stat_dates[-1]
         now = datetime.now(KYIV_TZ)
 
     return templates.TemplateResponse("strategy_detail.html", {
@@ -1019,4 +1063,9 @@ async def strategy_detail_page(
         "filter": filter,
         "series": series,
         "now": now,
+        "stat_dates": stat_dates,
+        "daily_stats": daily_stats,
+        "total_stats": total_stats,
+        "roi": roi,
+        "today_key": today_key,
     })
