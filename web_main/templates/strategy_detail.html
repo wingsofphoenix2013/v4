@@ -63,7 +63,7 @@
     </thead>
     <tbody>
       {% for p in open_positions %}
-      <tr class="border-b border-slate-100">
+      <tr class="border-b border-slate-100 hover:bg-slate-50">
         <td class="py-2 text-center">{{ loop.index }}</td>
         <td class="py-2">{{ p.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
         <td class="py-2 font-bold uppercase">{{ p.symbol }}</td>
@@ -104,8 +104,64 @@
 </div>
 <!-- Карточка: История торгов -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">История торгов</h2>
-  <!-- Контент временно пуст -->
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">История торгов</h2>
+
+  <table class="w-full table-auto text-sm text-slate-800">
+    <thead class="text-center bg-slate-100 text-slate-700 text-sm uppercase">
+      <tr>
+        <th class="px-4 py-3">№</th>
+        <th class="px-4 py-3 text-left">Дата входа</th>
+        <th class="px-4 py-3">Тикер</th>
+        <th class="px-4 py-3">Напр.</th>
+        <th class="px-4 py-3">Вход</th>
+        <th class="px-4 py-3">Выход</th>
+        <th class="px-4 py-3">Статус</th>
+        <th class="px-4 py-3 text-left">Дата выхода</th>
+        <th class="px-4 py-3">PnL</th>
+        <th class="px-4 py-3 text-right">Детали</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in closed_positions %}
+      <tr class="border-b border-slate-100 hover:bg-slate-50 text-center">
+        <td class="py-2">{{ loop.index + ((current_page - 1) * 50) }}</td>
+        <td class="py-2 text-left">{{ p.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td class="py-2 font-bold uppercase">{{ p.symbol }}</td>
+        <td class="py-2">
+          {% if p.direction == "long" %}
+            <span class="text-green-500 text-xs">▲</span>
+          {% elif p.direction == "short" %}
+            <span class="text-red-500 text-xs">▼</span>
+          {% endif %}
+          {{ p.direction }}
+        </td>
+        <td class="py-2">{{ p.entry_price if p.entry_price is not none else "—" }}</td>
+        <td class="py-2">{{ p.exit_price if p.exit_price is not none else "—" }}</td>
+        <td class="py-2">{{ p.close_reason if p.close_reason else "—" }}</td>
+        <td class="py-2 text-left">
+          {{ p.closed_at.strftime('%Y-%m-%d %H:%M:%S') if p.closed_at else "—" }}
+        </td>
+        <td class="py-2">{{ p.pnl if p.pnl is not none else "—" }}</td>
+        <td class="py-2 text-right">
+          <button class="px-3 py-1 text-sm bg-slate-200 hover:bg-slate-300 rounded-md">Детали</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <!-- Пагинация -->
+  {% if total_pages > 1 %}
+  <div class="mt-4 flex justify-center space-x-2">
+    {% for i in range(1, total_pages + 1) %}
+    <a href="?page={{ i }}{% if filter %}&filter={{ filter }}{% endif %}{% if series %}&series={{ series }}{% endif %}"
+       class="px-3 py-1 rounded-md text-sm font-medium
+              {{ 'bg-blue-600 text-white' if i == current_page else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+      {{ i }}
+    </a>
+    {% endfor %}
+  </div>
+  {% endif %}
 </div>
 </main>
 	</body>

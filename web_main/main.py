@@ -916,15 +916,16 @@ async def status_page(request: Request):
         }
     )
 # 🔸 Детальная страница стратегии по её name
-# 🔸 Детальная страница стратегии по её name
 @app.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_detail_page(
     request: Request,
     strategy_name: str,
     filter: str = None,
-    series: str = None
+    series: str = None,
+    page: int = 1
 ):
     async with pg_pool.acquire() as conn:
+        # Получение стратегии
         strategy = await conn.fetchrow("""
             SELECT s.*, sig.name AS signal_name
             FROM strategies_v4 s
@@ -935,13 +936,15 @@ async def strategy_detail_page(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
-        # Открытые позиции
+        strategy_id = strategy["id"]
+
+        # 🔹 Открытые позиции
         open_positions_raw = await conn.fetch("""
             SELECT *
             FROM positions_v4
             WHERE strategy_id = $1 AND status = 'open'
             ORDER BY created_at DESC
-        """, strategy["id"])
+        """, strategy_id)
 
         open_positions = [
             {
@@ -951,7 +954,7 @@ async def strategy_detail_page(
             for p in open_positions_raw
         ]
 
-        # Получаем TP/SL цели для открытых позиций
+        # 🔹 TP/SL цели
         position_uids = [p["position_uid"] for p in open_positions]
         targets_raw = await conn.fetch("""
             SELECT *
@@ -960,13 +963,11 @@ async def strategy_detail_page(
               AND hit = false AND canceled = false
         """, position_uids)
 
-        # Сгруппировать TP/SL по UID
         targets_by_uid = {}
         for t in targets_raw:
             uid = t["position_uid"]
             targets_by_uid.setdefault(uid, []).append(dict(t))
 
-        # Отобрать только ближайший TP и один SL
         tp_sl_by_uid = {}
         for uid, targets in targets_by_uid.items():
             tp = sorted((t for t in targets if t["type"] == "tp"), key=lambda x: x["level"])
@@ -976,6 +977,35 @@ async def strategy_detail_page(
                 "sl": sl[0] if sl else None
             }
 
+        # 🔹 Закрытые позиции (история торгов)
+        page_size = 50
+        offset = (page - 1) * page_size
+
+        closed_positions_raw = await conn.fetch("""
+            SELECT *
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+            ORDER BY closed_at DESC
+            LIMIT $2 OFFSET $3
+        """, strategy_id, page_size, offset)
+
+        closed_positions = [
+            {
+                **dict(p),
+                "created_at": p["created_at"].astimezone(KYIV_TZ) if p["created_at"] else None,
+                "closed_at": p["closed_at"].astimezone(KYIV_TZ) if p["closed_at"] else None,
+            }
+            for p in closed_positions_raw
+        ]
+
+        # Общее количество записей
+        total_closed = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy_id)
+
+        total_pages = (total_closed + page_size - 1) // page_size
         now = datetime.now(KYIV_TZ)
 
     return templates.TemplateResponse("strategy_detail.html", {
@@ -983,6 +1013,9 @@ async def strategy_detail_page(
         "strategy": dict(strategy),
         "open_positions": open_positions,
         "tp_sl_by_uid": tp_sl_by_uid,
+        "closed_positions": closed_positions,
+        "current_page": page,
+        "total_pages": total_pages,
         "filter": filter,
         "series": series,
         "now": now,
