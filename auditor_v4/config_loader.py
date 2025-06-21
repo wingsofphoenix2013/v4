@@ -43,21 +43,14 @@ async def load_enabled_strategies():
 async def load_enabled_indicators():
     query = """
         SELECT 
-            i.id,
-            i.indicator,
-            i.timeframe,
-            i.enabled,
-            i.stream_publish,
-            i.created_at,
-            COALESCE(v.symbol, NULL) AS symbol
-        FROM indicator_instances_v4 i
-        LEFT JOIN LATERAL (
-            SELECT symbol 
-            FROM indicator_values_v4 
-            WHERE instance_id = i.id 
-            LIMIT 1
-        ) v ON true
-        WHERE i.enabled = true
+            id,
+            indicator,
+            timeframe,
+            enabled,
+            stream_publish,
+            created_at
+        FROM indicator_instances_v4
+        WHERE enabled = true
     """
 
     async with infra.pg_pool.acquire() as conn:
@@ -65,7 +58,7 @@ async def load_enabled_indicators():
         indicators = {}
 
         for r in rows:
-            key = f"{r['id']}::{r['symbol'] or 'NONE'}"
+            key = str(r["id"])  # ключ = только ID
             indicators[key] = dict(r)
 
         infra.set_enabled_indicators(indicators)
@@ -73,7 +66,6 @@ async def load_enabled_indicators():
 
         log.info("📄 Список загруженных индикаторов:")
         for key, item in indicators.items():
-            symbol = item.get("symbol") or "NONE"
             indicator = item["indicator"]
             tf = item["timeframe"]
             log.info(f"• {key} → {indicator} ({tf})")

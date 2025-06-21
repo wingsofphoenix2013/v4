@@ -62,14 +62,14 @@ async def process_position(position: dict):
     base_idx = tf_order.index(base_tf)
     allowed_tfs = tf_order[:base_idx + 1]
 
-    # 🔸 Фильтрация индикаторов по symbol и допустимым таймфреймам
+    # 🔸 Фильтрация индикаторов только по допустимым таймфреймам
     indicators = [
         i for i in infra.enabled_indicators.values()
-        if i.get("symbol") == symbol and i.get("timeframe") in allowed_tfs
+        if i.get("timeframe") in allowed_tfs
     ]
 
     if not indicators:
-        log.info(f"ℹ️ Нет индикаторов для позиции {uid} ({symbol})")
+        log.info(f"ℹ️ Нет индикаторов для позиции {uid}")
         return
 
     snapshot_rows = []
