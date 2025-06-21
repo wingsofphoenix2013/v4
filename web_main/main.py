@@ -1070,7 +1070,12 @@ async def strategy_detail_page(
         "today_key": today_key,
     })
 @app.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
-async def strategy_stats_overview(request: Request, strategy_name: str):
+async def strategy_stats_overview(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
     async with pg_pool.acquire() as conn:
         strategy = await conn.fetchrow("""
             SELECT *
@@ -1083,5 +1088,7 @@ async def strategy_stats_overview(request: Request, strategy_name: str):
 
     return templates.TemplateResponse("strategy_stats.html", {
         "request": request,
-        "strategy": dict(strategy)
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series
     })
