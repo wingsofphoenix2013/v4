@@ -56,7 +56,11 @@ async def load_enabled_indicators():
 # 🔸 Слушатель PubSub событий
 async def config_event_listener():
     pubsub = infra.redis_client.pubsub()
-    await pubsub.subscribe("tickers_v4_events", "strategies_v4_events", "indicator_v4_events")
+    await pubsub.subscribe(
+        "tickers_v4_events",
+        "strategies_v4_events",
+        "indicators_v4_events"  # ✅ правильное имя
+    )
     log.info("📡 Подписка на конфигурационные каналы Redis начата")
 
     async for message in pubsub.listen():
@@ -81,7 +85,7 @@ async def config_event_listener():
                 await load_enabled_tickers()
             elif channel == "strategies_v4_events":
                 await load_enabled_strategies()
-            elif channel == "indicator_v4_events":
+            elif channel == "indicators_v4_events":
                 await load_enabled_indicators()
         except Exception:
             log.exception(f"❌ Ошибка при обновлении конфигурации из {channel}")
