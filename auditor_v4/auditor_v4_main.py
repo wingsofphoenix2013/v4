@@ -9,6 +9,12 @@ from infra import (
     setup_pg,
     setup_redis_client,
 )
+from config_loader import (
+    load_enabled_tickers,
+    load_enabled_strategies,
+    load_enabled_indicators,
+    config_event_listener,
+)
 from core_io import pg_task
 from redis_io import redis_task
 
@@ -39,6 +45,15 @@ async def main():
     except Exception:
         log.exception("❌ Ошибка инициализации внешних сервисов")
         return
+        
+    try:
+        await load_enabled_tickers()
+        await load_enabled_strategies()
+        await load_enabled_indicators()
+        log.info("📦 Конфигурации тикеров, стратегий и индикаторов загружены")
+    except Exception:
+        log.exception("❌ Ошибка загрузки начальной конфигурации")
+        return
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -50,6 +65,7 @@ async def main():
     await asyncio.gather(
         run_safe_loop(lambda: pg_task(stop_event), "CORE_IO"),
         run_safe_loop(lambda: redis_task(stop_event), "REDIS_IO"),
+        run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         stop_event.wait()
     )
 

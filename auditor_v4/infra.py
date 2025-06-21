@@ -63,3 +63,29 @@ async def setup_redis_client():
     await client.ping()
     globals()["redis_client"] = client
     log.info("📡 Подключение к Redis установлено")
+    
+# 🔸 Глобальные конфигурации
+enabled_tickers = {}
+enabled_strategies = {}
+enabled_indicators = {}
+
+
+# 🔸 Обновление кэша тикеров
+def set_enabled_tickers(new_dict: dict):
+    global enabled_tickers
+    enabled_tickers = new_dict
+    log.debug("Кэш тикеров обновлён (%d)", len(new_dict))
+
+
+# 🔸 Обновление кэша стратегий
+def set_enabled_strategies(new_dict: dict):
+    global enabled_strategies
+    enabled_strategies = new_dict
+    log.debug("Кэш стратегий обновлён (%d)", len(new_dict))
+
+
+# 🔸 Обновление кэша индикаторов
+def set_enabled_indicators(new_dict: dict):
+    global enabled_indicators
+    enabled_indicators = new_dict
+    log.debug("Кэш индикаторов обновлён (%d)", len(new_dict))
