@@ -9,14 +9,38 @@ from infra import pg_pool
 log = logging.getLogger("CORE_IO")
 
 
+# 🔸 Загрузка неаудированных закрытых позиций
+async def load_unprocessed_positions(limit: int = 100) -> list[dict]:
+    log.info("📥 Загрузка неаудированных позиций из базы...")
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT *
+            FROM positions_v4_test
+            WHERE status = 'closed' AND audited = false
+            ORDER BY created_at
+            LIMIT $1
+        """, limit)
+    log.info(f"📊 Загружено {len(rows)} позиций на аудит")
+    return [dict(r) for r in rows]
+
+
 # 🔸 Основной воркер PostgreSQL
 async def pg_task(stop_event: asyncio.Event):
     while not stop_event.is_set():
         try:
-            # Здесь будет логика: чистка, агрегация, аудит и т.п.
-            log.info("⏳ pg_task: имитация работы с PostgreSQL")
-            await asyncio.sleep(600)
+            log.info("🔁 Начало аудиторского прохода")
+            positions = await load_unprocessed_positions()
+
+            if not positions:
+                log.info("✅ Нет новых позиций для аудита — пауза")
+                await asyncio.sleep(60)
+                continue
+
+            # Здесь в следующих шагах появится логика обработки позиций
+
+            log.info("⏸ Пауза до следующего цикла")
+            await asyncio.sleep(60)
 
         except Exception:
             log.exception("❌ Ошибка в pg_task — продолжаем выполнение")
-            await asyncio.sleep(5)  # предотвратить лавинообразный перезапуск
+            await asyncio.sleep(5)
