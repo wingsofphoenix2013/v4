@@ -1092,3 +1092,25 @@ async def strategy_stats_overview(
         "filter": filter,
         "series": series
     })
+@app.get("/trades/details/{strategy_name}/stats/adx", response_class=HTMLResponse)
+async def strategy_adx_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+    return templates.TemplateResponse("strategy_stats_adx.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series
+    })

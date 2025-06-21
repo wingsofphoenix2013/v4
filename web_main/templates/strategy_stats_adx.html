@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ADX: Статистика по стратегии</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body {
+        background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
+      }
+    </style>
+  </head>
+  <body class="min-h-screen font-sans text-slate-800">
+    <!-- Верхнее меню -->
+    <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
+      <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+        <h1 class="text-2xl font-semibold text-blue-900 tracking-wide">Торговый Движок v4</h1>
+        <nav class="space-x-4 text-sm font-medium text-slate-700">
+          <a href="/" class="hover:text-blue-600 transition-colors">Главная</a>
+          <a href="/tickers" class="hover:text-blue-600 transition-colors">Тикеры</a>
+          <a href="/indicators" class="hover:text-blue-600 transition-colors">Индикаторы</a>
+          <a href="/signals" class="hover:text-blue-600 transition-colors">Сигналы</a>
+          <a href="/strategies" class="hover:text-blue-600 transition-colors">Стратегии</a>
+          <a href="/trades" class="hover:text-blue-600 transition-colors">Торги</a>
+          <a href="/status" class="hover:text-blue-600 transition-colors">Статус</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 py-10">
+      <!-- Назад к общей статистике -->
+      <a href="/trades/details/{{ strategy.name }}/stats?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+         class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">
+        Назад к статистике
+      </a>
+
+      <!-- Карточка: Стратегия -->
+      <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+        <div class="flex justify-between items-start mb-4">
+          <div>
+            <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
+            {% if strategy.description %}
+            <p class="text-sm text-slate-700 w-1/2 break-words mt-1">
+              {{ strategy.description }}
+            </p>
+            {% endif %}
+          </div>
+          <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
+        </div>
+      </div>
+
+      <!-- Карточка: Данные по индикатору ADX -->
+      <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+        <h2 class="text-lg font-semibold text-slate-800 mb-2">Данные по индикатору ADX</h2>
+        <!-- Контент в разработке -->
+        <p class="text-slate-600">Здесь будет аналитика по сигналам и эффективности стратегии в зависимости от значений ADX/DMI.</p>
+      </div>
+    </main>
+  </body>
+</html>
