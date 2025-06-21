@@ -55,13 +55,15 @@ async def load_enabled_indicators():
 
 # 🔸 Слушатель PubSub событий
 async def config_event_listener():
+    log = logging.getLogger("CONFIG_LOADER")
+
     pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe(
         "tickers_v4_events",
         "strategies_v4_events",
-        "indicators_v4_events"  # ✅ правильное имя
+        "indicators_v4_events"
     )
-    log.info("📡 Подписка на конфигурационные каналы Redis начата")
+    log.info("📡 Подписка на Redis каналы завершена")
 
     async for message in pubsub.listen():
         if message["type"] != "message":
@@ -69,23 +71,18 @@ async def config_event_listener():
 
         try:
             data = json.loads(message["data"])
-        except Exception:
-            log.warning("⚠️ Невалидное сообщение в PubSub")
-            continue
+            channel = message["channel"]
+            if isinstance(channel, bytes):  # Redis может вернуть channel в bytes
+                channel = channel.decode()
 
-        event = data.get("event")
-        if not event:
-            continue
+            log.info(f"🔔 Событие: {data.get('event')} в {channel}")
 
-        channel = message["channel"]
-        log.info(f"🔔 Событие: {event} в {channel}")
-
-        try:
             if channel == "tickers_v4_events":
                 await load_enabled_tickers()
             elif channel == "strategies_v4_events":
                 await load_enabled_strategies()
             elif channel == "indicators_v4_events":
                 await load_enabled_indicators()
-        except Exception:
-            log.exception(f"❌ Ошибка при обновлении конфигурации из {channel}")
+
+        except Exception as e:
+            log.exception(f"❌ Ошибка при обработке сообщения PubSub: {e}")
