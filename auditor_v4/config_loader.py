@@ -42,29 +42,41 @@ async def load_enabled_strategies():
 # 🔸 Загрузка активных индикаторов
 async def load_enabled_indicators():
     query = """
-        SELECT DISTINCT
+        SELECT 
             i.id,
             i.indicator,
             i.timeframe,
             i.enabled,
             i.stream_publish,
             i.created_at,
-            v.symbol
+            COALESCE(v.symbol, NULL) AS symbol
         FROM indicator_instances_v4 i
-        JOIN indicator_values_v4 v ON v.instance_id = i.id
+        LEFT JOIN LATERAL (
+            SELECT symbol 
+            FROM indicator_values_v4 
+            WHERE instance_id = i.id 
+            LIMIT 1
+        ) v ON true
         WHERE i.enabled = true
     """
+
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
         indicators = {}
 
         for r in rows:
-            key = f"{r['id']}::{r['symbol']}"
+            key = f"{r['id']}::{r['symbol'] or 'NONE'}"
             indicators[key] = dict(r)
 
         infra.set_enabled_indicators(indicators)
         log.info(f"✅ Загружено индикаторов: {len(indicators)}")
 
+        log.info("📄 Список загруженных индикаторов:")
+        for key, item in indicators.items():
+            symbol = item.get("symbol") or "NONE"
+            indicator = item["indicator"]
+            tf = item["timeframe"]
+            log.info(f"• {key} → {indicator} ({tf})")
 # 🔸 Слушатель PubSub событий
 async def config_event_listener():
     log = logging.getLogger("CONFIG_LOADER")
