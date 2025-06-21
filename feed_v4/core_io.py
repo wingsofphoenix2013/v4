@@ -3,6 +3,7 @@ import asyncio
 from decimal import Decimal
 from datetime import datetime, timezone
 import logging
+import json
 
 # 🔸 Сопоставление интервалов с таблицами
 TABLE_MAP = {
