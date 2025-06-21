@@ -35,21 +35,44 @@
         Назад к статистике
       </a>
 
-      <!-- Карточка: Стратегия -->
-      <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-        <div class="flex justify-between items-start mb-4">
-          <div>
-            <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
-            {% if strategy.description %}
-            <p class="text-sm text-slate-700 w-1/2 break-words mt-1">
-              {{ strategy.description }}
-            </p>
-            {% endif %}
-          </div>
-          <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
-        </div>
-      </div>
+<!-- Карточка: Стратегия -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <div class="flex justify-between items-start mb-4">
+    <div>
+      <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
+      {% if strategy.description %}
+      <p class="text-sm text-slate-700 w-1/2 break-words mt-1">
+        {{ strategy.description }}
+      </p>
+      {% endif %}
+    </div>
+    <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
+  </div>
 
+  <div class="flex gap-2">
+    <a href="/trades/details/{{ strategy.name }}"
+       class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800 text-center">
+      Детали
+    </a>
+
+    <a href="/trades/details/{{ strategy.name }}/stats"
+       class="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium text-center shadow hover:bg-blue-700">
+      Статистика
+    </a>
+
+    <div class="w-4"></div> <!-- Разрыв -->
+
+    <button class="px-4 py-2 bg-yellow-100 hover:bg-yellow-200 rounded-lg font-medium text-yellow-800">
+      Пауза
+    </button>
+    <button class="px-4 py-2 bg-red-100 hover:bg-red-200 rounded-lg font-medium text-red-700">
+      Выключить
+    </button>
+    <button class="px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium text-slate-600">
+      Архивировать
+    </button>
+  </div>
+</div>
       <!-- Карточка: Данные по индикатору ADX -->
       <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
         <h2 class="text-lg font-semibold text-slate-800 mb-2">Данные по индикатору ADX</h2>
