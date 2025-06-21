@@ -157,26 +157,33 @@ async def process_with_semaphore(position: dict, semaphore: asyncio.Semaphore):
 
 # 🔸 Основной воркер PostgreSQL
 async def pg_task(stop_event: asyncio.Event):
-    while not stop_event.is_set():
-        try:
-            log.info("🔁 Начало аудиторского прохода")
-            positions = await load_unprocessed_positions()
+    log.info("🔁 [pg_task] стартует")
 
-            if not positions:
-                log.info("✅ Нет новых позиций для аудита — пауза")
+    try:
+        while not stop_event.is_set():
+            try:
+                log.info("🔁 Начало аудиторского прохода")
+                positions = await load_unprocessed_positions()
+
+                if not positions:
+                    log.info("✅ Нет новых позиций для аудита — пауза")
+                    await asyncio.sleep(60)
+                    continue
+
+                semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+                tasks = [
+                    process_with_semaphore(pos, semaphore)
+                    for pos in positions
+                ]
+                await asyncio.gather(*tasks)
+
+                log.info("⏸ Пауза до следующего цикла")
                 await asyncio.sleep(60)
-                continue
 
-            semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
-            tasks = [
-                process_with_semaphore(pos, semaphore)
-                for pos in positions
-            ]
-            await asyncio.gather(*tasks)
+            except Exception:
+                log.exception("❌ Ошибка в pg_task — продолжаем выполнение")
+                await asyncio.sleep(5)
 
-            log.info("⏸ Пауза до следующего цикла")
-            await asyncio.sleep(60)
-
-        except Exception:
-            log.exception("❌ Ошибка в pg_task — продолжаем выполнение")
-            await asyncio.sleep(5)
+    except Exception:
+        log.exception("🔥 Ошибка вне цикла в pg_task — выясняем причину")
+        await asyncio.sleep(5)
