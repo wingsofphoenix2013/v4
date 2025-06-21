@@ -1,7 +1,6 @@
 # auditor_v4_main.py
 
 import asyncio
-import signal
 import logging
 
 from infra import (
@@ -23,11 +22,11 @@ log = logging.getLogger("AUDITOR_MAIN")
 
 
 # 🔸 Обёртка с автоперезапуском для воркеров
-async def run_safe_loop(coro_factory, label: str):
+async def run_safe_loop(coro, label: str):
     while True:
         try:
             log.info(f"[{label}] Запуск задачи")
-            await coro_factory()
+            await coro()
         except Exception:
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
             await asyncio.sleep(5)
@@ -55,18 +54,12 @@ async def main():
         log.exception("❌ Ошибка загрузки начальной конфигурации")
         return
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
-
     log.info("🚀 Запуск фоновых воркеров")
 
     await asyncio.gather(
-        run_safe_loop(lambda: pg_task(stop_event), "CORE_IO"),
-        run_safe_loop(lambda: redis_task(stop_event), "REDIS_IO"),
-        run_safe_loop(config_event_listener, "CONFIG_LOADER"),
-        stop_event.wait()
+        run_safe_loop(pg_task, "CORE_IO"),
+        run_safe_loop(redis_task, "REDIS_IO"),
+        run_safe_loop(config_event_listener, "CONFIG_LOADER")
     )
 
 

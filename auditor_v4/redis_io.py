@@ -10,8 +10,10 @@ log = logging.getLogger("REDIS_IO")
 
 
 # 🔸 Основной воркер Redis
-async def redis_task(stop_event: asyncio.Event):
-    while not stop_event.is_set():
+async def redis_task():
+    log.info("🔁 [redis_task] стартует")
+
+    while True:
         try:
             # Здесь будет логика: очистка ключей, аудит, метрики и т.п.
             log.info("⏳ redis_task: имитация работы с Redis")

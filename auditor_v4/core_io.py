@@ -140,7 +140,7 @@ async def insert_ind_snapshot(snapshot_rows: list[dict]):
 async def mark_position_audited(position_uid: str):
     async with infra.pg_pool.acquire() as conn:
         await conn.execute("""
-            UPDATE positions_v4_test
+            UPDATE positions_v4
             SET audited = true
             WHERE position_uid = $1
         """, position_uid)
@@ -156,11 +156,11 @@ async def process_with_semaphore(position: dict, semaphore: asyncio.Semaphore):
 
 
 # 🔸 Основной воркер PostgreSQL
-async def pg_task(stop_event: asyncio.Event):
+async def pg_task():
     log.info("🔁 [pg_task] стартует")
 
     try:
-        while not stop_event.is_set():
+        while True:
             try:
                 log.info("🔁 Начало аудиторского прохода")
                 positions = await load_unprocessed_positions()
@@ -175,7 +175,7 @@ async def pg_task(stop_event: asyncio.Event):
                     process_with_semaphore(pos, semaphore)
                     for pos in positions
                 ]
-                await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
                 log.info("⏸ Пауза до следующего цикла")
                 await asyncio.sleep(60)
