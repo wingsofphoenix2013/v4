@@ -39,8 +39,6 @@ async def load_unprocessed_positions(limit: int = 100) -> list[dict]:
         """, limit)
     log.info(f"📊 Загружено {len(rows)} позиций на аудит")
     return [dict(r) for r in rows]
-
-
 # 🔸 Обработка одной позиции
 async def process_position(position: dict):
     uid = position["position_uid"]
@@ -53,8 +51,8 @@ async def process_position(position: dict):
         log.warning(f"⚠️ Стратегия {strategy_id} не найдена — позиция {uid} пропущена")
         return
 
-    strategy_name = strategy["name"]
-    base_tf = strategy["timeframe"].lower()
+    strategy_name = strategy.get("name")
+    base_tf = strategy.get("timeframe", "").lower()
 
     tf_order = ["m1", "m5", "m15"]
     if base_tf not in tf_order:
@@ -64,9 +62,10 @@ async def process_position(position: dict):
     base_idx = tf_order.index(base_tf)
     allowed_tfs = tf_order[:base_idx + 1]
 
+    # 🔸 Фильтрация индикаторов по symbol и допустимым таймфреймам
     indicators = [
         i for i in infra.enabled_indicators.values()
-        if i["symbol"] == symbol and i["timeframe"] in allowed_tfs
+        if i.get("symbol") == symbol and i.get("timeframe") in allowed_tfs
     ]
 
     if not indicators:
@@ -86,6 +85,10 @@ async def process_position(position: dict):
                 WHERE instance_id = $1 AND symbol = $2 AND open_time = $3
             """, ind["id"], symbol, ot)
 
+            if not rows:
+                log.debug(f"🔸 Нет значений для индикатора {ind['id']} на {ot} ({tf})")
+                continue
+
             for row in rows:
                 snapshot_rows.append({
                     "position_uid": uid,
@@ -104,8 +107,6 @@ async def process_position(position: dict):
         log.info(f"✅ Позиция {uid} обработана ({len(snapshot_rows)} значений)")
     else:
         log.warning(f"⚠️ Позиция {uid} — ни одного значения индикатора не найдено")
-
-
 # 🔸 Вставка слепков индикаторов
 async def insert_ind_snapshot(snapshot_rows: list[dict]):
     async with infra.pg_pool.acquire() as conn:

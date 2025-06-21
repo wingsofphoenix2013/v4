@@ -42,16 +42,23 @@ async def load_enabled_strategies():
 # 🔸 Загрузка активных индикаторов
 async def load_enabled_indicators():
     query = """
-        SELECT *
-        FROM indicator_instances_v4
-        WHERE enabled = true
+        SELECT DISTINCT ON (i.id)
+            i.id,
+            i.indicator,
+            i.timeframe,
+            i.enabled,
+            i.stream_publish,
+            i.created_at,
+            v.symbol
+        FROM indicator_instances_v4 i
+        JOIN indicator_values_v4 v ON v.instance_id = i.id
+        WHERE i.enabled = true
     """
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
         indicators = {r["id"]: dict(r) for r in rows}
         set_enabled_indicators(indicators)
         log.info(f"✅ Загружено индикаторов: {len(indicators)}")
-
 
 # 🔸 Слушатель PubSub событий
 async def config_event_listener():
