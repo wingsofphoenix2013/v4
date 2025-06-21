@@ -4,7 +4,7 @@ import json
 import asyncio
 import logging
 
-from infra import pg_pool, redis_client
+import infra
 from infra import (
     set_enabled_tickers,
     set_enabled_strategies,
@@ -22,17 +22,17 @@ async def load_enabled_tickers():
         FROM tickers_v4
         WHERE status = 'enabled' AND tradepermission = 'enabled'
     """
-    async with pg_pool.acquire() as conn:
+    async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
         tickers = {r["symbol"]: dict(r) for r in rows}
         set_enabled_tickers(tickers)
         log.info(f"✅ Загружено тикеров: {len(tickers)}")
 
 
-# 🔸 Загрузка всех стратегий (включая неактивные)
+# 🔸 Загрузка всех стратегий
 async def load_enabled_strategies():
     query = "SELECT * FROM strategies_v4"
-    async with pg_pool.acquire() as conn:
+    async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
         strategies = {r["id"]: dict(r) for r in rows}
         set_enabled_strategies(strategies)
@@ -46,7 +46,7 @@ async def load_enabled_indicators():
         FROM indicator_instances_v4
         WHERE enabled = true
     """
-    async with pg_pool.acquire() as conn:
+    async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
         indicators = {r["id"]: dict(r) for r in rows}
         set_enabled_indicators(indicators)
@@ -55,7 +55,7 @@ async def load_enabled_indicators():
 
 # 🔸 Слушатель PubSub событий
 async def config_event_listener():
-    pubsub = redis_client.pubsub()
+    pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe("tickers_v4_events", "strategies_v4_events", "indicator_v4_events")
     log.info("📡 Подписка на конфигурационные каналы Redis начата")
 
