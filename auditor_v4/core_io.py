@@ -15,7 +15,8 @@ async def pg_task(stop_event: asyncio.Event):
         try:
             # Здесь будет логика: чистка, агрегация, аудит и т.п.
             log.info("⏳ pg_task: имитация работы с PostgreSQL")
-            await asyncio.sleep(600)
+            await asyncio.sleep(10)
 
         except Exception:
             log.exception("❌ Ошибка в pg_task — продолжаем выполнение")
+            await asyncio.sleep(5)  # предотвратить лавинообразный перезапуск

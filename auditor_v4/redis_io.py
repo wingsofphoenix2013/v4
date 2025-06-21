@@ -13,9 +13,10 @@ log = logging.getLogger("REDIS_IO")
 async def redis_task(stop_event: asyncio.Event):
     while not stop_event.is_set():
         try:
-            # Здесь будет логика: очистка ключей, статистика, аудит и т.п.
+            # Здесь будет логика: очистка ключей, аудит, метрики и т.п.
             log.info("⏳ redis_task: имитация работы с Redis")
-            await asyncio.sleep(600)
+            await asyncio.sleep(10)
 
         except Exception:
             log.exception("❌ Ошибка в redis_task — продолжаем выполнение")
+            await asyncio.sleep(5)  # обязательная пауза при ошибке
