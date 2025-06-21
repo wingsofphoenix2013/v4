@@ -32,7 +32,7 @@ async def load_unprocessed_positions(limit: int = 100) -> list[dict]:
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT *
-            FROM positions_v4_test
+            FROM positions_v4
             WHERE status = 'closed' AND audited = false
             ORDER BY created_at
             LIMIT $1
