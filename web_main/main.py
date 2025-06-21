@@ -1069,3 +1069,19 @@ async def strategy_detail_page(
         "roi": roi,
         "today_key": today_key,
     })
+@app.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
+async def strategy_stats_overview(request: Request, strategy_name: str):
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT *
+            FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+    return templates.TemplateResponse("strategy_stats.html", {
+        "request": request,
+        "strategy": dict(strategy)
+    })
