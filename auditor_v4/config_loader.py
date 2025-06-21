@@ -72,11 +72,17 @@ async def config_event_listener():
         try:
             data = json.loads(message["data"])
             channel = message["channel"]
-            if isinstance(channel, bytes):  # Redis может вернуть channel в bytes
+            if isinstance(channel, bytes):
                 channel = channel.decode()
 
-            log.info(f"🔔 Событие: {data.get('event')} в {channel}")
+            # 🔸 Формируем осмысленное описание события
+            event_type = data.get("type")
+            action = data.get("action")
+            desc = f"{event_type} → {action}"
 
+            log.info(f"🔔 Событие: {desc} в {channel}")
+
+            # 🔸 Обновляем соответствующий кэш
             if channel == "tickers_v4_events":
                 await load_enabled_tickers()
             elif channel == "strategies_v4_events":
