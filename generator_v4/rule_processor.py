@@ -4,8 +4,7 @@ import asyncio
 import logging
 import json
 from datetime import datetime
-from infra import infra, SIGNAL_CONFIGS
-from rule_loader import RULE_INSTANCES
+from infra import infra
 
 log = logging.getLogger("RULE_PROC")
 
@@ -61,7 +60,7 @@ async def handle_ready_event(data: dict):
         log.debug(f"[RULE_PROCESSOR] ⏩ Пропущен повторный вызов для {symbol}/{tf} @ {open_time}")
         return
 
-    for (rule_name, rule_symbol, rule_tf), rule in RULE_INSTANCES.items():
+    for (rule_name, rule_symbol, rule_tf), rule in infra.rule_instances.items():
         if rule_symbol != symbol or rule_tf != tf:
             continue
 
@@ -104,15 +103,18 @@ async def handle_ready_event(data: dict):
                 reason="Ошибка в update()",
                 details={"exception": str(e)}
             )
+
 # 🔸 Публикация сигнала в Redis Stream signals_stream
 async def publish_signal(result, open_time: datetime, symbol: str):
     redis = infra.redis_client
     now = datetime.utcnow().isoformat()
 
     try:
-        config = next(s for s in SIGNAL_CONFIGS if s["id"] == result.signal_id)
+        config = next((s for s in infra.signal_configs if s.get("id") == result.signal_id), None)
+        if not config:
+            raise ValueError()
         message = config["long_phrase"] if result.direction == "long" else config["short_phrase"]
-    except StopIteration:
+    except Exception:
         log.debug(f"[RULE_PROCESSOR] ⚠️ Не найдена фраза для signal_id={result.signal_id}")
         return
 

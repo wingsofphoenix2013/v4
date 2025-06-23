@@ -1,5 +1,3 @@
-# infra.py
-
 import os
 import logging
 import asyncpg
@@ -10,15 +8,16 @@ class Infra:
     pg_pool: asyncpg.Pool = None
     redis_client: aioredis.Redis = None
 
+    signal_configs: list = []
+    rule_definitions: dict = {}
+    enabled_tickers: dict = {}
+    rule_instances: dict = {}
+
 infra = Infra()
 
 # 🔸 Константы
 SIGNAL_STREAM = "signals_stream"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-
-ENABLED_TICKERS = {}
-SIGNAL_CONFIGS = []
-RULE_DEFINITIONS = {}
 
 # 🔸 Настройка централизованного логирования
 def setup_logging():
@@ -71,15 +70,15 @@ async def load_enabled_tickers():
     """
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
-        ENABLED_TICKERS.clear()
-        ENABLED_TICKERS.update({
+        infra.enabled_tickers.clear()
+        infra.enabled_tickers.update({
             row["symbol"]: {
                 "precision_price": row["precision_price"],
                 "precision_qty": row["precision_qty"]
             }
             for row in rows
         })
-    log.info(f"[INIT] Загружено тикеров: {len(ENABLED_TICKERS)}")
+    log.info(f"[INIT] Загружено тикеров: {len(infra.enabled_tickers)}")
 
 # 🔸 Загрузка сигналов из signals_v4
 async def load_signal_configs():
@@ -90,18 +89,18 @@ async def load_signal_configs():
     """
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
-        SIGNAL_CONFIGS.clear()
-        SIGNAL_CONFIGS.extend(rows)
-    log.info(f"[INIT] Загружено сигналов генератора: {len(SIGNAL_CONFIGS)}")
+        infra.signal_configs.clear()
+        infra.signal_configs.extend(rows)
+    log.info(f"[INIT] Загружено сигналов генератора: {len(infra.signal_configs)}")
 
 # 🔸 Загрузка правил из signal_rules_v4
 async def load_rule_definitions():
     query = "SELECT name, class_name, module_name FROM signal_rules_v4"
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
-        RULE_DEFINITIONS.clear()
-        RULE_DEFINITIONS.update({row["name"]: row for row in rows})
-    log.info(f"[INIT] Загружено правил: {len(RULE_DEFINITIONS)}")
+        infra.rule_definitions.clear()
+        infra.rule_definitions.update({row["name"]: row for row in rows})
+    log.info(f"[INIT] Загружено правил: {len(infra.rule_definitions)}")
 
 # 🔸 Комплексная загрузка всех конфигураций
 async def load_configs():
