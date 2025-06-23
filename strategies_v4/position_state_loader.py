@@ -74,7 +74,7 @@ async def load_position_state():
         target = Target(
             type=t["type"],
             level=t["level"],
-            price=Decimal(t["price"]),
+            price=Decimal(t["price"]) if t["price"] is not None else None,
             quantity=Decimal(t["quantity"]),
             hit=t["hit"] or False,
             hit_at=t["hit_at"],
