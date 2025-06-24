@@ -1118,7 +1118,7 @@ async def strategy_adx_stats(
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
         adx_data = await conn.fetch("""
-            SELECT pis.timeframe, pis.value, p.direction, p.pnl
+            SELECT pis.position_uid, pis.timeframe, pis.value, p.direction, p.pnl
             FROM position_ind_stat_v4 pis
             JOIN positions_v4 p ON pis.position_uid = p.position_uid
             WHERE pis.strategy_id = $1
@@ -1133,7 +1133,14 @@ async def strategy_adx_stats(
             "fail_short": defaultdict(lambda: [0]*8),
         }
 
+        seen = set()  # (position_uid, timeframe)
+
         for row in adx_data:
+            key = (row["position_uid"], row["timeframe"])
+            if key in seen:
+                continue
+            seen.add(key)
+
             tf = row["timeframe"]
             adx = float(row["value"])
             direction = row["direction"]
