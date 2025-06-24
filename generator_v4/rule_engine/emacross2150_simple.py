@@ -16,17 +16,18 @@ class EmaCross2150Simple(SignalRule):
 
     async def update(self, open_time: datetime) -> Optional[SignalResult]:
         try:
-            ema21 = await self.fetch_indicator_series("ema21", 2, open_time)
-            ema50 = await self.fetch_indicator_series("ema50", 2, open_time)
+            ema21 = await self.fetch_indicator_series("ema21", 3, open_time)
+            ema50 = await self.fetch_indicator_series("ema50", 3, open_time)
 
-            if len(ema21) < 2 or len(ema50) < 2:
+            if len(ema21) < 3 or len(ema50) < 3:
                 log.info(f"[EMACROSS2150_SIMPLE] ⚠️ Недостаточно данных: {self.symbol}/{self.timeframe}")
                 return None
 
-            prev_ema21, curr_ema21 = ema21
-            prev_ema50, curr_ema50 = ema50
+            # используем последние 2 точки для анализа пересечения
+            _, prev_ema21, curr_ema21 = ema21
+            _, prev_ema50, curr_ema50 = ema50
 
-            if prev_ema21 < prev_ema50 and curr_ema21 > curr_ema50:
+            if prev_ema21 <= prev_ema50 and curr_ema21 > curr_ema50:
                 log.info(f"[EMACROSS2150_SIMPLE] ✅ LONG сигнал для {self.symbol}/{self.timeframe}")
                 return SignalResult(
                     signal_id=self.signal_id,
@@ -40,7 +41,7 @@ class EmaCross2150Simple(SignalRule):
                     },
                 )
 
-            if prev_ema21 > prev_ema50 and curr_ema21 < curr_ema50:
+            if prev_ema21 >= prev_ema50 and curr_ema21 < curr_ema50:
                 log.info(f"[EMACROSS2150_SIMPLE] ✅ SHORT сигнал для {self.symbol}/{self.timeframe}")
                 return SignalResult(
                     signal_id=self.signal_id,
