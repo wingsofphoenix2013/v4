@@ -1117,15 +1117,30 @@ async def strategy_adx_stats(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
-        adx_data = await conn.fetch("""
-            SELECT pis.position_uid, pis.timeframe, pis.value, p.direction, p.pnl
-            FROM position_ind_stat_v4 pis
-            JOIN positions_v4 p ON pis.position_uid = p.position_uid
-            WHERE pis.strategy_id = $1
-              AND pis.param_name = 'adx_dmi14_adx'
-              AND p.status = 'closed'
+        # 1. Получаем все закрытые позиции по стратегии
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
         """, strategy["id"])
 
+        position_info = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        # 2. Получаем все строки ADX по этим позициям
+        adx_data = await conn.fetch("""
+            SELECT position_uid, timeframe, value
+            FROM position_ind_stat_v4
+            WHERE strategy_id = $1
+              AND param_name = 'adx_dmi14_adx'
+        """, strategy["id"])
+
+        # 3. Инициализируем структуру счёта
         result = {
             "success_long": defaultdict(lambda: [0]*8),
             "success_short": defaultdict(lambda: [0]*8),
@@ -1141,10 +1156,14 @@ async def strategy_adx_stats(
                 continue
             seen.add(key)
 
+            if row["position_uid"] not in position_info:
+                continue
+
+            info = position_info[row["position_uid"]]
+            pnl = info["pnl"]
+            direction = info["direction"]
             tf = row["timeframe"]
             adx = float(row["value"])
-            direction = row["direction"]
-            pnl = row["pnl"]
             idx = bin_index(adx)
 
             if pnl >= 0:
