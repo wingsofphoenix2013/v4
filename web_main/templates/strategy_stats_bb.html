@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Статистика по стратегии</title>
+    <title>BB: Статистика по стратегии</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
       body {
@@ -12,7 +12,7 @@
     </style>
   </head>
   <body class="min-h-screen font-sans text-slate-800">
-    <!-- Верхнее меню навигации -->
+    <!-- Верхнее меню -->
     <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
       <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
         <h1 class="text-2xl font-semibold text-blue-900 tracking-wide">Торговый Движок v4</h1>
@@ -27,12 +27,14 @@
         </nav>
       </div>
     </header>
-<!-- Контейнер кнопок и таблицы -->
-<main class="max-w-7xl mx-auto px-4 py-10">
-<a href="/trades/details/{{ strategy.name }}?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
-   class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">
-  Назад к стратегии
-</a>
+
+    <main class="max-w-7xl mx-auto px-4 py-10">
+      <!-- Назад к общей статистике -->
+      <a href="/trades/details/{{ strategy.name }}/stats?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+         class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">
+        Назад к статистике
+      </a>
+
 <!-- Карточка: Стратегия -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
   <div class="flex justify-between items-start mb-4">
@@ -71,46 +73,29 @@
     </button>
   </div>
 </div>
-<!-- Карточка: По результативности -->
+<!-- Карточка: BB std = 2.5 -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">По результативности</h2>
-  <!-- Контент в разработке -->
+  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 2.5)</h2>
+  <!-- Контент для bb20_2_5_center/lower/upper -->
 </div>
 
-<!-- Карточка: По тикерам -->
+<!-- Карточка: BB std = 2.0 -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">По тикерам</h2>
-  <!-- Контент в разработке -->
+  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 2.0)</h2>
+  <!-- Контент для bb20_2_0_center/lower/upper -->
 </div>
 
-<!-- Карточка: По индикаторам -->
+<!-- Карточка: BB std = 1.5 -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-4">По индикаторам</h2>
-
-  <div class="flex flex-wrap gap-3">
-<a href="/trades/details/{{ strategy.name }}/stats/rsi?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
-   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-  По RSI
-</a>
-<a href="/trades/details/{{ strategy.name }}/stats/adx?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
-   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-  По ADX/DMI
-</a>
-    <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По LR
-    </a>
-    <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По MFI
-    </a>
-<a href="/trades/details/{{ strategy.name }}/stats/bb?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
-   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-  По BB
-</a>
-    <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По MACD
-    </a>
-  </div>
+  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 1.5)</h2>
+  <!-- Контент для bb20_1_5_center/lower/upper -->
 </div>
-</main>
-	</body>
+
+<!-- Карточка: BB std = 1.0 -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 1.0)</h2>
+  <!-- Контент для bb20_1_0_center/lower/upper -->
+</div>
+    </main>
+  </body>
 </html>

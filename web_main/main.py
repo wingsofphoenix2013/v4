@@ -1309,3 +1309,26 @@ async def strategy_adx_stats(
         "adx_bins": ADX_BINS,
         "adx_inf": ADX_INF,
     })
+# 🔸 Статистика стратегии по индикатору Bollinger Bands
+@app.get("/trades/details/{strategy_name}/stats/bb", response_class=HTMLResponse)
+async def strategy_bb_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+    return templates.TemplateResponse("strategy_stats_bb.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series
+    })
