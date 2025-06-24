@@ -1158,12 +1158,17 @@ async def strategy_adx_stats(
             if info:
                 log.info(f"[ADX] → {uid} | ADX={val:.2f} | pnl={info['pnl']} | {info['direction']}")
 
-        # Результирующая структура
+        # Инициализация структуры
         result = {
             "success_long": {"main": [0]*8},
             "success_short": {"main": [0]*8},
             "fail_long": {"main": [0]*8},
             "fail_short": {"main": [0]*8},
+        }
+
+        adx_summary = {
+            "success": [0]*8,
+            "fail": [0]*8,
         }
 
         for row in adx_data:
@@ -1178,11 +1183,13 @@ async def strategy_adx_stats(
             idx = bin_index(adx)
 
             if pnl >= 0:
+                adx_summary["success"][idx] += 1
                 if direction == "long":
                     result["success_long"]["main"][idx] += 1
                 elif direction == "short":
                     result["success_short"]["main"][idx] += 1
             else:
+                adx_summary["fail"][idx] += 1
                 if direction == "long":
                     result["fail_long"]["main"][idx] += 1
                 elif direction == "short":
@@ -1194,6 +1201,7 @@ async def strategy_adx_stats(
         "filter": filter,
         "series": series,
         "adx_distribution": result,
+        "adx_summary": adx_summary,
         "adx_bins": ADX_BINS,
         "adx_inf": ADX_INF,
     })
