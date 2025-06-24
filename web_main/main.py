@@ -94,7 +94,6 @@ def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
         start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
         now_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     )
-    
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
@@ -1092,6 +1091,15 @@ async def strategy_stats_overview(
         "filter": filter,
         "series": series
     })
+# 🔸 Статистика стратегии по индикатору ADX
+ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
+
+def bin_index(adx_value: float) -> int:
+    for i, (lo, hi) in enumerate(ADX_BINS):
+        if lo <= adx_value < hi:
+            return i
+    return len(ADX_BINS) - 1
+
 @app.get("/trades/details/{strategy_name}/stats/adx", response_class=HTMLResponse)
 async def strategy_adx_stats(
     request: Request,
@@ -1108,9 +1116,45 @@ async def strategy_adx_stats(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
+        adx_data = await conn.fetch("""
+            SELECT pis.timeframe, pis.value, p.direction, p.pnl
+            FROM position_ind_stat_v4 pis
+            JOIN positions_v4 p ON pis.position_uid = p.position_uid
+            WHERE pis.strategy_id = $1
+              AND pis.param_name = 'adx_dmi14_adx'
+              AND p.status = 'closed'
+        """, strategy["id"])
+
+        result = {
+            "success_long": defaultdict(lambda: [0]*8),
+            "success_short": defaultdict(lambda: [0]*8),
+            "fail_long": defaultdict(lambda: [0]*8),
+            "fail_short": defaultdict(lambda: [0]*8),
+        }
+
+        for row in adx_data:
+            tf = row["timeframe"]
+            adx = float(row["value"])
+            direction = row["direction"]
+            pnl = row["pnl"]
+            idx = bin_index(adx)
+
+            if pnl >= 0:
+                if direction == "long":
+                    result["success_long"][tf][idx] += 1
+                elif direction == "short":
+                    result["success_short"][tf][idx] += 1
+            else:
+                if direction == "long":
+                    result["fail_long"][tf][idx] += 1
+                elif direction == "short":
+                    result["fail_short"][tf][idx] += 1
+
     return templates.TemplateResponse("strategy_stats_adx.html", {
         "request": request,
         "strategy": dict(strategy),
         "filter": filter,
-        "series": series
+        "series": series,
+        "adx_distribution": result,
+        "adx_bins": ADX_BINS,
     })
