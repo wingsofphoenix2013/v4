@@ -75,8 +75,44 @@
 </div>
 <!-- Карточка: BB std = 2.5 -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 2.5)</h2>
-  <!-- Контент для bb20_2_5_center/lower/upper -->
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">Bollinger Bands (std = 2.5)</h2>
+
+  <table class="w-full table-auto text-sm text-slate-800 border border-slate-200">
+    <thead class="bg-slate-100 text-slate-700">
+      <tr>
+        <th class="px-3 py-2 text-left">Тип сделки</th>
+        <th class="px-3 py-2 text-center">Выше upper</th>
+        <th class="px-3 py-2 text-center">↑ верх. сегмент</th>
+        <th class="px-3 py-2 text-center">↓ верх. сегмент</th>
+        <th class="px-3 py-2 text-center">↑ ниж. сегмент</th>
+        <th class="px-3 py-2 text-center">↓ ниж. сегмент</th>
+        <th class="px-3 py-2 text-center">Ниже lower</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for key, label in [
+        ("success_long", "Успешные — Long"),
+        ("success_short", "Успешные — Short"),
+        ("fail_long", "Неуспешные — Long"),
+        ("fail_short", "Неуспешные — Short")
+      ] %}
+      {% set bins = bb25_distribution[key] %}
+      {% set total = bins | sum %}
+      <tr class="border-t border-slate-100 hover:bg-slate-50">
+        <td class="px-3 py-2 font-medium">{{ label }}</td>
+        {% for count in bins %}
+        <td class="px-3 py-2 text-center">
+          {% if count > 0 %}
+            {{ count }} ({{ ((count / total) * 100) | round(1) }}%)
+          {% else %}
+            —
+          {% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </div>
 
 <!-- Карточка: BB std = 2.0 -->
