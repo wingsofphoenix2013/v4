@@ -88,13 +88,14 @@
   <h2 class="text-lg font-semibold text-slate-800 mb-4">По индикаторам</h2>
 
   <div class="flex flex-wrap gap-3">
-    <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По RSI
-    </a>
-    <a href="/trades/details/{{ strategy.name }}/stats/adx"
-       class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По ADX/DMI
-    </a>
+<a href="/trades/details/{{ strategy.name }}/stats/rsi?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+  По RSI
+</a>
+<a href="/trades/details/{{ strategy.name }}/stats/adx?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+  По ADX/DMI
+</a>
     <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
       По LR
     </a>

@@ -1091,6 +1091,110 @@ async def strategy_stats_overview(
         "filter": filter,
         "series": series
     })
+# 🔸 Статистика стратегии по индикатору RSI
+RSI_BINS = [(0, 20), (20, 30), (30, 40), (40, 50),
+            (50, 60), (60, 70), (70, 80), (80, float("inf"))]
+RSI_INF = float("inf")
+
+def rsi_bin_index(value: float) -> int:
+    for i, (lo, hi) in enumerate(RSI_BINS):
+        if lo <= value < hi:
+            return i
+    return len(RSI_BINS) - 1
+
+@app.get("/trades/details/{strategy_name}/stats/rsi", response_class=HTMLResponse)
+async def strategy_rsi_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("RSI_STATS")
+
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+        log.info(f"[RSI] Стратегия: {strategy_name} | таймфрейм: {tf}")
+
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        log.info(f"[RSI] Закрытых сделок: {len(position_map)}")
+
+        rsi_data = await conn.fetch("""
+            SELECT position_uid, value
+            FROM position_ind_stat_v4
+            WHERE param_name = 'rsi14'
+              AND timeframe = $2
+              AND position_uid = ANY($1)
+        """, list(position_map.keys()), tf)
+
+        log.info(f"[RSI] RSI-записей по {tf}: {len(rsi_data)}")
+
+        result = {
+            "success_long": {"main": [0]*8},
+            "success_short": {"main": [0]*8},
+            "fail_long": {"main": [0]*8},
+            "fail_short": {"main": [0]*8},
+        }
+
+        summary = {
+            "success": [0]*8,
+            "fail": [0]*8,
+        }
+
+        for row in rsi_data:
+            uid = row["position_uid"]
+            if uid not in position_map:
+                continue
+
+            rsi = float(row["value"])
+            info = position_map[uid]
+            pnl = info["pnl"]
+            direction = info["direction"]
+            idx = rsi_bin_index(rsi)
+
+            if pnl >= 0:
+                summary["success"][idx] += 1
+                if direction == "long":
+                    result["success_long"]["main"][idx] += 1
+                elif direction == "short":
+                    result["success_short"]["main"][idx] += 1
+            else:
+                summary["fail"][idx] += 1
+                if direction == "long":
+                    result["fail_long"]["main"][idx] += 1
+                elif direction == "short":
+                    result["fail_short"]["main"][idx] += 1
+
+    return templates.TemplateResponse("strategy_stats_rsi.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "rsi_distribution": result,
+        "rsi_summary": summary,
+        "rsi_bins": RSI_BINS,
+        "rsi_inf": RSI_INF,
+    })
 # 🔸 Статистика стратегии по индикатору ADX
 ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
 ADX_INF = float("inf")  # для шаблона
