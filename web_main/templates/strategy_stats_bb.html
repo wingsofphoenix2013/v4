@@ -73,9 +73,11 @@
     </button>
   </div>
 </div>
-<!-- Карточка: BB std = 2.5 -->
+{% set bb_sets = [("2_5", "2.5"), ("2_0", "2.0"), ("1_5", "1.5"), ("1_0", "1.0")] %}
+
+{% for key, label in bb_sets %}
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-4">Bollinger Bands (std = 2.5)</h2>
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">Bollinger Bands (std = {{ label }})</h2>
 
   <table class="w-full table-auto text-sm text-slate-800 border border-slate-200">
     <thead class="bg-slate-100 text-slate-700">
@@ -90,16 +92,16 @@
       </tr>
     </thead>
     <tbody>
-      {% for key, label in [
+      {% for group_key, group_label in [
         ("success_long", "Успешные — Long"),
         ("success_short", "Успешные — Short"),
         ("fail_long", "Неуспешные — Long"),
         ("fail_short", "Неуспешные — Short")
       ] %}
-      {% set bins = bb25_distribution[key] %}
+      {% set bins = bb_distribution[key][group_key] %}
       {% set total = bins | sum %}
       <tr class="border-t border-slate-100 hover:bg-slate-50">
-        <td class="px-3 py-2 font-medium">{{ label }}</td>
+        <td class="px-3 py-2 font-medium">{{ group_label }}</td>
         {% for count in bins %}
         <td class="px-3 py-2 text-center">
           {% if count > 0 %}
@@ -114,24 +116,7 @@
     </tbody>
   </table>
 </div>
-
-<!-- Карточка: BB std = 2.0 -->
-<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 2.0)</h2>
-  <!-- Контент для bb20_2_0_center/lower/upper -->
-</div>
-
-<!-- Карточка: BB std = 1.5 -->
-<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 1.5)</h2>
-  <!-- Контент для bb20_1_5_center/lower/upper -->
-</div>
-
-<!-- Карточка: BB std = 1.0 -->
-<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">Bollinger Bands (std = 1.0)</h2>
-  <!-- Контент для bb20_1_0_center/lower/upper -->
-</div>
+{% endfor %}
     </main>
   </body>
 </html>

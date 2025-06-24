@@ -1310,8 +1310,24 @@ async def strategy_adx_stats(
         "adx_inf": ADX_INF,
     })
 # 🔸 Статистика стратегии по Bollinger Bands
-BB_ZONES = 6  # всего 6 зон
-BB25_KEYS = ("bb20_2_5_upper", "bb20_2_5_center", "bb20_2_5_lower")
+BB_ZONES = 6
+BB_SETS = ["2_5", "2_0", "1_5", "1_0"]
+
+def classify_zone(entry, upper, center, lower) -> int:
+    mid_upper = (center + upper) / 2
+    mid_lower = (center + lower) / 2
+    if entry > upper:
+        return 0
+    elif entry > mid_upper:
+        return 1
+    elif entry > center:
+        return 2
+    elif entry > mid_lower:
+        return 3
+    elif entry > lower:
+        return 4
+    else:
+        return 5
 
 @app.get("/trades/details/{strategy_name}/stats/bb", response_class=HTMLResponse)
 async def strategy_bb_stats(
@@ -1323,7 +1339,6 @@ async def strategy_bb_stats(
     log = logging.getLogger("BB_STATS")
 
     async with pg_pool.acquire() as conn:
-        # Получение стратегии
         strategy = await conn.fetchrow("""
             SELECT * FROM strategies_v4
             WHERE name = $1
@@ -1335,9 +1350,8 @@ async def strategy_bb_stats(
         tf = strategy["timeframe"]
         log.info(f"[BB] Стратегия: {strategy_name} | таймфрейм: {tf}")
 
-        # Закрытые сделки
         positions = await conn.fetch("""
-            SELECT id, position_uid, entry_price, pnl, direction
+            SELECT position_uid, entry_price, pnl, direction
             FROM positions_v4
             WHERE strategy_id = $1 AND status = 'closed'
         """, strategy["id"])
@@ -1351,79 +1365,65 @@ async def strategy_bb_stats(
             for p in positions
         }
 
-        log.info(f"[BB] Закрытых сделок: {len(position_map)}")
-
-        # Получаем все BB-параметры (upper, center, lower) по каждой сделке
-        bb_values_raw = await conn.fetch("""
+        bb_data_raw = await conn.fetch("""
             SELECT position_uid, param_name, value
             FROM position_ind_stat_v4
-            WHERE param_name IN ('bb20_2_5_upper', 'bb20_2_5_center', 'bb20_2_5_lower')
-              AND timeframe = $2
+            WHERE timeframe = $2
               AND position_uid = ANY($1)
+              AND (
+                param_name LIKE 'bb20_2_5_%' OR
+                param_name LIKE 'bb20_2_0_%' OR
+                param_name LIKE 'bb20_1_5_%' OR
+                param_name LIKE 'bb20_1_0_%'
+              )
         """, list(position_map.keys()), tf)
 
-        # Собираем BB-наборы
-        bb_data = defaultdict(dict)
-        for row in bb_values_raw:
-            bb_data[row["position_uid"]][row["param_name"]] = float(row["value"])
-
-        log.info(f"[BB] Полных BB-наборов: возможно до {len(bb_data)}")
-
-        # Инициализация распределения
-        bb25_distribution = {
-            "success_long": [0]*BB_ZONES,
-            "success_short": [0]*BB_ZONES,
-            "fail_long": [0]*BB_ZONES,
-            "fail_short": [0]*BB_ZONES,
+        # Сборка BB-наборов по каждой позиции и каждому std
+        bb_full_data = {
+            std: defaultdict(dict) for std in BB_SETS
         }
 
-        def classify_zone(entry, upper, center, lower) -> int:
-            mid_upper = (center + upper) / 2
-            mid_lower = (center + lower) / 2
-            if entry > upper:
-                return 0
-            elif entry > mid_upper:
-                return 1
-            elif entry > center:
-                return 2
-            elif entry > mid_lower:
-                return 3
-            elif entry > lower:
-                return 4
-            else:
-                return 5
+        for row in bb_data_raw:
+            uid = row["position_uid"]
+            param = row["param_name"]
+            for std in BB_SETS:
+                if f"bb20_{std}_" in param:
+                    base = f"bb20_{std}_"
+                    bb_full_data[std][uid][param[len(base):]] = float(row["value"])
 
-        # Расчёт по каждой позиции
-        for uid, info in position_map.items():
-            if uid not in bb_data:
-                continue
-            bb = bb_data[uid]
-            if not all(k in bb for k in BB25_KEYS):
-                continue
+        bb_distribution = {
+            std: {
+                "success_long": [0]*BB_ZONES,
+                "success_short": [0]*BB_ZONES,
+                "fail_long": [0]*BB_ZONES,
+                "fail_short": [0]*BB_ZONES,
+            } for std in BB_SETS
+        }
 
-            entry = info["entry_price"]
-            upper = bb["bb20_2_5_upper"]
-            center = bb["bb20_2_5_center"]
-            lower = bb["bb20_2_5_lower"]
-            pnl = info["pnl"]
-            direction = info["direction"]
-            zone = classify_zone(entry, upper, center, lower)
+        for std in BB_SETS:
+            for uid, bb in bb_full_data[std].items():
+                if uid not in position_map:
+                    continue
+                if not all(k in bb for k in ["upper", "center", "lower"]):
+                    continue
 
-            if pnl >= 0:
-                if direction == "long":
-                    bb25_distribution["success_long"][zone] += 1
-                elif direction == "short":
-                    bb25_distribution["success_short"][zone] += 1
-            else:
-                if direction == "long":
-                    bb25_distribution["fail_long"][zone] += 1
-                elif direction == "short":
-                    bb25_distribution["fail_short"][zone] += 1
+                info = position_map[uid]
+                entry = info["entry_price"]
+                pnl = info["pnl"]
+                direction = info["direction"]
+
+                zone = classify_zone(entry, bb["upper"], bb["center"], bb["lower"])
+
+                key = (
+                    "success_" if pnl >= 0 else "fail_"
+                ) + direction
+
+                bb_distribution[std][key][zone] += 1
 
     return templates.TemplateResponse("strategy_stats_bb.html", {
         "request": request,
         "strategy": dict(strategy),
         "filter": filter,
         "series": series,
-        "bb25_distribution": bb25_distribution,
+        "bb_distribution": bb_distribution,
     })
