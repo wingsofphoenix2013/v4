@@ -1093,7 +1093,7 @@ async def strategy_stats_overview(
     })
 # 🔸 Статистика стратегии по индикатору ADX
 ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
-ADX_INF = float("inf")  # для использования в шаблоне
+ADX_INF = float("inf")  # для шаблона
 
 def bin_index(adx_value: float) -> int:
     for i, (lo, hi) in enumerate(ADX_BINS):
@@ -1108,7 +1108,10 @@ async def strategy_adx_stats(
     filter: str = None,
     series: str = None
 ):
+    log = logging.getLogger("ADX_STATS")
+
     async with pg_pool.acquire() as conn:
+        # Стратегия
         strategy = await conn.fetchrow("""
             SELECT * FROM strategies_v4
             WHERE name = $1
@@ -1117,14 +1120,17 @@ async def strategy_adx_stats(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
-        # 1. Получаем все закрытые позиции по стратегии
+        tf = strategy["timeframe"]
+        log.info(f"[ADX] Стратегия: {strategy_name} | таймфрейм: {tf}")
+
+        # Закрытые сделки
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
             FROM positions_v4
             WHERE strategy_id = $1 AND status = 'closed'
         """, strategy["id"])
 
-        position_info = {
+        position_map = {
             p["position_uid"]: {
                 "pnl": p["pnl"],
                 "direction": p["direction"]
@@ -1132,50 +1138,55 @@ async def strategy_adx_stats(
             for p in positions
         }
 
-        # 2. Получаем все строки ADX по этим позициям
-        adx_data = await conn.fetch("""
-            SELECT position_uid, timeframe, value
-            FROM position_ind_stat_v4
-            WHERE strategy_id = $1
-              AND param_name = 'adx_dmi14_adx'
-        """, strategy["id"])
+        log.info(f"[ADX] Найдено закрытых сделок: {len(position_map)}")
 
-        # 3. Инициализируем структуру счёта
+        # ADX по таймфрейму стратегии
+        adx_data = await conn.fetch("""
+            SELECT position_uid, value
+            FROM position_ind_stat_v4
+            WHERE param_name = 'adx_dmi14_adx'
+              AND timeframe = $2
+              AND position_uid = ANY($1)
+        """, list(position_map.keys()), tf)
+
+        log.info(f"[ADX] Записей ADX по таймфрейму {tf}: {len(adx_data)}")
+
+        for i, row in enumerate(adx_data[:5]):
+            uid = row["position_uid"]
+            val = float(row["value"])
+            info = position_map.get(uid)
+            if info:
+                log.info(f"[ADX] → {uid} | ADX={val:.2f} | pnl={info['pnl']} | {info['direction']}")
+
+        # Результирующая структура
         result = {
-            "success_long": defaultdict(lambda: [0]*8),
-            "success_short": defaultdict(lambda: [0]*8),
-            "fail_long": defaultdict(lambda: [0]*8),
-            "fail_short": defaultdict(lambda: [0]*8),
+            "success_long": {"main": [0]*8},
+            "success_short": {"main": [0]*8},
+            "fail_long": {"main": [0]*8},
+            "fail_short": {"main": [0]*8},
         }
 
-        seen = set()  # (position_uid, timeframe)
-
         for row in adx_data:
-            key = (row["position_uid"], row["timeframe"])
-            if key in seen:
-                continue
-            seen.add(key)
-
-            if row["position_uid"] not in position_info:
+            uid = row["position_uid"]
+            if uid not in position_map:
                 continue
 
-            info = position_info[row["position_uid"]]
+            adx = float(row["value"])
+            info = position_map[uid]
             pnl = info["pnl"]
             direction = info["direction"]
-            tf = row["timeframe"]
-            adx = float(row["value"])
             idx = bin_index(adx)
 
             if pnl >= 0:
                 if direction == "long":
-                    result["success_long"][tf][idx] += 1
+                    result["success_long"]["main"][idx] += 1
                 elif direction == "short":
-                    result["success_short"][tf][idx] += 1
+                    result["success_short"]["main"][idx] += 1
             else:
                 if direction == "long":
-                    result["fail_long"][tf][idx] += 1
+                    result["fail_long"]["main"][idx] += 1
                 elif direction == "short":
-                    result["fail_short"][tf][idx] += 1
+                    result["fail_short"]["main"][idx] += 1
 
     return templates.TemplateResponse("strategy_stats_adx.html", {
         "request": request,
