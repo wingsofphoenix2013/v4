@@ -93,7 +93,7 @@
           <th class="px-3 py-2 text-left">Таймфрейм</th>
           {% for lo, hi in adx_bins %}
           <th class="px-3 py-2 text-center">
-            {% if hi == float('inf') %}
+            {% if hi == adx_inf %}
               >{{ lo }}
             {% else %}
               {{ lo }}–{{ hi }}

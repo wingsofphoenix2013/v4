@@ -1093,6 +1093,7 @@ async def strategy_stats_overview(
     })
 # 🔸 Статистика стратегии по индикатору ADX
 ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
+ADX_INF = float("inf")  # для использования в шаблоне
 
 def bin_index(adx_value: float) -> int:
     for i, (lo, hi) in enumerate(ADX_BINS):
@@ -1157,4 +1158,5 @@ async def strategy_adx_stats(
         "series": series,
         "adx_distribution": result,
         "adx_bins": ADX_BINS,
+        "adx_inf": ADX_INF,
     })
