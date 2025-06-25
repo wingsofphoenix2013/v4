@@ -11,26 +11,42 @@ class Strategy207Flat:
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
+        price = float(signal["price"])
 
         try:
-            indicators = await load_indicators(symbol, ["rsi14", "mfi14"], tf)
+            indicators = await load_indicators(symbol, [
+                "rsi14", "mfi14", "adx14",
+                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
+            ], tf)
+
             rsi = indicators.get("rsi14")
             mfi = indicators.get("mfi14")
+            adx = indicators.get("adx14")
+            bb_center = indicators.get("bb20_2_0_center")
+            bb_upper = indicators.get("bb20_2_0_upper")
+            bb_lower = indicators.get("bb20_2_0_lower")
 
-            log.debug(f"🔍 [207 FLAT] symbol={symbol}, direction={direction}, tf={tf}, rsi={rsi}, mfi={mfi}")
+            log.debug(f"🔍 [207 FLAT] symbol={symbol}, direction={direction}, tf={tf}, "
+                      f"rsi={rsi}, mfi={mfi}, adx={adx}, price={price}, "
+                      f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}")
 
-            if rsi is None or mfi is None:
-                return ("ignore", "нет значений RSI/MFI")
+            if None in (rsi, mfi, adx, bb_center, bb_upper, bb_lower):
+                return ("ignore", "недостаточно данных RSI/MFI/ADX/BB")
+
+            if not (25 <= adx <= 40):
+                return ("ignore", f"фильтр ADX не пройден: adx={adx}")
 
             if direction == "long":
-                if rsi < 28 and mfi < 20:
+                bb_limit = bb_center - (bb_center - bb_lower) / 2
+                if rsi < 28 and mfi < 25 and price < bb_limit:
                     return True
-                return ("ignore", f"фильтр long не пройден: rsi={rsi}, mfi={mfi}")
+                return ("ignore", f"фильтр long не пройден: rsi={rsi}, mfi={mfi}, price={price}, bb_limit={bb_limit}")
 
             elif direction == "short":
-                if rsi > 72 and mfi > 80:
+                bb_limit = bb_center + (bb_upper - bb_center) / 2
+                if rsi > 72 and mfi > 75 and price > bb_limit:
                     return True
-                return ("ignore", f"фильтр short не пройден: rsi={rsi}, mfi={mfi}")
+                return ("ignore", f"фильтр short не пройден: rsi={rsi}, mfi={mfi}, price={price}, bb_limit={bb_limit}")
 
             return ("ignore", f"неизвестное направление: {direction}")
 

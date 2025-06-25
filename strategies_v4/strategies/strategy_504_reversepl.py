@@ -2,7 +2,7 @@
 
 import logging
 import json
-from infra import load_indicators, get_price
+from infra import load_indicators
 
 log = logging.getLogger("STRATEGY_504_REVERSEPL")
 
@@ -13,17 +13,29 @@ class Strategy504Reversepl:
         tf = context["strategy"]["timeframe"].lower()
 
         try:
-            indicators = await load_indicators(symbol, ["adx_dmi14_adx"], tf)
+            indicators = await load_indicators(symbol, ["adx_dmi14_adx", "rsi14"], tf)
             adx = indicators.get("adx_dmi14_adx")
+            rsi = indicators.get("rsi14")
 
-            if adx is None:
-                return ("ignore", "нет значения ADX")
+            log.debug(f"🔍 [504 REVERSEPL] symbol={symbol}, direction={direction}, tf={tf}, adx={adx}, rsi={rsi}")
 
-            log.debug(f"🔍 [504 REVERSEPL] symbol={symbol}, direction={direction}, tf={tf}, adx={adx}")
+            if adx is None or rsi is None:
+                return ("ignore", "нет значения ADX или RSI")
 
-            if adx > 22:
-                return True
-            return ("ignore", f"adx={adx} <= 22")
+            if adx <= 20:
+                return ("ignore", f"фильтр ADX не пройден: adx={adx}")
+
+            if direction == "long":
+                if rsi > 60:
+                    return True
+                return ("ignore", f"фильтр RSI long не пройден: rsi={rsi}")
+
+            elif direction == "short":
+                if rsi < 40:
+                    return True
+                return ("ignore", f"фильтр RSI short не пройден: rsi={rsi}")
+
+            return ("ignore", f"неизвестное направление: {direction}")
 
         except Exception:
             log.exception("❌ Ошибка в validate_signal")

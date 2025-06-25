@@ -2,7 +2,7 @@
 
 import logging
 import json
-from infra import load_indicators, get_price
+from infra import load_indicators
 
 log = logging.getLogger("STRATEGY_501_REVERSE")
 
@@ -16,14 +16,14 @@ class Strategy501Reverse:
             indicators = await load_indicators(symbol, ["adx_dmi14_adx"], tf)
             adx = indicators.get("adx_dmi14_adx")
 
+            log.debug(f"🔍 [501 REVERSE] symbol={symbol}, direction={direction}, tf={tf}, adx={adx}")
+
             if adx is None:
                 return ("ignore", "нет значения ADX")
 
-            log.debug(f"🔍 [501 REVERSE] symbol={symbol}, direction={direction}, tf={tf}, adx={adx}")
-
-            if adx > 13:
+            if adx > 20:
                 return True
-            return ("ignore", f"adx={adx} <= 13")
+            return ("ignore", f"фильтр ADX не пройден: adx={adx}")
 
         except Exception:
             log.exception("❌ Ошибка в validate_signal")

@@ -2,7 +2,7 @@
 
 import logging
 import json
-from infra import load_indicators, get_price
+from infra import load_indicators
 
 log = logging.getLogger("STRATEGY_505_REVERSE")
 
@@ -11,19 +11,41 @@ class Strategy505Reverse:
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
+        price = float(signal["price"])
 
         try:
-            indicators = await load_indicators(symbol, ["adx_dmi14_adx"], tf)
+            indicators = await load_indicators(symbol, [
+                "adx_dmi14_adx",
+                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
+            ], tf)
+
             adx = indicators.get("adx_dmi14_adx")
+            bb_center = indicators.get("bb20_2_0_center")
+            bb_upper = indicators.get("bb20_2_0_upper")
+            bb_lower = indicators.get("bb20_2_0_lower")
 
-            if adx is None:
-                return ("ignore", "нет значения ADX")
+            log.debug(f"🔍 [505 REVERSE] symbol={symbol}, direction={direction}, tf={tf}, price={price}, "
+                      f"adx={adx}, bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}")
 
-            log.debug(f"🔍 [505 REVERSE] symbol={symbol}, direction={direction}, tf={tf}, adx={adx}")
+            if None in (adx, bb_center, bb_upper, bb_lower):
+                return ("ignore", "недостаточно данных ADX или BB")
 
-            if adx > 25:
-                return True
-            return ("ignore", f"adx={adx} <= 25")
+            if adx <= 20:
+                return ("ignore", f"фильтр ADX не пройден: adx={adx}")
+
+            if direction == "long":
+                bb_limit = bb_center + (bb_upper - bb_center) / 2
+                if price > bb_limit:
+                    return True
+                return ("ignore", f"фильтр BB long не пройден: price={price}, bb_limit={bb_limit}")
+
+            elif direction == "short":
+                bb_limit = bb_center - (bb_center - bb_lower) / 2
+                if price < bb_limit:
+                    return True
+                return ("ignore", f"фильтр BB short не пройден: price={price}, bb_limit={bb_limit}")
+
+            return ("ignore", f"неизвестное направление: {direction}")
 
         except Exception:
             log.exception("❌ Ошибка в validate_signal")
