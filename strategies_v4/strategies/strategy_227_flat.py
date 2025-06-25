@@ -15,13 +15,13 @@ class Strategy227Flat:
 
         try:
             indicators = await load_indicators(symbol, [
-                "rsi14", "mfi14", "adx14",
+                "rsi14", "mfi14", "adx_dmi14_adx",
                 "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
             ], tf)
 
             rsi = indicators.get("rsi14")
             mfi = indicators.get("mfi14")
-            adx = indicators.get("adx14")
+            adx = indicators.get("adx_dmi14_adx")
             bb_center = indicators.get("bb20_2_0_center")
             bb_upper = indicators.get("bb20_2_0_upper")
             bb_lower = indicators.get("bb20_2_0_lower")

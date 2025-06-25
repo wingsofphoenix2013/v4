@@ -13,10 +13,10 @@ class Strategy264Reversepl:
         tf = context["strategy"]["timeframe"].lower()
 
         try:
-            indicators = await load_indicators(symbol, ["rsi14", "mfi14", "adx14"], tf)
+            indicators = await load_indicators(symbol, ["rsi14", "mfi14", "adx_dmi14_adx"], tf)
             rsi = indicators.get("rsi14")
             mfi = indicators.get("mfi14")
-            adx = indicators.get("adx14")
+            adx = indicators.get("adx_dmi14_adx")
 
             log.debug(f"🔍 [264 REVERSEPL] symbol={symbol}, direction={direction}, tf={tf}, rsi={rsi}, mfi={mfi}, adx={adx}")
 
