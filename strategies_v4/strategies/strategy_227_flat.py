@@ -2,7 +2,7 @@
 
 import logging
 import json
-from infra import load_indicators
+from infra import load_indicators, get_price
 
 log = logging.getLogger("STRATEGY_227_FLAT")
 
@@ -11,9 +11,12 @@ class Strategy227Flat:
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
-        price = float(signal["price"])
-
+        
         try:
+            price = await get_price(symbol)
+            if price is None:
+                return ("ignore", "нет текущей цены для символа")
+                
             indicators = await load_indicators(symbol, [
                 "rsi14", "mfi14", "adx_dmi14_adx",
                 "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
