@@ -2,7 +2,7 @@
 
 import logging
 import json
-from infra import load_indicators
+from infra import load_indicators, get_price
 
 log = logging.getLogger("STRATEGY_101_FLAT")
 
@@ -11,9 +11,12 @@ class Strategy101Flat:
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
-        price = float(signal["price"])
 
         try:
+            price = await get_price(symbol)
+            if price is None:
+                return ("ignore", "нет текущей цены для символа")
+
             indicators = await load_indicators(symbol, [
                 "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
             ], tf)
@@ -26,21 +29,21 @@ class Strategy101Flat:
                       f"price={price}, bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}")
 
             if None in (bb_center, bb_upper, bb_lower):
-                return ("ignore", "нет значений Bollinger Bands")
+                return ("ignore", "недостаточно данных Bollinger Bands")
 
             if direction == "long":
                 bb_limit = bb_center - (bb_center - bb_lower) / 2
                 log.info(f"[BB LONG] price={price} < bb_limit={bb_limit}")
                 if price < bb_limit:
                     return True
-                return ("ignore", f"фильтр long не пройден: price={price}, bb_limit={bb_limit}")
+                return ("ignore", f"фильтр BB long не пройден: price={price}, bb_limit={bb_limit}")
 
             elif direction == "short":
                 bb_limit = bb_center + (bb_upper - bb_center) / 2
                 log.info(f"[BB SHORT] price={price} > bb_limit={bb_limit}")
                 if price > bb_limit:
                     return True
-                return ("ignore", f"фильтр short не пройден: price={price}, bb_limit={bb_limit}")
+                return ("ignore", f"фильтр BB short не пройден: price={price}, bb_limit={bb_limit}")
 
             return ("ignore", f"неизвестное направление: {direction}")
 
