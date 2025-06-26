@@ -51,12 +51,17 @@ redis_client: aioredis.Redis = None
 
 def init_redis_client():
     global redis_client
-    protocol = "rediss" if REDIS_USE_TLS else "redis"
-    redis_client = aioredis.from_url(
-        f"{protocol}://{REDIS_HOST}:{REDIS_PORT}",
-        password=REDIS_PASSWORD,
-        decode_responses=True
-    )
+    try:
+        protocol = "rediss" if REDIS_USE_TLS else "redis"
+        redis_client = aioredis.from_url(
+            f"{protocol}://{REDIS_HOST}:{REDIS_PORT}",
+            password=REDIS_PASSWORD,
+            decode_responses=True
+        )
+        log.info("✅ Redis client initialized")
+    except Exception:
+        log.exception("❌ Ошибка инициализации Redis client")
+        raise
 
 # 🔸 FastAPI шаблоны
 templates = Jinja2Templates(directory="templates")
