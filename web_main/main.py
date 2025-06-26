@@ -26,7 +26,6 @@ from infra import (
     init_pg_pool,
     init_redis_client,
     pg_pool,
-    redis_client,
     templates,
     get_kyiv_day_bounds,
     get_kyiv_range_backwards,
@@ -40,6 +39,9 @@ app = FastAPI()
 async def startup():
     setup_logging()
     await init_pg_pool()
+
+    # Импортируем redis_client только после инициализации
+    from infra import init_redis_client, redis_client
     init_redis_client()
     app.state.redis = redis_client
 
@@ -375,6 +377,10 @@ log = logging.getLogger("WEBHOOK")
 
 @app.post("/webhook_v4")
 async def webhook_v4(request: Request):
+    redis = request.app.state.redis
+    if redis is None:
+        raise HTTPException(status_code=500, detail="Redis not initialized")
+
     try:
         payload = await request.json()
     except Exception:
@@ -388,17 +394,13 @@ async def webhook_v4(request: Request):
     if not message or not symbol:
         raise HTTPException(status_code=422, detail="Missing 'message' or 'symbol'")
 
-    # 🔹 Очистка тикера от постфикса .P
     if symbol.endswith(".P"):
         symbol = symbol[:-2]
 
     received_at = datetime.utcnow().isoformat()
 
-    # 🔹 Отладочный лог сигнала
     log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
-    # 🔹 Публикация в Redis Stream с источником
-    redis = request.app.state.redis
     await redis.xadd("signals_stream", {
         "message": message,
         "symbol": symbol,
@@ -408,8 +410,7 @@ async def webhook_v4(request: Request):
         "source": "external_signal"
     })
 
-    return JSONResponse({"status": "ok", "received_at": received_at})
-# 🔸 Страница стратегий
+    return JSONResponse({"status": "ok", "received_at": received_at})# 🔸 Страница стратегий
 @app.get("/strategies", response_class=HTMLResponse)
 async def strategies_page(request: Request):
     async with pg_pool.acquire() as conn:
