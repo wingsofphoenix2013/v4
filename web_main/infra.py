@@ -1,4 +1,4 @@
-# infra.py — глобальная инфраструктура: конфигурация, подключения, логирование
+# 🔹 infra.py — глобальная инфраструктура: конфигурация, подключения, логирование
 
 import os
 import logging
@@ -35,12 +35,16 @@ def setup_logging():
 pg_pool: asyncpg.Pool = None
 
 async def init_pg_pool():
-    return await asyncpg.create_pool(DATABASE_URL)
+    global pg_pool
+    pg_pool = await asyncpg.create_pool(DATABASE_URL)
 
 # 🔸 Подключение к Redis
+redis_client: aioredis.Redis = None
+
 def init_redis_client():
+    global redis_client
     protocol = "rediss" if REDIS_USE_TLS else "redis"
-    return aioredis.from_url(
+    redis_client = aioredis.from_url(
         f"{protocol}://{REDIS_HOST}:{REDIS_PORT}",
         password=REDIS_PASSWORD,
         decode_responses=True
