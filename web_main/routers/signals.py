@@ -4,7 +4,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Request, Form, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 router = APIRouter()
