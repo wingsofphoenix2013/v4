@@ -130,3 +130,22 @@ async def create_signal(
         """, name, long_phrase, short_phrase, timeframe, source, rule, description, enabled_bool)
 
     return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 GET: страница подробностей сигнала
+@router.get("/signals/{signal_id}", response_class=HTMLResponse)
+async def signal_detail_page(request: Request, signal_id: int):
+    async with pg_pool.acquire() as conn:
+        signal = await conn.fetchrow("""
+            SELECT id, name, description, long_phrase, short_phrase,
+                   timeframe, source, rule, enabled
+            FROM signals_v4
+            WHERE id = $1
+        """, signal_id)
+
+        if not signal:
+            raise HTTPException(status_code=404, detail="Сигнал не найден")
+
+    return templates.TemplateResponse("signals_detail.html", {
+        "request": request,
+        "signal": signal,
+        "logs": []  # пока без логов, добавим позже
+    })
