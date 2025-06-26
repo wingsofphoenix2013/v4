@@ -74,7 +74,13 @@ async def update_signal_status(signal_id: int, new_value: bool):
 # 🔸 GET: форма создания нового сигнала
 @router.get("/signals/create", response_class=HTMLResponse)
 async def signals_create_form(request: Request):
-    return templates.TemplateResponse("signals_create.html", {"request": request, "error": None})
+    async with pg_pool.acquire() as conn:
+        rules = await conn.fetch("SELECT name, description FROM signal_rules_v4 ORDER BY name")
+    return templates.TemplateResponse("signals_create.html", {
+        "request": request,
+        "error": None,
+        "rules": rules
+    })
 
 
 # 🔸 POST: создание нового сигнала
@@ -87,7 +93,8 @@ async def create_signal(
     timeframe: str = Form(...),
     source: str = Form(...),
     description: str = Form(...),
-    enabled: str = Form(...)
+    enabled: str = Form(...),
+    rule: str = Form(None)
 ):
     name = name.upper()
     long_phrase = long_phrase.upper()
@@ -96,18 +103,30 @@ async def create_signal(
     enabled_bool = enabled == "enabled"
 
     async with pg_pool.acquire() as conn:
+        rules = await conn.fetch("SELECT name, description FROM signal_rules_v4 ORDER BY name")
+
+        if source == "generator":
+            valid_rule_names = {r["name"] for r in rules}
+            if not rule or rule not in valid_rule_names:
+                return templates.TemplateResponse("signals_create.html", {
+                    "request": request,
+                    "error": "Для источника 'generator' необходимо выбрать корректное правило",
+                    "rules": rules
+                })
+
         exists = await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM signals_v4 WHERE name = $1)", name
         )
         if exists:
             return templates.TemplateResponse("signals_create.html", {
                 "request": request,
-                "error": f"Сигнал с именем '{name}' уже существует"
+                "error": f"Сигнал с именем '{name}' уже существует",
+                "rules": rules
             })
 
         await conn.execute("""
-            INSERT INTO signals_v4 (name, long_phrase, short_phrase, timeframe, source, description, enabled, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-        """, name, long_phrase, short_phrase, timeframe, source, description, enabled_bool)
+            INSERT INTO signals_v4 (name, long_phrase, short_phrase, timeframe, source, rule, description, enabled, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        """, name, long_phrase, short_phrase, timeframe, source, rule, description, enabled_bool)
 
     return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
