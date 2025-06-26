@@ -54,7 +54,7 @@
       <tr>
         <td class="px-4 py-2">{{ loop.index + ((page - 1) * 25) }}</td>
         <td class="px-4 py-2 font-mono text-slate-600">
-          <a href="#" class="text-blue-600 hover:underline uid-toggle" data-uid="{{ row.uid }}">{{ row.uid }}</a>
+          <a href="#" class="text-blue-600 hover:underline uid-toggle" data-uid="{{ row.full_uid }}">{{ row.uid }}</a>
         </td>
         <td class="px-4 py-2 font-semibold">{{ row.symbol }}</td>
         <td class="px-4 py-2 capitalize">{{ row.direction }}</td>

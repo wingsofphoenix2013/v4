@@ -165,6 +165,7 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
 
         logs.append({
             "uid": row["uid"][:8] + "...",
+            "full_uid": row["uid"],
             "symbol": row["symbol"],
             "direction": row["direction"],
             "bar_time": row["bar_time"].strftime("%Y-%m-%d %H:%M"),
