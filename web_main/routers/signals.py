@@ -130,9 +130,12 @@ async def create_signal(
         """, name, long_phrase, short_phrase, timeframe, source, rule, description, enabled_bool)
 
     return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
-# 🔸 GET: страница подробностей сигнала
+# 🔸 GET: страница подробностей сигнала с логами
 @router.get("/signals/{signal_id}", response_class=HTMLResponse)
-async def signal_detail_page(request: Request, signal_id: int):
+async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
+    page_size = 25
+    offset = (page - 1) * page_size
+
     async with pg_pool.acquire() as conn:
         signal = await conn.fetchrow("""
             SELECT id, name, description, long_phrase, short_phrase,
@@ -144,8 +147,37 @@ async def signal_detail_page(request: Request, signal_id: int):
         if not signal:
             raise HTTPException(status_code=404, detail="Сигнал не найден")
 
+        log_rows = await conn.fetch("""
+            SELECT uid, symbol, direction, bar_time, raw_message
+            FROM signals_v4_log
+            WHERE signal_id = $1
+            ORDER BY received_at DESC
+            LIMIT $2 OFFSET $3
+        """, signal_id, page_size + 1, offset)
+
+    # Парсим и подготавливаем лог
+    logs = []
+    for row in log_rows[:page_size]:
+        try:
+            raw = json.loads(row["raw_message"])
+            strategies = raw.get("strategies", [])
+        except Exception:
+            strategies = []
+
+        logs.append({
+            "uid": row["uid"][:8] + "...",
+            "symbol": row["symbol"],
+            "direction": row["direction"],
+            "bar_time": row["bar_time"].strftime("%Y-%m-%d %H:%M"),
+            "strategies": ", ".join(map(str, strategies))
+        })
+
+    has_next_page = len(log_rows) > page_size
+
     return templates.TemplateResponse("signals_detail.html", {
         "request": request,
         "signal": signal,
-        "logs": []  # пока без логов, добавим позже
+        "logs": logs,
+        "page": page,
+        "has_next_page": has_next_page
     })

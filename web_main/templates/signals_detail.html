@@ -29,7 +29,7 @@
     </header>
 <!-- Контейнер кнопок и таблицы -->
 <main class="max-w-7xl mx-auto px-4 py-10">
-<a href="/signals.hml">Назад к сигналам</a>
+<a href="/signals" class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад к сигналам</a>
 <!-- Карточка: Сигнал -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
   <h2 class="text-lg font-semibold text-slate-800 mb-2">Информация про сигнал</h2>
@@ -37,8 +37,44 @@
 </div>
 <!-- Карточка: Лог вывода -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-2">По результативности</h2>
-  <!-- Контент в разработке -->
+  <h2 class="text-lg font-semibold text-slate-800 mb-2">Лог вывода</h2>
+<table class="w-full table-auto text-sm bg-white rounded-md shadow mb-4">
+  <thead class="bg-slate-100 text-slate-700 uppercase text-xs">
+    <tr>
+      <th class="px-4 py-2">№</th>
+      <th class="px-4 py-2">UID</th>
+      <th class="px-4 py-2">Тикер</th>
+      <th class="px-4 py-2">Направление</th>
+      <th class="px-4 py-2">Свеча</th>
+      <th class="px-4 py-2">Стратегии</th>
+    </tr>
+  </thead>
+  <tbody class="text-slate-800 divide-y divide-slate-200">
+    {% for row in logs %}
+    <tr>
+      <td class="px-4 py-2">{{ loop.index + ((page - 1) * 25) }}</td>
+      <td class="px-4 py-2 font-mono text-slate-600">{{ row.uid }}</td>
+      <td class="px-4 py-2">{{ row.symbol }}</td>
+      <td class="px-4 py-2 capitalize">{{ row.direction }}</td>
+      <td class="px-4 py-2">{{ row.bar_time }}</td>
+      <td class="px-4 py-2">{{ row.strategies }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<!-- Пагинация -->
+<div class="flex justify-between items-center">
+  {% if page > 1 %}
+    <a href="?page={{ page - 1 }}" class="text-blue-600 hover:underline">&larr; Назад</a>
+  {% else %}
+    <span></span>
+  {% endif %}
+
+  {% if has_next_page %}
+    <a href="?page={{ page + 1 }}" class="text-blue-600 hover:underline">Вперёд &rarr;</a>
+  {% endif %}
+</div>
 </div>
 </main>
 	</body>
