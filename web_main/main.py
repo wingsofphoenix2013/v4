@@ -41,6 +41,7 @@ async def startup():
     setup_logging()
     await init_pg_pool()
     init_redis_client()
+    app.state.redis = redis_client
 
 # 🔸 Получение всех тикеров из базы
 async def get_all_tickers():
@@ -397,7 +398,8 @@ async def webhook_v4(request: Request):
     log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
     # 🔹 Публикация в Redis Stream с источником
-    await redis_client.xadd("signals_stream", {
+    redis = request.app.state.redis
+    await redis.xadd("signals_stream", {
         "message": message,
         "symbol": symbol,
         "bar_time": bar_time or "",
