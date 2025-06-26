@@ -31,12 +31,20 @@ def setup_logging():
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
+# 🔸 Логгер модуля infra
+log = logging.getLogger("INFRA")
+
 # 🔸 Подключение к PostgreSQL (асинхронный пул)
 pg_pool: asyncpg.Pool = None
 
 async def init_pg_pool():
     global pg_pool
-    pg_pool = await asyncpg.create_pool(DATABASE_URL)
+    try:
+        pg_pool = await asyncpg.create_pool(DATABASE_URL)
+        log.info("✅ PostgreSQL pool initialized")
+    except Exception:
+        log.exception("❌ Ошибка инициализации PostgreSQL pool")
+        raise
 
 # 🔸 Подключение к Redis
 redis_client: aioredis.Redis = None
