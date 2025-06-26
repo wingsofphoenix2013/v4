@@ -151,16 +151,15 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
             SELECT uid, symbol, direction, bar_time, raw_message
             FROM signals_v4_log
             WHERE signal_id = $1
-            ORDER BY received_at DESC
+            ORDER BY logged_at DESC
             LIMIT $2 OFFSET $3
         """, signal_id, page_size + 1, offset)
 
-    # Парсим и подготавливаем лог
     logs = []
     for row in log_rows[:page_size]:
         try:
             raw = json.loads(row["raw_message"])
-            strategies = raw.get("strategies", [])
+            strategies = sorted(raw.get("strategies", []))
         except Exception:
             strategies = []
 
