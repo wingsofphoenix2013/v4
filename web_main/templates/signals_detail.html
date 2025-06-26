@@ -88,19 +88,59 @@
   document.addEventListener("DOMContentLoaded", () => {
     const toggles = document.querySelectorAll(".uid-toggle");
 
+    let openRow = null;
+
     toggles.forEach(link => {
-      link.addEventListener("click", event => {
+      link.addEventListener("click", async event => {
         event.preventDefault();
 
         const uid = link.dataset.uid;
-        const allDetails = document.querySelectorAll(".uid-details");
-        const thisDetail = document.querySelector(`.uid-details[data-for="${uid}"]`);
+        const targetRow = document.querySelector(`.uid-details[data-for="${uid}"]`);
 
-        // Скрываем все
-        allDetails.forEach(row => row.classList.add("hidden"));
+        // Скрыть открытую строку, если кликнули на другую
+        if (openRow && openRow !== targetRow) {
+          openRow.classList.add("hidden");
+          openRow.innerHTML = '<td colspan="6" class="px-4 py-3 bg-slate-50 text-slate-700 text-sm border-t"><em>Загрузка...</em></td>';
+        }
 
-        // Показываем только выбранный
-        thisDetail.classList.remove("hidden");
+        // Переключение текущей строки
+        if (targetRow.classList.contains("hidden")) {
+          openRow = targetRow;
+          targetRow.classList.remove("hidden");
+          targetRow.innerHTML = '<td colspan="6" class="px-4 py-3 bg-slate-50 text-slate-700 text-sm border-t"><em>Загрузка...</em></td>';
+
+          try {
+            const res = await fetch(`/api/signal-log-details/${uid}`);
+            const data = await res.json();
+
+            if (data.length === 0) {
+              targetRow.innerHTML = '<td colspan="6" class="px-4 py-3 text-slate-500 italic border-t">Нет данных</td>';
+              return;
+            }
+
+            let table = '<td colspan="6" class="px-4 py-3 bg-slate-50 text-slate-700 border-t"><table class="w-full text-sm"><thead><tr><th class="text-left pr-4">ID</th><th class="text-left pr-4">Стратегия</th><th class="text-left pr-4">Статус</th><th class="text-left pr-4">Позиция</th><th class="text-left">Время</th></tr></thead><tbody>';
+
+            data.forEach(row => {
+              table += `<tr>
+                <td class="pr-4">${row.id}</td>
+                <td class="pr-4">${row.name}</td>
+                <td class="pr-4">${row.status}</td>
+                <td class="pr-4">${row.position_uid}</td>
+                <td>${row.logged_at}</td>
+              </tr>`;
+            });
+
+            table += '</tbody></table></td>';
+            targetRow.innerHTML = table;
+
+          } catch (err) {
+            targetRow.innerHTML = '<td colspan="6" class="px-4 py-3 text-red-600 border-t">Ошибка загрузки</td>';
+          }
+        } else {
+          // Повторный клик — скрыть
+          targetRow.classList.add("hidden");
+          openRow = null;
+        }
       });
     });
   });

@@ -180,3 +180,26 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
         "page": page,
         "has_next_page": has_next_page
     })
+# 🔸 API: детали обработки по UID
+@router.get("/api/signal-log-details/{uid}")
+async def get_signal_log_details(uid: str):
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT s.id, st.name, s.status, s.position_uid, s.logged_at
+            FROM signal_log_entries_v4 s
+            LEFT JOIN strategies_v4 st ON s.strategy_id = st.id
+            WHERE s.log_uid = $1
+            ORDER BY s.logged_at
+        """, uid)
+
+    result = []
+    for row in rows:
+        result.append({
+            "id": row["id"],
+            "name": row["name"],
+            "status": row["status"],
+            "position_uid": row["position_uid"][:8] + "..." if row["position_uid"] else "",
+            "logged_at": row["logged_at"].strftime("%Y-%m-%d %H:%M")
+        })
+
+    return JSONResponse(result)
