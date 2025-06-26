@@ -94,6 +94,7 @@ def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
         start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
         now_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     )
+
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
@@ -101,6 +102,15 @@ async def startup():
     global pg_pool, redis_client
     pg_pool = await init_pg_pool()
     redis_client = init_redis_client()
+
+    # 🔸 Передаём зависимости в роутеры
+    from routers import init_dependencies
+    init_dependencies(pg_pool, redis_client, templates)
+
+# 🔸 Подключаем все маршруты
+from routers import routers
+for router in routers:
+    app.include_router(router)
 
 # 🔸 Получение всех тикеров из базы
 async def get_all_tickers():
@@ -341,94 +351,6 @@ async def create_indicator(
             )
 
     return RedirectResponse(url="/indicators", status_code=HTTP_303_SEE_OTHER)
-# 🔸 Страница сигналов
-@app.get("/signals", response_class=HTMLResponse)
-async def signals_page(request: Request):
-    async with pg_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, name, timeframe, long_phrase, short_phrase, description, enabled, source
-            FROM signals_v4
-            ORDER BY id
-        """)
-        signals = []
-        for row in rows:
-            signals.append({
-                "id": row["id"],
-                "name": row["name"],
-                "description": row["description"],
-                "phrase": f"{row['long_phrase']}\n{row['short_phrase']}",
-                "timeframe": row["timeframe"].upper(),
-                "source": row["source"],
-                "enabled": row["enabled"],
-            })
-    return templates.TemplateResponse("signals.html", {"request": request, "signals": signals})
-# 🔸 POST: включение/отключение сигнала
-@app.post("/signals/{signal_id}/enable")
-async def enable_signal(signal_id: int):
-    await update_signal_status(signal_id, True)
-    return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
-
-@app.post("/signals/{signal_id}/disable")
-async def disable_signal(signal_id: int):
-    await update_signal_status(signal_id, False)
-    return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
-# 🔸 Обновление статуса сигнала и отправка уведомления в Redis
-log = logging.getLogger("SIGNALS")
-
-async def update_signal_status(signal_id: int, new_value: bool):
-    async with pg_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE signals_v4 SET enabled = $1 WHERE id = $2",
-            new_value, signal_id
-        )
-
-    event = {
-        "id": signal_id,
-        "type": "enabled",
-        "action": str(new_value).lower(),
-        "source": "web_ui"
-    }
-
-    await redis_client.publish("signals_v4_events", json.dumps(event))
-    log.info(f"[PubSub] {event}")
-# 🔸 GET: форма создания нового сигнала
-@app.get("/signals/create", response_class=HTMLResponse)
-async def signals_create_form(request: Request):
-    return templates.TemplateResponse("signals_create.html", {"request": request, "error": None})
-# 🔸 POST: создание нового сигнала
-@app.post("/signals/create", response_class=HTMLResponse)
-async def create_signal(
-    request: Request,
-    name: str = Form(...),
-    long_phrase: str = Form(...),
-    short_phrase: str = Form(...),
-    timeframe: str = Form(...),
-    source: str = Form(...),
-    description: str = Form(...),
-    enabled: str = Form(...)
-):
-    name = name.upper()
-    long_phrase = long_phrase.upper()
-    short_phrase = short_phrase.upper()
-    timeframe = timeframe.lower()
-    enabled_bool = enabled == "enabled"
-
-    async with pg_pool.acquire() as conn:
-        exists = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM signals_v4 WHERE name = $1)", name
-        )
-        if exists:
-            return templates.TemplateResponse("signals_create.html", {
-                "request": request,
-                "error": f"Сигнал с именем '{name}' уже существует"
-            })
-
-        await conn.execute("""
-            INSERT INTO signals_v4 (name, long_phrase, short_phrase, timeframe, source, description, enabled, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-        """, name, long_phrase, short_phrase, timeframe, source, description, enabled_bool)
-
-    return RedirectResponse(url="/signals", status_code=status.HTTP_303_SEE_OTHER)
 # 🔸 Приём сигналов от TradingView (формат JSON, v4)
 log = logging.getLogger("WEBHOOK")
 
