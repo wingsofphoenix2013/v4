@@ -21,42 +21,20 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST
 )
 
-from infra import setup_logging, init_pg_pool, init_redis_client, pg_pool, redis_client
+from infra import (
+    setup_logging,
+    init_pg_pool,
+    init_redis_client,
+    pg_pool,
+    redis_client,
+    templates,
+    get_kyiv_day_bounds,
+    get_kyiv_range_backwards,
+)
 
 # 🔸 FastAPI и шаблоны
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
 
-# 🔸 Временная зона и фильтрация по локальному времени (Киев)
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
-
-def get_kyiv_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
-    """
-    Возвращает границы суток по Киеву в naive-UTC формате (для SQL через asyncpg).
-    days_ago = 0 → сегодня, 1 → вчера и т.д.
-    """
-    now_kyiv = datetime.now(KYIV_TZ)
-    target_day = now_kyiv.date() - timedelta(days=days_ago)
-
-    start_kyiv = datetime.combine(target_day, time.min, tzinfo=KYIV_TZ)
-    end_kyiv = datetime.combine(target_day, time.max, tzinfo=KYIV_TZ)
-
-    return (
-        start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
-        end_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-    )
-
-def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
-    """
-    Возвращает диапазон последних N суток по Киеву — в naive-UTC формате (для SQL).
-    """
-    now_kyiv = datetime.now(KYIV_TZ)
-    start_kyiv = now_kyiv - timedelta(days=days)
-
-    return (
-        start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
-        now_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-    )
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
