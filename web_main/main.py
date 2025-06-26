@@ -21,6 +21,8 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST
 )
 
+from infra import setup_logging
+
 # 🔸 Переменные окружения
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -28,20 +30,6 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-
-# 🔸 Централизованная настройка логирования
-def setup_logging():
-    """
-    Централизованная настройка логирования.
-    DEBUG_MODE=True → debug/info/warning/error
-    DEBUG_MODE=False → info/warning/error
-    """
-    level = logging.DEBUG if DEBUG_MODE else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
 
 # 🔸 Подключение к PostgreSQL (асинхронный пул)
 pg_pool: asyncpg.Pool = None
@@ -454,7 +442,7 @@ async def webhook_v4(request: Request):
     received_at = datetime.utcnow().isoformat()
 
     # 🔹 Отладочный лог сигнала
-    log.debug(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
+    log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
     # 🔹 Публикация в Redis Stream с источником
     await redis_client.xadd("signals_stream", {
