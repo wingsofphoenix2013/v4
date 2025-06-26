@@ -21,32 +21,7 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST
 )
 
-from infra import setup_logging
-
-# 🔸 Переменные окружения
-DATABASE_URL = os.getenv("DATABASE_URL")
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
-REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-
-# 🔸 Подключение к PostgreSQL (асинхронный пул)
-pg_pool: asyncpg.Pool = None
-
-async def init_pg_pool():
-    return await asyncpg.create_pool(DATABASE_URL)
-
-# 🔸 Подключение к Redis
-redis_client: aioredis.Redis = None
-
-def init_redis_client():
-    protocol = "rediss" if REDIS_USE_TLS else "redis"
-    return aioredis.from_url(
-        f"{protocol}://{REDIS_HOST}:{REDIS_PORT}",
-        password=REDIS_PASSWORD,
-        decode_responses=True
-    )
+from infra import setup_logging, init_pg_pool, init_redis_client, pg_pool, redis_client
 
 # 🔸 FastAPI и шаблоны
 app = FastAPI()
@@ -86,9 +61,8 @@ def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
 @app.on_event("startup")
 async def startup():
     setup_logging()
-    global pg_pool, redis_client
-    pg_pool = await init_pg_pool()
-    redis_client = init_redis_client()
+    await init_pg_pool()
+    init_redis_client()
 
 # 🔸 Получение всех тикеров из базы
 async def get_all_tickers():
