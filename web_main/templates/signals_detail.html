@@ -118,20 +118,44 @@
               return;
             }
 
-            let table = '<td colspan="6" class="px-4 py-3 bg-slate-50 text-slate-700 border-t"><table class="w-full text-sm"><thead><tr><th class="text-left pr-4">ID</th><th class="text-left pr-4">Стратегия</th><th class="text-left pr-4">Статус</th><th class="text-left pr-4">Позиция</th><th class="text-left">Время</th></tr></thead><tbody>';
+let table = `
+  <td colspan="6" class="px-4 py-3 bg-white/70 text-slate-700 border-t">
+    <table class="w-full text-sm border border-slate-300 rounded overflow-hidden">
+      <thead class="bg-slate-50 text-slate-600">
+        <tr>
+          <th class="text-left px-3 py-2 border border-slate-200">ID</th>
+          <th class="text-left px-3 py-2 border border-slate-200">Стратегия</th>
+          <th class="text-left px-3 py-2 border border-slate-200">Статус</th>
+          <th class="text-left px-3 py-2 border border-slate-200">Комментарий</th>
+          <th class="text-left px-3 py-2 border border-slate-200">Позиция</th>
+          <th class="text-left px-3 py-2 border border-slate-200">Время</th>
+        </tr>
+      </thead>
+      <tbody>
+`;
 
-            data.forEach(row => {
-              table += `<tr>
-                <td class="pr-4">${row.id}</td>
-                <td class="pr-4">${row.name}</td>
-                <td class="pr-4">${row.status}</td>
-                <td class="pr-4">${row.position_uid}</td>
-                <td>${row.logged_at}</td>
-              </tr>`;
-            });
+data.forEach(row => {
+  table += `
+        <tr>
+          <td class="px-3 py-2 border border-slate-200">${row.id}</td>
+          <td class="px-3 py-2 border border-slate-200">${row.name}</td>
+          <td class="px-3 py-2 border border-slate-200">${row.status}</td>
+          <td class="px-3 py-2 border border-slate-200">${row.note || ""}</td>
+          <td class="px-3 py-2 border border-slate-200">
+            ${row.position_uid ? `<a href="#" class="text-blue-600 hover:underline">${row.position_uid}</a>` : ""}
+          </td>
+          <td class="px-3 py-2 border border-slate-200">${row.logged_at}</td>
+        </tr>
+  `;
+});
 
-            table += '</tbody></table></td>';
-            targetRow.innerHTML = table;
+table += `
+      </tbody>
+    </table>
+  </td>
+`;
+
+targetRow.innerHTML = table;
 
           } catch (err) {
             targetRow.innerHTML = '<td colspan="6" class="px-4 py-3 text-red-600 border-t">Ошибка загрузки</td>';
