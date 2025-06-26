@@ -21,29 +21,86 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST
 )
 
-from infra import (
-    setup_logging,
-    init_pg_pool,
-    init_redis_client,
-    pg_pool,
-    templates,
-    get_kyiv_day_bounds,
-    get_kyiv_range_backwards,
-)
+# 🔸 Переменные окружения
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+# 🔸 Централизованная настройка логирования
+def setup_logging():
+    """
+    Централизованная настройка логирования.
+    DEBUG_MODE=True → debug/info/warning/error
+    DEBUG_MODE=False → info/warning/error
+    """
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+# 🔸 Подключение к PostgreSQL (асинхронный пул)
+pg_pool: asyncpg.Pool = None
+
+async def init_pg_pool():
+    return await asyncpg.create_pool(DATABASE_URL)
+
+# 🔸 Подключение к Redis
+redis_client: aioredis.Redis = None
+
+def init_redis_client():
+    protocol = "rediss" if REDIS_USE_TLS else "redis"
+    return aioredis.from_url(
+        f"{protocol}://{REDIS_HOST}:{REDIS_PORT}",
+        password=REDIS_PASSWORD,
+        decode_responses=True
+    )
 
 # 🔸 FastAPI и шаблоны
 app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
+# 🔸 Временная зона и фильтрация по локальному времени (Киев)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def get_kyiv_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
+    """
+    Возвращает границы суток по Киеву в naive-UTC формате (для SQL через asyncpg).
+    days_ago = 0 → сегодня, 1 → вчера и т.д.
+    """
+    now_kyiv = datetime.now(KYIV_TZ)
+    target_day = now_kyiv.date() - timedelta(days=days_ago)
+
+    start_kyiv = datetime.combine(target_day, time.min, tzinfo=KYIV_TZ)
+    end_kyiv = datetime.combine(target_day, time.max, tzinfo=KYIV_TZ)
+
+    return (
+        start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
+        end_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    )
+
+def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
+    """
+    Возвращает диапазон последних N суток по Киеву — в naive-UTC формате (для SQL).
+    """
+    now_kyiv = datetime.now(KYIV_TZ)
+    start_kyiv = now_kyiv - timedelta(days=days)
+
+    return (
+        start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
+        now_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    )
 # 🔸 Инициализация пула при запуске приложения
 @app.on_event("startup")
 async def startup():
     setup_logging()
-    await init_pg_pool()
-
-    # Импортируем redis_client только после инициализации
-    from infra import init_redis_client, redis_client
-    init_redis_client()
-    app.state.redis = redis_client
+    global pg_pool, redis_client
+    pg_pool = await init_pg_pool()
+    redis_client = init_redis_client()
 
 # 🔸 Получение всех тикеров из базы
 async def get_all_tickers():
@@ -377,10 +434,6 @@ log = logging.getLogger("WEBHOOK")
 
 @app.post("/webhook_v4")
 async def webhook_v4(request: Request):
-    redis = request.app.state.redis
-    if redis is None:
-        raise HTTPException(status_code=500, detail="Redis not initialized")
-
     try:
         payload = await request.json()
     except Exception:
@@ -394,14 +447,17 @@ async def webhook_v4(request: Request):
     if not message or not symbol:
         raise HTTPException(status_code=422, detail="Missing 'message' or 'symbol'")
 
+    # 🔹 Очистка тикера от постфикса .P
     if symbol.endswith(".P"):
         symbol = symbol[:-2]
 
     received_at = datetime.utcnow().isoformat()
 
-    log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
+    # 🔹 Отладочный лог сигнала
+    log.debug(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
-    await redis.xadd("signals_stream", {
+    # 🔹 Публикация в Redis Stream с источником
+    await redis_client.xadd("signals_stream", {
         "message": message,
         "symbol": symbol,
         "bar_time": bar_time or "",
@@ -410,7 +466,8 @@ async def webhook_v4(request: Request):
         "source": "external_signal"
     })
 
-    return JSONResponse({"status": "ok", "received_at": received_at})# 🔸 Страница стратегий
+    return JSONResponse({"status": "ok", "received_at": received_at})
+# 🔸 Страница стратегий
 @app.get("/strategies", response_class=HTMLResponse)
 async def strategies_page(request: Request):
     async with pg_pool.acquire() as conn:
