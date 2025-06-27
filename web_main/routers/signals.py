@@ -160,7 +160,7 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
         uids = [row["uid"] for row in log_rows[:page_size]]
         strategy_status_map = {}
         if uids:
-            placeholders = ','.join(f"${i+2}" for i in range(len(uids)))
+            placeholders = ','.join(f"${i+1}" for i in range(len(uids)))
             query = f"""
                 SELECT log_uid, strategy_id, status
                 FROM signal_log_entries_v4
