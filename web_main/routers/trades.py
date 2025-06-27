@@ -102,7 +102,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
 
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
         return result
-@app.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
+@router.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_detail_page(
     request: Request,
     strategy_name: str,
@@ -255,7 +255,7 @@ async def strategy_detail_page(
         "roi": roi,
         "today_key": today_key,
     })
-@app.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
+@router.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
 async def strategy_stats_overview(
     request: Request,
     strategy_name: str,
@@ -289,7 +289,7 @@ def rsi_bin_index(value: float) -> int:
             return i
     return len(RSI_BINS) - 1
 
-@app.get("/trades/details/{strategy_name}/stats/rsi", response_class=HTMLResponse)
+@router.get("/trades/details/{strategy_name}/stats/rsi", response_class=HTMLResponse)
 async def strategy_rsi_stats(
     request: Request,
     strategy_name: str,
@@ -392,7 +392,7 @@ def bin_index(adx_value: float) -> int:
             return i
     return len(ADX_BINS) - 1
 
-@app.get("/trades/details/{strategy_name}/stats/adx", response_class=HTMLResponse)
+@router.get("/trades/details/{strategy_name}/stats/adx", response_class=HTMLResponse)
 async def strategy_adx_stats(
     request: Request,
     strategy_name: str,
@@ -516,7 +516,7 @@ def classify_zone(entry, upper, center, lower) -> int:
     else:
         return 5
 
-@app.get("/trades/details/{strategy_name}/stats/bb", response_class=HTMLResponse)
+@router.get("/trades/details/{strategy_name}/stats/bb", response_class=HTMLResponse)
 async def strategy_bb_stats(
     request: Request,
     strategy_name: str,
