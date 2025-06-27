@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from main import get_kyiv_day_bounds, get_kyiv_range_backwards
+from main import KYIV_TZ, get_kyiv_day_bounds, get_kyiv_range_backwards
 
 router = APIRouter()
 log = logging.getLogger("TRADES")
@@ -102,3 +102,515 @@ async def get_trading_summary(filter: str) -> list[dict]:
 
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
         return result
+@app.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
+async def strategy_detail_page(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None,
+    page: int = 1
+):
+    async with pg_pool.acquire() as conn:
+        # Стратегия
+        strategy = await conn.fetchrow("""
+            SELECT s.*, sig.name AS signal_name
+            FROM strategies_v4 s
+            LEFT JOIN signals_v4 sig ON sig.id = s.signal_id
+            WHERE s.name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        strategy_id = strategy["id"]
+
+        # Открытые позиции
+        open_positions_raw = await conn.fetch("""
+            SELECT *
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'open'
+            ORDER BY created_at DESC
+        """, strategy_id)
+
+        open_positions = [
+            {
+                **dict(p),
+                "created_at": p["created_at"].astimezone(KYIV_TZ) if p["created_at"] else None
+            }
+            for p in open_positions_raw
+        ]
+
+        # TP/SL цели
+        position_uids = [p["position_uid"] for p in open_positions]
+        targets_raw = await conn.fetch("""
+            SELECT *
+            FROM position_targets_v4
+            WHERE position_uid = ANY($1::text[])
+              AND hit = false AND canceled = false
+        """, position_uids)
+
+        targets_by_uid = {}
+        for t in targets_raw:
+            uid = t["position_uid"]
+            targets_by_uid.setdefault(uid, []).append(dict(t))
+
+        tp_sl_by_uid = {}
+        for uid, targets in targets_by_uid.items():
+            tp = sorted((t for t in targets if t["type"] == "tp"), key=lambda x: x["level"])
+            sl = [t for t in targets if t["type"] == "sl"]
+            tp_sl_by_uid[uid] = {
+                "tp": tp[0] if tp else None,
+                "sl": sl[0] if sl else None
+            }
+
+        # Закрытые позиции (история)
+        page_size = 50
+        offset = (page - 1) * page_size
+
+        closed_positions_raw = await conn.fetch("""
+            SELECT *
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+            ORDER BY closed_at DESC
+            LIMIT $2 OFFSET $3
+        """, strategy_id, page_size, offset)
+
+        closed_positions = [
+            {
+                **dict(p),
+                "created_at": p["created_at"].astimezone(KYIV_TZ) if p["created_at"] else None,
+                "closed_at": p["closed_at"].astimezone(KYIV_TZ) if p["closed_at"] else None,
+            }
+            for p in closed_positions_raw
+        ]
+
+        # Общее количество закрытых сделок
+        total_closed = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy_id)
+
+        total_pages = (total_closed + page_size - 1) // page_size
+
+        # Статистика по 10 дням (включая сегодня)
+        days = 10
+        daily_stats = defaultdict(lambda: {
+            "count": 0,
+            "positive": 0,
+            "negative": 0,
+            "pnl": Decimal("0.0")
+        })
+
+        for i in range(days):
+            day_start, day_end = get_kyiv_day_bounds(i)
+            rows = await conn.fetch("""
+                SELECT pnl
+                FROM positions_v4
+                WHERE strategy_id = $1 AND status = 'closed'
+                  AND closed_at BETWEEN $2 AND $3
+            """, strategy_id, day_start, day_end)
+
+            date_key = day_start.strftime('%Y-%m-%d')
+            for row in rows:
+                pnl = row["pnl"]
+                daily_stats[date_key]["count"] += 1
+                daily_stats[date_key]["pnl"] += pnl
+                if pnl >= 0:
+                    daily_stats[date_key]["positive"] += 1
+                else:
+                    daily_stats[date_key]["negative"] += 1
+
+        total_stats = {
+            "count": sum(d["count"] for d in daily_stats.values()),
+            "positive": sum(d["positive"] for d in daily_stats.values()),
+            "negative": sum(d["negative"] for d in daily_stats.values()),
+            "pnl": sum(d["pnl"] for d in daily_stats.values())
+        }
+
+        deposit = strategy["deposit"] or 0
+        roi = (total_stats["pnl"] / deposit * 100) if deposit else None
+
+        stat_dates = [
+            get_kyiv_day_bounds(i)[0].strftime('%Y-%m-%d')
+            for i in reversed(range(days))
+        ]
+        today_key = stat_dates[-1]
+        now = datetime.now(KYIV_TZ)
+
+    return templates.TemplateResponse("strategy_detail.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "open_positions": open_positions,
+        "tp_sl_by_uid": tp_sl_by_uid,
+        "closed_positions": closed_positions,
+        "current_page": page,
+        "total_pages": total_pages,
+        "filter": filter,
+        "series": series,
+        "now": now,
+        "stat_dates": stat_dates,
+        "daily_stats": daily_stats,
+        "total_stats": total_stats,
+        "roi": roi,
+        "today_key": today_key,
+    })
+@app.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
+async def strategy_stats_overview(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT *
+            FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+    return templates.TemplateResponse("strategy_stats.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series
+    })
+# 🔸 Статистика стратегии по индикатору RSI
+RSI_BINS = [(0, 20), (20, 30), (30, 40), (40, 50),
+            (50, 60), (60, 70), (70, 80), (80, float("inf"))]
+RSI_INF = float("inf")
+
+def rsi_bin_index(value: float) -> int:
+    for i, (lo, hi) in enumerate(RSI_BINS):
+        if lo <= value < hi:
+            return i
+    return len(RSI_BINS) - 1
+
+@app.get("/trades/details/{strategy_name}/stats/rsi", response_class=HTMLResponse)
+async def strategy_rsi_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("RSI_STATS")
+
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+        log.info(f"[RSI] Стратегия: {strategy_name} | таймфрейм: {tf}")
+
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        log.info(f"[RSI] Закрытых сделок: {len(position_map)}")
+
+        rsi_data = await conn.fetch("""
+            SELECT position_uid, value
+            FROM position_ind_stat_v4
+            WHERE param_name = 'rsi14'
+              AND timeframe = $2
+              AND position_uid = ANY($1)
+        """, list(position_map.keys()), tf)
+
+        log.info(f"[RSI] RSI-записей по {tf}: {len(rsi_data)}")
+
+        result = {
+            "success_long": {"main": [0]*8},
+            "success_short": {"main": [0]*8},
+            "fail_long": {"main": [0]*8},
+            "fail_short": {"main": [0]*8},
+        }
+
+        summary = {
+            "success": [0]*8,
+            "fail": [0]*8,
+        }
+
+        for row in rsi_data:
+            uid = row["position_uid"]
+            if uid not in position_map:
+                continue
+
+            rsi = float(row["value"])
+            info = position_map[uid]
+            pnl = info["pnl"]
+            direction = info["direction"]
+            idx = rsi_bin_index(rsi)
+
+            if pnl >= 0:
+                summary["success"][idx] += 1
+                if direction == "long":
+                    result["success_long"]["main"][idx] += 1
+                elif direction == "short":
+                    result["success_short"]["main"][idx] += 1
+            else:
+                summary["fail"][idx] += 1
+                if direction == "long":
+                    result["fail_long"]["main"][idx] += 1
+                elif direction == "short":
+                    result["fail_short"]["main"][idx] += 1
+
+    return templates.TemplateResponse("strategy_stats_rsi.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "rsi_distribution": result,
+        "rsi_summary": summary,
+        "rsi_bins": RSI_BINS,
+        "rsi_inf": RSI_INF,
+    })
+# 🔸 Статистика стратегии по индикатору ADX
+ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
+ADX_INF = float("inf")  # для шаблона
+
+def bin_index(adx_value: float) -> int:
+    for i, (lo, hi) in enumerate(ADX_BINS):
+        if lo <= adx_value < hi:
+            return i
+    return len(ADX_BINS) - 1
+
+@app.get("/trades/details/{strategy_name}/stats/adx", response_class=HTMLResponse)
+async def strategy_adx_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("ADX_STATS")
+
+    async with pg_pool.acquire() as conn:
+        # Стратегия
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+        log.info(f"[ADX] Стратегия: {strategy_name} | таймфрейм: {tf}")
+
+        # Закрытые сделки
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        log.info(f"[ADX] Найдено закрытых сделок: {len(position_map)}")
+
+        # ADX по таймфрейму стратегии
+        adx_data = await conn.fetch("""
+            SELECT position_uid, value
+            FROM position_ind_stat_v4
+            WHERE param_name = 'adx_dmi14_adx'
+              AND timeframe = $2
+              AND position_uid = ANY($1)
+        """, list(position_map.keys()), tf)
+
+        log.info(f"[ADX] Записей ADX по таймфрейму {tf}: {len(adx_data)}")
+
+        for i, row in enumerate(adx_data[:5]):
+            uid = row["position_uid"]
+            val = float(row["value"])
+            info = position_map.get(uid)
+            if info:
+                log.info(f"[ADX] → {uid} | ADX={val:.2f} | pnl={info['pnl']} | {info['direction']}")
+
+        # Инициализация структуры
+        result = {
+            "success_long": {"main": [0]*8},
+            "success_short": {"main": [0]*8},
+            "fail_long": {"main": [0]*8},
+            "fail_short": {"main": [0]*8},
+        }
+
+        adx_summary = {
+            "success": [0]*8,
+            "fail": [0]*8,
+        }
+
+        for row in adx_data:
+            uid = row["position_uid"]
+            if uid not in position_map:
+                continue
+
+            adx = float(row["value"])
+            info = position_map[uid]
+            pnl = info["pnl"]
+            direction = info["direction"]
+            idx = bin_index(adx)
+
+            if pnl >= 0:
+                adx_summary["success"][idx] += 1
+                if direction == "long":
+                    result["success_long"]["main"][idx] += 1
+                elif direction == "short":
+                    result["success_short"]["main"][idx] += 1
+            else:
+                adx_summary["fail"][idx] += 1
+                if direction == "long":
+                    result["fail_long"]["main"][idx] += 1
+                elif direction == "short":
+                    result["fail_short"]["main"][idx] += 1
+
+    return templates.TemplateResponse("strategy_stats_adx.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "adx_distribution": result,
+        "adx_summary": adx_summary,
+        "adx_bins": ADX_BINS,
+        "adx_inf": ADX_INF,
+    })
+# 🔸 Статистика стратегии по Bollinger Bands
+BB_ZONES = 6
+BB_SETS = ["2_5", "2_0", "1_5", "1_0"]
+
+def classify_zone(entry, upper, center, lower) -> int:
+    mid_upper = (center + upper) / 2
+    mid_lower = (center + lower) / 2
+    if entry > upper:
+        return 0
+    elif entry > mid_upper:
+        return 1
+    elif entry > center:
+        return 2
+    elif entry > mid_lower:
+        return 3
+    elif entry > lower:
+        return 4
+    else:
+        return 5
+
+@app.get("/trades/details/{strategy_name}/stats/bb", response_class=HTMLResponse)
+async def strategy_bb_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("BB_STATS")
+
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+        log.info(f"[BB] Стратегия: {strategy_name} | таймфрейм: {tf}")
+
+        positions = await conn.fetch("""
+            SELECT position_uid, entry_price, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "entry_price": float(p["entry_price"]),
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        bb_data_raw = await conn.fetch("""
+            SELECT position_uid, param_name, value
+            FROM position_ind_stat_v4
+            WHERE timeframe = $2
+              AND position_uid = ANY($1)
+              AND (
+                param_name LIKE 'bb20_2_5_%' OR
+                param_name LIKE 'bb20_2_0_%' OR
+                param_name LIKE 'bb20_1_5_%' OR
+                param_name LIKE 'bb20_1_0_%'
+              )
+        """, list(position_map.keys()), tf)
+
+        # Сборка BB-наборов по каждой позиции и каждому std
+        bb_full_data = {
+            std: defaultdict(dict) for std in BB_SETS
+        }
+
+        for row in bb_data_raw:
+            uid = row["position_uid"]
+            param = row["param_name"]
+            for std in BB_SETS:
+                if f"bb20_{std}_" in param:
+                    base = f"bb20_{std}_"
+                    bb_full_data[std][uid][param[len(base):]] = float(row["value"])
+
+        bb_distribution = {
+            std: {
+                "success_long": [0]*BB_ZONES,
+                "success_short": [0]*BB_ZONES,
+                "fail_long": [0]*BB_ZONES,
+                "fail_short": [0]*BB_ZONES,
+            } for std in BB_SETS
+        }
+
+        for std in BB_SETS:
+            for uid, bb in bb_full_data[std].items():
+                if uid not in position_map:
+                    continue
+                if not all(k in bb for k in ["upper", "center", "lower"]):
+                    continue
+
+                info = position_map[uid]
+                entry = info["entry_price"]
+                pnl = info["pnl"]
+                direction = info["direction"]
+
+                zone = classify_zone(entry, bb["upper"], bb["center"], bb["lower"])
+
+                key = (
+                    "success_" if pnl >= 0 else "fail_"
+                ) + direction
+
+                bb_distribution[std][key][zone] += 1
+
+    return templates.TemplateResponse("strategy_stats_bb.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "bb_distribution": bb_distribution,
+    })
