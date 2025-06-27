@@ -258,7 +258,7 @@ async def strategy_detail_page(
         "roi": roi,
         "today_key": today_key,
     })
- # 🔸 Страница статистики по стратегиям
+# 🔸 Страница статистики по стратегиям
 @router.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
 async def strategy_stats_overview(
     request: Request,
@@ -268,8 +268,7 @@ async def strategy_stats_overview(
 ):
     async with pg_pool.acquire() as conn:
         strategy = await conn.fetchrow("""
-            SELECT *
-            FROM strategies_v4
+            SELECT * FROM strategies_v4
             WHERE name = $1
         """, strategy_name)
 
@@ -302,7 +301,6 @@ async def strategy_stats_overview(
         }
 
         tickers = []
-
         for row in ticker_stats:
             row = dict(row)
             symbol = row["symbol"]
@@ -316,7 +314,7 @@ async def strategy_stats_overview(
             tickers.append({
                 "symbol": symbol,
                 "total": total,
-                "total_pct": None,  # будет позже
+                "total_pct": None,
                 "winrate": round(wins / total * 100, 1) if total else 0,
                 "long_total": long_total,
                 "long_winrate": round(long_win / long_total * 100, 1) if long_total else 0,
@@ -345,13 +343,66 @@ async def strategy_stats_overview(
             "short_winrate": round(summary["short_win"] / summary["short_total"] * 100, 1) if summary["short_total"] else 0,
         }
 
+        # 🔸 EMA анализ
+        positions = await conn.fetch("""
+            SELECT position_uid, entry_price, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "entry": float(p["entry_price"]),
+                "pnl": p["pnl"],
+                "dir": p["direction"]
+            }
+            for p in positions
+        }
+
+        ema_keys = ["ema9", "ema14", "ema21", "ema50", "ema200"]
+        tf = strategy["timeframe"]
+
+        ema_raw = await conn.fetch(f"""
+            SELECT position_uid, param_name, value
+            FROM position_ind_stat_v4
+            WHERE strategy_id = $1
+              AND timeframe = $2
+              AND param_name = ANY($3)
+        """, strategy["id"], tf, ema_keys)
+
+        ema_distribution = {
+            k: {
+                "success_long": [0, 0],
+                "success_short": [0, 0],
+                "fail_long": [0, 0],
+                "fail_short": [0, 0],
+            } for k in ema_keys
+        }
+
+        for row in ema_raw:
+            uid = row["position_uid"]
+            param = row["param_name"]
+            ema = float(row["value"])
+
+            if uid not in position_map:
+                continue
+
+            entry = position_map[uid]["entry"]
+            pnl = position_map[uid]["pnl"]
+            direction = position_map[uid]["dir"]
+
+            above = 0 if entry > ema else 1
+            key = ("success_" if pnl >= 0 else "fail_") + direction
+            ema_distribution[param][key][above] += 1
+
     return templates.TemplateResponse("strategy_stats.html", {
         "request": request,
         "strategy": dict(strategy),
         "filter": filter,
         "series": series,
         "tickers": tickers,
-        "summary_row": summary_row
+        "summary_row": summary_row,
+        "ema_distribution": ema_distribution
     })
 # 🔸 Статистика стратегии по индикатору RSI
 RSI_BINS = [(0, 20), (20, 30), (30, 40), (40, 50),

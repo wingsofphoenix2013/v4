@@ -122,7 +122,47 @@
 
 <!-- Карточка: По индикаторам -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-4">По индикаторам</h2>
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">EMA</h2>
+
+  <div class="overflow-x-auto">
+    <table class="min-w-full text-sm text-left border border-slate-300 rounded-md overflow-hidden">
+      <thead class="bg-slate-100 text-slate-700 uppercase text-xs">
+        <tr>
+          <th class="px-4 py-2">Тип сделки</th>
+          {% for ema in [9, 14, 21, 50, 200] %}
+          <th class="px-3 py-2 text-center">↑EMA{{ ema }}</th>
+          <th class="px-3 py-2 text-center">↓EMA{{ ema }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody class="text-slate-800 divide-y divide-slate-200">
+        {% for key, label in [
+          ("success_long", "Успешные — Long"),
+          ("success_short", "Успешные — Short"),
+          ("fail_long", "Неуспешные — Long"),
+          ("fail_short", "Неуспешные — Short")
+        ] %}
+        <tr class="hover:bg-slate-50 transition">
+          <td class="px-4 py-2 font-medium">{{ label }}</td>
+          {% for ema in [9, 14, 21, 50, 200] %}
+            {% set bins = ema_distribution["ema" ~ ema][key] %}
+            {% for count in bins %}
+              <td class="px-3 py-2 text-center">
+                {% if count > 0 %}
+                  {{ count }}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+            {% endfor %}
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 
   <div class="flex flex-wrap gap-3">
 <a href="/trades/details/{{ strategy.name }}/stats/rsi?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
