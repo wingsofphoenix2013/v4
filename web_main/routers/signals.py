@@ -187,7 +187,7 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
 async def get_signal_log_details(uid: str):
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT s.id, st.name, s.status, s.position_uid, s.logged_at
+            SELECT s.id, st.name, s.status, s.note, s.position_uid, s.logged_at
             FROM signal_log_entries_v4 s
             LEFT JOIN strategies_v4 st ON s.strategy_id = st.id
             WHERE s.log_uid = $1
