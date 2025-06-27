@@ -258,7 +258,7 @@ async def strategy_detail_page(
         "roi": roi,
         "today_key": today_key,
     })
- # 🔸 Страница статистики по стратегии
+ # 🔸 Страница статистики по стратегиям
 @router.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
 async def strategy_stats_overview(
     request: Request,
