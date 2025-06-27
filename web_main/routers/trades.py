@@ -258,6 +258,7 @@ async def strategy_detail_page(
         "roi": roi,
         "today_key": today_key,
     })
+ # 🔸 Страница статистики по стратегии
 @router.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
 async def strategy_stats_overview(
     request: Request,
@@ -275,11 +276,82 @@ async def strategy_stats_overview(
         if not strategy:
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
+        # 🔸 Статистика по тикерам
+        ticker_stats = await conn.fetch("""
+            SELECT
+                symbol,
+                COUNT(*) AS total,
+                SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN direction = 'long' THEN 1 ELSE 0 END) AS long_total,
+                SUM(CASE WHEN direction = 'long' AND pnl >= 0 THEN 1 ELSE 0 END) AS long_win,
+                SUM(CASE WHEN direction = 'short' THEN 1 ELSE 0 END) AS short_total,
+                SUM(CASE WHEN direction = 'short' AND pnl >= 0 THEN 1 ELSE 0 END) AS short_win
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+            GROUP BY symbol
+            ORDER BY total DESC
+        """, strategy["id"])
+
+        summary = {
+            "total": 0,
+            "wins": 0,
+            "long_total": 0,
+            "long_win": 0,
+            "short_total": 0,
+            "short_win": 0
+        }
+
+        tickers = []
+
+        for row in ticker_stats:
+            row = dict(row)
+            symbol = row["symbol"]
+            total = row["total"]
+            wins = row["wins"]
+            long_total = row["long_total"]
+            long_win = row["long_win"]
+            short_total = row["short_total"]
+            short_win = row["short_win"]
+
+            tickers.append({
+                "symbol": symbol,
+                "total": total,
+                "total_pct": None,  # будет позже
+                "winrate": round(wins / total * 100, 1) if total else 0,
+                "long_total": long_total,
+                "long_winrate": round(long_win / long_total * 100, 1) if long_total else 0,
+                "short_total": short_total,
+                "short_winrate": round(short_win / short_total * 100, 1) if short_total else 0,
+            })
+
+            summary["total"] += total
+            summary["wins"] += wins
+            summary["long_total"] += long_total
+            summary["long_win"] += long_win
+            summary["short_total"] += short_total
+            summary["short_win"] += short_win
+
+        for row in tickers:
+            row["total_pct"] = round(row["total"] / summary["total"] * 100, 1) if summary["total"] else 0
+
+        summary_row = {
+            "symbol": "ИТОГО",
+            "total": summary["total"],
+            "total_pct": 100,
+            "winrate": round(summary["wins"] / summary["total"] * 100, 1) if summary["total"] else 0,
+            "long_total": summary["long_total"],
+            "long_winrate": round(summary["long_win"] / summary["long_total"] * 100, 1) if summary["long_total"] else 0,
+            "short_total": summary["short_total"],
+            "short_winrate": round(summary["short_win"] / summary["short_total"] * 100, 1) if summary["short_total"] else 0,
+        }
+
     return templates.TemplateResponse("strategy_stats.html", {
         "request": request,
         "strategy": dict(strategy),
         "filter": filter,
-        "series": series
+        "series": series,
+        "tickers": tickers,
+        "summary_row": summary_row
     })
 # 🔸 Статистика стратегии по индикатору RSI
 RSI_BINS = [(0, 20), (20, 30), (30, 40), (40, 50),

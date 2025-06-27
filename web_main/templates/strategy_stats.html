@@ -80,7 +80,44 @@
 <!-- Карточка: По тикерам -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
   <h2 class="text-lg font-semibold text-slate-800 mb-2">По тикерам</h2>
-  <!-- Контент в разработке -->
+<div class="overflow-x-auto">
+  <table class="min-w-full text-sm text-left border border-slate-300 rounded-md overflow-hidden">
+    <thead class="bg-slate-100 text-slate-700 uppercase text-xs">
+      <tr>
+        <th class="px-4 py-2">Тикер</th>
+        <th class="px-4 py-2">Всего</th>
+        <th class="px-4 py-2">Winrate</th>
+        <th class="px-4 py-2">Лонг</th>
+        <th class="px-4 py-2">Лонг Winrate</th>
+        <th class="px-4 py-2">Шорт</th>
+        <th class="px-4 py-2">Шорт Winrate</th>
+      </tr>
+    </thead>
+    <tbody class="text-slate-800 divide-y divide-slate-200">
+      {% for row in tickers %}
+      <tr class="hover:bg-slate-50 transition">
+        <td class="px-4 py-2 font-semibold">{{ row.symbol }}</td>
+        <td class="px-4 py-2">{{ row.total }} <span class="text-slate-400 text-xs">({{ row.total_pct }}%)</span></td>
+        <td class="px-4 py-2">{{ row.winrate }}%</td>
+        <td class="px-4 py-2">{{ row.long_total }}</td>
+        <td class="px-4 py-2">{{ row.long_winrate }}%</td>
+        <td class="px-4 py-2">{{ row.short_total }}</td>
+        <td class="px-4 py-2">{{ row.short_winrate }}%</td>
+      </tr>
+      {% endfor %}
+
+      <tr class="bg-slate-100 font-semibold">
+        <td class="px-4 py-2">ИТОГО</td>
+        <td class="px-4 py-2">{{ summary_row.total }}</td>
+        <td class="px-4 py-2">{{ summary_row.winrate }}%</td>
+        <td class="px-4 py-2">{{ summary_row.long_total }}</td>
+        <td class="px-4 py-2">{{ summary_row.long_winrate }}%</td>
+        <td class="px-4 py-2">{{ summary_row.short_total }}</td>
+        <td class="px-4 py-2">{{ summary_row.short_winrate }}%</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
 </div>
 
 <!-- Карточка: По индикаторам -->
