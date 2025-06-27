@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, Request, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from main import KYIV_TZ
 
 router = APIRouter()
 log = logging.getLogger("SIGNALS")
@@ -168,7 +169,7 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
             "full_uid": row["uid"],
             "symbol": row["symbol"],
             "direction": row["direction"],
-            "bar_time": row["bar_time"].strftime("%Y-%m-%d %H:%M"),
+            "bar_time": row["bar_time"].astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M"),
             "strategies": ", ".join(map(str, strategies))
         })
 
@@ -199,8 +200,9 @@ async def get_signal_log_details(uid: str):
             "id": row["id"],
             "name": row["name"],
             "status": row["status"],
+            "note": row["note"],
             "position_uid": row["position_uid"][:8] + "..." if row["position_uid"] else "",
-            "logged_at": row["logged_at"].strftime("%Y-%m-%d %H:%M")
+            "logged_at": row["logged_at"].astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M")
         })
 
     return JSONResponse(result)
