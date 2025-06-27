@@ -149,7 +149,7 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
             raise HTTPException(status_code=404, detail="Сигнал не найден")
 
         log_rows = await conn.fetch("""
-            SELECT uid, symbol, direction, bar_time, raw_message
+            SELECT uid, symbol, direction, received_at, raw_message
             FROM signals_v4_log
             WHERE signal_id = $1
             ORDER BY logged_at DESC
@@ -206,7 +206,7 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
             "full_uid": uid,
             "symbol": row["symbol"],
             "direction": row["direction"],
-            "bar_time": row["bar_time"].astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M"),
+            "received_at": row["received_at"].astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M"),
             "strategies": ", ".join(rendered)
         })
 
@@ -227,8 +227,10 @@ async def get_signal_log_details(uid: str):
             SELECT s.id, st.name, s.status, s.note, s.position_uid, s.logged_at
             FROM signal_log_entries_v4 s
             LEFT JOIN strategies_v4 st ON s.strategy_id = st.id
+            JOIN signals_v4_log l ON s.log_uid = l.uid
             WHERE s.log_uid = $1
-            ORDER BY s.logged_at
+              AND s.logged_at <= l.received_at + interval '1 minute'
+            ORDER BY st.name
         """, uid)
 
     result = []

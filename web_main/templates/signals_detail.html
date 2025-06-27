@@ -58,7 +58,7 @@
         </td>
         <td class="px-4 py-2 font-semibold">{{ row.symbol }}</td>
         <td class="px-4 py-2 capitalize">{{ row.direction }}</td>
-        <td class="px-4 py-2">{{ row.bar_time }}</td>
+        <td class="px-4 py-2">{{ row.received_at }}</td>
         <td class="px-4 py-2">{% autoescape false %}{{ row.strategies }}{% endautoescape %}</td>
       </tr>
       <tr class="uid-details hidden" data-for="{{ row.full_uid }}">
