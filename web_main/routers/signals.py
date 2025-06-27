@@ -156,21 +156,58 @@ async def signal_detail_page(request: Request, signal_id: int, page: int = 1):
             LIMIT $2 OFFSET $3
         """, signal_id, page_size + 1, offset)
 
+        # 🔸 Загружаем статусы стратегий (opened/closed) по UID
+        uids = [row["uid"] for row in log_rows[:page_size]]
+        strategy_status_map = {}
+        if uids:
+            placeholders = ','.join(f"${i+2}" for i in range(len(uids)))
+            query = f"""
+                SELECT log_uid, strategy_id, status
+                FROM signal_log_entries_v4
+                WHERE log_uid IN ({placeholders})
+                  AND status IN ('opened', 'closed')
+            """
+            status_rows = await conn.fetch(query, *uids)
+            for r in status_rows:
+                uid = r["log_uid"]
+                sid = r["strategy_id"]
+                status = r["status"]
+                strategy_status_map.setdefault(uid, {}).setdefault(sid, set()).add(status)
+
+    # 🔸 Сборка логов для отображения
     logs = []
     for row in log_rows[:page_size]:
         try:
             raw = json.loads(row["raw_message"])
-            strategies = sorted(raw.get("strategies", []))
+            strategy_ids = sorted(raw.get("strategies", []))
         except Exception:
-            strategies = []
+            strategy_ids = []
+
+        uid = row["uid"]
+        statuses_by_sid = strategy_status_map.get(uid, {})
+
+        rendered = []
+        for sid in strategy_ids:
+            style = ""
+            statuses = statuses_by_sid.get(sid, set())
+
+            if "opened" in statuses:
+                style = "text-green-600 font-semibold"
+            elif "closed" in statuses:
+                style = "text-red-600 font-semibold"
+
+            if style:
+                rendered.append(f'<span class="{style}">{sid}</span>')
+            else:
+                rendered.append(str(sid))
 
         logs.append({
-            "uid": row["uid"][:8] + "...",
-            "full_uid": row["uid"],
+            "uid": uid[:8] + "...",
+            "full_uid": uid,
             "symbol": row["symbol"],
             "direction": row["direction"],
             "bar_time": row["bar_time"].astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M"),
-            "strategies": ", ".join(map(str, strategies))
+            "strategies": ", ".join(rendered)
         })
 
     has_next_page = len(log_rows) > page_size

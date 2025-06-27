@@ -59,7 +59,7 @@
         <td class="px-4 py-2 font-semibold">{{ row.symbol }}</td>
         <td class="px-4 py-2 capitalize">{{ row.direction }}</td>
         <td class="px-4 py-2">{{ row.bar_time }}</td>
-        <td class="px-4 py-2">{{ row.strategies }}</td>
+        <td class="px-4 py-2">{% autoescape false %}{{ row.strategies }}{% endautoescape %}</td>
       </tr>
       <tr class="uid-details hidden" data-for="{{ row.full_uid }}">
         <td colspan="6" class="px-4 py-3 bg-slate-50 text-slate-700 text-sm border-t">
