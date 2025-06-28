@@ -740,3 +740,103 @@ async def strategy_bb_stats(
         "series": series,
         "bb_distribution": bb_distribution,
     })
+# 🔸 Статистика стратегии по MFI
+MFI_BINS = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50),
+            (50, 60), (60, 70), (70, 80), (80, 90), (90, float("inf"))]
+
+def mfi_bin_index(value: float) -> int:
+    for i, (lo, hi) in enumerate(MFI_BINS):
+        if lo <= value < hi:
+            return i
+    return len(MFI_BINS) - 1
+
+@router.get("/trades/details/{strategy_name}/stats/mfi", response_class=HTMLResponse)
+async def strategy_mfi_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("MFI_STATS")
+
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+        log.info(f"[MFI] Стратегия: {strategy_name} | таймфрейм: {tf}")
+
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        mfi_data = await conn.fetch("""
+            SELECT position_uid, value
+            FROM position_ind_stat_v4
+            WHERE param_name = 'mfi14'
+              AND timeframe = $2
+              AND position_uid = ANY($1)
+        """, list(position_map.keys()), tf)
+
+        log.info(f"[MFI] Найдено записей: {len(mfi_data)}")
+
+        result = {
+            "success_long": [0]*10,
+            "success_short": [0]*10,
+            "fail_long": [0]*10,
+            "fail_short": [0]*10,
+        }
+
+        summary = {
+            "success": [0]*10,
+            "fail": [0]*10,
+        }
+
+        for row in mfi_data:
+            uid = row["position_uid"]
+            if uid not in position_map:
+                continue
+
+            mfi = float(row["value"])
+            info = position_map[uid]
+            pnl = info["pnl"]
+            direction = info["direction"]
+            idx = mfi_bin_index(mfi)
+
+            if pnl >= 0:
+                summary["success"][idx] += 1
+                if direction == "long":
+                    result["success_long"][idx] += 1
+                elif direction == "short":
+                    result["success_short"][idx] += 1
+            else:
+                summary["fail"][idx] += 1
+                if direction == "long":
+                    result["fail_long"][idx] += 1
+                elif direction == "short":
+                    result["fail_short"][idx] += 1
+
+    return templates.TemplateResponse("strategy_stats_mfi.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "mfi_distribution": result,
+        "mfi_summary": summary,
+        "mfi_bins": MFI_BINS
+    })
