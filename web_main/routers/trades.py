@@ -870,3 +870,130 @@ async def strategy_mfi_stats(
         "mfi_summary": summary,
         "mfi_bins": MFI_BINS
     })
+# 🔸 Статистика стратегии по LR (угол наклона)
+LR_BINS = [
+    (-float("inf"), -0.02),
+    (-0.02, -0.015),
+    (-0.015, -0.01),
+    (-0.01, -0.005),
+    (-0.005, 0),
+    (0, 0),  # строго 0
+    (0, 0.005),
+    (0.005, 0.01),
+    (0.01, 0.015),
+    (0.015, 0.02),
+    (0.02, float("inf"))
+]
+
+LR_LABELS = [
+    "< -0.02", "-0.02–-0.015", "-0.015–-0.01", "-0.01–-0.005",
+    "-0.005–0", "0", "0–0.005", "0.005–0.01", "0.01–0.015", "0.015–0.02", "> 0.02"
+]
+
+def lr_bin_index(angle: float) -> int:
+    if angle == 0:
+        return 5
+    elif angle < -0.02:
+        return 0
+    elif angle < -0.015:
+        return 1
+    elif angle < -0.01:
+        return 2
+    elif angle < -0.005:
+        return 3
+    elif angle < 0:
+        return 4
+    elif angle <= 0.005:
+        return 6
+    elif angle <= 0.01:
+        return 7
+    elif angle <= 0.015:
+        return 8
+    elif angle <= 0.02:
+        return 9
+    else:
+        return 10
+
+@router.get("/trades/details/{strategy_name}/stats/lr", response_class=HTMLResponse)
+async def strategy_lr_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("LR_STATS")
+
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        lr_data = await conn.fetch("""
+            SELECT position_uid, value
+            FROM position_ind_stat_v4
+            WHERE param_name = 'lr50_angle'
+              AND timeframe = $2
+              AND position_uid = ANY($1)
+        """, list(position_map.keys()), tf)
+
+        log.info(f"[LR] Найдено: {len(lr_data)} записей")
+
+        result = {
+            "success_long": [0]*11,
+            "success_short": [0]*11,
+            "fail_long": [0]*11,
+            "fail_short": [0]*11,
+        }
+
+        summary = {
+            "success": [0]*11,
+            "fail": [0]*11,
+        }
+
+        for row in lr_data:
+            uid = row["position_uid"]
+            if uid not in position_map:
+                continue
+
+            angle = float(row["value"])
+            info = position_map[uid]
+            pnl = info["pnl"]
+            direction = info["direction"]
+            idx = lr_bin_index(angle)
+
+            if pnl >= 0:
+                summary["success"][idx] += 1
+                result[f"success_{direction}"][idx] += 1
+            else:
+                summary["fail"][idx] += 1
+                result[f"fail_{direction}"][idx] += 1
+
+    return templates.TemplateResponse("strategy_stats_lr.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "lr_distribution": result,
+        "lr_summary": summary,
+        "lr_labels": LR_LABELS
+    })    

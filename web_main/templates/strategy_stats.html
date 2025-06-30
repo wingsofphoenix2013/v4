@@ -172,9 +172,10 @@
    class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
   По ADX/DMI
 </a>
-    <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По LR
-    </a>
+<a href="/trades/details/{{ strategy.name }}/stats/lr?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+  По LR
+</a>
 <a href="/trades/details/{{ strategy.name }}/stats/mfi?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
    class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
   По MFI
