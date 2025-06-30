@@ -996,4 +996,101 @@ async def strategy_lr_stats(
         "lr_distribution": result,
         "lr_summary": summary,
         "lr_labels": LR_LABELS
-    })    
+    })
+# 🔸 Статистика стратегии по MACD
+MACD_CATEGORIES = ["↓↓ hist", "↑↓ hist", "hist ↓↑", "hist ↑↑"]
+
+def classify_macd(macd, signal, hist) -> str:
+    if macd <= signal and macd < hist:
+        return "↓↓ hist"
+    elif macd > signal and macd <= hist:
+        return "↑↓ hist"
+    elif macd <= signal and macd > hist:
+        return "hist ↓↑"
+    else:
+        return "hist ↑↑"
+
+@router.get("/trades/details/{strategy_name}/stats/macd", response_class=HTMLResponse)
+async def strategy_macd_stats(
+    request: Request,
+    strategy_name: str,
+    filter: str = None,
+    series: str = None
+):
+    log = logging.getLogger("MACD_STATS")
+
+    async with pg_pool.acquire() as conn:
+        strategy = await conn.fetchrow("""
+            SELECT * FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        tf = strategy["timeframe"]
+
+        positions = await conn.fetch("""
+            SELECT position_uid, pnl, direction
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+        """, strategy["id"])
+
+        position_map = {
+            p["position_uid"]: {
+                "pnl": p["pnl"],
+                "direction": p["direction"]
+            }
+            for p in positions
+        }
+
+        macd_rows = await conn.fetch("""
+            SELECT position_uid, param_name, value
+            FROM position_ind_stat_v4
+            WHERE position_uid = ANY($1)
+              AND timeframe = $2
+              AND param_name IN (
+                'macd12_macd',
+                'macd12_macd_signal',
+                'macd12_macd_hist'
+              )
+        """, list(position_map.keys()), tf)
+
+        macd_map = defaultdict(dict)
+        for row in macd_rows:
+            macd_map[row["position_uid"]][row["param_name"]] = float(row["value"])
+
+        result = {
+            "success_long": {k: 0 for k in MACD_CATEGORIES},
+            "success_short": {k: 0 for k in MACD_CATEGORIES},
+            "fail_long": {k: 0 for k in MACD_CATEGORIES},
+            "fail_short": {k: 0 for k in MACD_CATEGORIES},
+        }
+
+        for uid, info in position_map.items():
+            pnl = info["pnl"]
+            direction = info["direction"]
+
+            data = macd_map.get(uid, {})
+            if not all(k in data for k in [
+                "macd12_macd", "macd12_macd_signal", "macd12_macd_hist"
+            ]):
+                continue
+
+            macd = data["macd12_macd"]
+            signal = data["macd12_macd_signal"]
+            hist = data["macd12_macd_hist"]
+
+            category = classify_macd(macd, signal, hist)
+
+            key = f"{'success' if pnl >= 0 else 'fail'}_{direction}"
+            result[key][category] += 1
+
+    return templates.TemplateResponse("strategy_stats_macd.html", {
+        "request": request,
+        "strategy": dict(strategy),
+        "filter": filter,
+        "series": series,
+        "macd_distribution": result,
+        "macd_categories": MACD_CATEGORIES
+    })

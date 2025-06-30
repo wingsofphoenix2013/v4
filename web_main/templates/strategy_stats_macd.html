@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RSI: Статистика по стратегии</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body {
+        background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
+      }
+    </style>
+  </head>
+  <body class="min-h-screen font-sans text-slate-800">
+    <main class="max-w-7xl mx-auto px-4 py-10">
+      <!-- Назад -->
+      <a href="/trades/details/{{ strategy.name }}/stats?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+         class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">
+        Назад к статистике
+      </a>
+      <!-- Карточка: Стратегия -->
+      <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+        <div class="flex justify-between items-start mb-4">
+          <div>
+            <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
+            {% if strategy.description %}
+            <p class="text-sm text-slate-700 w-1/2 break-words mt-1">
+              {{ strategy.description }}
+            </p>
+            {% endif %}
+          </div>
+          <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
+        </div>
+
+        <div class="flex gap-2">
+          <a href="/trades/details/{{ strategy.name }}"
+             class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800 text-center">
+            Детали
+          </a>
+          <a href="/trades/details/{{ strategy.name }}/stats"
+             class="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium text-center shadow hover:bg-blue-700">
+            Статистика
+          </a>
+        </div>
+      </div>
+<!-- Карточка: Данные по индикатору MACD -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">Данные по индикатору MACD</h2>
+
+  <!-- Успешные сделки -->
+  <div class="mb-8">
+    <h3 class="text-md font-semibold text-slate-700 mb-3">Успешные сделки</h3>
+    <table class="w-full table-auto text-sm text-slate-800 border border-slate-200">
+      <thead class="bg-slate-100 text-slate-700">
+        <tr>
+          <th class="px-3 py-2 text-left">Тип</th>
+          {% for cat in macd_categories %}
+          <th class="px-3 py-2 text-center">{{ cat }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for key, label in [("long", "Успешные — Long"), ("short", "Успешные — Short")] %}
+        {% set row = macd_distribution["success_" ~ key] %}
+        {% set total = row.values() | sum %}
+        <tr class="border-t border-slate-100 hover:bg-slate-50">
+          <td class="px-3 py-2 font-medium">{{ label }}</td>
+          {% for cat in macd_categories %}
+          <td class="px-3 py-2 text-center">
+            {% if row[cat] > 0 %}
+              {{ row[cat] }} ({{ ((row[cat] / total) * 100) | round(1) }}%)
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Неуспешные сделки -->
+  <div>
+    <h3 class="text-md font-semibold text-slate-700 mb-3">Неуспешные сделки</h3>
+    <table class="w-full table-auto text-sm text-slate-800 border border-slate-200">
+      <thead class="bg-slate-100 text-slate-700">
+        <tr>
+          <th class="px-3 py-2 text-left">Тип</th>
+          {% for cat in macd_categories %}
+          <th class="px-3 py-2 text-center">{{ cat }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for key, label in [("long", "Неуспешные — Long"), ("short", "Неуспешные — Short")] %}
+        {% set row = macd_distribution["fail_" ~ key] %}
+        {% set total = row.values() | sum %}
+        <tr class="border-t border-slate-100 hover:bg-slate-50">
+          <td class="px-3 py-2 font-medium">{{ label }}</td>
+          {% for cat in macd_categories %}
+          <td class="px-3 py-2 text-center">
+            {% if row[cat] > 0 %}
+              {{ row[cat] }} ({{ ((row[cat] / total) * 100) | round(1) }}%)
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+    </main>
+  </body>
+</html>

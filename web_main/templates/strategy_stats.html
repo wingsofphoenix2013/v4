@@ -184,9 +184,10 @@
    class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
   По BB
 </a>
-    <a href="#" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
-      По MACD
-    </a>
+<a href="/trades/details/{{ strategy.name }}/stats/macd?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
+   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+  По MACD
+</a>
   </div>
 </div>
 </main>
