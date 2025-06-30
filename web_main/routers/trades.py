@@ -997,18 +997,23 @@ async def strategy_lr_stats(
         "lr_summary": summary,
         "lr_labels": LR_LABELS
     })
-# 🔸 Статистика стратегии по MACD
-MACD_CATEGORIES = ["↓↓ hist", "↑↓ hist", "hist ↓↑", "hist ↑↑"]
+# 🔸 Статистика стратегии по MACD (включая направление тренда)
+MACD_CATEGORIES_EXT = [
+    "↓↓ hist←", "↓↓ hist→",
+    "↑↓ hist←", "↑↓ hist→",
+    "←hist ↓↑", "→hist ↓↑",
+    "←hist ↑↑", "→hist ↑↑"
+]
 
-def classify_macd(macd, signal, hist) -> str:
-    if macd <= signal and macd < hist:
-        return "↓↓ hist"
-    elif macd > signal and macd <= hist:
-        return "↑↓ hist"
-    elif macd <= signal and macd > hist:
-        return "hist ↓↑"
+def classify_macd_full(macd, signal, hist, plus_di, minus_di):
+    if macd <= signal:
+        base = "↓↓ hist" if macd < hist else "↑↓ hist"
+        arrow = "→" if minus_di >= plus_di else "←"
+        return f"{base}{arrow}"
     else:
-        return "hist ↑↑"
+        base = "hist ↓↑" if macd < hist else "hist ↑↑"
+        arrow = "→" if plus_di > minus_di else "←"
+        return f"{arrow}{base}"
 
 @router.get("/trades/details/{strategy_name}/stats/macd", response_class=HTMLResponse)
 async def strategy_macd_stats(
@@ -1044,46 +1049,45 @@ async def strategy_macd_stats(
             for p in positions
         }
 
-        macd_rows = await conn.fetch("""
+        ind_rows = await conn.fetch("""
             SELECT position_uid, param_name, value
             FROM position_ind_stat_v4
             WHERE position_uid = ANY($1)
               AND timeframe = $2
               AND param_name IN (
-                'macd12_macd',
-                'macd12_macd_signal',
-                'macd12_macd_hist'
+                'macd12_macd', 'macd12_macd_signal', 'macd12_macd_hist',
+                'adx_dmi14_plus_di', 'adx_dmi14_minus_di'
               )
         """, list(position_map.keys()), tf)
 
-        macd_map = defaultdict(dict)
-        for row in macd_rows:
-            macd_map[row["position_uid"]][row["param_name"]] = float(row["value"])
+        ind_map = defaultdict(dict)
+        for row in ind_rows:
+            ind_map[row["position_uid"]][row["param_name"]] = float(row["value"])
 
         result = {
-            "success_long": {k: 0 for k in MACD_CATEGORIES},
-            "success_short": {k: 0 for k in MACD_CATEGORIES},
-            "fail_long": {k: 0 for k in MACD_CATEGORIES},
-            "fail_short": {k: 0 for k in MACD_CATEGORIES},
+            "success_long": {k: 0 for k in MACD_CATEGORIES_EXT},
+            "success_short": {k: 0 for k in MACD_CATEGORIES_EXT},
+            "fail_long": {k: 0 for k in MACD_CATEGORIES_EXT},
+            "fail_short": {k: 0 for k in MACD_CATEGORIES_EXT},
         }
 
         for uid, info in position_map.items():
-            pnl = info["pnl"]
-            direction = info["direction"]
-
-            data = macd_map.get(uid, {})
+            data = ind_map.get(uid, {})
             if not all(k in data for k in [
-                "macd12_macd", "macd12_macd_signal", "macd12_macd_hist"
+                "macd12_macd", "macd12_macd_signal", "macd12_macd_hist",
+                "adx_dmi14_plus_di", "adx_dmi14_minus_di"
             ]):
                 continue
 
             macd = data["macd12_macd"]
             signal = data["macd12_macd_signal"]
             hist = data["macd12_macd_hist"]
+            plus_di = data["adx_dmi14_plus_di"]
+            minus_di = data["adx_dmi14_minus_di"]
 
-            category = classify_macd(macd, signal, hist)
+            category = classify_macd_full(macd, signal, hist, plus_di, minus_di)
 
-            key = f"{'success' if pnl >= 0 else 'fail'}_{direction}"
+            key = f"{'success' if info['pnl'] >= 0 else 'fail'}_{info['direction']}"
             result[key][category] += 1
 
     return templates.TemplateResponse("strategy_stats_macd.html", {
@@ -1092,5 +1096,5 @@ async def strategy_macd_stats(
         "filter": filter,
         "series": series,
         "macd_distribution": result,
-        "macd_categories": MACD_CATEGORIES
+        "macd_categories_ext": MACD_CATEGORIES_EXT
     })

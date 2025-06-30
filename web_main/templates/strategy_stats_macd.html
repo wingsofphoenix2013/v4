@@ -45,7 +45,7 @@
       </div>
 <!-- Карточка: Данные по индикатору MACD -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <h2 class="text-lg font-semibold text-slate-800 mb-4">Данные по индикатору MACD</h2>
+  <h2 class="text-lg font-semibold text-slate-800 mb-4">Данные по индикатору MACD (с направлением тренда)</h2>
 
   <!-- Успешные сделки -->
   <div class="mb-8">
@@ -54,7 +54,7 @@
       <thead class="bg-slate-100 text-slate-700">
         <tr>
           <th class="px-3 py-2 text-left">Тип</th>
-          {% for cat in macd_categories %}
+          {% for cat in macd_categories_ext %}
           <th class="px-3 py-2 text-center">{{ cat }}</th>
           {% endfor %}
         </tr>
@@ -65,7 +65,7 @@
         {% set total = row.values() | sum %}
         <tr class="border-t border-slate-100 hover:bg-slate-50">
           <td class="px-3 py-2 font-medium">{{ label }}</td>
-          {% for cat in macd_categories %}
+          {% for cat in macd_categories_ext %}
           <td class="px-3 py-2 text-center">
             {% if row[cat] > 0 %}
               {{ row[cat] }} ({{ ((row[cat] / total) * 100) | round(1) }}%)
@@ -87,7 +87,7 @@
       <thead class="bg-slate-100 text-slate-700">
         <tr>
           <th class="px-3 py-2 text-left">Тип</th>
-          {% for cat in macd_categories %}
+          {% for cat in macd_categories_ext %}
           <th class="px-3 py-2 text-center">{{ cat }}</th>
           {% endfor %}
         </tr>
@@ -98,7 +98,7 @@
         {% set total = row.values() | sum %}
         <tr class="border-t border-slate-100 hover:bg-slate-50">
           <td class="px-3 py-2 font-medium">{{ label }}</td>
-          {% for cat in macd_categories %}
+          {% for cat in macd_categories_ext %}
           <td class="px-3 py-2 text-center">
             {% if row[cat] > 0 %}
               {{ row[cat] }} ({{ ((row[cat] / total) * 100) | round(1) }}%)
