@@ -512,11 +512,20 @@ async def strategy_rsi_stats(
 ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
 ADX_INF = float("inf")  # для шаблона
 
+GAP_ZONES = [-float("inf"), -15, -5, 5, 10, 15, 20, 25, 30, float("inf")]
+GAP_LABELS = ["≤-15", "-15–-5", "-5–+5", "+5–10", "+10–15", "+15–20", "+20–25", "+25–30", ">30"]
+
 def bin_index(adx_value: float) -> int:
     for i, (lo, hi) in enumerate(ADX_BINS):
         if lo <= adx_value < hi:
             return i
     return len(ADX_BINS) - 1
+
+def gap_bin_index(val: float) -> int:
+    for i in range(len(GAP_ZONES) - 1):
+        if GAP_ZONES[i] <= val < GAP_ZONES[i + 1]:
+            return i
+    return len(GAP_ZONES) - 2
 
 @router.get("/trades/details/{strategy_name}/stats/adx", response_class=HTMLResponse)
 async def strategy_adx_stats(
@@ -528,7 +537,6 @@ async def strategy_adx_stats(
     log = logging.getLogger("ADX_STATS")
 
     async with pg_pool.acquire() as conn:
-        # Стратегия
         strategy = await conn.fetchrow("""
             SELECT * FROM strategies_v4
             WHERE name = $1
@@ -540,7 +548,6 @@ async def strategy_adx_stats(
         tf = strategy["timeframe"]
         log.info(f"[ADX] Стратегия: {strategy_name} | таймфрейм: {tf}")
 
-        # Закрытые сделки
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
             FROM positions_v4
@@ -557,26 +564,36 @@ async def strategy_adx_stats(
 
         log.info(f"[ADX] Найдено закрытых сделок: {len(position_map)}")
 
-        # ADX по таймфрейму стратегии
-        adx_data = await conn.fetch("""
-            SELECT position_uid, value
+        ind_data = await conn.fetch("""
+            SELECT position_uid, param_name, value
             FROM position_ind_stat_v4
-            WHERE param_name = 'adx_dmi14_adx'
+            WHERE position_uid = ANY($1)
               AND timeframe = $2
-              AND position_uid = ANY($1)
+              AND param_name IN (
+                'adx_dmi14_adx',
+                'adx_dmi14_plus_di',
+                'adx_dmi14_minus_di'
+              )
         """, list(position_map.keys()), tf)
 
-        log.info(f"[ADX] Записей ADX по таймфрейму {tf}: {len(adx_data)}")
+        adx_values = {}
+        plus_di = {}
+        minus_di = {}
 
-        for i, row in enumerate(adx_data[:5]):
+        for row in ind_data:
             uid = row["position_uid"]
             val = float(row["value"])
-            info = position_map.get(uid)
-            if info:
-                log.info(f"[ADX] → {uid} | ADX={val:.2f} | pnl={info['pnl']} | {info['direction']}")
+            if row["param_name"] == "adx_dmi14_adx":
+                adx_values[uid] = val
+            elif row["param_name"] == "adx_dmi14_plus_di":
+                plus_di[uid] = val
+            elif row["param_name"] == "adx_dmi14_minus_di":
+                minus_di[uid] = val
 
-        # Инициализация структуры
-        result = {
+        log.info(f"[ADX] Найдено ADX: {len(adx_values)} | +DI: {len(plus_di)} | -DI: {len(minus_di)}")
+
+        # 🔸 Распределение по ADX-зонам
+        adx_distribution = {
             "success_long": {"main": [0]*8},
             "success_short": {"main": [0]*8},
             "fail_long": {"main": [0]*8},
@@ -588,39 +605,52 @@ async def strategy_adx_stats(
             "fail": [0]*8,
         }
 
-        for row in adx_data:
-            uid = row["position_uid"]
-            if uid not in position_map:
-                continue
+        # 🔸 Распределение по signed_gap
+        signed_gap_success = {"long": [0]*9, "short": [0]*9}
+        signed_gap_fail = {"long": [0]*9, "short": [0]*9}
 
-            adx = float(row["value"])
-            info = position_map[uid]
+        for uid, info in position_map.items():
             pnl = info["pnl"]
             direction = info["direction"]
-            idx = bin_index(adx)
 
-            if pnl >= 0:
-                adx_summary["success"][idx] += 1
+            # --- ADX ---
+            if uid in adx_values:
+                adx = adx_values[uid]
+                idx = bin_index(adx)
+
+                if pnl >= 0:
+                    adx_summary["success"][idx] += 1
+                    adx_distribution[f"success_{direction}"]["main"][idx] += 1
+                else:
+                    adx_summary["fail"][idx] += 1
+                    adx_distribution[f"fail_{direction}"]["main"][idx] += 1
+
+            # --- Signed GAP ---
+            if uid in plus_di and uid in minus_di:
                 if direction == "long":
-                    result["success_long"]["main"][idx] += 1
-                elif direction == "short":
-                    result["success_short"]["main"][idx] += 1
-            else:
-                adx_summary["fail"][idx] += 1
-                if direction == "long":
-                    result["fail_long"]["main"][idx] += 1
-                elif direction == "short":
-                    result["fail_short"]["main"][idx] += 1
+                    gap = plus_di[uid] - minus_di[uid]
+                else:
+                    gap = minus_di[uid] - plus_di[uid]
+
+                gidx = gap_bin_index(gap)
+
+                if pnl >= 0:
+                    signed_gap_success[direction][gidx] += 1
+                else:
+                    signed_gap_fail[direction][gidx] += 1
 
     return templates.TemplateResponse("strategy_stats_adx.html", {
         "request": request,
         "strategy": dict(strategy),
         "filter": filter,
         "series": series,
-        "adx_distribution": result,
+        "adx_distribution": adx_distribution,
         "adx_summary": adx_summary,
         "adx_bins": ADX_BINS,
         "adx_inf": ADX_INF,
+        "signed_gap_success": signed_gap_success,
+        "signed_gap_fail": signed_gap_fail,
+        "gap_labels": GAP_LABELS
     })
 # 🔸 Статистика стратегии по Bollinger Bands
 BB_ZONES = 6
