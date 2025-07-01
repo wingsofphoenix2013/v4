@@ -45,16 +45,16 @@ class ConfigState:
             )
             if row:
                 self.tickers[symbol] = dict(row)
-                log.debug(f"🔄 Тикер обновлён: {symbol}")
+                log.info(f"🔄 Тикер обновлён: {symbol}")
             else:
                 self.tickers.pop(symbol, None)
-                log.debug(f"❌ Тикер удалён (не найден): {symbol}")
+                log.info(f"❌ Тикер удалён (не найден): {symbol}")
 
     # 🔸 Удаление тикера
     async def remove_ticker(self, symbol: str):
         async with self._lock:
             self.tickers.pop(symbol, None)
-            log.debug(f"🗑️ Тикер удалён: {symbol}")
+            log.info(f"🗑️ Тикер удалён: {symbol}")
 
     # 🔸 Обновление стратегии
     async def reload_strategy(self, strategy_id: int):
@@ -66,15 +66,15 @@ class ConfigState:
             if not row:
                 self.strategies.pop(strategy_id, None)
                 self.strategy_tickers.pop(strategy_id, None)
-                log.debug(f"🗑️ Стратегия удалена: id={strategy_id}")
+                log.info(f"🗑️ Стратегия удалена: id={strategy_id}")
                 return
 
             strategy = dict(row)
             strategy["module_name"] = strategy["name"]
-
+            
             normalize_strategy_flags(strategy)
-
-            log.debug(
+            
+            log.info(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
                 f"reverse={strategy['reverse']} "
@@ -94,26 +94,11 @@ class ConfigState:
                     strategy_id
                 )
             ]
-
+            
             # 🔹 Обогащение sl_rules полем level
             level_map = {lvl["id"]: lvl["level"] for lvl in strategy["tp_levels"]}
             for rule in strategy["sl_rules"]:
                 rule["level"] = level_map.get(rule["tp_level_id"])
-
-            try:
-                log.info(
-                    f"♻️ Стратегия обновлена: id={strategy_id} | "
-                    f"name={strategy['name']} | "
-                    f"deposit={strategy['deposit']} | "
-                    f"risk={strategy['max_risk']}% | "
-                    f"leverage={strategy['leverage']} | "
-                    f"timeframe={strategy['timeframe']} | "
-                    f"SL={strategy['sl_type']}:{strategy['sl_value']} | "
-                    f"SL_protect={strategy['sl_protection']}"
-                )
-            except Exception as e:
-                log.exception(f"❌ Ошибка логирования стратегии {strategy_id}: {e}")
-                log.debug(f"[DEBUG-FIELDS] strategy keys: {list(strategy.keys())}")
 
             self.strategies[strategy_id] = strategy
 
@@ -128,21 +113,21 @@ class ConfigState:
             )
             self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers}
 
-            log.debug(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
+            log.info(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
 
             # 🔸 Дополнительный лог с деталями загрузки
-            log.debug(
+            log.info(
                 f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
             )
-            
+
     # 🔸 Удаление стратегии
     async def remove_strategy(self, strategy_id: int):
         async with self._lock:
             self.strategies.pop(strategy_id, None)
             self.strategy_tickers.pop(strategy_id, None)
-            log.debug(f"🗑️ Стратегия удалена: id={strategy_id}")
+            log.info(f"🗑️ Стратегия удалена: id={strategy_id}")
 
     # 🔸 Загрузка всех тикеров (только активных с разрешением)
     async def _load_tickers(self):
@@ -165,7 +150,7 @@ class ConfigState:
             
             normalize_strategy_flags(strategy)
             
-            log.debug(
+            log.info(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
                 f"reverse={strategy['reverse']} "
@@ -194,7 +179,7 @@ class ConfigState:
             self.strategies[strategy_id] = strategy
 
             # 🔸 Лог: детали загруженной стратегии
-            log.debug(
+            log.info(
                 f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
@@ -222,7 +207,7 @@ config = ConfigState()
 # 🔸 Первичная инициализация конфигурации
 async def init_config_state():
     await config.reload_all()
-    log.debug("✅ Конфигурация инициализирована")
+    log.info("✅ Конфигурация инициализирована")
 
 # 🔸 Слушатель событий из Redis Pub/Sub
 async def config_event_listener():
@@ -230,7 +215,7 @@ async def config_event_listener():
     pubsub = redis.pubsub()
     await pubsub.subscribe("tickers_v4_events", "strategies_v4_events")
 
-    log.debug("📡 Подписка на каналы Redis запущена")
+    log.info("📡 Подписка на каналы Redis запущена")
 
     async for msg in pubsub.listen():
         if msg["type"] != "message":
@@ -261,15 +246,15 @@ async def listen_strategy_update_stream():
 
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
-        log.debug(f"📡 Группа {group} создана для {stream}")
+        log.info(f"📡 Группа {group} создана для {stream}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.debug(f"ℹ️ Группа {group} уже существует")
+            log.info(f"ℹ️ Группа {group} уже существует")
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.debug(f"📥 Подписка на поток обновлений стратегий: {stream} → {group}")
+    log.info(f"📥 Подписка на поток обновлений стратегий: {stream} → {group}")
 
     while True:
         try:
