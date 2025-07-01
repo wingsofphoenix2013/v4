@@ -47,11 +47,13 @@ async def run():
             op = Decimal(r["pnl_operational"])
             ins = Decimal(r["pnl_insurance"])
 
+            log.info(f"📄 Стратегия {sid}: deposit={deposit:.2f}, op={op:.2f}, ins={ins:.2f}")
+
             try:
                 async with conn.transaction():
                     threshold = (strategy_deposit * Decimal("0.01")).quantize(Decimal("0.01"))
 
-                    # 🔹 Сценарий 1: перевод из кассы в депозит
+                    # 🔹 Сценарий 1
                     if op >= threshold:
                         amount = (threshold // Decimal("10")) * Decimal("10")
                         new_deposit = deposit + amount
@@ -78,9 +80,11 @@ async def run():
                         """, sid,
                             f"Переведено {amount:.2f} из кассы в депозит. "
                             f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
+
+                        log.info(f"✅ Переведено {amount:.2f} из кассы → депозит: {new_deposit:.2f}, лимит: {new_limit}")
                         continue
 
-                    # 🔹 Сценарий 2: недостаточно средств
+                    # 🔹 Сценарий 2
                     if op > 0:
                         await conn.execute("""
                             INSERT INTO strategies_treasury_meta_log_v4 (
@@ -89,9 +93,10 @@ async def run():
                             VALUES ($1, 'noop', $2)
                         """, sid,
                             f"Недостаточно средств в кассе. Требуется ≥ {threshold:.2f}, доступно: {op:.2f}")
+                        log.info(f"⏸ Пропуск — в кассе {op:.2f} < порог {threshold:.2f}")
                         continue
 
-                    # 🔹 Сценарий 3: списание убытка из депозита
+                    # 🔹 Сценарий 3
                     if op == 0 and ins < 0:
                         loss = abs(ins)
                         risk_limit = strategy_deposit * (max_risk / Decimal("100"))
@@ -119,11 +124,13 @@ async def run():
                                 )
                                 VALUES ($1, 'reduction', $2)
                             """, sid,
-                                f"Списано {rounded_loss:.2f} из депозита для покрытия убытка "
-                                f"в страховом фонде. Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
+                                f"Списано {rounded_loss:.2f} из депозита для покрытия убытка. "
+                                f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
+
+                            log.info(f"✅ Списание {rounded_loss:.2f} из депозита → депозит: {new_deposit:.2f}, лимит: {new_limit}")
                             continue
 
-                        # 🔹 Сценарий 4: отключение стратегии
+                        # 🔹 Сценарий 4
                         await conn.execute("""
                             UPDATE strategies_v4
                             SET enabled = false
@@ -136,8 +143,9 @@ async def run():
                             )
                             VALUES ($1, 'disabled', $2)
                         """, sid,
-                            f"Отключена стратегия: убыток в страховом фонде {loss:.2f} "
-                            f"превышает лимит {risk_limit:.2f}")
+                            f"Отключена стратегия: убыток {loss:.2f} > лимит {risk_limit:.2f}")
+
+                        log.info(f"🛑 Отключена стратегия — убыток {loss:.2f} > лимит {risk_limit:.2f}")
 
             except Exception as e:
                 log.exception(f"❌ Ошибка при обработке стратегии {sid}: {e}")
