@@ -67,6 +67,7 @@ async def run():
                         amount = (threshold // Decimal("10")) * Decimal("10")
                         new_deposit = deposit + amount
                         new_limit = int(new_deposit // Decimal("10"))
+                        new_op = op - amount
 
                         await conn.execute("""
                             UPDATE strategies_v4
@@ -76,9 +77,9 @@ async def run():
 
                         await conn.execute("""
                             UPDATE strategies_treasury_v4
-                            SET pnl_operational = CAST(pnl_operational AS numeric) - CAST($1 AS numeric)
+                            SET pnl_operational = $1
                             WHERE strategy_id = $2
-                        """, str(amount), sid)
+                        """, new_op, sid)
 
                         await conn.execute("""
                             INSERT INTO strategies_treasury_log_v4 (
@@ -87,7 +88,7 @@ async def run():
                                 delta_insurance, comment
                             )
                             VALUES ($1, '-', now(), 'transfer', 0, -$2, 0, $3)
-                        """, sid, str(amount),
+                        """, sid, amount,
                             f"Перевод {amount:.2f} из кассы в депозит стратегии. "
                             f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
 
