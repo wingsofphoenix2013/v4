@@ -57,6 +57,7 @@ async def run():
                         new_deposit = deposit + amount
                         new_limit = int(new_deposit // Decimal("10"))
                         new_op = op - amount
+                        delta_op = -amount
 
                         await conn.execute("""
                             UPDATE strategies_v4
@@ -76,8 +77,8 @@ async def run():
                                 operation_type, pnl, delta_operational,
                                 delta_insurance, comment
                             )
-                            VALUES ($1, '-', now(), 'transfer', 0, -$2, 0, $3)
-                        """, sid, amount,
+                            VALUES ($1, '-', now(), 'transfer', 0, $2, 0, $3)
+                        """, sid, delta_op,
                             f"Перевод {amount:.2f} из кассы в депозит стратегии. "
                             f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
                         continue
