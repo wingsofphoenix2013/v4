@@ -236,3 +236,44 @@ async def config_event_listener():
                     await config.remove_strategy(strategy_id)
         except Exception:
             log.exception("❌ Ошибка обработки события из Redis")
+# 🔸 Подписка на обновления стратегий из Redis Stream
+async def listen_strategy_update_stream():
+    stream = "strategy_update_stream"
+    group = "strategy_runtime"
+    consumer = "strategy_listener_1"
+    redis = infra.redis_client
+    log = logging.getLogger("CONFIG")
+
+    try:
+        await redis.xgroup_create(stream, group, id="$", mkstream=True)
+        log.debug(f"📡 Группа {group} создана для {stream}")
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.debug(f"ℹ️ Группа {group} уже существует")
+        else:
+            log.exception("❌ Ошибка создания Consumer Group")
+            return
+
+    log.debug(f"📥 Подписка на поток обновлений стратегий: {stream} → {group}")
+
+    while True:
+        try:
+            entries = await redis.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams={stream: ">"},
+                count=100,
+                block=1000
+            )
+            for _, records in entries:
+                for record_id, data in records:
+                    try:
+                        if data.get("type") == "strategy" and data.get("action") == "update":
+                            sid = int(data["id"])
+                            await config.reload_strategy(sid)
+                            log.info(f"♻️ Стратегия обновлена: id={sid}")
+                        await redis.xack(stream, group, record_id)
+                    except Exception:
+                        log.exception("❌ Ошибка обработки записи потока")
+        except Exception:
+            log.exception("❌ Ошибка чтения из потока")

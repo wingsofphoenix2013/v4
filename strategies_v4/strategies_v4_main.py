@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from infra import setup_logging, setup_pg, setup_redis_client, listen_indicator_stream, init_indicator_cache_via_redis
-from config_loader import init_config_state, config_event_listener
+from config_loader import init_config_state, config_event_listener, listen_strategy_update_stream
 from strategy_loader import load_strategies
 from position_state_loader import load_position_state
 from signal_processor import run_signal_loop, set_strategy_registry
@@ -70,7 +70,8 @@ async def main():
         run_safe_loop(run_position_opener_loop, "POSITION_OPENER"),
         run_safe_loop(run_position_open_writer, "POSITION_DB_WRITER"),
         run_safe_loop(run_position_handler, "POSITION_HANDLER"),
-        run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER")
+        run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER"),
+        run_safe_loop(listen_strategy_update_stream, "STRATEGY_STREAM")
     )
     
 # 🔸 Запуск через CLI
