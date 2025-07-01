@@ -71,9 +71,9 @@ class ConfigState:
 
             strategy = dict(row)
             strategy["module_name"] = strategy["name"]
-            
+
             normalize_strategy_flags(strategy)
-            
+
             log.debug(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
@@ -94,11 +94,22 @@ class ConfigState:
                     strategy_id
                 )
             ]
-            
+
             # 🔹 Обогащение sl_rules полем level
             level_map = {lvl["id"]: lvl["level"] for lvl in strategy["tp_levels"]}
             for rule in strategy["sl_rules"]:
                 rule["level"] = level_map.get(rule["tp_level_id"])
+
+            log.info(
+                f"♻️ Стратегия обновлена: id={strategy_id} | "
+                f"name={strategy['name']} | "
+                f"deposit={strategy['deposit']} | "
+                f"risk={strategy['max_risk']}% | "
+                f"leverage={strategy['leverage']} | "
+                f"timeframe={strategy['timeframe']} | "
+                f"SL={strategy['sl_type']}:{strategy['sl_value']} | "
+                f"SL_protect={strategy['sl_protection']}"
+            )
 
             self.strategies[strategy_id] = strategy
 
