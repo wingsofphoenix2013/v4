@@ -100,16 +100,20 @@ class ConfigState:
             for rule in strategy["sl_rules"]:
                 rule["level"] = level_map.get(rule["tp_level_id"])
 
-            log.info(
-                f"♻️ Стратегия обновлена: id={strategy_id} | "
-                f"name={strategy['name']} | "
-                f"deposit={strategy['deposit']} | "
-                f"risk={strategy['max_risk']}% | "
-                f"leverage={strategy['leverage']} | "
-                f"timeframe={strategy['timeframe']} | "
-                f"SL={strategy['sl_type']}:{strategy['sl_value']} | "
-                f"SL_protect={strategy['sl_protection']}"
-            )
+            try:
+                log.info(
+                    f"♻️ Стратегия обновлена: id={strategy_id} | "
+                    f"name={strategy['name']} | "
+                    f"deposit={strategy['deposit']} | "
+                    f"risk={strategy['max_risk']}% | "
+                    f"leverage={strategy['leverage']} | "
+                    f"timeframe={strategy['timeframe']} | "
+                    f"SL={strategy['sl_type']}:{strategy['sl_value']} | "
+                    f"SL_protect={strategy['sl_protection']}"
+                )
+            except Exception as e:
+                log.exception(f"❌ Ошибка логирования стратегии {strategy_id}: {e}")
+                log.debug(f"[DEBUG-FIELDS] strategy keys: {list(strategy.keys())}")
 
             self.strategies[strategy_id] = strategy
 
@@ -132,7 +136,7 @@ class ConfigState:
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
             )
-
+            
     # 🔸 Удаление стратегии
     async def remove_strategy(self, strategy_id: int):
         async with self._lock:
