@@ -70,7 +70,7 @@ async def run():
 
                         await conn.execute("""
                             UPDATE strategies_treasury_v4
-                            SET pnl_operational = pnl_operational - $1
+                            SET pnl_operational = pnl_operational - CAST($1 AS numeric)
                             WHERE strategy_id = $2
                         """, amount, sid)
 
