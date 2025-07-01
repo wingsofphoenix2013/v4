@@ -74,7 +74,7 @@ class ConfigState:
             
             normalize_strategy_flags(strategy)
             
-            log.info(
+            log.debug(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
                 f"reverse={strategy['reverse']} "
@@ -116,7 +116,7 @@ class ConfigState:
             log.info(f"🔄 Стратегия обновлена: [id={strategy_id}] {strategy['human_name']}")
 
             # 🔸 Дополнительный лог с деталями загрузки
-            log.info(
+            log.debug(
                 f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
@@ -150,7 +150,7 @@ class ConfigState:
             
             normalize_strategy_flags(strategy)
             
-            log.info(
+            log.debug(
                 f"[DEBUG-NORM] Strategy {strategy_id} → "
                 f"enabled={strategy['enabled']} "
                 f"reverse={strategy['reverse']} "
@@ -179,7 +179,7 @@ class ConfigState:
             self.strategies[strategy_id] = strategy
 
             # 🔸 Лог: детали загруженной стратегии
-            log.info(
+            log.debug(
                 f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
