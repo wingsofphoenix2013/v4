@@ -76,7 +76,7 @@ async def run():
 
                         await conn.execute("""
                             UPDATE strategies_treasury_v4
-                            SET pnl_operational = pnl_operational - $1::numeric
+                            SET pnl_operational = CAST(pnl_operational AS numeric) - CAST($1 AS numeric)
                             WHERE strategy_id = $2
                         """, str(amount), sid)
 
@@ -86,8 +86,7 @@ async def run():
                                 operation_type, pnl, delta_operational,
                                 delta_insurance, comment
                             )
-                            VALUES ($1, '-', now(), 'transfer', 0, -$2, 0,
-                            $3)
+                            VALUES ($1, '-', now(), 'transfer', 0, -$2, 0, $3)
                         """, sid, str(amount),
                             f"Перевод {amount:.2f} из кассы в депозит стратегии. "
                             f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
@@ -141,8 +140,7 @@ async def run():
                                     operation_type, pnl, delta_operational,
                                     delta_insurance, comment
                                 )
-                                VALUES ($1, '-', now(), 'reduction', 0, 0, 0,
-                                $2)
+                                VALUES ($1, '-', now(), 'reduction', 0, 0, 0, $2)
                             """, sid,
                                 f"Списание {rounded_loss:.2f} из депозита для покрытия убытка "
                                 f"в страховом фонде. Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
@@ -169,8 +167,7 @@ async def run():
                                 operation_type, pnl, delta_operational,
                                 delta_insurance, comment
                             )
-                            VALUES ($1, '-', now(), 'disabled', 0, 0, 0,
-                            $2)
+                            VALUES ($1, '-', now(), 'disabled', 0, 0, 0, $2)
                         """, sid,
                             f"Отключена стратегия: убыток в страховом фонде {loss:.2f} "
                             f"превышает лимит {risk_limit:.2f}")
