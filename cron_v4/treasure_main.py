@@ -42,7 +42,7 @@ async def run():
                    t.strategy_deposit, t.pnl_operational, t.pnl_insurance
             FROM strategies_v4 s
             JOIN strategies_treasury_v4 t ON s.id = t.strategy_id
-            WHERE s.enabled = true
+            WHERE s.enabled = true AND s.auditor_enabled = true
         """)
 
         for r in rows:
