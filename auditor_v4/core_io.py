@@ -187,3 +187,83 @@ async def pg_task():
     except Exception:
         log.exception("🔥 Ошибка вне цикла в pg_task — выясняем причину")
         await asyncio.sleep(5)
+# 🔸 Финмониторинг позиций
+async def finmonitor_task():
+    log = logging.getLogger("FINMONITOR")
+    log.info("🔁 [finmonitor_task] стартует")
+
+    while True:
+        try:
+            async with infra.pg_pool.acquire() as conn:
+                # 1. Загружаем стратегии, у которых разрешён аудит
+                strategy_rows = await conn.fetch("""
+                    SELECT id FROM strategies_v4
+                    WHERE auditor_enabled = true
+                """)
+                strategy_ids = [r["id"] for r in strategy_rows]
+
+                if not strategy_ids:
+                    log.info("ℹ️ Нет стратегий с включённым аудитом")
+                    await asyncio.sleep(60)
+                    continue
+
+                # 2. Загружаем позиции с finmonitor = false
+                position_rows = await conn.fetch("""
+                    SELECT strategy_id, position_uid, symbol,
+                           created_at, closed_at, pnl
+                    FROM positions_v4
+                    WHERE status = 'closed'
+                      AND finmonitor = false
+                      AND strategy_id = ANY($1::int[])
+                """, strategy_ids)
+
+                if not position_rows:
+                    log.info("✅ Нет новых позиций для финмониторинга — пауза")
+                    await asyncio.sleep(60)
+                    continue
+
+                # 3. Формируем строки для вставки
+                insert_data = []
+                mark_done = []
+
+                for row in position_rows:
+                    created = row["created_at"]
+                    closed = row["closed_at"]
+                    duration = int((closed - created).total_seconds() // 60)
+
+                    insert_data.append((
+                        row["strategy_id"],
+                        row["position_uid"],
+                        row["symbol"],
+                        created,
+                        closed,
+                        duration,
+                        "win" if row["pnl"] > 0 else "loss",
+                        row["pnl"]
+                    ))
+                    mark_done.append(row["position_uid"])
+
+                # 4. Вставляем в strategies_finmonitor_v4
+                await conn.executemany("""
+                    INSERT INTO strategies_finmonitor_v4 (
+                        strategy_id, position_uid, symbol,
+                        created_at, closed_at, duration,
+                        result, pnl
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    ON CONFLICT DO NOTHING
+                """, insert_data)
+
+                # 5. Обновляем positions_v4
+                await conn.executemany("""
+                    UPDATE positions_v4
+                    SET finmonitor = true
+                    WHERE position_uid = $1
+                """, [(uid,) for uid in mark_done])
+
+                log.info(f"✅ Обработано финмониторингом {len(mark_done)} позиций")
+
+        except Exception:
+            log.exception("❌ Ошибка в finmonitor_task")
+
+        await asyncio.sleep(60)
