@@ -208,7 +208,7 @@ async def finmonitor_task():
                     await asyncio.sleep(60)
                     continue
 
-                # 2. Загружаем позиции с finmonitor = false
+                # 2. Загружаем закрытые позиции с finmonitor = false
                 position_rows = await conn.fetch("""
                     SELECT strategy_id, position_uid, symbol,
                            created_at, closed_at, pnl
@@ -216,6 +216,8 @@ async def finmonitor_task():
                     WHERE status = 'closed'
                       AND finmonitor = false
                       AND strategy_id = ANY($1::int[])
+                    ORDER BY closed_at
+                    LIMIT 100
                 """, strategy_ids)
 
                 if not position_rows:
@@ -223,7 +225,6 @@ async def finmonitor_task():
                     await asyncio.sleep(60)
                     continue
 
-                # 3. Формируем строки для вставки
                 insert_data = []
                 mark_done = []
 
@@ -231,6 +232,7 @@ async def finmonitor_task():
                     created = row["created_at"]
                     closed = row["closed_at"]
                     duration = int((closed - created).total_seconds() // 60)
+                    result = "win" if row["pnl"] > 0 else "loss"
 
                     insert_data.append((
                         row["strategy_id"],
@@ -239,12 +241,12 @@ async def finmonitor_task():
                         created,
                         closed,
                         duration,
-                        "win" if row["pnl"] > 0 else "loss",
+                        result,
                         row["pnl"]
                     ))
                     mark_done.append(row["position_uid"])
 
-                # 4. Вставляем в strategies_finmonitor_v4
+                # 3. Вставляем в финмониторинг
                 await conn.executemany("""
                     INSERT INTO strategies_finmonitor_v4 (
                         strategy_id, position_uid, symbol,
@@ -255,20 +257,20 @@ async def finmonitor_task():
                     ON CONFLICT DO NOTHING
                 """, insert_data)
 
-                # 5. Обновляем positions_v4
+                # 4. Обновляем пометки в positions_v4
                 await conn.executemany("""
                     UPDATE positions_v4
                     SET finmonitor = true
                     WHERE position_uid = $1
                 """, [(uid,) for uid in mark_done])
 
-                log.info(f"✅ Обработано финмониторингом {len(mark_done)} позиций")
+                log.info(f"📌 Обработано в финмониторинге: {len(mark_done)} позиций")
 
         except Exception:
             log.exception("❌ Ошибка в finmonitor_task")
 
         await asyncio.sleep(60)
-# 🔸 Фоновая задача казначейства
+# 🔸 Казначейская обработка
 async def treasury_task():
     log = logging.getLogger("TREASURY")
     log.info("🔁 [treasury_task] стартует")
@@ -280,7 +282,7 @@ async def treasury_task():
                     SELECT strategy_id, position_uid, pnl
                     FROM strategies_finmonitor_v4
                     WHERE treasurised = false
-                    ORDER BY created_at
+                    ORDER BY closed_at
                     LIMIT 100
                 """)
 
@@ -315,14 +317,29 @@ async def treasury_task():
                         delta_ins = Decimal("0.00")
 
                         if pnl > 0:
-                            delta_op = (pnl * Decimal("0.9")).quantize(Decimal("0.01"))
-                            delta_ins = (pnl * Decimal("0.1")).quantize(Decimal("0.01"))
-                            op += delta_op
-                            ins += delta_ins
-                            comment = (
-                                f"Прибыльная позиция: +{pnl:.2f} → распределено "
-                                f"{delta_op:.2f} в кассу, {delta_ins:.2f} в страховой фонд"
-                            )
+                            # сначала покрываем минус в страховом фонде
+                            if ins < 0:
+                                cover = min(pnl, abs(ins))
+                                delta_ins = cover
+                                ins += cover
+                                remainder = pnl - cover
+                                if remainder > 0:
+                                    delta_op = remainder
+                                    op += remainder
+                                comment = (
+                                    f"Прибыльная позиция: +{pnl:.2f} → покрыт минус страхового фонда {cover:.2f}"
+                                )
+                                if remainder > 0:
+                                    comment += f", остаток {remainder:.2f} отправлен в кассу"
+                            else:
+                                delta_op = (pnl * Decimal("0.9")).quantize(Decimal("0.01"))
+                                delta_ins = (pnl * Decimal("0.1")).quantize(Decimal("0.01"))
+                                op += delta_op
+                                ins += delta_ins
+                                comment = (
+                                    f"Прибыльная позиция: +{pnl:.2f} → распределено "
+                                    f"{delta_op:.2f} в кассу, {delta_ins:.2f} в страховой фонд"
+                                )
                         else:
                             loss = abs(pnl)
                             from_op = min(loss, op)
