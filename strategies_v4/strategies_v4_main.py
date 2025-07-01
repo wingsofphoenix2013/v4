@@ -71,7 +71,7 @@ async def main():
         run_safe_loop(run_position_open_writer, "POSITION_DB_WRITER"),
         run_safe_loop(run_position_handler, "POSITION_HANDLER"),
         run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER"),
-        run_safe_loop(listen_strategy_update_stream, "STRATEGY_STREAM")
+#         run_safe_loop(listen_strategy_update_stream, "STRATEGY_STREAM")
     )
     
 # 🔸 Запуск через CLI
