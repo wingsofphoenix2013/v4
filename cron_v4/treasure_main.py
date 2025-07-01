@@ -57,7 +57,6 @@ async def run():
                         new_deposit = deposit + amount
                         new_limit = int(new_deposit // Decimal("10"))
                         new_op = op - amount
-                        delta_op = -amount
 
                         await conn.execute("""
                             UPDATE strategies_v4
@@ -72,14 +71,12 @@ async def run():
                         """, new_op, sid)
 
                         await conn.execute("""
-                            INSERT INTO strategies_treasury_log_v4 (
-                                strategy_id, position_uid, timestamp,
-                                operation_type, pnl, delta_operational,
-                                delta_insurance, comment
+                            INSERT INTO strategies_treasury_meta_log_v4 (
+                                strategy_id, scenario, comment
                             )
-                            VALUES ($1, '-', now(), 'transfer', 0, $2, 0, $3)
-                        """, sid, delta_op,
-                            f"Перевод {amount:.2f} из кассы в депозит стратегии. "
+                            VALUES ($1, 'transfer', $2)
+                        """, sid,
+                            f"Переведено {amount:.2f} из кассы в депозит. "
                             f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
                         continue
 
@@ -91,8 +88,7 @@ async def run():
                             )
                             VALUES ($1, 'noop', $2)
                         """, sid,
-                            f"Недостаточно средств в кассе для перевода: 1% от депозита = "
-                            f"{threshold:.2f}, доступно только {op:.2f}")
+                            f"Недостаточно средств в кассе. Требуется ≥ {threshold:.2f}, доступно: {op:.2f}")
                         continue
 
                     # 🔹 Сценарий 3: списание убытка из депозита
@@ -118,14 +114,12 @@ async def run():
                             """, sid)
 
                             await conn.execute("""
-                                INSERT INTO strategies_treasury_log_v4 (
-                                    strategy_id, position_uid, timestamp,
-                                    operation_type, pnl, delta_operational,
-                                    delta_insurance, comment
+                                INSERT INTO strategies_treasury_meta_log_v4 (
+                                    strategy_id, scenario, comment
                                 )
-                                VALUES ($1, '-', now(), 'reduction', 0, 0, 0, $2)
+                                VALUES ($1, 'reduction', $2)
                             """, sid,
-                                f"Списание {rounded_loss:.2f} из депозита для покрытия убытка "
+                                f"Списано {rounded_loss:.2f} из депозита для покрытия убытка "
                                 f"в страховом фонде. Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
                             continue
 
@@ -137,12 +131,10 @@ async def run():
                         """, sid)
 
                         await conn.execute("""
-                            INSERT INTO strategies_treasury_log_v4 (
-                                strategy_id, position_uid, timestamp,
-                                operation_type, pnl, delta_operational,
-                                delta_insurance, comment
+                            INSERT INTO strategies_treasury_meta_log_v4 (
+                                strategy_id, scenario, comment
                             )
-                            VALUES ($1, '-', now(), 'disabled', 0, 0, 0, $2)
+                            VALUES ($1, 'disabled', $2)
                         """, sid,
                             f"Отключена стратегия: убыток в страховом фонде {loss:.2f} "
                             f"превышает лимит {risk_limit:.2f}")
