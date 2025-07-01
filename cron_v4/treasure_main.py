@@ -1,13 +1,16 @@
 import os
+import json
 import logging
 import asyncio
 import asyncpg
+import redis.asyncio as aioredis
 from decimal import Decimal
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("CRON_TREASURY")
 
 pg_pool = None
+redis_client = None
 
 
 # 🔸 PostgreSQL
@@ -19,6 +22,22 @@ async def setup_pg():
     pg_pool = await asyncpg.create_pool(db_url)
     await pg_pool.execute("SELECT 1")
     log.info("🛢️ Подключение к PostgreSQL установлено")
+
+
+# 🔸 Redis
+async def setup_redis_client():
+    global redis_client
+    host = os.getenv("REDIS_HOST", "localhost")
+    port = int(os.getenv("REDIS_PORT", 6379))
+    password = os.getenv("REDIS_PASSWORD")
+    use_tls = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
+    protocol = "rediss" if use_tls else "redis"
+    redis_url = f"{protocol}://{host}:{port}"
+
+    client = aioredis.from_url(redis_url, password=password, decode_responses=True)
+    await client.ping()
+    redis_client = client
+    log.info("📡 Подключение к Redis установлено")
 
 
 # 🔸 Основная логика обработки стратегий
@@ -82,6 +101,14 @@ async def run():
                             f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
 
                         log.info(f"✅ Переведено {amount:.2f} из кассы → депозит: {new_deposit:.2f}, лимит: {new_limit}")
+
+                        await redis_client.xadd("strategy_update_stream", {
+                            "id": str(sid),
+                            "type": "strategy",
+                            "action": "update",
+                            "source": "treasury_cron"
+                        })
+
                         continue
 
                     # 🔹 Сценарий 2
@@ -128,6 +155,14 @@ async def run():
                                 f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
 
                             log.info(f"✅ Списание {rounded_loss:.2f} из депозита → депозит: {new_deposit:.2f}, лимит: {new_limit}")
+
+                            await redis_client.xadd("strategy_update_stream", {
+                                "id": str(sid),
+                                "type": "strategy",
+                                "action": "update",
+                                "source": "treasury_cron"
+                            })
+
                             continue
 
                         # 🔹 Сценарий 4
@@ -147,6 +182,13 @@ async def run():
 
                         log.info(f"🛑 Отключена стратегия — убыток {loss:.2f} > лимит {risk_limit:.2f}")
 
+                        await redis_client.publish("strategies_v4_events", json.dumps({
+                            "id": sid,
+                            "type": "enabled",
+                            "action": "false",
+                            "source": "treasury_cron"
+                        }))
+
             except Exception as e:
                 log.exception(f"❌ Ошибка при обработке стратегии {sid}: {e}")
                 raise
@@ -155,6 +197,7 @@ async def run():
 # 🔸 Запуск
 async def main():
     await setup_pg()
+    await setup_redis_client()
     await run()
 
 
