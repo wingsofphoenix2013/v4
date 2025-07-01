@@ -14,7 +14,7 @@ from config_loader import (
     load_enabled_indicators,
     config_event_listener,
 )
-from core_io import pg_task, finmonitor_task
+from core_io import pg_task, finmonitor_task, treasury_task
 from redis_io import redis_task
 
 # 🔸 Логгер для главного процесса
@@ -60,7 +60,8 @@ async def main():
         run_safe_loop(pg_task, "CORE_IO"),
         run_safe_loop(redis_task, "REDIS_IO"),
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
-        run_safe_loop(finmonitor_task, "FINMONITOR")
+        run_safe_loop(finmonitor_task, "FINMONITOR"),
+        run_safe_loop(treasury_task, "TREASURY")
     )
 
 

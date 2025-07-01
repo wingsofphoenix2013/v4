@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from decimal import Decimal
 
 import infra
 
@@ -265,5 +266,125 @@ async def finmonitor_task():
 
         except Exception:
             log.exception("❌ Ошибка в finmonitor_task")
+
+        await asyncio.sleep(60)
+# 🔸 Фоновая задача казначейства
+async def treasury_task():
+    log = logging.getLogger("TREASURY")
+    log.info("🔁 [treasury_task] стартует")
+
+    while True:
+        try:
+            async with infra.pg_pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT strategy_id, position_uid, pnl
+                    FROM strategies_finmonitor_v4
+                    WHERE treasurised = false
+                    ORDER BY created_at
+                    LIMIT 100
+                """)
+
+                if not rows:
+                    log.info("✅ Нет новых позиций для казначейства — пауза")
+                    await asyncio.sleep(60)
+                    continue
+
+                for r in rows:
+                    strategy_id = r["strategy_id"]
+                    position_uid = r["position_uid"]
+                    pnl = Decimal(r["pnl"])
+
+                    async with conn.transaction():
+                        await conn.execute("""
+                            INSERT INTO strategies_treasury_v4 (strategy_id, strategy_deposit)
+                            SELECT id, deposit FROM strategies_v4 WHERE id = $1
+                            ON CONFLICT DO NOTHING
+                        """, strategy_id)
+
+                        treasury = await conn.fetchrow("""
+                            SELECT pnl_total, pnl_operational, pnl_insurance
+                            FROM strategies_treasury_v4
+                            WHERE strategy_id = $1
+                            FOR UPDATE
+                        """, strategy_id)
+
+                        op = Decimal(treasury["pnl_operational"])
+                        ins = Decimal(treasury["pnl_insurance"])
+
+                        delta_op = Decimal("0.00")
+                        delta_ins = Decimal("0.00")
+
+                        if pnl > 0:
+                            delta_op = (pnl * Decimal("0.9")).quantize(Decimal("0.01"))
+                            delta_ins = (pnl * Decimal("0.1")).quantize(Decimal("0.01"))
+                            op += delta_op
+                            ins += delta_ins
+                            comment = (
+                                f"Прибыльная позиция: +{pnl:.2f} → распределено "
+                                f"{delta_op:.2f} в кассу, {delta_ins:.2f} в страховой фонд"
+                            )
+                        else:
+                            loss = abs(pnl)
+                            from_op = min(loss, op)
+                            from_ins = loss - from_op
+
+                            delta_op = -from_op
+                            delta_ins = -from_ins
+
+                            op -= from_op
+                            ins -= from_ins
+
+                            if from_op == 0 and from_ins == 0:
+                                comment = (
+                                    f"Убыточная позиция: {pnl:.2f} → касса пуста, "
+                                    f"страховой фонд пуст, убыток записан в страховой фонд: {pnl:.2f}"
+                                )
+                            elif from_op > 0 and from_ins == 0:
+                                comment = (
+                                    f"Убыточная позиция: {pnl:.2f} → списано {from_op:.2f} из кассы"
+                                )
+                            elif from_op == 0 and from_ins > 0:
+                                comment = (
+                                    f"Убыточная позиция: {pnl:.2f} → касса пуста, "
+                                    f"списано {from_ins:.2f} из страхового фонда"
+                                )
+                            else:
+                                comment = (
+                                    f"Убыточная позиция: {pnl:.2f} → списано {from_op:.2f} из кассы, "
+                                    f"{from_ins:.2f} из страхового фонда"
+                                )
+
+                        comment += f" (касса: {op:.2f}, фонд: {ins:.2f})"
+
+                        await conn.execute("""
+                            UPDATE strategies_treasury_v4
+                            SET pnl_total = pnl_total + $2,
+                                pnl_operational = $3,
+                                pnl_insurance = $4,
+                                updated_at = now()
+                            WHERE strategy_id = $1
+                        """, strategy_id, pnl, op, ins)
+
+                        await conn.execute("""
+                            INSERT INTO strategies_treasury_log_v4 (
+                                strategy_id, position_uid, timestamp,
+                                operation_type, pnl, delta_operational,
+                                delta_insurance, comment
+                            )
+                            VALUES ($1, $2, now(), $3, $4, $5, $6, $7)
+                        """, strategy_id, position_uid,
+                             "income" if pnl > 0 else "loss",
+                             pnl, delta_op, delta_ins, comment)
+
+                        await conn.execute("""
+                            UPDATE strategies_finmonitor_v4
+                            SET treasurised = true
+                            WHERE position_uid = $1
+                        """, position_uid)
+
+                        log.info(f"💰 Позиция {position_uid} обработана")
+
+        except Exception:
+            log.exception("❌ Ошибка в treasury_task")
 
         await asyncio.sleep(60)
