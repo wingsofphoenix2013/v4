@@ -44,25 +44,36 @@
   </div>
 <!-- Карточка: Казначейство -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <div class="flex justify-between items-center mb-3">
-    <h2 class="text-lg font-semibold text-slate-700">Казначейство</h2>
+  {% if treasury %}
+    {% set available = treasury.pnl_operational - reserve_required %}
+    <div class="flex justify-between items-center mb-3">
+      <h2 class="text-lg font-semibold text-slate-700">Казначейство</h2>
 
-    <div class="flex gap-2">
-      {% if treasury %}
-        {% set available = treasury.pnl_operational - reserve_required %}
+      <div class="flex gap-2 items-center" id="withdraw-container">
         {% if available > 0 %}
-          <button class="px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg font-medium">
-            Снять из депозита
+          <input type="number"
+                 id="withdraw-input"
+                 placeholder="Сумма"
+                 min="0.01"
+                 step="0.01"
+                 class="hidden px-3 py-1.5 text-sm rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                 oninput="validateAmount(this, {{ available | round(2) }})">
+        {% endif %}
+
+        {% if available > 0 %}
+          <button id="withdraw-button"
+                  class="px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg font-medium"
+                  onclick="handleWithdrawClick({{ available | round(2) }})">
+            Снять кассу
           </button>
         {% endif %}
-      {% endif %}
-      <button class="px-4 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-sm rounded-lg font-medium">
-        Добавить депозит
-      </button>
-    </div>
-  </div>
 
-  {% if treasury %}
+        <button class="px-4 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-sm rounded-lg font-medium">
+          Добавить депозит
+        </button>
+      </div>
+    </div>
+
     <table class="w-full table-auto rounded-xl overflow-hidden mb-6">
       <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
         <tr>
@@ -135,5 +146,42 @@
     <!-- содержание позже -->
   </div>
 </div>
-</main></body>
+</main>
+<script>
+let withdrawActive = false;
+
+function handleWithdrawClick(maxAvailable) {
+  const input = document.getElementById("withdraw-input");
+  const button = document.getElementById("withdraw-button");
+
+  if (!withdrawActive) {
+    input.classList.remove("hidden");
+    input.focus();
+    withdrawActive = true;
+  } else {
+    const value = parseFloat(input.value);
+    if (isNaN(value) || value <= 0) {
+      alert("Введите сумму для снятия");
+      return;
+    }
+    if (value > maxAvailable) {
+      alert(`Доступно только ${maxAvailable.toFixed(2)}`);
+      return;
+    }
+
+    // TODO: заменить на реальный запрос
+    alert(`Будет снято: ${value.toFixed(2)} USDT`);
+  }
+}
+
+function validateAmount(input, max) {
+  const val = parseFloat(input.value);
+  if (val > max) {
+    input.classList.add("border-red-500", "ring-red-500");
+  } else {
+    input.classList.remove("border-red-500", "ring-red-500");
+  }
+}
+</script>
+</body>
 </html>
