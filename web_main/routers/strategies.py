@@ -156,5 +156,49 @@ async def create_strategy(
              deposit, position_limit, leverage, max_risk,
              timeframe.lower(), enabled_bool, reverse, sl_protection,
              use_all_tickers, sl_type, Decimal(sl_value))
+        # Получаем ID вставленной стратегии
+        result = await conn.fetchrow("SELECT id FROM strategies_v4 WHERE name = $1", name)
+        strategy_id = result["id"]
 
+        # 🔸 TP уровни
+        tp_level_ids = []
+        level = 1
+        while f"tp_{level}_volume" in form_data:
+            volume = int(form_data.get(f"tp_{level}_volume"))
+            tp_type = form_data.get(f"tp_{level}_type")
+            tp_value = form_data.get(f"tp_{level}_value")
+            value = Decimal(tp_value) if tp_type != "signal" else None
+
+            row = await conn.fetchrow("""
+                INSERT INTO strategy_tp_levels_v4 (
+                    strategy_id, level, tp_type, tp_value, volume_percent, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                RETURNING id
+            """, strategy_id, level, tp_type, value, volume)
+            tp_level_ids.append(row["id"])
+            level += 1
+
+        # 🔸 SL-настройки для TP уровней
+        for i in range(1, len(tp_level_ids)):
+            mode = form_data.get(f"sl_tp_{i}_mode")
+            val = form_data.get(f"sl_tp_{i}_value")
+            sl_val = Decimal(val) if mode in ("percent", "atr") else None
+
+            await conn.execute("""
+                INSERT INTO strategy_tp_sl_v4 (
+                    strategy_id, tp_level_id, sl_mode, sl_value, created_at
+                )
+                VALUES ($1, $2, $3, $4, NOW())
+            """, strategy_id, tp_level_ids[i - 1], mode, sl_val)
+
+        # 🔸 Привязка тикеров
+        if not use_all_tickers:
+            selected_ids = form_data.getlist("ticker_id[]")
+            for tid in selected_ids:
+                await conn.execute("""
+                    INSERT INTO strategy_tickers_v4 (strategy_id, ticker_id, enabled)
+                    VALUES ($1, $2, true)
+                """, strategy_id, int(tid))
+                
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
