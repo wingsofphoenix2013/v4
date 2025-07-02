@@ -235,7 +235,7 @@ async def check_strategy_name(name: str):
 @router.get("/strategies/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_details(strategy_name: str, request: Request, filter: str = "all", page: int = 1):
     async with pg_pool.acquire() as conn:
-        # Получение стратегии
+        # 🔹 Получение стратегии
         row = await conn.fetchrow("""
             SELECT s.*, COALESCE(sig.name, '-') AS signal_name
             FROM strategies_v4 s
@@ -248,11 +248,25 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
 
         strategy = dict(row)
 
-        # Параметры пагинации
+        # 🔹 Получение данных казначейства (текущие суммы)
+        treasury_row = await conn.fetchrow("""
+            SELECT pnl_total, pnl_operational, pnl_insurance, updated_at
+            FROM strategies_treasury_v4
+            WHERE strategy_id = $1
+        """, strategy["id"])
+        treasury = dict(treasury_row) if treasury_row else None
+
+        # 🔹 Расчёт резерва по сложному проценту (7 дней по 1%)
+        reserve_required = None
+        if treasury and strategy.get("deposit"):
+            deposit = strategy["deposit"]
+            reserve_required = float(deposit) * ((1.01 ** 7) - 1)
+
+        # 🔹 Параметры пагинации
         limit = 10
         offset = max((page - 1), 0) * limit
 
-        # Получение логов казначейства
+        # 🔹 Получение логов казначейства
         logs = await conn.fetch("""
             SELECT timestamp, scenario, comment
             FROM strategies_treasury_meta_log_v4
@@ -261,7 +275,7 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
             LIMIT $2 OFFSET $3
         """, strategy["id"], limit, offset)
 
-        # Общее количество логов
+        # 🔹 Общее количество логов
         log_count_row = await conn.fetchrow("""
             SELECT COUNT(*) FROM strategies_treasury_meta_log_v4
             WHERE strategy_id = $1
@@ -271,6 +285,8 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
     return templates.TemplateResponse("strategy_details.html", {
         "request": request,
         "strategy": strategy,
+        "treasury": treasury,
+        "reserve_required": reserve_required,
         "filter": filter,
         "page": page,
         "treasury_log": logs,
