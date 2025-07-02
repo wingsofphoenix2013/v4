@@ -241,6 +241,10 @@ async def strategy_detail_page(
         today_key = stat_dates[-1]
         now = datetime.now(KYIV_TZ)
 
+        # 🔍 Отладочный лог
+        log.info(f"[STATS] Сегодня: {get_kyiv_day_bounds(0)[0].strftime('%Y-%m-%d')}")
+        log.info(f"[STATS] Список дат: {stat_dates}")
+
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
         "strategy": dict(strategy),
