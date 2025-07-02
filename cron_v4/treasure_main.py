@@ -73,7 +73,9 @@ async def run():
                     threshold = (strategy_deposit * Decimal("0.01")).quantize(Decimal("0.01"))
 
                     # 🔹 Сценарий 1
-                    if op >= threshold:
+                    reserve = strategy_deposit * (Decimal("1.01") ** 4 - Decimal("1"))
+                    if op >= reserve:
+                        threshold = (strategy_deposit * Decimal("0.01")).quantize(Decimal("0.01"))
                         amount = (threshold // Decimal("10")) * Decimal("10")
                         new_deposit = deposit + amount
                         new_limit = int(new_deposit // Decimal("10"))
