@@ -93,3 +93,68 @@ async def get_signals_by_tf(tf: str):
             ORDER BY name
         """, tf)
         return [{"id": r["id"], "name": r["name"]} for r in rows]
+# 🔸 POST: создание стратегии (без TP/SL/тикеров)
+@router.post("/strategies/create", response_class=HTMLResponse)
+async def create_strategy(
+    request: Request,
+    name: str = Form(...),
+    human_name: str = Form(...),
+    description: str = Form(...),
+    signal_id: int = Form(...),
+    deposit: int = Form(...),
+    position_limit: int = Form(...),
+    leverage: int = Form(...),
+    max_risk: int = Form(...),
+    timeframe: str = Form(...),
+    sl_type: str = Form(...),
+    sl_value: str = Form(...),  # сохраняется как строка, потом оборачивается в Decimal
+    reverse: bool = Form(False),
+    sl_protection: bool = Form(False)
+):
+    enabled_bool = False
+    if reverse:
+        sl_protection = True
+
+    form_data = await request.form()
+    use_all_flag = form_data.get("use_all_tickers")
+    use_all_tickers = use_all_flag == "on"
+
+    async with pg_pool.acquire() as conn:
+        # Проверка на уникальность
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)",
+            name
+        )
+        if exists:
+            rows = await conn.fetch("SELECT id, name, enabled FROM signals_v4 ORDER BY id")
+            signals = [{"id": r["id"], "name": r["name"], "enabled": bool(r["enabled"])} for r in rows]
+            return templates.TemplateResponse("strategies_create.html", {
+                "request": request,
+                "signals": signals,
+                "error": f"Стратегия с кодом '{name}' уже существует"
+            })
+
+        # Вставка стратегии
+        await conn.execute("""
+            INSERT INTO strategies_v4 (
+                name, human_name, description, signal_id,
+                deposit, position_limit, leverage, max_risk,
+                timeframe, enabled, reverse, sl_protection,
+                archived, use_all_tickers, allow_open,
+                use_stoploss, sl_type, sl_value,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                false, $13, true,
+                true, $14, $15,
+                NOW()
+            )
+        """, name, human_name, description, signal_id,
+             deposit, position_limit, leverage, max_risk,
+             timeframe.lower(), enabled_bool, reverse, sl_protection,
+             use_all_tickers, sl_type, Decimal(sl_value))
+
+    return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
