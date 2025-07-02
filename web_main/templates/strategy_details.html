@@ -45,61 +45,56 @@
 <!-- Карточка: Казначейство -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
   <h2 class="text-lg font-semibold text-slate-700 mb-3">Казначейство</h2>
-{% if treasury %}
-  <table class="w-full table-auto rounded-xl overflow-hidden mb-6">
+
+  {% if treasury %}
+    <table class="w-full table-auto rounded-xl overflow-hidden mb-6">
+      <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
+        <tr>
+          <th class="py-2">Прибыль</th>
+          <th class="py-2">Касса</th>
+          <th class="py-2">Страховка</th>
+          <th class="py-2">Доступно</th>
+        </tr>
+      </thead>
+      <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
+        <tr>
+          <td class="py-2">{{ treasury.pnl_total | round(2) }}</td>
+          <td class="py-2">{{ treasury.pnl_operational | round(2) }}</td>
+          <td class="py-2">{{ treasury.pnl_insurance | round(2) }}</td>
+          <td class="py-2">
+            {% set available = treasury.pnl_operational - reserve_required %}
+            {% if available > 0 %}
+              <span class="text-green-600 font-semibold">{{ available | round(2) }}</span>
+            {% else %}
+              <span class="text-red-500">Снятие недоступно</span>
+            {% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  {% endif %}
+
+  <table class="w-full table-auto rounded-xl overflow-hidden mb-4">
     <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
       <tr>
-        <th class="px-4 py-3">Прибыль</th>
-        <th class="px-4 py-3">Касса</th>
-        <th class="px-4 py-3">Страховка</th>
-        <th class="px-4 py-3">Доступно</th>
+        <th class="px-4 py-3">№</th>
+        <th class="px-4 py-3">Время</th>
+        <th class="px-4 py-3">Сценарий</th>
+        <th class="px-4 py-3">Комментарий</th>
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-      <tr>
-        <td class="px-4 py-3 font-mono">
-          {{ treasury.pnl_total | round(2) }}
-        </td>
-        <td class="px-4 py-3 font-mono">
-          {{ treasury.pnl_operational | round(2) }}
-        </td>
-        <td class="px-4 py-3 font-mono">
-          {{ treasury.pnl_insurance | round(2) }}
-        </td>
-        <td class="px-4 py-3">
-          {% set available = treasury.pnl_operational - reserve_required %}
-          {% if available > 0 %}
-            <strong>{{ available | round(2) }}</strong>
-          {% else %}
-            <span class="text-slate-500 italic">Снятие недоступно</span>
-          {% endif %}
-        </td>
+      {% for row in treasury_log %}
+      <tr class="hover:bg-slate-100">
+        <td class="px-4 py-3">{{ loop.index + ((page - 1) * log_limit) }}</td>
+        <td class="px-4 py-3 font-mono">{{ row.timestamp | format_date_ru }}</td>
+        <td class="px-4 py-3">{{ row.scenario }}</td>
+        <td class="px-4 py-3 whitespace-pre-wrap">{{ row.comment | highlight_amounts | safe }}</td>
       </tr>
+      {% endfor %}
     </tbody>
   </table>
-{% endif %}
-<table class="w-full table-auto rounded-xl overflow-hidden mb-4">
-  <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
-    <tr>
-      <th class="px-4 py-3">№</th>
-      <th class="px-4 py-3">Время</th>
-      <th class="px-4 py-3">Сценарий</th>
-      <th class="px-4 py-3">Комментарий</th>
-    </tr>
-  </thead>
-  <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-    {% for row in treasury_log %}
-    <tr class="hover:bg-slate-100">
-      <td class="px-4 py-3">{{ loop.index + ((page - 1) * log_limit) }}</td>
-      <td class="px-4 py-3 font-mono">{{ row.timestamp | format_date_ru }}</td>
-      <td class="px-4 py-3">{{ row.scenario }}</td>
-      <td class="px-4 py-3 whitespace-pre-wrap">{{ row.comment | highlight_amounts | safe }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
 
-  <!-- Пагинация -->
   {% set total_pages = (log_total // log_limit) + (1 if log_total % log_limit > 0 else 0) %}
   {% if total_pages > 1 %}
   <div class="flex justify-center gap-2">
