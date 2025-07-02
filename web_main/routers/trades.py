@@ -214,7 +214,7 @@ async def strategy_detail_page(
                   AND closed_at BETWEEN $2 AND $3
             """, strategy_id, day_start, day_end)
 
-            date_key = day_start.strftime('%Y-%m-%d')
+            date_key = day_start.replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ).strftime('%Y-%m-%d')
             for row in rows:
                 pnl = row["pnl"]
                 daily_stats[date_key]["count"] += 1
@@ -235,14 +235,17 @@ async def strategy_detail_page(
         roi = (total_stats["pnl"] / deposit * 100) if deposit else None
 
         stat_dates = [
-            get_kyiv_day_bounds(i)[0].strftime('%Y-%m-%d')
+            get_kyiv_day_bounds(i)[0]
+                .replace(tzinfo=ZoneInfo("UTC"))
+                .astimezone(KYIV_TZ)
+                .strftime('%Y-%m-%d')
             for i in reversed(range(days))
         ]
         today_key = stat_dates[-1]
         now = datetime.now(KYIV_TZ)
 
         # 🔍 Отладочный лог
-        log.info(f"[STATS] Сегодня: {get_kyiv_day_bounds(0)[0].strftime('%Y-%m-%d')}")
+        log.info(f"[STATS] Сегодня: {get_kyiv_day_bounds(0)[0].replace(tzinfo=ZoneInfo('UTC')).astimezone(KYIV_TZ).strftime('%Y-%m-%d')}")
         log.info(f"[STATS] Список дат: {stat_dates}")
         log.info(f"[TIME] now() = {datetime.now()}")
         log.info(f"[TIME] now(KYIV) = {datetime.now(KYIV_TZ)}")
