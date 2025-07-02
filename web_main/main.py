@@ -397,26 +397,6 @@ async def webhook_v4(request: Request):
     })
 
     return JSONResponse({"status": "ok", "received_at": received_at})
-# 🔸 GET: список тикеров со статусом 'enabled' (для стратегии)
-@app.get("/tickers/enabled")
-async def get_enabled_tickers():
-    async with pg_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, symbol
-            FROM tickers_v4
-            WHERE status = 'enabled'
-            ORDER BY symbol
-        """)
-        return [{"id": r["id"], "symbol": r["symbol"]} for r in rows]
-# 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
-@app.get("/strategies/check_name")
-async def check_strategy_name(name: str):
-    """
-    Проверка уникальности кода стратегии (name) — вызывается из UI через AJAX
-    """
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT 1 FROM strategies_v4 WHERE name = $1", name)
-    return {"exists": row is not None}
 @app.get("/testsignals", response_class=HTMLResponse)
 async def testsignals_page(request: Request):
     async with pg_pool.acquire() as conn:

@@ -202,3 +202,24 @@ async def create_strategy(
                 """, strategy_id, int(tid))
                 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+# 🔸 GET: список тикеров со статусом 'enabled' (для стратегии)
+@router.get("/tickers/enabled")
+async def get_enabled_tickers():
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, symbol
+            FROM tickers_v4
+            WHERE status = 'enabled'
+            ORDER BY symbol
+        """)
+        return [{"id": r["id"], "symbol": r["symbol"]} for r in rows]
+
+# 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
+@router.get("/strategies/check_name")
+async def check_strategy_name(name: str):
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM strategies_v4 WHERE name = $1",
+            name
+        )
+    return {"exists": row is not None}
