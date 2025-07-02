@@ -8,6 +8,7 @@ from fastapi.templating import Jinja2Templates
 from starlette import status
 from decimal import Decimal
 from datetime import datetime
+from pydantic import BaseModel
 
 
 # 🔸 Инициализация
@@ -297,8 +298,14 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
         "log_limit": limit,
     })
 # 🔸 POST: Снятие средств из кассы
+
+class WithdrawRequest(BaseModel):
+    amount: float
+
 @router.post("/strategies/details/{strategy_name}/withdraw")
-async def withdraw_from_cash(strategy_name: str, amount: float = Body(...)):
+async def withdraw_from_cash(strategy_name: str, payload: WithdrawRequest):
+    amount = payload.amount
+
     async with pg_pool.acquire() as conn:
         async with conn.transaction():
             # 🔹 Получение ID стратегии и текущего баланса кассы
