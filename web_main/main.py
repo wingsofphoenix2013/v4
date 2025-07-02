@@ -72,12 +72,15 @@ def get_kyiv_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
     Возвращает границы суток по Киеву в naive-UTC формате (для SQL через asyncpg).
     days_ago = 0 → сегодня, 1 → вчера и т.д.
     """
-    now_kyiv = datetime.now(KYIV_TZ)
+    # Получаем "текущий момент" по UTC и преобразуем в Киев
+    now_kyiv = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
     target_day = now_kyiv.date() - timedelta(days=days_ago)
 
-    start_kyiv = datetime.combine(target_day, time.min, tzinfo=KYIV_TZ)
-    end_kyiv = datetime.combine(target_day, time.max, tzinfo=KYIV_TZ)
+    # Создаём границы дня в Киевском времени
+    start_kyiv = datetime.combine(target_day, time.min).replace(tzinfo=KYIV_TZ)
+    end_kyiv = datetime.combine(target_day, time.max).replace(tzinfo=KYIV_TZ)
 
+    # Преобразуем в UTC и убираем tzinfo (для SQL)
     return (
         start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
         end_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
@@ -85,14 +88,19 @@ def get_kyiv_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
 
 def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
     """
-    Возвращает диапазон последних N суток по Киеву — в naive-UTC формате (для SQL).
+    Возвращает диапазон последних N суток по Киеву в naive-UTC формате (для SQL).
     """
-    now_kyiv = datetime.now(KYIV_TZ)
-    start_kyiv = now_kyiv - timedelta(days=days)
+    # Получаем "текущий момент" по UTC и переводим в Киев
+    now_kyiv = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
+    end_kyiv = now_kyiv
+
+    # Начало диапазона: (N дней назад, в 00:00:00 по Киеву)
+    start_day = (now_kyiv - timedelta(days=days)).date()
+    start_kyiv = datetime.combine(start_day, time.min).replace(tzinfo=KYIV_TZ)
 
     return (
         start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
-        now_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        end_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     )
 
 # 🔸 Инициализация пула при запуске приложения
