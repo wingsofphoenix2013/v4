@@ -232,8 +232,9 @@ async def check_strategy_name(name: str):
     return {"exists": row is not None}
 # 🔸 Детали стратегии по name
 @router.get("/strategies/details/{strategy_name}", response_class=HTMLResponse)
-async def strategy_details(strategy_name: str, request: Request, filter: str = "all"):
+async def strategy_details(strategy_name: str, request: Request, filter: str = "all", page: int = 1):
     async with pg_pool.acquire() as conn:
+        # Получение стратегии
         row = await conn.fetchrow("""
             SELECT s.*, COALESCE(sig.name, '-') AS signal_name
             FROM strategies_v4 s
@@ -241,13 +242,37 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
             WHERE s.name = $1
         """, strategy_name)
 
-    if not row:
-        return HTMLResponse(content="Стратегия не найдена", status_code=404)
+        if not row:
+            return HTMLResponse(content="Стратегия не найдена", status_code=404)
 
-    strategy = dict(row)
+        strategy = dict(row)
+
+        # Параметры пагинации
+        limit = 10
+        offset = max((page - 1), 0) * limit
+
+        # Получение логов казначейства
+        logs = await conn.fetch("""
+            SELECT timestamp, scenario, comment
+            FROM strategies_treasury_meta_log_v4
+            WHERE strategy_id = $1
+            ORDER BY timestamp DESC
+            LIMIT $2 OFFSET $3
+        """, strategy["id"], limit, offset)
+
+        # Общее количество логов
+        log_count_row = await conn.fetchrow("""
+            SELECT COUNT(*) FROM strategies_treasury_meta_log_v4
+            WHERE strategy_id = $1
+        """, strategy["id"])
+        log_total = log_count_row["count"]
 
     return templates.TemplateResponse("strategy_details.html", {
         "request": request,
         "strategy": strategy,
-        "filter": filter
+        "filter": filter,
+        "page": page,
+        "treasury_log": logs,
+        "log_total": log_total,
+        "log_limit": limit,
     })

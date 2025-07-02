@@ -35,11 +35,6 @@
     ← Назад
   </a>
 </div>
-<div class="flex justify-between items-center mb-6">
-  <a href="/strategies?filter={{ filter }}" class="px-5 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium text-sm">
-    ← Назад
-  </a>
-</div>
 
 <div class="grid grid-cols-1 gap-6">
   <!-- Карточка: Стратегия -->
@@ -47,13 +42,45 @@
     <h2 class="text-lg font-semibold text-slate-700 mb-3">Стратегия</h2>
     <!-- содержание позже -->
   </div>
+<!-- Карточка: Казначейство -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <h2 class="text-lg font-semibold text-slate-700 mb-3">Казначейство</h2>
 
-  <!-- Карточка: Казначейство -->
-  <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-    <h2 class="text-lg font-semibold text-slate-700 mb-3">Казначейство</h2>
-    <!-- содержание позже -->
+  <table class="w-full table-auto rounded-xl overflow-hidden mb-4">
+    <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+      <tr>
+        <th class="px-4 py-3">№</th>
+        <th class="px-4 py-3">Время</th>
+        <th class="px-4 py-3">Сценарий</th>
+        <th class="px-4 py-3">Комментарий</th>
+      </tr>
+    </thead>
+    <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+      {% for row in treasury_log %}
+      <tr class="hover:bg-slate-100">
+        <td class="px-4 py-3">{{ loop.index + ((page - 1) * log_limit) }}</td>
+        <td class="px-4 py-3 font-mono">{{ row.timestamp.strftime('%Y-%m-%d %H:%M') }}</td>
+        <td class="px-4 py-3">{{ row.scenario }}</td>
+        <td class="px-4 py-3 whitespace-pre-wrap">{{ row.comment }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <!-- Пагинация -->
+  {% set total_pages = (log_total // log_limit) + (1 if log_total % log_limit > 0 else 0) %}
+  {% if total_pages > 1 %}
+  <div class="flex justify-center gap-2">
+    {% for p in range(1, total_pages + 1) %}
+      <a href="?filter={{ filter }}&page={{ p }}"
+         class="px-3 py-1 rounded-md text-sm font-medium
+                {{ 'bg-blue-600 text-white' if p == page else 'bg-slate-200 hover:bg-slate-300 text-slate-700' }}">
+        {{ p }}
+      </a>
+    {% endfor %}
   </div>
-
+  {% endif %}
+</div>
   <!-- Карточка: Торговля -->
   <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
     <h2 class="text-lg font-semibold text-slate-700 mb-3">Торговля</h2>
