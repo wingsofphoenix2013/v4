@@ -1,12 +1,15 @@
 # 🔸 Маршруты стратегий (strategies)
 
 import logging
+import re
 
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup, escape
 from starlette import status
 
+# 🔸 Инициализация
 router = APIRouter()
 log = logging.getLogger("STRATEGIES")
 
@@ -14,6 +17,30 @@ log = logging.getLogger("STRATEGIES")
 pg_pool = None
 redis_client = None
 templates = Jinja2Templates(directory="templates")
+
+# 🔸 Фильтр Jinja: форматирование даты по-русски
+MONTHS_RU = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
+}
+
+def format_date_ru(dt):
+    if not dt:
+        return ""
+    return f"{dt.day:02d} {MONTHS_RU.get(dt.month, '')} {dt.year} года"
+
+templates.env.filters["format_date_ru"] = format_date_ru
+
+# 🔸 Фильтр Jinja: выделение сумм жирным
+def highlight_amounts(text):
+    if not text:
+        return ""
+    pattern = r"(\b[><=]?\s?[+-]?\d+\.\d{2}\b)"
+    highlighted = re.sub(pattern, r"<strong>\1</strong>", escape(text))
+    return Markup(highlighted)
+
+templates.env.filters["highlight_amounts"] = highlight_amounts
 
 # 🔸 Страница со списком стратегий
 @router.get("/strategies", response_class=HTMLResponse)
