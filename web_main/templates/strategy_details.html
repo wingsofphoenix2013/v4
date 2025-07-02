@@ -157,6 +157,7 @@ function handleWithdrawClick(maxAvailable) {
   if (!withdrawActive) {
     input.classList.remove("hidden");
     input.focus();
+    button.textContent = "Подтвердить снятие";  // 🟢 вот эта строка меняет текст
     withdrawActive = true;
   } else {
     const value = parseFloat(input.value);
@@ -169,8 +170,18 @@ function handleWithdrawClick(maxAvailable) {
       return;
     }
 
-    // TODO: заменить на реальный запрос
-    alert(`Будет снято: ${value.toFixed(2)} USDT`);
+    // Отправка запроса на сервер
+    fetch(window.location.pathname + "/withdraw", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amount: value })
+    }).then(res => {
+      if (res.ok) {
+        window.location.reload();
+      } else {
+        alert("Ошибка при выполнении операции");
+      }
+    });
   }
 }
 

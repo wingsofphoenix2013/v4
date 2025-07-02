@@ -2,11 +2,13 @@
 
 import logging
 
-from fastapi import APIRouter, Request, Form
+from fastapi import APIRouter, Request, Form, Body
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette import status
 from decimal import Decimal
+from datetime import datetime
+
 
 # 🔸 Инициализация
 router = APIRouter()
@@ -294,3 +296,45 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
         "log_total": log_total,
         "log_limit": limit,
     })
+# 🔸 POST: Снятие средств из кассы
+@router.post("/strategies/details/{strategy_name}/withdraw")
+async def withdraw_from_cash(strategy_name: str, amount: float = Body(...)):
+    async with pg_pool.acquire() as conn:
+        async with conn.transaction():
+            # 🔹 Получение ID стратегии и текущего баланса кассы
+            row = await conn.fetchrow("""
+                SELECT s.id AS strategy_id, t.pnl_operational
+                FROM strategies_v4 s
+                JOIN strategies_treasury_v4 t ON t.strategy_id = s.id
+                WHERE s.name = $1
+            """, strategy_name)
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+            strategy_id = row["strategy_id"]
+            current_cash = row["pnl_operational"]
+
+            # 🔹 Проверка лимита
+            if Decimal(amount) > current_cash:
+                raise HTTPException(status_code=400, detail="Недостаточно средств")
+
+            new_cash = current_cash - Decimal(amount)
+
+            # 🔹 Обновление состояния кассы
+            await conn.execute("""
+                UPDATE strategies_treasury_v4
+                SET pnl_operational = $1, updated_at = now()
+                WHERE strategy_id = $2
+            """, new_cash, strategy_id)
+
+            # 🔹 Логирование события
+            await conn.execute("""
+                INSERT INTO strategies_treasury_meta_log_v4 (
+                    strategy_id, timestamp, scenario, comment
+                )
+                VALUES ($1, $2, 'reduction', $3)
+            """, strategy_id, datetime.utcnow(),
+                f"Снято из кассы ${float(amount):.2f}. Остаток в кассе ${float(new_cash):.2f}")
+
+    return {"status": "ok"}
