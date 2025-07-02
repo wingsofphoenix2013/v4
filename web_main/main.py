@@ -397,32 +397,6 @@ async def webhook_v4(request: Request):
     })
 
     return JSONResponse({"status": "ok", "received_at": received_at})
-# 🔸 Страница стратегий
-@app.get("/strategies", response_class=HTMLResponse)
-async def strategies_page(request: Request):
-    async with pg_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT s.id, s.name, s.human_name, s.timeframe, s.enabled,
-                   COALESCE(sig.name, '-') AS signal_name
-            FROM strategies_v4 s
-            LEFT JOIN signals_v4 sig ON sig.id = s.signal_id
-            ORDER BY s.id
-        """)
-        strategies = []
-        for r in rows:
-            strategies.append({
-                "id": r["id"],
-                "name": r["name"],
-                "human_name": r["human_name"],
-                "signal_name": r["signal_name"],
-                "timeframe": r["timeframe"].upper(),
-                "enabled": r["enabled"]
-            })
-
-    return templates.TemplateResponse("strategies.html", {
-        "request": request,
-        "strategies": strategies
-    })
 # 🔸 POST: включение стратегии
 @app.post("/strategies/{strategy_id}/enable")
 async def enable_strategy(strategy_id: int):
