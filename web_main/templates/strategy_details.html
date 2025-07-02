@@ -109,30 +109,32 @@
         </button>
       </div>
     </div>
-    <table class="w-full table-auto rounded-xl overflow-hidden mb-6">
-      <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
-        <tr>
-          <th class="py-2">Прибыль</th>
-          <th class="py-2">Касса</th>
-          <th class="py-2">Страховка</th>
-          <th class="py-2">Доступно</th>
-        </tr>
-      </thead>
-      <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
-        <tr>
-          <td class="py-2">$ {{ treasury.pnl_total | round(2) }}</td>
-          <td class="py-2">$ {{ treasury.pnl_operational | round(2) }}</td>
-          <td class="py-2">$ {{ treasury.pnl_insurance | round(2) }}</td>
-          <td class="py-2">
-            {% if available > 0 %}
-              <span class="text-green-600 font-semibold">$ {{ available | round(2) }}</span>
-            {% else %}
-              <span class="text-red-500">Снятие недоступно</span>
-            {% endif %}
-          </td>
-        </tr>
-      </tbody>
-    </table>
+<table class="w-full table-auto rounded-xl overflow-hidden mb-6">
+  <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
+    <tr>
+      <th class="py-2">Депозит</th>
+      <th class="py-2">Прибыль</th>
+      <th class="py-2">Касса</th>
+      <th class="py-2">Страховка</th>
+      <th class="py-2">Доступно</th>
+    </tr>
+  </thead>
+  <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
+    <tr>
+      <td class="py-2">$ {{ strategy.deposit | round(2) }}</td>
+      <td class="py-2">$ {{ treasury.pnl_total | round(2) }}</td>
+      <td class="py-2">$ {{ treasury.pnl_operational | round(2) }}</td>
+      <td class="py-2">$ {{ treasury.pnl_insurance | round(2) }}</td>
+      <td class="py-2">
+        {% if available > 0 %}
+          <span class="text-green-600 font-semibold">$ {{ available | round(2) }}</span>
+        {% else %}
+          <span class="text-red-500">Снятие недоступно</span>
+        {% endif %}
+      </td>
+    </tr>
+  </tbody>
+</table>
   {% endif %}
 <h2 class="text-lg font-semibold text-slate-700 mb-3">История операций</h2>
   <table class="w-full table-auto rounded-xl overflow-hidden mb-4">
