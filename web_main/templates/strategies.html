@@ -30,11 +30,64 @@
 <!-- Контейнер кнопок и таблицы -->
 <main class="max-w-7xl mx-auto px-4 py-10">
   <!-- Панель управления -->
-  <div class="flex justify-between items-center mb-6">
-    <a href="/" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад</a>
-    <a href="/strategies/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition">Добавить стратегию</a>
+<div class="flex justify-between items-center mb-6 gap-2">
+  <!-- Левая кнопка -->
+  <a href="/" class="px-5 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium text-sm">
+    ← Назад
+  </a>
+
+  <!-- Центрированные кнопки -->
+  <div class="flex gap-2">
+    <a href="/strategies?filter=enabled" class="px-5 py-2 bg-blue-100 hover:bg-blue-200 text-blue-800 rounded-lg font-medium text-sm">
+      Включенные стратегии
+    </a>
+    <a href="/strategies?filter=disabled" class="px-5 py-2 bg-blue-100 hover:bg-blue-200 text-blue-800 rounded-lg font-medium text-sm">
+      Выключенные стратегии
+    </a>
   </div>
 
+  <!-- Правая кнопка -->
+  <a href="/strategies/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold text-sm">
+    + Добавить стратегию
+  </a>
+</div>
+{% if filter == "enabled" or filter == "all" %}
+  <h2 class="text-lg font-semibold text-slate-700 mb-3">Включенные стратегии</h2>
+  <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden mb-10">
+    <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+      <tr>
+        <th class="px-4 py-3">№</th>
+        <th class="px-4 py-3">Код</th>
+        <th class="px-4 py-3">Название</th>
+        <th class="px-4 py-3">Сигнал</th>
+        <th class="px-4 py-3">ТФ</th>
+        <th class="px-4 py-3">Статус</th>
+      </tr>
+    </thead>
+    <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+      {% for s in enabled_strategies %}
+      <tr>
+        <td class="px-4 py-3">{{ loop.index }}</td>
+        <td class="px-4 py-3 font-mono">{{ s.name }}</td>
+        <td class="px-4 py-3">{{ s.human_name }}</td>
+        <td class="px-4 py-3">{{ s.signal_name }}</td>
+        <td class="px-4 py-3">{{ s.timeframe }}</td>
+        <td class="px-4 py-3">
+          <div class="flex items-center space-x-3">
+            <div class="h-3 w-3 rounded-full bg-green-500"></div>
+            <form method="post" action="/strategies/{{ s.id }}/disable">
+              <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% if filter == "disabled" or filter == "all" %}
+  <h2 class="text-lg font-semibold text-slate-700 mb-3">Выключенные стратегии</h2>
   <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
     <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
       <tr>
@@ -47,7 +100,7 @@
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-      {% for s in strategies %}
+      {% for s in disabled_strategies %}
       <tr>
         <td class="px-4 py-3">{{ loop.index }}</td>
         <td class="px-4 py-3 font-mono">{{ s.name }}</td>
@@ -56,11 +109,9 @@
         <td class="px-4 py-3">{{ s.timeframe }}</td>
         <td class="px-4 py-3">
           <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full {{ 'bg-green-500' if s.enabled else 'bg-red-500' }}"></div>
-            <form method="post" action="/strategies/{{ s.id }}/{{ 'disable' if s.enabled else 'enable' }}">
-              <button class="text-sm text-blue-600 hover:underline">
-                {{ 'Выключить' if s.enabled else 'Включить' }}
-              </button>
+            <div class="h-3 w-3 rounded-full bg-red-500"></div>
+            <form method="post" action="/strategies/{{ s.id }}/enable">
+              <button class="text-sm text-blue-600 hover:underline">Включить</button>
             </form>
           </div>
         </td>
@@ -68,5 +119,6 @@
       {% endfor %}
     </tbody>
   </table>
+{% endif %}
 </main></body>
 </html>

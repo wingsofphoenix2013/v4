@@ -16,7 +16,7 @@ templates = Jinja2Templates(directory="templates")
 
 # 🔸 Страница со списком стратегий
 @router.get("/strategies", response_class=HTMLResponse)
-async def strategies_page(request: Request):
+async def strategies_page(request: Request, filter: str = "all"):
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT s.id, s.name, s.human_name, s.timeframe, s.enabled,
@@ -25,20 +25,26 @@ async def strategies_page(request: Request):
             LEFT JOIN signals_v4 sig ON sig.id = s.signal_id
             ORDER BY s.id
         """)
-        strategies = []
-        for r in rows:
-            strategies.append({
-                "id": r["id"],
-                "name": r["name"],
-                "human_name": r["human_name"],
-                "signal_name": r["signal_name"],
-                "timeframe": r["timeframe"].upper(),
-                "enabled": r["enabled"]
-            })
+    
+    enabled_list = []
+    disabled_list = []
+
+    for r in rows:
+        strategy = {
+            "id": r["id"],
+            "name": r["name"],
+            "human_name": r["human_name"],
+            "signal_name": r["signal_name"],
+            "timeframe": r["timeframe"].upper(),
+            "enabled": r["enabled"]
+        }
+        (enabled_list if r["enabled"] else disabled_list).append(strategy)
 
     return templates.TemplateResponse("strategies.html", {
         "request": request,
-        "strategies": strategies
+        "enabled_strategies": enabled_list,
+        "disabled_strategies": disabled_list,
+        "filter": filter
     })
 # 🔸 POST: включение стратегии
 @router.post("/strategies/{strategy_id}/enable")
