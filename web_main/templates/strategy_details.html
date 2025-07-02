@@ -5,11 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Стратегии</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-      body {
-        background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
-      }
-    </style>
+<style>
+  body {
+    background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
+  }
+
+  .action-btn {
+    padding: 0.375rem 1rem; /* py-1.5 px-4 */
+    background-color: #2563eb; /* bg-blue-600 */
+    color: white;
+    font-size: 0.875rem; /* text-sm */
+    font-weight: 500;    /* font-medium */
+    border-radius: 0.5rem; /* rounded-lg */
+    transition: background-color 0.2s ease;
+  }
+
+  .action-btn:hover:not(.disabled) {
+    background-color: #1e40af; /* bg-blue-700 */
+  }
+
+  .action-btn.disabled {
+    background-color: #cbd5e1; /* bg-slate-300 */
+    color: #94a3b8;            /* text-slate-500 */
+    cursor: not-allowed;
+  }
+</style>
   </head>
   <body class="min-h-screen font-sans text-slate-800">
     <!-- Верхнее меню навигации -->
@@ -49,26 +69,32 @@
     <div class="flex justify-between items-center mb-3">
       <h2 class="text-lg font-semibold text-slate-700">Казначейство</h2>
 
-      <div class="flex gap-2 items-center" id="withdraw-container">
-        {% if available > 0 %}
-          <input type="number"
-                 id="withdraw-input"
-                 placeholder="Сумма"
-                 min="0.01"
-                 step="0.01"
-                 class="hidden px-3 py-1.5 text-sm rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-400"
-                 oninput="validateAmount(this, {{ available | round(2) }})">
-        {% endif %}
+      <div class="flex gap-2 items-center" id="action-container">
+        <input type="number"
+               id="action-input"
+               placeholder="Сумма"
+               min="0.01"
+               step="0.01"
+               class="hidden px-3 py-1.5 text-sm rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-400"
+               oninput="validateAmount(this, {{ available | round(2) }})">
 
         {% if available > 0 %}
           <button id="withdraw-button"
-                  class="px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg font-medium"
-                  onclick="handleWithdrawClick({{ available | round(2) }})">
+                  class="action-btn"
+                  onclick="startAction('withdraw', {{ available | round(2) }})">
             Снять кассу
+          </button>
+
+          <button id="transfer-button"
+                  class="action-btn"
+                  onclick="startAction('transfer', {{ available | round(2) }})">
+            Перевод кассы
           </button>
         {% endif %}
 
-        <button class="px-4 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-sm rounded-lg font-medium">
+        <button id="deposit-button"
+                class="action-btn"
+                onclick="startAction('deposit', 9999999)"> <!-- лимит не важен -->
           Добавить депозит
         </button>
       </div>
@@ -148,40 +174,55 @@
 </div>
 </main>
 <script>
-let withdrawActive = false;
+let currentAction = null;
 
-function handleWithdrawClick(maxAvailable) {
-  const input = document.getElementById("withdraw-input");
-  const button = document.getElementById("withdraw-button");
+function startAction(action, maxAmount) {
+  if (currentAction && currentAction !== action) return;
 
-  if (!withdrawActive) {
+  const input = document.getElementById("action-input");
+  const withdrawBtn = document.getElementById("withdraw-button");
+  const transferBtn = document.getElementById("transfer-button");
+  const depositBtn = document.getElementById("deposit-button");
+
+  const buttons = {
+    withdraw: withdrawBtn,
+    transfer: transferBtn,
+    deposit: depositBtn
+  };
+
+  if (!currentAction) {
     input.classList.remove("hidden");
     input.focus();
-    button.textContent = "Подтвердить снятие";  // 🟢 вот эта строка меняет текст
-    withdrawActive = true;
+
+    for (const key in buttons) {
+      if (key !== action && buttons[key]) {
+        buttons[key].classList.add("disabled");
+        buttons[key].disabled = true;
+      }
+    }
+
+    buttons[action].textContent = (
+      action === "withdraw" ? "Подтвердить снятие" :
+      action === "transfer" ? "Подтвердить перевод" :
+      "Подтвердить пополнение"
+    );
+
+    currentAction = action;
   } else {
     const value = parseFloat(input.value);
     if (isNaN(value) || value <= 0) {
-      alert("Введите сумму для снятия");
-      return;
-    }
-    if (value > maxAvailable) {
-      alert(`Доступно только ${maxAvailable.toFixed(2)}`);
+      alert("Введите сумму");
       return;
     }
 
-    // Отправка запроса на сервер
-    fetch(window.location.pathname + "/withdraw", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount: value })
-    }).then(res => {
-      if (res.ok) {
-        window.location.reload();
-      } else {
-        alert("Ошибка при выполнении операции");
-      }
-    });
+    if (value > maxAmount) {
+      alert(`Максимум: ${maxAmount.toFixed(2)}`);
+      return;
+    }
+
+    alert(`${action.toUpperCase()}: ${value.toFixed(2)} USDT`);
+
+    // TODO: отправка fetch или форма
   }
 }
 
