@@ -70,13 +70,23 @@
       <h2 class="text-lg font-semibold text-slate-700">Казначейство</h2>
 
       <div class="flex gap-2 items-center" id="action-container">
-        <input type="number"
-               id="action-input"
-               placeholder="Сумма"
-               min="0.01"
-               step="0.01"
-               class="hidden px-3 py-1.5 text-sm rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-400"
-               oninput="validateAmount(this, {{ available | round(2) }})">
+        <!-- поле ввода суммы -->
+        <div class="flex items-center gap-2">
+          <button id="action-cancel"
+                  onclick="cancelAction()"
+                  class="hidden text-red-600 text-xl font-bold px-2 hover:text-red-800"
+                  title="Отменить">
+            &times;
+          </button>
+
+          <input type="number"
+                 id="action-input"
+                 placeholder="Сумма"
+                 min="0.01"
+                 step="0.01"
+                 class="hidden px-3 py-1.5 text-sm rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                 oninput="validateAmount(this, {{ available | round(2) }})">
+        </div>
 
         {% if available > 0 %}
           <button id="withdraw-button"
@@ -94,12 +104,11 @@
 
         <button id="deposit-button"
                 class="action-btn"
-                onclick="startAction('deposit', 9999999)"> <!-- лимит не важен -->
+                onclick="startAction('deposit', 9999999)">
           Добавить депозит
         </button>
       </div>
     </div>
-
     <table class="w-full table-auto rounded-xl overflow-hidden mb-6">
       <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
         <tr>
@@ -180,6 +189,7 @@ function startAction(action, maxAmount) {
   if (currentAction && currentAction !== action) return;
 
   const input = document.getElementById("action-input");
+  const cancelBtn = document.getElementById("action-cancel");
   const withdrawBtn = document.getElementById("withdraw-button");
   const transferBtn = document.getElementById("transfer-button");
   const depositBtn = document.getElementById("deposit-button");
@@ -192,6 +202,7 @@ function startAction(action, maxAmount) {
 
   if (!currentAction) {
     input.classList.remove("hidden");
+    cancelBtn.classList.remove("hidden");
     input.focus();
 
     for (const key in buttons) {
@@ -221,8 +232,40 @@ function startAction(action, maxAmount) {
     }
 
     alert(`${action.toUpperCase()}: ${value.toFixed(2)} USDT`);
+    // TODO: отправка fetch
+  }
+}
 
-    // TODO: отправка fetch или форма
+function cancelAction() {
+  const input = document.getElementById("action-input");
+  const cancelBtn = document.getElementById("action-cancel");
+  const withdrawBtn = document.getElementById("withdraw-button");
+  const transferBtn = document.getElementById("transfer-button");
+  const depositBtn = document.getElementById("deposit-button");
+
+  input.classList.add("hidden");
+  input.value = "";
+  cancelBtn.classList.add("hidden");
+  currentAction = null;
+
+  const buttons = {
+    withdraw: withdrawBtn,
+    transfer: transferBtn,
+    deposit: depositBtn
+  };
+
+  for (const key in buttons) {
+    const btn = buttons[key];
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("disabled");
+
+      btn.textContent = (
+        key === "withdraw" ? "Снять кассу" :
+        key === "transfer" ? "Перевод кассы" :
+        "Добавить депозит"
+      );
+    }
   }
 }
 
