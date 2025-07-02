@@ -230,3 +230,24 @@ async def check_strategy_name(name: str):
             name
         )
     return {"exists": row is not None}
+# 🔸 Детали стратегии по name
+@router.get("/strategies/details/{strategy_name}", response_class=HTMLResponse)
+async def strategy_details(strategy_name: str, request: Request, filter: str = "all"):
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT s.*, COALESCE(sig.name, '-') AS signal_name
+            FROM strategies_v4 s
+            LEFT JOIN signals_v4 sig ON sig.id = s.signal_id
+            WHERE s.name = $1
+        """, strategy_name)
+
+    if not row:
+        return HTMLResponse(content="Стратегия не найдена", status_code=404)
+
+    strategy = dict(row)
+
+    return templates.TemplateResponse("strategy_details.html", {
+        "request": request,
+        "strategy": strategy,
+        "filter": filter
+    })
