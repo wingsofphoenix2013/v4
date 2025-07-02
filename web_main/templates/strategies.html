@@ -38,10 +38,14 @@
 
   <!-- Центрированные кнопки -->
   <div class="flex gap-2">
-    <a href="/strategies?filter=enabled" class="px-5 py-2 bg-blue-100 hover:bg-blue-200 text-blue-800 rounded-lg font-medium text-sm">
+    <a href="/strategies?filter=enabled"
+       class="px-5 py-2 rounded-lg font-medium text-sm
+              {{ 'bg-blue-600 text-white' if filter == 'enabled' else 'bg-blue-100 hover:bg-blue-200 text-blue-800' }}">
       Включенные стратегии
     </a>
-    <a href="/strategies?filter=disabled" class="px-5 py-2 bg-blue-100 hover:bg-blue-200 text-blue-800 rounded-lg font-medium text-sm">
+    <a href="/strategies?filter=disabled"
+       class="px-5 py-2 rounded-lg font-medium text-sm
+              {{ 'bg-blue-600 text-white' if filter == 'disabled' else 'bg-blue-100 hover:bg-blue-200 text-blue-800' }}">
       Выключенные стратегии
     </a>
   </div>
@@ -51,6 +55,7 @@
     + Добавить стратегию
   </a>
 </div>
+
 {% if filter == "enabled" or filter == "all" %}
   <h2 class="text-lg font-semibold text-slate-700 mb-3">Включенные стратегии</h2>
   <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden mb-10">
@@ -66,7 +71,7 @@
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
       {% for s in enabled_strategies %}
-      <tr>
+      <tr class="hover:bg-slate-50">
         <td class="px-4 py-3">{{ loop.index }}</td>
         <td class="px-4 py-3 font-mono">{{ s.name }}</td>
         <td class="px-4 py-3">{{ s.human_name }}</td>
@@ -101,7 +106,7 @@
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
       {% for s in disabled_strategies %}
-      <tr>
+      <tr class="hover:bg-slate-50">
         <td class="px-4 py-3">{{ loop.index }}</td>
         <td class="px-4 py-3 font-mono">{{ s.name }}</td>
         <td class="px-4 py-3">{{ s.human_name }}</td>
