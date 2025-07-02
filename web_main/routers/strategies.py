@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette import status
+from decimal import Decimal
 
 # 🔸 Инициализация
 router = APIRouter()
@@ -260,7 +261,7 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
         reserve_required = None
         if treasury and strategy.get("deposit"):
             deposit = strategy["deposit"]
-            reserve_required = float(deposit) * ((1.01 ** 7) - 1)
+            reserve_required = Decimal(deposit) * Decimal((1.01 ** 7) - 1)
 
         # 🔹 Параметры пагинации
         limit = 10
