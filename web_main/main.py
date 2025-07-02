@@ -86,7 +86,7 @@ def highlight_amounts(text):
         return ""
     # Подсвечивает целые и дробные числа с необязательным знаком и сравнением
     pattern = r"(\b[><=]?\s?[+-]?\d+(?:[.,]\d{2})?\b)"
-    highlighted = re.sub(pattern, r"<strong>\1</strong>", escape(text))
+    highlighted = re.sub(pattern, r"<strong>\1</strong>", text)
     return Markup(highlighted)
 
 templates.env.filters["highlight_amounts"] = highlight_amounts
