@@ -3,8 +3,9 @@
 import logging
 
 from fastapi import APIRouter, Request, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from starlette import status
 
 router = APIRouter()
 log = logging.getLogger("STRATEGIES")
@@ -48,15 +49,15 @@ async def strategies_page(request: Request, filter: str = "all"):
     })
 # 🔸 POST: включение стратегии
 @router.post("/strategies/{strategy_id}/enable")
-async def enable_strategy(strategy_id: int):
+async def enable_strategy(strategy_id: int, filter: str = Form("all")):
     await update_strategy_status(strategy_id, True)
-    return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=f"/strategies?filter={filter}", status_code=status.HTTP_303_SEE_OTHER)
 
 # 🔸 POST: отключение стратегии
 @router.post("/strategies/{strategy_id}/disable")
-async def disable_strategy(strategy_id: int):
+async def disable_strategy(strategy_id: int, filter: str = Form("all")):
     await update_strategy_status(strategy_id, False)
-    return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=f"/strategies?filter={filter}", status_code=status.HTTP_303_SEE_OTHER)
 
 # 🔸 Обновление статуса стратегии и публикация события
 async def update_strategy_status(strategy_id: int, new_value: bool):
