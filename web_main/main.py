@@ -84,7 +84,8 @@ templates.env.filters["format_date_ru"] = format_date_ru
 def highlight_amounts(text):
     if not text:
         return ""
-    pattern = r"(\b[><=]?\s?[+-]?\d+\.\d{2}\b)"
+    # Подсвечивает целые и дробные числа с необязательным знаком и сравнением
+    pattern = r"(\b[><=]?\s?[+-]?\d+(?:[.,]\d{2})?\b)"
     highlighted = re.sub(pattern, r"<strong>\1</strong>", escape(text))
     return Markup(highlighted)
 

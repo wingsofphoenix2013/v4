@@ -61,7 +61,7 @@
       <td class="px-4 py-3">{{ loop.index + ((page - 1) * log_limit) }}</td>
       <td class="px-4 py-3 font-mono">{{ row.timestamp | format_date_ru }}</td>
       <td class="px-4 py-3">{{ row.scenario }}</td>
-      <td class="px-4 py-3 whitespace-pre-wrap">{{ row.comment | highlight_amounts }}</td>
+      <td class="px-4 py-3 whitespace-pre-wrap">{{ row.comment | highlight_amounts | safe }}</td>
     </tr>
     {% endfor %}
   </tbody>
