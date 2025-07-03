@@ -217,7 +217,7 @@ function startAction(action, maxAmount) {
     buttons[action].textContent = (
       action === "withdraw" ? "Подтвердить снятие" :
       action === "transfer" ? "Подтвердить перевод" :
-      "Подтвердить пополнение"
+      "Подтвердить изменения"
     );
 
     currentAction = action;
@@ -228,16 +228,16 @@ function startAction(action, maxAmount) {
       return;
     }
 
-    if (value > maxAmount) {
+    if (value > maxAmount && currentAction !== "deposit") {
       alert(`Максимум: ${maxAmount.toFixed(2)}`);
       return;
     }
 
-    const endpoint = action === "withdraw"
-      ? "/withdraw"
-      : action === "transfer"
-        ? "/transfer"
-        : null;
+    const endpoint =
+      action === "withdraw" ? "/withdraw" :
+      action === "transfer" ? "/transfer" :
+      action === "deposit" ? "/adjust" :
+      null;
 
     if (!endpoint) {
       alert("Эта операция пока не реализована");
@@ -285,7 +285,7 @@ function cancelAction() {
       btn.textContent = (
         key === "withdraw" ? "Снять кассу" :
         key === "transfer" ? "Перевод кассы" :
-        "Добавить депозит"
+        "Изменить депозит"
       );
     }
   }

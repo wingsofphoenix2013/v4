@@ -340,7 +340,7 @@ async def withdraw_from_cash(strategy_name: str, payload: WithdrawRequest):
                 INSERT INTO strategies_treasury_meta_log_v4 (
                     strategy_id, timestamp, scenario, comment
                 )
-                VALUES ($1, $2, 'reduction', $3)
+                VALUES ($1, $2, 'Снятие из кассы', $3)
             """, strategy_id, datetime.utcnow(),
                 f"Снято из кассы ${float(amount):.2f}. Остаток в кассе ${float(new_cash):.2f}")
 
@@ -391,6 +391,7 @@ async def transfer_cash_to_deposit(strategy_name: str, payload: TransferRequest)
                 new_deposit = deposit + rounded
                 new_limit = int(position_limit + rounded / Decimal("10"))
 
+                scenario = "Перевод в депозит"
                 comment = (
                     f"Переведено {rounded:.2f} из кассы в депозит. "
                     f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}"
@@ -410,6 +411,7 @@ async def transfer_cash_to_deposit(strategy_name: str, payload: TransferRequest)
                 new_deposit = deposit - rounded_abs
                 new_limit = int(position_limit - rounded_abs / Decimal("10"))
 
+                scenario = "Перевод в кассу"
                 comment = (
                     f"Возврат {rounded_abs:.2f} из депозита в кассу. "
                     f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}"
@@ -434,10 +436,93 @@ async def transfer_cash_to_deposit(strategy_name: str, payload: TransferRequest)
                 INSERT INTO strategies_treasury_meta_log_v4 (
                     strategy_id, timestamp, scenario, comment
                 )
-                VALUES ($1, $2, 'transfer', $3)
-            """, strategy_id, datetime.utcnow(), comment)
+                VALUES ($1, $2, $3, $4)
+            """, strategy_id, datetime.utcnow(), scenario, comment)
 
             # 🔹 Публикация события в Redis
+            await redis_client.xadd("strategy_update_stream", {
+                "id": str(strategy_id),
+                "type": "strategy",
+                "action": "update",
+                "source": "ui_event"
+            })
+
+    return {"status": "ok"}
+# 🔸 POST: Изменение депозита вручную
+
+class AdjustDepositRequest(BaseModel):
+    amount: condecimal(gt=Decimal("-100000000"), lt=Decimal("100000000"))
+
+@router.post("/strategies/details/{strategy_name}/adjust")
+async def adjust_deposit(strategy_name: str, payload: AdjustDepositRequest):
+    # 🔹 Округление до десятков
+    amount = payload.amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if amount == 0:
+        raise HTTPException(status_code=400, detail="Сумма должна быть отлична от нуля")
+
+    rounded = (abs(amount) // Decimal("10")) * Decimal("10")
+    if amount < 0:
+        rounded *= Decimal("-1")
+
+    async with pg_pool.acquire() as conn:
+        async with conn.transaction():
+            # 🔹 Получение данных стратегии
+            row = await conn.fetchrow("""
+                SELECT id, deposit, position_limit
+                FROM strategies_v4
+                WHERE name = $1
+            """, strategy_name)
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+            strategy_id = row["id"]
+            deposit = row["deposit"]
+            limit = row["position_limit"]
+
+            if rounded > 0:
+                # ➕ Пополнение депозита
+                new_deposit = deposit + rounded
+                new_limit = int(limit + rounded / Decimal("10"))
+
+                comment = (
+                    f"Депозит пополнен на {rounded:.2f}. "
+                    f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}"
+                )
+                scenario = "Пополнение депозита"
+
+            else:
+                # ➖ Изъятие депозита
+                rounded_abs = abs(rounded)
+
+                if rounded_abs > deposit:
+                    raise HTTPException(status_code=400, detail="Недостаточно средств в депозите")
+
+                new_deposit = deposit - rounded_abs
+                new_limit = int(limit - rounded_abs / Decimal("10"))
+
+                comment = (
+                    f"Депозит уменьшен на {rounded_abs:.2f}. "
+                    f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}"
+                )
+                scenario = "Изъятие депозита"
+
+            # 🔹 Обновление стратегии
+            await conn.execute("""
+                UPDATE strategies_v4
+                SET deposit = $1, position_limit = $2
+                WHERE id = $3
+            """, new_deposit, new_limit, strategy_id)
+
+            # 🔹 Запись в лог
+            await conn.execute("""
+                INSERT INTO strategies_treasury_meta_log_v4 (
+                    strategy_id, timestamp, scenario, comment
+                )
+                VALUES ($1, $2, $3, $4)
+            """, strategy_id, datetime.utcnow(), scenario, comment)
+
+            # 🔹 Уведомление в Redis
             await redis_client.xadd("strategy_update_stream", {
                 "id": str(strategy_id),
                 "type": "strategy",
