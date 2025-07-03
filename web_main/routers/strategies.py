@@ -237,7 +237,13 @@ async def check_strategy_name(name: str):
     return {"exists": row is not None}
 # 🔸 Детали стратегии по name
 @router.get("/strategies/details/{strategy_name}", response_class=HTMLResponse)
-async def strategy_details(strategy_name: str, request: Request, filter: str = "all", page: int = 1):
+async def strategy_details(
+    strategy_name: str,
+    request: Request,
+    filter: str = "all",
+    page: int = 1,
+    trade_page: int = 1
+):
     async with pg_pool.acquire() as conn:
         # 🔹 Получение стратегии
         row = await conn.fetchrow("""
@@ -252,7 +258,7 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
 
         strategy = dict(row)
 
-        # 🔹 Получение данных казначейства (текущие суммы)
+        # 🔹 Казначейство
         treasury_row = await conn.fetchrow("""
             SELECT pnl_total, pnl_operational, pnl_insurance, updated_at
             FROM strategies_treasury_v4
@@ -260,31 +266,52 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
         """, strategy["id"])
         treasury = dict(treasury_row) if treasury_row else None
 
-        # 🔹 Расчёт резерва по сложному проценту (7 дней по 1%)
+        # 🔹 Резерв под рост депозита (сложный процент на 7 дней)
         reserve_required = None
         if treasury and strategy.get("deposit"):
             deposit = strategy["deposit"]
             reserve_required = Decimal(deposit) * Decimal((1.01 ** 7) - 1)
 
-        # 🔹 Параметры пагинации
-        limit = 10
-        offset = max((page - 1), 0) * limit
+        # 🔹 Пагинация: лог казначейства
+        log_limit = 10
+        log_offset = max((page - 1), 0) * log_limit
 
-        # 🔹 Получение логов казначейства
-        logs = await conn.fetch("""
+        treasury_log = await conn.fetch("""
             SELECT timestamp, scenario, comment
             FROM strategies_treasury_meta_log_v4
             WHERE strategy_id = $1
             ORDER BY timestamp DESC
             LIMIT $2 OFFSET $3
-        """, strategy["id"], limit, offset)
+        """, strategy["id"], log_limit, log_offset)
 
-        # 🔹 Общее количество логов
-        log_count_row = await conn.fetchrow("""
+        log_total = await conn.fetchval("""
             SELECT COUNT(*) FROM strategies_treasury_meta_log_v4
             WHERE strategy_id = $1
         """, strategy["id"])
-        log_total = log_count_row["count"]
+
+        # 🔹 Пагинация: Торговля
+        trade_limit = 25
+        trade_offset = max((trade_page - 1), 0) * trade_limit
+
+        trades = await conn.fetch("""
+            SELECT f.position_uid,
+                   f.symbol,
+                   f.created_at,
+                   f.closed_at,
+                   f.duration,
+                   f.result,
+                   COALESCE(t.comment, '-') AS comment
+            FROM strategies_finmonitor_v4 f
+            LEFT JOIN strategies_treasury_log_v4 t ON t.position_uid = f.position_uid
+            WHERE f.strategy_id = $1
+            ORDER BY f.closed_at DESC
+            LIMIT $2 OFFSET $3
+        """, strategy["id"], trade_limit, trade_offset)
+
+        trade_total = await conn.fetchval("""
+            SELECT COUNT(*) FROM strategies_finmonitor_v4
+            WHERE strategy_id = $1
+        """, strategy["id"])
 
     return templates.TemplateResponse("strategy_details.html", {
         "request": request,
@@ -293,9 +320,13 @@ async def strategy_details(strategy_name: str, request: Request, filter: str = "
         "reserve_required": reserve_required,
         "filter": filter,
         "page": page,
-        "treasury_log": logs,
+        "treasury_log": treasury_log,
         "log_total": log_total,
-        "log_limit": limit,
+        "log_limit": log_limit,
+        "trades": trades,
+        "trade_page": trade_page,
+        "trade_total": trade_total,
+        "trade_limit": trade_limit,
     })
 # 🔸 POST: Снятие средств из кассы
 

@@ -218,12 +218,66 @@
   </div>
   {% endif %}
 </div>
-  <!-- Карточка: Торговля -->
-  <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-    <h2 class="text-lg font-semibold text-slate-700 mb-3">Торговля</h2>
-    <!-- содержание позже -->
-  </div>
+<!-- Карточка: Торговля -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <h2 class="text-lg font-semibold text-slate-700 mb-3">Торговля</h2>
 
+  <table class="w-full table-auto rounded-xl overflow-hidden shadow mb-4">
+    <thead class="bg-slate-100 text-slate-700 text-sm uppercase text-center">
+      <tr>
+        <th class="py-2">№</th>
+        <th class="py-2">Позиция</th>
+        <th class="py-2">Символ</th>
+        <th class="py-2">Открытие</th>
+        <th class="py-2">Закрытие</th>
+        <th class="py-2">Удержание</th>
+        <th class="py-2">Результат</th>
+        <th class="py-2 text-left">Описание</th>
+      </tr>
+    </thead>
+    <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
+      {% for row in trades %}
+      <tr>
+        <td class="py-2">{{ loop.index + ((trade_page - 1) * trade_limit) }}</td>
+        <td class="py-2">
+          <a href="#" class="text-blue-600 hover:underline font-mono">
+            {{ row.position_uid[:8] ~ '...' }}
+          </a>
+        </td>
+        <td class="py-2">{{ row.symbol }}</td>
+        <td class="py-2 font-mono">{{ row.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td class="py-2 font-mono">{{ row.closed_at.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td class="py-2">
+          {% set h = row.duration // 60 %}
+          {% set m = row.duration % 60 %}
+          {% if h > 0 %}{{ h }} ч {% endif %}{{ m }} мин
+        </td>
+        <td class="py-2 font-semibold">
+          <span class="{{ 'text-green-600' if row.result == 'win' else 'text-red-500' }}">
+            {{ row.result.upper() }}
+          </span>
+        </td>
+        <td class="py-2 text-left whitespace-pre-wrap">
+          {{ row.comment | highlight_amounts | safe }}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% set total_trade_pages = (trade_total // trade_limit) + (1 if trade_total % trade_limit > 0 else 0) %}
+  {% if total_trade_pages > 1 %}
+  <div class="flex justify-center gap-2">
+    {% for p in range(1, total_trade_pages + 1) %}
+      <a href="?filter={{ filter }}&trade_page={{ p }}&page={{ page }}"
+         class="px-3 py-1 rounded-md text-sm font-medium
+                {{ 'bg-blue-600 text-white' if p == trade_page else 'bg-slate-200 hover:bg-slate-300 text-slate-700' }}">
+        {{ p }}
+      </a>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
   <!-- Карточка: Служебная информация -->
   <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
     <h2 class="text-lg font-semibold text-slate-700 mb-3">Служебная информация</h2>
