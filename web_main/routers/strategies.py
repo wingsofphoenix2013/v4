@@ -21,15 +21,6 @@ pg_pool = None
 redis_client = None
 templates = None  # будет присвоено в main.py
 
-# 🔸 Инициализация времени по Киеву
-def format_kyiv(dt: datetime) -> str:
-    if not dt:
-        return "-"
-    local = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Kyiv"))
-    return local.strftime('%d.%m.%Y %H:%M')
-
-templates.env.filters["format_kyiv"] = format_kyiv
-
 # 🔸 Страница со списком стратегий
 @router.get("/strategies", response_class=HTMLResponse)
 async def strategies_page(request: Request, filter: str = "all"):
@@ -276,13 +267,13 @@ async def strategy_details(
         """, strategy["id"])
         treasury = dict(treasury_row) if treasury_row else None
 
-        # 🔹 Резерв под рост депозита (сложный процент на 7 дней)
+        # 🔹 Резерв под рост депозита
         reserve_required = None
         if treasury and strategy.get("deposit"):
             deposit = strategy["deposit"]
             reserve_required = Decimal(deposit) * Decimal((1.01 ** 7) - 1)
 
-        # 🔹 Пагинация: лог казначейства
+        # 🔹 Пагинация: казначейский лог
         log_limit = 10
         log_offset = max((page - 1), 0) * log_limit
 
@@ -322,6 +313,11 @@ async def strategy_details(
             SELECT COUNT(*) FROM strategies_finmonitor_v4
             WHERE strategy_id = $1
         """, strategy["id"])
+
+        # 🔹 Конвертация времени в Europe/Kyiv
+        for row in trades:
+            row["created_at"] = row["created_at"].replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
+            row["closed_at"] = row["closed_at"].replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
 
     return templates.TemplateResponse("strategy_details.html", {
         "request": request,

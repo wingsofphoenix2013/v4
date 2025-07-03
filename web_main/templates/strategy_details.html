@@ -245,8 +245,8 @@
           </a>
         </td>
         <td class="py-2 font-semibold">{{ row.symbol }}</td>
-        <td class="py-2">{{ row.created_at | format_kyiv }}</td>
-        <td class="py-2">{{ row.closed_at | format_kyiv }}</td>
+        <td class="py-2">{{ row.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td class="py-2">{{ row.closed_at.strftime('%d.%m.%Y %H:%M') }}</td>
         <td class="py-2">
           {% set h = row.duration // 60 %}
           {% set m = row.duration % 60 %}
