@@ -11,6 +11,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pydantic import BaseModel, condecimal
 
+from main import KYIV_TZ
 
 # 🔸 Инициализация
 router = APIRouter()
