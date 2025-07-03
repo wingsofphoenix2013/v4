@@ -316,6 +316,7 @@ async def strategy_details(
         """, strategy["id"])
 
         # 🔹 Конвертация времени в Europe/Kyiv
+        trades = [dict(row) for row in trades]
         for row in trades:
             row["created_at"] = row["created_at"].replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
             row["closed_at"] = row["closed_at"].replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
