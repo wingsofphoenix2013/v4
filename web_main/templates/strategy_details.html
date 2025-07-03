@@ -92,20 +92,20 @@
           <button id="withdraw-button"
                   class="action-btn"
                   onclick="startAction('withdraw', {{ available | round(2) }})">
-            Снять кассу
+            Снять из кассы
           </button>
 
           <button id="transfer-button"
                   class="action-btn"
                   onclick="startAction('transfer', {{ available | round(2) }})">
-            Перевод кассы
+            Операции с кассой
           </button>
         {% endif %}
 
         <button id="deposit-button"
                 class="action-btn"
                 onclick="startAction('deposit', 9999999)">
-          Добавить депозит
+          Изменить депозит
         </button>
       </div>
     </div>
@@ -223,8 +223,8 @@ function startAction(action, maxAmount) {
     currentAction = action;
   } else {
     const value = parseFloat(input.value);
-    if (isNaN(value) || value <= 0) {
-      alert("Введите сумму");
+    if (isNaN(value) || value === 0) {
+      alert("Введите ненулевую сумму");
       return;
     }
 
