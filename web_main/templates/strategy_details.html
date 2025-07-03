@@ -58,23 +58,55 @@
 
 <div class="grid grid-cols-1 gap-6">
   <!-- Карточка: Стратегия -->
-<div class="flex justify-between items-start mb-2">
-  <div>
-    <h2 class="text-lg font-semibold text-slate-700">
-      {{ strategy.human_name }}
-      <span class="text-sm text-slate-500 font-normal">({{ strategy.name }})</span>
-    </h2>
-    <div class="text-sm text-slate-600 mt-1">
-      {{ strategy.description }}
+<!-- Карточка: Стратегия -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <div class="flex justify-between items-start mb-2">
+    <div>
+      <h2 class="text-lg font-semibold text-slate-700">
+        {{ strategy.human_name }}
+        <span class="text-sm text-slate-500 font-normal">({{ strategy.name }})</span>
+      </h2>
+      <div class="text-sm text-slate-600 mt-1">
+        {{ strategy.description }}
+      </div>
+    </div>
+
+    <div class="text-lg font-semibold mt-1">
+      {% if strategy.enabled %}
+        <span class="text-green-600">Включена</span>
+      {% else %}
+        <span class="text-red-500">Выключена</span>
+      {% endif %}
     </div>
   </div>
 
-  <div class="text-lg font-semibold mt-1">
-    {% if strategy.enabled %}
-      <span class="text-green-600">Включена</span>
-    {% else %}
-      <span class="text-red-500">Выключена</span>
-    {% endif %}
+  <div class="flex justify-between items-center mt-4">
+    <!-- Левая кнопка -->
+    <a href="/trades/details/{{ strategy.name }}"
+       class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium">
+      Торги
+    </a>
+
+    <!-- Правая группа кнопок -->
+    <div class="flex gap-2 items-center">
+      <button
+        class="px-4 py-1.5 text-sm rounded-lg font-medium
+               {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if not strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
+        Пауза
+      </button>
+
+      <button
+        class="px-4 py-1.5 text-sm rounded-lg font-medium
+               bg-blue-600 hover:bg-blue-700 text-white">
+        {{ 'Выключить' if strategy.enabled else 'Включить' }}
+      </button>
+
+      <button
+        class="px-4 py-1.5 text-sm rounded-lg font-medium
+               {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
+        Архивировать
+      </button>
+    </div>
   </div>
 </div>
 <!-- Карточка: Казначейство -->
@@ -152,8 +184,8 @@
 </table>
   {% endif %}
 <h2 class="text-lg font-semibold text-slate-700 mb-3">История операций</h2>
-  <table class="w-full table-auto rounded-xl overflow-hidden mb-4">
-    <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+<table class="w-full table-auto rounded-xl overflow-hidden shadow mb-4">
+  <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
       <tr>
         <th class="px-4 py-3">№</th>
         <th class="px-4 py-3">Время</th>
