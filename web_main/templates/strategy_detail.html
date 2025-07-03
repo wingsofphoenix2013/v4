@@ -33,37 +33,64 @@
    class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад к торгам</a>
 <!-- Карточка: Стратегия -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <div class="flex justify-between items-start mb-4">
+<!-- Карточка стратегии (на странице trades/details) -->
+<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+  <div class="flex justify-between items-start mb-2">
     <div>
-      <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
+      <h2 class="text-lg font-semibold text-slate-700">
+        {{ strategy.human_name }}
+        <span class="text-sm text-slate-500 font-normal">({{ strategy.name }})</span>
+      </h2>
       {% if strategy.description %}
-      <p class="text-sm text-slate-700 w-1/2 break-words mt-1">
+      <div class="text-sm text-slate-600 mt-1">
         {{ strategy.description }}
-      </p>
+      </div>
       {% endif %}
     </div>
-    <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
+
+    <div class="text-lg font-semibold mt-1">
+      {% if strategy.enabled %}
+        <span class="text-green-600">Включена</span>
+      {% else %}
+        <span class="text-red-500">Выключена</span>
+      {% endif %}
+    </div>
   </div>
 
-  <div class="flex gap-2">
-    <button class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800">
+  <div class="flex justify-between items-center mt-4">
+    <!-- Левая кнопка -->
+    <a href="/strategies/details/{{ strategy.name }}"
+       class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium">
       Детали
-    </button>
-<a href="/trades/details/{{ strategy.name }}/stats"
-   class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800 inline-block text-center">
-  Статистика
-</a>
-    <div class="w-4"></div> <!-- Разрыв -->
-    <button class="px-4 py-2 bg-yellow-100 hover:bg-yellow-200 rounded-lg font-medium text-yellow-800">
-      Пауза
-    </button>
-    <button class="px-4 py-2 bg-red-100 hover:bg-red-200 rounded-lg font-medium text-red-700">
-      Выключить
-    </button>
-    <button class="px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium text-slate-600">
-      Архивировать
-    </button>
+    </a>
+
+    <!-- Правая группа кнопок -->
+    <div class="flex gap-2 items-center">
+      <a href="/trades/details/{{ strategy.name }}/stats"
+         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium">
+        Статистика
+      </a>
+
+      <button
+        class="px-4 py-1.5 text-sm rounded-lg font-medium
+               {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if not strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
+        Пауза
+      </button>
+
+      <button
+        class="px-4 py-1.5 text-sm rounded-lg font-medium
+               bg-blue-600 hover:bg-blue-700 text-white">
+        {{ 'Выключить' if strategy.enabled else 'Включить' }}
+      </button>
+
+      <button
+        class="px-4 py-1.5 text-sm rounded-lg font-medium
+               {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
+        Архивировать
+      </button>
+    </div>
   </div>
+</div>
 </div>
 <!-- Карточка: Статистика -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">

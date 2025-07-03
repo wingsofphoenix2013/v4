@@ -246,10 +246,10 @@ async def strategy_detail_page(
         now = datetime.now(KYIV_TZ)
 
         # 🔍 Отладочный лог
-        log.info(f"[STATS] Сегодня: {get_kyiv_day_bounds(0)[0].replace(tzinfo=ZoneInfo('UTC')).astimezone(KYIV_TZ).strftime('%Y-%m-%d')}")
-        log.info(f"[STATS] Список дат: {stat_dates}")
-        log.info(f"[TIME] now() = {datetime.now()}")
-        log.info(f"[TIME] now(KYIV) = {datetime.now(KYIV_TZ)}")
+        log.debug(f"[STATS] Сегодня: {get_kyiv_day_bounds(0)[0].replace(tzinfo=ZoneInfo('UTC')).astimezone(KYIV_TZ).strftime('%Y-%m-%d')}")
+        log.debug(f"[STATS] Список дат: {stat_dates}")
+        log.debug(f"[TIME] now() = {datetime.now()}")
+        log.debug(f"[TIME] now(KYIV) = {datetime.now(KYIV_TZ)}")
 
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
@@ -444,7 +444,7 @@ async def strategy_rsi_stats(
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
         tf = strategy["timeframe"]
-        log.info(f"[RSI] Стратегия: {strategy_name} | таймфрейм: {tf}")
+        log.debug(f"[RSI] Стратегия: {strategy_name} | таймфрейм: {tf}")
 
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
@@ -460,7 +460,7 @@ async def strategy_rsi_stats(
             for p in positions
         }
 
-        log.info(f"[RSI] Закрытых сделок: {len(position_map)}")
+        log.debug(f"[RSI] Закрытых сделок: {len(position_map)}")
 
         rsi_data = await conn.fetch("""
             SELECT position_uid, value
@@ -470,7 +470,7 @@ async def strategy_rsi_stats(
               AND position_uid = ANY($1)
         """, list(position_map.keys()), tf)
 
-        log.info(f"[RSI] RSI-записей по {tf}: {len(rsi_data)}")
+        log.debug(f"[RSI] RSI-записей по {tf}: {len(rsi_data)}")
 
         result = {
             "success_long": {"main": [0]*8},
@@ -556,7 +556,7 @@ async def strategy_adx_stats(
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
         tf = strategy["timeframe"]
-        log.info(f"[ADX] Стратегия: {strategy_name} | таймфрейм: {tf}")
+        log.debug(f"[ADX] Стратегия: {strategy_name} | таймфрейм: {tf}")
 
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
@@ -572,7 +572,7 @@ async def strategy_adx_stats(
             for p in positions
         }
 
-        log.info(f"[ADX] Найдено закрытых сделок: {len(position_map)}")
+        log.debug(f"[ADX] Найдено закрытых сделок: {len(position_map)}")
 
         ind_data = await conn.fetch("""
             SELECT position_uid, param_name, value
@@ -600,7 +600,7 @@ async def strategy_adx_stats(
             elif row["param_name"] == "adx_dmi14_minus_di":
                 minus_di[uid] = val
 
-        log.info(f"[ADX] Найдено ADX: {len(adx_values)} | +DI: {len(plus_di)} | -DI: {len(minus_di)}")
+        log.debug(f"[ADX] Найдено ADX: {len(adx_values)} | +DI: {len(plus_di)} | -DI: {len(minus_di)}")
 
         # 🔸 Распределение по ADX-зонам
         adx_distribution = {
@@ -701,7 +701,7 @@ async def strategy_bb_stats(
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
         tf = strategy["timeframe"]
-        log.info(f"[BB] Стратегия: {strategy_name} | таймфрейм: {tf}")
+        log.debug(f"[BB] Стратегия: {strategy_name} | таймфрейм: {tf}")
 
         positions = await conn.fetch("""
             SELECT position_uid, entry_price, pnl, direction
@@ -809,7 +809,7 @@ async def strategy_mfi_stats(
             raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
         tf = strategy["timeframe"]
-        log.info(f"[MFI] Стратегия: {strategy_name} | таймфрейм: {tf}")
+        log.debug(f"[MFI] Стратегия: {strategy_name} | таймфрейм: {tf}")
 
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
@@ -833,7 +833,7 @@ async def strategy_mfi_stats(
               AND position_uid = ANY($1)
         """, list(position_map.keys()), tf)
 
-        log.info(f"[MFI] Найдено записей: {len(mfi_data)}")
+        log.debug(f"[MFI] Найдено записей: {len(mfi_data)}")
 
         result = {
             "success_long": [0]*10,
@@ -966,7 +966,7 @@ async def strategy_lr_stats(
               AND position_uid = ANY($1)
         """, list(position_map.keys()), tf)
 
-        log.info(f"[LR] Найдено: {len(lr_data)} записей")
+        log.debug(f"[LR] Найдено: {len(lr_data)} записей")
 
         result = {
             "success_long": [0]*11,
