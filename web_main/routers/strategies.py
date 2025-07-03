@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request, Form, Body
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette import status
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from pydantic import BaseModel
 
@@ -343,5 +343,78 @@ async def withdraw_from_cash(strategy_name: str, payload: WithdrawRequest):
                 VALUES ($1, $2, 'reduction', $3)
             """, strategy_id, datetime.utcnow(),
                 f"Снято из кассы ${float(amount):.2f}. Остаток в кассе ${float(new_cash):.2f}")
+
+    return {"status": "ok"}
+# 🔸 POST: Перевод средств из кассы в депозит
+
+class TransferRequest(BaseModel):
+    amount: float
+
+@router.post("/strategies/details/{strategy_name}/transfer")
+async def transfer_cash_to_deposit(strategy_name: str, payload: TransferRequest):
+    amount = Decimal(str(payload.amount)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    rounded = (amount // Decimal("10")) * Decimal("10")
+
+    async with pg_pool.acquire() as conn:
+        async with conn.transaction():
+            # 🔹 Получаем данные стратегии и казначейства
+            row = await conn.fetchrow("""
+                SELECT s.id AS strategy_id,
+                       s.deposit,
+                       s.position_limit,
+                       t.pnl_operational
+                FROM strategies_v4 s
+                JOIN strategies_treasury_v4 t ON t.strategy_id = s.id
+                WHERE s.name = $1
+            """, strategy_name)
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+            strategy_id = row["strategy_id"]
+            current_deposit = row["deposit"]
+            current_limit = row["position_limit"]
+            current_cash = row["pnl_operational"]
+
+            # 🔹 Проверка лимита
+            if rounded > current_cash:
+                raise HTTPException(status_code=400, detail="Недостаточно средств в кассе")
+
+            # 🔹 Вычисления
+            new_cash = current_cash - rounded
+            new_deposit = current_deposit + rounded
+            new_limit = int(current_limit + rounded / Decimal("10"))
+
+            # 🔹 Обновление казначейства
+            await conn.execute("""
+                UPDATE strategies_treasury_v4
+                SET pnl_operational = $1, updated_at = now()
+                WHERE strategy_id = $2
+            """, new_cash, strategy_id)
+
+            # 🔹 Обновление стратегии
+            await conn.execute("""
+                UPDATE strategies_v4
+                SET deposit = $1, position_limit = $2
+                WHERE id = $3
+            """, new_deposit, new_limit, strategy_id)
+
+            # 🔹 Логирование события
+            await conn.execute("""
+                INSERT INTO strategies_treasury_meta_log_v4 (
+                    strategy_id, timestamp, scenario, comment
+                )
+                VALUES ($1, $2, 'transfer', $3)
+            """, strategy_id, datetime.utcnow(),
+                f"Переведено {rounded:.2f} из кассы в депозит. "
+                f"Новый депозит: {new_deposit:.2f}, лимит: {new_limit}")
+
+            # 🔹 Уведомление в Redis
+            await redis_client.xadd("strategy_update_stream", {
+                "id": str(strategy_id),
+                "type": "strategy",
+                "action": "update",
+                "source": "ui_event"
+            })
 
     return {"status": "ok"}

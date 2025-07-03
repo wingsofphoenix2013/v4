@@ -233,8 +233,28 @@ function startAction(action, maxAmount) {
       return;
     }
 
-    alert(`${action.toUpperCase()}: ${value.toFixed(2)} USDT`);
-    // TODO: отправка fetch
+    const endpoint = action === "withdraw"
+      ? "/withdraw"
+      : action === "transfer"
+        ? "/transfer"
+        : null;
+
+    if (!endpoint) {
+      alert("Эта операция пока не реализована");
+      return;
+    }
+
+    fetch(window.location.pathname + endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amount: value })
+    }).then(res => {
+      if (res.ok) {
+        window.location.reload();
+      } else {
+        alert("Ошибка при выполнении операции");
+      }
+    });
   }
 }
 
