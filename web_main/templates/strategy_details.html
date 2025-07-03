@@ -59,8 +59,25 @@
 <div class="grid grid-cols-1 gap-6">
   <!-- Карточка: Стратегия -->
   <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-    <h2 class="text-lg font-semibold text-slate-700 mb-3">Стратегия</h2>
-    <!-- содержание позже -->
+<div class="flex justify-between items-start mb-2">
+  <div>
+    <h2 class="text-lg font-semibold text-slate-700">
+      {{ strategy.human_name }}
+      <span class="text-sm text-slate-500 font-normal">({{ strategy.name }})</span>
+    </h2>
+    <div class="text-sm text-slate-600 mt-1">
+      {{ strategy.description }}
+    </div>
+  </div>
+
+  <div class="text-lg font-semibold mt-1">
+    {% if strategy.enabled %}
+      <span class="text-green-600">Включена</span>
+    {% else %}
+      <span class="text-red-500">Выключена</span>
+    {% endif %}
+  </div>
+</div>
   </div>
 <!-- Карточка: Казначейство -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
