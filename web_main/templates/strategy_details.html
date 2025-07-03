@@ -293,7 +293,18 @@ function cancelAction() {
 
 function validateAmount(input, max) {
   const val = parseFloat(input.value);
-  if (val > max) {
+
+  let invalid = false;
+
+  if (currentAction === "withdraw" || currentAction === "transfer") {
+    invalid = val > max;
+  } else if (currentAction === "deposit") {
+    if (val < 0) {
+      invalid = Math.abs(val) > max;
+    }
+  }
+
+  if (invalid) {
     input.classList.add("border-red-500", "ring-red-500");
   } else {
     input.classList.remove("border-red-500", "ring-red-500");
