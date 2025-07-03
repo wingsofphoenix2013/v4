@@ -33,8 +33,6 @@
    class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">Назад к торгам</a>
 <!-- Карточка: Стратегия -->
 <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-<!-- Карточка стратегии (на странице trades/details) -->
-<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
   <div class="flex justify-between items-start mb-2">
     <div>
       <h2 class="text-lg font-semibold text-slate-700">
@@ -56,39 +54,38 @@
       {% endif %}
     </div>
   </div>
-
-  <div class="flex justify-between items-center mt-4">
-    <!-- Левая кнопка -->
+<div class="flex justify-between items-center mt-4">
+  <!-- Левая группа -->
+  <div class="flex gap-2">
     <a href="/strategies/details/{{ strategy.name }}"
        class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium">
       Детали
     </a>
+    <a href="/trades/details/{{ strategy.name }}/stats"
+       class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium">
+      Статистика
+    </a>
+  </div>
 
-    <!-- Правая группа кнопок -->
-    <div class="flex gap-2 items-center">
-      <a href="/trades/details/{{ strategy.name }}/stats"
-         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium">
-        Статистика
-      </a>
+  <!-- Правая группа -->
+  <div class="flex gap-2 items-center">
+    <button
+      class="px-4 py-1.5 text-sm rounded-lg font-medium
+             {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if not strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
+      Пауза
+    </button>
 
-      <button
-        class="px-4 py-1.5 text-sm rounded-lg font-medium
-               {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if not strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
-        Пауза
-      </button>
+    <button
+      class="px-4 py-1.5 text-sm rounded-lg font-medium
+             bg-blue-600 hover:bg-blue-700 text-white">
+      {{ 'Выключить' if strategy.enabled else 'Включить' }}
+    </button>
 
-      <button
-        class="px-4 py-1.5 text-sm rounded-lg font-medium
-               bg-blue-600 hover:bg-blue-700 text-white">
-        {{ 'Выключить' if strategy.enabled else 'Включить' }}
-      </button>
-
-      <button
-        class="px-4 py-1.5 text-sm rounded-lg font-medium
-               {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
-        Архивировать
-      </button>
-    </div>
+    <button
+      class="px-4 py-1.5 text-sm rounded-lg font-medium
+             {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
+      Архивировать
+    </button>
   </div>
 </div>
 </div>
