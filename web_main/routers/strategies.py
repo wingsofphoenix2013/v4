@@ -8,6 +8,7 @@ from fastapi.templating import Jinja2Templates
 from starlette import status
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pydantic import BaseModel, condecimal
 
 
@@ -19,6 +20,15 @@ log = logging.getLogger("STRATEGIES")
 pg_pool = None
 redis_client = None
 templates = None  # будет присвоено в main.py
+
+# 🔸 Инициализация времени по Киеву
+def format_kyiv(dt: datetime) -> str:
+    if not dt:
+        return "-"
+    local = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Kyiv"))
+    return local.strftime('%d.%m.%Y %H:%M')
+
+templates.env.filters["format_kyiv"] = format_kyiv
 
 # 🔸 Страница со списком стратегий
 @router.get("/strategies", response_class=HTMLResponse)

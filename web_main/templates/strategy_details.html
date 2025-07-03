@@ -197,7 +197,7 @@
       {% for row in treasury_log %}
       <tr class="hover:bg-slate-100">
         <td class="px-4 py-3">{{ loop.index + ((page - 1) * log_limit) }}</td>
-        <td class="px-4 py-3 font-mono">{{ row.timestamp | format_date_ru }}</td>
+        <td class="px-4 py-3">{{ row.timestamp | format_date_ru }}</td>
         <td class="px-4 py-3">{{ row.scenario }}</td>
         <td class="px-4 py-3 whitespace-pre-wrap">{{ row.comment | highlight_amounts | safe }}</td>
       </tr>
@@ -228,11 +228,11 @@
         <th class="py-2">№</th>
         <th class="py-2">Позиция</th>
         <th class="py-2">Символ</th>
-        <th class="py-2">Открытие</th>
-        <th class="py-2">Закрытие</th>
-        <th class="py-2">Удержание</th>
+        <th class="py-2">Откр.</th>
+        <th class="py-2">Закр.</th>
+        <th class="py-2">Удерж.</th>
         <th class="py-2">Результат</th>
-        <th class="py-2 text-left">Описание</th>
+        <th class="py-2">Описание</th>
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
@@ -240,13 +240,13 @@
       <tr>
         <td class="py-2">{{ loop.index + ((trade_page - 1) * trade_limit) }}</td>
         <td class="py-2">
-          <a href="#" class="text-blue-600 hover:underline font-mono">
+          <a href="#" class="text-blue-600 hover:underline">
             {{ row.position_uid[:8] ~ '...' }}
           </a>
         </td>
-        <td class="py-2">{{ row.symbol }}</td>
-        <td class="py-2 font-mono">{{ row.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
-        <td class="py-2 font-mono">{{ row.closed_at.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td class="py-2 font-semibold">{{ row.symbol }}</td>
+        <td class="py-2">{{ row.created_at | format_kyiv }}</td>
+        <td class="py-2">{{ row.closed_at | format_kyiv }}</td>
         <td class="py-2">
           {% set h = row.duration // 60 %}
           {% set m = row.duration % 60 %}
