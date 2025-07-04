@@ -593,3 +593,34 @@ async def toggle_auditor(strategy_name: str):
         """, new_value, row["id"])
 
     return RedirectResponse(url=f"/strategies/details/{strategy_name}", status_code=303)
+# 🔸 Переключение флага Binance-торговли
+@router.post("/strategies/{strategy_name}/toggle-binance")
+async def toggle_binance(strategy_name: str):
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, binance_enabled
+            FROM strategies_v4
+            WHERE name = $1
+        """, strategy_name)
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+
+        strategy_id = row["id"]
+        new_value = not row["binance_enabled"]
+
+        await conn.execute("""
+            UPDATE strategies_v4
+            SET binance_enabled = $1
+            WHERE id = $2
+        """, new_value, strategy_id)
+
+        # Публикация в Redis Pub/Sub
+        payload = json.dumps({
+            "strategy_id": strategy_id,
+            "binance_enabled": new_value
+        })
+
+        await redis_client.publish("binance_strategy_updates", payload)
+
+    return RedirectResponse(url=f"/strategies/details/{strategy_name}", status_code=303)
