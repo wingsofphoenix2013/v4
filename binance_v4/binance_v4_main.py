@@ -5,7 +5,7 @@ import logging
 
 from infra import setup_logging, setup_pg, setup_redis_client
 from redis_consumer import run_redis_consumer
-from strategy_registry import load_binance_enabled_strategies
+from strategy_registry import load_binance_enabled_strategies, run_binance_strategy_watcher
 
 
 # 🔸 Обёртка с автоперезапуском для воркеров
@@ -29,6 +29,7 @@ async def main():
 
     await asyncio.gather(
         run_safe_loop(run_redis_consumer, label="REDIS_CONSUMER"),
+        run_safe_loop(run_binance_strategy_watcher, label="STRATEGY_WATCHER"),
     )
 
 
