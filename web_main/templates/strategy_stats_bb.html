@@ -146,7 +146,7 @@
     {% for z in range(6) %}
       {% set pnl_success = bb_pnl_distribution[key][side][0][z] %}
       {% set pnl_fail = bb_pnl_distribution[key][side][1][z] %}
-      {% set balance = (pnl_success - pnl_fail) | round(2) %}
+      {% set balance = (pnl_success + pnl_fail) | round(2) %}
       <td class="px-4 py-3 font-semibold
                  {% if balance > 0 %}text-green-600
                  {% elif balance < 0 %}text-red-600
