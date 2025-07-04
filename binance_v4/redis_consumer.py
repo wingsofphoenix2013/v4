@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import json
+
 from infra import infra
+from strategy_registry import is_strategy_binance_enabled
 
 log = logging.getLogger("REDIS_CONSUMER")
 
@@ -39,7 +42,7 @@ async def run_redis_consumer():
     while True:
         try:
             entries = await infra.redis_client.xreadgroup(
-                groupname=list(STREAMS.values())[0],  # первая группа
+                groupname=list(STREAMS.values())[0],
                 consumername=CONSUMER_NAME,
                 streams={name: ">" for name in STREAMS.keys()},
                 count=10,
@@ -48,8 +51,29 @@ async def run_redis_consumer():
 
             for stream_name, records in entries:
                 for record_id, data in records:
-                    log.info(f"📨 [{stream_name}] {data}")
+                    payload = data.get("data")
                     group = STREAMS[stream_name]
+
+                    if not payload:
+                        log.warning(f"⚠️ Нет поля 'data' в сообщении из {stream_name}")
+                        await infra.redis_client.xack(stream_name, group, record_id)
+                        continue
+
+                    try:
+                        event = json.loads(payload)
+                        strategy_id = event.get("strategy_id")
+                    except Exception:
+                        log.warning(f"⚠️ Невозможно распарсить JSON из {stream_name}: {payload}")
+                        await infra.redis_client.xack(stream_name, group, record_id)
+                        continue
+
+                    if not strategy_id:
+                        log.warning(f"⚠️ Нет strategy_id в сообщении: {event}")
+                    elif not is_strategy_binance_enabled(strategy_id):
+                        log.info(f"⏭️ [{stream_name}] Пропущено: стратегия {strategy_id} не включена для Binance")
+                    else:
+                        log.info(f"✅ [{stream_name}] Принято сообщение для стратегии {strategy_id}: {event}")
+
                     await infra.redis_client.xack(stream_name, group, record_id)
 
         except Exception:
