@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RSI: Статистика по стратегии</title>
+    <title>BB: Статистика по стратегии</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
       body {
@@ -12,7 +12,6 @@
     </style>
   </head>
   <body class="min-h-screen font-sans text-slate-800">
-    <main class="max-w-7xl mx-auto px-4 py-10">
     <!-- Верхнее меню -->
     <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
       <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
@@ -28,7 +27,9 @@
         </nav>
       </div>
     </header>
-      <!-- Назад -->
+
+    <main class="max-w-7xl mx-auto px-4 py-10">
+      <!-- Назад к общей статистике -->
       <a href="/trades/details/{{ strategy.name }}/stats?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
          class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded font-medium">
         Назад к статистике
