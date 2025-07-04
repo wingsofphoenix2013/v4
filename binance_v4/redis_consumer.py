@@ -41,18 +41,23 @@ async def run_redis_consumer():
 
     while True:
         try:
-            entries = await infra.redis_client.xreadgroup(
-                groupname=list(STREAMS.values())[0],
-                consumername=CONSUMER_NAME,
-                streams={name: ">" for name in STREAMS.keys()},
-                count=10,
-                block=1000
-            )
+            entries = []
+
+            # читаем каждый поток отдельно с его группой
+            for stream_name, group_name in STREAMS.items():
+                batch = await infra.redis_client.xreadgroup(
+                    groupname=group_name,
+                    consumername=CONSUMER_NAME,
+                    streams={stream_name: ">"},
+                    count=10,
+                    block=1000
+                )
+                entries.extend(batch)
 
             for stream_name, records in entries:
+                group = STREAMS[stream_name]
                 for record_id, data in records:
                     payload = data.get("data")
-                    group = STREAMS[stream_name]
 
                     if not payload:
                         log.warning(f"⚠️ Нет поля 'data' в сообщении из {stream_name}")
