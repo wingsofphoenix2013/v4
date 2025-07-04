@@ -664,7 +664,7 @@ async def strategy_adx_stats(
     })
 # 🔸 Статистика стратегии по Bollinger Bands
 BB_ZONES = 6
-BB_SETS = ["2_5", "2_0"]
+BB_SETS = ["2_5", "2_0", "1_5", "1_0"]
 
 def classify_zone(entry, upper, center, lower) -> int:
     mid_upper = (center + upper) / 2
@@ -712,7 +712,7 @@ async def strategy_bb_stats(
         position_map = {
             p["position_uid"]: {
                 "entry_price": float(p["entry_price"]),
-                "pnl": float(p["pnl"] or 0.0),
+                "pnl": p["pnl"],
                 "direction": p["direction"]
             }
             for p in positions
@@ -725,18 +725,23 @@ async def strategy_bb_stats(
               AND position_uid = ANY($1)
               AND (
                 param_name LIKE 'bb20_2_5_%' OR
-                param_name LIKE 'bb20_2_0_%'
+                param_name LIKE 'bb20_2_0_%' OR
+                param_name LIKE 'bb20_1_5_%' OR
+                param_name LIKE 'bb20_1_0_%'
               )
         """, list(position_map.keys()), tf)
 
-        bb_full_data = {std: defaultdict(dict) for std in BB_SETS}
+        # Сборка BB-наборов по каждой позиции и каждому std
+        bb_full_data = {
+            std: defaultdict(dict) for std in BB_SETS
+        }
 
         for row in bb_data_raw:
             uid = row["position_uid"]
             param = row["param_name"]
             for std in BB_SETS:
-                base = f"bb20_{std}_"
-                if param.startswith(base):
+                if f"bb20_{std}_" in param:
+                    base = f"bb20_{std}_"
                     bb_full_data[std][uid][param[len(base):]] = float(row["value"])
 
         bb_distribution = {
@@ -745,13 +750,6 @@ async def strategy_bb_stats(
                 "success_short": [0]*BB_ZONES,
                 "fail_long": [0]*BB_ZONES,
                 "fail_short": [0]*BB_ZONES,
-            } for std in BB_SETS
-        }
-
-        bb_pnl_distribution = {
-            std: {
-                "long": [[0.0]*BB_ZONES, [0.0]*BB_ZONES],   # [успешные, неуспешные]
-                "short": [[0.0]*BB_ZONES, [0.0]*BB_ZONES],
             } for std in BB_SETS
         }
 
@@ -768,14 +766,12 @@ async def strategy_bb_stats(
                 direction = info["direction"]
 
                 zone = classify_zone(entry, bb["upper"], bb["center"], bb["lower"])
-                is_success = pnl >= 0
-                group_key = ("success_" if is_success else "fail_") + direction
 
-                bb_distribution[std][group_key][zone] += 1
+                key = (
+                    "success_" if pnl >= 0 else "fail_"
+                ) + direction
 
-                if direction in ("long", "short"):
-                    index = 0 if is_success else 1
-                    bb_pnl_distribution[std][direction][index][zone] += pnl
+                bb_distribution[std][key][zone] += 1
 
     return templates.TemplateResponse("strategy_stats_bb.html", {
         "request": request,
@@ -783,7 +779,6 @@ async def strategy_bb_stats(
         "filter": filter,
         "series": series,
         "bb_distribution": bb_distribution,
-        "bb_pnl_distribution": bb_pnl_distribution,
     })
 # 🔸 Статистика стратегии по MFI
 MFI_BINS = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50),

@@ -31,79 +31,99 @@
     <main class="max-w-7xl mx-auto px-4 py-10">
       <!-- Назад к общей статистике -->
       <a href="/trades/details/{{ strategy.name }}/stats?filter={{ filter | default('today') }}{% if series %}&series={{ series }}{% endif %}"
-         class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-medium">
+         class="inline-block mb-6 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded font-medium">
         Назад к статистике
       </a>
-
 <!-- Карточка: Стратегия -->
-<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
-  <div class="flex justify-between items-start mb-4">
+<div class="w-full bg-white/80 rounded shadow p-6 mb-4">
+  <div class="flex justify-between items-start mb-2">
     <div>
-      <h2 class="text-xl font-semibold text-slate-800">{{ strategy.name }}</h2>
+      <h2 class="text-lg font-semibold text-slate-700">
+        {{ strategy.human_name }}
+        <span class="text-sm text-slate-500 font-normal">({{ strategy.name }})</span>
+      </h2>
       {% if strategy.description %}
-      <p class="text-sm text-slate-700 w-1/2 break-words mt-1">
+      <div class="text-sm text-slate-600 mt-1">
         {{ strategy.description }}
-      </p>
+      </div>
       {% endif %}
     </div>
-    <div class="text-xl font-semibold text-blue-900">{{ strategy.human_name }}</div>
-  </div>
 
+    <div class="text-lg font-semibold mt-1">
+      {% if strategy.enabled %}
+        <span class="text-green-600">Включена</span>
+      {% else %}
+        <span class="text-red-500">Выключена</span>
+      {% endif %}
+    </div>
+  </div>
+<div class="flex justify-between items-center mt-4">
+  <!-- Левая группа -->
   <div class="flex gap-2">
-    <a href="/trades/details/{{ strategy.name }}"
-       class="px-4 py-2 bg-slate-200 hover:bg-slate-300 rounded-lg font-medium text-slate-800 text-center">
+    <a href="/strategies/details/{{ strategy.name }}"
+       class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded font-medium">
       Детали
     </a>
-
     <a href="/trades/details/{{ strategy.name }}/stats"
-       class="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium text-center shadow hover:bg-blue-700">
+       class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded font-medium">
       Статистика
     </a>
+  </div>
 
-    <div class="w-4"></div> <!-- Разрыв -->
-
-    <button class="px-4 py-2 bg-yellow-100 hover:bg-yellow-200 rounded-lg font-medium text-yellow-800">
+  <!-- Правая группа -->
+  <div class="flex gap-2 items-center">
+    <button
+      class="px-4 py-1.5 text-sm rounded font-medium
+             {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if not strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
       Пауза
     </button>
-    <button class="px-4 py-2 bg-red-100 hover:bg-red-200 rounded-lg font-medium text-red-700">
-      Выключить
+
+    <button
+      class="px-4 py-1.5 text-sm rounded font-medium
+             bg-blue-600 hover:bg-blue-700 text-white">
+      {{ 'Выключить' if strategy.enabled else 'Включить' }}
     </button>
-    <button class="px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium text-slate-600">
+
+    <button
+      class="px-4 py-1.5 text-sm rounded font-medium
+             {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
       Архивировать
     </button>
   </div>
 </div>
-{% set bb_sets = [("2_5", "2.5"), ("2_0", "2.0"), ("1_5", "1.5"), ("1_0", "1.0")] %}
+</div>
+{% set bb_sets = [("2_5", "2.5"), ("2_0", "2.0")] %}
 
 {% for key, label in bb_sets %}
-<div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
+<div class="w-full bg-white/80 rounded shadow p-6 mb-6">
   <h2 class="text-lg font-semibold text-slate-800 mb-4">Bollinger Bands (std = {{ label }})</h2>
 
-  <table class="w-full table-auto text-sm text-slate-800 border border-slate-200">
-    <thead class="bg-slate-100 text-slate-700">
+  {% for side in ["long", "short"] %}
+  <h3 class="text-base font-medium text-slate-700 mb-2">
+    {{ "Длинные позиции (Long)" if side == "long" else "Короткие позиции (Short)" }}
+  </h3>
+
+  <table class="w-full table-auto rounded overflow-hidden shadow mb-4">
+    <thead class="bg-slate-100 text-slate-700 text-center text-sm uppercase">
       <tr>
-        <th class="px-3 py-2 text-left">Тип сделки</th>
-        <th class="px-3 py-2 text-center">Выше upper</th>
-        <th class="px-3 py-2 text-center">↑ верх. сегмент</th>
-        <th class="px-3 py-2 text-center">↓ верх. сегмент</th>
-        <th class="px-3 py-2 text-center">↑ ниж. сегмент</th>
-        <th class="px-3 py-2 text-center">↓ ниж. сегмент</th>
-        <th class="px-3 py-2 text-center">Ниже lower</th>
+        <th class="px-4 py-3 text-left">Тип сделки</th>
+        <th class="px-4 py-3">Выше upper</th>
+        <th class="px-4 py-3">↑ верх. сегмент</th>
+        <th class="px-4 py-3">↓ верх. сегмент</th>
+        <th class="px-4 py-3">↑ ниж. сегмент</th>
+        <th class="px-4 py-3">↓ ниж. сегмент</th>
+        <th class="px-4 py-3">Ниже lower</th>
       </tr>
     </thead>
-    <tbody>
-      {% for group_key, group_label in [
-        ("success_long", "Успешные — Long"),
-        ("success_short", "Успешные — Short"),
-        ("fail_long", "Неуспешные — Long"),
-        ("fail_short", "Неуспешные — Short")
-      ] %}
+    <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
+      {% for i, group_key in enumerate(["success_" ~ side, "fail_" ~ side]) %}
+      {% set label = ("Успешные — " if i == 0 else "Неуспешные — ") ~ (side | capitalize) %}
       {% set bins = bb_distribution[key][group_key] %}
       {% set total = bins | sum %}
-      <tr class="border-t border-slate-100 hover:bg-slate-50">
-        <td class="px-3 py-2 font-medium">{{ group_label }}</td>
+      <tr>
+        <td class="px-4 py-3 text-left font-medium">{{ label }}</td>
         {% for count in bins %}
-        <td class="px-3 py-2 text-center">
+        <td class="px-4 py-3">
           {% if count > 0 %}
             {{ count }} ({{ ((count / total) * 100) | round(1) }}%)
           {% else %}
@@ -113,8 +133,25 @@
         {% endfor %}
       </tr>
       {% endfor %}
+
+      {# Финансовый баланс — строка 3 #}
+      <tr>
+        <td class="px-4 py-3 text-left font-semibold text-slate-700">Финансовый баланс</td>
+        {% for z in range(6) %}
+        {% set pnl_success = bb_pnl_distribution[key][side][0][z] %}
+        {% set pnl_fail = bb_pnl_distribution[key][side][1][z] %}
+        {% set balance = (pnl_success - pnl_fail) | round(2) %}
+        <td class="px-4 py-3 font-semibold 
+                   {% if balance > 0 %}text-green-600
+                   {% elif balance < 0 %}text-red-600
+                   {% else %}text-slate-500 italic{% endif %}">
+          {{ balance }}
+        </td>
+        {% endfor %}
+      </tr>
     </tbody>
   </table>
+  {% endfor %}
 </div>
 {% endfor %}
     </main>
