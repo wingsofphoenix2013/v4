@@ -454,7 +454,7 @@ async def strategy_rsi_stats(
 
         position_map = {
             p["position_uid"]: {
-                "pnl": p["pnl"],
+                "pnl": float(p["pnl"] or 0.0),
                 "direction": p["direction"]
             }
             for p in positions
@@ -472,16 +472,16 @@ async def strategy_rsi_stats(
 
         log.debug(f"[RSI] RSI-записей по {tf}: {len(rsi_data)}")
 
-        result = {
-            "success_long": {"main": [0]*8},
-            "success_short": {"main": [0]*8},
-            "fail_long": {"main": [0]*8},
-            "fail_short": {"main": [0]*8},
+        rsi_distribution = {
+            "success_long": [0]*8,
+            "success_short": [0]*8,
+            "fail_long": [0]*8,
+            "fail_short": [0]*8,
         }
 
-        summary = {
-            "success": [0]*8,
-            "fail": [0]*8,
+        rsi_pnl_distribution = {
+            "long": [[0.0]*8, [0.0]*8],  # [успешные, неуспешные]
+            "short": [[0.0]*8, [0.0]*8],
         }
 
         for row in rsi_data:
@@ -495,26 +495,21 @@ async def strategy_rsi_stats(
             direction = info["direction"]
             idx = rsi_bin_index(rsi)
 
-            if pnl >= 0:
-                summary["success"][idx] += 1
-                if direction == "long":
-                    result["success_long"]["main"][idx] += 1
-                elif direction == "short":
-                    result["success_short"]["main"][idx] += 1
-            else:
-                summary["fail"][idx] += 1
-                if direction == "long":
-                    result["fail_long"]["main"][idx] += 1
-                elif direction == "short":
-                    result["fail_short"]["main"][idx] += 1
+            is_success = pnl >= 0
+            group_key = ("success_" if is_success else "fail_") + direction
+            rsi_distribution[group_key][idx] += 1
+
+            if direction in ("long", "short"):
+                i = 0 if is_success else 1
+                rsi_pnl_distribution[direction][i][idx] += pnl
 
     return templates.TemplateResponse("strategy_stats_rsi.html", {
         "request": request,
         "strategy": dict(strategy),
         "filter": filter,
         "series": series,
-        "rsi_distribution": result,
-        "rsi_summary": summary,
+        "rsi_distribution": rsi_distribution,
+        "rsi_pnl_distribution": rsi_pnl_distribution,
         "rsi_bins": RSI_BINS,
         "rsi_inf": RSI_INF,
     })
