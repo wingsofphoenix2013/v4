@@ -116,37 +116,38 @@
       </tr>
     </thead>
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200 text-center">
-      {% for i, group_key in enumerate(["success_" ~ side, "fail_" ~ side]) %}
-      {% set label = ("Успешные — " if i == 0 else "Неуспешные — ") ~ (side | capitalize) %}
-      {% set bins = bb_distribution[key][group_key] %}
-      {% set total = bins | sum %}
-      <tr>
-        <td class="px-4 py-3 text-left font-medium">{{ label }}</td>
-        {% for count in bins %}
-        <td class="px-4 py-3">
-          {% if count > 0 %}
-            {{ count }} ({{ ((count / total) * 100) | round(1) }}%)
-          {% else %}
-            —
-          {% endif %}
-        </td>
-        {% endfor %}
-      </tr>
+      {% set group_keys = ["success_" ~ side, "fail_" ~ side] %}
+      {% for group_key in group_keys %}
+        {% set i = loop.index0 %}
+        {% set label = ("Успешные — " if i == 0 else "Неуспешные — ") ~ (side | capitalize) %}
+        {% set bins = bb_distribution[key][group_key] %}
+        {% set total = bins | sum %}
+        <tr>
+          <td class="px-4 py-3 text-left font-medium">{{ label }}</td>
+          {% for count in bins %}
+          <td class="px-4 py-3">
+            {% if count > 0 %}
+              {{ count }} ({{ ((count / total) * 100) | round(1) }}%)
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          {% endfor %}
+        </tr>
       {% endfor %}
 
-      {# Финансовый баланс — строка 3 #}
       <tr>
         <td class="px-4 py-3 text-left font-semibold text-slate-700">Финансовый баланс</td>
         {% for z in range(6) %}
-        {% set pnl_success = bb_pnl_distribution[key][side][0][z] %}
-        {% set pnl_fail = bb_pnl_distribution[key][side][1][z] %}
-        {% set balance = (pnl_success - pnl_fail) | round(2) %}
-        <td class="px-4 py-3 font-semibold 
-                   {% if balance > 0 %}text-green-600
-                   {% elif balance < 0 %}text-red-600
-                   {% else %}text-slate-500 italic{% endif %}">
-          {{ balance }}
-        </td>
+          {% set pnl_success = bb_pnl_distribution[key][side][0][z] %}
+          {% set pnl_fail = bb_pnl_distribution[key][side][1][z] %}
+          {% set balance = (pnl_success - pnl_fail) | round(2) %}
+          <td class="px-4 py-3 font-semibold
+                     {% if balance > 0 %}text-green-600
+                     {% elif balance < 0 %}text-red-600
+                     {% else %}text-slate-500 italic{% endif %}">
+            {{ balance }}
+          </td>
         {% endfor %}
       </tr>
     </tbody>
