@@ -42,12 +42,12 @@ async def handle_opened(event: dict):
 
         log.info(f"📥 [opened] Стратегия {strategy_id} | {symbol} | side={side} | qty={quantity} | lev={leverage}")
 
-        # 🔸 Пропущена смена маржи: предполагается, что уже ISOLATED
-        log.info(f"ℹ️ Пропуск change_margin_type — предполагается ISOLATED уже установлен")
-
-        # 🔸 Установка плеча
-        client.futures_change_leverage(symbol=symbol, leverage=leverage)
-        log.info(f"📌 Плечо установлено: {leverage}x")
+        # 🔸 Плечо (безопасный вызов)
+        try:
+            client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            log.info(f"📌 Плечо установлено: {leverage}x")
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось установить плечо для {symbol}, используется по умолчанию: {e}")
 
         # 🔸 Открытие позиции MARKET
         entry_order = client.futures_create_order(
@@ -87,6 +87,7 @@ async def handle_opened(event: dict):
             if tp.get("price") and not tp.get("canceled") and not tp.get("hit"):
                 tp_price = float(tp["price"])
                 tp_qty = float(tp["quantity"])
+                opposite_side = "SELL" if side == "BUY" else "BUY"
 
                 tp_order = client.futures_create_order(
                     symbol=symbol,
