@@ -1,11 +1,14 @@
 # binance_worker.py
 
 import logging
+import json
+from infra import infra
+from strategy_registry import get_leverage
 
 log = logging.getLogger("BINANCE_WORKER")
 
 
-# 🔹 Обработка одного события из binance_стримов
+# 🔸 Обработка одного события из binance_стримов
 async def process_binance_event(event: dict):
     event_type = event.get("event_type")
     strategy_id = event.get("strategy_id")
@@ -23,19 +26,99 @@ async def process_binance_event(event: dict):
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
 
 
-# 🔹 Обработка открытия позиции
+# 🔸 Обработка открытия позиции
 async def handle_opened(event: dict):
-    log.info(f"📥 [opened] Стратегия {event.get('strategy_id')} | {event.get('symbol')} | Объём: {event.get('quantity')}")
-    # TODO: реализовать отправку MARKET-ордера, SL и TP
+    client = infra.binance_client
+    if client is None:
+        log.warning("⚠️ Binance клиент не инициализирован, пропуск handle_opened")
+        return
+
+    try:
+        strategy_id = int(event["strategy_id"])
+        symbol = event["symbol"]
+        direction = event["direction"]
+        side = "BUY" if direction == "long" else "SELL"
+        quantity = float(event["quantity"])
+        leverage = get_leverage(strategy_id)
+
+        log.info(f"📥 [opened] Стратегия {strategy_id} | {symbol} | side={side} | qty={quantity} | lev={leverage}")
+
+        # 🔸 Установка маржи: ISOLATED
+        try:
+            client.futures_change_margin_type(symbol=symbol, marginType="ISOLATED")
+            log.info(f"🧲 Маржа установлена: ISOLATED для {symbol}")
+        except Exception as e:
+            if "No need to change margin type" in str(e):
+                log.debug(f"ℹ️ Маржа уже ISOLATED для {symbol}")
+            else:
+                raise
+
+        # 🔸 Установка плеча
+        client.futures_change_leverage(symbol=symbol, leverage=leverage)
+        log.info(f"📌 Плечо установлено: {leverage}x")
+
+        # 🔸 Открытие позиции MARKET
+        entry_order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=quantity
+        )
+
+        log.info(f"✅ Позиция открыта (orderId={entry_order['orderId']})")
+
+        # 🔸 Установка SL
+        sl_targets = json.loads(event.get("sl_targets", "[]"))
+        active_sl = next((sl for sl in sl_targets if not sl["hit"] and not sl["canceled"] and sl["price"]), None)
+
+        if active_sl:
+            stop_price = float(active_sl["price"])
+            opposite_side = "SELL" if side == "BUY" else "BUY"
+
+            sl_order = client.futures_create_order(
+                symbol=symbol,
+                side=opposite_side,
+                type="STOP_MARKET",
+                stopPrice=stop_price,
+                closePosition=True,
+                timeInForce="GTC",
+                workingType="MARK_PRICE"
+            )
+
+            log.info(f"🛡️ SL установлен: {stop_price} (orderId={sl_order['orderId']})")
+        else:
+            log.info("ℹ️ SL не задан или отменён")
+
+        # 🔸 Установка TP целей
+        tp_targets = json.loads(event.get("tp_targets", "[]"))
+        for tp in tp_targets:
+            if tp.get("price") and not tp.get("canceled") and not tp.get("hit"):
+                tp_price = float(tp["price"])
+                tp_qty = float(tp["quantity"])
+
+                tp_order = client.futures_create_order(
+                    symbol=symbol,
+                    side=opposite_side,
+                    type="LIMIT",
+                    price=tp_price,
+                    quantity=tp_qty,
+                    reduceOnly=True,
+                    timeInForce="GTC"
+                )
+
+                log.info(f"🎯 TP-{tp['level']} установлен: {tp_price}, qty={tp_qty}, orderId={tp_order['orderId']}")
+
+    except Exception as e:
+        log.exception(f"❌ Ошибка при обработке события 'opened': {e}")
 
 
-# 🔹 Обработка TP
+# 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
-    # TODO: реализовать обновление SL или закрытие позиции
+    # TODO: реализовать обновление SL или частичное закрытие
 
 
-# 🔹 Обработка закрытия позиции
+# 🔸 Обработка закрытия позиции
 async def handle_closed(event: dict):
     log.info(f"🔒 [closed] Стратегия {event.get('strategy_id')} | Причина: {event.get('close_reason')}")
-    # TODO: отменить ордера на Binance
+    # TODO: реализовать отмену SL/TP и закрытие позиции
