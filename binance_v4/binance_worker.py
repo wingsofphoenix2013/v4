@@ -24,7 +24,7 @@ async def process_binance_event(event: dict):
         await handle_closed(event)
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
-# 🔸 Обработка открытия позиции (тест подключения к Binance Testnet)
+# 🔸 Обработка открытия позиции (минимальный MARKET ордер)
 async def handle_opened(event: dict):
     client = infra.binance_client
     if client is None:
@@ -32,11 +32,23 @@ async def handle_opened(event: dict):
         return
 
     try:
-        info = client.futures_exchange_info()
-        symbols = [s["symbol"] for s in info["symbols"][:5]]
-        log.info(f"📊 Binance Testnet API отвечает. Первые тикеры: {symbols}")
+        symbol = event.get("symbol", "BTCUSDT")  # ← можно хардкодить для теста
+        quantity = float(event.get("quantity", 0.001))
+        side = "BUY"
+
+        log.info(f"📥 Отправка MARKET ордера: {side} {symbol} x {quantity}")
+
+        result = client.new_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=quantity
+        )
+
+        log.info(f"✅ Ордер отправлен: orderId={result['orderId']}, статус={result['status']}")
+
     except Exception as e:
-        log.exception("❌ Test: Binance Testnet API не отвечает на exchangeInfo")
+        log.exception("❌ Ошибка при отправке MARKET-ордера")
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
