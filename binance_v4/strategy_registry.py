@@ -84,7 +84,7 @@ async def load_symbol_precisions():
             symbol_precision_map[symbol] = precision
 
     log.info(f"📊 Загружено precision для {len(symbol_precision_map)} тикеров")
-
+    log.info(f"✅ Точности: {symbol_precision_map}")
 
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:

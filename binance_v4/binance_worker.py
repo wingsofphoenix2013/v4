@@ -48,6 +48,8 @@ async def handle_opened(event: dict):
         quantity = float(rounded_qty)
 
         log.info(f"📥 Открытие позиции: {side} {symbol} x {quantity} | плечо: {leverage}")
+        log.info(f"🔎 Precision для {symbol}: {precision_qty}")
+        log.info(f"🔎 Quantity до округления: {raw_quantity}, после: {quantity}")
 
         # 🔸 Установка режима маржи: ISOLATED
         try:
