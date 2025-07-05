@@ -2,3 +2,4 @@ redis>=5.0.0
 binance-futures-connector>=1.1.0
 asyncpg
 python-dotenv
+aiohttp>=3.8
