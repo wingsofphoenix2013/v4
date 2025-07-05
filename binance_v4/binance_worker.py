@@ -24,8 +24,7 @@ async def process_binance_event(event: dict):
         await handle_closed(event)
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
-
-# 🔸 Обработка открытия позиции
+# 🔸 Обработка открытия позиции (минимальная проверка подключения)
 async def handle_opened(event: dict):
     client = infra.binance_client
     if client is None:
@@ -33,76 +32,16 @@ async def handle_opened(event: dict):
         return
 
     try:
-        strategy_id = int(event["strategy_id"])
-        symbol = event["symbol"]
-        direction = event["direction"]
-        side = "BUY" if direction == "long" else "SELL"
-        quantity = float(event["quantity"])
-        leverage = get_leverage(strategy_id)
+        balances = client.futures_account_balance()
+        usdt = next((b for b in balances if b["asset"] == "USDT"), None)
 
-        log.info(f"📥 [opened] Стратегия {strategy_id} | {symbol} | side={side} | qty={quantity} | lev={leverage}")
-
-        # 🔸 Плечо (безопасный вызов)
-        try:
-            client.futures_change_leverage(symbol=symbol, leverage=leverage)
-            log.info(f"📌 Плечо установлено: {leverage}x")
-        except Exception as e:
-            log.warning(f"⚠️ Не удалось установить плечо для {symbol}, используется по умолчанию: {e}")
-
-        # 🔸 Открытие позиции MARKET
-        entry_order = client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type="MARKET",
-            quantity=quantity
-        )
-
-        log.info(f"✅ Позиция открыта (orderId={entry_order['orderId']})")
-
-        # 🔸 Установка SL
-        sl_targets = json.loads(event.get("sl_targets", "[]"))
-        active_sl = next((sl for sl in sl_targets if not sl["hit"] and not sl["canceled"] and sl["price"]), None)
-
-        if active_sl:
-            stop_price = float(active_sl["price"])
-            opposite_side = "SELL" if side == "BUY" else "BUY"
-
-            sl_order = client.futures_create_order(
-                symbol=symbol,
-                side=opposite_side,
-                type="STOP_MARKET",
-                stopPrice=stop_price,
-                closePosition=True,
-                timeInForce="GTC",
-                workingType="MARK_PRICE"
-            )
-
-            log.info(f"🛡️ SL установлен: {stop_price} (orderId={sl_order['orderId']})")
+        if usdt:
+            log.info(f"💰 Binance USDT баланс: {usdt['balance']} | доступно: {usdt['availableBalance']}")
         else:
-            log.info("ℹ️ SL не задан или отменён")
-
-        # 🔸 Установка TP целей
-        tp_targets = json.loads(event.get("tp_targets", "[]"))
-        for tp in tp_targets:
-            if tp.get("price") and not tp.get("canceled") and not tp.get("hit"):
-                tp_price = float(tp["price"])
-                tp_qty = float(tp["quantity"])
-                opposite_side = "SELL" if side == "BUY" else "BUY"
-
-                tp_order = client.futures_create_order(
-                    symbol=symbol,
-                    side=opposite_side,
-                    type="LIMIT",
-                    price=tp_price,
-                    quantity=tp_qty,
-                    reduceOnly=True,
-                    timeInForce="GTC"
-                )
-
-                log.info(f"🎯 TP-{tp['level']} установлен: {tp_price}, qty={tp_qty}, orderId={tp_order['orderId']}")
+            log.warning("⚠️ Баланс USDT не найден")
 
     except Exception as e:
-        log.exception(f"❌ Ошибка при обработке события 'opened': {e}")
+        log.exception("❌ Ошибка при запросе баланса на Binance Testnet")
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
