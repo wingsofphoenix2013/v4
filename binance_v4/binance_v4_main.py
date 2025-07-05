@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from infra import setup_logging, setup_pg, setup_redis_client, setup_binance_client
+from infra import setup_logging, setup_pg, setup_redis_client, setup_binance_client, setup_binance_ws_client
 from redis_consumer import run_redis_consumer
 from strategy_registry import load_binance_enabled_strategies, run_binance_strategy_watcher, load_symbol_precisions
 

@@ -2,8 +2,10 @@
 
 import os
 import logging
+import asyncio
 import asyncpg
 import redis.asyncio as aioredis
+import aiohttp
 from binance.um_futures import UMFutures
 from binance.error import ClientError
 
@@ -13,12 +15,15 @@ class Infra:
     pg_pool: asyncpg.Pool = None
     redis_client: aioredis.Redis = None
     binance_client: UMFutures = None
+    binance_ws_listen_key: str = None
+    binance_ws_client: aiohttp.ClientWebSocketResponse = None
+    binance_ws_session: aiohttp.ClientSession = None
 
 
 infra = Infra()
 
 
-# 🔸 Константы (если понадобятся)
+# 🔸 Константы
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 
@@ -81,7 +86,7 @@ async def setup_binance_client():
         infra.binance_client = client
         log.info("🔑 Binance (UMFutures) инициализирован для Testnet")
 
-        # 🔸 Проверка доступности API (без авторизации)
+        # 🔸 Проверка доступности API
         try:
             server_time = client.time()
             log.info(f"📡 Binance Testnet доступен. Время сервера: {server_time['serverTime']}")
@@ -100,3 +105,40 @@ async def setup_binance_client():
     except Exception as e:
         log.exception("❌ Ошибка инициализации Binance клиента")
         raise
+
+
+# 🔸 Binance WebSocket (User Data Stream)
+async def setup_binance_ws_client():
+    log = logging.getLogger("INFRA")
+    client = infra.binance_client
+
+    try:
+        listen_key_resp = client.new_listen_key()
+        listen_key = listen_key_resp["listenKey"]
+        infra.binance_ws_listen_key = listen_key
+
+        url = f"wss://fstream.binance.com/ws/{listen_key}"
+        session = aiohttp.ClientSession()
+        ws = await session.ws_connect(url)
+        infra.binance_ws_session = session
+        infra.binance_ws_client = ws
+
+        log.info("🔌 Binance WebSocket подключён")
+
+        asyncio.create_task(_keep_alive_binance_listen_key(listen_key))
+
+    except Exception:
+        log.exception("❌ Ошибка при подключении к Binance WebSocket")
+
+
+async def _keep_alive_binance_listen_key(listen_key: str):
+    log = logging.getLogger("INFRA")
+    client = infra.binance_client
+
+    while True:
+        try:
+            client.keep_alive_listen_key(listen_key)
+            log.debug("🔄 Binance listenKey обновлён")
+        except Exception:
+            log.warning("⚠️ Не удалось обновить listenKey")
+        await asyncio.sleep(30 * 60)
