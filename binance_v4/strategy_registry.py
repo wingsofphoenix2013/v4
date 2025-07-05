@@ -12,6 +12,7 @@ binance_strategies: dict[int, int] = {}
 
 # 🔸 Кеш точностей тикеров: symbol → precision_qty
 symbol_precision_map: dict[str, int] = {}
+symbol_price_precision_map: dict[str, int] = {}
 
 # 🔸 Канал Pub/Sub для обновлений стратегий
 PUBSUB_CHANNEL = "binance_strategy_updates"
@@ -73,19 +74,30 @@ async def run_binance_strategy_watcher():
 
 # 🔸 Загрузка точностей тикеров из таблицы tickers_v4
 async def load_symbol_precisions():
-    query = "SELECT symbol, precision_qty FROM tickers_v4"
+    query = "SELECT symbol, precision_qty, precision_price FROM tickers_v4"
     rows = await infra.pg_pool.fetch(query)
 
     symbol_precision_map.clear()
+    symbol_price_precision_map.clear()
+
     for row in rows:
         symbol = row["symbol"]
-        precision = row["precision_qty"]
-        if symbol and precision is not None:
-            symbol_precision_map[symbol] = precision
+        qty_precision = row["precision_qty"]
+        price_precision = row["precision_price"]
 
-    log.info(f"📊 Загружено precision для {len(symbol_precision_map)} тикеров")
-    log.info(f"✅ Точности: {symbol_precision_map}")
+        if symbol:
+            if qty_precision is not None:
+                symbol_precision_map[symbol] = qty_precision
+            if price_precision is not None:
+                symbol_price_precision_map[symbol] = price_precision
+
+    log.info(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
+    log.info(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
 
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:
     return symbol_precision_map.get(symbol, 3)
+
+# 🔸 Получение точности price по символу
+def get_price_precision_for_symbol(symbol: str) -> int:
+    return symbol_price_precision_map.get(symbol, 2)

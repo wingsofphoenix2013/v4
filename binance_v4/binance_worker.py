@@ -5,7 +5,7 @@ import json
 from decimal import Decimal, ROUND_DOWN
 
 from infra import infra
-from strategy_registry import get_leverage, get_precision_for_symbol
+from strategy_registry import get_leverage, get_precision_for_symbol, get_price_precision_for_symbol
 
 log = logging.getLogger("BINANCE_WORKER")
 
@@ -101,8 +101,14 @@ async def handle_opened(event: dict):
         tp_targets = json.loads(event.get("tp_targets", "[]"))
         for tp in tp_targets:
             if tp.get("price") and not tp.get("canceled") and not tp.get("hit"):
-                tp_price = float(tp["price"])
+                # Округление quantity
                 tp_qty = float(Decimal(str(tp["quantity"])).quantize(quantize_mask, rounding=ROUND_DOWN))
+
+                # Округление price по precision_price
+                price_precision = get_price_precision_for_symbol(symbol)
+                price_mask = Decimal("1").scaleb(-price_precision)
+                tp_price_decimal = Decimal(str(tp["price"])).quantize(price_mask, rounding=ROUND_DOWN)
+                tp_price = format(tp_price_decimal, f".{price_precision}f")
 
                 tp_order = client.new_order(
                     symbol=symbol,
