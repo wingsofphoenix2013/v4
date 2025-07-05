@@ -105,16 +105,19 @@ async def setup_binance_client():
     except Exception as e:
         log.exception("❌ Ошибка инициализации Binance клиента")
         raise
+
 # 🔸 Binance WebSocket (User Data Stream)
 async def setup_binance_ws_client():
     log = logging.getLogger("INFRA")
     client = infra.binance_client
 
     try:
+        # Получаем listenKey через REST
         listen_key_resp = client.new_listen_key()
         listen_key = listen_key_resp["listenKey"]
         infra.binance_ws_listen_key = listen_key
 
+        # Устанавливаем WebSocket-соединение
         url = f"wss://fstream.binance.com/ws/{listen_key}"
         session = aiohttp.ClientSession()
         ws = await session.ws_connect(url)
@@ -123,12 +126,17 @@ async def setup_binance_ws_client():
 
         log.info("🔌 Binance WebSocket подключён")
 
+        # Запускаем фоновую задачу продления listenKey
         asyncio.create_task(_keep_alive_binance_listen_key(listen_key))
+
+        # Запускаем фоновую задачу переподключения через 23 часа
+        asyncio.create_task(_restart_binance_ws_after_timeout(23 * 60 * 60))
 
     except Exception:
         log.exception("❌ Ошибка при подключении к Binance WebSocket")
 
 
+# 🔸 Продление listenKey каждые 30 минут
 async def _keep_alive_binance_listen_key(listen_key: str):
     log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
@@ -150,3 +158,27 @@ async def _keep_alive_binance_listen_key(listen_key: str):
         except Exception as e:
             log.warning(f"⚠️ Не удалось обновить listenKey: {e}")
         await asyncio.sleep(30 * 60)
+
+
+# 🔸 Переподключение к WebSocket после 23 часов
+async def _restart_binance_ws_after_timeout(delay_seconds: int):
+    log = logging.getLogger("INFRA")
+    await asyncio.sleep(delay_seconds)
+
+    try:
+        log.info("♻️ Переподключение к Binance WebSocket (таймер 24ч)")
+
+        # Закрываем старые соединения
+        if infra.binance_ws_client is not None:
+            await infra.binance_ws_client.close()
+            infra.binance_ws_client = None
+
+        if infra.binance_ws_session is not None:
+            await infra.binance_ws_session.close()
+            infra.binance_ws_session = None
+
+        # Повторное подключение
+        await setup_binance_ws_client()
+
+    except Exception:
+        log.exception("❌ Ошибка при переподключении к Binance WebSocket")
