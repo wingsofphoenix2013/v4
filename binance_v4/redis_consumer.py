@@ -6,6 +6,7 @@ import json
 
 from infra import infra
 from strategy_registry import is_strategy_binance_enabled
+from binance_worker import process_binance_event
 
 log = logging.getLogger("REDIS_CONSUMER")
 
@@ -37,6 +38,7 @@ async def ensure_consumer_groups():
 
 # 🔹 Основной цикл
 async def run_redis_consumer():
+
     await ensure_consumer_groups()
 
     while True:
@@ -63,6 +65,7 @@ async def run_redis_consumer():
                         log.warning(f"⚠️ Нет поля 'data' в сообщении из {stream_name}")
                         await infra.redis_client.xack(stream_name, group, record_id)
                         continue
+
                     try:
                         event = json.loads(payload)
                         raw_id = event.get("strategy_id")
@@ -75,9 +78,10 @@ async def run_redis_consumer():
                     if strategy_id is None:
                         log.warning(f"⚠️ Нет strategy_id в сообщении: {event}")
                     elif not is_strategy_binance_enabled(strategy_id):
-                        log.info(f"⏭️ [{stream_name}] Пропущено: стратегия {strategy_id} не включена для Binance")
+                        log.debug(f"⏭️ [{stream_name}] Пропущено: стратегия {strategy_id} не включена для Binance")
                     else:
                         log.info(f"✅ [{stream_name}] Принято сообщение для стратегии {strategy_id}: {event}")
+                        await process_binance_event(event)
 
                     await infra.redis_client.xack(stream_name, group, record_id)
 
