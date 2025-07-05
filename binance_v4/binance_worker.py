@@ -2,8 +2,10 @@
 
 import logging
 import json
+from decimal import Decimal, ROUND_DOWN
+
 from infra import infra
-from strategy_registry import get_leverage
+from strategy_registry import get_leverage, get_precision_for_symbol
 
 log = logging.getLogger("BINANCE_WORKER")
 
@@ -23,7 +25,8 @@ async def process_binance_event(event: dict):
         await handle_closed(event)
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
-# 🔸 Обработка открытия позиции (ISOLATED + плечо + MARKET)
+        
+# 🔸 Обработка открытия позиции (ISOLATED + плечо + MARKET + precision)
 async def handle_opened(event: dict):
     client = infra.binance_client
     if client is None:
@@ -35,8 +38,14 @@ async def handle_opened(event: dict):
         symbol = event["symbol"]
         direction = event["direction"]
         side = "BUY" if direction == "long" else "SELL"
-        quantity = float(event["quantity"])
+        raw_quantity = float(event["quantity"])
         leverage = get_leverage(strategy_id)
+
+        # 🔸 Округление по precision из tickers_v4
+        precision_qty = get_precision_for_symbol(symbol)
+        quantize_mask = Decimal("1").scaleb(-precision_qty)
+        rounded_qty = Decimal(str(raw_quantity)).quantize(quantize_mask, rounding=ROUND_DOWN)
+        quantity = float(rounded_qty)
 
         log.info(f"📥 Открытие позиции: {side} {symbol} x {quantity} | плечо: {leverage}")
 
@@ -69,6 +78,7 @@ async def handle_opened(event: dict):
 
     except Exception as e:
         log.exception("❌ Ошибка при обработке события 'opened'")
+        
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")

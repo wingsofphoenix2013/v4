@@ -10,6 +10,9 @@ log = logging.getLogger("STRATEGY_REGISTRY")
 # 🔸 Кеш стратегий: strategy_id → leverage
 binance_strategies: dict[int, int] = {}
 
+# 🔸 Кеш точностей тикеров: symbol → precision_qty
+symbol_precision_map: dict[str, int] = {}
+
 # 🔸 Канал Pub/Sub для обновлений стратегий
 PUBSUB_CHANNEL = "binance_strategy_updates"
 
@@ -67,3 +70,22 @@ async def run_binance_strategy_watcher():
 
         except Exception:
             log.exception(f"❌ Ошибка обработки сообщения из {PUBSUB_CHANNEL}")
+
+# 🔸 Загрузка точностей тикеров из таблицы tickers_v4
+async def load_symbol_precisions():
+    query = "SELECT symbol, precision_qty FROM tickers_v4 WHERE is_active = true"
+    rows = await infra.pg_pool.fetch(query)
+
+    symbol_precision_map.clear()
+    for row in rows:
+        symbol = row["symbol"]
+        precision = row["precision_qty"]
+        if symbol and precision is not None:
+            symbol_precision_map[symbol] = precision
+
+    log.info(f"📊 Загружено precision для {len(symbol_precision_map)} тикеров")
+
+
+# 🔸 Получение точности quantity по символу
+def get_precision_for_symbol(symbol: str) -> int:
+    return symbol_precision_map.get(symbol, 3)
