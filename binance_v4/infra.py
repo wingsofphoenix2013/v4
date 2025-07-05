@@ -105,8 +105,6 @@ async def setup_binance_client():
     except Exception as e:
         log.exception("❌ Ошибка инициализации Binance клиента")
         raise
-
-
 # 🔸 Binance WebSocket (User Data Stream)
 async def setup_binance_ws_client():
     log = logging.getLogger("INFRA")
@@ -133,12 +131,22 @@ async def setup_binance_ws_client():
 
 async def _keep_alive_binance_listen_key(listen_key: str):
     log = logging.getLogger("INFRA")
-    client = infra.binance_client
+    api_key = os.getenv("BINANCE_API_KEY")
+    url = "https://testnet.binancefuture.com/fapi/v1/listenKey"
 
     while True:
         try:
-            client.keep_alive_listen_key()
-            log.info("🔄 Binance listenKey обновлён")
-        except Exception:
-            log.warning("⚠️ Не удалось обновить listenKey")
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    url,
+                    headers={"X-MBX-APIKEY": api_key},
+                    params={"listenKey": listen_key}
+                ) as resp:
+                    if resp.status == 200:
+                        log.debug("🔄 Binance listenKey обновлён")
+                    else:
+                        text = await resp.text()
+                        log.warning(f"⚠️ Ошибка продления listenKey: HTTP {resp.status} — {text}")
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось обновить listenKey: {e}")
         await asyncio.sleep(30 * 60)
