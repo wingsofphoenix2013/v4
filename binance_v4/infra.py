@@ -4,14 +4,15 @@ import os
 import logging
 import asyncpg
 import redis.asyncio as aioredis
-from binance.client import Client
+from binance.um_futures import UMFutures
+from binance.error import ClientError
 
 
 # 🔸 Глобальное состояние
 class Infra:
     pg_pool: asyncpg.Pool = None
     redis_client: aioredis.Redis = None
-    binance_client: Client = None
+    binance_client: UMFutures = None
 
 
 infra = Infra()
@@ -64,8 +65,10 @@ async def setup_redis_client():
     logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
 
 
-# 🔸 Binance Testnet
+# 🔸 Binance Testnet (официальный коннектор)
 async def setup_binance_client():
+    log = logging.getLogger("INFRA")
+
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     testnet_url = "https://testnet.binancefuture.com"
@@ -73,8 +76,27 @@ async def setup_binance_client():
     if not api_key or not api_secret:
         raise RuntimeError("❌ BINANCE_API_KEY или BINANCE_API_SECRET не заданы")
 
-    client = Client(api_key=api_key, api_secret=api_secret)
-    client.FUTURES_URL = testnet_url
+    try:
+        client = UMFutures(key=api_key, secret=api_secret, base_url=testnet_url)
+        infra.binance_client = client
+        log.info("🔑 Binance (UMFutures) инициализирован для Testnet")
 
-    infra.binance_client = client
-    logging.getLogger("INFRA").info("🔑 Подключение к Binance Futures Testnet установлено")
+        # 🔸 Проверка доступности API (без авторизации)
+        try:
+            server_time = client.time()
+            log.info(f"📡 Binance Testnet доступен. Время сервера: {server_time['serverTime']}")
+        except Exception as e:
+            log.exception("❌ Ошибка при /time — Testnet API недоступен")
+
+        # 🔸 Проверка авторизации
+        try:
+            acc_info = client.account()
+            log.info(f"✅ Авторизация успешна. Общий баланс: {acc_info.get('totalWalletBalance', '?')}")
+        except ClientError as e:
+            log.error(f"❌ Ошибка авторизации Binance: {e.error_message}")
+        except Exception:
+            log.exception("❌ Неизвестная ошибка авторизации Binance")
+
+    except Exception as e:
+        log.exception("❌ Ошибка инициализации Binance клиента")
+        raise

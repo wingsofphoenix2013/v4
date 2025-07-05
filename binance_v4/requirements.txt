@@ -1,4 +1,4 @@
 redis>=5.0.0
-python-binance>=1.0.17
+binance-futures-connector>=1.1.0
 asyncpg
 python-dotenv
