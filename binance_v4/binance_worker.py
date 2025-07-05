@@ -45,7 +45,7 @@ async def handle_opened(event: dict):
         precision_qty = get_precision_for_symbol(symbol)
         quantize_mask = Decimal("1").scaleb(-precision_qty)
         rounded_qty = Decimal(str(raw_quantity)).quantize(quantize_mask, rounding=ROUND_DOWN)
-        quantity = float(rounded_qty)
+        quantity = format(rounded_qty, f".{precision_qty}f")
 
         log.info(f"📥 Открытие позиции: {side} {symbol} x {quantity} | плечо: {leverage}")
 
