@@ -7,7 +7,6 @@ from strategy_registry import get_leverage
 
 log = logging.getLogger("BINANCE_WORKER")
 
-
 # 🔸 Обработка одного события из binance_стримов
 async def process_binance_event(event: dict):
     event_type = event.get("event_type")
@@ -24,7 +23,7 @@ async def process_binance_event(event: dict):
         await handle_closed(event)
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
-# 🔸 Обработка открытия позиции (минимальный MARKET ордер)
+# 🔸 Обработка открытия позиции (ISOLATED + плечо + MARKET)
 async def handle_opened(event: dict):
     client = infra.binance_client
     if client is None:
@@ -32,12 +31,33 @@ async def handle_opened(event: dict):
         return
 
     try:
-        symbol = event.get("symbol", "BTCUSDT")  # ← можно хардкодить для теста
-        quantity = float(event.get("quantity", 0.001))
-        side = "BUY"
+        strategy_id = int(event["strategy_id"])
+        symbol = event["symbol"]
+        direction = event["direction"]
+        side = "BUY" if direction == "long" else "SELL"
+        quantity = float(event["quantity"])
+        leverage = get_leverage(strategy_id)
 
-        log.info(f"📥 Отправка MARKET ордера: {side} {symbol} x {quantity}")
+        log.info(f"📥 Открытие позиции: {side} {symbol} x {quantity} | плечо: {leverage}")
 
+        # 🔸 Установка режима маржи: ISOLATED
+        try:
+            client.change_margin_type(symbol=symbol, marginType="ISOLATED")
+            log.info(f"🧲 Маржа установлена: ISOLATED для {symbol}")
+        except Exception as e:
+            if "No need to change margin type" in str(e):
+                log.debug(f"ℹ️ Маржа уже ISOLATED для {symbol}")
+            else:
+                log.warning(f"⚠️ Не удалось установить маржу ISOLATED для {symbol}: {e}")
+
+        # 🔸 Установка плеча
+        try:
+            result = client.change_leverage(symbol=symbol, leverage=leverage)
+            log.info(f"📌 Плечо установлено: {result['leverage']}x для {symbol}")
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось установить плечо для {symbol}, используется по умолчанию: {e}")
+
+        # 🔸 Отправка MARKET-ордера
         result = client.new_order(
             symbol=symbol,
             side=side,
@@ -45,10 +65,10 @@ async def handle_opened(event: dict):
             quantity=quantity
         )
 
-        log.info(f"✅ Ордер отправлен: orderId={result['orderId']}, статус={result['status']}")
+        log.info(f"✅ MARKET ордер отправлен: orderId={result['orderId']}, статус={result['status']}")
 
     except Exception as e:
-        log.exception("❌ Ошибка при отправке MARKET-ордера")
+        log.exception("❌ Ошибка при обработке события 'opened'")
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
