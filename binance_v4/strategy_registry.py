@@ -73,7 +73,7 @@ async def run_binance_strategy_watcher():
 
 # 🔸 Загрузка точностей тикеров из таблицы tickers_v4
 async def load_symbol_precisions():
-    query = "SELECT symbol, precision_qty FROM tickers_v4 WHERE is_active = true"
+    query = "SELECT symbol, precision_qty FROM tickers_v4"
     rows = await infra.pg_pool.fetch(query)
 
     symbol_precision_map.clear()
