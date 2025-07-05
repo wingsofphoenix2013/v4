@@ -24,7 +24,7 @@ async def process_binance_event(event: dict):
         await handle_closed(event)
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
-# 🔸 Обработка открытия позиции (минимальная проверка подключения)
+# 🔸 Обработка открытия позиции (тест подключения к Binance Testnet)
 async def handle_opened(event: dict):
     client = infra.binance_client
     if client is None:
@@ -32,16 +32,11 @@ async def handle_opened(event: dict):
         return
 
     try:
-        balances = client.futures_account_balance()
-        usdt = next((b for b in balances if b["asset"] == "USDT"), None)
-
-        if usdt:
-            log.info(f"💰 Binance USDT баланс: {usdt['balance']} | доступно: {usdt['availableBalance']}")
-        else:
-            log.warning("⚠️ Баланс USDT не найден")
-
+        info = client.futures_exchange_info()
+        symbols = [s["symbol"] for s in info["symbols"][:5]]
+        log.info(f"📊 Binance Testnet API отвечает. Первые тикеры: {symbols}")
     except Exception as e:
-        log.exception("❌ Ошибка при запросе баланса на Binance Testnet")
+        log.exception("❌ Test: Binance Testnet API не отвечает на exchangeInfo")
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
