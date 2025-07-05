@@ -137,8 +137,8 @@ async def _keep_alive_binance_listen_key(listen_key: str):
 
     while True:
         try:
-            client.keep_alive_listen_key(listen_key)
-            log.debug("🔄 Binance listenKey обновлён")
+            client.keep_alive_listen_key()
+            log.info("🔄 Binance listenKey обновлён")
         except Exception:
             log.warning("⚠️ Не удалось обновить listenKey")
         await asyncio.sleep(30 * 60)
