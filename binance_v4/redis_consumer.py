@@ -63,16 +63,16 @@ async def run_redis_consumer():
                         log.warning(f"⚠️ Нет поля 'data' в сообщении из {stream_name}")
                         await infra.redis_client.xack(stream_name, group, record_id)
                         continue
-
                     try:
                         event = json.loads(payload)
-                        strategy_id = event.get("strategy_id")
+                        raw_id = event.get("strategy_id")
+                        strategy_id = int(raw_id) if raw_id is not None else None
                     except Exception:
-                        log.warning(f"⚠️ Невозможно распарсить JSON из {stream_name}: {payload}")
+                        log.warning(f"⚠️ Невозможно распарсить JSON или strategy_id из {stream_name}: {payload}")
                         await infra.redis_client.xack(stream_name, group, record_id)
                         continue
 
-                    if not strategy_id:
+                    if strategy_id is None:
                         log.warning(f"⚠️ Нет strategy_id в сообщении: {event}")
                     elif not is_strategy_binance_enabled(strategy_id):
                         log.info(f"⏭️ [{stream_name}] Пропущено: стратегия {strategy_id} не включена для Binance")
