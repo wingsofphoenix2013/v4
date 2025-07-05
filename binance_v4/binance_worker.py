@@ -25,7 +25,6 @@ async def process_binance_event(event: dict):
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
 
-
 # 🔸 Обработка открытия позиции
 async def handle_opened(event: dict):
     client = infra.binance_client
@@ -43,15 +42,8 @@ async def handle_opened(event: dict):
 
         log.info(f"📥 [opened] Стратегия {strategy_id} | {symbol} | side={side} | qty={quantity} | lev={leverage}")
 
-        # 🔸 Установка маржи: ISOLATED
-        try:
-            client.futures_change_margin_type(symbol=symbol, marginType="ISOLATED")
-            log.info(f"🧲 Маржа установлена: ISOLATED для {symbol}")
-        except Exception as e:
-            if "No need to change margin type" in str(e):
-                log.debug(f"ℹ️ Маржа уже ISOLATED для {symbol}")
-            else:
-                raise
+        # 🔸 Пропущена смена маржи: предполагается, что уже ISOLATED
+        log.info(f"ℹ️ Пропуск change_margin_type — предполагается ISOLATED уже установлен")
 
         # 🔸 Установка плеча
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
@@ -110,8 +102,6 @@ async def handle_opened(event: dict):
 
     except Exception as e:
         log.exception(f"❌ Ошибка при обработке события 'opened': {e}")
-
-
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
