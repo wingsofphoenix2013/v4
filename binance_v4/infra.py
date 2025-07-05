@@ -4,12 +4,14 @@ import os
 import logging
 import asyncpg
 import redis.asyncio as aioredis
+from binance.client import Client
 
 
 # 🔸 Глобальное состояние
 class Infra:
     pg_pool: asyncpg.Pool = None
     redis_client: aioredis.Redis = None
+    binance_client: Client = None
 
 
 infra = Infra()
@@ -60,3 +62,19 @@ async def setup_redis_client():
     await client.ping()
     infra.redis_client = client
     logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
+
+
+# 🔸 Binance Testnet
+async def setup_binance_client():
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    testnet_url = "https://testnet.binancefuture.com"
+
+    if not api_key or not api_secret:
+        raise RuntimeError("❌ BINANCE_API_KEY или BINANCE_API_SECRET не заданы")
+
+    client = Client(api_key=api_key, api_secret=api_secret)
+    client.FUTURES_URL = testnet_url
+
+    infra.binance_client = client
+    logging.getLogger("INFRA").info("🔑 Подключение к Binance Futures Testnet установлено")
