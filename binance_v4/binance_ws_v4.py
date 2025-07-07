@@ -20,7 +20,9 @@ async def run_binance_ws_listener():
 
     while True:
         try:
+            log.info("🧪 Ожидаем сообщение из WebSocket")
             msg = await ws.receive_json()
+            log.info(f"🛰 Получено сообщение от Binance WS: {msg}")
             await handle_execution_report(msg)
         except Exception as e:
             log.exception(f"⚠️ Ошибка при обработке WebSocket-сообщения: {e}")
