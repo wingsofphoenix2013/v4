@@ -3,10 +3,23 @@
 import asyncio
 import logging
 
-from infra import setup_logging, setup_pg, setup_redis_client, setup_binance_client
-from redis_consumer import run_redis_consumer
-from strategy_registry import load_binance_enabled_strategies, run_binance_strategy_watcher, load_symbol_precisions
-from binance_ws_v4 import run_binance_ws_listener
+# 🔸 Инициализация компонентов
+from infra import (
+    setup_logging,
+    setup_pg,
+    setup_redis_client,
+    setup_binance_client
+)
+
+# 🔸 Запуск воркеров
+from redis_consumer import run_redis_consumer                    # Redis Stream: binance_open_stream
+from strategy_registry import (
+    load_binance_enabled_strategies,                             # Кэш стратегий
+    load_symbol_precisions,                                      # Точности тикеров
+    run_binance_strategy_watcher                                 # Подписка на Redis Pub/Sub
+)
+from binance_ws_v4 import run_binance_ws_listener                # WebSocket Binance: User Data Stream
+
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -19,6 +32,7 @@ async def run_safe_loop(coro_factory, label: str):
             log.exception(f"❌ Ошибка в цикле {label}: {e}")
         await asyncio.sleep(5)
 
+
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
@@ -30,10 +44,12 @@ async def main():
     await load_symbol_precisions()
 
     await asyncio.gather(
-        run_safe_loop(run_redis_consumer, label="REDIS_CONSUMER"),
-        run_safe_loop(run_binance_strategy_watcher, label="STRATEGY_WATCHER"),
-        run_safe_loop(run_binance_ws_listener, label="BINANCE_WS")
+        run_safe_loop(run_redis_consumer, label="REDIS_CONSUMER"),           # входящие сигналы
+        run_safe_loop(run_binance_strategy_watcher, label="STRATEGY_WATCHER"), # подписка на обновления
+        run_safe_loop(run_binance_ws_listener, label="BINANCE_WS")            # отслеживание фактов исполнения
     )
 
+
+# 🔸 Запуск
 if __name__ == "__main__":
     asyncio.run(main())

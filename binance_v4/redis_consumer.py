@@ -1,90 +1,55 @@
 # redis_consumer.py
 
-import asyncio
-import logging
 import json
-
+import logging
 from infra import infra
-from strategy_registry import is_strategy_binance_enabled
-from binance_worker import process_binance_event
+from binance_worker import handle_open_position  # 🔸 обработка сигналов на открытие
 
 log = logging.getLogger("REDIS_CONSUMER")
 
-STREAMS = {
-    "binance_open_stream": "binance_open_group",
-    "binance_update_stream": "binance_update_group"
-}
-
-CONSUMER_NAME = "binance_worker_1"
+REDIS_STREAM_KEY = "binance_open_stream"
+CONSUMER_GROUP = "binance_open_group"
+CONSUMER_NAME = "binance_open_worker"
 
 
-# 🔹 Инициализация всех групп
-async def ensure_consumer_groups():
-    for stream, group in STREAMS.items():
-        try:
-            await infra.redis_client.xgroup_create(
-                name=stream,
-                groupname=group,
-                id="$",
-                mkstream=True
-            )
-            log.info(f"📦 Создана группа {group} на потоке {stream}")
-        except Exception as e:
-            if "BUSYGROUP" in str(e):
-                log.info(f"ℹ️ Группа {group} уже существует")
-            else:
-                log.exception(f"❌ Ошибка при создании группы для {stream}")
+# 🔸 Инициализация консюмер-группы Redis
+async def init_redis_stream_group():
+    try:
+        await infra.redis_client.xgroup_create(REDIS_STREAM_KEY, CONSUMER_GROUP, id="$", mkstream=True)
+        log.info(f"✅ Redis stream group {CONSUMER_GROUP} создан")
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.info(f"ℹ️ Redis group {CONSUMER_GROUP} уже существует")
+        else:
+            raise
 
 
-# 🔹 Основной цикл
+# 🔸 Основной цикл чтения и маршрутизации
 async def run_redis_consumer():
-
-    await ensure_consumer_groups()
+    await init_redis_stream_group()
 
     while True:
         try:
-            entries = []
+            entries = await infra.redis_client.xread_group(
+                group_name=CONSUMER_GROUP,
+                consumer_name=CONSUMER_NAME,
+                streams={REDIS_STREAM_KEY: '>'},
+                count=10,
+                block=5000
+            )
 
-            # читаем каждый поток отдельно с его группой
-            for stream_name, group_name in STREAMS.items():
-                batch = await infra.redis_client.xreadgroup(
-                    groupname=group_name,
-                    consumername=CONSUMER_NAME,
-                    streams={stream_name: ">"},
-                    count=10,
-                    block=1000
-                )
-                entries.extend(batch)
-
-            for stream_name, records in entries:
-                group = STREAMS[stream_name]
-                for record_id, data in records:
-                    payload = data.get("data")
-
-                    if not payload:
-                        log.warning(f"⚠️ Нет поля 'data' в сообщении из {stream_name}")
-                        await infra.redis_client.xack(stream_name, group, record_id)
-                        continue
-
+            for stream_key, messages in entries:
+                for message_id, fields in messages:
                     try:
-                        event = json.loads(payload)
-                        raw_id = event.get("strategy_id")
-                        strategy_id = int(raw_id) if raw_id is not None else None
+                        payload = json.loads(fields["data"])
+                        event_type = payload.get("event_type")
+
+                        if event_type == "opened":
+                            await handle_open_position(payload)
+
+                        await infra.redis_client.xack(REDIS_STREAM_KEY, CONSUMER_GROUP, message_id)
+
                     except Exception:
-                        log.warning(f"⚠️ Невозможно распарсить JSON или strategy_id из {stream_name}: {payload}")
-                        await infra.redis_client.xack(stream_name, group, record_id)
-                        continue
-
-                    if strategy_id is None:
-                        log.warning(f"⚠️ Нет strategy_id в сообщении: {event}")
-                    elif not is_strategy_binance_enabled(strategy_id):
-                        log.debug(f"⏭️ [{stream_name}] Пропущено: стратегия {strategy_id} не включена для Binance")
-                    else:
-                        log.info(f"✅ [{stream_name}] Принято сообщение для стратегии {strategy_id}: {event}")
-                        await process_binance_event(event)
-
-                    await infra.redis_client.xack(stream_name, group, record_id)
-
+                        log.exception(f"❌ Ошибка обработки сообщения {message_id}")
         except Exception:
-            log.exception("❌ Ошибка в run_redis_consumer")
-            await asyncio.sleep(2)
+            log.exception("❌ Ошибка чтения из Redis Stream")
