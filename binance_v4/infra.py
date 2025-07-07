@@ -123,6 +123,7 @@ async def get_binance_listen_key() -> str:
 
 # 🔸 Продление listenKey каждые 30 минут (в фоне)
 async def keep_alive_binance_listen_key():
+    log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
     url = "https://testnet.binancefuture.com/fapi/v1/listenKey"
 
