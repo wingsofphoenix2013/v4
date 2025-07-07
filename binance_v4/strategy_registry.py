@@ -2,6 +2,7 @@
 
 import logging
 import json
+import aiohttp
 
 from infra import infra
 
@@ -121,7 +122,6 @@ def get_sl_policy(strategy_id: int, tp_level: int) -> dict | None:
 def get_strategy_config(strategy_id: int) -> dict | None:
     return binance_strategies.get(strategy_id)
 
-
 # 🔸 Слушатель Redis Pub/Sub для обновлений стратегий в кеше
 async def run_binance_strategy_watcher():
     pubsub = infra.redis_client.pubsub()
@@ -170,6 +170,35 @@ async def load_symbol_precisions():
     log.info(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
     log.info(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
 
+    await log_binance_precision_check()
+
+
+# 🔸 Сравнение локальных precision с Binance
+async def log_binance_precision_check():
+    log.info("🔍 Сравнение точностей тикеров с Binance")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo") as resp:
+                data = await resp.json()
+                all_symbols = {s["symbol"]: s for s in data.get("symbols", [])}
+
+                for symbol in sorted(symbol_precision_map):
+                    binance = all_symbols.get(symbol)
+                    if not binance:
+                        log.warning(f"❓ {symbol} отсутствует в Binance exchangeInfo")
+                        continue
+
+                    bin_qty = binance.get("quantityPrecision")
+                    bin_price = binance.get("pricePrecision")
+                    db_qty = symbol_precision_map.get(symbol, "-")
+                    db_price = symbol_price_precision_map.get(symbol, "-")
+
+                    match = "✅" if bin_qty == db_qty and bin_price == db_price else "❗"
+                    log.info(f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | Binance: qty={bin_qty}, price={bin_price} {match}")
+
+    except Exception as e:
+        log.warning(f"⚠️ Ошибка при получении данных от Binance: {e}")
 
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:
