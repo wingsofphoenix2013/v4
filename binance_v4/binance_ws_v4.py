@@ -19,6 +19,9 @@ async def run_binance_ws_listener():
     log.info("🔄 Запуск Binance WebSocket listener")
     log.info(f"🧾 Активный listenKey: {infra.binance_ws_listen_key}")
 
+    # ⏳ Отложенный запуск теста смены плеча через 2 минуты
+    asyncio.create_task(delayed_test_change_leverage(120))
+
     while True:
         try:
             log.info("🧪 Ожидаем сообщение из WebSocket")
@@ -29,14 +32,15 @@ async def run_binance_ws_listener():
             log.exception(f"⚠️ Ошибка при обработке WebSocket-сообщения: {e}")
             await asyncio.sleep(1)
 
+
 # 🔸 Обработка executionReport (в том числе не FILLED)
 async def handle_execution_report(msg: dict):
     if msg.get("e") != "executionReport":
         return
 
     order_id = msg.get("i")
-    status = msg.get("X")         # текущий статус ордера (NEW, PARTIALLY_FILLED, FILLED, ...)
-    exec_type = msg.get("x")      # тип исполнения (TRADE, NEW, CANCELED и т.д.)
+    status = msg.get("X")
+    exec_type = msg.get("x")
 
     log.info(f"📬 executionReport: orderId={order_id}, status={status}, exec_type={exec_type}")
 
@@ -107,4 +111,13 @@ async def handle_execution_report(msg: dict):
     # 🧹 Удалить из inflight-кэша
     infra.inflight_positions.pop(position_uid, None)
 
-    # ⬆️ (Шаг 3: расчёт TP/SL — в следующих шагах)
+
+# 🔸 Тестовая функция смены плеча (генерация события)
+async def delayed_test_change_leverage(delay_sec: int):
+    await asyncio.sleep(delay_sec)
+    log.info("🚀 Отправка запроса на смену плеча для BTCUSDT (для проверки WS)")
+    try:
+        result = infra.binance_client.change_leverage(symbol="BTCUSDT", leverage=9)
+        log.info(f"✅ Ответ от Binance: {result}")
+    except Exception as e:
+        log.exception(f"❌ Ошибка при смене плеча: {e}")
