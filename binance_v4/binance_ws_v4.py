@@ -117,7 +117,7 @@ async def delayed_test_change_leverage(delay_sec: int):
     await asyncio.sleep(delay_sec)
     log.info("🚀 Отправка запроса на смену плеча для BTCUSDT (для проверки WS)")
     try:
-        result = infra.binance_client.change_leverage(symbol="BTCUSDT", leverage=9)
+        result = infra.binance_client.change_leverage(symbol="BTCUSDT", leverage=5)
         log.info(f"✅ Ответ от Binance: {result}")
     except Exception as e:
         log.exception(f"❌ Ошибка при смене плеча: {e}")
