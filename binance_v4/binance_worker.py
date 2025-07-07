@@ -51,7 +51,8 @@ async def handle_opened(event: dict):
         quantize_mask = Decimal("1").scaleb(-precision_qty)
         rounded_qty = Decimal(str(raw_quantity)).quantize(quantize_mask, rounding=ROUND_DOWN)
         quantity = float(rounded_qty)
-
+        
+        log.info(f"🎯 Итоговое значение quantity: {quantity} (precision: {precision_qty})")
         log.info(f"📥 Открытие позиции: {side} {symbol} x {quantity} | плечо: {leverage}")
 
         # 🔸 Установка маржи: ISOLATED
