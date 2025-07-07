@@ -18,14 +18,12 @@ class Infra:
     binance_ws_listen_key: str = None
     binance_ws_client: aiohttp.ClientWebSocketResponse = None
     binance_ws_session: aiohttp.ClientSession = None
-
-
+    inflight_positions: dict[str, dict] = {}
+    
 infra = Infra()
-
 
 # 🔸 Константы
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-
 
 # 🔸 Логирование
 def setup_logging():
@@ -35,7 +33,6 @@ def setup_logging():
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-
 
 # 🔸 PostgreSQL
 async def setup_pg():
@@ -47,7 +44,6 @@ async def setup_pg():
     await pool.execute("SELECT 1")
     infra.pg_pool = pool
     logging.getLogger("INFRA").info("🛢️ Подключение к PostgreSQL установлено")
-
 
 # 🔸 Redis
 async def setup_redis_client():

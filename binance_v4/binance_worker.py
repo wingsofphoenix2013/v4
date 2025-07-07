@@ -3,6 +3,7 @@
 import logging
 import json
 from decimal import Decimal, ROUND_DOWN
+from datetime import datetime
 
 from infra import infra
 from strategy_registry import get_leverage, get_precision_for_symbol, get_price_precision_for_symbol
@@ -25,7 +26,8 @@ async def process_binance_event(event: dict):
         await handle_closed(event)
     else:
         log.warning(f"⚠️ Неизвестный event_type: {event_type}")
-# 🔸 Обработка открытия позиции с SL и TP
+        
+# 🔸 Обработка открытия позиции на Binance (без TP/SL)
 async def handle_opened(event: dict):
     client = infra.binance_client
     if client is None:
@@ -33,12 +35,15 @@ async def handle_opened(event: dict):
         return
 
     try:
+        log.info(f"📩 Получен сигнал на открытие позиции: {event}")
+
         strategy_id = int(event["strategy_id"])
+        position_uid = event["position_uid"]
         symbol = event["symbol"]
         direction = event["direction"]
         side = "BUY" if direction == "long" else "SELL"
-        opposite_side = "SELL" if side == "BUY" else "BUY"
         raw_quantity = float(event["quantity"])
+
         leverage = get_leverage(strategy_id)
 
         # 🔸 Округление quantity
@@ -49,7 +54,7 @@ async def handle_opened(event: dict):
 
         log.info(f"📥 Открытие позиции: {side} {symbol} x {quantity} | плечо: {leverage}")
 
-        # 🔸 Маржа: ISOLATED
+        # 🔸 Установка маржи: ISOLATED
         try:
             client.change_margin_type(symbol=symbol, marginType="ISOLATED")
             log.info(f"🧲 Маржа установлена: ISOLATED для {symbol}")
@@ -57,16 +62,16 @@ async def handle_opened(event: dict):
             if "No need to change margin type" in str(e):
                 log.debug(f"ℹ️ Маржа уже ISOLATED для {symbol}")
             else:
-                log.warning(f"⚠️ Не удалось установить маржу ISOLATED для {symbol}: {e}")
+                log.warning(f"⚠️ Не удалось установить маржу ISOLATED: {e}")
 
-        # 🔸 Плечо
+        # 🔸 Установка плеча
         try:
             result = client.change_leverage(symbol=symbol, leverage=leverage)
             log.info(f"📌 Плечо установлено: {result['leverage']}x для {symbol}")
         except Exception as e:
-            log.warning(f"⚠️ Не удалось установить плечо для {symbol}, используется по умолчанию: {e}")
+            log.warning(f"⚠️ Не удалось установить плечо: {e}")
 
-        # 🔸 MARKET-ордер
+        # 🔸 Отправка MARKET ордера
         result = client.new_order(
             symbol=symbol,
             side=side,
@@ -74,56 +79,38 @@ async def handle_opened(event: dict):
             quantity=quantity
         )
 
-        log.info(f"✅ MARKET ордер отправлен: orderId={result['orderId']}, статус={result['status']}")
+        order_id = result["orderId"]
+        log.info(f"✅ MARKET ордер отправлен: orderId={order_id}, статус={result['status']}")
 
-        # 🔸 SL
-        sl_targets = json.loads(event.get("sl_targets", "[]"))
-        active_sl = next((sl for sl in sl_targets if not sl.get("hit") and not sl.get("canceled") and sl.get("price")), None)
+        # 🔸 Кэширование позиции в infra
+        infra.inflight_positions[position_uid] = {
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "order_id": order_id,
+            "created_at": datetime.utcnow()
+        }
 
-        if active_sl:
-            stop_price = float(active_sl["price"])
+        log.info(f"💾 Позиция временно сохранена в infra.inflight_positions: {position_uid}")
 
-            sl_order = client.new_order(
-                symbol=symbol,
-                side=opposite_side,
-                type="STOP_MARKET",
-                stopPrice=stop_price,
-                closePosition=True,
-                workingType="MARK_PRICE",
-                timeInForce="GTC"
+        # 🔸 Запись MARKET ордера в binance_orders_v4
+        await infra.pg_pool.execute(
+            """
+            INSERT INTO binance_orders_v4 (
+                position_uid, strategy_id, symbol, binance_order_id,
+                side, type, status, purpose, quantity, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, 'MARKET', 'NEW', 'entry', $6, NOW()
             )
+            """,
+            position_uid, strategy_id, symbol, order_id, side, Decimal(quantity)
+        )
 
-            log.info(f"🛡️ SL установлен: {stop_price} (orderId={sl_order['orderId']})")
-        else:
-            log.info("ℹ️ SL не задан или отменён")
-
-        # 🔸 TP
-        tp_targets = json.loads(event.get("tp_targets", "[]"))
-        for tp in tp_targets:
-            if tp.get("price") and not tp.get("canceled") and not tp.get("hit"):
-                # Округление quantity
-                tp_qty = float(Decimal(str(tp["quantity"])).quantize(quantize_mask, rounding=ROUND_DOWN))
-
-                # Округление price по precision_price
-                price_precision = get_price_precision_for_symbol(symbol)
-                price_mask = Decimal("1").scaleb(-price_precision)
-                tp_price_decimal = Decimal(str(tp["price"])).quantize(price_mask, rounding=ROUND_DOWN)
-                tp_price = format(tp_price_decimal, f".{price_precision}f")
-
-                tp_order = client.new_order(
-                    symbol=symbol,
-                    side=opposite_side,
-                    type="LIMIT",
-                    price=tp_price,
-                    quantity=tp_qty,
-                    reduceOnly=True,
-                    timeInForce="GTC"
-                )
-
-                log.info(f"🎯 TP-{tp['level']} установлен: {tp_price}, qty={tp_qty}, orderId={tp_order['orderId']}")
+        log.info(f"📝 Ордер записан в binance_orders_v4: {order_id} → {position_uid}")
 
     except Exception as e:
-        log.exception("❌ Ошибка при обработке события 'opened'")        
+        log.exception("❌ Ошибка при обработке открытия позиции на Binance")
 # 🔸 Обработка TP
 async def handle_tp_hit(event: dict):
     log.info(f"🎯 [tp_hit] Стратегия {event.get('strategy_id')} | TP уровень: {event.get('tp_level')}")
