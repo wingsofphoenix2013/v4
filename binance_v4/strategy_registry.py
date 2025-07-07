@@ -167,15 +167,15 @@ async def load_symbol_precisions():
             if price_precision is not None:
                 symbol_price_precision_map[symbol] = price_precision
 
-    log.info(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
-    log.info(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
+    log.debug(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
+    log.debug(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
 
     await log_binance_precision_check()
 
 
 # 🔸 Сравнение локальных precision с Binance
 async def log_binance_precision_check():
-    log.info("🔍 Сравнение точностей тикеров с Binance")
+    log.debug("🔍 Сравнение точностей тикеров с Binance")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -195,7 +195,7 @@ async def log_binance_precision_check():
                     db_price = symbol_price_precision_map.get(symbol, "-")
 
                     match = "✅" if bin_qty == db_qty and bin_price == db_price else "❗"
-                    log.info(f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | Binance: qty={bin_qty}, price={bin_price} {match}")
+                    log.debug(f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | Binance: qty={bin_qty}, price={bin_price} {match}")
 
     except Exception as e:
         log.warning(f"⚠️ Ошибка при получении данных от Binance: {e}")
