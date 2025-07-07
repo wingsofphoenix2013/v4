@@ -15,12 +15,18 @@ CONSUMER_NAME = "binance_open_worker"
 # 🔸 Инициализация консюмер-группы Redis
 async def init_redis_stream_group():
     try:
-        await infra.redis_client.xgroup_create(REDIS_STREAM_KEY, CONSUMER_GROUP, id="$", mkstream=True)
+        await infra.redis_client.xgroup_create(
+            name=REDIS_STREAM_KEY,
+            groupname=CONSUMER_GROUP,
+            id="$",
+            mkstream=True
+        )
         log.info(f"✅ Redis stream group {CONSUMER_GROUP} создан")
     except Exception as e:
         if "BUSYGROUP" in str(e):
             log.info(f"ℹ️ Redis group {CONSUMER_GROUP} уже существует")
         else:
+            log.exception("❌ Ошибка при создании Redis группы")
             raise
 
 
@@ -31,8 +37,8 @@ async def run_redis_consumer():
     while True:
         try:
             entries = await infra.redis_client.xreadgroup(
-                group_name=CONSUMER_GROUP,
-                consumer_name=CONSUMER_NAME,
+                groupname=CONSUMER_GROUP,
+                consumername=CONSUMER_NAME,
                 streams={REDIS_STREAM_KEY: '>'},
                 count=10,
                 block=5000
@@ -41,7 +47,13 @@ async def run_redis_consumer():
             for stream_key, messages in entries:
                 for message_id, fields in messages:
                     try:
-                        payload = json.loads(fields["data"])
+                        raw_data = fields.get("data")
+                        if not raw_data:
+                            log.warning(f"⚠️ Пустое поле 'data' в сообщении {message_id}")
+                            await infra.redis_client.xack(REDIS_STREAM_KEY, CONSUMER_GROUP, message_id)
+                            continue
+
+                        payload = json.loads(raw_data)
                         event_type = payload.get("event_type")
 
                         if event_type == "opened":
@@ -51,5 +63,6 @@ async def run_redis_consumer():
 
                     except Exception:
                         log.exception(f"❌ Ошибка обработки сообщения {message_id}")
+
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream")
