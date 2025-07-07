@@ -114,7 +114,7 @@ async def setup_binance_ws_client():
         infra.binance_ws_listen_key = listen_key
 
         # Устанавливаем WebSocket-соединение
-        url = f"wss://fstream.binance.com/ws/{listen_key}"
+        url = f"wss://fstream.binance.com/stream?streams={listen_key}"
         session = aiohttp.ClientSession()
         ws = await session.ws_connect(url)
         infra.binance_ws_session = session
