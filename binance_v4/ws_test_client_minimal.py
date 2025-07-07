@@ -24,7 +24,8 @@ async def run_ws_listener():
     listen_key = await get_listen_key()
     log.info(f"🧾 Получен listenKey: {listen_key}")
 
-    ws_url = f"wss://fstream.binance.com/stream?streams={listen_key}"
+    # ✅ Правильный URL по документации: /ws/<listenKey>
+    ws_url = f"wss://fstream.binance.com/ws/{listen_key}"
     log.info(f"🔌 Подключение к WebSocket: {ws_url}")
 
     async with aiohttp.ClientSession() as session:
