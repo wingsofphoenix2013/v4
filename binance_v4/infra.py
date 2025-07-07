@@ -104,6 +104,7 @@ async def setup_binance_client():
 
 # 🔸 Получение нового listenKey (вызов в binance_ws_v4 или setup)
 async def get_binance_listen_key() -> str:
+    log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
     url = "https://testnet.binancefuture.com/fapi/v1/listenKey"
 
