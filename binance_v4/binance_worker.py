@@ -29,7 +29,7 @@ async def handle_open_position(payload: dict):
     log.info(f"📤 Отправка MARKET-ордера: {symbol} {side} qty={qty_str}")
 
     try:
-        resp = await infra.binance_client.futures_create_order(
+        resp = await infra.binance_client.new_order(
             symbol=symbol,
             side=side,
             type="MARKET",
