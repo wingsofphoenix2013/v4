@@ -30,7 +30,7 @@ async def run_redis_consumer():
 
     while True:
         try:
-            entries = await infra.redis_client.xread_group(
+            entries = await infra.redis_client.xreadgroup(
                 group_name=CONSUMER_GROUP,
                 consumer_name=CONSUMER_NAME,
                 streams={REDIS_STREAM_KEY: '>'},
