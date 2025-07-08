@@ -20,11 +20,11 @@ PUBSUB_CHANNEL = "binance_strategy_updates"
 
 # 🔸 Загрузка всех разрешённых стратегий Binance при старте
 async def load_binance_enabled_strategies():
-    # Шаг 1: загружаем базовые настройки стратегий
+    # Шаг 1: базовые параметры стратегий
     query_base = """
-        SELECT id AS strategy_id, leverage, use_stoploss, sl_type, sl_value
-        FROM strategies_v4
-        WHERE binance_enabled = true
+        SELECT s.id AS strategy_id, s.leverage, s.use_stoploss, s.sl_type, s.sl_value
+        FROM strategies_v4 s
+        WHERE s.binance_enabled = true
     """
     base_rows = await infra.pg_pool.fetch(query_base)
 
@@ -41,9 +41,9 @@ async def load_binance_enabled_strategies():
             "tp_levels": {}
         }
 
-    # Шаг 2: загружаем TP/SL уровни отдельно
+    # Шаг 2: TP/SL уровни
     query_tp_sl = """
-        SELECT strategy_id,
+        SELECT s.id AS strategy_id,
                tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
                sl.sl_mode, sl.sl_value
         FROM strategies_v4 s
@@ -58,7 +58,7 @@ async def load_binance_enabled_strategies():
         level = row["tp_level"]
 
         if sid not in binance_strategies:
-            continue  # защита от рассинхрона
+            continue
 
         if level is not None:
             if row["sl_mode"] is not None:
@@ -75,7 +75,6 @@ async def load_binance_enabled_strategies():
 
     log.info(f"📊 Загружено {len(binance_strategies)} стратегий с binance_enabled=true")
 
-    # 🔸 Детальное логирование
     for sid, cfg in binance_strategies.items():
         log.info(f"🔸 Стратегия {sid}: leverage={cfg['leverage']}, SL={cfg['sl_type']} {cfg['sl_value']}%")
         for level, tp in sorted(cfg["tp_levels"].items()):
@@ -86,11 +85,10 @@ async def load_binance_enabled_strategies():
 
 # 🔸 Динамическая подгрузка полной конфигурации одной стратегии
 async def load_single_strategy(strategy_id: int):
-    # Шаг 1: стратегия
     query_base = """
-        SELECT id AS strategy_id, leverage, use_stoploss, sl_type, sl_value
-        FROM strategies_v4
-        WHERE id = $1
+        SELECT s.id AS strategy_id, s.leverage, s.use_stoploss, s.sl_type, s.sl_value
+        FROM strategies_v4 s
+        WHERE s.id = $1
     """
     base = await infra.pg_pool.fetchrow(query_base, strategy_id)
 
@@ -106,7 +104,6 @@ async def load_single_strategy(strategy_id: int):
         "tp_levels": {}
     }
 
-    # Шаг 2: TP/SL
     query_tp_sl = """
         SELECT tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
                sl.sl_mode, sl.sl_value
@@ -132,7 +129,7 @@ async def load_single_strategy(strategy_id: int):
                 "volume_percent": row["volume_percent"]
             }
 
-    log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")   
+    log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")
      
 # 🔸 Проверка: разрешена ли стратегия для Binance
 def is_strategy_binance_enabled(strategy_id: int) -> bool:
