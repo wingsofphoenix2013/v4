@@ -14,6 +14,8 @@ binance_strategies: dict[int, dict] = {}
 # 🔸 Кеш точностей тикеров: symbol → precision_qty
 symbol_precision_map: dict[str, int] = {}
 symbol_price_precision_map: dict[str, int] = {}
+symbol_tick_size_map: dict[str, float] = {}
+symbol_min_qty_map: dict[str, float] = {}
 
 # 🔸 Канал Pub/Sub для обновлений стратегий
 PUBSUB_CHANNEL = "binance_strategy_updates"
@@ -175,35 +177,29 @@ async def run_binance_strategy_watcher():
         except Exception:
             log.exception(f"❌ Ошибка обработки сообщения из {PUBSUB_CHANNEL}")
 
-
-# 🔸 Загрузка точностей тикеров из таблицы tickers_v4
+# 🔸 Загрузка точностей тикеров из таблицы tickers_v4 + tickSize из Binance
 async def load_symbol_precisions():
-    query = "SELECT symbol, precision_qty, precision_price FROM tickers_v4"
+    query = "SELECT symbol, precision_qty, precision_price, min_qty FROM tickers_v4"
     rows = await infra.pg_pool.fetch(query)
 
     symbol_precision_map.clear()
     symbol_price_precision_map.clear()
+    symbol_tick_size_map.clear()
+    symbol_min_qty_map.clear()
 
     for row in rows:
         symbol = row["symbol"]
         qty_precision = row["precision_qty"]
         price_precision = row["precision_price"]
+        min_qty = row["min_qty"]
 
         if symbol:
             if qty_precision is not None:
                 symbol_precision_map[symbol] = qty_precision
             if price_precision is not None:
                 symbol_price_precision_map[symbol] = price_precision
-
-    log.debug(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
-    log.debug(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
-
-    await log_binance_precision_check()
-
-
-# 🔸 Сравнение локальных precision с Binance
-async def log_binance_precision_check():
-    log.debug("🔍 Сравнение точностей тикеров с Binance")
+            if min_qty is not None:
+                symbol_min_qty_map[symbol] = float(min_qty)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -212,22 +208,49 @@ async def log_binance_precision_check():
                 all_symbols = {s["symbol"]: s for s in data.get("symbols", [])}
 
                 for symbol in sorted(symbol_precision_map):
-                    binance = all_symbols.get(symbol)
-                    if not binance:
+                    entry = all_symbols.get(symbol)
+                    if not entry:
                         log.warning(f"❓ {symbol} отсутствует в Binance exchangeInfo")
                         continue
 
-                    bin_qty = binance.get("quantityPrecision")
-                    bin_price = binance.get("pricePrecision")
+                    bin_qty = entry.get("quantityPrecision")
+                    bin_price = entry.get("pricePrecision")
+
                     db_qty = symbol_precision_map.get(symbol, "-")
                     db_price = symbol_price_precision_map.get(symbol, "-")
 
-                    match = "✅" if bin_qty == db_qty and bin_price == db_price else "❗"
-                    log.debug(f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | Binance: qty={bin_qty}, price={bin_price} {match}")
+                    # 🔸 tickSize
+                    price_filter = next(
+                        (f for f in entry.get("filters", []) if f["filterType"] == "PRICE_FILTER"),
+                        None
+                    )
+                    tick_size = float(price_filter["tickSize"]) if price_filter else None
+                    if tick_size:
+                        symbol_tick_size_map[symbol] = tick_size
+
+                    match_qty = "✅" if bin_qty == db_qty else "❗"
+                    match_price = "✅" if bin_price == db_price else "❗"
+
+                    # 🔸 tickSize vs min_qty
+                    db_tick = symbol_min_qty_map.get(symbol)
+                    if db_tick is not None and abs(tick_size - db_tick) > 1e-10:
+                        match_tick = "❗"
+                        log.info(f"  • {symbol:<10} | DB: tick={db_tick} | Binance: tick={tick_size} {match_tick}")
+                    else:
+                        match_tick = "✅"
+
+                    log.info(
+                        f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | "
+                        f"Binance: qty={bin_qty}, price={bin_price} | tick={tick_size} {match_qty}{match_price}{match_tick}"
+                    )
 
     except Exception as e:
         log.warning(f"⚠️ Ошибка при получении данных от Binance: {e}")
 
+    log.info(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
+    log.info(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
+    log.info(f"📊 Загружено tickSize для {len(symbol_tick_size_map)} тикеров")
+    
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:
     return symbol_precision_map.get(symbol, 3)
