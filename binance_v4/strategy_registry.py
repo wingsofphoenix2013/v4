@@ -156,7 +156,7 @@ async def run_binance_strategy_watcher():
     pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe(PUBSUB_CHANNEL)
 
-    log.info(f"📡 Подписка на канал Redis: {PUBSUB_CHANNEL}")
+    log.debug(f"📡 Подписка на канал Redis: {PUBSUB_CHANNEL}")
 
     async for message in pubsub.listen():
         if message["type"] != "message":
@@ -232,13 +232,13 @@ async def load_symbol_precisions():
                     if tick_size is not None and db_tick is not None:
                         if abs(tick_size - db_tick) > 1e-10:
                             match_tick = "❗"
-                            log.info(f"  • {symbol:<10} | DB: tick={db_tick} | Binance: tick={tick_size} {match_tick}")
+                            log.debug(f"  • {symbol:<10} | DB: tick={db_tick} | Binance: tick={tick_size} {match_tick}")
                         else:
                             match_tick = "✅"
                     else:
                         match_tick = "—"
 
-                    log.info(
+                    log.debug(
                         f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | "
                         f"Binance: qty={bin_qty}, price={bin_price} | tick={tick_size} {match_qty}{match_price}{match_tick}"
                     )
@@ -246,9 +246,9 @@ async def load_symbol_precisions():
     except Exception as e:
         log.warning(f"⚠️ Ошибка при получении данных от Binance: {e}")
 
-    log.info(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
-    log.info(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
-    log.info(f"📊 Загружено ticksize из БД для {len(symbol_tick_size_map)} тикеров")    
+    log.debug(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
+    log.debug(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
+    log.debug(f"📊 Загружено ticksize из БД для {len(symbol_tick_size_map)} тикеров")    
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:
     return symbol_precision_map.get(symbol, 3)
@@ -257,3 +257,11 @@ def get_precision_for_symbol(symbol: str) -> int:
 # 🔸 Получение точности price по символу
 def get_price_precision_for_symbol(symbol: str) -> int:
     return symbol_price_precision_map.get(symbol, 2)
+    
+# 🔸 Округление значения по ticksize (вниз к ближайшему кратному)
+def round_to_tick(value: float, tick: float) -> float:
+    if tick <= 0:
+        raise ValueError("Tick size must be positive and non-zero")
+
+    rounded = round(value / tick) * tick
+    return round(rounded, 10)  # 🔸 защита от плавающей точности

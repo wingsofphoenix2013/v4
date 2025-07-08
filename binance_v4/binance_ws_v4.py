@@ -126,70 +126,84 @@ async def on_order_filled(order: dict):
         tp_levels=tp_levels,
         sl_price=sl_price
     )
-    
-# 🔸 Размещение TP и SL ордеров после входа в позицию
-async def place_tp_sl_orders(
-    symbol: str,
-    direction: str,
-    entry_price: float,
-    qty: float,
-    tp_levels: dict,
-    sl_price: float
-):
-    side_tp = "SELL" if direction == "long" else "BUY"
-    qty_precision = get_precision_for_symbol(symbol)
+
+# 🔸 Размещение TP и SL ордеров после открытия позиции
+async def place_tp_sl_orders(symbol: str, direction: str, qty: float, entry_price: float, strategy_id: int):
+    config = get_strategy_config(strategy_id)
+    if not config:
+        log.warning(f"⚠️ Стратегия {strategy_id} не найдена в кеше для размещения TP/SL")
+        return
+
+    tp_levels = config.get("tp_levels", {})
     price_precision = get_price_precision_for_symbol(symbol)
+    tick = get_tick_size_for_symbol(symbol)
 
-    total_allocated = 0.0
-    sorted_levels = sorted(tp_levels.items())
+    total_tp_volume = 0.0
+    sorted_tp = sorted(tp_levels.items())
+    num_tp = len(sorted_tp)
 
-    for i, (level, tp) in enumerate(sorted_levels):
+    # 🔸 TP ордера
+    for i, (level, tp) in enumerate(sorted_tp):
         if tp["tp_type"] != "percent":
             continue
 
         percent = float(tp["tp_value"]) / 100
+        volume_percent = float(tp["volume_percent"])
 
-        tp_price = (
-            entry_price * (1 + percent)
-            if direction == "long"
-            else entry_price * (1 - percent)
-        )
-        tp_price = round(tp_price, price_precision)
-
-        if i < len(sorted_levels) - 1:
-            volume = qty * (float(tp["volume_percent"]) / 100)
-            volume = round(volume, qty_precision)
-            total_allocated += volume
+        if i < num_tp - 1:
+            volume = qty * (volume_percent / 100)
+            total_tp_volume += volume
         else:
-            volume = round(qty - total_allocated, qty_precision)
+            volume = qty - total_tp_volume  # 🔸 остаток для последнего TP
 
-        if volume <= 0:
-            continue
+        if direction == "long":
+            tp_price = entry_price * (1 + percent)
+            side = "SELL"
+        else:
+            tp_price = entry_price * (1 - percent)
+            side = "BUY"
+
+        tp_price = round_to_tick(tp_price, tick)
+        volume = round(volume, get_precision_for_symbol(symbol))
+        volume_str = f"{volume:.{get_precision_for_symbol(symbol)}f}"
 
         try:
-            resp = infra.binance_client.new_order(
+            resp = await infra.binance_client.new_order(
                 symbol=symbol,
-                side=side_tp,
+                side=side,
                 type="LIMIT",
-                quantity=f"{volume:.{qty_precision}f}",
+                timeInForce="GTC",
+                quantity=volume_str,
                 price=f"{tp_price:.{price_precision}f}",
-                reduceOnly=True,
-                timeInForce="GTC"
+                reduceOnly=True
             )
-            log.info(f"📌 TP{level} ордер размещён: qty={volume}, price={tp_price}")
+            log.info(f"📌 TP{level} ордер размещён: qty={volume_str}, price={tp_price:.{price_precision}f}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка размещения TP{level}: {e}")
 
-    # 🔸 Размещение SL-ордера (STOP_MARKET)
+    # 🔸 SL ордер (STOP_MARKET)
+    sl_value = float(config.get("sl_value", 0))
+    sl_percent = sl_value / 100
+
+    if direction == "long":
+        sl_price = entry_price * (1 - sl_percent)
+        side = "SELL"
+    else:
+        sl_price = entry_price * (1 + sl_percent)
+        side = "BUY"
+
+    sl_price = round_to_tick(sl_price, tick)
+    qty_str = f"{qty:.{get_precision_for_symbol(symbol)}f}"
+
     try:
-        resp = infra.binance_client.new_order(
+        resp = await infra.binance_client.new_order(
             symbol=symbol,
-            side=side_tp,
+            side=side,
             type="STOP_MARKET",
-            stopPrice=f"{round(sl_price, price_precision):.{price_precision}f}",
-            quantity=f"{round(qty, qty_precision):.{qty_precision}f}",
+            stopPrice=f"{sl_price:.{price_precision}f}",
+            quantity=qty_str,
             reduceOnly=True
         )
-        log.info(f"📌 SL ордер размещён: qty={qty}, stopPrice={sl_price}")
+        log.info(f"📌 SL ордер размещён: qty={qty_str}, stopPrice={sl_price:.{price_precision}f}")
     except Exception as e:
         log.warning(f"⚠️ Ошибка размещения SL: {e}")
