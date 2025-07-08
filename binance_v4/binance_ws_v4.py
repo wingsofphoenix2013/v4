@@ -96,23 +96,14 @@ async def on_order_filled(order: dict):
         except Exception as e:
             log.warning(f"⚠️ Ошибка расчёта TP{level}: {e}")
 
-    # 🔸 Начальный SL из strategies_v4
-    if config.get("use_stoploss"):
-        sl_type = config.get("sl_type")
-        sl_value = config.get("sl_value")
+    # 🔸 SL: всегда percent
+    sl_value = float(config["sl_value"])
+    percent = sl_value / 100
 
-        if sl_type == "percent":
-            try:
-                percent = float(sl_value) / 100
-                if direction == "long":
-                    sl_price = entry_price * (1 - percent)
-                else:
-                    sl_price = entry_price * (1 + percent)
-                sl_price = round(sl_price, price_precision)
-                log.info(f"🔸 SL (initial): {sl_price:.{price_precision}f} ({sl_value}%)")
-            except Exception as e:
-                log.warning(f"⚠️ Ошибка при расчёте SL (percent): {e}")
-        else:
-            log.warning(f"⚠️ SL тип '{sl_type}' не поддерживается")
+    if direction == "long":
+        sl_price = entry_price * (1 - percent)
     else:
-        log.info("🔸 SL: отключён")
+        sl_price = entry_price * (1 + percent)
+
+    sl_price = round(sl_price, price_precision)
+    log.info(f"🔸 SL (initial): {sl_price:.{price_precision}f} ({sl_value}%)")
