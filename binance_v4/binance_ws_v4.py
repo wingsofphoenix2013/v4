@@ -84,7 +84,7 @@ async def on_order_filled(order: dict):
             continue
 
         tp_value = float(tp["tp_value"])
-        volume = qty * (tp["volume_percent"] / 100)
+        volume = qty * (float(tp["volume_percent"]) / 100)
         percent = tp_value / 100
 
         if direction == "long":
