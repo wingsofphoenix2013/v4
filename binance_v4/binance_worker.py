@@ -10,21 +10,17 @@ from strategy_registry import (
 
 log = logging.getLogger("BINANCE_WORKER")
 
-
 # 🔸 Обработка события "opened": открытие MARKET-ордера на Binance
 async def handle_open_position(payload: dict):
     strategy_id = int(payload["strategy_id"])
     symbol = payload["symbol"]
     direction = payload["direction"]
     quantity = float(payload["quantity"])
-    position_uid = payload["position_uid"]
 
     side = "BUY" if direction == "long" else "SELL"
     qty_precision = get_precision_for_symbol(symbol)
     qty = round(quantity, qty_precision)
     qty_str = f"{qty:.{qty_precision}f}"
-
-    client_order_id = f"entry_{position_uid}"
 
     log.info(f"📤 Отправка MARKET-ордера: {symbol} {side} qty={qty_str}")
 
@@ -33,8 +29,7 @@ async def handle_open_position(payload: dict):
             symbol=symbol,
             side=side,
             type="MARKET",
-            quantity=qty_str,
-            newClientOrderId=client_order_id
+            quantity=qty_str
         )
         log.info(f"✅ Binance order sent: orderId={resp['orderId']}")
 
