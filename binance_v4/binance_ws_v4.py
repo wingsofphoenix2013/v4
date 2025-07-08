@@ -51,7 +51,6 @@ async def run_binance_ws_listener():
         log.info("⏳ Перезапуск подключения через 5 секунд...")
         await asyncio.sleep(5)
 
-
 # 🔸 Обработка FILLED-события: расчёт TP и SL
 async def on_order_filled(order: dict):
     order_id = order["i"]
@@ -82,34 +81,38 @@ async def on_order_filled(order: dict):
         if tp["tp_type"] != "percent":
             continue
 
-        tp_value = float(tp["tp_value"])
-        volume = qty * (float(tp["volume_percent"]) / 100)
-        percent = tp_value / 100
+        try:
+            tp_value = float(tp["tp_value"])
+            volume = qty * (float(tp["volume_percent"]) / 100)
+            percent = tp_value / 100
 
-        if direction == "long":
-            tp_price = entry_price * (1 + percent)
-        else:
-            tp_price = entry_price * (1 - percent)
+            if direction == "long":
+                tp_price = entry_price * (1 + percent)
+            else:
+                tp_price = entry_price * (1 - percent)
 
-        tp_price = round(tp_price, price_precision)
-        log.info(f"🔸 TP{level}: {tp_price:.{price_precision}f} | {tp['volume_percent']}% → {volume:.4f}")
+            tp_price = round(tp_price, price_precision)
+            log.info(f"🔸 TP{level}: {tp_price:.{price_precision}f} | {tp['volume_percent']}% → {volume:.4f}")
+        except Exception as e:
+            log.warning(f"⚠️ Ошибка расчёта TP{level}: {e}")
 
     # 🔸 Начальный SL из strategies_v4
     if config.get("use_stoploss"):
         sl_type = config.get("sl_type")
         sl_value = config.get("sl_value")
 
-        if sl_type == "percent" and sl_value is not None:
-            percent = float(sl_value) / 100
-            if direction == "long":
-                sl_price = entry_price * (1 - percent)
-            else:
-                sl_price = entry_price * (1 + percent)
-            sl_price = round(sl_price, price_precision)
-            log.info(f"🔸 SL (initial): {sl_price:.{price_precision}f} ({sl_value}%)")
-
+        if sl_type == "percent":
+            try:
+                percent = float(sl_value) / 100
+                if direction == "long":
+                    sl_price = entry_price * (1 - percent)
+                else:
+                    sl_price = entry_price * (1 + percent)
+                sl_price = round(sl_price, price_precision)
+                log.info(f"🔸 SL (initial): {sl_price:.{price_precision}f} ({sl_value}%)")
+            except Exception as e:
+                log.warning(f"⚠️ Ошибка при расчёте SL (percent): {e}")
         else:
             log.warning(f"⚠️ SL тип '{sl_type}' не поддерживается")
-
     else:
         log.info("🔸 SL: отключён")
