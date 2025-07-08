@@ -73,7 +73,6 @@ async def on_order_filled(order: dict):
         return
 
     tp_levels = config.get("tp_levels", {})
-    sl_policy = config.get("sl_policy", {})
     price_precision = get_price_precision_for_symbol(symbol)
 
     log.info(f"📐 FILLED стратегия {strategy_id}, symbol={symbol}, entry={entry_price:.{price_precision}f}, qty={qty}")
@@ -95,29 +94,22 @@ async def on_order_filled(order: dict):
         tp_price = round(tp_price, price_precision)
         log.info(f"🔸 TP{level}: {tp_price:.{price_precision}f} | {tp['volume_percent']}% → {volume:.4f}")
 
-    # 🔸 SL-политика на уровне 0
-    sl = sl_policy.get(0)
-    if sl:
-        sl_mode = sl["sl_mode"]
-        sl_value = float(sl["sl_value"]) if sl["sl_value"] is not None else None
+    # 🔸 Начальный SL из strategies_v4
+    if config.get("use_stoploss"):
+        sl_type = config.get("sl_type")
+        sl_value = config.get("sl_value")
 
-        if sl_mode == "percent" and sl_value is not None:
-            percent = sl_value / 100
+        if sl_type == "percent" and sl_value is not None:
+            percent = float(sl_value) / 100
             if direction == "long":
                 sl_price = entry_price * (1 - percent)
             else:
                 sl_price = entry_price * (1 + percent)
             sl_price = round(sl_price, price_precision)
-            log.info(f"🔸 SL (percent): {sl_price:.{price_precision}f} ({sl_value}%)")
-
-        elif sl_mode == "entry":
-            sl_price = round(entry_price, price_precision)
-            log.info(f"🔸 SL (entry): {sl_price:.{price_precision}f}")
-
-        elif sl_mode == "none":
-            log.info("🔸 SL: none")
+            log.info(f"🔸 SL (initial): {sl_price:.{price_precision}f} ({sl_value}%)")
 
         else:
-            log.warning(f"⚠️ SL режим '{sl_mode}' не поддерживается")
+            log.warning(f"⚠️ SL тип '{sl_type}' не поддерживается")
+
     else:
-        log.info("🔸 Нет SL-политики на уровне 0")
+        log.info("🔸 SL: отключён")
