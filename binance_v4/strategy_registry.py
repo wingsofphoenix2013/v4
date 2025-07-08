@@ -132,25 +132,6 @@ async def load_single_strategy(strategy_id: int):
 
     log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")
      
-# 🔸 Проверка: разрешена ли стратегия для Binance
-def is_strategy_binance_enabled(strategy_id: int) -> bool:
-    return strategy_id in binance_strategies
-
-
-# 🔸 Получение плеча по стратегии (по умолчанию 1)
-def get_leverage(strategy_id: int) -> int:
-    return binance_strategies.get(strategy_id, {}).get("leverage", 1)
-
-
-# 🔸 Получение SL-политики для TP-уровня
-def get_sl_policy(strategy_id: int, tp_level: int) -> dict | None:
-    return binance_strategies.get(strategy_id, {}).get("sl_policy", {}).get(tp_level)
-
-
-# 🔸 Получение полной конфигурации стратегии
-def get_strategy_config(strategy_id: int) -> dict | None:
-    return binance_strategies.get(strategy_id)
-
 # 🔸 Слушатель Redis Pub/Sub для обновлений стратегий в кеше
 async def run_binance_strategy_watcher():
     pubsub = infra.redis_client.pubsub()
@@ -248,15 +229,19 @@ async def load_symbol_precisions():
 
     log.debug(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
     log.debug(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
-    log.debug(f"📊 Загружено ticksize из БД для {len(symbol_tick_size_map)} тикеров")    
+    log.debug(f"📊 Загружено ticksize из БД для {len(symbol_tick_size_map)} тикеров")  
+      
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:
     return symbol_precision_map.get(symbol, 3)
 
-
 # 🔸 Получение точности price по символу
 def get_price_precision_for_symbol(symbol: str) -> int:
     return symbol_price_precision_map.get(symbol, 2)
+
+# 🔸 Получение ticksize по символу
+def get_tick_size_for_symbol(symbol: str) -> float:
+    return symbol_tick_size_map.get(symbol, 0.01)
     
 # 🔸 Округление значения по ticksize (вниз к ближайшему кратному)
 def round_to_tick(value: float, tick: float) -> float:
@@ -265,3 +250,18 @@ def round_to_tick(value: float, tick: float) -> float:
 
     rounded = round(value / tick) * tick
     return round(rounded, 10)  # 🔸 защита от плавающей точности
+# 🔸 Проверка: разрешена ли стратегия для Binance
+def is_strategy_binance_enabled(strategy_id: int) -> bool:
+    return strategy_id in binance_strategies
+
+# 🔸 Получение плеча по стратегии (по умолчанию 1)
+def get_leverage(strategy_id: int) -> int:
+    return binance_strategies.get(strategy_id, {}).get("leverage", 1)
+
+# 🔸 Получение SL-политики для TP-уровня
+def get_sl_policy(strategy_id: int, tp_level: int) -> dict | None:
+    return binance_strategies.get(strategy_id, {}).get("sl_policy", {}).get(tp_level)
+
+# 🔸 Получение полной конфигурации стратегии
+def get_strategy_config(strategy_id: int) -> dict | None:
+    return binance_strategies.get(strategy_id)
