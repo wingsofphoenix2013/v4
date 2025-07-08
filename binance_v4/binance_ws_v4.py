@@ -123,8 +123,7 @@ async def on_order_filled(order: dict):
         direction=direction,
         entry_price=entry_price,
         qty=qty,
-        tp_levels=tp_levels,
-        sl_price=sl_price
+        strategy_id=strategy_id
     )
 
 # 🔸 Размещение TP и SL ордеров после открытия позиции
