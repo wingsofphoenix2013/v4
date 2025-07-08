@@ -18,12 +18,32 @@ symbol_price_precision_map: dict[str, int] = {}
 # 🔸 Канал Pub/Sub для обновлений стратегий
 PUBSUB_CHANNEL = "binance_strategy_updates"
 
-
 # 🔸 Загрузка всех разрешённых стратегий Binance при старте
 async def load_binance_enabled_strategies():
-    query = """
-        SELECT s.id AS strategy_id, s.leverage,
-               s.use_stoploss, s.sl_type, s.sl_value,
+    # Шаг 1: загружаем базовые настройки стратегий
+    query_base = """
+        SELECT id AS strategy_id, leverage, use_stoploss, sl_type, sl_value
+        FROM strategies_v4
+        WHERE binance_enabled = true
+    """
+    base_rows = await infra.pg_pool.fetch(query_base)
+
+    binance_strategies.clear()
+
+    for row in base_rows:
+        sid = row["strategy_id"]
+        binance_strategies[sid] = {
+            "leverage": int(row["leverage"] or 1),
+            "use_stoploss": row["use_stoploss"],
+            "sl_type": row["sl_type"],
+            "sl_value": row["sl_value"],
+            "sl_policy": {},
+            "tp_levels": {}
+        }
+
+    # Шаг 2: загружаем TP/SL уровни отдельно
+    query_tp_sl = """
+        SELECT strategy_id,
                tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
                sl.sl_mode, sl.sl_value
         FROM strategies_v4 s
@@ -31,30 +51,14 @@ async def load_binance_enabled_strategies():
         LEFT JOIN strategy_tp_sl_v4 sl ON sl.strategy_id = s.id AND sl.tp_level_id = tp.id
         WHERE s.binance_enabled = true
     """
-    rows = await infra.pg_pool.fetch(query)
-
-    binance_strategies.clear()
+    rows = await infra.pg_pool.fetch(query_tp_sl)
 
     for row in rows:
         sid = row["strategy_id"]
         level = row["tp_level"]
 
         if sid not in binance_strategies:
-            binance_strategies[sid] = {
-                "leverage": int(row["leverage"] or 1),
-                "use_stoploss": row["use_stoploss"],
-                "sl_type": row["sl_type"],
-                "sl_value": row["sl_value"],
-                "sl_policy": {},
-                "tp_levels": {}
-            }
-        else:
-            if binance_strategies[sid]["use_stoploss"] is None and row["use_stoploss"] is not None:
-                binance_strategies[sid]["use_stoploss"] = row["use_stoploss"]
-            if binance_strategies[sid]["sl_type"] is None and row["sl_type"] is not None:
-                binance_strategies[sid]["sl_type"] = row["sl_type"]
-            if binance_strategies[sid]["sl_value"] is None and row["sl_value"] is not None:
-                binance_strategies[sid]["sl_value"] = row["sl_value"]
+            continue  # защита от рассинхрона
 
         if level is not None:
             if row["sl_mode"] is not None:
@@ -71,7 +75,7 @@ async def load_binance_enabled_strategies():
 
     log.info(f"📊 Загружено {len(binance_strategies)} стратегий с binance_enabled=true")
 
-    # 🔸 Детальное логирование по каждой стратегии
+    # 🔸 Детальное логирование
     for sid, cfg in binance_strategies.items():
         log.info(f"🔸 Стратегия {sid}: leverage={cfg['leverage']}, SL={cfg['sl_type']} {cfg['sl_value']}%")
         for level, tp in sorted(cfg["tp_levels"].items()):
@@ -82,40 +86,37 @@ async def load_binance_enabled_strategies():
 
 # 🔸 Динамическая подгрузка полной конфигурации одной стратегии
 async def load_single_strategy(strategy_id: int):
-    query = """
-        SELECT s.id AS strategy_id, s.leverage,
-               s.use_stoploss, s.sl_type, s.sl_value,
-               tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
-               sl.sl_mode, sl.sl_value
-        FROM strategies_v4 s
-        LEFT JOIN strategy_tp_levels_v4 tp ON tp.strategy_id = s.id
-        LEFT JOIN strategy_tp_sl_v4 sl ON sl.strategy_id = s.id AND sl.tp_level_id = tp.id
-        WHERE s.id = $1
+    # Шаг 1: стратегия
+    query_base = """
+        SELECT id AS strategy_id, leverage, use_stoploss, sl_type, sl_value
+        FROM strategies_v4
+        WHERE id = $1
     """
-    rows = await infra.pg_pool.fetch(query, strategy_id)
+    base = await infra.pg_pool.fetchrow(query_base, strategy_id)
 
-    if not rows:
+    if not base:
         return
 
     binance_strategies[strategy_id] = {
-        "leverage": 1,
-        "use_stoploss": None,
-        "sl_type": None,
-        "sl_value": None,
+        "leverage": int(base["leverage"] or 1),
+        "use_stoploss": base["use_stoploss"],
+        "sl_type": base["sl_type"],
+        "sl_value": base["sl_value"],
         "sl_policy": {},
         "tp_levels": {}
     }
 
+    # Шаг 2: TP/SL
+    query_tp_sl = """
+        SELECT tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
+               sl.sl_mode, sl.sl_value
+        FROM strategy_tp_levels_v4 tp
+        LEFT JOIN strategy_tp_sl_v4 sl ON sl.strategy_id = $1 AND sl.tp_level_id = tp.id
+        WHERE tp.strategy_id = $1
+    """
+    rows = await infra.pg_pool.fetch(query_tp_sl, strategy_id)
+
     for row in rows:
-        binance_strategies[strategy_id]["leverage"] = int(row["leverage"] or 1)
-
-        if binance_strategies[strategy_id]["use_stoploss"] is None and row["use_stoploss"] is not None:
-            binance_strategies[strategy_id]["use_stoploss"] = row["use_stoploss"]
-        if binance_strategies[strategy_id]["sl_type"] is None and row["sl_type"] is not None:
-            binance_strategies[strategy_id]["sl_type"] = row["sl_type"]
-        if binance_strategies[strategy_id]["sl_value"] is None and row["sl_value"] is not None:
-            binance_strategies[strategy_id]["sl_value"] = row["sl_value"]
-
         level = row["tp_level"]
 
         if level is not None:
@@ -131,8 +132,8 @@ async def load_single_strategy(strategy_id: int):
                 "volume_percent": row["volume_percent"]
             }
 
-    log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")
-    
+    log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")   
+     
 # 🔸 Проверка: разрешена ли стратегия для Binance
 def is_strategy_binance_enabled(strategy_id: int) -> bool:
     return strategy_id in binance_strategies
