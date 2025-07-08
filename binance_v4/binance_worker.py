@@ -4,9 +4,10 @@ import logging
 from infra import infra
 from strategy_registry import (
     get_precision_for_symbol,
+    get_leverage,
     is_strategy_binance_enabled,
 )
-from binance_ws_v4 import filled_order_map  # 🔸 карта: orderId → {strategy_id, direction, quantity}
+from binance_ws_v4 import filled_order_map
 
 log = logging.getLogger("BINANCE_WORKER")
 
@@ -28,6 +29,15 @@ async def handle_open_position(payload: dict):
     qty = round(quantity, qty_precision)
     qty_str = f"{qty:.{qty_precision}f}"
 
+    leverage = get_leverage(strategy_id)
+
+    log.info(f"⚙️ Установка плеча {leverage} и режима 'ISOLATED' для {symbol}")
+    try:
+        infra.binance_client.change_margin_type(symbol=symbol, marginType="ISOLATED")
+        infra.binance_client.change_leverage(symbol=symbol, leverage=leverage)
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось установить плечо/маржу для {symbol}: {e}")
+
     log.info(f"📤 Отправка MARKET-ордера: {symbol} {side} qty={qty_str} (strategy_id={strategy_id})")
 
     try:
@@ -39,7 +49,6 @@ async def handle_open_position(payload: dict):
         )
         order_id = resp["orderId"]
 
-        # 🔸 Сохраняем orderId для последующей привязки к стратегии
         filled_order_map[order_id] = {
             "strategy_id": strategy_id,
             "direction": direction,
