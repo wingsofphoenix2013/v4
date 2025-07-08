@@ -5,8 +5,17 @@ import aiohttp
 import logging
 import json
 
-from infra import get_binance_listen_key, keep_alive_binance_listen_key
-from strategy_registry import get_strategy_config, get_price_precision_for_symbol
+from infra import (
+    infra,
+    get_binance_listen_key,
+    keep_alive_binance_listen_key,
+)
+
+from strategy_registry import (
+    get_strategy_config,
+    get_price_precision_for_symbol,
+    get_precision_for_symbol,
+)
 
 log = logging.getLogger("BINANCE_WS")
 
@@ -107,3 +116,80 @@ async def on_order_filled(order: dict):
 
     sl_price = round(sl_price, price_precision)
     log.info(f"🔸 SL (initial): {sl_price:.{price_precision}f} ({sl_value}%)")
+
+    # 🔸 Размещение ордеров
+    await place_tp_sl_orders(
+        symbol=symbol,
+        direction=direction,
+        entry_price=entry_price,
+        qty=qty,
+        tp_levels=tp_levels,
+        sl_price=sl_price
+    )
+    
+# 🔸 Размещение TP и SL ордеров после входа в позицию
+async def place_tp_sl_orders(
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    qty: float,
+    tp_levels: dict,
+    sl_price: float
+):
+    side_tp = "SELL" if direction == "long" else "BUY"
+    qty_precision = get_precision_for_symbol(symbol)
+    price_precision = get_price_precision_for_symbol(symbol)
+
+    total_allocated = 0.0
+    sorted_levels = sorted(tp_levels.items())
+
+    for i, (level, tp) in enumerate(sorted_levels):
+        if tp["tp_type"] != "percent":
+            continue
+
+        percent = float(tp["tp_value"]) / 100
+
+        tp_price = (
+            entry_price * (1 + percent)
+            if direction == "long"
+            else entry_price * (1 - percent)
+        )
+        tp_price = round(tp_price, price_precision)
+
+        if i < len(sorted_levels) - 1:
+            volume = qty * (float(tp["volume_percent"]) / 100)
+            volume = round(volume, qty_precision)
+            total_allocated += volume
+        else:
+            volume = round(qty - total_allocated, qty_precision)
+
+        if volume <= 0:
+            continue
+
+        try:
+            resp = infra.binance_client.new_order(
+                symbol=symbol,
+                side=side_tp,
+                type="LIMIT",
+                quantity=f"{volume:.{qty_precision}f}",
+                price=f"{tp_price:.{price_precision}f}",
+                reduceOnly=True,
+                timeInForce="GTC"
+            )
+            log.info(f"📌 TP{level} ордер размещён: qty={volume}, price={tp_price}")
+        except Exception as e:
+            log.warning(f"⚠️ Ошибка размещения TP{level}: {e}")
+
+    # 🔸 Размещение SL-ордера (STOP_MARKET)
+    try:
+        resp = infra.binance_client.new_order(
+            symbol=symbol,
+            side=side_tp,
+            type="STOP_MARKET",
+            stopPrice=f"{round(sl_price, price_precision):.{price_precision}f}",
+            quantity=f"{round(qty, qty_precision):.{qty_precision}f}",
+            reduceOnly=True
+        )
+        log.info(f"📌 SL ордер размещён: qty={qty}, stopPrice={sl_price}")
+    except Exception as e:
+        log.warning(f"⚠️ Ошибка размещения SL: {e}")
