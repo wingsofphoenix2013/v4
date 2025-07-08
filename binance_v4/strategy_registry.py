@@ -23,6 +23,7 @@ PUBSUB_CHANNEL = "binance_strategy_updates"
 async def load_binance_enabled_strategies():
     query = """
         SELECT s.id AS strategy_id, s.leverage,
+               s.use_stoploss, s.sl_type, s.sl_value,
                tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
                sl.sl_mode, sl.sl_value
         FROM strategies_v4 s
@@ -41,6 +42,9 @@ async def load_binance_enabled_strategies():
         if sid not in binance_strategies:
             binance_strategies[sid] = {
                 "leverage": int(row["leverage"] or 1),
+                "use_stoploss": row["use_stoploss"],
+                "sl_type": row["sl_type"],
+                "sl_value": row["sl_value"],
                 "sl_policy": {},
                 "tp_levels": {}
             }
@@ -65,6 +69,7 @@ async def load_binance_enabled_strategies():
 async def load_single_strategy(strategy_id: int):
     query = """
         SELECT s.id AS strategy_id, s.leverage,
+               s.use_stoploss, s.sl_type, s.sl_value,
                tp.level AS tp_level, tp.tp_type, tp.tp_value, tp.volume_percent,
                sl.sl_mode, sl.sl_value
         FROM strategies_v4 s
@@ -79,12 +84,19 @@ async def load_single_strategy(strategy_id: int):
 
     binance_strategies[strategy_id] = {
         "leverage": 1,
+        "use_stoploss": None,
+        "sl_type": None,
+        "sl_value": None,
         "sl_policy": {},
         "tp_levels": {}
     }
 
     for row in rows:
         binance_strategies[strategy_id]["leverage"] = int(row["leverage"] or 1)
+        binance_strategies[strategy_id]["use_stoploss"] = row["use_stoploss"]
+        binance_strategies[strategy_id]["sl_type"] = row["sl_type"]
+        binance_strategies[strategy_id]["sl_value"] = row["sl_value"]
+
         level = row["tp_level"]
 
         if level is not None:
@@ -101,7 +113,6 @@ async def load_single_strategy(strategy_id: int):
             }
 
     log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")
-
 
 # 🔸 Проверка: разрешена ли стратегия для Binance
 def is_strategy_binance_enabled(strategy_id: int) -> bool:
