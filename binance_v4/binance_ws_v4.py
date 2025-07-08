@@ -15,6 +15,8 @@ from strategy_registry import (
     get_strategy_config,
     get_price_precision_for_symbol,
     get_precision_for_symbol,
+    get_tick_size_for_symbol,
+    round_to_tick,
 )
 
 log = logging.getLogger("BINANCE_WS")
