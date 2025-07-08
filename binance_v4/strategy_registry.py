@@ -48,6 +48,13 @@ async def load_binance_enabled_strategies():
                 "sl_policy": {},
                 "tp_levels": {}
             }
+        else:
+            if binance_strategies[sid]["use_stoploss"] is None and row["use_stoploss"] is not None:
+                binance_strategies[sid]["use_stoploss"] = row["use_stoploss"]
+            if binance_strategies[sid]["sl_type"] is None and row["sl_type"] is not None:
+                binance_strategies[sid]["sl_type"] = row["sl_type"]
+            if binance_strategies[sid]["sl_value"] is None and row["sl_value"] is not None:
+                binance_strategies[sid]["sl_value"] = row["sl_value"]
 
         if level is not None:
             if row["sl_mode"] is not None:
@@ -63,6 +70,14 @@ async def load_binance_enabled_strategies():
             }
 
     log.info(f"📊 Загружено {len(binance_strategies)} стратегий с binance_enabled=true")
+
+    # 🔸 Детальное логирование по каждой стратегии
+    for sid, cfg in binance_strategies.items():
+        log.info(f"🔸 Стратегия {sid}: leverage={cfg['leverage']}, SL={cfg['sl_type']} {cfg['sl_value']}%")
+        for level, tp in sorted(cfg["tp_levels"].items()):
+            log.info(f"   • TP{level}: type={tp['tp_type']} value={tp['tp_value']} → {tp['volume_percent']}%")
+        if not cfg["tp_levels"]:
+            log.info("   • TP уровни: отсутствуют")
 
 
 # 🔸 Динамическая подгрузка полной конфигурации одной стратегии
@@ -93,9 +108,13 @@ async def load_single_strategy(strategy_id: int):
 
     for row in rows:
         binance_strategies[strategy_id]["leverage"] = int(row["leverage"] or 1)
-        binance_strategies[strategy_id]["use_stoploss"] = row["use_stoploss"]
-        binance_strategies[strategy_id]["sl_type"] = row["sl_type"]
-        binance_strategies[strategy_id]["sl_value"] = row["sl_value"]
+
+        if binance_strategies[strategy_id]["use_stoploss"] is None and row["use_stoploss"] is not None:
+            binance_strategies[strategy_id]["use_stoploss"] = row["use_stoploss"]
+        if binance_strategies[strategy_id]["sl_type"] is None and row["sl_type"] is not None:
+            binance_strategies[strategy_id]["sl_type"] = row["sl_type"]
+        if binance_strategies[strategy_id]["sl_value"] is None and row["sl_value"] is not None:
+            binance_strategies[strategy_id]["sl_value"] = row["sl_value"]
 
         level = row["tp_level"]
 
@@ -113,7 +132,7 @@ async def load_single_strategy(strategy_id: int):
             }
 
     log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")
-
+    
 # 🔸 Проверка: разрешена ли стратегия для Binance
 def is_strategy_binance_enabled(strategy_id: int) -> bool:
     return strategy_id in binance_strategies
