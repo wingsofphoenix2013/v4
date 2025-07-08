@@ -21,7 +21,7 @@ async def handle_open_position(payload: dict):
 
     # 🔸 Проверка: стратегия должна быть разрешена для Binance
     if not is_strategy_binance_enabled(strategy_id):
-        log.warning(f"🚫 Стратегия {strategy_id} не разрешена для Binance — игнорируем сигнал")
+        log.debug(f"🚫 Стратегия {strategy_id} не разрешена для Binance — игнорируем сигнал")
         return
 
     side = "BUY" if direction == "long" else "SELL"
