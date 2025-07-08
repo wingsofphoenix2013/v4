@@ -169,7 +169,7 @@ async def place_tp_sl_orders(symbol: str, direction: str, qty: float, entry_pric
         volume_str = f"{volume:.{get_precision_for_symbol(symbol)}f}"
 
         try:
-            resp = await infra.binance_client.new_order(
+            resp = infra.binance_client.new_order(
                 symbol=symbol,
                 side=side,
                 type="LIMIT",
@@ -197,7 +197,7 @@ async def place_tp_sl_orders(symbol: str, direction: str, qty: float, entry_pric
     qty_str = f"{qty:.{get_precision_for_symbol(symbol)}f}"
 
     try:
-        resp = await infra.binance_client.new_order(
+        resp = infra.binance_client.new_order(
             symbol=symbol,
             side=side,
             type="STOP_MARKET",
