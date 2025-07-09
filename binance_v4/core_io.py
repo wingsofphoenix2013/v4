@@ -1,8 +1,10 @@
 # core_io.py
 
 import logging
-from infra import infra
 import json
+from decimal import Decimal, ROUND_DOWN
+
+from infra import infra
 
 log = logging.getLogger("CORE_IO")
 
@@ -52,7 +54,7 @@ async def insert_binance_order(
             reduce_only, close_position, time_in_force,
             raw_data_str
         )
-        
+
         log.info(f"📥 Ордер записан: {binance_order_id} ({purpose})")
 
     except Exception as e:
@@ -92,16 +94,23 @@ async def insert_binance_position(
         raw_data_str = json.dumps(raw_data) if raw_data is not None else None
         entry_time_naive = entry_time.replace(tzinfo=None)
 
+        # 🔸 Убираем хвосты
+        entry_price = Decimal(entry_price).quantize(Decimal("1.00000000"), rounding=ROUND_DOWN)
+        executed_qty = Decimal(executed_qty).quantize(Decimal("1.000"), rounding=ROUND_DOWN)
+        notional_value = Decimal(notional_value).quantize(Decimal("1.0000"), rounding=ROUND_DOWN)
+
         await infra.pg_pool.execute(query,
             position_uid, strategy_id, symbol, direction,
             entry_price, entry_time_naive, leverage, position_side,
             executed_qty, notional_value, raw_data_str
         )
+
         log.info(f"📌 Позиция записана: {position_uid}")
 
     except Exception as e:
         log.exception(f"❌ Ошибка insert_binance_position: {e}")
-        
+
+
 # 🔸 Обновление статуса ордера по событию WebSocket
 async def update_binance_order_status(order_id: int, new_status: str):
     query = """
