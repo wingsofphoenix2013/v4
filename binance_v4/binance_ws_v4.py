@@ -95,10 +95,15 @@ async def on_order_filled(order: dict):
 
     price_precision = get_price_precision_for_symbol(symbol)
     qty_precision = get_precision_for_symbol(symbol)
+
+    # 🔸 Округление входной цены и количества
     entry_price = Decimal(order["ap"]).quantize(Decimal("1." + "0" * price_precision), rounding=ROUND_DOWN)
     qty = Decimal(str(order["q"])).quantize(Decimal("1." + "0" * qty_precision), rounding=ROUND_DOWN)
 
-    log.info(f"📐 FILLED стратегия {strategy_id}, symbol={symbol}, entry={entry_price:.{price_precision}f}, qty={qty}")
+    # 🔸 Строка для передачи в place_tp_sl_orders
+    entry_price_str = f"{entry_price:.{price_precision}f}"
+
+    log.info(f"📐 FILLED стратегия {strategy_id}, symbol={symbol}, entry={entry_price_str}, qty={qty}")
 
     # 🔸 Сохраняем позицию в базу
     try:
@@ -125,7 +130,7 @@ async def on_order_filled(order: dict):
     except Exception as e:
         log.exception(f"❌ Ошибка записи позиции {position_uid} в базу: {e}")
 
-    # 🔸 TP-уровни (для логирования — не для расчёта ордеров)
+    # 🔸 TP уровни — логгирование
     tp_levels = config.get("tp_levels", {})
     for level, tp in sorted(tp_levels.items()):
         if tp["tp_type"] != "percent":
@@ -146,9 +151,10 @@ async def on_order_filled(order: dict):
         except Exception as e:
             log.warning(f"⚠️ Ошибка расчёта TP{level}: {e}")
 
-    # 🔸 SL-цена
+    # 🔸 SL логгирование
     try:
         sl_percent = Decimal(str(config.get("sl_value", 0))) / Decimal("100")
+
         if direction == "long":
             sl_price = entry_price * (Decimal("1") - sl_percent)
         else:
@@ -160,24 +166,24 @@ async def on_order_filled(order: dict):
     except Exception as e:
         log.warning(f"⚠️ Ошибка расчёта SL: {e}")
 
-    # 🔸 Размещение TP/SL ордеров
+    # 🔸 Размещение TP/SL
     await place_tp_sl_orders(
         symbol=symbol,
         direction=direction,
-        entry_price=float(entry_price),
+        entry_price=entry_price_str,  # ← строго как str
         qty=float(qty),
         strategy_id=strategy_id,
         position_uid=position_uid
     )
 
-    # 🔸 Очистка буфера — удаляем использованный order_id
-    filled_order_map.pop(order_id, None)    
+    # 🔸 Очистка буфера
+    filled_order_map.pop(order_id, None)
 # 🔸 Размещение TP и SL ордеров после открытия позиции
 async def place_tp_sl_orders(
     symbol: str,
     direction: str,
     qty: float,
-    entry_price: float,
+    entry_price: str,  # 🔸 передаётся как str с нужной точностью
     strategy_id: int,
     position_uid: str
 ):
@@ -191,7 +197,7 @@ async def place_tp_sl_orders(
     qty_precision = get_precision_for_symbol(symbol)
     tick = Decimal(str(get_tick_size_for_symbol(symbol)))
 
-    entry_price_d = Decimal(str(entry_price))
+    entry_price_d = Decimal(entry_price)
     qty_d = Decimal(str(qty))
 
     total_tp_volume = Decimal('0')
@@ -221,6 +227,8 @@ async def place_tp_sl_orders(
 
         tp_price = tp_price.quantize(tick, rounding=ROUND_DOWN)
         volume = volume.quantize(Decimal('1.' + '0' * qty_precision), rounding=ROUND_DOWN)
+
+        tp_price_str = f"{tp_price:.{price_precision}f}"
         volume_str = f"{volume:.{qty_precision}f}"
 
         try:
@@ -230,11 +238,11 @@ async def place_tp_sl_orders(
                 type="LIMIT",
                 timeInForce="GTC",
                 quantity=volume_str,
-                price=f"{tp_price:.{price_precision}f}",
+                price=tp_price_str,
                 reduceOnly=True
             )
 
-            log.info(f"📌 TP{level} ордер размещён: qty={volume_str}, price={tp_price:.{price_precision}f}")
+            log.info(f"📌 TP{level} ордер размещён: qty={volume_str}, price={tp_price_str}")
 
             try:
                 await insert_binance_order(
@@ -272,18 +280,19 @@ async def place_tp_sl_orders(
 
     sl_price = sl_price.quantize(tick, rounding=ROUND_DOWN)
     qty_str = f"{qty_d:.{qty_precision}f}"
+    sl_price_str = f"{sl_price:.{price_precision}f}"
 
     try:
         resp = infra.binance_client.new_order(
             symbol=symbol,
             side=side,
             type="STOP_MARKET",
-            stopPrice=f"{sl_price:.{price_precision}f}",
+            stopPrice=sl_price_str,
             quantity=qty_str,
             reduceOnly=True
         )
 
-        log.info(f"📌 SL ордер размещён: qty={qty_str}, stopPrice={sl_price:.{price_precision}f}")
+        log.info(f"📌 SL ордер размещён: qty={qty_str}, stopPrice={sl_price_str}")
 
         try:
             await insert_binance_order(
