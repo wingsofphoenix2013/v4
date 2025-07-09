@@ -188,18 +188,20 @@ async def place_tp_sl_orders(
         log.warning(f"⚠️ Стратегия {strategy_id} не найдена в кеше для размещения TP/SL")
         return
 
+    # 🔸 Подгружаем параметры точности
     tp_levels = config.get("tp_levels", {})
     price_precision = get_price_precision_for_symbol(symbol)
     qty_precision = get_precision_for_symbol(symbol)
     tick = Decimal(str(get_tick_size_for_symbol(symbol)))
 
-    entry_price_d = Decimal(entry_price)
+    # 🔸 Подготовка входных значений
+    entry_price_d = Decimal(entry_price).quantize(tick, rounding=ROUND_DOWN)
     qty_d = qty
 
     total_tp_volume = Decimal('0')
     sorted_tp = sorted(tp_levels.items())
     num_tp = len(sorted_tp)
-
+    
     # 🔸 TP ордера
     for i, (level, tp) in enumerate(sorted_tp):
         if tp["tp_type"] != "percent":
