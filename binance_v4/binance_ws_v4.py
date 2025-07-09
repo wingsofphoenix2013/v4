@@ -19,6 +19,9 @@ from strategy_registry import (
     round_to_tick,
 )
 
+from core_io import insert_binance_position, insert_binance_order
+from datetime import datetime, timezone
+
 log = logging.getLogger("BINANCE_WS")
 
 # 🔸 Временное сопоставление orderId → стратегия и параметры
@@ -76,6 +79,7 @@ async def on_order_filled(order: dict):
     context = filled_order_map[order_id]
     strategy_id = context["strategy_id"]
     direction = context["direction"]
+    position_uid = context["position_uid"]
 
     config = get_strategy_config(strategy_id)
     if not config:
@@ -86,6 +90,31 @@ async def on_order_filled(order: dict):
     price_precision = get_price_precision_for_symbol(symbol)
 
     log.info(f"📐 FILLED стратегия {strategy_id}, symbol={symbol}, entry={entry_price:.{price_precision}f}, qty={qty}")
+
+    # 🔸 Сохраняем позицию в базу
+    try:
+        entry_time_ms = int(order["T"])
+        entry_time = datetime.fromtimestamp(entry_time_ms / 1000, tz=timezone.utc)
+        leverage = config.get("leverage", 1)
+        position_side = "LONG" if direction == "long" else "SHORT"
+        notional_value = entry_price * qty
+
+        await insert_binance_position(
+            position_uid=position_uid,
+            strategy_id=strategy_id,
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            leverage=leverage,
+            position_side=position_side,
+            executed_qty=qty,
+            notional_value=notional_value,
+            raw_data=order
+        )
+
+    except Exception as e:
+        log.exception(f"❌ Ошибка записи позиции {position_uid} в базу: {e}")
 
     # 🔸 TP-уровни
     for level, tp in sorted(tp_levels.items()):
@@ -125,11 +154,18 @@ async def on_order_filled(order: dict):
         direction=direction,
         entry_price=entry_price,
         qty=qty,
-        strategy_id=strategy_id
+        strategy_id=strategy_id,
+        position_uid=position_uid
     )
-
 # 🔸 Размещение TP и SL ордеров после открытия позиции
-async def place_tp_sl_orders(symbol: str, direction: str, qty: float, entry_price: float, strategy_id: int):
+async def place_tp_sl_orders(
+    symbol: str,
+    direction: str,
+    qty: float,
+    entry_price: float,
+    strategy_id: int,
+    position_uid: str
+):
     config = get_strategy_config(strategy_id)
     if not config:
         log.warning(f"⚠️ Стратегия {strategy_id} не найдена в кеше для размещения TP/SL")
@@ -178,7 +214,30 @@ async def place_tp_sl_orders(symbol: str, direction: str, qty: float, entry_pric
                 price=f"{tp_price:.{price_precision}f}",
                 reduceOnly=True
             )
+
             log.info(f"📌 TP{level} ордер размещён: qty={volume_str}, price={tp_price:.{price_precision}f}")
+
+            try:
+                await insert_binance_order(
+                    position_uid=position_uid,
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    binance_order_id=resp["orderId"],
+                    side=side,
+                    type_="LIMIT",
+                    status="NEW",
+                    purpose="tp",
+                    level=level,
+                    price=tp_price,
+                    quantity=volume,
+                    reduce_only=True,
+                    close_position=False,
+                    time_in_force="GTC",
+                    raw_data=resp
+                )
+            except Exception as db_exc:
+                log.exception(f"⚠️ Ошибка записи TP{level} ордера в БД: {db_exc}")
+
         except Exception as e:
             log.warning(f"⚠️ Ошибка размещения TP{level}: {e}")
 
@@ -205,6 +264,29 @@ async def place_tp_sl_orders(symbol: str, direction: str, qty: float, entry_pric
             quantity=qty_str,
             reduceOnly=True
         )
+
         log.info(f"📌 SL ордер размещён: qty={qty_str}, stopPrice={sl_price:.{price_precision}f}")
+
+        try:
+            await insert_binance_order(
+                position_uid=position_uid,
+                strategy_id=strategy_id,
+                symbol=symbol,
+                binance_order_id=resp["orderId"],
+                side=side,
+                type_="STOP_MARKET",
+                status="NEW",
+                purpose="sl",
+                level=None,
+                price=None,
+                quantity=qty,
+                reduce_only=True,
+                close_position=False,
+                time_in_force=None,
+                raw_data=resp
+            )
+        except Exception as db_exc:
+            log.exception(f"⚠️ Ошибка записи SL ордера в БД: {db_exc}")
+
     except Exception as e:
         log.warning(f"⚠️ Ошибка размещения SL: {e}")
