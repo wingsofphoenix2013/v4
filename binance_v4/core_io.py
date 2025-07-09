@@ -101,3 +101,16 @@ async def insert_binance_position(
 
     except Exception as e:
         log.exception(f"❌ Ошибка insert_binance_position: {e}")
+        
+# 🔸 Обновление статуса ордера по событию WebSocket
+async def update_binance_order_status(order_id: int, new_status: str):
+    query = """
+        UPDATE binance_orders_v4
+        SET status = $1, updated_at = NOW()
+        WHERE binance_order_id = $2
+    """
+    try:
+        await infra.pg_pool.execute(query, new_status, order_id)
+        log.info(f"🔄 Обновлён статус ордера {order_id} → {new_status}")
+    except Exception as e:
+        log.exception(f"❌ Ошибка при обновлении статуса ордера {order_id}: {e}")

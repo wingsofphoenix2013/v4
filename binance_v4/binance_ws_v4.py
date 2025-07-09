@@ -4,6 +4,8 @@ import asyncio
 import aiohttp
 import logging
 import json
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
 
 from infra import (
     infra,
@@ -19,14 +21,12 @@ from strategy_registry import (
     round_to_tick,
 )
 
-from core_io import insert_binance_position, insert_binance_order
-from datetime import datetime, timezone
+from core_io import insert_binance_position, insert_binance_orde, update_binance_order_status
 
 log = logging.getLogger("BINANCE_WS")
 
 # 🔸 Временное сопоставление orderId → стратегия и параметры
 filled_order_map: dict[int, dict] = {}  # order_id → {"strategy_id", "direction", "quantity"}
-
 
 # 🔸 Обработчик WebSocket Binance
 async def run_binance_ws_listener():
@@ -50,7 +50,16 @@ async def run_binance_ws_listener():
 
                             if data.get("e") == "ORDER_TRADE_UPDATE":
                                 order = data.get("o", {})
-                                if order.get("X") == "FILLED":
+                                order_id = order.get("i")
+                                status = order.get("X")
+
+                                if order_id and status:
+                                    try:
+                                        await update_binance_order_status(order_id, status)
+                                    except Exception:
+                                        log.exception(f"❌ Ошибка обновления статуса ордера {order_id}")
+
+                                if status == "FILLED":
                                     await on_order_filled(order)
 
                             log.info(f"📨 Сообщение: {msg.data}")
@@ -157,6 +166,10 @@ async def on_order_filled(order: dict):
         strategy_id=strategy_id,
         position_uid=position_uid
     )
+
+    # 🔸 Очистка буфера — удаляем использованный order_id
+    filled_order_map.pop(order_id, None)
+    
 # 🔸 Размещение TP и SL ордеров после открытия позиции
 async def place_tp_sl_orders(
     symbol: str,
@@ -173,9 +186,13 @@ async def place_tp_sl_orders(
 
     tp_levels = config.get("tp_levels", {})
     price_precision = get_price_precision_for_symbol(symbol)
-    tick = get_tick_size_for_symbol(symbol)
+    qty_precision = get_precision_for_symbol(symbol)
+    tick = Decimal(str(get_tick_size_for_symbol(symbol)))
 
-    total_tp_volume = 0.0
+    entry_price_d = Decimal(str(entry_price))
+    qty_d = Decimal(str(qty))
+
+    total_tp_volume = Decimal('0')
     sorted_tp = sorted(tp_levels.items())
     num_tp = len(sorted_tp)
 
@@ -184,25 +201,25 @@ async def place_tp_sl_orders(
         if tp["tp_type"] != "percent":
             continue
 
-        percent = float(tp["tp_value"]) / 100
-        volume_percent = float(tp["volume_percent"])
+        percent = Decimal(str(tp["tp_value"])) / Decimal('100')
+        volume_percent = Decimal(str(tp["volume_percent"]))
 
         if i < num_tp - 1:
-            volume = qty * (volume_percent / 100)
+            volume = qty_d * volume_percent / Decimal('100')
             total_tp_volume += volume
         else:
-            volume = qty - total_tp_volume  # 🔸 остаток для последнего TP
+            volume = qty_d - total_tp_volume  # остаток
 
         if direction == "long":
-            tp_price = entry_price * (1 + percent)
+            tp_price = entry_price_d * (Decimal('1') + percent)
             side = "SELL"
         else:
-            tp_price = entry_price * (1 - percent)
+            tp_price = entry_price_d * (Decimal('1') - percent)
             side = "BUY"
 
-        tp_price = round_to_tick(tp_price, tick)
-        volume = round(volume, get_precision_for_symbol(symbol))
-        volume_str = f"{volume:.{get_precision_for_symbol(symbol)}f}"
+        tp_price = tp_price.quantize(tick, rounding=ROUND_DOWN)
+        volume = volume.quantize(Decimal('1.' + '0' * qty_precision), rounding=ROUND_DOWN)
+        volume_str = f"{volume:.{qty_precision}f}"
 
         try:
             resp = infra.binance_client.new_order(
@@ -228,8 +245,8 @@ async def place_tp_sl_orders(
                     status="NEW",
                     purpose="tp",
                     level=level,
-                    price=tp_price,
-                    quantity=volume,
+                    price=float(tp_price),
+                    quantity=float(volume),
                     reduce_only=True,
                     close_position=False,
                     time_in_force="GTC",
@@ -241,19 +258,18 @@ async def place_tp_sl_orders(
         except Exception as e:
             log.warning(f"⚠️ Ошибка размещения TP{level}: {e}")
 
-    # 🔸 SL ордер (STOP_MARKET)
-    sl_value = float(config.get("sl_value", 0))
-    sl_percent = sl_value / 100
+    # 🔸 SL ордер
+    sl_value = Decimal(str(config.get("sl_value", 0))) / Decimal('100')
 
     if direction == "long":
-        sl_price = entry_price * (1 - sl_percent)
+        sl_price = entry_price_d * (Decimal('1') - sl_value)
         side = "SELL"
     else:
-        sl_price = entry_price * (1 + sl_percent)
+        sl_price = entry_price_d * (Decimal('1') + sl_value)
         side = "BUY"
 
-    sl_price = round_to_tick(sl_price, tick)
-    qty_str = f"{qty:.{get_precision_for_symbol(symbol)}f}"
+    sl_price = sl_price.quantize(tick, rounding=ROUND_DOWN)
+    qty_str = f"{qty_d:.{qty_precision}f}"
 
     try:
         resp = infra.binance_client.new_order(
@@ -279,7 +295,7 @@ async def place_tp_sl_orders(
                 purpose="sl",
                 level=None,
                 price=None,
-                quantity=qty,
+                quantity=float(qty_d),
                 reduce_only=True,
                 close_position=False,
                 time_in_force=None,
