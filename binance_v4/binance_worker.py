@@ -2,6 +2,8 @@
 
 import logging
 from infra import infra
+from decimal import Decimal, ROUND_DOWN
+
 from strategy_registry import (
     get_precision_for_symbol,
     get_leverage,
@@ -17,7 +19,6 @@ async def handle_open_position(payload: dict):
     strategy_id = int(payload["strategy_id"])
     symbol = payload["symbol"]
     direction = payload["direction"]
-    quantity = float(payload["quantity"])
     position_uid = payload["position_uid"]
 
     # 🔸 Проверка: стратегия должна быть разрешена для Binance
@@ -27,10 +28,12 @@ async def handle_open_position(payload: dict):
 
     side = "BUY" if direction == "long" else "SELL"
     qty_precision = get_precision_for_symbol(symbol)
-    qty = round(quantity, qty_precision)
-    qty_str = f"{qty:.{qty_precision}f}"
-
     leverage = get_leverage(strategy_id)
+
+    # 🔸 Объём: строго через Decimal
+    quantity = Decimal(str(payload["quantity"]))
+    qty = quantity.quantize(Decimal("1." + "0" * qty_precision), rounding=ROUND_DOWN)
+    qty_str = f"{qty:.{qty_precision}f}"
 
     log.info(f"⚙️ Установка плеча {leverage} и режима 'ISOLATED' для {symbol}")
     try:
@@ -53,13 +56,12 @@ async def handle_open_position(payload: dict):
         filled_order_map[order_id] = {
             "strategy_id": strategy_id,
             "direction": direction,
-            "quantity": quantity,
+            "quantity": qty,               # 🔸 Decimal!
             "position_uid": position_uid
         }
 
         log.info(f"✅ Binance order sent: orderId={order_id}")
 
-        # 🔸 Запись ордера в базу
         try:
             await insert_binance_order(
                 position_uid=position_uid,

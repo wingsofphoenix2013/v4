@@ -8,7 +8,6 @@ from infra import infra
 
 log = logging.getLogger("CORE_IO")
 
-
 # 🔸 Запись нового ордера в binance_orders_v4
 async def insert_binance_order(
     *,
@@ -20,8 +19,8 @@ async def insert_binance_order(
     type_: str,
     status: str,
     purpose: str,
-    quantity: float,
-    price: float | None = None,
+    quantity: Decimal,
+    price: Decimal | None = None,
     level: int | None = None,
     reduce_only: bool | None = None,
     close_position: bool | None = None,
@@ -47,6 +46,10 @@ async def insert_binance_order(
     try:
         raw_data_str = json.dumps(raw_data) if raw_data is not None else None
 
+        if price is not None:
+            price = price.quantize(Decimal("1.00000000"), rounding=ROUND_DOWN)
+        quantity = quantity.quantize(Decimal("1.000"), rounding=ROUND_DOWN)
+
         await infra.pg_pool.execute(query,
             position_uid, strategy_id, symbol, binance_order_id,
             side, type_, status, purpose,
@@ -59,8 +62,6 @@ async def insert_binance_order(
 
     except Exception as e:
         log.exception(f"❌ Ошибка insert_binance_order: {e}")
-
-
 # 🔸 Запись открытой позиции в binance_positions_v4
 async def insert_binance_position(
     *,
@@ -68,12 +69,12 @@ async def insert_binance_position(
     strategy_id: int,
     symbol: str,
     direction: str,
-    entry_price: float,
+    entry_price: Decimal,
     entry_time,
     leverage: int,
     position_side: str,
-    executed_qty: float,
-    notional_value: float,
+    executed_qty: Decimal,
+    notional_value: Decimal,
     raw_data: dict | None = None
 ):
     query = """
@@ -94,10 +95,9 @@ async def insert_binance_position(
         raw_data_str = json.dumps(raw_data) if raw_data is not None else None
         entry_time_naive = entry_time.replace(tzinfo=None)
 
-        # 🔸 Убираем хвосты
-        entry_price = Decimal(entry_price).quantize(Decimal("1.00000000"), rounding=ROUND_DOWN)
-        executed_qty = Decimal(executed_qty).quantize(Decimal("1.000"), rounding=ROUND_DOWN)
-        notional_value = Decimal(notional_value).quantize(Decimal("1.0000"), rounding=ROUND_DOWN)
+        entry_price = entry_price.quantize(Decimal("1.00000000"), rounding=ROUND_DOWN)
+        executed_qty = executed_qty.quantize(Decimal("1.000"), rounding=ROUND_DOWN)
+        notional_value = notional_value.quantize(Decimal("1.0000"), rounding=ROUND_DOWN)
 
         await infra.pg_pool.execute(query,
             position_uid, strategy_id, symbol, direction,
@@ -109,8 +109,7 @@ async def insert_binance_position(
 
     except Exception as e:
         log.exception(f"❌ Ошибка insert_binance_position: {e}")
-
-
+        
 # 🔸 Обновление статуса ордера по событию WebSocket
 async def update_binance_order_status(order_id: int, new_status: str):
     query = """

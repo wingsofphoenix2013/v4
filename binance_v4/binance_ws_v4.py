@@ -4,8 +4,8 @@ import asyncio
 import aiohttp
 import logging
 import json
-from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
 
 from infra import (
     infra,
@@ -73,7 +73,6 @@ async def run_binance_ws_listener():
 
         log.info("⏳ Перезапуск подключения через 5 секунд...")
         await asyncio.sleep(5)
-
 # 🔸 Обработка FILLED-события: расчёт TP и SL
 async def on_order_filled(order: dict):
     order_id = order["i"]
@@ -96,11 +95,10 @@ async def on_order_filled(order: dict):
     price_precision = get_price_precision_for_symbol(symbol)
     qty_precision = get_precision_for_symbol(symbol)
 
-    # 🔸 Округление входной цены и количества
     entry_price = Decimal(order["ap"]).quantize(Decimal("1." + "0" * price_precision), rounding=ROUND_DOWN)
     qty = Decimal(str(order["q"])).quantize(Decimal("1." + "0" * qty_precision), rounding=ROUND_DOWN)
+    notional_value = (entry_price * qty).quantize(Decimal("1.0000"), rounding=ROUND_DOWN)
 
-    # 🔸 Строка для передачи в place_tp_sl_orders
     entry_price_str = f"{entry_price:.{price_precision}f}"
 
     log.info(f"📐 FILLED стратегия {strategy_id}, symbol={symbol}, entry={entry_price_str}, qty={qty}")
@@ -111,19 +109,18 @@ async def on_order_filled(order: dict):
         entry_time = datetime.fromtimestamp(entry_time_ms / 1000, tz=timezone.utc)
         leverage = config.get("leverage", 1)
         position_side = "LONG" if direction == "long" else "SHORT"
-        notional_value = (entry_price * qty).quantize(Decimal("1.0000"), rounding=ROUND_DOWN)
 
         await insert_binance_position(
             position_uid=position_uid,
             strategy_id=strategy_id,
             symbol=symbol,
             direction=direction,
-            entry_price=float(entry_price),
+            entry_price=entry_price,
             entry_time=entry_time,
             leverage=leverage,
             position_side=position_side,
-            executed_qty=float(qty),
-            notional_value=float(notional_value),
+            executed_qty=qty,
+            notional_value=notional_value,
             raw_data=order
         )
 
@@ -170,20 +167,19 @@ async def on_order_filled(order: dict):
     await place_tp_sl_orders(
         symbol=symbol,
         direction=direction,
-        entry_price=entry_price_str,  # ← строго как str
-        qty=float(qty),
+        entry_price=entry_price_str,  # передаётся как str
+        qty=qty,
         strategy_id=strategy_id,
         position_uid=position_uid
     )
 
-    # 🔸 Очистка буфера
     filled_order_map.pop(order_id, None)
 # 🔸 Размещение TP и SL ордеров после открытия позиции
 async def place_tp_sl_orders(
     symbol: str,
     direction: str,
-    qty: float,
-    entry_price: str,  # 🔸 передаётся как str с нужной точностью
+    qty: Decimal,
+    entry_price: str,
     strategy_id: int,
     position_uid: str
 ):
@@ -198,7 +194,7 @@ async def place_tp_sl_orders(
     tick = Decimal(str(get_tick_size_for_symbol(symbol)))
 
     entry_price_d = Decimal(entry_price)
-    qty_d = Decimal(str(qty))
+    qty_d = qty
 
     total_tp_volume = Decimal('0')
     sorted_tp = sorted(tp_levels.items())
@@ -216,7 +212,7 @@ async def place_tp_sl_orders(
             volume = qty_d * volume_percent / Decimal('100')
             total_tp_volume += volume
         else:
-            volume = qty_d - total_tp_volume  # остаток
+            volume = qty_d - total_tp_volume
 
         if direction == "long":
             tp_price = entry_price_d * (Decimal('1') + percent)
@@ -230,6 +226,14 @@ async def place_tp_sl_orders(
 
         tp_price_str = f"{tp_price:.{price_precision}f}"
         volume_str = f"{volume:.{qty_precision}f}"
+
+        # 🔸 Защита от некорректной цены
+        if direction == "short" and tp_price >= entry_price_d:
+            log.warning(f"⚠️ TP{level} цена {tp_price} не ниже entry={entry_price_d} — ордер не будет отправлен (short)")
+            continue
+        if direction == "long" and tp_price <= entry_price_d:
+            log.warning(f"⚠️ TP{level} цена {tp_price} не выше entry={entry_price_d} — ордер не будет отправлен (long)")
+            continue
 
         try:
             resp = infra.binance_client.new_order(
@@ -255,8 +259,8 @@ async def place_tp_sl_orders(
                     status="NEW",
                     purpose="tp",
                     level=level,
-                    price=float(tp_price),
-                    quantity=float(volume),
+                    price=tp_price,
+                    quantity=volume,
                     reduce_only=True,
                     close_position=False,
                     time_in_force="GTC",
@@ -306,7 +310,7 @@ async def place_tp_sl_orders(
                 purpose="sl",
                 level=None,
                 price=None,
-                quantity=float(qty_d),
+                quantity=qty_d,
                 reduce_only=True,
                 close_position=False,
                 time_in_force=None,
