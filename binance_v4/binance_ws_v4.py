@@ -21,7 +21,7 @@ from strategy_registry import (
     round_to_tick,
 )
 
-from core_io import insert_binance_position, insert_binance_orde, update_binance_order_status
+from core_io import insert_binance_position, insert_binance_order, update_binance_order_status
 
 log = logging.getLogger("BINANCE_WS")
 
