@@ -2,6 +2,7 @@
 
 import logging
 from infra import infra
+import json
 
 log = logging.getLogger("CORE_IO")
 
@@ -42,11 +43,16 @@ async def insert_binance_order(
         ON CONFLICT (binance_order_id) DO NOTHING
     """
     try:
-        await infra.pg_pool.execute(query, position_uid, strategy_id, symbol, binance_order_id,
-                                    side, type_, status, purpose,
-                                    level, price, quantity,
-                                    reduce_only, close_position, time_in_force,
-                                    raw_data)
+        raw_data_str = json.dumps(raw_data) if raw_data is not None else None
+
+        await infra.pg_pool.execute(query,
+            position_uid, strategy_id, symbol, binance_order_id,
+            side, type_, status, purpose,
+            level, price, quantity,
+            reduce_only, close_position, time_in_force,
+            raw_data_str
+        )
+        
         log.info(f"📥 Ордер записан: {binance_order_id} ({purpose})")
 
     except Exception as e:
@@ -83,9 +89,14 @@ async def insert_binance_position(
         ON CONFLICT (position_uid) DO NOTHING
     """
     try:
-        await infra.pg_pool.execute(query, position_uid, strategy_id, symbol, direction,
-                                    entry_price, entry_time, leverage, position_side,
-                                    executed_qty, notional_value, raw_data)
+        raw_data_str = json.dumps(raw_data) if raw_data is not None else None
+        entry_time_naive = entry_time.replace(tzinfo=None)
+
+        await infra.pg_pool.execute(query,
+            position_uid, strategy_id, symbol, direction,
+            entry_price, entry_time_naive, leverage, position_side,
+            executed_qty, notional_value, raw_data_str
+        )
         log.info(f"📌 Позиция записана: {position_uid}")
 
     except Exception as e:
