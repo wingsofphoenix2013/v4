@@ -681,8 +681,24 @@ async def bulk_create_strategies(request: Request):
     sl_after_tp = []
     for j in range(1, len(tp_levels)):
         mode = form.get(f"sl_tp_{j}_mode")
-        val = form.get(f"sl_tp_{j}_value") or None
-        sl_value = Decimal(val) if mode in ("percent", "atr") and val else None
+        val_raw = form.get(f"sl_tp_{j}_value", "").strip()
+
+        if mode in ("percent", "atr"):
+            if not val_raw:
+                return templates.TemplateResponse("strategies_bulk_create.html", {
+                    "request": request,
+                    "error": f"SL-значение обязательно для TP {j} при режиме '{mode}'"
+                })
+            try:
+                sl_value = Decimal(val_raw)
+            except Exception:
+                return templates.TemplateResponse("strategies_bulk_create.html", {
+                    "request": request,
+                    "error": f"Неверный формат SL-значения на TP {j}: '{val_raw}'"
+                })
+        else:
+            sl_value = None
+
         sl_after_tp.append({
             "tp_level_index": j - 1,
             "mode": mode,
