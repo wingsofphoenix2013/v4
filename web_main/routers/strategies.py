@@ -788,3 +788,9 @@ async def bulk_create_strategies(request: Request):
                         """, strategy_id, tid)
 
     return RedirectResponse(url="/strategies", status_code=303)
+@router.get("/strategies/bulk-create", response_class=HTMLResponse)
+async def strategies_bulk_create_form(request: Request):
+    return templates.TemplateResponse("strategies_bulk_create.html", {
+        "request": request,
+        "error": None
+    })
