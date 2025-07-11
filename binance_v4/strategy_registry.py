@@ -74,14 +74,14 @@ async def load_binance_enabled_strategies():
                 "volume_percent": row["volume_percent"]
             }
 
-    log.info(f"📊 Загружено {len(binance_strategies)} стратегий с binance_enabled=true")
+    log.debug(f"📊 Загружено {len(binance_strategies)} стратегий с binance_enabled=true")
 
     for sid, cfg in binance_strategies.items():
-        log.info(f"🔸 Стратегия {sid}: leverage={cfg['leverage']}, SL={cfg['sl_type']} {cfg['sl_value']}%")
+        log.debug(f"🔸 Стратегия {sid}: leverage={cfg['leverage']}, SL={cfg['sl_type']} {cfg['sl_value']}%")
         for level, tp in sorted(cfg["tp_levels"].items()):
-            log.info(f"   • TP{level}: type={tp['tp_type']} value={tp['tp_value']} → {tp['volume_percent']}%")
+            log.debug(f"   • TP{level}: type={tp['tp_type']} value={tp['tp_value']} → {tp['volume_percent']}%")
         if not cfg["tp_levels"]:
-            log.info("   • TP уровни: отсутствуют")
+            log.debug("   • TP уровни: отсутствуют")
 
 
 # 🔸 Динамическая подгрузка полной конфигурации одной стратегии
@@ -130,14 +130,14 @@ async def load_single_strategy(strategy_id: int):
                 "volume_percent": row["volume_percent"]
             }
 
-    log.info(f"🔁 Стратегия {strategy_id} подгружена динамически")
+    log.debug(f"🔁 Стратегия {strategy_id} подгружена динамически")
      
 # 🔸 Слушатель Redis Pub/Sub для обновлений стратегий в кеше
 async def run_binance_strategy_watcher():
     pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe(PUBSUB_CHANNEL)
 
-    log.info(f"📡 Подписка на канал Redis: {PUBSUB_CHANNEL}")
+    log.debug(f"📡 Подписка на канал Redis: {PUBSUB_CHANNEL}")
 
     async for message in pubsub.listen():
         if message["type"] != "message":
@@ -152,7 +152,7 @@ async def run_binance_strategy_watcher():
                 await load_single_strategy(strategy_id)
             else:
                 binance_strategies.pop(strategy_id, None)
-                log.info(f"🚫 Стратегия {strategy_id} отключена от Binance")
+                log.debug(f"🚫 Стратегия {strategy_id} отключена от Binance")
 
         except Exception:
             log.exception(f"❌ Ошибка обработки сообщения из {PUBSUB_CHANNEL}")
@@ -213,13 +213,13 @@ async def load_symbol_precisions():
                     if tick_size is not None and db_tick is not None:
                         if abs(tick_size - db_tick) > 1e-10:
                             match_tick = "❗"
-                            log.info(f"  • {symbol:<10} | DB: tick={db_tick} | Binance: tick={tick_size} {match_tick}")
+                            log.debug(f"  • {symbol:<10} | DB: tick={db_tick} | Binance: tick={tick_size} {match_tick}")
                         else:
                             match_tick = "✅"
                     else:
                         match_tick = "—"
 
-                    log.info(
+                    log.debug(
                         f"  • {symbol:<10} | DB: qty={db_qty}, price={db_price} | "
                         f"Binance: qty={bin_qty}, price={bin_price} | tick={tick_size} {match_qty}{match_price}{match_tick}"
                     )
@@ -227,9 +227,9 @@ async def load_symbol_precisions():
     except Exception as e:
         log.warning(f"⚠️ Ошибка при получении данных от Binance: {e}")
 
-    log.info(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
-    log.info(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
-    log.info(f"📊 Загружено ticksize из БД для {len(symbol_tick_size_map)} тикеров")  
+    log.debug(f"📊 Загружено quantity precision для {len(symbol_precision_map)} тикеров")
+    log.debug(f"📊 Загружено price precision для {len(symbol_price_precision_map)} тикеров")
+    log.debug(f"📊 Загружено ticksize из БД для {len(symbol_tick_size_map)} тикеров")  
       
 # 🔸 Получение точности quantity по символу
 def get_precision_for_symbol(symbol: str) -> int:
