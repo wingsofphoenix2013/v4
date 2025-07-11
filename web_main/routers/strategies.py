@@ -624,3 +624,167 @@ async def toggle_binance(strategy_name: str):
         await redis_client.publish("binance_strategy_updates", payload)
 
     return RedirectResponse(url=f"/strategies/details/{strategy_name}", status_code=303)
+# 🔸 Пакетное добавление стратегий
+@router.post("/strategies/bulk-create", response_class=HTMLResponse)
+async def bulk_create_strategies(request: Request):
+    form = await request.form()
+    tsv_input = form.get("tsv_input", "").strip()
+
+    if not tsv_input:
+        return templates.TemplateResponse("strategies_bulk_create.html", {
+            "request": request,
+            "error": "Пустой ввод TSV"
+        })
+
+    # 🔹 Общие параметры
+    try:
+        signal_id = int(form.get("signal_id"))
+        deposit = int(form.get("deposit"))
+        position_limit = int(form.get("position_limit"))
+        leverage = int(form.get("leverage"))
+        max_risk = int(form.get("max_risk"))
+        timeframe = form.get("timeframe").lower()
+        sl_type = form.get("sl_type")
+        sl_value = Decimal(form.get("sl_value"))
+        reverse = "reverse" in form
+        sl_protection = reverse or ("sl_protection" in form)
+        use_all_tickers = "use_all_tickers" in form
+    except Exception as e:
+        return templates.TemplateResponse("strategies_bulk_create.html", {
+            "request": request,
+            "error": f"Ошибка чтения параметров формы: {e}"
+        })
+
+    # 🔹 TP уровни
+    tp_levels = []
+    i = 1
+    while f"tp_{i}_volume" in form:
+        try:
+            volume = int(form.get(f"tp_{i}_volume"))
+            tp_type = form.get(f"tp_{i}_type")
+            tp_value = form.get(f"tp_{i}_value") or None
+            value = Decimal(tp_value) if tp_type != "signal" and tp_value else None
+            tp_levels.append({
+                "level": i,
+                "type": tp_type,
+                "value": value,
+                "volume": volume
+            })
+            i += 1
+        except Exception as e:
+            return templates.TemplateResponse("strategies_bulk_create.html", {
+                "request": request,
+                "error": f"Ошибка разбора TP-уровней: TP{i}: {e}"
+            })
+
+    # 🔹 SL после TP
+    sl_after_tp = []
+    for j in range(1, len(tp_levels)):
+        mode = form.get(f"sl_tp_{j}_mode")
+        val = form.get(f"sl_tp_{j}_value") or None
+        sl_value = Decimal(val) if mode in ("percent", "atr") and val else None
+        sl_after_tp.append({
+            "tp_level_index": j - 1,
+            "mode": mode,
+            "value": sl_value
+        })
+
+    # 🔹 Тикеры
+    ticker_ids = []
+    if not use_all_tickers:
+        try:
+            ticker_ids = [int(tid) for tid in form.getlist("ticker_id[]")]
+        except Exception as e:
+            return templates.TemplateResponse("strategies_bulk_create.html", {
+                "request": request,
+                "error": f"Ошибка разбора тикеров: {e}"
+            })
+
+    # 🔹 Разбор TSV
+    strategies = []
+    lines = tsv_input.strip().splitlines()
+    for lineno, line in enumerate(lines, start=1):
+        parts = line.strip().split('\t')
+        if len(parts) != 3:
+            return templates.TemplateResponse("strategies_bulk_create.html", {
+                "request": request,
+                "error": f"Неверный формат TSV на строке {lineno}: должно быть 3 колонки"
+            })
+        name, human_name, description = [p.strip() for p in parts]
+        if not name:
+            return templates.TemplateResponse("strategies_bulk_create.html", {
+                "request": request,
+                "error": f"Пустой код стратегии на строке {lineno}"
+            })
+        strategies.append({
+            "name": name,
+            "human_name": human_name,
+            "description": description
+        })
+
+    # 🔹 Вставка в БД
+    async with pg_pool.acquire() as conn:
+        async with conn.transaction():
+            for s in strategies:
+                exists = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM strategies_v4 WHERE name = $1)",
+                    s["name"]
+                )
+                if exists:
+                    raise ValueError(f"Стратегия '{s['name']}' уже существует")
+
+            for s in strategies:
+                row = await conn.fetchrow("""
+                    INSERT INTO strategies_v4 (
+                        name, human_name, description, signal_id,
+                        deposit, position_limit, leverage, max_risk,
+                        timeframe, enabled, reverse, sl_protection,
+                        archived, use_all_tickers, allow_open,
+                        use_stoploss, sl_type, sl_value,
+                        auditor_enabled, binance_enabled, created_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4,
+                        $5, $6, $7, $8,
+                        $9, false, $10, $11,
+                        false, $12, true,
+                        true, $13, $14,
+                        false, false, NOW()
+                    )
+                    RETURNING id
+                """, s["name"], s["human_name"], s["description"], signal_id,
+                     deposit, position_limit, leverage, max_risk,
+                     timeframe, reverse, sl_protection,
+                     use_all_tickers, sl_type, sl_value)
+                strategy_id = row["id"]
+
+                # TP уровни
+                tp_level_ids = []
+                for tp in tp_levels:
+                    r = await conn.fetchrow("""
+                        INSERT INTO strategy_tp_levels_v4 (
+                            strategy_id, level, tp_type, tp_value, volume_percent, created_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5, NOW())
+                        RETURNING id
+                    """, strategy_id, tp["level"], tp["type"], tp["value"], tp["volume"])
+                    tp_level_ids.append(r["id"])
+
+                # SL после TP
+                for j, sl in enumerate(sl_after_tp):
+                    await conn.execute("""
+                        INSERT INTO strategy_tp_sl_v4 (
+                            strategy_id, tp_level_id, sl_mode, sl_value, created_at
+                        )
+                        VALUES ($1, $2, $3, $4, NOW())
+                    """, strategy_id, tp_level_ids[sl["tp_level_index"]], sl["mode"], sl["value"])
+
+                # Тикеры
+                if not use_all_tickers:
+                    for tid in ticker_ids:
+                        await conn.execute("""
+                            INSERT INTO strategy_tickers_v4 (strategy_id, ticker_id, enabled)
+                            VALUES ($1, $2, true)
+                        """, strategy_id, tid)
+
+    return RedirectResponse(url="/strategies", status_code=303)

@@ -51,9 +51,14 @@
   </div>
 
   <!-- Правая кнопка -->
+<div class="flex gap-2">
   <a href="/strategies/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold text-sm">
     + Добавить стратегию
   </a>
+  <a href="/strategies/bulk-create" class="px-5 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-semibold text-sm">
+    + Пакетное добавление
+  </a>
+</div>
 </div>
 {% if filter == "enabled" or filter == "all" %}
   <div class="w-full bg-white/80 rounded-xl shadow p-6 mb-4">
