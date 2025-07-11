@@ -61,7 +61,7 @@ async def process_position(position: dict):
         return
 
     base_idx = tf_order.index(base_tf)
-    allowed_tfs = tf_order[:base_idx + 1]
+    allowed_tfs = tf_order[base_idx:]  # 👈 Изменено: от base_tf и выше
 
     # 🔸 Фильтрация индикаторов только по допустимым таймфреймам
     indicators = [
