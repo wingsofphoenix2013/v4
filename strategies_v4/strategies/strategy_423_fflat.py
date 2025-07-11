@@ -41,14 +41,14 @@ class Strategy423Fflat:
 
             if direction == "long":
                 bb_limit_lower = bb_center + (bb_upper - bb_center) / 3
-                if 60 <= rsi <= 80 and lr_angle > 0.005 and price <= bb_upper_25 and price >= bb_limit_lower:
+                if 60 <= rsi <= 80 and lr_angle >= 0 and price <= bb_upper_25 and price >= bb_limit_lower:
                     return True
                 return ("ignore", f"фильтр long не пройден: rsi={rsi}, lr_angle={lr_angle}, price={price}, "
                                   f"bb_upper_25={bb_upper_25}, bb_limit_lower={bb_limit_lower}")
 
             elif direction == "short":
                 bb_limit_upper = bb_center - (bb_center - bb_lower) / 3
-                if 20 <= rsi <= 40 and lr_angle < -0.005 and price >= bb_lower_25 and price <= bb_limit_upper:
+                if 20 <= rsi <= 40 and lr_angle >= 0 and price >= bb_lower_25 and price <= bb_limit_upper:
                     return True
                 return ("ignore", f"фильтр short не пройден: rsi={rsi}, lr_angle={lr_angle}, price={price}, "
                                   f"bb_lower_25={bb_lower_25}, bb_limit_upper={bb_limit_upper}")

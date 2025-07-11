@@ -44,7 +44,7 @@ class Strategy416Freversenostopmove:
                 bb_limit_lower = bb_center + (bb_upper - bb_center) / 3
                 if (
                     55 <= rsi <= 80 and
-                    lr_angle > 0.005 and
+                    lr_angle >= 0 and
                     mfi <= 90 and
                     price <= bb_upper_25 and
                     price >= bb_limit_lower
@@ -57,7 +57,7 @@ class Strategy416Freversenostopmove:
                 bb_limit_upper = bb_center - (bb_center - bb_lower) / 3
                 if (
                     20 <= rsi <= 45 and
-                    lr_angle < -0.005 and
+                    lr_angle >= 0 and
                     mfi >= 10 and
                     price >= bb_lower_25 and
                     price <= bb_limit_upper

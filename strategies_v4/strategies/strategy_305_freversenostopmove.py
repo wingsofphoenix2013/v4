@@ -31,12 +31,12 @@ class Strategy305Freversenostopmove:
                 return ("ignore", "недостаточно данных RSI или LR")
 
             if direction == "long":
-                if 55 <= rsi <= 75 and lr_angle > 0.005:
+                if 55 <= rsi <= 75 and lr_angle >= 0:
                     return True
                 return ("ignore", f"фильтр long не пройден: rsi={rsi}, lr_angle={lr_angle}")
 
             elif direction == "short":
-                if 25 <= rsi <= 45 and lr_angle < -0.005:
+                if 25 <= rsi <= 45 and lr_angle >= 0:
                     return True
                 return ("ignore", f"фильтр short не пройден: rsi={rsi}, lr_angle={lr_angle}")
 

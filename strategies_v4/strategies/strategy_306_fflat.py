@@ -32,12 +32,12 @@ class Strategy306Fflat:
                 return ("ignore", "недостаточно данных RSI, LR или MFI")
 
             if direction == "long":
-                if 55 <= rsi <= 75 and lr_angle > 0.005 and mfi <= 90:
+                if 55 <= rsi <= 75 and lr_angle >= 0 and mfi <= 90:
                     return True
                 return ("ignore", f"фильтр long не пройден: rsi={rsi}, lr_angle={lr_angle}, mfi={mfi}")
 
             elif direction == "short":
-                if 25 <= rsi <= 45 and lr_angle < -0.005 and mfi >= 10:
+                if 25 <= rsi <= 45 and lr_angle >= 0 and mfi >= 10:
                     return True
                 return ("ignore", f"фильтр short не пройден: rsi={rsi}, lr_angle={lr_angle}, mfi={mfi}")
 
