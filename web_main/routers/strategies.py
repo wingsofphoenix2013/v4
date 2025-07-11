@@ -624,7 +624,6 @@ async def toggle_binance(strategy_name: str):
         await redis_client.publish("binance_strategy_updates", payload)
 
     return RedirectResponse(url=f"/strategies/details/{strategy_name}", status_code=303)
-# 🔸 Пакетное добавление стратегий
 @router.post("/strategies/bulk-create", response_class=HTMLResponse)
 async def bulk_create_strategies(request: Request):
     form = await request.form()
@@ -645,7 +644,7 @@ async def bulk_create_strategies(request: Request):
         max_risk = int(form.get("max_risk"))
         timeframe = form.get("timeframe").lower()
         sl_type = form.get("sl_type")
-        sl_value = Decimal(form.get("sl_value"))
+        main_sl_value = Decimal(form.get("sl_value"))
         reverse = "reverse" in form
         sl_protection = reverse or ("sl_protection" in form)
         use_all_tickers = "use_all_tickers" in form
@@ -690,19 +689,19 @@ async def bulk_create_strategies(request: Request):
                     "error": f"SL-значение обязательно для TP {j} при режиме '{mode}'"
                 })
             try:
-                sl_value = Decimal(val_raw)
+                tp_sl_value = Decimal(val_raw)
             except Exception:
                 return templates.TemplateResponse("strategies_bulk_create.html", {
                     "request": request,
                     "error": f"Неверный формат SL-значения на TP {j}: '{val_raw}'"
                 })
         else:
-            sl_value = None
+            tp_sl_value = None
 
         sl_after_tp.append({
             "tp_level_index": j - 1,
             "mode": mode,
-            "value": sl_value
+            "value": tp_sl_value
         })
 
     # 🔹 Тикеры
@@ -771,7 +770,7 @@ async def bulk_create_strategies(request: Request):
                 """, s["name"], s["human_name"], s["description"], signal_id,
                      deposit, position_limit, leverage, max_risk,
                      timeframe, reverse, sl_protection,
-                     use_all_tickers, sl_type, sl_value)
+                     use_all_tickers, sl_type, main_sl_value)
                 strategy_id = row["id"]
 
                 # TP уровни
