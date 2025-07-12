@@ -25,7 +25,7 @@ class Strategy306Freverseplus:
             lr_angle = indicators.get("lr50_angle")
             mfi = indicators.get("mfi14")
 
-            log.debug(f"🔍 [206 FREVERSEPLUS] symbol={symbol}, direction={direction}, tf={tf}, "
+            log.debug(f"🔍 [306 FREVERSEPLUS] symbol={symbol}, direction={direction}, tf={tf}, "
                       f"rsi={rsi}, lr_angle={lr_angle}, mfi={mfi}, price={price}")
 
             if None in (rsi, lr_angle, mfi):

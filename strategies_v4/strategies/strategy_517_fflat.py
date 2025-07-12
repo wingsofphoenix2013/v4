@@ -23,7 +23,7 @@ class Strategy517Fflat:
 
             rsi = indicators.get("rsi14")
 
-            log.debug(f"🔍 [217 FFLAT] symbol={symbol}, direction={direction}, tf={tf}, "
+            log.debug(f"🔍 [517 FFLAT] symbol={symbol}, direction={direction}, tf={tf}, "
                       f"rsi={rsi}, price={price}")
 
             if rsi is None:

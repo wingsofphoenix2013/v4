@@ -23,7 +23,7 @@ class Strategy517Freverseplus:
 
             rsi = indicators.get("rsi14")
 
-            log.debug(f"🔍 [217 FREVERSEPLUS] symbol={symbol}, direction={direction}, tf={tf}, "
+            log.debug(f"🔍 [517 FREVERSEPLUS] symbol={symbol}, direction={direction}, tf={tf}, "
                       f"rsi={rsi}, price={price}")
 
             if rsi is None:

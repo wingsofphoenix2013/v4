@@ -31,7 +31,7 @@ class Strategy523Fflat:
             bb_upper_25 = indicators.get("bb20_2_5_upper")
             bb_lower_25 = indicators.get("bb20_2_5_lower")
 
-            log.debug(f"🔍 [223 FFLAT] symbol={symbol}, direction={direction}, tf={tf}, "
+            log.debug(f"🔍 [523 FFLAT] symbol={symbol}, direction={direction}, tf={tf}, "
                       f"rsi={rsi}, lr_angle={lr_angle}, price={price}, "
                       f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}, "
                       f"bb_upper_25={bb_upper_25}, bb_lower_25={bb_lower_25}")

@@ -24,7 +24,7 @@ class Strategy321Fflat:
             rsi = indicators.get("rsi14")
             lr_angle = indicators.get("lr50_angle")
 
-            log.debug(f"🔍 [221 FFLAT] symbol={symbol}, direction={direction}, tf={tf}, "
+            log.debug(f"🔍 [321 FFLAT] symbol={symbol}, direction={direction}, tf={tf}, "
                       f"rsi={rsi}, lr_angle={lr_angle}, price={price}")
 
             if rsi is None or lr_angle is None:

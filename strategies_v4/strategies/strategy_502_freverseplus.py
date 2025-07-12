@@ -24,7 +24,7 @@ class Strategy502Freverseplus:
             rsi = indicators.get("rsi14")
             mfi = indicators.get("mfi14")
 
-            log.debug(f"🔍 [202 FREVERSEPLUS] symbol={symbol}, direction={direction}, tf={tf}, "
+            log.debug(f"🔍 [502 FREVERSEPLUS] symbol={symbol}, direction={direction}, tf={tf}, "
                       f"rsi={rsi}, mfi={mfi}, price={price}")
 
             if rsi is None or mfi is None:
