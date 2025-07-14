@@ -40,7 +40,7 @@ class Strategy271Level1:
             if None in (adx, rsi, bb_center, bb_upper, bb_lower, bb_upper_25, bb_lower_25):
                 return ("ignore", "недостаточно данных BB, ADX или RSI")
 
-            if adx <= 25:
+            if adx <= 30:
                 return ("ignore", f"фильтр ADX не пройден: adx={adx}")
 
             if direction == "long":

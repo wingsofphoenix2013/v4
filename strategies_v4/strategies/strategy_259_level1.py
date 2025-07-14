@@ -28,7 +28,7 @@ class Strategy259Level1:
             if adx is None or rsi is None:
                 return ("ignore", "недостаточно данных ADX или RSI")
 
-            if adx <= 25:
+            if adx <= 30:
                 return ("ignore", f"фильтр ADX не пройден: adx={adx}")
 
             # 🔸 RSI фильтр
