@@ -80,4 +80,6 @@ class Strategy100Test:
 
         try:
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.debug(f"📤 Сигнал отправ
+            log.debug(f"📤 Сигнал отправлен: {payload}")
+        except Exception as e:
+            log.warning(f"⚠️ Ошибка при отправке сигнала: {e}")
