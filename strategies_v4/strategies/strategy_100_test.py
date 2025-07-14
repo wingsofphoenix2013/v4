@@ -33,26 +33,24 @@ class Strategy100Test:
             candle_1 = current_open - timedelta(minutes=tf_minutes)
             candle_2 = current_open - timedelta(minutes=2 * tf_minutes)
 
-            # 🔹 Конвертируем в миллисекунды
+            # 🔹 Время в миллисекундах
             t1 = int(candle_1.timestamp() * 1000)
             t2 = int(candle_2.timestamp() * 1000)
 
-            # 🔹 Чтение RSI из Redis TimeSeries
-            key = f"ts_ind:{symbol}:{tf}:rsi14"
-            rsi_values = await redis.ts().mget(
-                filters=[f"__key__={key}"],
-                latest=False,
-                withlabels=False
-            )
+            # 🔹 Запрос RSI значений из Redis TimeSeries
+            rsi_key = f"ts_ind:{symbol}:{tf}:rsi14"
+            rsi_data = await redis.ts().range(rsi_key, t2, t1)
 
-            # 🔹 Фильтрация по временам
-            rsi_dict = {int(ts): float(val) for (_, [(ts, val)]) in rsi_values if ts and val}
-            rsi_2 = rsi_dict.get(t2)
-            rsi_1 = rsi_dict.get(t1)
+            if not rsi_data or len(rsi_data) < 2:
+                return ("ignore", "недостаточно точек RSI для анализа")
 
-            log.info(f"🔍 [RSITREND] symbol={symbol}, tf={tf}, t2={t2}, t1={t1}, rsi_2={rsi_2}, rsi_1={rsi_1}")
+            # 🔹 Извлекаем значения ближе к t2 и t1
+            rsi_2 = next((float(v) for ts, v in rsi_data if int(ts) <= t2), None)
+            rsi_1 = next((float(v) for ts, v in reversed(rsi_data) if int(ts) <= t1), None)
 
-            if rsi_2 is None or rsi_1 is None:
+            log.debug(f"🔍 [RSITREND] symbol={symbol}, tf={tf}, t2={t2}, t1={t1}, rsi_2={rsi_2}, rsi_1={rsi_1}")
+
+            if rsi_1 is None or rsi_2 is None:
                 return ("ignore", f"нет RSI значений на свечах t2={t2}, t1={t1}")
 
             if direction == "long" and rsi_1 > rsi_2:
@@ -82,6 +80,4 @@ class Strategy100Test:
 
         try:
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.info(f"📤 Сигнал отправлен: {payload}")
-        except Exception as e:
-            log.warning(f"⚠️ Ошибка при отправке сигнала: {e}")
+            log.debug(f"📤 Сигнал отправ
