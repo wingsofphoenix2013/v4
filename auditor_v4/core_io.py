@@ -1,5 +1,7 @@
 # core_io.py
 
+import os
+import aiohttp
 import asyncio
 import logging
 from datetime import datetime
@@ -211,7 +213,8 @@ async def finmonitor_task():
                 # 2. Загружаем закрытые позиции с finmonitor = false
                 position_rows = await conn.fetch("""
                     SELECT strategy_id, position_uid, symbol,
-                           created_at, closed_at, pnl
+                           created_at, closed_at, pnl,
+                           entry_price, exit_price
                     FROM positions_v4
                     WHERE status = 'closed'
                       AND finmonitor = false
@@ -245,6 +248,30 @@ async def finmonitor_task():
                         row["pnl"]
                     ))
                     mark_done.append(row["position_uid"])
+
+                    # 🔸 Формируем сообщение для Telegram
+                    if row["pnl"] > 0:
+                        msg = (
+                            "🚀 <b>Money printer go brrr 💸</b>\n\n"
+                            f"📈 <b>{row['symbol']}</b>\n"
+                            f"🎯 Entry: <code>{row['entry_price']}</code>\n"
+                            f"🎯 Exit: <code>{row['exit_price']}</code>\n"
+                            f"💰 PnL: <b>+{row['pnl']}</b>\n"
+                            f"⏱ Duration: {duration} minutes of pure brilliance 🧠\n"
+                            f"🕒 {created} → {closed}"
+                        )
+                    else:
+                        msg = (
+                            "🔻 <b>Ouch... it happens 😅</b>\n\n"
+                            f"📉 <b>{row['symbol']}</b>\n"
+                            f"🎯 Entry: <code>{row['entry_price']}</code>\n"
+                            f"🎯 Exit: <code>{row['exit_price']}</code>\n"
+                            f"💸 PnL: <b>{row['pnl']}</b>\n"
+                            f"⏱ We fought for {duration} minutes... but alas 🙈\n"
+                            f"🕒 {created} → {closed}"
+                        )
+
+                    await send_telegram_message(msg)
 
                 # 3. Вставляем в финмониторинг
                 await conn.executemany("""
@@ -283,7 +310,7 @@ async def treasury_task():
                     FROM strategies_finmonitor_v4
                     WHERE treasurised = false
                     ORDER BY closed_at
-                    LIMIT 100
+                    LIMIT 1
                 """)
 
                 if not rows:
@@ -405,3 +432,29 @@ async def treasury_task():
             log.exception("❌ Ошибка в treasury_task")
 
         await asyncio.sleep(60)
+# 🔸 Отправка сообщения в Telegram
+async def send_telegram_message(text: str):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        log.warning("❌ TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы — сообщение не отправлено")
+        return
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=payload) as resp:
+                if resp.status == 200:
+                    log.debug("📤 Telegram: сообщение успешно отправлено")
+                else:
+                    body = await resp.text()
+                    log.warning(f"❌ Telegram API вернул ошибку {resp.status}: {body}")
+    except Exception as e:
+        log.exception(f"❌ Ошибка отправки Telegram-сообщения: {e}")
