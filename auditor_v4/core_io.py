@@ -310,7 +310,7 @@ async def treasury_task():
                     FROM strategies_finmonitor_v4
                     WHERE treasurised = false
                     ORDER BY closed_at
-                    LIMIT 1
+                    LIMIT 100
                 """)
 
                 if not rows:
