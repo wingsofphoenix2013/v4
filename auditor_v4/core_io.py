@@ -213,6 +213,7 @@ async def finmonitor_task():
                 # 2. Загружаем закрытые позиции с finmonitor = false
                 position_rows = await conn.fetch("""
                     SELECT strategy_id, position_uid, symbol,
+                           direction,
                            created_at, closed_at, pnl,
                            entry_price, exit_price
                     FROM positions_v4
@@ -249,26 +250,31 @@ async def finmonitor_task():
                     ))
                     mark_done.append(row["position_uid"])
 
+                    # 🔸 Форматируем время и направление
+                    created_fmt = created.strftime("%Y-%m-%d %H:%M UTC")
+                    closed_fmt = closed.strftime("%Y-%m-%d %H:%M UTC")
+                    dir_label = "🟢 long" if row["direction"] == "long" else "🔴 short"
+
                     # 🔸 Формируем сообщение для Telegram
                     if row["pnl"] > 0:
                         msg = (
-                            "🚀 <b>Money printer go brrr 💸</b>\n\n"
-                            f"📈 <b>{row['symbol']}</b>\n"
+                            "🟢 <b>Nice one! We bagged some profit 💰</b>\n\n"
+                            f"⚔️ Took a {dir_label} shot on <b>{row['symbol']}</b>\n"
                             f"🎯 Entry: <code>{row['entry_price']}</code>\n"
-                            f"🎯 Exit: <code>{row['exit_price']}</code>\n"
-                            f"💰 PnL: <b>+{row['pnl']}</b>\n"
-                            f"⏱ Duration: {duration} minutes of pure brilliance 🧠\n"
-                            f"🕒 {created} → {closed}"
+                            f"🏁 Exit: <code>{row['exit_price']}</code>\n"
+                            f"💵 PnL: <b>+{row['pnl']}</b>\n"
+                            f"🕓 It took us {duration} minutes of glorious trading 🧠\n"
+                            f"⏳ {created_fmt} → {closed_fmt}"
                         )
                     else:
                         msg = (
-                            "🔻 <b>Ouch... it happens 😅</b>\n\n"
-                            f"📉 <b>{row['symbol']}</b>\n"
+                            "🔴 <b>Not our proudest moment... but hey, we tried 😅</b>\n\n"
+                            f"⚔️ Took a {dir_label} shot on <b>{row['symbol']}</b>\n"
                             f"🎯 Entry: <code>{row['entry_price']}</code>\n"
-                            f"🎯 Exit: <code>{row['exit_price']}</code>\n"
+                            f"🏁 Exit: <code>{row['exit_price']}</code>\n"
                             f"💸 PnL: <b>{row['pnl']}</b>\n"
-                            f"⏱ We fought for {duration} minutes... but alas 🙈\n"
-                            f"🕒 {created} → {closed}"
+                            f"🕓 We fought bravely for {duration} minutes… and then accepted fate 🙃\n"
+                            f"⏳ {created_fmt} → {closed_fmt}"
                         )
 
                     await send_telegram_message(msg)
