@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from decimal import Decimal
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 import re
@@ -389,17 +389,19 @@ async def create_indicator(
 # 🔸 Приём сигналов от TradingView (формат JSON, v4)
 log = logging.getLogger("WEBHOOK")
 
-# 🔹 Извлечение timestamp из строки и преобразование в ISO 8601
-def extract_iso_from_string(value: str) -> str:
-    import re
+# 🔹 Преобразование значения в ISO-8601 с 'Z' и без микросекунд
+def normalize_iso_utc_z(value: str) -> str:
     try:
         match = re.search(r"\d{10}", value)
         if match:
             ts = int(match.group(0))
-            return datetime.utcfromtimestamp(ts).isoformat()
+            dt = datetime.utcfromtimestamp(ts).replace(microsecond=0)
+        else:
+            # Удаляем 'Z', если есть, и разбираем как ISO
+            dt = datetime.fromisoformat(value.replace("Z", "")).replace(microsecond=0)
+        return dt.isoformat() + "Z"
     except Exception:
-        pass
-    return value
+        return value  # fallback: оставить как есть
 
 @app.post("/webhook_v4")
 async def webhook_v4(request: Request):
@@ -420,11 +422,12 @@ async def webhook_v4(request: Request):
     if symbol.endswith(".P"):
         symbol = symbol[:-2]
 
-    # 🔹 Попытка извлечения ISO-даты из bar_time и sent_at
-    bar_time = extract_iso_from_string(bar_time) if bar_time else ""
-    sent_at  = extract_iso_from_string(sent_at)  if sent_at else ""
+    # 🔹 Приведение bar_time и sent_at к ISO с 'Z'
+    bar_time = normalize_iso_utc_z(bar_time) if bar_time else ""
+    sent_at  = normalize_iso_utc_z(sent_at)  if sent_at else ""
 
-    received_at = datetime.utcnow().isoformat()
+    # 🔹 Время получения — UTC с микросекундами, без 'Z'
+    received_at = datetime.now(timezone.utc).isoformat()
 
     # 🔹 Отладочный лог сигнала
     log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
