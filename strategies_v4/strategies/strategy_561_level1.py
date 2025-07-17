@@ -32,14 +32,14 @@ class Strategy561Level1:
                 return ("ignore", "недостаточно данных BB")
 
             if direction == "long":
-                bb_limit = bb_lower + (bb_center - bb_lower) * (1 / 3)
-                if price <= bb_limit:
+                bb_limit = bb_lower + (bb_center - bb_lower) * 2 / 3
+                if price < bb_limit:
                     return True
                 return ("ignore", f"фильтр BB long не пройден: price={price}, limit={bb_limit}")
 
             elif direction == "short":
-                bb_limit = bb_upper - (bb_upper - bb_center) * (1 / 3)
-                if price >= bb_limit:
+                bb_limit = bb_upper - (bb_upper - bb_center) * 2 / 3
+                if price > bb_limit:
                     return True
                 return ("ignore", f"фильтр BB short не пройден: price={price}, limit={bb_limit}")
 

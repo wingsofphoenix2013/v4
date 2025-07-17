@@ -11,7 +11,6 @@ class Strategy365Level2:
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
-        redis = context["redis"]
 
         try:
             price = await get_price(symbol)
@@ -19,51 +18,30 @@ class Strategy365Level2:
                 return ("ignore", "нет текущей цены")
 
             indicators = await load_indicators(symbol, [
-                "adx_dmi14_adx", "rsi14",
-                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower",
-                "bb20_2_5_upper", "bb20_2_5_lower"
+                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
             ], tf)
 
-            adx = indicators.get("adx_dmi14_adx")
-            rsi = indicators.get("rsi14")
             bb_center = indicators.get("bb20_2_0_center")
             bb_upper = indicators.get("bb20_2_0_upper")
             bb_lower = indicators.get("bb20_2_0_lower")
-            bb_upper_25 = indicators.get("bb20_2_5_upper")
-            bb_lower_25 = indicators.get("bb20_2_5_lower")
 
             log.debug(f"[365] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
-                      f"adx={adx}, rsi={rsi}, bb_center={bb_center}, bb_upper={bb_upper}, "
-                      f"bb_lower={bb_lower}, bb_upper_25={bb_upper_25}, bb_lower_25={bb_lower_25}")
+                      f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}")
 
-            # Проверка данных
-            if None in (adx, rsi, bb_center, bb_upper, bb_lower, bb_upper_25, bb_lower_25):
-                return ("ignore", "недостаточно данных BB, ADX или RSI")
-
-            if adx <= 30:
-                return ("ignore", f"фильтр ADX не пройден: adx={adx}")
+            if None in (bb_center, bb_upper, bb_lower):
+                return ("ignore", "недостаточно данных BB")
 
             if direction == "long":
-                if not (60 < rsi < 80):
-                    return ("ignore", f"фильтр RSI long не пройден: rsi={rsi}")
-
-                bb_limit_lower = bb_center + (bb_upper - bb_center) / 3
-                if price > bb_upper_25 or price < bb_limit_lower:
-                    return ("ignore", f"фильтр BB long не пройден: price={price}, "
-                                      f"upper_25={bb_upper_25}, bb_limit_lower={bb_limit_lower}")
-
-                return True
+                bb_limit = bb_lower + (bb_center - bb_lower) * 2 / 3
+                if price < bb_limit:
+                    return True
+                return ("ignore", f"фильтр BB long не пройден: price={price}, limit={bb_limit}")
 
             elif direction == "short":
-                if not (20 < rsi < 40):
-                    return ("ignore", f"фильтр RSI short не пройден: rsi={rsi}")
-
-                bb_limit_upper = bb_center - (bb_center - bb_lower) / 3
-                if price < bb_lower_25 or price > bb_limit_upper:
-                    return ("ignore", f"фильтр BB short не пройден: price={price}, "
-                                      f"lower_25={bb_lower_25}, bb_limit_upper={bb_limit_upper}")
-
-                return True
+                bb_limit = bb_upper - (bb_upper - bb_center) * 2 / 3
+                if price > bb_limit:
+                    return True
+                return ("ignore", f"фильтр BB short не пройден: price={price}, limit={bb_limit}")
 
             return ("ignore", f"неизвестное направление: {direction}")
 

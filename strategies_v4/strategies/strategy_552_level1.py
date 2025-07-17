@@ -2,7 +2,6 @@
 
 import logging
 import json
-from infra import load_indicators, get_price
 
 log = logging.getLogger("STRATEGY_552_LEVEL1")
 
@@ -12,42 +11,8 @@ class Strategy552Level1:
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
 
-        try:
-            price = await get_price(symbol)
-            if price is None:
-                return ("ignore", "нет текущей цены")
-
-            indicators = await load_indicators(symbol, [
-                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
-            ], tf)
-
-            bb_center = indicators.get("bb20_2_0_center")
-            bb_upper = indicators.get("bb20_2_0_upper")
-            bb_lower = indicators.get("bb20_2_0_lower")
-
-            log.debug(f"[552] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
-                      f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}")
-
-            if None in (bb_center, bb_upper, bb_lower):
-                return ("ignore", "недостаточно данных BB")
-
-            if direction == "long":
-                bb_limit = bb_lower + (bb_center - bb_lower) * 2 / 3
-                if price < bb_limit:
-                    return True
-                return ("ignore", f"фильтр BB long не пройден: price={price}, limit={bb_limit}")
-
-            elif direction == "short":
-                bb_limit = bb_upper - (bb_upper - bb_center) * 2 / 3
-                if price > bb_limit:
-                    return True
-                return ("ignore", f"фильтр BB short не пройден: price={price}, limit={bb_limit}")
-
-            return ("ignore", f"неизвестное направление: {direction}")
-
-        except Exception:
-            log.exception("❌ Ошибка в strategy_552_level1")
-            return ("ignore", "ошибка в стратегии")
+        log.debug(f"[552] Принят сигнал без проверок: symbol={symbol}, direction={direction}, tf={tf}")
+        return True
 
     async def run(self, signal, context):
         redis = context.get("redis")

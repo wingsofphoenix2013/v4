@@ -1,50 +1,18 @@
-# strategy_303_level2.py
+# strategy_503_level2.py
 
 import logging
 import json
-from infra import load_indicators, get_price
 
-log = logging.getLogger("STRATEGY_303_LEVEL2")
+log = logging.getLogger("STRATEGY_503_LEVEL2")
 
-class Strategy303Level2:
+class Strategy503Level2:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
-        redis = context["redis"]
 
-        try:
-            price = await get_price(symbol)
-            if price is None:
-                return ("ignore", "нет текущей цены")
-
-            indicators = await load_indicators(symbol, ["adx_dmi14_adx", "rsi14"], tf)
-            adx = indicators.get("adx_dmi14_adx")
-            rsi = indicators.get("rsi14")
-
-            log.debug(f"[303] symbol={symbol}, tf={tf}, direction={direction}, price={price}, adx={adx}, rsi={rsi}")
-
-            if adx is None or rsi is None:
-                return ("ignore", "недостаточно данных ADX или RSI")
-
-            if adx <= 25:
-                return ("ignore", f"фильтр ADX не пройден: adx={adx}")
-
-            if direction == "long":
-                if not (60 < rsi < 80):
-                    return ("ignore", f"фильтр RSI long не пройден: rsi={rsi}")
-                return True
-
-            elif direction == "short":
-                if not (20 < rsi < 40):
-                    return ("ignore", f"фильтр RSI short не пройден: rsi={rsi}")
-                return True
-
-            return ("ignore", f"неизвестное направление: {direction}")
-
-        except Exception:
-            log.exception("❌ Ошибка в strategy_303_level2")
-            return ("ignore", "ошибка в стратегии")
+        log.debug(f"[503] Принят сигнал без проверок: symbol={symbol}, direction={direction}, tf={tf}")
+        return True
 
     async def run(self, signal, context):
         redis = context.get("redis")

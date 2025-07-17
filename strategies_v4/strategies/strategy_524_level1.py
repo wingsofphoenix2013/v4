@@ -17,23 +17,31 @@ class Strategy524Level1:
             if price is None:
                 return ("ignore", "нет текущей цены")
 
-            indicators = await load_indicators(symbol, ["rsi14"], tf)
-            rsi = indicators.get("rsi14")
+            indicators = await load_indicators(symbol, [
+                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower"
+            ], tf)
 
-            log.debug(f"[524] symbol={symbol}, tf={tf}, direction={direction}, price={price}, rsi={rsi}")
+            bb_center = indicators.get("bb20_2_0_center")
+            bb_upper = indicators.get("bb20_2_0_upper")
+            bb_lower = indicators.get("bb20_2_0_lower")
 
-            if rsi is None:
-                return ("ignore", "нет значения RSI")
+            log.debug(f"[524] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
+                      f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}")
+
+            if None in (bb_center, bb_upper, bb_lower):
+                return ("ignore", "недостаточно данных BB")
 
             if direction == "long":
-                if rsi < 25:
+                bb_limit = bb_lower + (bb_center - bb_lower) * (1 / 3)
+                if price <= bb_limit:
                     return True
-                return ("ignore", f"RSI выше порога для long: rsi={rsi}")
+                return ("ignore", f"фильтр BB long не пройден: price={price}, limit={bb_limit}")
 
             elif direction == "short":
-                if rsi > 75:
+                bb_limit = bb_upper - (bb_upper - bb_center) * (1 / 3)
+                if price >= bb_limit:
                     return True
-                return ("ignore", f"RSI ниже порога для short: rsi={rsi}")
+                return ("ignore", f"фильтр BB short не пройден: price={price}, limit={bb_limit}")
 
             return ("ignore", f"неизвестное направление: {direction}")
 
