@@ -1,17 +1,17 @@
-# strategy_502_level1.py
+# strategy_402_level1.py
 
 import logging
 import json
 
-log = logging.getLogger("STRATEGY_502_LEVEL1")
+log = logging.getLogger("STRATEGY_402_LEVEL1")
 
-class Strategy502Level1:
+class Strategy402Level1:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
         tf = context["strategy"]["timeframe"].lower()
 
-        log.debug(f"[502] Принят сигнал без проверок: symbol={symbol}, direction={direction}, tf={tf}")
+        log.debug(f"[402] Принят сигнал без проверок: symbol={symbol}, direction={direction}, tf={tf}")
         return True
 
     async def run(self, signal, context):
