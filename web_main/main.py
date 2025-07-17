@@ -427,10 +427,10 @@ async def webhook_v4(request: Request):
     sent_at  = normalize_iso_utc_z(sent_at)  if sent_at else ""
 
     # 🔹 Время получения — UTC с микросекундами, без 'Z'
-    received_at = datetime.now(timezone.utc).isoformat()
+    received_at = datetime.utcnow().isoformat()
 
     # 🔹 Отладочный лог сигнала
-    log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
+    log.debug(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
     # 🔹 Публикация в Redis Stream с источником
     await redis_client.xadd("signals_stream", {
