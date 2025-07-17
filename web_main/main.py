@@ -411,7 +411,7 @@ async def webhook_v4(request: Request):
     received_at = datetime.utcnow().isoformat()
 
     # 🔹 Отладочный лог сигнала
-    log.debug(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
+    log.info(f"{message} | {symbol} | bar_time={bar_time} | sent_at={sent_at}")
 
     # 🔹 Публикация в Redis Stream с источником
     await redis_client.xadd("signals_stream", {
