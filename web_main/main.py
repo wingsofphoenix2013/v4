@@ -389,6 +389,18 @@ async def create_indicator(
 # 🔸 Приём сигналов от TradingView (формат JSON, v4)
 log = logging.getLogger("WEBHOOK")
 
+# 🔹 Извлечение timestamp из строки и преобразование в ISO 8601
+def extract_iso_from_string(value: str) -> str:
+    import re
+    try:
+        match = re.search(r"\d{10}", value)
+        if match:
+            ts = int(match.group(0))
+            return datetime.utcfromtimestamp(ts).isoformat()
+    except Exception:
+        pass
+    return value
+
 @app.post("/webhook_v4")
 async def webhook_v4(request: Request):
     try:
@@ -396,10 +408,10 @@ async def webhook_v4(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    message = payload.get("message")
-    symbol = payload.get("symbol")
-    bar_time = payload.get("time")
-    sent_at = payload.get("sent_at")
+    message   = payload.get("message")
+    symbol    = payload.get("symbol")
+    bar_time  = payload.get("time")
+    sent_at   = payload.get("sent_at")
 
     if not message or not symbol:
         raise HTTPException(status_code=422, detail="Missing 'message' or 'symbol'")
@@ -407,6 +419,10 @@ async def webhook_v4(request: Request):
     # 🔹 Очистка тикера от постфикса .P
     if symbol.endswith(".P"):
         symbol = symbol[:-2]
+
+    # 🔹 Попытка извлечения ISO-даты из bar_time и sent_at
+    bar_time = extract_iso_from_string(bar_time) if bar_time else ""
+    sent_at  = extract_iso_from_string(sent_at)  if sent_at else ""
 
     received_at = datetime.utcnow().isoformat()
 
@@ -417,8 +433,8 @@ async def webhook_v4(request: Request):
     await redis_client.xadd("signals_stream", {
         "message": message,
         "symbol": symbol,
-        "bar_time": bar_time or "",
-        "sent_at": sent_at or "",
+        "bar_time": bar_time,
+        "sent_at": sent_at,
         "received_at": received_at,
         "source": "external_signal"
     })
