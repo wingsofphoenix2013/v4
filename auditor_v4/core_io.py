@@ -19,6 +19,7 @@ TF_SECONDS = {
     "m1": 60,
     "m5": 300,
     "m15": 900,
+    "h1": 3600,
 }
 
 
@@ -57,7 +58,7 @@ async def process_position(position: dict):
     strategy_name = strategy.get("name")
     base_tf = strategy.get("timeframe", "").lower()
 
-    tf_order = ["m1", "m5", "m15"]
+    tf_order = ["m1", "m5", "m15", "h1"]
     if base_tf not in tf_order:
         log.warning(f"⚠️ Неизвестный таймфрейм '{base_tf}' — позиция {uid} пропущена")
         return
