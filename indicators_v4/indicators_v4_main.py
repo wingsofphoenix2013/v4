@@ -131,7 +131,8 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     step_ms = {
         "m1": 60_000,
         "m5": 300_000,
-        "m15": 900_000
+        "m15": 900_000,
+        "h1": 3_600_000
     }[interval]
     start_ts = end_ts - (count - 1) * step_ms
 
