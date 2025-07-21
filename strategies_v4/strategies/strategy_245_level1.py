@@ -8,56 +8,12 @@ log = logging.getLogger("STRATEGY_245_LEVEL1")
 
 class Strategy245Level1:
     async def validate_signal(self, signal, context):
-        symbol = signal["symbol"]
         direction = signal["direction"].lower()
-        tf = context["strategy"]["timeframe"].lower()
 
-        try:
-            price = await get_price(symbol)
-            if price is None:
-                return ("ignore", "нет текущей цены")
-
-            indicators = await load_indicators(symbol, [
-                "bb20_2_0_center", "bb20_2_0_upper", "bb20_2_0_lower", "ema100"
-            ], tf)
-
-            bb_center = indicators.get("bb20_2_0_center")
-            bb_upper = indicators.get("bb20_2_0_upper")
-            bb_lower = indicators.get("bb20_2_0_lower")
-            ema100 = indicators.get("ema100")
-
-            log.debug(f"[241] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
-                      f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}, ema100={ema100}")
-
-            if None in (bb_center, bb_upper, bb_lower, ema100):
-                return ("ignore", "недостаточно данных BB или EMA")
-
-            if direction == "long":
-                if price <= ema100:
-                    return ("ignore", f"фильтр EMA long не пройден: price={price}, ema100={ema100}")
-                bb_limit = bb_lower + (bb_center - bb_lower) * (1 / 3)
-                if price <= bb_limit:
-                    return True
-                return ("ignore", f"фильтр BB long не пройден: price={price}, limit={bb_limit}")
-
-            elif direction == "short":
-                if price >= ema100:
-                    return ("ignore", f"фильтр EMA short не пройден: price={price}, ema100={ema100}")
-                bb_limit = bb_upper - (bb_upper - bb_center) * (1 / 3)
-                if price >= bb_limit:
-                    return True
-                return ("ignore", f"фильтр BB short не пройден: price={price}, limit={bb_limit}")
-
-            return ("ignore", f"неизвестное направление: {direction}")
-
-        except Exception:
-            log.exception("❌ Ошибка в strategy_241_level1")
-            return ("ignore", "ошибка в стратегии")
-            
-        except Exception:
-            log.exception("❌ Ошибка в strategy_245_level1")
-            return ("ignore", "ошибка в стратегии")
-
+        if direction == "short":
+            return True
+        return ("ignore", "разрешён только short")
+        
     async def run(self, signal, context):
         redis = context.get("redis")
         if redis is None:
