@@ -13,7 +13,6 @@ from config_loader import (
     config_event_listener,
 )
 from core_io import pg_task, finmonitor_task, treasury_task
-from redis_io import redis_task  # Оставлен, если используется
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
 
 # 🔸 Логгер для главного процесса
@@ -73,13 +72,11 @@ async def main():
 
     await asyncio.gather(
         run_safe_loop(pg_task, "CORE_IO"),
-        run_safe_loop(redis_task, "REDIS_IO"),
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600),
         loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180)
-        # REDIS_TS_AUDITOR временно отключён
     )
 
 if __name__ == "__main__":
