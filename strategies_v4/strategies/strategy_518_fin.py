@@ -2,6 +2,7 @@
 
 import logging
 import json
+from infra import load_indicators, get_price
 
 log = logging.getLogger("STRATEGY_518_FIN")
 
