@@ -14,6 +14,13 @@ TF_SECONDS = {
     "h1": 3600,
 }
 
+BINANCE_INTERVAL_MAP = {
+    "m1": "1m",
+    "m5": "5m",
+    "m15": "15m",
+    "h1": "1h",
+}
+
 # 🔸 Возвращает from_time и to_time для данного таймфрейма и тикера
 def get_audit_window(tf: str, created_at: datetime) -> tuple[datetime, datetime]:
     now = datetime.utcnow()
@@ -130,7 +137,7 @@ async def fix_missing_candles():
 
             params = {
                 "symbol": symbol,
-                "interval": interval,
+                "interval": BINANCE_INTERVAL_MAP[interval],
                 "startTime": start_ts,
                 "limit": 1
             }
