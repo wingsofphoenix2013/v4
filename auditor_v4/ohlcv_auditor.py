@@ -1,9 +1,8 @@
-# ohlcv_auditor.py
-
 import asyncio
 import logging
 from datetime import datetime, timedelta
 
+import aiohttp
 import infra
 
 log = logging.getLogger("OHLCV_AUDITOR")
@@ -15,7 +14,6 @@ TF_SECONDS = {
     "h1": 3600,
 }
 
-
 # 🔸 Возвращает from_time и to_time для данного таймфрейма и тикера
 def get_audit_window(tf: str, created_at: datetime) -> tuple[datetime, datetime]:
     now = datetime.utcnow()
@@ -26,6 +24,7 @@ def get_audit_window(tf: str, created_at: datetime) -> tuple[datetime, datetime]
     from_time = max(created_at, to_time - timedelta(days=29))
 
     return from_time, to_time
+
 
 # 🔸 Аудит одного тикера и одного таймфрейма
 async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semaphore):
@@ -54,7 +53,6 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
 
             from_time = max(created_at, actual_min_time, to_time - timedelta(days=29))
 
-            # 🔧 Округление вниз до кратного tf
             from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
             from_time_aligned = datetime.fromtimestamp(from_ts)
 
@@ -91,6 +89,8 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
 
         except Exception:
             log.exception(f"❌ Ошибка при аудите {symbol} [{tf}]")
+
+
 # 🔸 Запуск аудита по всем тикерам и интервалам
 async def run_audit_all_symbols():
     log.info("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
@@ -105,3 +105,71 @@ async def run_audit_all_symbols():
     await asyncio.gather(*tasks)
 
     log.info("✅ [AUDIT] Завершён аудит всех тикеров и таймфреймов")
+
+
+# 🔸 Запрашивает и чинит пропущенные свечи из Binance
+async def fix_missing_candles():
+    log.info("🔧 [FIXER] Запуск обработки пропущенных свечей")
+    url = "https://fapi.binance.com/fapi/v1/klines"
+
+    async with aiohttp.ClientSession() as session:
+        async with infra.pg_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT symbol, interval, open_time
+                FROM ohlcv_gaps_v4
+                WHERE fixed = false
+                ORDER BY open_time
+                LIMIT 50
+            """)
+
+        for row in rows:
+            symbol = row["symbol"]
+            interval = row["interval"]
+            open_time = row["open_time"]
+            start_ts = int(open_time.timestamp() * 1000)
+
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "startTime": start_ts,
+                "limit": 1
+            }
+
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        log.warning(f"❌ Binance API error {resp.status} for {symbol} {interval} {open_time}")
+                        continue
+
+                    data = await resp.json()
+                    if not data:
+                        log.warning(f"⚠️ Нет данных от Binance для {symbol} {interval} {open_time}")
+                        continue
+
+                    kline = data[0]
+                    table = f"ohlcv4_{interval}"
+                    insert_query = f"""
+                        INSERT INTO {table} (
+                            symbol, open_time, open, high, low, close, volume, source
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'binance')
+                        ON CONFLICT (symbol, open_time) DO NOTHING
+                    """
+
+                    values = (
+                        symbol,
+                        datetime.fromtimestamp(kline[0] / 1000),
+                        kline[1], kline[2], kline[3], kline[4], kline[5]
+                    )
+
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(insert_query, *values)
+                        await conn.execute("""
+                            UPDATE ohlcv_gaps_v4
+                            SET fixed = true, fixed_at = now()
+                            WHERE symbol = $1 AND interval = $2 AND open_time = $3
+                        """, symbol, interval, open_time)
+
+                    log.info(f"✅ Вставлена свеча {symbol} {interval} {open_time}")
+
+            except Exception:
+                log.exception(f"❌ Ошибка обработки {symbol} {interval} {open_time}")

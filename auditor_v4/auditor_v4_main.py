@@ -14,7 +14,7 @@ from config_loader import (
 )
 from core_io import pg_task, finmonitor_task, treasury_task
 from redis_io import redis_task
-from ohlcv_auditor import run_audit_all_symbols
+from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -32,7 +32,11 @@ async def run_safe_loop(coro, label: str):
 
 
 # 🔸 Периодическая обёртка с задержкой между циклами
-async def loop_with_interval(coro_func, label: str, interval_sec: int):
+async def loop_with_interval(coro_func, label: str, interval_sec: int, initial_delay: int = 0):
+    if initial_delay > 0:
+        log.info(f"[{label}] ⏳ Первая задержка {initial_delay} сек перед запуском")
+        await asyncio.sleep(initial_delay)
+
     while True:
         try:
             log.info(f"[{label}] ⏳ Запуск задачи")
@@ -42,8 +46,7 @@ async def loop_with_interval(coro_func, label: str, interval_sec: int):
         except Exception:
             log.exception(f"[{label}] ❌ Ошибка — перезапуск через 5 секунд")
             await asyncio.sleep(5)
-
-
+            
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
@@ -74,9 +77,9 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
-        loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600)
+        loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600),
+        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 3600, initial_delay=300)
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())
