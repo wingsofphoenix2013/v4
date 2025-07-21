@@ -1,24 +1,34 @@
-# redis_io.py
-
 import asyncio
 import logging
 
-from infra import redis_client
+import infra
 
-# 🔸 Логгер для Redis операций
 log = logging.getLogger("REDIS_IO")
 
 
-# 🔸 Основной воркер Redis
+# 🔸 Обновление RETENTION для всех Redis TS ключей
+async def update_retention_for_all_ts_keys():
+    try:
+        log.info("🔧 Начинаю обновление RETENTION для всех ключей Redis TS...")
+
+        keys = await infra.redis_client.keys("ts:*:*:*")
+        log.info(f"🔍 Найдено ключей: {len(keys)}")
+
+        updated = 0
+        for key in keys:
+            try:
+                await infra.redis_client.execute_command("TS.ALTER", key, "RETENTION", 2592000000)
+                log.info(f"✅ Обновлён: {key}")
+                updated += 1
+            except Exception as e:
+                log.warning(f"⚠️ Ошибка при обновлении {key}: {e}")
+
+        log.info(f"🏁 Обновление завершено. Успешно обновлено: {updated} ключей из {len(keys)}")
+
+    except Exception:
+        log.exception("❌ Ошибка при массовом обновлении RETENTION ключей Redis TS")
+
+
+# 🔸 Основной воркер (заглушка, если нужно вызвать через run_safe_loop)
 async def redis_task():
-    log.info("🔁 [redis_task] стартует")
-
-    while True:
-        try:
-            # Здесь будет логика: очистка ключей, аудит, метрики и т.п.
-            log.info("⏳ redis_task: имитация работы с Redis")
-            await asyncio.sleep(600)
-
-        except Exception:
-            log.exception("❌ Ошибка в redis_task — продолжаем выполнение")
-            await asyncio.sleep(5)  # обязательная пауза при ошибке
+    await update_retention_for_all_ts_keys()
