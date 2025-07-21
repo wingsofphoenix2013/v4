@@ -118,6 +118,7 @@ async def run_audit_all_symbols():
 async def fix_missing_candles():
     log.info("🔧 [FIXER] Запуск обработки пропущенных свечей")
     url = "https://fapi.binance.com/fapi/v1/klines"
+    fixed_count = 0
 
     async with aiohttp.ClientSession() as session:
         async with infra.pg_pool.acquire() as conn:
@@ -126,7 +127,7 @@ async def fix_missing_candles():
                 FROM ohlcv_gaps_v4
                 WHERE fixed = false
                 ORDER BY open_time
-                LIMIT 50
+                LIMIT 100
             """)
 
         for row in rows:
@@ -177,6 +178,12 @@ async def fix_missing_candles():
                         """, symbol, interval, open_time)
 
                     log.info(f"✅ Вставлена свеча {symbol} {interval} {open_time}")
+                    fixed_count += 1
 
             except Exception:
                 log.exception(f"❌ Ошибка обработки {symbol} {interval} {open_time}")
+
+    # 🔹 Общий лог после прохода
+    async with infra.pg_pool.acquire() as conn:
+        remaining = await conn.fetchval("SELECT COUNT(*) FROM ohlcv_gaps_v4 WHERE fixed = false")
+        log.info(f"📊 [FIXER] Обработано {fixed_count} свечей, осталось: {remaining}")

@@ -32,7 +32,7 @@ def get_last_closed_open_time(created_at: datetime, tf: str) -> datetime:
 
 # 🔸 Загрузка неаудированных закрытых позиций
 async def load_unprocessed_positions(limit: int = 100) -> list[dict]:
-    log.info("📥 Загрузка неаудированных позиций из базы...")
+    log.debug("📥 Загрузка неаудированных позиций из базы...")
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT *
@@ -41,7 +41,7 @@ async def load_unprocessed_positions(limit: int = 100) -> list[dict]:
             ORDER BY created_at
             LIMIT $1
         """, limit)
-    log.info(f"📊 Загружено {len(rows)} позиций на аудит")
+    log.debug(f"📊 Загружено {len(rows)} позиций на аудит")
     return [dict(r) for r in rows]
 # 🔸 Обработка одной позиции
 async def process_position(position: dict):
@@ -73,7 +73,7 @@ async def process_position(position: dict):
     ]
 
     if not indicators:
-        log.info(f"ℹ️ Нет индикаторов для позиции {uid}")
+        log.debug(f"ℹ️ Нет индикаторов для позиции {uid}")
         return
 
     snapshot_rows = []
@@ -108,7 +108,7 @@ async def process_position(position: dict):
     if snapshot_rows:
         await insert_ind_snapshot(snapshot_rows)
         await mark_position_audited(uid)
-        log.info(f"✅ Позиция {uid} обработана ({len(snapshot_rows)} значений)")
+        log.debug(f"✅ Позиция {uid} обработана ({len(snapshot_rows)} значений)")
     else:
         log.warning(f"⚠️ Позиция {uid} — ни одного значения индикатора не найдено")
 # 🔸 Вставка слепков индикаторов
@@ -161,16 +161,16 @@ async def process_with_semaphore(position: dict, semaphore: asyncio.Semaphore):
 
 # 🔸 Основной воркер PostgreSQL
 async def pg_task():
-    log.info("🔁 [pg_task] стартует")
+    log.debug("🔁 [pg_task] стартует")
 
     try:
         while True:
             try:
-                log.info("🔁 Начало аудиторского прохода")
+                log.debug("🔁 Начало аудиторского прохода")
                 positions = await load_unprocessed_positions()
 
                 if not positions:
-                    log.info("✅ Нет новых позиций для аудита — пауза")
+                    log.debug("✅ Нет новых позиций для аудита — пауза")
                     await asyncio.sleep(60)
                     continue
 
@@ -181,7 +181,7 @@ async def pg_task():
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-                log.info("⏸ Пауза до следующего цикла")
+                log.debug("⏸ Пауза до следующего цикла")
                 await asyncio.sleep(60)
 
             except Exception:
@@ -194,7 +194,7 @@ async def pg_task():
 # 🔸 Финмониторинг позиций
 async def finmonitor_task():
     log = logging.getLogger("FINMONITOR")
-    log.info("🔁 [finmonitor_task] стартует")
+    log.debug("🔁 [finmonitor_task] стартует")
 
     while True:
         try:
@@ -207,7 +207,7 @@ async def finmonitor_task():
                 strategy_ids = [r["id"] for r in strategy_rows]
 
                 if not strategy_ids:
-                    log.info("ℹ️ Нет стратегий с включённым аудитом")
+                    log.debug("ℹ️ Нет стратегий с включённым аудитом")
                     await asyncio.sleep(60)
                     continue
 
@@ -226,7 +226,7 @@ async def finmonitor_task():
                 """, strategy_ids)
 
                 if not position_rows:
-                    log.info("✅ Нет новых позиций для финмониторинга — пауза")
+                    log.debug("✅ Нет новых позиций для финмониторинга — пауза")
                     await asyncio.sleep(60)
                     continue
 
@@ -298,7 +298,7 @@ async def finmonitor_task():
                     WHERE position_uid = $1
                 """, [(uid,) for uid in mark_done])
 
-                log.info(f"📌 Обработано в финмониторинге: {len(mark_done)} позиций")
+                log.debug(f"📌 Обработано в финмониторинге: {len(mark_done)} позиций")
 
         except Exception:
             log.exception("❌ Ошибка в finmonitor_task")
@@ -307,7 +307,7 @@ async def finmonitor_task():
 # 🔸 Казначейская обработка
 async def treasury_task():
     log = logging.getLogger("TREASURY")
-    log.info("🔁 [treasury_task] стартует")
+    log.debug("🔁 [treasury_task] стартует")
 
     while True:
         try:
@@ -321,7 +321,7 @@ async def treasury_task():
                 """)
 
                 if not rows:
-                    log.info("✅ Нет новых позиций для казначейства — пауза")
+                    log.debug("✅ Нет новых позиций для казначейства — пауза")
                     await asyncio.sleep(60)
                     continue
 
@@ -433,7 +433,7 @@ async def treasury_task():
                             WHERE position_uid = $1
                         """, position_uid)
 
-                        log.info(f"💰 Позиция {position_uid} обработана")
+                        log.debug(f"💰 Позиция {position_uid} обработана")
 
         except Exception:
             log.exception("❌ Ошибка в treasury_task")

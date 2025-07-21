@@ -78,7 +78,7 @@ async def main():
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600),
-        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 3600, initial_delay=300)
+        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180)
     )
 
 if __name__ == "__main__":
