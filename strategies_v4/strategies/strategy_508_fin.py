@@ -6,7 +6,7 @@ from infra import load_indicators, get_price
 
 log = logging.getLogger("STRATEGY_508_LEVEL1")
 
-class Strategy508Level1:
+class Strategy508Fin:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"].lower()

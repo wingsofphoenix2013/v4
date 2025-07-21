@@ -1,12 +1,12 @@
-# strategy_557_level1.py
+# strategy_512_level1.py
 
 import logging
 import json
 from infra import load_indicators, get_price
 
-log = logging.getLogger("STRATEGY_557_LEVEL1")
+log = logging.getLogger("STRATEGY_512_LEVEL1")
 
-class Strategy557Level1:
+class Strategy512Fin:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
@@ -26,7 +26,7 @@ class Strategy557Level1:
             bb_lower = indicators.get("bb20_2_0_lower")
             ema200 = indicators.get("ema200")
 
-            log.debug(f"[557] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
+            log.debug(f"[512] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
                       f"bb_center={bb_center}, bb_upper={bb_upper}, bb_lower={bb_lower}, ema200={ema200}")
 
             if None in (bb_center, bb_upper, bb_lower, ema200):
@@ -51,7 +51,7 @@ class Strategy557Level1:
             return ("ignore", f"неизвестное направление: {direction}")
 
         except Exception:
-            log.exception("❌ Ошибка в strategy_557_level1")
+            log.exception("❌ Ошибка в strategy_512_level1")
             return ("ignore", "ошибка в стратегии")
 
     async def run(self, signal, context):
