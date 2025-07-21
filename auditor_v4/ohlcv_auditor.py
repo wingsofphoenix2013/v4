@@ -27,7 +27,6 @@ def get_audit_window(tf: str, created_at: datetime) -> tuple[datetime, datetime]
 
     return from_time, to_time
 
-
 # 🔸 Аудит одного тикера и одного таймфрейма
 async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semaphore):
     async with semaphore:
@@ -37,21 +36,40 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
                 log.warning(f"⏳ Пропущен тикер {symbol} — отсутствует created_at")
                 return
 
-            from_time, to_time = get_audit_window(tf, created_at)
             tf_sec = TF_SECONDS[tf]
-            expected = set(
-                from_time + timedelta(seconds=tf_sec * i)
-                for i in range(int((to_time - from_time).total_seconds() // tf_sec) + 1)
-            )
+            now = datetime.utcnow()
+            to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
+            to_time = datetime.fromtimestamp(to_ts)
 
             table = f"ohlcv4_{tf}"
-            query = f"""
+            query_range = f"""
+                SELECT MIN(open_time) AS min_open_time
+                FROM {table}
+                WHERE symbol = $1 AND open_time <= $2
+            """
+
+            async with infra.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(query_range, symbol, to_time)
+                actual_min_time = row["min_open_time"] or to_time
+
+            from_time = max(created_at, actual_min_time, to_time - timedelta(days=29))
+
+            # 🔧 Округление вниз до кратного tf
+            from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
+            from_time_aligned = datetime.fromtimestamp(from_ts)
+
+            expected = set(
+                from_time_aligned + timedelta(seconds=tf_sec * i)
+                for i in range(int((to_time - from_time_aligned).total_seconds() // tf_sec) + 1)
+            )
+
+            query_data = f"""
                 SELECT open_time FROM {table}
                 WHERE symbol = $1 AND open_time BETWEEN $2 AND $3
             """
 
             async with infra.pg_pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, from_time, to_time)
+                rows = await conn.fetch(query_data, symbol, from_time_aligned, to_time)
                 actual = set(row["open_time"] for row in rows)
 
             missing = sorted(expected - actual)
@@ -73,8 +91,6 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
 
         except Exception:
             log.exception(f"❌ Ошибка при аудите {symbol} [{tf}]")
-
-
 # 🔸 Запуск аудита по всем тикерам и интервалам
 async def run_audit_all_symbols():
     log.info("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
