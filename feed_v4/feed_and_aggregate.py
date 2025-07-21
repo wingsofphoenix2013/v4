@@ -188,7 +188,7 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
                 # Если нет — создаём
                 await redis.execute_command(
                     "TS.CREATE", field_key,
-                    "RETENTION", 604800000,  # 7 дней
+                    "RETENTION", 2592000000,  # 7 дней
                     "DUPLICATE_POLICY", "last",
                     "LABELS",
                     "symbol", symbol,
