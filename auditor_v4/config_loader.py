@@ -15,10 +15,10 @@ from infra import (
 log = logging.getLogger("CONFIG_LOADER")
 
 
-# 🔸 Загрузка тикеров с разрешённым статусом и торговлей
+# 🔸 Загрузка тикеров с разрешённым статусом и торговлей (включая created_at)
 async def load_enabled_tickers():
     query = """
-        SELECT symbol, precision_price, precision_qty
+        SELECT symbol, precision_price, precision_qty, created_at
         FROM tickers_v4
         WHERE status = 'enabled' AND tradepermission = 'enabled'
     """

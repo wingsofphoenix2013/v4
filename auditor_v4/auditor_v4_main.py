@@ -1,5 +1,3 @@
-# auditor_v4_main.py
-
 import asyncio
 import logging
 
@@ -16,6 +14,7 @@ from config_loader import (
 )
 from core_io import pg_task, finmonitor_task, treasury_task
 from redis_io import redis_task
+from ohlcv_auditor import run_audit_all_symbols
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -29,6 +28,19 @@ async def run_safe_loop(coro, label: str):
             await coro()
         except Exception:
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
+            await asyncio.sleep(5)
+
+
+# 🔸 Периодическая обёртка с задержкой между циклами
+async def loop_with_interval(coro_func, label: str, interval_sec: int):
+    while True:
+        try:
+            log.info(f"[{label}] ⏳ Запуск задачи")
+            await coro_func()
+            log.info(f"[{label}] ⏸ Следующий запуск через {interval_sec} сек")
+            await asyncio.sleep(interval_sec)
+        except Exception:
+            log.exception(f"[{label}] ❌ Ошибка — перезапуск через 5 секунд")
             await asyncio.sleep(5)
 
 
@@ -61,7 +73,8 @@ async def main():
         run_safe_loop(redis_task, "REDIS_IO"),
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(finmonitor_task, "FINMONITOR"),
-        run_safe_loop(treasury_task, "TREASURY")
+        run_safe_loop(treasury_task, "TREASURY"),
+        loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600)
     )
 
 
