@@ -90,6 +90,20 @@ async def run_strategy_rating_worker():
             "trade_count": trade_count,
         })
 
+    # 🔹 Фильтрация стратегий по активности
+    total_trades = sum(r["trade_count"] for r in results)
+    num_strategies = len(results)
+    avg_trades = total_trades / num_strategies if num_strategies > 0 else 0
+    threshold = max(2, int(avg_trades * 0.3))
+
+    metrics_df = pd.DataFrame(results)
+    metrics_df = metrics_df[metrics_df["trade_count"] >= threshold]
+
+    log.info(
+        f"[STRATEGY_RATER] 📊 Порог участия: {threshold} сделок — "
+        f"{len(metrics_df)} стратегий допущено из {num_strategies}"
+    )
+
     # 🔹 Нормализация и рейтинг
     metrics_df = pd.DataFrame(results)
     EPSILON = 1e-9
