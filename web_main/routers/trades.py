@@ -60,6 +60,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             SELECT strategy_id, rating,
                    ROW_NUMBER() OVER (PARTITION BY strategy_id ORDER BY ts DESC) AS rn
             FROM strategies_active_v4
+            WHERE rating IS NOT NULL
         """)
 
         # 🧠 Собираем map strategy_id → (current, previous)
@@ -67,11 +68,14 @@ async def get_trading_summary(filter: str) -> list[dict]:
         for row in rating_rows:
             sid = row["strategy_id"]
             rating = row["rating"]
+            rn = row["rn"]
+
             if sid not in rating_map:
                 rating_map[sid] = [None, None]
-            if row["rn"] == 1:
+
+            if rn == 1:
                 rating_map[sid][0] = rating  # current
-            elif row["rn"] == 2:
+            elif rn == 2:
                 rating_map[sid][1] = rating  # previous
 
         # 🔁 Диапазон по фильтру
