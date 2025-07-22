@@ -38,6 +38,7 @@ async def trades_page(request: Request, filter: str = "24h", series: str = None)
 # 🔸 Расчёт статистики стратегий под /trades
 async def get_trading_summary(filter: str) -> list[dict]:
     async with pg_pool.acquire() as conn:
+        # Все стратегии
         strategies = await conn.fetch("""
             SELECT id, name, human_name, deposit
             FROM strategies_v4
@@ -45,6 +46,35 @@ async def get_trading_summary(filter: str) -> list[dict]:
             ORDER BY id
         """)
 
+        # 👑 Получаем последнюю запись из strategies_active_v4
+        active_row = await conn.fetchrow("""
+            SELECT * FROM strategies_active_v4
+            ORDER BY ts DESC
+            LIMIT 1
+        """)
+        current_king_id = active_row["strategy_id"] if active_row else None
+        previous_king_id = active_row["previous_strategy_id"] if active_row else None
+
+        # 📊 Получаем рейтинг для последних 2 точек по каждой стратегии
+        rating_rows = await conn.fetch("""
+            SELECT strategy_id, rating,
+                   ROW_NUMBER() OVER (PARTITION BY strategy_id ORDER BY ts DESC) AS rn
+            FROM strategies_active_v4
+        """)
+
+        # 🧠 Собираем map strategy_id → (current, previous)
+        rating_map = {}
+        for row in rating_rows:
+            sid = row["strategy_id"]
+            rating = row["rating"]
+            if sid not in rating_map:
+                rating_map[sid] = [None, None]
+            if row["rn"] == 1:
+                rating_map[sid][0] = rating  # current
+            elif row["rn"] == 2:
+                rating_map[sid][1] = rating  # previous
+
+        # 🔁 Диапазон по фильтру
         if filter == "24h":
             end = datetime.utcnow()
             start = end - timedelta(hours=24)
@@ -65,6 +95,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             sid = strat["id"]
             deposit = strat["deposit"]
 
+            # Закрытые позиции
             if start and end:
                 closed_rows = await conn.fetch("""
                     SELECT pnl FROM positions_v4
@@ -85,6 +116,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             winrate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
             roi = round(pnl_sum / deposit * 100, 2) if deposit else None
 
+            # Открытые позиции
             if filter == "24h":
                 open_count = await conn.fetchval("""
                     SELECT COUNT(*) FROM positions_v4
@@ -94,6 +126,22 @@ async def get_trading_summary(filter: str) -> list[dict]:
             else:
                 open_count = 0
 
+            # 👑 и 🤡
+            is_king = sid == current_king_id
+            was_king = sid == previous_king_id
+
+            # 📈 / 📉 / ➖ / ❓
+            r_current, r_prev = rating_map.get(sid, (None, None))
+            if r_current is not None and r_prev is not None:
+                if r_current > r_prev:
+                    trend = "📈"  # рейтинг вырос → стало лучше
+                elif r_current < r_prev:
+                    trend = "📉"  # рейтинг упал → стало хуже
+                else:
+                    trend = "➖"
+            else:
+                trend = "❓"
+
             result.append({
                 "id": sid,
                 "name": strat["name"],
@@ -101,7 +149,10 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 "open": open_count,
                 "closed": closed_count,
                 "winrate": winrate,
-                "roi": roi
+                "roi": roi,
+                "is_king": is_king,
+                "was_king": was_king,
+                "rating_trend": trend,
             })
 
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
