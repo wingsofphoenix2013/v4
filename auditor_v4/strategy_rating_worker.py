@@ -53,31 +53,31 @@ async def run_strategy_rating_worker():
         trade_count = len(group)
 
         # 🔸 PnL %
-        total_pnl = group["pnl"].sum()
-        total_value = group["notional_value"].sum()
+        total_pnl = float(group["pnl"].sum())
+        total_value = float(group["notional_value"].sum())
         pnl_pct = (total_pnl / total_value * 100) if total_value > 0 else 0.0
 
         # 🔸 Profit factor
         profit = group[group["pnl"] > 0]["pnl"].sum()
         loss = group[group["pnl"] < 0]["pnl"].sum()
-        profit_factor = profit / abs(loss) if loss < 0 else None
+        profit_factor = float(profit / abs(loss)) if loss < 0 else None
 
         # 🔸 Win rate
-        win_rate = (group["pnl"] > 0).mean()
+        win_rate = float((group["pnl"] > 0).mean())
 
         # 🔸 Volatility
-        volatility = group["pnl"].std(ddof=0)
+        volatility = float(group["pnl"].std(ddof=0)) if trade_count > 1 else 0.0
 
         # 🔸 Trend slope
         equity = group.sort_values("closed_at")["pnl"].cumsum()
         minutes = (group["closed_at"] - group["closed_at"].min()).dt.total_seconds() / 60
-        slope = linregress(minutes, equity).slope if len(group) >= 2 else 0.0
+        slope = float(linregress(minutes, equity).slope) if trade_count >= 2 else 0.0
 
         # 🔸 Max drawdown
         balance = equity
         peak = balance.cummax()
         drawdown = peak - balance
-        max_drawdown = drawdown.max()
+        max_drawdown = float(drawdown.max()) if not drawdown.empty else 0.0
 
         results.append({
             "strategy_id": strategy_id,
@@ -132,13 +132,13 @@ async def run_strategy_rating_worker():
 
     prev_map = {r["strategy_id"]: dict(r) for r in prev_rows}
 
-    # 🔹 Δ rating и pnl_diff_pct
+    # 🔹 Δ rating и pnl_diff_pct с безопасным float()
     metrics_df["pnl_diff_pct"] = metrics_df.apply(
-        lambda row: row["pnl_pct"] - prev_map.get(row["strategy_id"], {}).get("pnl_pct", 0),
+        lambda row: row["pnl_pct"] - float(prev_map.get(row["strategy_id"], {}).get("pnl_pct", 0) or 0),
         axis=1
     )
     metrics_df["delta_rating"] = metrics_df.apply(
-        lambda row: row["rating"] - prev_map.get(row["strategy_id"], {}).get("rating", 0),
+        lambda row: row["rating"] - float(prev_map.get(row["strategy_id"], {}).get("rating", 0) or 0),
         axis=1
     )
 
@@ -163,9 +163,9 @@ async def run_strategy_rating_worker():
             await conn.execute(
                 insert_query,
                 row.strategy_id, ts_now,
-                row.pnl_pct, row.trend_slope, row.profit_factor, row.win_rate,
-                row.max_drawdown, row.volatility, row.trade_count,
-                row.pnl_diff_pct, row.rating
+                float(row.pnl_pct), float(row.trend_slope), float(row.profit_factor or 0), float(row.win_rate),
+                float(row.max_drawdown), float(row.volatility), int(row.trade_count),
+                float(row.pnl_diff_pct), float(row.rating)
             )
 
     # 🔹 Финальное логирование
@@ -198,7 +198,7 @@ async def run_strategy_rating_worker():
         should_record = True
         reason = "initial_selection"
     else:
-        rating_diff = best_rating - last_entry["rating"]
+        rating_diff = best_rating - float(last_entry["rating"])
         minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
         previous_id = last_entry["strategy_id"]
 
@@ -222,6 +222,8 @@ async def run_strategy_rating_worker():
 
         log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
     else:
+        rating_diff = best_rating - float(last_entry["rating"]) if last_entry else 0
+        minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60 if last_entry else 0
         log.info(
             f"[STRATEGY_RATER] 👑 Стратегия {best_id} — лидер, но не зафиксирован "
             f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
