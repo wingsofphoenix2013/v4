@@ -130,7 +130,7 @@ async def run_strategy_rating_worker():
     async with infra.pg_pool.acquire() as conn:
         prev_rows = await conn.fetch(query_prev, ts_now)
 
-    prev_map = {r["strategy_id"]: r for r in prev_rows}
+    prev_map = {r["strategy_id"]: dict(r) for r in prev_rows}
 
     # 🔹 Δ rating и pnl_diff_pct
     metrics_df["pnl_diff_pct"] = metrics_df.apply(
