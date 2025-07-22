@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import linregress
 
-from infra import pg_pool
+import infra
 
 # 🔸 Логгер
 log = logging.getLogger("STRATEGY_RATER")
@@ -32,7 +32,7 @@ async def run_strategy_rating_worker():
           AND notional_value IS NOT NULL
     """
 
-    async with pg_pool.acquire() as conn:
+    async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query, from_ts, now)
 
     if not rows:
