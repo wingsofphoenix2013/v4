@@ -142,7 +142,7 @@ async def run_strategy_rating_worker():
         axis=1
     )
 
-    # 🔹 Сохраняем метрики
+    # 🔹 Сохраняем метрики (без дублирования)
     insert_query = """
         INSERT INTO strategies_metrics_v4 (
             strategy_id, ts,
@@ -156,6 +156,7 @@ async def run_strategy_rating_worker():
             $7, $8, $9,
             $10, $11
         )
+        ON CONFLICT DO NOTHING
     """
 
     async with infra.pg_pool.acquire() as conn:
