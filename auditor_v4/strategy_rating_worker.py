@@ -142,7 +142,7 @@ async def run_strategy_rating_worker():
         axis=1
     )
 
-    # 🔹 Запись в БД
+    # 🔹 Запись в strategies_metrics_v4
     insert_query = """
         INSERT INTO strategies_metrics_v4 (
             strategy_id, ts,
@@ -170,10 +170,62 @@ async def run_strategy_rating_worker():
 
     # 🔹 Финальное логирование
     for row in metrics_df.itertuples():
-        delta = row.delta_rating
         log.info(
             f"[STRATEGY_RATER] ⭐ Стратегия {row.strategy_id} — "
-            f"rating: {row.rating:.4f}, Δ rating: {delta:+.4f}"
+            f"rating: {row.rating:.4f}, Δ rating: {row.delta_rating:+.4f}"
+        )
+
+    # 🔹 Выбор и фиксация "Короля"
+    best_row = metrics_df.sort_values("rating", ascending=False).iloc[0]
+    best_id = best_row.strategy_id
+    best_rating = best_row.rating
+
+    query_last_active = """
+        SELECT ts, strategy_id, rating
+        FROM strategies_active_v4
+        ORDER BY ts DESC
+        LIMIT 1
+    """
+
+    async with infra.pg_pool.acquire() as conn:
+        last_entry = await conn.fetchrow(query_last_active)
+
+    should_record = False
+    reason = ""
+    previous_id = None
+
+    if last_entry is None:
+        should_record = True
+        reason = "initial_selection"
+    else:
+        rating_diff = best_rating - last_entry["rating"]
+        minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
+        previous_id = last_entry["strategy_id"]
+
+        if rating_diff > 0.15 and minutes_passed >= 30:
+            should_record = True
+            reason = f"rating_diff={rating_diff:.4f}, waited={minutes_passed:.1f}m"
+
+    if should_record:
+        insert_active = """
+            INSERT INTO strategies_active_v4 (
+                ts, strategy_id, rating, previous_strategy_id, reason
+            )
+            VALUES ($1, $2, $3, $4, $5)
+        """
+
+        async with infra.pg_pool.acquire() as conn:
+            await conn.execute(
+                insert_active,
+                ts_now, best_id, best_rating, previous_id, reason
+            )
+
+        log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
+    else:
+        log.info(
+            f"[STRATEGY_RATER] 👑 Стратегия {best_id} — лидер, но не зафиксирован "
+            f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
+            f"нужно Δ > 0.15 и ≥ 30 мин)"
         )
 
     elapsed = datetime.utcnow() - start
