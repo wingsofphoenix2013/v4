@@ -221,26 +221,30 @@ async def run_strategy_rating_worker():
         WHERE ts = $4 AND strategy_id = $5
     """
 
+    reset_top_flag = "UPDATE strategies_v4 SET top_strategy = FALSE"
+    set_top_flag = "UPDATE strategies_v4 SET top_strategy = TRUE WHERE id = $1"
+
     async with infra.pg_pool.acquire() as conn:
         last_entry = await conn.fetchrow(query_last_active)
 
         if last_entry is None:
-            # 🔸 Первый Король
             await conn.execute(insert_active, ts_now, best_id, best_rating, None, "initial_selection")
+            await conn.execute(reset_top_flag)
+            await conn.execute(set_top_flag, best_id)
             log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: initial_selection")
         else:
             previous_id = last_entry["strategy_id"]
             minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
 
             if best_id == previous_id:
-                # 🔸 Король не сменился — обновляем ts и рейтинг
                 await conn.execute(update_active, ts_now, best_rating, "confirmed", last_entry["ts"], best_id)
+                await conn.execute(reset_top_flag)
+                await conn.execute(set_top_flag, best_id)
                 log.info(
                     f"[STRATEGY_RATER] 👑 Стратегия {best_id} подтверждена как 'Король' — "
-                    f"обновлён рейтинг и время"
+                    f"обновлён рейтинг и флаг top_strategy"
                 )
             else:
-                # 🔸 Новый кандидат — сравниваем с текущим Королём
                 previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "rating"]
                 previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
                 rating_diff = best_rating - previous_rating
@@ -248,6 +252,8 @@ async def run_strategy_rating_worker():
                 if rating_diff > 0.15 and minutes_passed >= 30:
                     reason = f"rating_diff={rating_diff:.4f}, waited={minutes_passed:.1f}m"
                     await conn.execute(insert_active, ts_now, best_id, best_rating, previous_id, reason)
+                    await conn.execute(reset_top_flag)
+                    await conn.execute(set_top_flag, best_id)
                     log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
                 else:
                     log.info(
@@ -255,6 +261,5 @@ async def run_strategy_rating_worker():
                         f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
                         f"нужно Δ > 0.15 и ≥ 30 мин)"
                     )
-
     elapsed = datetime.utcnow() - start
     log.info(f"[STRATEGY_RATER] ✅ Расчёт завершён за {elapsed.total_seconds():.2f} сек")
