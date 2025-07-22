@@ -3,3 +3,6 @@ asyncio
 asyncpg
 python-dotenv
 aiohttp>=3.8.0
+numpy
+pandas
+scipy
