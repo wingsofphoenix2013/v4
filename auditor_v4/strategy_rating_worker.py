@@ -201,7 +201,12 @@ async def run_strategy_rating_worker():
         reason = "initial_selection"
     else:
         previous_id = last_entry["strategy_id"]
-        rating_diff = best_rating - float(last_entry["rating"])
+
+        # 🔸 Сравниваем с актуальным рейтингом предыдущего "Короля"
+        previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "rating"]
+        previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
+
+        rating_diff = best_rating - previous_rating
         minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
 
         if rating_diff > 0.15 and minutes_passed >= 30:
@@ -229,6 +234,6 @@ async def run_strategy_rating_worker():
             f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
             f"нужно Δ > 0.15 и ≥ 30 мин)"
         )
-
+        
     elapsed = datetime.utcnow() - start
     log.info(f"[STRATEGY_RATER] ✅ Расчёт завершён за {elapsed.total_seconds():.2f} сек")
