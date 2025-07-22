@@ -132,7 +132,7 @@ async def run_strategy_rating_worker():
 
     prev_map = {r["strategy_id"]: dict(r) for r in prev_rows}
 
-    # 🔹 Δ rating и pnl_diff_pct с безопасным float()
+    # 🔹 Δ rating и pnl_diff_pct
     metrics_df["pnl_diff_pct"] = metrics_df.apply(
         lambda row: row["pnl_pct"] - float(prev_map.get(row["strategy_id"], {}).get("pnl_pct", 0) or 0),
         axis=1
@@ -142,7 +142,7 @@ async def run_strategy_rating_worker():
         axis=1
     )
 
-    # 🔹 Запись в strategies_metrics_v4
+    # 🔹 Сохраняем метрики
     insert_query = """
         INSERT INTO strategies_metrics_v4 (
             strategy_id, ts,
@@ -175,7 +175,7 @@ async def run_strategy_rating_worker():
             f"rating: {row.rating:.4f}, Δ rating: {row.delta_rating:+.4f}"
         )
 
-    # 🔹 Выбор и фиксация "Короля"
+    # 🔹 Фиксация "Короля"
     best_row = metrics_df.sort_values("rating", ascending=False).iloc[0]
     best_id = best_row.strategy_id
     best_rating = best_row.rating
@@ -193,14 +193,16 @@ async def run_strategy_rating_worker():
     should_record = False
     reason = ""
     previous_id = None
+    rating_diff = 0.0
+    minutes_passed = 0.0
 
     if last_entry is None:
         should_record = True
         reason = "initial_selection"
     else:
+        previous_id = last_entry["strategy_id"]
         rating_diff = best_rating - float(last_entry["rating"])
         minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
-        previous_id = last_entry["strategy_id"]
 
         if rating_diff > 0.15 and minutes_passed >= 30:
             should_record = True
@@ -222,8 +224,6 @@ async def run_strategy_rating_worker():
 
         log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
     else:
-        rating_diff = best_rating - float(last_entry["rating"]) if last_entry else 0
-        minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60 if last_entry else 0
         log.info(
             f"[STRATEGY_RATER] 👑 Стратегия {best_id} — лидер, но не зафиксирован "
             f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
