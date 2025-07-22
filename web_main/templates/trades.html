@@ -31,16 +31,16 @@
 <main class="max-w-7xl mx-auto px-4 py-10">
 <!-- Панель кнопок фильтрации по дате и серии -->
 <div class="flex justify-between items-center mb-6">
-  <!-- Фильтр по дате -->
-  <div class="flex space-x-3">
-    {% for f in ['today', 'yesterday', '7days', 'all'] %}
-    <a href="/trades?filter={{ f }}{% if series %}&series={{ series }}{% endif %}"
-       class="px-4 py-2 rounded-lg font-semibold transition
-       {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == f else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-      {% if f == 'today' %}Сегодня{% elif f == 'yesterday' %}Вчера{% elif f == '7days' %}7 дней{% else %}Всего{% endif %}
-    </a>
-    {% endfor %}
-  </div>
+<!-- Фильтр по дате -->
+<div class="flex space-x-3">
+  {% for f in ['24h', 'yesterday', '7days', 'all'] %}
+  <a href="/trades?filter={{ f }}{% if series %}&series={{ series }}{% endif %}"
+     class="px-4 py-2 rounded-lg font-semibold transition
+     {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == f else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+    {% if f == '24h' %}24 часа{% elif f == 'yesterday' %}Вчера{% elif f == '7days' %}7 дней{% else %}Всего{% endif %}
+  </a>
+  {% endfor %}
+</div>
 
 <!-- Фильтр по серии -->
 <div class="flex space-x-3">

@@ -21,7 +21,7 @@ templates = Jinja2Templates(directory="templates")
 
 # 🔸 Страница /trades — список активных стратегий с фильтрацией
 @router.get("/trades", response_class=HTMLResponse)
-async def trades_page(request: Request, filter: str = "today", series: str = None):
+async def trades_page(request: Request, filter: str = "24h", series: str = None):
     strategies = await get_trading_summary(filter)
 
     if series:
@@ -35,7 +35,6 @@ async def trades_page(request: Request, filter: str = "today", series: str = Non
         "series": series,
     })
 
-
 # 🔸 Расчёт статистики стратегий под /trades
 async def get_trading_summary(filter: str) -> list[dict]:
     async with pg_pool.acquire() as conn:
@@ -46,8 +45,9 @@ async def get_trading_summary(filter: str) -> list[dict]:
             ORDER BY id
         """)
 
-        if filter == "today":
-            start, end = get_kyiv_day_bounds(0)
+        if filter == "24h":
+            end = datetime.utcnow()
+            start = end - timedelta(hours=24)
         elif filter == "yesterday":
             start, end = get_kyiv_day_bounds(1)
         elif filter == "7days":
@@ -85,7 +85,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             winrate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
             roi = round(pnl_sum / deposit * 100, 2) if deposit else None
 
-            if filter == "today":
+            if filter == "24h":
                 open_count = await conn.fetchval("""
                     SELECT COUNT(*) FROM positions_v4
                     WHERE strategy_id = $1 AND status = 'open'
