@@ -92,7 +92,7 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
                         [(symbol, tf, ts) for ts in missing]
                     )
             else:
-                log.info(f"✅ {symbol} [{tf}] — без пропусков")
+                log.debug(f"✅ {symbol} [{tf}] — без пропусков")
 
         except Exception:
             log.exception(f"❌ Ошибка при аудите {symbol} [{tf}]")
@@ -100,7 +100,7 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
 
 # 🔸 Запуск аудита по всем тикерам и интервалам
 async def run_audit_all_symbols():
-    log.info("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
+    log.debug("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
 
     semaphore = asyncio.Semaphore(50)
     tasks = []
@@ -111,12 +111,12 @@ async def run_audit_all_symbols():
 
     await asyncio.gather(*tasks)
 
-    log.info("✅ [AUDIT] Завершён аудит всех тикеров и таймфреймов")
+    log.debug("✅ [AUDIT] Завершён аудит всех тикеров и таймфреймов")
 
 
 # 🔸 Запрашивает и чинит пропущенные свечи из Binance
 async def fix_missing_candles():
-    log.info("🔧 [FIXER] Запуск обработки пропущенных свечей")
+    log.debug("🔧 [FIXER] Запуск обработки пропущенных свечей")
     url = "https://fapi.binance.com/fapi/v1/klines"
     fixed_count = 0
 
@@ -177,7 +177,7 @@ async def fix_missing_candles():
                             WHERE symbol = $1 AND interval = $2 AND open_time = $3
                         """, symbol, interval, open_time)
 
-                    log.info(f"✅ Вставлена свеча {symbol} {interval} {open_time}")
+                    log.debug(f"✅ Вставлена свеча {symbol} {interval} {open_time}")
                     fixed_count += 1
 
             except Exception:
@@ -186,4 +186,4 @@ async def fix_missing_candles():
     # 🔹 Общий лог после прохода
     async with infra.pg_pool.acquire() as conn:
         remaining = await conn.fetchval("SELECT COUNT(*) FROM ohlcv_gaps_v4 WHERE fixed = false")
-        log.info(f"📊 [FIXER] Обработано {fixed_count} свечей, осталось: {remaining}")
+        log.debug(f"📊 [FIXER] Обработано {fixed_count} свечей, осталось: {remaining}")

@@ -14,6 +14,7 @@ from config_loader import (
 )
 from core_io import pg_task, finmonitor_task, treasury_task
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
+from strategy_rating_worker import run_strategy_rating_worker
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -76,7 +77,8 @@ async def main():
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600),
-        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180)
+        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
+        loop_with_interval(run_strategy_rating_worker, "STRATEGY_RATER", 300)
     )
 
 if __name__ == "__main__":
