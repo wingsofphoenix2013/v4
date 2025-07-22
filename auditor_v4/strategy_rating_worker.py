@@ -195,6 +195,12 @@ async def run_strategy_rating_worker():
     best_id = best_row.strategy_id
     best_rating = best_row.rating
 
+    should_record = False
+    reason = ""
+    previous_id = None
+    rating_diff = 0.0
+    minutes_passed = 0.0
+
     query_last_active = """
         SELECT ts, strategy_id, rating
         FROM strategies_active_v4
@@ -202,61 +208,53 @@ async def run_strategy_rating_worker():
         LIMIT 1
     """
 
+    insert_active = """
+        INSERT INTO strategies_active_v4 (
+            ts, strategy_id, rating, previous_strategy_id, reason
+        )
+        VALUES ($1, $2, $3, $4, $5)
+    """
+
+    update_active = """
+        UPDATE strategies_active_v4
+        SET ts = $1, rating = $2, reason = $3
+        WHERE ts = $4 AND strategy_id = $5
+    """
+
     async with infra.pg_pool.acquire() as conn:
         last_entry = await conn.fetchrow(query_last_active)
 
-    previous_id = None
-    rating_diff = 0.0
-    minutes_passed = 0.0
-    reason = ""
-
-    if last_entry is None:
-        # 🔸 Первый Король
-        insert_active = """
-            INSERT INTO strategies_active_v4 (
-                ts, strategy_id, rating, previous_strategy_id, reason
-            )
-            VALUES ($1, $2, $3, NULL, $4)
-        """
-        await conn.execute(insert_active, ts_now, best_id, best_rating, "initial_selection")
-        log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: initial_selection")
-    else:
-        previous_id = last_entry["strategy_id"]
-        minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
-
-        if best_id == previous_id:
-            # 🔸 Король тот же — обновляем ts и рейтинг
-            update_active = """
-                UPDATE strategies_active_v4
-                SET ts = $1, rating = $2, reason = $3
-                WHERE ts = $4 AND strategy_id = $5
-            """
-            await conn.execute(update_active, ts_now, best_rating, "confirmed", last_entry["ts"], best_id)
-            log.info(
-                f"[STRATEGY_RATER] 👑 Стратегия {best_id} подтверждена как 'Король' — "
-                f"обновлён рейтинг и время"
-            )
+        if last_entry is None:
+            # 🔸 Первый Король
+            await conn.execute(insert_active, ts_now, best_id, best_rating, None, "initial_selection")
+            log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: initial_selection")
         else:
-            # 🔸 Новый кандидат — сравниваем рейтинг
-            previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "rating"]
-            previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
-            rating_diff = best_rating - previous_rating
+            previous_id = last_entry["strategy_id"]
+            minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
 
-            if rating_diff > 0.15 and minutes_passed >= 30:
-                insert_active = """
-                    INSERT INTO strategies_active_v4 (
-                        ts, strategy_id, rating, previous_strategy_id, reason
-                    )
-                    VALUES ($1, $2, $3, $4, $5)
-                """
-                reason = f"rating_diff={rating_diff:.4f}, waited={minutes_passed:.1f}m"
-                await conn.execute(insert_active, ts_now, best_id, best_rating, previous_id, reason)
-                log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
-            else:
+            if best_id == previous_id:
+                # 🔸 Король не сменился — обновляем ts и рейтинг
+                await conn.execute(update_active, ts_now, best_rating, "confirmed", last_entry["ts"], best_id)
                 log.info(
-                    f"[STRATEGY_RATER] 👑 Стратегия {best_id} — лидер, но не зафиксирован "
-                    f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
-                    f"нужно Δ > 0.15 и ≥ 30 мин)"
-                )        
+                    f"[STRATEGY_RATER] 👑 Стратегия {best_id} подтверждена как 'Король' — "
+                    f"обновлён рейтинг и время"
+                )
+            else:
+                # 🔸 Новый кандидат — сравниваем с текущим Королём
+                previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "rating"]
+                previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
+                rating_diff = best_rating - previous_rating
+
+                if rating_diff > 0.15 and minutes_passed >= 30:
+                    reason = f"rating_diff={rating_diff:.4f}, waited={minutes_passed:.1f}m"
+                    await conn.execute(insert_active, ts_now, best_id, best_rating, previous_id, reason)
+                    log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
+                else:
+                    log.info(
+                        f"[STRATEGY_RATER] 👑 Стратегия {best_id} — лидер, но не зафиксирован "
+                        f"(Δ rating: {rating_diff:.4f}, прошло: {minutes_passed:.1f} мин — "
+                        f"нужно Δ > 0.15 и ≥ 30 мин)"
+                    )
+
     elapsed = datetime.utcnow() - start
     log.info(f"[STRATEGY_RATER] ✅ Расчёт завершён за {elapsed.total_seconds():.2f} сек")
