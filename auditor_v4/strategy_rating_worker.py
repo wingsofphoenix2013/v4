@@ -14,6 +14,7 @@ import infra
 log = logging.getLogger("STRATEGY_RATER")
 
 # 🔸 Основной воркер
+# 🔸 Основной воркер
 async def run_strategy_rating_worker():
     start = datetime.utcnow()
     log.info("[STRATEGY_RATER] 🔁 Запуск расчёта рейтингов стратегий")
@@ -47,7 +48,6 @@ async def run_strategy_rating_worker():
 
     # 🔹 Группировка по strategy_id
     grouped = df.groupby("strategy_id")
-
     results = []
 
     for strategy_id, group in grouped:
@@ -91,11 +91,36 @@ async def run_strategy_rating_worker():
             "trade_count": trade_count,
         })
 
-    # 🔸 Логирование промежуточных результатов
-    for item in results:
+    # 🔹 Нормализация и рейтинг
+    metrics_df = pd.DataFrame(results)
+    EPSILON = 1e-9
+
+    def normalize(series):
+        min_val = series.min()
+        max_val = series.max()
+        return (series - min_val) / (max_val - min_val + EPSILON)
+
+    metrics_df["norm_pnl_pct"]       = normalize(metrics_df["pnl_pct"])
+    metrics_df["norm_trend_slope"]   = normalize(metrics_df["trend_slope"])
+    metrics_df["norm_profit_factor"] = normalize(metrics_df["profit_factor"].fillna(0))
+    metrics_df["norm_win_rate"]      = normalize(metrics_df["win_rate"])
+    metrics_df["norm_max_drawdown"]  = normalize(metrics_df["max_drawdown"].fillna(0))
+    metrics_df["norm_volatility"]    = normalize(metrics_df["volatility"].fillna(0))
+
+    metrics_df["rating"] = (
+        0.30 * metrics_df["norm_pnl_pct"] +
+        0.20 * metrics_df["norm_trend_slope"] +
+        0.20 * metrics_df["norm_profit_factor"] +
+        0.10 * metrics_df["norm_win_rate"] -
+        0.10 * metrics_df["norm_max_drawdown"] -
+        0.10 * metrics_df["norm_volatility"]
+    )
+
+    # 🔸 Логирование результата
+    for row in metrics_df.itertuples():
         log.info(
-            f"[STRATEGY_RATER] ▶ Стратегия {item['strategy_id']} — "
-            f"PnL%: {item['pnl_pct']:.2f}, сделки: {item['trade_count']}"
+            f"[STRATEGY_RATER] ⭐ Стратегия {row.strategy_id} — "
+            f"rating: {row.rating:.4f}"
         )
 
     elapsed = datetime.utcnow() - start
