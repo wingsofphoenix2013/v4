@@ -14,7 +14,6 @@ import infra
 log = logging.getLogger("STRATEGY_RATER")
 
 # 🔸 Основной воркер
-# 🔸 Основной воркер
 async def run_strategy_rating_worker():
     start = datetime.utcnow()
     log.info("[STRATEGY_RATER] 🔁 Запуск расчёта рейтингов стратегий")
@@ -67,9 +66,9 @@ async def run_strategy_rating_worker():
         win_rate = (group["pnl"] > 0).mean()
 
         # 🔸 Volatility
-        volatility = group["pnl"].std(ddof=0)  # stddev_pop
+        volatility = group["pnl"].std(ddof=0)
 
-        # 🔸 Trend slope (линейная регрессия по equity)
+        # 🔸 Trend slope
         equity = group.sort_values("closed_at")["pnl"].cumsum()
         minutes = (group["closed_at"] - group["closed_at"].min()).dt.total_seconds() / 60
         slope = linregress(minutes, equity).slope if len(group) >= 2 else 0.0
@@ -116,11 +115,65 @@ async def run_strategy_rating_worker():
         0.10 * metrics_df["norm_volatility"]
     )
 
-    # 🔸 Логирование результата
+    # 🔹 Получение предыдущих метрик
+    ts_now = now.replace(second=0, microsecond=0)
+
+    query_prev = """
+        SELECT strategy_id, pnl_pct, rating
+        FROM strategies_metrics_v4
+        WHERE ts = (
+            SELECT MAX(ts) FROM strategies_metrics_v4
+            WHERE ts < $1
+        )
+    """
+
+    async with infra.pg_pool.acquire() as conn:
+        prev_rows = await conn.fetch(query_prev, ts_now)
+
+    prev_map = {r["strategy_id"]: r for r in prev_rows}
+
+    # 🔹 Δ rating и pnl_diff_pct
+    metrics_df["pnl_diff_pct"] = metrics_df.apply(
+        lambda row: row["pnl_pct"] - prev_map.get(row["strategy_id"], {}).get("pnl_pct", 0),
+        axis=1
+    )
+    metrics_df["delta_rating"] = metrics_df.apply(
+        lambda row: row["rating"] - prev_map.get(row["strategy_id"], {}).get("rating", 0),
+        axis=1
+    )
+
+    # 🔹 Запись в БД
+    insert_query = """
+        INSERT INTO strategies_metrics_v4 (
+            strategy_id, ts,
+            pnl_pct, trend_slope, profit_factor, win_rate,
+            max_drawdown, volatility, trade_count,
+            pnl_diff_pct, rating
+        )
+        VALUES (
+            $1, $2,
+            $3, $4, $5, $6,
+            $7, $8, $9,
+            $10, $11
+        )
+    """
+
+    async with infra.pg_pool.acquire() as conn:
+        for row in metrics_df.itertuples():
+            await conn.execute(
+                insert_query,
+                row.strategy_id, ts_now,
+                row.pnl_pct, row.trend_slope, row.profit_factor, row.win_rate,
+                row.max_drawdown, row.volatility, row.trade_count,
+                row.pnl_diff_pct, row.rating
+            )
+
+    # 🔹 Финальное логирование
     for row in metrics_df.itertuples():
+        delta = row.delta_rating
         log.info(
             f"[STRATEGY_RATER] ⭐ Стратегия {row.strategy_id} — "
-            f"rating: {row.rating:.4f}"
+            f"rating: {row.rating:.4f}, Δ rating: {delta:+.4f}"
         )
 
     elapsed = datetime.utcnow() - start
