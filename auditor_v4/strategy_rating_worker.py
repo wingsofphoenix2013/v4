@@ -187,13 +187,61 @@ async def run_strategy_rating_worker():
     avg_trade_count = metrics_df["trade_count"].mean()
     metrics_df["avg_trade_count"] = avg_trade_count
 
-    log.info(f"[STRATEGY_RATER] 📊 Метрики рассчитаны для {len(metrics_df)} стратегий (3ч окно)")
+    log.debug(f"[STRATEGY_RATER] 📊 Метрики рассчитаны для {len(metrics_df)} стратегий (3ч окно)")
 
     for row in metrics_df.itertuples():
-        log.info(
+        log.debug(
             f"[STRATEGY_RATER] • Стратегия {row.strategy_id} — "
             f"pnl={row.pnl_pct:.2f}%, trades={row.trade_count}, "
             f"win={row.win_rate:.2f}, pf={row.profit_factor:.2f}, "
             f"slope={row.trend_slope:.2f}, ddraw={row.max_drawdown:.2f}, "
             f"hold={row.avg_holding_time:.1f}s"
+        )
+
+    # 🔹 Расчёт speed_factor и reliability_weight
+    metrics_df["speed_factor"] = metrics_df["trade_count"].clip(upper=20) / 20.0
+    metrics_df["reliability_weight"] = (
+        np.log1p(metrics_df["trade_count"]) / np.log1p(metrics_df["avg_trade_count"])
+    ).clip(upper=1.0)
+
+    # 🔹 Нормализация
+    def normalize(series):
+        min_val = series.min()
+        max_val = series.max()
+        return (series - min_val) / (max_val - min_val + 1e-9)
+
+    metrics_df["norm_pnl"] = normalize(metrics_df["pnl_pct"])
+    metrics_df["norm_trend"] = normalize(metrics_df["trend_slope"])
+    metrics_df["norm_pf"] = normalize(metrics_df["profit_factor"].fillna(0))
+    metrics_df["norm_win"] = normalize(metrics_df["win_rate"])
+    metrics_df["norm_ddraw"] = normalize(metrics_df["max_drawdown"])
+    metrics_df["norm_hold"] = normalize(metrics_df["avg_holding_time"])
+
+    # 🔹 Рейтинг
+    metrics_df["raw_rating"] = (
+        0.40 * metrics_df["norm_pnl"] * metrics_df["speed_factor"] +
+        0.20 * metrics_df["norm_trend"] +
+        0.15 * metrics_df["norm_pf"] +
+        0.10 * metrics_df["norm_win"] -
+        0.10 * metrics_df["norm_ddraw"] -
+        0.05 * metrics_df["norm_hold"]
+    )
+
+    metrics_df["final_rating"] = metrics_df["raw_rating"] * metrics_df["reliability_weight"]
+
+    # 🔹 Отсекаем слабые по reliability
+    before = len(metrics_df)
+    metrics_df = metrics_df[metrics_df["reliability_weight"] >= 0.3]
+    after = len(metrics_df)
+
+    log.info(
+        f"[STRATEGY_RATER] ⚖️ Оставлено {after} стратегий после фильтра reliability_weight >= 0.3 (из {before})"
+    )
+
+    log.info("[STRATEGY_RATER] 🧮 Рейтинги стратегий после фильтра:")
+    for row in metrics_df.itertuples():
+        log.info(
+            f"[STRATEGY_RATER] • Стратегия {row.strategy_id} — "
+            f"raw={row.raw_rating:.4f}, final={row.final_rating:.4f}, "
+            f"weight={row.reliability_weight:.2f}, speed={row.speed_factor:.2f}"
         )
