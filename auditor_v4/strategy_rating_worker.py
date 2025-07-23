@@ -286,7 +286,7 @@ async def run_strategy_rating_worker():
 
     # 🔹 Подготовка запросов
     query_last_active = """
-        SELECT ts, strategy_id, final_rating
+        SELECT ts, strategy_id, rating
         FROM strategies_active_v4
         ORDER BY ts DESC
         LIMIT 1
