@@ -11,9 +11,8 @@ import infra
 log = logging.getLogger("KING_MARKER")
 
 
-# 🔸 Dry-run воркер: логирует позиции, открытые стратегией-королем в интервале её правления
 async def run_king_marker_worker():
-    log.info("[KING_MARKER] 🔁 Dry-run: поиск позиций, открытых стратегией-королем")
+    log.info("[KING_MARKER] 🔁 Маркировка позиций с привязкой к правлению Короля")
 
     # 🔹 Загружаем интервалы правления Королей
     query_kings = """
@@ -35,11 +34,9 @@ async def run_king_marker_worker():
     df_kings = pd.DataFrame(kings, columns=["strategy_id", "ts_recorded", "next_ts"])
     df_kings["ts_recorded"] = pd.to_datetime(df_kings["ts_recorded"])
     df_kings["next_ts"] = pd.to_datetime(df_kings["next_ts"])
-
-    # 🔹 Получаем минимальное время вступления первого Короля
     min_ts = df_kings["ts_recorded"].min()
 
-    # 🔹 Загружаем непроверенные позиции после первого Короля
+    # 🔹 Загружаем непроверенные позиции
     query_positions = """
         SELECT id, strategy_id, created_at
         FROM positions_v4
@@ -53,14 +50,14 @@ async def run_king_marker_worker():
         positions = await conn.fetch(query_positions, min_ts)
 
     if not positions:
-        log.info("[KING_MARKER] ✅ Нет новых позиций для анализа")
+        log.info("[KING_MARKER] ✅ Нет новых позиций для маркировки")
         return
 
     df_pos = pd.DataFrame(positions, columns=["id", "strategy_id", "created_at"])
     df_pos["created_at"] = pd.to_datetime(df_pos["created_at"])
 
-    matched = 0
-    unmatched = 0
+    updates = []
+    skip_ids = []
 
     for pos in df_pos.itertuples():
         pos_time = pos.created_at
@@ -73,11 +70,37 @@ async def run_king_marker_worker():
         ]
 
         if not matched_king.empty:
-            king_id = matched_king.iloc[0]["strategy_id"]
-            log.info(f"[KING_MARKER] ✅ Позиция {pos.id} — открыта стратегией {king_id} во время её правления")
-            matched += 1
+            updates.append((True, strategy_id, pos.id))  # opened_by_king, king_id, position_id
         else:
-            log.info(f"[KING_MARKER] ⚠️ Позиция {pos.id} — стратегия {strategy_id} не была Королём на момент открытия")
-            unmatched += 1
+            skip_ids.append(pos.id)
 
-    log.info(f"[KING_MARKER] 🧾 Завершено: {len(df_pos)} позиций, {matched} совпали, {unmatched} без Короля")
+    async with infra.pg_pool.acquire() as conn:
+        # 🔹 Обновляем подходящие позиции
+        for opened_by_king, king_id, pos_id in updates:
+            await conn.execute(
+                """
+                UPDATE positions_v4
+                SET
+                    opened_by_king = $1,
+                    king_strategy_id = $2,
+                    king_checked = TRUE
+                WHERE id = $3
+                """,
+                opened_by_king, king_id, pos_id
+            )
+
+        # 🔹 Отмечаем оставшиеся как проверенные, но без Короля
+        for pos_id in skip_ids:
+            await conn.execute(
+                """
+                UPDATE positions_v4
+                SET king_checked = TRUE
+                WHERE id = $1
+                """,
+                pos_id
+            )
+
+    log.info(
+        f"[KING_MARKER] ✅ Обновлено {len(updates)} позиций как открытые при Короле, "
+        f"{len(skip_ids)} отмечены как проверенные без совпадения"
+    )
