@@ -83,8 +83,11 @@ async def run_strategy_rating_worker():
     # 🔹 Медианный pnl_pct по всем стратегиям
     median_pnl = metrics_12h["pnl_pct_12h"].median()
 
-    # 🔹 Получение всех стратегий из infra
-    total_strategies = list(infra.enabled_strategies.keys())
+    # 🔹 Получение всех активных стратегий (enabled = true)
+    total_strategies = [
+        sid for sid, strategy in infra.enabled_strategies.items()
+        if strategy.get("enabled") is True
+    ]
     passed = []
     rejected = []
 
