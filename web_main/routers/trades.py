@@ -105,20 +105,44 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 trend_map[sid] = "⛔"
 
         # 🔥 Добавляем "Королевские торги" — псевдо-стратегию
-        rows_king = await conn.fetch("""
-            SELECT status, pnl FROM positions_v4
-            WHERE opened_by_king = true
-        """)
+        if start and end:
+            rows_king = await conn.fetch("""
+                SELECT p.status, p.pnl, p.notional_value, p.strategy_id, s.leverage
+                FROM positions_v4 p
+                JOIN strategies_v4 s ON p.strategy_id = s.id
+                WHERE p.opened_by_king = true
+                  AND p.created_at BETWEEN $1 AND $2
+            """, start, end)
+        else:
+            rows_king = await conn.fetch("""
+                SELECT p.status, p.pnl, p.notional_value, p.strategy_id, s.leverage
+                FROM positions_v4 p
+                JOIN strategies_v4 s ON p.strategy_id = s.id
+                WHERE p.opened_by_king = true
+            """)
 
         open_count = sum(1 for r in rows_king if r["status"] == "open")
-        closed_pnls = [r["pnl"] for r in rows_king if r["status"] == "closed" and r["pnl"] is not None]
-        closed_count = len(closed_pnls)
-        win_count = sum(1 for pnl in closed_pnls if pnl >= 0)
-        pnl_sum = sum(closed_pnls)
-        deposit_virtual = 100_000  # условный базовый депозит
+
+        closed_positions = [
+            r for r in rows_king
+            if r["status"] == "closed"
+            and r["pnl"] is not None
+            and r["notional_value"] is not None
+            and r["leverage"]
+        ]
+
+        closed_count = len(closed_positions)
+        win_count = sum(1 for r in closed_positions if r["pnl"] >= 0)
+        pnl_sum = sum(r["pnl"] for r in closed_positions)
+
+        total_invested = sum(
+            r["notional_value"] / r["leverage"]
+            for r in closed_positions
+            if r["leverage"] > 0
+        )
 
         winrate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
-        roi = round(pnl_sum / deposit_virtual * 100, 2) if deposit_virtual else None
+        roi = round(pnl_sum / total_invested * 100, 2) if total_invested > 0 else None
 
         result = [{
             "id": -1,
