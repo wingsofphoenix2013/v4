@@ -14,22 +14,6 @@ import infra
 log = logging.getLogger("STRATEGY_RATER")
 
 
-# strategy_rating_worker.py
-
-import logging
-from datetime import datetime, timedelta
-
-import numpy as np
-import pandas as pd
-from scipy.stats import linregress
-import asyncpg
-
-import infra
-
-# 🔸 Логгер
-log = logging.getLogger("STRATEGY_RATER")
-
-
 # 🔸 Основной воркер
 async def run_strategy_rating_worker():
     start = datetime.utcnow()
@@ -67,10 +51,18 @@ async def run_strategy_rating_worker():
     df["created_at"] = pd.to_datetime(df["created_at"])
     df["closed_at"] = pd.to_datetime(df["closed_at"])
 
-    # 🔹 Расчёт метрик за 12ч
+    # 🔹 Расчёт метрик за 12ч (с учётом левереджа)
     df_12h = df.copy()
-    df_12h["pnl_pct"] = df_12h["pnl"] / df_12h["notional_value"] * 100
 
+    # 🔸 Добавляем левередж из enabled_strategies
+    df_12h["leverage"] = df_12h["strategy_id"].map(
+        lambda sid: float(infra.enabled_strategies.get(sid, {}).get("leverage", 1))
+    )
+
+    # 🔸 Пересчёт доходности: pnl / (notional / leverage) * 100
+    df_12h["pnl_pct"] = df_12h["pnl"] * df_12h["leverage"] / df_12h["notional_value"] * 100
+
+    # 🔸 Группировка по стратегии
     grouped_12h = df_12h.groupby("strategy_id")
     metrics_12h = grouped_12h.agg({
         "pnl_pct": "mean",
@@ -79,7 +71,7 @@ async def run_strategy_rating_worker():
         "pnl_pct": "pnl_pct_12h",
         "pnl": "trade_count_12h"
     })
-
+    
     # 🔹 Медианный pnl_pct по всем стратегиям
     median_pnl = metrics_12h["pnl_pct_12h"].median()
 
@@ -102,29 +94,29 @@ async def run_strategy_rating_worker():
         trades = row["trade_count_12h"]
 
         passed_by_pnl = pnl >= median_pnl
-        passed_by_trades = trades >= 10
+        passed_by_trades = trades >= 5  # изменено с 10 → 5
 
-        if passed_by_pnl or passed_by_trades:
-            reason_parts = []
-            if passed_by_pnl:
-                reason_parts.append("по pnl")
-            if passed_by_trades:
-                reason_parts.append("по сделкам")
-            passed.append((sid, pnl, trades, reason_parts))
+        if passed_by_pnl and passed_by_trades:
+            passed.append((sid, pnl, trades))
         else:
-            reason = f"pnl={pnl:.2f}, trades={trades} — ниже медианы и < 10"
+            reasons = []
+            if not passed_by_pnl:
+                reasons.append("ниже медианы по pnl")
+            if not passed_by_trades:
+                reasons.append("менее 5 сделок")
+            reason = f"pnl={pnl:.2f}, trades={trades} — " + ", ".join(reasons)
             rejected.append((sid, reason))
 
     if not passed:
-        log.warning("[STRATEGY_RATER] ❌ Ни одна стратегия не прошла фильтр допуска (12ч)")
+        log.critical("[STRATEGY_RATER] ❌ Ни одна стратегия не прошла фильтр допуска (оба условия). Торги должны быть остановлены.")
         return
 
     log.info(f"[STRATEGY_RATER] ✅ К допуску прошли {len(passed)} стратегий (из {len(total_strategies)} включённых в системе)")
 
     log.info("[STRATEGY_RATER] 📄 Список допущенных стратегий:")
-    for sid, pnl, trades, reason_parts in passed:
+    for sid, pnl, trades in passed:
         log.info(
-            f"[STRATEGY_RATER] • Стратегия {sid} — pnl={pnl:.2f}, trades={trades} — допущена ({' и '.join(reason_parts)})"
+            f"[STRATEGY_RATER] • Стратегия {sid} — pnl={pnl:.2f}, trades={trades} — допущена (по двум условиям)"
         )
 
     log.info(f"[STRATEGY_RATER] ❌ Отклонено {len(rejected)} стратегий:")
