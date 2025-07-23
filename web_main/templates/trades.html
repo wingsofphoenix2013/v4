@@ -80,10 +80,7 @@
   {{ loop.index }}
   {% if s.is_king %}<span title="Текущий лидер">👑</span>{% endif %}
   {% if s.was_king %}<span title="Бывший лидер">🤡</span>{% endif %}
-  {% if s.rating_trend %}
-    <span title="Динамика рейтинга">{{ s.rating_trend }}</span>
-  {% endif %}
-</td>
+        </td>
         <td class="px-4 py-3 font-mono">{{ s.name }}</td>
         <td class="px-4 py-3">
           <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-blue-600 underline hover:text-blue-800">{{ s.human_name }}</a>

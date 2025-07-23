@@ -34,7 +34,6 @@ async def trades_page(request: Request, filter: str = "24h", series: str = None)
         "filter": filter,
         "series": series,
     })
-
 # 🔸 Расчёт статистики стратегий под /trades
 async def get_trading_summary(filter: str) -> list[dict]:
     async with pg_pool.acquire() as conn:
@@ -55,29 +54,6 @@ async def get_trading_summary(filter: str) -> list[dict]:
         current_king_id = active_row["strategy_id"] if active_row else None
         previous_king_id = active_row["previous_strategy_id"] if active_row else None
 
-        # 📊 Получаем рейтинг для последних 2 точек по каждой стратегии
-        rating_rows = await conn.fetch("""
-            SELECT strategy_id, rating,
-                   ROW_NUMBER() OVER (PARTITION BY strategy_id ORDER BY ts DESC) AS rn
-            FROM strategies_active_v4
-            WHERE rating IS NOT NULL
-        """)
-
-        # 🧠 Собираем map strategy_id → (current, previous)
-        rating_map = {}
-        for row in rating_rows:
-            sid = row["strategy_id"]
-            rating = row["rating"]
-            rn = int(row["rn"])  # Приводим к int для безопасного сравнения
-
-            if sid not in rating_map:
-                rating_map[sid] = [None, None]
-
-            if rn == 1:
-                rating_map[sid][0] = rating  # current
-            elif rn == 2:
-                rating_map[sid][1] = rating  # previous
-                
         # 🔁 Диапазон по фильтру
         if filter == "24h":
             end = datetime.utcnow()
@@ -134,18 +110,6 @@ async def get_trading_summary(filter: str) -> list[dict]:
             is_king = sid == current_king_id
             was_king = sid == previous_king_id
 
-            # 📈 / 📉 / ➖ / ❓
-            r_current, r_prev = rating_map.get(sid, (None, None))
-            if r_current is not None and r_prev is not None:
-                if r_current > r_prev:
-                    trend = "📈"  # рейтинг вырос → стало лучше
-                elif r_current < r_prev:
-                    trend = "📉"  # рейтинг упал → стало хуже
-                else:
-                    trend = "➖"
-            else:
-                trend = "❓"
-
             result.append({
                 "id": sid,
                 "name": strat["name"],
@@ -156,7 +120,6 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 "roi": roi,
                 "is_king": is_king,
                 "was_king": was_king,
-                "rating_trend": trend,
             })
 
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
