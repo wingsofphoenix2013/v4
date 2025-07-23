@@ -68,7 +68,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
         for row in rating_rows:
             sid = row["strategy_id"]
             rating = row["rating"]
-            rn = row["rn"]
+            rn = int(row["rn"])  # Приводим к int для безопасного сравнения
 
             if sid not in rating_map:
                 rating_map[sid] = [None, None]
@@ -77,7 +77,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 rating_map[sid][0] = rating  # current
             elif rn == 2:
                 rating_map[sid][1] = rating  # previous
-
+                
         # 🔁 Диапазон по фильтру
         if filter == "24h":
             end = datetime.utcnow()
