@@ -222,6 +222,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 "closed": closed_count,
                 "winrate": winrate,
                 "roi": roi,
+                "profit": pnl_sum,
                 "is_king": is_king,
                 "was_king": was_king,
                 "trend_icon": trend_map.get(sid, "⛔"),

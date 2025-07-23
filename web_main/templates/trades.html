@@ -73,7 +73,7 @@
       <th class="px-4 py-3">Название стратегии</th>
       <th class="px-4 py-3">Сделки</th>
       <th class="px-4 py-3">Winrate</th>
-      <th class="px-4 py-3">ROI</th>
+      <th class="px-4 py-3">Прибыль</th>
     </tr>
   </thead>
   <tbody class="text-slate-800 text-sm divide-y divide-yellow-200">
@@ -89,7 +89,7 @@
       <td class="px-4 py-3">{{ s.open }}/{{ s.closed }}</td>
       <td class="px-4 py-3">
         {% if s.winrate is not none %}
-          <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
+          <span class="font-bold {{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
             {{ "%.2f" | format(s.winrate) }}%
           </span>
         {% else %}
@@ -97,9 +97,9 @@
         {% endif %}
       </td>
       <td class="px-4 py-3">
-        {% if s.roi is not none %}
-          <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
-            {{ "%.2f" | format(s.roi) }}%
+        {% if s.profit is not none %}
+          <span class="font-bold {{ 'text-green-600' if s.profit >= 0 else 'text-red-600' }}">
+            ${{ "{:,.2f}".format(s.profit) }}
           </span>
         {% else %}
           N/A
@@ -110,7 +110,6 @@
   </tbody>
 </table>
 {% endif %}
-
 <!-- 🧩 Основная таблица стратегий -->
 <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
   <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
