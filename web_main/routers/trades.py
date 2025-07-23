@@ -1,7 +1,7 @@
 # 🔸 Маршруты торгов
 
 import logging
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from collections import defaultdict
