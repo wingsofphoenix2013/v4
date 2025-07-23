@@ -283,10 +283,11 @@ async def run_strategy_rating_worker():
     best_row = metrics_df.sort_values("final_rating", ascending=False).iloc[0]
     best_id = best_row.strategy_id
     best_rating = best_row.final_rating
+    ts_recorded = datetime.utcnow()
 
     # 🔹 Запросы
     query_last_active = """
-        SELECT ts, ts_switch, strategy_id, rating
+        SELECT ts, ts_switch, ts_recorded, strategy_id, rating
         FROM strategies_active_v4
         ORDER BY ts DESC
         LIMIT 1
@@ -294,9 +295,9 @@ async def run_strategy_rating_worker():
 
     insert_active = """
         INSERT INTO strategies_active_v4 (
-            ts, ts_switch, strategy_id, rating, previous_strategy_id, reason
+            ts, ts_switch, ts_recorded, strategy_id, rating, previous_strategy_id, reason
         )
-        VALUES ($1, $1, $2, $3, $4, $5)
+        VALUES ($1, $1, $2, $3, $4, $5, $6)
     """
 
     update_active = """
@@ -313,7 +314,7 @@ async def run_strategy_rating_worker():
 
         if last_entry is None:
             # 🟢 Первый запуск
-            await conn.execute(insert_active, ts_now, best_id, best_rating, None, "initial_selection")
+            await conn.execute(insert_active, ts_now, ts_recorded, best_id, best_rating, None, "initial_selection")
             await conn.execute(reset_top_flag)
             await conn.execute(set_top_flag, best_id)
             log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: initial_selection")
@@ -321,12 +322,18 @@ async def run_strategy_rating_worker():
         else:
             previous_id = last_entry["strategy_id"]
 
-            # 🔹 Безопасная работа с ts_switch
+            # 🔹 Безопасно извлекаем ts_switch или ts
             ts_switch = last_entry["ts_switch"] or last_entry["ts"]
             minutes_passed = (ts_now - ts_switch).total_seconds() / 60
 
+            # 🔹 Безопасно получаем рейтинг прошлого Короля
             previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "final_rating"]
-            previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
+            previous_rating = (
+                float(previous_rating_row.iloc[0])
+                if not previous_rating_row.empty
+                else float(last_entry["rating"])
+            )
+
             rating_diff = best_rating - previous_rating
 
             if best_id == previous_id:
@@ -339,7 +346,7 @@ async def run_strategy_rating_worker():
             elif rating_diff >= 0.15 and minutes_passed >= 15:
                 # 🟢 Новый лидер → переключаем
                 reason = f"switched (Δ={rating_diff:.4f}, {minutes_passed:.1f} мин)"
-                await conn.execute(insert_active, ts_now, best_id, best_rating, previous_id, reason)
+                await conn.execute(insert_active, ts_now, ts_recorded, best_id, best_rating, previous_id, reason)
                 await conn.execute(reset_top_flag)
                 await conn.execute(set_top_flag, best_id)
                 log.info(f"[STRATEGY_RATER] 👑 Стратегия {best_id} зафиксирована как 'Король' — причина: {reason}")
