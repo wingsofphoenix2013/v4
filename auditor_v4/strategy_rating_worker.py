@@ -238,9 +238,9 @@ async def run_strategy_rating_worker():
         f"[STRATEGY_RATER] ⚖️ Оставлено {after} стратегий после фильтра reliability_weight >= 0.3 (из {before})"
     )
 
-    log.info("[STRATEGY_RATER] 🧮 Рейтинги стратегий после фильтра:")
+    log.debug("[STRATEGY_RATER] 🧮 Рейтинги стратегий после фильтра:")
     for row in metrics_df.itertuples():
-        log.info(
+        log.debug(
             f"[STRATEGY_RATER] • Стратегия {row.strategy_id} — "
             f"raw={row.raw_rating:.4f}, final={row.final_rating:.4f}, "
             f"weight={row.reliability_weight:.2f}, speed={row.speed_factor:.2f}"
