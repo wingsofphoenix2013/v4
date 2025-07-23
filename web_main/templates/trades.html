@@ -60,61 +60,111 @@
   {% endfor %}
 </div>
 </div>
+{% set special_strategy = strategies | selectattr("name", "equalto", "kings_bounty") | list %}
+{% set main_strategies = strategies | rejectattr("name", "equalto", "kings_bounty") | list %}
 
-  <!-- Таблица стратегий -->
-  <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
-    <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
-      <tr>
-        <th class="px-4 py-3">№</th>
-        <th class="px-4 py-3">Код</th>
-        <th class="px-4 py-3">Название стратегии</th>
-        <th class="px-4 py-3">Сделки</th>
-        <th class="px-4 py-3">Winrate</th>
-        <th class="px-4 py-3">ROI</th>
-      </tr>
-    </thead>
-    <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-      {% for s in strategies %}
-      <tr>
-<td class="px-4 py-3">
-  {{ loop.index }}
-  {% if s.is_king %}<span title="Текущий лидер">👑</span>{% endif %}
-  {% if s.was_king %}<span title="Бывший лидер">🤡</span>{% endif %}
-  {% if s.trend_icon %}<span title="Динамика рейтинга">{{ s.trend_icon }}</span>{% endif %}
-</td>
-        <td class="px-4 py-3 font-mono">{{ s.name }}</td>
-        <td class="px-4 py-3">
-          <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-blue-600 underline hover:text-blue-800">{{ s.human_name }}</a>
-        </td>
-        <td class="px-4 py-3">
-          {% if filter == "today" %}
-            {{ s.open }}/{{ s.closed }}
-          {% else %}
-            {{ s.closed }}
-          {% endif %}
-        </td>
-        <td class="px-4 py-3">
-          {% if s.winrate is not none %}
-            <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
-              {{ "%.2f" | format(s.winrate) }}%
-            </span>
-          {% else %}
-            N/A
-          {% endif %}
-        </td>
-        <td class="px-4 py-3">
-          {% if s.roi is not none %}
-            <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
-              {{ "%.2f" | format(s.roi) }}%
-            </span>
-          {% else %}
-            N/A
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+<!-- 🔥 Первая таблица: Королевские торги -->
+{% if special_strategy %}
+<table class="w-full table-auto bg-yellow-50 rounded-xl shadow overflow-hidden mb-8">
+  <thead class="bg-yellow-100 text-slate-700 text-left text-sm uppercase">
+    <tr>
+      <th class="px-4 py-3">№</th>
+      <th class="px-4 py-3">Код</th>
+      <th class="px-4 py-3">Название стратегии</th>
+      <th class="px-4 py-3">Сделки</th>
+      <th class="px-4 py-3">Winrate</th>
+      <th class="px-4 py-3">ROI</th>
+    </tr>
+  </thead>
+  <tbody class="text-slate-800 text-sm divide-y divide-yellow-200">
+    {% for s in special_strategy %}
+    <tr>
+      <td class="px-4 py-3">👑</td>
+      <td class="px-4 py-3 font-mono">{{ s.name }}</td>
+      <td class="px-4 py-3">
+        <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-yellow-800 underline hover:text-yellow-600">
+          {{ s.human_name }}
+        </a>
+      </td>
+      <td class="px-4 py-3">{{ s.open }}/{{ s.closed }}</td>
+      <td class="px-4 py-3">
+        {% if s.winrate is not none %}
+          <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
+            {{ "%.2f" | format(s.winrate) }}%
+          </span>
+        {% else %}
+          N/A
+        {% endif %}
+      </td>
+      <td class="px-4 py-3">
+        {% if s.roi is not none %}
+          <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
+            {{ "%.2f" | format(s.roi) }}%
+          </span>
+        {% else %}
+          N/A
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<!-- 🧩 Основная таблица стратегий -->
+<table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
+  <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+    <tr>
+      <th class="px-4 py-3">№</th>
+      <th class="px-4 py-3">Код</th>
+      <th class="px-4 py-3">Название стратегии</th>
+      <th class="px-4 py-3">Сделки</th>
+      <th class="px-4 py-3">Winrate</th>
+      <th class="px-4 py-3">ROI</th>
+    </tr>
+  </thead>
+  <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+    {% for s in main_strategies %}
+    <tr>
+      <td class="px-4 py-3">
+        {{ loop.index }}
+        {% if s.is_king %}<span title="Текущий лидер">👑</span>{% endif %}
+        {% if s.was_king %}<span title="Бывший лидер">🤡</span>{% endif %}
+        {% if s.trend_icon %}<span title="Динамика рейтинга">{{ s.trend_icon }}</span>{% endif %}
+      </td>
+      <td class="px-4 py-3 font-mono">{{ s.name }}</td>
+      <td class="px-4 py-3">
+        <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-blue-600 underline hover:text-blue-800">{{ s.human_name }}</a>
+      </td>
+      <td class="px-4 py-3">
+        {% if filter == "today" %}
+          {{ s.open }}/{{ s.closed }}
+        {% else %}
+          {{ s.closed }}
+        {% endif %}
+      </td>
+      <td class="px-4 py-3">
+        {% if s.winrate is not none %}
+          <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
+            {{ "%.2f" | format(s.winrate) }}%
+          </span>
+        {% else %}
+          N/A
+        {% endif %}
+      </td>
+      <td class="px-4 py-3">
+        {% if s.roi is not none %}
+          <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
+            {{ "%.2f" | format(s.roi) }}%
+          </span>
+        {% else %}
+          N/A
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
 </main>
 	</body>
 </html>

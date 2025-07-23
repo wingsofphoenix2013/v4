@@ -104,6 +104,35 @@ async def get_trading_summary(filter: str) -> list[dict]:
             else:
                 trend_map[sid] = "⛔"
 
+        # 🔥 Добавляем "Королевские торги" — псевдо-стратегию
+        rows_king = await conn.fetch("""
+            SELECT status, pnl FROM positions_v4
+            WHERE opened_by_king = true
+        """)
+
+        open_count = sum(1 for r in rows_king if r["status"] == "open")
+        closed_pnls = [r["pnl"] for r in rows_king if r["status"] == "closed" and r["pnl"] is not None]
+        closed_count = len(closed_pnls)
+        win_count = sum(1 for pnl in closed_pnls if pnl >= 0)
+        pnl_sum = sum(closed_pnls)
+        deposit_virtual = 100_000  # условный базовый депозит
+
+        winrate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
+        roi = round(pnl_sum / deposit_virtual * 100, 2) if deposit_virtual else None
+
+        result = [{
+            "id": -1,
+            "name": "kings_bounty",
+            "human_name": "Королевские торги",
+            "open": open_count,
+            "closed": closed_count,
+            "winrate": winrate,
+            "roi": roi,
+            "is_king": False,
+            "was_king": False,
+            "trend_icon": "👑"
+        }]
+
         # 🔁 Диапазон по фильтру
         if filter == "24h":
             end = datetime.utcnow()
@@ -119,8 +148,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             start = start.replace(tzinfo=None)
             end = end.replace(tzinfo=None)
 
-        result = []
-
+        # 📦 Основные стратегии
         for strat in strategies:
             sid = strat["id"]
             deposit = strat["deposit"]
@@ -156,7 +184,6 @@ async def get_trading_summary(filter: str) -> list[dict]:
             else:
                 open_count = 0
 
-            # 👑 и 🤡
             is_king = sid == current_king_id
             was_king = sid == previous_king_id
 
