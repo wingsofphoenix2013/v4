@@ -113,15 +113,15 @@ async def run_strategy_rating_worker():
 
     log.info(f"[STRATEGY_RATER] ✅ К допуску прошли {len(passed)} стратегий (из {len(total_strategies)} включённых в системе)")
 
-    log.info("[STRATEGY_RATER] 📄 Список допущенных стратегий:")
+    log.debug("[STRATEGY_RATER] 📄 Список допущенных стратегий:")
     for sid, pnl, trades in passed:
-        log.info(
+        log.debug(
             f"[STRATEGY_RATER] • Стратегия {sid} — pnl={pnl:.2f}, trades={trades} — допущена (по двум условиям)"
         )
 
     log.info(f"[STRATEGY_RATER] ❌ Отклонено {len(rejected)} стратегий:")
     for sid, reason in rejected:
-        log.info(f"[STRATEGY_RATER] • Стратегия {sid} — {reason}")
+        log.debug(f"[STRATEGY_RATER] • Стратегия {sid} — {reason}")
 
     # 🔹 Оставляем только допущенные стратегии
     passed_ids = [sid for sid, *_ in passed]
@@ -133,3 +133,67 @@ async def run_strategy_rating_worker():
 
     # 🔹 Отсечение данных до 3ч
     df = df[df["closed_at"] >= from_ts_3h]
+
+    # 🔹 Расчёт метрик за 3ч (core set)
+    grouped_3h = df.groupby("strategy_id")
+    results = []
+
+    for strategy_id, group in grouped_3h:
+        trade_count = len(group)
+
+        # 🔸 Доходность с учётом левереджа
+        leverage = float(infra.enabled_strategies.get(strategy_id, {}).get("leverage", 1))
+        pnl_pct = (group["pnl"] * leverage / group["notional_value"] * 100).mean()
+
+        # 🔸 Profit factor
+        profit = group[group["pnl"] > 0]["pnl"].sum()
+        loss = group[group["pnl"] < 0]["pnl"].sum()
+        profit_factor = float(profit / abs(loss)) if loss < 0 else 0.0
+
+        # 🔸 Win rate
+        win_rate = float((group["pnl"] > 0).mean())
+
+        # 🔸 Avg holding time (в секундах)
+        holding_durations = (group["closed_at"] - group["created_at"]).dt.total_seconds()
+        avg_holding_time = holding_durations.mean() if not holding_durations.empty else 0.0
+
+        # 🔸 Trend slope (наклон equity кривой)
+        equity = group.sort_values("closed_at")["pnl"].cumsum()
+        minutes = (group["closed_at"] - group["closed_at"].min()).dt.total_seconds() / 60
+        slope = float(linregress(minutes, equity).slope) if len(group) >= 2 else 0.0
+
+        # 🔸 Max drawdown
+        peak = equity.cummax()
+        drawdown = peak - equity
+        max_drawdown = float(drawdown.max()) if not drawdown.empty else 0.0
+
+        results.append({
+            "strategy_id": strategy_id,
+            "pnl_pct": pnl_pct,
+            "trend_slope": slope,
+            "profit_factor": profit_factor,
+            "win_rate": win_rate,
+            "max_drawdown": max_drawdown,
+            "avg_holding_time": avg_holding_time,
+            "trade_count": trade_count
+        })
+
+    if not results:
+        log.warning("[STRATEGY_RATER] ❌ Ни одной стратегии не осталось для анализа за 3ч")
+        return
+
+    # 🔹 Преобразуем в DataFrame и логируем
+    metrics_df = pd.DataFrame(results)
+    avg_trade_count = metrics_df["trade_count"].mean()
+    metrics_df["avg_trade_count"] = avg_trade_count
+
+    log.info(f"[STRATEGY_RATER] 📊 Метрики рассчитаны для {len(metrics_df)} стратегий (3ч окно)")
+
+    for row in metrics_df.itertuples():
+        log.info(
+            f"[STRATEGY_RATER] • Стратегия {row.strategy_id} — "
+            f"pnl={row.pnl_pct:.2f}%, trades={row.trade_count}, "
+            f"win={row.win_rate:.2f}, pf={row.profit_factor:.2f}, "
+            f"slope={row.trend_slope:.2f}, ddraw={row.max_drawdown:.2f}, "
+            f"hold={row.avg_holding_time:.1f}s"
+        )
