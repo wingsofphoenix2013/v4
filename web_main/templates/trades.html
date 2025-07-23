@@ -97,7 +97,7 @@
         {% endif %}
       </td>
       <td class="px-4 py-3">
-        {% if s.profit is not none %}
+        {% if s.get("profit") is not none %}
           <span class="font-bold {{ 'text-green-600' if s.profit >= 0 else 'text-red-600' }}">
             ${{ "{:,.2f}".format(s.profit) }}
           </span>
