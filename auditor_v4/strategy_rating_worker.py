@@ -320,7 +320,10 @@ async def run_strategy_rating_worker():
 
         else:
             previous_id = last_entry["strategy_id"]
-            minutes_passed = (ts_now - last_entry["ts_switch"]).total_seconds() / 60
+
+            # 🔹 Безопасная работа с ts_switch
+            ts_switch = last_entry["ts_switch"] or last_entry["ts"]
+            minutes_passed = (ts_now - ts_switch).total_seconds() / 60
 
             previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "final_rating"]
             previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
