@@ -39,7 +39,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
     async with pg_pool.acquire() as conn:
         # Все стратегии
         strategies = await conn.fetch("""
-            SELECT id, name, human_name, deposit
+            SELECT id, name, human_name, deposit, leverage
             FROM strategies_v4
             WHERE enabled = true
             ORDER BY id
@@ -54,6 +54,21 @@ async def get_trading_summary(filter: str) -> list[dict]:
         current_king_id = active_row["strategy_id"] if active_row else None
         previous_king_id = active_row["previous_strategy_id"] if active_row else None
         current_ts = active_row["ts"] if active_row else None
+
+        # 🔁 Диапазон по фильтру
+        if filter == "24h":
+            end = datetime.utcnow()
+            start = end - timedelta(hours=24)
+        elif filter == "yesterday":
+            start, end = get_kyiv_day_bounds(1)
+        elif filter == "7days":
+            start, end = get_kyiv_range_backwards(7)
+        else:
+            start, end = None, None
+
+        if start and end:
+            start = start.replace(tzinfo=None)
+            end = end.replace(tzinfo=None)
 
         # ⏳ Предыдущее ts из диапазона 4–6 минут
         previous_ts = await conn.fetchval("""
@@ -104,7 +119,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             else:
                 trend_map[sid] = "⛔"
 
-        # 🔥 Добавляем "Королевские торги" — псевдо-стратегию
+        # 🔥 "Королевские торги"
         if start and end:
             rows_king = await conn.fetch("""
                 SELECT p.status, p.pnl, p.notional_value, p.strategy_id, s.leverage
@@ -157,21 +172,6 @@ async def get_trading_summary(filter: str) -> list[dict]:
             "trend_icon": "👑"
         }]
 
-        # 🔁 Диапазон по фильтру
-        if filter == "24h":
-            end = datetime.utcnow()
-            start = end - timedelta(hours=24)
-        elif filter == "yesterday":
-            start, end = get_kyiv_day_bounds(1)
-        elif filter == "7days":
-            start, end = get_kyiv_range_backwards(7)
-        else:
-            start, end = None, None
-
-        if start and end:
-            start = start.replace(tzinfo=None)
-            end = end.replace(tzinfo=None)
-
         # 📦 Основные стратегии
         for strat in strategies:
             sid = strat["id"]
@@ -199,14 +199,17 @@ async def get_trading_summary(filter: str) -> list[dict]:
             roi = round(pnl_sum / deposit * 100, 2) if deposit else None
 
             # Открытые позиции
-            if filter == "24h":
+            if start and end:
                 open_count = await conn.fetchval("""
                     SELECT COUNT(*) FROM positions_v4
                     WHERE strategy_id = $1 AND status = 'open'
                       AND created_at BETWEEN $2 AND $3
                 """, sid, start, end)
             else:
-                open_count = 0
+                open_count = await conn.fetchval("""
+                    SELECT COUNT(*) FROM positions_v4
+                    WHERE strategy_id = $1 AND status = 'open'
+                """, sid)
 
             is_king = sid == current_king_id
             was_king = sid == previous_king_id
