@@ -76,11 +76,12 @@
     <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
       {% for s in strategies %}
       <tr>
-        <td class="px-4 py-3">
+<td class="px-4 py-3">
   {{ loop.index }}
   {% if s.is_king %}<span title="Текущий лидер">👑</span>{% endif %}
   {% if s.was_king %}<span title="Бывший лидер">🤡</span>{% endif %}
-        </td>
+  {% if s.trend_icon %}<span title="Динамика рейтинга">{{ s.trend_icon }}</span>{% endif %}
+</td>
         <td class="px-4 py-3 font-mono">{{ s.name }}</td>
         <td class="px-4 py-3">
           <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-blue-600 underline hover:text-blue-800">{{ s.human_name }}</a>

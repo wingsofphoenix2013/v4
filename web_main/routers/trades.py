@@ -53,6 +53,56 @@ async def get_trading_summary(filter: str) -> list[dict]:
         """)
         current_king_id = active_row["strategy_id"] if active_row else None
         previous_king_id = active_row["previous_strategy_id"] if active_row else None
+        current_ts = active_row["ts"] if active_row else None
+
+        # ⏳ Предыдущее ts из диапазона 4–6 минут
+        previous_ts = await conn.fetchval("""
+            SELECT ts FROM strategies_metrics_v4
+            WHERE ts < $1
+              AND ts >= $1 - interval '6 minutes'
+              AND ts <= $1 - interval '4 minutes'
+            ORDER BY ts DESC
+            LIMIT 1
+        """, current_ts)
+
+        # 📊 Метрики по current_ts
+        rows_current = await conn.fetch("""
+            SELECT strategy_id, final_rating
+            FROM strategies_metrics_v4
+            WHERE ts = $1
+        """, current_ts)
+        metrics_current = {r["strategy_id"]: r["final_rating"] for r in rows_current}
+
+        # 📉 Метрики по previous_ts
+        rows_prev = await conn.fetch("""
+            SELECT strategy_id, final_rating
+            FROM strategies_metrics_v4
+            WHERE ts = $1
+        """, previous_ts)
+        metrics_prev = {r["strategy_id"]: r["final_rating"] for r in rows_prev}
+
+        # 🧠 Строим словарь динамики
+        trend_map = {}
+        all_ids = {s["id"] for s in strategies}
+        for sid in all_ids:
+            in_current = sid in metrics_current
+            in_prev = sid in metrics_prev
+
+            if in_current and in_prev:
+                curr = metrics_current[sid]
+                prev = metrics_prev[sid]
+                if curr > prev:
+                    trend_map[sid] = "📈"
+                elif curr < prev:
+                    trend_map[sid] = "📉"
+                else:
+                    trend_map[sid] = "➖"
+            elif in_current and not in_prev:
+                trend_map[sid] = "🔥"
+            elif not in_current and in_prev:
+                trend_map[sid] = "❌"
+            else:
+                trend_map[sid] = "⛔"
 
         # 🔁 Диапазон по фильтру
         if filter == "24h":
@@ -120,6 +170,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 "roi": roi,
                 "is_king": is_king,
                 "was_king": was_king,
+                "trend_icon": trend_map.get(sid, "⛔"),
             })
 
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
