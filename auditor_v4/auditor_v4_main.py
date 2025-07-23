@@ -80,7 +80,7 @@ async def main():
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600),
         loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
         loop_with_interval(run_strategy_rating_worker, "STRATEGY_RATER", 300),
-        loop_with_interval(run_king_marker_worker, "KING_MARKER", 300)
+        loop_with_interval(run_king_marker_worker, "KING_MARKER", 300, initial_delay=120)
     )
 
 if __name__ == "__main__":
