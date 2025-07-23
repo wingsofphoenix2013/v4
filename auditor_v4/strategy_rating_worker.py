@@ -14,6 +14,22 @@ import infra
 log = logging.getLogger("STRATEGY_RATER")
 
 
+# strategy_rating_worker.py
+
+import logging
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+from scipy.stats import linregress
+import asyncpg
+
+import infra
+
+# 🔸 Логгер
+log = logging.getLogger("STRATEGY_RATER")
+
+
 # 🔸 Основной воркер
 async def run_strategy_rating_worker():
     start = datetime.utcnow()
@@ -67,23 +83,42 @@ async def run_strategy_rating_worker():
     # 🔹 Медианный pnl_pct по всем стратегиям
     median_pnl = metrics_12h["pnl_pct_12h"].median()
 
-    # 🔹 Применение фильтра допуска
-    filtered_strategies = metrics_12h[
-        (metrics_12h["pnl_pct_12h"] >= median_pnl) |
-        (metrics_12h["trade_count_12h"] >= 10)
-    ].index.tolist()
+    # 🔹 Получение всех стратегий из infra
+    total_strategies = list(infra.enabled_strategies.keys())
+    passed = []
+    rejected = []
 
-    if not filtered_strategies:
+    for sid in total_strategies:
+        if sid not in metrics_12h.index:
+            rejected.append((sid, "нет сделок за 12ч"))
+            continue
+
+        row = metrics_12h.loc[sid]
+        passed_by_pnl = row["pnl_pct_12h"] >= median_pnl
+        passed_by_trades = row["trade_count_12h"] >= 10
+
+        if passed_by_pnl or passed_by_trades:
+            passed.append(sid)
+        else:
+            reason = f"pnl={row['pnl_pct_12h']:.2f}, trades={row['trade_count_12h']} — ниже медианы и < 10"
+            rejected.append((sid, reason))
+
+    if not passed:
         log.warning("[STRATEGY_RATER] ❌ Ни одна стратегия не прошла фильтр допуска (12ч)")
         return
 
-    log.info(f"[STRATEGY_RATER] ✅ К допуску прошли {len(filtered_strategies)} стратегий (из {metrics_12h.shape[0]})")
+    log.info(f"[STRATEGY_RATER] ✅ К допуску прошли {len(passed)} стратегий (из {len(total_strategies)} включённых в системе)")
+
     log.info("[STRATEGY_RATER] 📄 Список допущенных стратегий:")
-    for strategy_id in filtered_strategies:
-        log.info(f"[STRATEGY_RATER] • Стратегия {strategy_id}")
+    for sid in passed:
+        log.info(f"[STRATEGY_RATER] • Стратегия {sid}")
+
+    log.info(f"[STRATEGY_RATER] ❌ Отклонено {len(rejected)} стратегий:")
+    for sid, reason in rejected:
+        log.info(f"[STRATEGY_RATER] • Стратегия {sid} — {reason}")
 
     # 🔹 Оставляем только допущенные стратегии
-    df = df[df["strategy_id"].isin(filtered_strategies)]
+    df = df[df["strategy_id"].isin(passed)]
 
     if df.empty:
         log.warning("[STRATEGY_RATER] ❌ После фильтрации не осталось данных за 3ч")
