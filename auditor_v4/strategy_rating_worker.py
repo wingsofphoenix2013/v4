@@ -219,12 +219,12 @@ async def run_strategy_rating_worker():
 
     # 🔹 Рейтинг
     metrics_df["raw_rating"] = (
-        0.40 * metrics_df["norm_pnl"] * metrics_df["speed_factor"] +
-        0.20 * metrics_df["norm_trend"] +
-        0.15 * metrics_df["norm_pf"] +
-        0.10 * metrics_df["norm_win"] -
+        0.30 * metrics_df["norm_pnl"] * metrics_df["speed_factor"] +
+        0.35 * metrics_df["norm_trend"] +
+        0.10 * metrics_df["norm_pf"] +
+        0.05 * metrics_df["norm_win"] -
         0.10 * metrics_df["norm_ddraw"] -
-        0.05 * metrics_df["norm_hold"]
+        0.10 * metrics_df["norm_hold"]
     )
 
     metrics_df["final_rating"] = metrics_df["raw_rating"] * metrics_df["reliability_weight"]
