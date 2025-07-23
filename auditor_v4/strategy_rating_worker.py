@@ -286,7 +286,7 @@ async def run_strategy_rating_worker():
 
     # 🔹 Запросы
     query_last_active = """
-        SELECT ts, strategy_id, rating
+        SELECT ts, ts_switch, strategy_id, rating
         FROM strategies_active_v4
         ORDER BY ts DESC
         LIMIT 1
@@ -294,9 +294,9 @@ async def run_strategy_rating_worker():
 
     insert_active = """
         INSERT INTO strategies_active_v4 (
-            ts, strategy_id, rating, previous_strategy_id, reason
+            ts, ts_switch, strategy_id, rating, previous_strategy_id, reason
         )
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1, $1, $2, $3, $4, $5)
     """
 
     update_active = """
@@ -320,7 +320,7 @@ async def run_strategy_rating_worker():
 
         else:
             previous_id = last_entry["strategy_id"]
-            minutes_passed = (ts_now - last_entry["ts"]).total_seconds() / 60
+            minutes_passed = (ts_now - last_entry["ts_switch"]).total_seconds() / 60
 
             previous_rating_row = metrics_df.loc[metrics_df["strategy_id"] == previous_id, "final_rating"]
             previous_rating = float(previous_rating_row.iloc[0]) if not previous_rating_row.empty else float(last_entry["rating"])
