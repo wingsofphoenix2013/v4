@@ -119,7 +119,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             else:
                 trend_map[sid] = "⛔"
 
-        # 🔥 "Королевские торги"
+        # 🔥 Добавляем "Королевские торги" — псевдо-стратегию
         if start and end:
             rows_king = await conn.fetch("""
                 SELECT p.status, p.pnl, p.notional_value, p.strategy_id, s.leverage
@@ -148,10 +148,10 @@ async def get_trading_summary(filter: str) -> list[dict]:
 
         closed_count = len(closed_positions)
         win_count = sum(1 for r in closed_positions if r["pnl"] >= 0)
-        pnl_sum = sum(r["pnl"] for r in closed_positions)
+        pnl_sum = sum((r["pnl"] for r in closed_positions), Decimal("0"))
 
         total_invested = sum(
-            r["notional_value"] / r["leverage"]
+            (r["notional_value"] / r["leverage"])
             for r in closed_positions
             if r["leverage"] > 0
         )
@@ -167,11 +167,12 @@ async def get_trading_summary(filter: str) -> list[dict]:
             "closed": closed_count,
             "winrate": winrate,
             "roi": roi,
+            "profit": pnl_sum,
             "is_king": False,
             "was_king": False,
             "trend_icon": "👑"
         }]
-
+        
         # 📦 Основные стратегии
         for strat in strategies:
             sid = strat["id"]
