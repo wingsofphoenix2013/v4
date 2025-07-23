@@ -88,6 +88,7 @@ async def run_strategy_rating_worker():
         sid for sid, strategy in infra.enabled_strategies.items()
         if strategy.get("enabled") is True
     ]
+
     passed = []
     rejected = []
 
@@ -97,13 +98,21 @@ async def run_strategy_rating_worker():
             continue
 
         row = metrics_12h.loc[sid]
-        passed_by_pnl = row["pnl_pct_12h"] >= median_pnl
-        passed_by_trades = row["trade_count_12h"] >= 10
+        pnl = row["pnl_pct_12h"]
+        trades = row["trade_count_12h"]
+
+        passed_by_pnl = pnl >= median_pnl
+        passed_by_trades = trades >= 10
 
         if passed_by_pnl or passed_by_trades:
-            passed.append(sid)
+            reason_parts = []
+            if passed_by_pnl:
+                reason_parts.append("по pnl")
+            if passed_by_trades:
+                reason_parts.append("по сделкам")
+            passed.append((sid, pnl, trades, reason_parts))
         else:
-            reason = f"pnl={row['pnl_pct_12h']:.2f}, trades={row['trade_count_12h']} — ниже медианы и < 10"
+            reason = f"pnl={pnl:.2f}, trades={trades} — ниже медианы и < 10"
             rejected.append((sid, reason))
 
     if not passed:
@@ -113,15 +122,18 @@ async def run_strategy_rating_worker():
     log.info(f"[STRATEGY_RATER] ✅ К допуску прошли {len(passed)} стратегий (из {len(total_strategies)} включённых в системе)")
 
     log.info("[STRATEGY_RATER] 📄 Список допущенных стратегий:")
-    for sid in passed:
-        log.info(f"[STRATEGY_RATER] • Стратегия {sid}")
+    for sid, pnl, trades, reason_parts in passed:
+        log.info(
+            f"[STRATEGY_RATER] • Стратегия {sid} — pnl={pnl:.2f}, trades={trades} — допущена ({' и '.join(reason_parts)})"
+        )
 
     log.info(f"[STRATEGY_RATER] ❌ Отклонено {len(rejected)} стратегий:")
     for sid, reason in rejected:
         log.info(f"[STRATEGY_RATER] • Стратегия {sid} — {reason}")
 
     # 🔹 Оставляем только допущенные стратегии
-    df = df[df["strategy_id"].isin(passed)]
+    passed_ids = [sid for sid, *_ in passed]
+    df = df[df["strategy_id"].isin(passed_ids)]
 
     if df.empty:
         log.warning("[STRATEGY_RATER] ❌ После фильтрации не осталось данных за 3ч")
