@@ -33,7 +33,7 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
     tf = "m5"
     count = 20
 
-    log.info(f"⏳ Сбор данных для расчёта volatility_state: {symbol} @ {open_time}")
+    log.debug(f"⏳ Сбор данных для расчёта volatility_state: {symbol} @ {open_time}")
 
     history = {"ts_ind": {}, "ts": {}}
 
@@ -64,7 +64,7 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
             log.warning(f"⚠️ Ошибка чтения {key}: {e}")
             history["ts"][label] = []
 
-    log.info("✅ История индикаторов и OHLCV собрана успешно.")
+    log.debug("✅ История индикаторов и OHLCV собрана успешно.")
 
     # --- Расчёт volatility_state ---
     explanation = []
@@ -195,9 +195,9 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
             result = "MEDIUM"
             explanation.append("• Нет чётких признаков — MEDIUM по умолчанию")
 
-        log.info(f"🧭 volatility_state = {result} для {symbol} @ {open_time}")
+        log.debug(f"🧭 volatility_state = {result} для {symbol} @ {open_time}")
         for line in explanation:
-            log.info("    " + line)
+            log.debug("    " + line)
             
         await save_flag(symbol, open_time, "volatility_state", result)
 
@@ -218,7 +218,7 @@ async def handle_initiator(message: dict):
     if tf != "m5" or indicator != "atr14" or status != "ready":
         return
 
-    log.info(f"🔔 Сигнал для расчёта volatility_state: {symbol} | {indicator} | {tf} | {open_time}")
+    log.debug(f"🔔 Сигнал для расчёта volatility_state: {symbol} | {indicator} | {tf} | {open_time}")
     await wait_for_all_volatility_data(symbol, open_time)
 
 
@@ -228,7 +228,7 @@ async def run_volatility_worker():
     stream_name = "indicator_stream"
     last_id = "$"
 
-    log.info("📡 Подписка на Redis Stream: indicator_stream (volatility)")
+    log.debug("📡 Подписка на Redis Stream: indicator_stream (volatility)")
 
     while True:
         try:

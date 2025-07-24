@@ -18,4 +18,4 @@ async def save_flag(symbol: str, open_time: str, flag_type: str, flag_value: str
 
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(query, symbol, open_dt, flag_type, flag_value)
-        log.debug(f"💾 Сохранён флаг {flag_type}={flag_value} для {symbol} @ {open_time}")
+        log.info(f"💾 Сохранён флаг {flag_type}={flag_value} для {symbol} @ {open_time}")
