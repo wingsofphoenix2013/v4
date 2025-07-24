@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 
 import infra
+from core_io import save_flag
 import redis.exceptions
 
 log = logging.getLogger("VOLATILITY_WORKER")
@@ -197,6 +198,8 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
         log.info(f"🧭 volatility_state = {result} для {symbol} @ {open_time}")
         for line in explanation:
             log.info("    " + line)
+            
+        await save_flag(symbol, open_time, "volatility_state", result)
 
     except Exception as e:
         log.exception(f"❌ Ошибка при расчёте volatility_state: {e}")
