@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime
 import infra
+import redis.exceptions
 
 log = logging.getLogger("TREND_WORKER")
 
@@ -40,12 +41,22 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
 
         for tf, params in REQUIRED_PARAMS.items():
             for param in params:
-                key = f"ind:{symbol}:{tf}:{param}"
-                val = await redis.ts().get(key)
+                key = f"ts_ind:{symbol}:{tf}:{param}"
+                try:
+                    val = await redis.ts().get(key)
+                except redis.exceptions.ResponseError as e:
+                    if "WRONGTYPE" in str(e):
+                        log.warning(f"⚠️ Неверный тип Redis ключа: {key} — не TimeSeries")
+                        all_ready = False
+                        break
+                    else:
+                        raise
+
                 if not val:
                     log.debug(f"⏳ Ожидание: {key} пока отсутствует")
                     all_ready = False
                     break
+
                 values[f"{tf}:{param}"] = val[1]
 
             if not all_ready:
