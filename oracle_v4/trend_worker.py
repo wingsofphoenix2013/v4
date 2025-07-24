@@ -24,9 +24,7 @@ REQUIRED_PARAMS = {
         "rsi14",
     ],
 }
-
-
-# 🔸 Асинхронное ожидание всех нужных значений в Redis TS
+# 🔸 Асинхронное ожидание всех нужных значений в Redis TS (с историей)
 async def wait_for_all_indicators(symbol: str, open_time: str):
     redis = infra.redis_client
     max_wait_sec = 20
@@ -35,9 +33,13 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
 
     log.info(f"⏳ Ожидание индикаторов для {symbol} @ {open_time}")
 
+    # Преобразуем open_time в timestamp
+    target_dt = datetime.fromisoformat(open_time.replace("Z", ""))
+    target_ts = int(target_dt.timestamp() * 1000)
+
     while waited < max_wait_sec:
         all_ready = True
-        values = {}
+        values_ready = {}
 
         for tf, params in REQUIRED_PARAMS.items():
             for param in params:
@@ -57,24 +59,45 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
                     all_ready = False
                     break
 
-                values[f"{tf}:{param}"] = val[1]
+                values_ready[f"{tf}:{param}"] = val[1]
 
             if not all_ready:
                 break
 
         if all_ready:
             log.info(f"✅ Все параметры получены для {symbol} @ {open_time}")
-            log.info("📊 Собранные значения:")
-            for k, v in sorted(values.items()):
-                log.info(f"    • {k:<25} = {v}")
+
+            log.info("📊 История значений из Redis TS:")
+            for tf, params in REQUIRED_PARAMS.items():
+                for param in params:
+                    key = f"ts_ind:{symbol}:{tf}:{param}"
+
+                    # Предполагаем, что таймфрейм m15 = 900_000 мс, m5 = 300_000 мс
+                    interval_ms = 900_000 if tf == "m15" else 300_000
+                    from_ts = target_ts - interval_ms * 4  # 5 точек включая целевую
+
+                    try:
+                        series = await redis.ts().range(
+                            key,
+                            from_ts,
+                            target_ts,
+                            count=5
+                        )
+                    except redis.exceptions.ResponseError as e:
+                        log.warning(f"⚠️ Ошибка чтения TS для {key}: {e}")
+                        continue
+
+                    log.info(f"🔍 {key}")
+                    for ts, value in series:
+                        ts_str = datetime.utcfromtimestamp(ts / 1000).isoformat()
+                        log.info(f"    • {ts_str} → {value}")
+
             return
 
         await asyncio.sleep(check_interval)
         waited += check_interval
 
     log.warning(f"⚠️ Не удалось собрать все параметры для {symbol} @ {open_time} за {max_wait_sec} сек")
-
-
 # 🔸 Обработка одного инициирующего сигнала
 async def handle_initiator(message: dict):
     symbol = message.get("symbol")
