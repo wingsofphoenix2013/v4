@@ -31,7 +31,7 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
     check_interval = 1
     waited = 0
 
-    log.info(f"⏳ Ожидание индикаторов для {symbol} @ {open_time}")
+    log.debug(f"⏳ Ожидание индикаторов для {symbol} @ {open_time}")
 
     # Целевая точка во времени (в мс)
     target_dt = datetime.fromisoformat(open_time.replace("Z", ""))
@@ -204,9 +204,11 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
             result = "FLAT"
             explanation.append("• Не выполнено ≥3 условий ни для одного сценария → FLAT")
 
-        log.info(f"🧭 trend_state = {result} для {symbol} @ {open_time}")
+        log.debug(f"🧭 trend_state = {result} для {symbol} @ {open_time}")
         for line in explanation:
-            log.info("    " + line)
+            log.debug("    " + line)
+
+        await save_flag(symbol, open_time, "trend_state", result)
 
         return
 # 🔸 Обработка одного инициирующего сигнала
@@ -224,7 +226,7 @@ async def handle_initiator(message: dict):
     if tf != "m15" or indicator != "ema9" or status != "ready":
         return
 
-    log.info(f"🔔 Инициирующий сигнал получен: {symbol} | {indicator} | {tf} | {open_time}")
+    log.debug(f"🔔 Инициирующий сигнал получен: {symbol} | {indicator} | {tf} | {open_time}")
     await wait_for_all_indicators(symbol, open_time)
 
 
@@ -234,7 +236,7 @@ async def run_trend_worker():
     stream_name = "indicator_stream"
     last_id = "$"
 
-    log.info("📡 Подписка на Redis Stream: indicator_stream")
+    log.debug("📡 Подписка на Redis Stream: indicator_stream")
 
     while True:
         try:
@@ -250,3 +252,13 @@ async def run_trend_worker():
         except Exception:
             log.exception("❌ Ошибка при чтении из indicator_stream")
             await asyncio.sleep(1)
+# 🔸 Сохранение результата во флаговую таблицу
+async def save_flag(symbol: str, open_time: str, flag_type: str, flag_value: str):
+    query = """
+        INSERT INTO oracle_flags_v4 (symbol, open_time, flag_type, flag_value)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT DO NOTHING
+    """
+    async with infra.pg_pool.acquire() as conn:
+        await conn.execute(query, symbol, open_time, flag_type, flag_value)
+        log.info(f"💾 Сохранён флаг {flag_type}={flag_value} для {symbol} @ {open_time}")
