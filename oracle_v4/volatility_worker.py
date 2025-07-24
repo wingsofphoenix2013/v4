@@ -34,25 +34,22 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
 
     log.info(f"⏳ Сбор данных для расчёта volatility_state: {symbol} @ {open_time}")
 
-    target_dt = datetime.fromisoformat(open_time.replace("Z", ""))
-    target_ts = int(target_dt.timestamp() * 1000)
-    interval_ms = 300_000
-    from_ts = target_ts - interval_ms * (count - 1)
-
     history = {"ts_ind": {}, "ts": {}}
 
     # --- ts_ind параметры ---
     for param in REQUIRED_PARAMS_TS:
         key = f"ts_ind:{symbol}:{tf}:{param}"
         try:
-            series = await redis.ts().range(key, from_ts, target_ts, count=count)
+            series = await redis.ts().revrange(key, "-", "+", count=count)
+            series.reverse()
             values = [(datetime.utcfromtimestamp(ts / 1000), float(v)) for ts, v in series]
             history["ts_ind"][param] = values
+            log.debug(f"🔍 ts_ind:{param} — {len(values)} точек")
         except Exception as e:
             log.warning(f"⚠️ Ошибка чтения {key}: {e}")
             history["ts_ind"][param] = []
 
-    # --- OHLCV параметры из ts:{symbol}:{tf}:{field} (используем короткие обозначения)
+    # --- OHLCV параметры из ts:{symbol}:{tf}:{field}
     ohlcv_mapping = {
         "open": "o",
         "high": "h",
@@ -63,27 +60,18 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
     for label, short in ohlcv_mapping.items():
         key = f"ts:{symbol}:{tf}:{short}"
         try:
-            series = await redis.ts().range(key, from_ts, target_ts, count=count)
+            series = await redis.ts().revrange(key, "-", "+", count=count)
+            series.reverse()
             values = [(datetime.utcfromtimestamp(ts / 1000), float(v)) for ts, v in series]
             history["ts"][label] = values
+            log.debug(f"🔍 ts:{label} — {len(values)} точек")
         except Exception as e:
             log.warning(f"⚠️ Ошибка чтения {key}: {e}")
             history["ts"][label] = []
 
-    # --- Логирование собранного ---
-    log.info(f"📊 История ts_ind (индикаторы):")
-    for param, series in history["ts_ind"].items():
-        log.debug(f"🔍 {param}")
-        for ts, val in series:
-            log.debug(f"    • {ts.isoformat()} → {val}")
-
-    log.info(f"📊 История ts (OHLCV):")
-    for label, series in history["ts"].items():
-        log.debug(f"🔍 {label}")
-        for ts, val in series:
-            log.debug(f"    • {ts.isoformat()} → {val}")
-
-    # расчёты будут позже
+    # --- Лог: короткое подтверждение
+    log.info("✅ История индикаторов и OHLCV собрана успешно.")
+    # расчёты будут добавлены позже
 # 🔸 Обработка инициирующего сигнала
 async def handle_initiator(message: dict):
     symbol = message.get("symbol")
