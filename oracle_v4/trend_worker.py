@@ -24,7 +24,7 @@ REQUIRED_PARAMS = {
         "rsi14",
     ],
 }
-# 🔸 Асинхронное ожидание всех нужных значений в Redis TS (с историей)
+# 🔸 Асинхронное ожидание всех нужных значений в Redis TS (с историей и расчётом флага)
 async def wait_for_all_indicators(symbol: str, open_time: str):
     redis = infra.redis_client
     max_wait_sec = 20
@@ -33,14 +33,14 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
 
     log.info(f"⏳ Ожидание индикаторов для {symbol} @ {open_time}")
 
-    # Преобразуем open_time в timestamp
+    # Целевая точка во времени (в мс)
     target_dt = datetime.fromisoformat(open_time.replace("Z", ""))
     target_ts = int(target_dt.timestamp() * 1000)
 
     while waited < max_wait_sec:
         all_ready = True
-        values_ready = {}
 
+        # Проверка наличия последней точки
         for tf, params in REQUIRED_PARAMS.items():
             for param in params:
                 key = f"ts_ind:{symbol}:{tf}:{param}"
@@ -53,51 +53,162 @@ async def wait_for_all_indicators(symbol: str, open_time: str):
                         break
                     else:
                         raise
-
                 if not val:
                     log.debug(f"⏳ Ожидание: {key} пока отсутствует")
                     all_ready = False
                     break
-
-                values_ready[f"{tf}:{param}"] = val[1]
-
             if not all_ready:
                 break
 
-        if all_ready:
-            log.info(f"✅ Все параметры получены для {symbol} @ {open_time}")
+        if not all_ready:
+            await asyncio.sleep(check_interval)
+            waited += check_interval
+            continue
 
-            log.info("📊 История значений из Redis TS:")
-            for tf, params in REQUIRED_PARAMS.items():
-                for param in params:
-                    key = f"ts_ind:{symbol}:{tf}:{param}"
+        # ✅ Все параметры готовы — загружаем историю
+        history = {}  # tf -> param -> List[float]
+        for tf, params in REQUIRED_PARAMS.items():
+            interval_ms = 900_000 if tf == "m15" else 300_000
+            from_ts = target_ts - interval_ms * 4
+            history[tf] = {}
 
-                    # Предполагаем, что таймфрейм m15 = 900_000 мс, m5 = 300_000 мс
-                    interval_ms = 900_000 if tf == "m15" else 300_000
-                    from_ts = target_ts - interval_ms * 4  # 5 точек включая целевую
+            for param in params:
+                key = f"ts_ind:{symbol}:{tf}:{param}"
+                try:
+                    series = await redis.ts().range(key, from_ts, target_ts, count=5)
+                    values = [float(v) for _, v in series]
+                    history[tf][param] = values
+                except redis.exceptions.ResponseError as e:
+                    log.warning(f"⚠️ Ошибка чтения TS для {key}: {e}")
+                    history[tf][param] = []
 
-                    try:
-                        series = await redis.ts().range(
-                            key,
-                            from_ts,
-                            target_ts,
-                            count=5
-                        )
-                    except redis.exceptions.ResponseError as e:
-                        log.warning(f"⚠️ Ошибка чтения TS для {key}: {e}")
-                        continue
+        # 🔍 Расчёт условий
+        explanation = []
+        result = None
 
-                    log.info(f"🔍 {key}")
-                    for ts, value in series:
-                        ts_str = datetime.utcfromtimestamp(ts / 1000).isoformat()
-                        log.info(f"    • {ts_str} → {value}")
+        # --- UP ---
+        cond_up = 0
+        try:
+            if history["m15"]["ema9"][-1] > history["m15"]["ema21"][-1] and \
+               history["m15"]["ema9"][-1] > history["m15"]["ema9"][0]:
+                cond_up += 1
+                explanation.append("• EMA(9) > EMA(21) и наклон вверх — OK")
+            else:
+                explanation.append("• EMA(9) > EMA(21) и наклон вверх — FAILED")
 
-            return
+            if history["m15"]["adx_dmi14_adx"][-1] > 20 and \
+               history["m15"]["adx_dmi14_plus_di"][-1] > history["m15"]["adx_dmi14_minus_di"][-1]:
+                cond_up += 1
+                explanation.append("• ADX > 20 и DMI+ > DMI− — OK")
+            else:
+                explanation.append("• ADX > 20 и DMI+ > DMI− — FAILED")
 
-        await asyncio.sleep(check_interval)
-        waited += check_interval
+            h_hist = history["m5"]["macd12_macd_hist"]
+            if history["m5"]["macd12_macd"][-1] > history["m5"]["macd12_macd_signal"][-1] and \
+               h_hist[-1] > 0 and h_hist[-1] > h_hist[-2]:
+                cond_up += 1
+                explanation.append("• MACD > сигнал, гистограмма растёт — OK")
+            else:
+                explanation.append("• MACD > сигнал, гистограмма растёт — FAILED")
 
-    log.warning(f"⚠️ Не удалось собрать все параметры для {symbol} @ {open_time} за {max_wait_sec} сек")
+            h_rsi = history["m5"]["rsi14"]
+            if h_rsi[-1] > 55 and min(h_rsi) > 50:
+                cond_up += 1
+                explanation.append("• RSI > 55 и выше 50 на всех 5 свечах — OK")
+            else:
+                explanation.append("• RSI > 55 и выше 50 на всех 5 свечах — FAILED")
+        except Exception as e:
+            explanation.append(f"⚠️ Ошибка при расчёте условий UP: {e}")
+
+        if cond_up >= 3:
+            result = "UP"
+
+        # --- DOWN ---
+        if not result:
+            cond_down = 0
+            try:
+                if history["m15"]["ema9"][-1] < history["m15"]["ema21"][-1] and \
+                   history["m15"]["ema9"][-1] < history["m15"]["ema9"][0]:
+                    cond_down += 1
+                    explanation.append("• EMA(9) < EMA(21) и наклон вниз — OK")
+                else:
+                    explanation.append("• EMA(9) < EMA(21) и наклон вниз — FAILED")
+
+                if history["m15"]["adx_dmi14_adx"][-1] > 20 and \
+                   history["m15"]["adx_dmi14_minus_di"][-1] > history["m15"]["adx_dmi14_plus_di"][-1]:
+                    cond_down += 1
+                    explanation.append("• ADX > 20 и DMI− > DMI+ — OK")
+                else:
+                    explanation.append("• ADX > 20 и DMI− > DMI+ — FAILED")
+
+                h_hist = history["m5"]["macd12_macd_hist"]
+                if history["m5"]["macd12_macd"][-1] < history["m5"]["macd12_macd_signal"][-1] and \
+                   h_hist[-1] < 0 and h_hist[-1] < h_hist[-2]:
+                    cond_down += 1
+                    explanation.append("• MACD < сигнал, гистограмма убывает — OK")
+                else:
+                    explanation.append("• MACD < сигнал, гистограмма убывает — FAILED")
+
+                h_rsi = history["m5"]["rsi14"]
+                if h_rsi[-1] < 45 and max(h_rsi) < 50:
+                    cond_down += 1
+                    explanation.append("• RSI < 45 и ниже 50 на всех 5 свечах — OK")
+                else:
+                    explanation.append("• RSI < 45 и ниже 50 на всех 5 свечах — FAILED")
+            except Exception as e:
+                explanation.append(f"⚠️ Ошибка при расчёте условий DOWN: {e}")
+
+            if cond_down >= 3:
+                result = "DOWN"
+
+        # --- TRANSITION ---
+        if not result:
+            cond_trans = 0
+            try:
+                h_adx = history["m15"]["adx_dmi14_adx"]
+                if h_adx[0] < 15 and h_adx[-1] > 20:
+                    cond_trans += 1
+                    explanation.append("• ADX растёт с <15 до >20 — OK")
+                else:
+                    explanation.append("• ADX растёт с <15 до >20 — FAILED")
+
+                e9 = history["m15"]["ema9"]
+                e21 = history["m15"]["ema21"]
+                if (e9[0] < e21[0] and e9[-1] > e21[-1]) or (e9[0] > e21[0] and e9[-1] < e21[-1]):
+                    cond_trans += 1
+                    explanation.append("• EMA(9) пересекает EMA(21) — OK")
+                else:
+                    explanation.append("• EMA(9) пересекает EMA(21) — FAILED")
+
+                h_hist = history["m5"]["macd12_macd_hist"]
+                if h_hist[-1] * h_hist[-2] < 0:
+                    cond_trans += 1
+                    explanation.append("• MACD hist меняет знак — OK")
+                else:
+                    explanation.append("• MACD hist меняет знак — FAILED")
+
+                h_rsi = history["m5"]["rsi14"]
+                if 47 <= h_rsi[0] <= 53 and (h_rsi[-1] > 55 or h_rsi[-1] < 45):
+                    cond_trans += 1
+                    explanation.append("• RSI выходит из зоны 47–53 — OK")
+                else:
+                    explanation.append("• RSI выходит из зоны 47–53 — FAILED")
+            except Exception as e:
+                explanation.append(f"⚠️ Ошибка при расчёте условий TRANSITION: {e}")
+
+            if cond_trans >= 3:
+                result = "TRANSITION"
+
+        # --- FLAT по умолчанию ---
+        if not result:
+            result = "FLAT"
+            explanation.append("• Не выполнено ≥3 условий ни для одного сценария → FLAT")
+
+        log.info(f"🧭 trend_state = {result} для {symbol} @ {open_time}")
+        for line in explanation:
+            log.info("    " + line)
+
+        return
 # 🔸 Обработка одного инициирующего сигнала
 async def handle_initiator(message: dict):
     symbol = message.get("symbol")
