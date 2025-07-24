@@ -13,6 +13,8 @@ from config_loader import (
     config_event_listener,
 )
 
+from trend_worker import run_trend_worker
+
 log = logging.getLogger("ORACLE_MAIN")
 
 
@@ -50,7 +52,8 @@ async def main():
     log.info("🚀 Запуск фоновых воркеров")
 
     await asyncio.gather(
-        run_safe_loop(config_event_listener, "CONFIG_LOADER")
+        run_safe_loop(config_event_listener, "CONFIG_LOADER"),
+        run_safe_loop(run_trend_worker, "TREND_WORKER"),
     )
 
 
