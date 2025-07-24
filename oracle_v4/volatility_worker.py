@@ -48,37 +48,42 @@ async def wait_for_all_volatility_data(symbol: str, open_time: str):
             series = await redis.ts().range(key, from_ts, target_ts, count=count)
             values = [(datetime.utcfromtimestamp(ts / 1000), float(v)) for ts, v in series]
             history["ts_ind"][param] = values
-        except redis.exceptions.ResponseError as e:
+        except Exception as e:
             log.warning(f"⚠️ Ошибка чтения {key}: {e}")
             history["ts_ind"][param] = []
 
-    # --- OHLCV параметры из ts ---
-    for field in REQUIRED_PARAMS_OHLCV:
-        key = f"ts:{symbol}:{tf}:{field}"
+    # --- OHLCV параметры из ts:{symbol}:{tf}:{field} (используем короткие обозначения)
+    ohlcv_mapping = {
+        "open": "o",
+        "high": "h",
+        "low": "l",
+        "close": "c",
+    }
+
+    for label, short in ohlcv_mapping.items():
+        key = f"ts:{symbol}:{tf}:{short}"
         try:
             series = await redis.ts().range(key, from_ts, target_ts, count=count)
             values = [(datetime.utcfromtimestamp(ts / 1000), float(v)) for ts, v in series]
-            history["ts"][field] = values
-        except redis.exceptions.ResponseError as e:
+            history["ts"][label] = values
+        except Exception as e:
             log.warning(f"⚠️ Ошибка чтения {key}: {e}")
-            history["ts"][field] = []
+            history["ts"][label] = []
 
     # --- Логирование собранного ---
     log.info(f"📊 История ts_ind (индикаторы):")
     for param, series in history["ts_ind"].items():
-        log.info(f"🔍 {param}")
+        log.debug(f"🔍 {param}")
         for ts, val in series:
-            log.info(f"    • {ts.isoformat()} → {val}")
+            log.debug(f"    • {ts.isoformat()} → {val}")
 
     log.info(f"📊 История ts (OHLCV):")
-    for field, series in history["ts"].items():
-        log.info(f"🔍 {field}")
+    for label, series in history["ts"].items():
+        log.debug(f"🔍 {label}")
         for ts, val in series:
-            log.info(f"    • {ts.isoformat()} → {val}")
+            log.debug(f"    • {ts.isoformat()} → {val}")
 
     # расчёты будут позже
-
-
 # 🔸 Обработка инициирующего сигнала
 async def handle_initiator(message: dict):
     symbol = message.get("symbol")
