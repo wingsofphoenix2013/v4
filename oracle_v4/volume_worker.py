@@ -16,7 +16,7 @@ async def wait_for_volume_data(symbol: str, open_time: str):
     tf = "m5"
     count = 20
 
-    log.info(f"⏳ Сбор данных для volume_state: {symbol} @ {open_time}")
+    log.debug(f"⏳ Сбор данных для volume_state: {symbol} @ {open_time}")
 
     key = f"ts:{symbol}:{tf}:v"
     try:
@@ -75,9 +75,9 @@ async def wait_for_volume_data(symbol: str, open_time: str):
         result = "STABLE"
         explanation.append("• Не выполнены условия других флагов — STABLE по умолчанию")
 
-    log.info(f"🧭 volume_state = {result} для {symbol} @ {open_time}")
+    log.debug(f"🧭 volume_state = {result} для {symbol} @ {open_time}")
     for line in explanation:
-        log.info("    " + line)
+        log.debug("    " + line)
 
     await save_flag(symbol, open_time, "volume_state", result)
 
@@ -97,7 +97,7 @@ async def handle_initiator(message: dict):
     if tf != "m5" or indicator != "atr14" or status != "ready":
         return
 
-    log.info(f"🔔 Сигнал для расчёта volume_state: {symbol} | {indicator} | {tf} | {open_time}")
+    log.debug(f"🔔 Сигнал для расчёта volume_state: {symbol} | {indicator} | {tf} | {open_time}")
     await wait_for_volume_data(symbol, open_time)
 
 
@@ -107,7 +107,7 @@ async def run_volume_worker():
     stream_name = "indicator_stream"
     last_id = "$"
 
-    log.info("📡 Подписка на Redis Stream: indicator_stream (volume)")
+    log.debug("📡 Подписка на Redis Stream: indicator_stream (volume)")
 
     while True:
         try:
