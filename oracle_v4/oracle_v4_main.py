@@ -15,6 +15,7 @@ from config_loader import (
 
 from trend_worker import run_trend_worker
 from volatility_worker import run_volatility_worker
+from volume_worker import run_volume_worker
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -56,6 +57,7 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(run_trend_worker, "TREND_WORKER"),
         run_safe_loop(run_volatility_worker, "VOLATILITY_WORKER"),
+        run_safe_loop(run_volume_worker, "VOLUME_WORKER"),
     )
 
 
