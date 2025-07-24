@@ -56,7 +56,10 @@ async def get_trading_summary(filter: str) -> list[dict]:
         current_ts = active_row["ts"] if active_row else None
 
         # 🔁 Диапазон по фильтру
-        if filter == "24h":
+        if filter == "3h":
+            end = datetime.utcnow()
+            start = end - timedelta(hours=3)
+        elif filter == "24h":
             end = datetime.utcnow()
             start = end - timedelta(hours=24)
         elif filter == "yesterday":
@@ -69,7 +72,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
         if start and end:
             start = start.replace(tzinfo=None)
             end = end.replace(tzinfo=None)
-
+            
         # ⏳ Предыдущее ts из диапазона 4–6 минут
         previous_ts = await conn.fetchval("""
             SELECT ts FROM strategies_metrics_v4
