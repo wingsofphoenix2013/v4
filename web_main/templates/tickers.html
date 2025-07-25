@@ -35,60 +35,97 @@
         <a href="/tickers/create" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition">Добавить тикер</a>
       </div>
 
-      <!-- Таблица тикеров -->
-      <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
-        <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
-          <tr>
-            <th class="px-4 py-3">№№</th>
-            <th class="px-4 py-3">Название тикера</th>
-            <th class="px-4 py-3">Статус</th>
-            <th class="px-4 py-3">Торговля</th>
-          </tr>
-        </thead>
-        <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-          {% for t in tickers %}
-          <tr>
-            <td class="px-4 py-3">{{ loop.index }}</td>
-            <td class="px-4 py-3 font-semibold uppercase">{{ t.symbol }}</td>
+<!-- Таблица тикеров -->
+<table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
+  <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+    <tr>
+      <th class="px-4 py-3">№№</th>
+      <th class="px-4 py-3">Название тикера</th>
+      <th class="px-4 py-3">Статус</th>
+      <th class="px-4 py-3">Торговля</th>
+      <th class="px-4 py-3">Рынок</th>
+    </tr>
+  </thead>
+  <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+    {% for t in tickers %}
+    <tr>
+      <td class="px-4 py-3">{{ loop.index }}</td>
+      <td class="px-4 py-3 font-semibold uppercase">{{ t.symbol }}</td>
 
-            <!-- Столбец: Статус -->
-            <td class="px-4 py-3">
-              <div class="flex items-center space-x-3">
-                {% if t.status == 'enabled' %}
-                  <div class="h-3 w-3 rounded-full bg-green-500"></div>
-                  <form method="post" action="/tickers/{{ t.id }}/disable_status">
-                    <button class="text-sm text-blue-600 hover:underline">Выключить</button>
-                  </form>
-                {% else %}
-                  <div class="h-3 w-3 rounded-full bg-red-500"></div>
-                  <form method="post" action="/tickers/{{ t.id }}/enable_status">
-                    <button class="text-sm text-blue-600 hover:underline">Включить</button>
-                  </form>
-                {% endif %}
-              </div>
-            </td>
+      <!-- Столбец: Статус -->
+      <td class="px-4 py-3">
+        <div class="flex items-center space-x-3">
+          {% if t.status == 'enabled' %}
+            <div class="h-3 w-3 rounded-full bg-green-500"></div>
+            <form method="post" action="/tickers/{{ t.id }}/disable_status">
+              <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+            </form>
+          {% else %}
+            <div class="h-3 w-3 rounded-full bg-red-500"></div>
+            <form method="post" action="/tickers/{{ t.id }}/enable_status">
+              <button class="text-sm text-blue-600 hover:underline">Включить</button>
+            </form>
+          {% endif %}
+        </div>
+      </td>
 
-            <!-- Столбец: Торговля -->
-            <td class="px-4 py-3">
-              <div class="flex items-center space-x-3">
-                {% if t.tradepermission == 'enabled' %}
-                  <div class="h-3 w-3 rounded-full bg-green-500"></div>
-                  <form method="post" action="/tickers/{{ t.id }}/disable_trade">
-                    <button class="text-sm text-blue-600 hover:underline">Выключить</button>
-                  </form>
-                {% else %}
-                  <div class="h-3 w-3 rounded-full bg-red-500"></div>
-                  <form method="post" action="/tickers/{{ t.id }}/enable_trade">
-                    <button class="text-sm text-blue-600 hover:underline">Включить</button>
-                  </form>
-                {% endif %}
-              </div>
-            </td>
+      <!-- Столбец: Торговля -->
+      <td class="px-4 py-3">
+        <div class="flex items-center space-x-3">
+          {% if t.tradepermission == 'enabled' %}
+            <div class="h-3 w-3 rounded-full bg-green-500"></div>
+            <form method="post" action="/tickers/{{ t.id }}/disable_trade">
+              <button class="text-sm text-blue-600 hover:underline">Выключить</button>
+            </form>
+          {% else %}
+            <div class="h-3 w-3 rounded-full bg-red-500"></div>
+            <form method="post" action="/tickers/{{ t.id }}/enable_trade">
+              <button class="text-sm text-blue-600 hover:underline">Включить</button>
+            </form>
+          {% endif %}
+        </div>
+      </td>
 
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <!-- Столбец: Флаги -->
+      <td class="px-4 py-3 text-lg space-x-1">
+        {# trend_state #}
+        {% if t.trend_state == 'UP' %}
+          <span title="UP">🟢</span>
+        {% elif t.trend_state == 'DOWN' %}
+          <span title="DOWN">🔴</span>
+        {% elif t.trend_state == 'TRANSITION' %}
+          <span title="TRANSITION">🔄</span>
+        {% elif t.trend_state == 'FLAT' %}
+          <span title="FLAT">➖</span>
+        {% endif %}
+
+        {# volatility_state #}
+        {% if t.volatility_state == 'LOW' %}
+          <span title="LOW">❄️</span>
+        {% elif t.volatility_state == 'MEDIUM' %}
+          <span title="MEDIUM">💧</span>
+        {% elif t.volatility_state == 'HIGH' %}
+          <span title="HIGH">🔥</span>
+        {% elif t.volatility_state == 'EXPLODING' %}
+          <span title="EXPLODING">💥</span>
+        {% endif %}
+
+        {# volume_state #}
+        {% if t.volume_state == 'RISING' %}
+          <span title="RISING">📈</span>
+        {% elif t.volume_state == 'FALLING' %}
+          <span title="FALLING">📉</span>
+        {% elif t.volume_state == 'STABLE' %}
+          <span title="STABLE">⚖️</span>
+        {% elif t.volume_state == 'SPIKE' %}
+          <span title="SPIKE">🚀</span>
+        {% endif %}
+      </td>
+
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
     </main>
   </body>
 </html>
