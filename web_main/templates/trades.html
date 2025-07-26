@@ -50,11 +50,11 @@
     Все серии
   </a>
 
-  {% for s in ['1', '2', '3', '4', '5'] %}
+  {% for s in ['1', '2', '3', '4', '5', '6', '7', '8'] %}
   <a href="/trades?series={{ s }}{% if filter %}&filter={{ filter }}{% endif %}"
      class="px-3 py-2 rounded-lg font-semibold transition
      {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if series == s else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-    {{ s }}XX
+    {{ s }}
   </a>
   {% endfor %}
 </div>
