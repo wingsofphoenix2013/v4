@@ -46,7 +46,7 @@ class Strategy514Short:
             return ("ignore", f"неизвестное направление: {direction}")
 
         except Exception:
-            log.exception("❌ Ошибка в strategy_514_universal_shortonly")
+            log.exception("❌ Ошибка в strategy_514_short")
             return ("ignore", "ошибка в стратегии")
 
     async def run(self, signal, context):

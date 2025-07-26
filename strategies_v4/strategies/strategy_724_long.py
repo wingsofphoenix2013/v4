@@ -46,7 +46,7 @@ class Strategy724Long:
             return ("ignore", f"неизвестное направление: {direction}")
 
         except Exception:
-            log.exception("❌ Ошибка в strategy_724_universal_longonly")
+            log.exception("❌ Ошибка в strategy_724_long")
             return ("ignore", "ошибка в стратегии")
 
     async def run(self, signal, context):
