@@ -94,7 +94,7 @@ async def run_strategy_rating_worker():
         trades = row["trade_count_12h"]
 
         passed_by_pnl = pnl >= median_pnl
-        passed_by_trades = trades >= 5  # изменено с 10 → 5
+        passed_by_trades = trades >= 5
 
         if passed_by_pnl and passed_by_trades:
             passed.append((sid, pnl, trades))
