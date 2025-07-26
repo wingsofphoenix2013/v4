@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 
 import infra
+from core_io import save_ema_phase
 
 log = logging.getLogger("EMA_WORKER")
 
