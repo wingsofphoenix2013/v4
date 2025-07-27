@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections import Counter
+from collections import Counter, defaultdict
 
 import infra
 
@@ -13,6 +13,7 @@ VALID_INTERVALS = {"m5", "m15", "h1"}
 
 # Глобальный счётчик сигналов по тикерам
 signal_counter = Counter()
+signal_stats = defaultdict(lambda: defaultdict(int))
 
 
 # 🔸 Обработка одного сообщения из Redis Stream
@@ -35,15 +36,17 @@ async def handle_ema_message(message: dict):
     if status != "ready":
         return
 
-    signal_counter[symbol] += 1
+    signal_stats[symbol][interval] += 1
     log.info(f"📥 Сигнал EMA: {symbol} | {interval} | {indicator} @ {open_time}")
 
-    # Логируем топ тикеров каждые 100 сигналов
-    if sum(signal_counter.values()) % 100 == 0:
-        top = signal_counter.most_common(10)
-        log.info("📊 Топ тикеров по количеству сигналов:")
-        for sym, count in top:
-            log.info(f"    • {sym}: {count}")
+    # Каждые 100 сигналов — выводим полную статистику
+    total = sum(sum(v.values()) for v in signal_stats.values())
+    if total % 100 == 0:
+        log.info("📊 Статистика сигналов по тикерам:")
+        for sym in sorted(signal_stats):
+            counts = signal_stats[sym]
+            line = f"• {sym}: " + ", ".join(f"{tf}={counts.get(tf, 0)}" for tf in sorted(VALID_INTERVALS))
+            log.info(line)
 
 
 # 🔸 Основной воркер
