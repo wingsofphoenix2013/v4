@@ -50,21 +50,29 @@ async def handle_ema_message(message: dict):
 async def run_ema_position_worker():
     redis = infra.redis_client
     stream_name = "indicator_stream"
-    last_id = "$"
 
-    log.info("📡 Подписка на indicator_stream (EMA)")
+    # Стартуем с самого последнего сообщения (без риска потерять последующие)
+    try:
+        stream_info = await redis.xinfo_stream(stream_name)
+        last_id = stream_info["last-generated-id"]
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось получить last ID из stream: {e}")
+        last_id = "$"
+
+    log.info(f"📡 Подписка на indicator_stream (EMA) с last_id = {last_id}")
 
     while True:
         try:
             response = await redis.xread(
                 streams={stream_name: last_id},
-                count=10,
+                count=50,
                 block=1000
             )
             for stream, messages in response:
-                for _, msg_data in messages:
+                for msg_id, msg_data in messages:
                     parsed = {k: v for k, v in msg_data.items()}
                     asyncio.create_task(handle_ema_message(parsed))
+                    last_id = msg_id  # 🔁 Обновляем позицию, чтобы не пропустить
         except Exception:
             log.exception("❌ Ошибка чтения из indicator_stream")
             await asyncio.sleep(1)
