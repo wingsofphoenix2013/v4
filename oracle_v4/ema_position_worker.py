@@ -65,6 +65,10 @@ async def process_ema_phase(symbol: str, interval: str, open_time: str, ema_name
 
         log.info(f"📊 EMA Фаза: {symbol} | {interval} | {ema_name} → {phase}")
 
+        # 🔸 Сохранение в базу
+        ema_period = int(ema_name.replace("ema", ""))
+        await save_ema_phase(symbol, interval, open_time, ema_period, phase)
+
     except Exception as e:
         log.exception(f"❌ Ошибка обработки {symbol} {interval} {ema_name}: {e}")
 
