@@ -226,9 +226,15 @@ async def handle_initiator(message: dict):
 async def run_volatility_worker():
     redis = infra.redis_client
     stream_name = "indicator_stream"
-    last_id = "$"
 
-    log.debug("📡 Подписка на Redis Stream: indicator_stream (volatility)")
+    try:
+        stream_info = await redis.xinfo_stream(stream_name)
+        last_id = stream_info["last-generated-id"]
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось получить last ID из stream: {e}")
+        last_id = "$"
+
+    log.info(f"📡 Подписка на Redis Stream: {stream_name} (volatility) с last_id = {last_id}")
 
     while True:
         try:
@@ -241,6 +247,7 @@ async def run_volatility_worker():
                 for msg_id, msg_data in messages:
                     parsed = {k: v for k, v in msg_data.items()}
                     asyncio.create_task(handle_initiator(parsed))
+                    last_id = msg_id  # 🔁 обновляем позицию
         except Exception:
             log.exception("❌ Ошибка чтения из indicator_stream")
             await asyncio.sleep(1)

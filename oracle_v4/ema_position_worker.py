@@ -63,7 +63,7 @@ async def process_ema_phase(symbol: str, interval: str, open_time: str, ema_name
 
             phase = determine_phase(close_prev, close_now, ema_prev, ema_now)
 
-        log.info(f"📊 EMA Фаза: {symbol} | {interval} | {ema_name} → {phase}")
+        log.debug(f"📊 EMA Фаза: {symbol} | {interval} | {ema_name} → {phase}")
 
         ema_period = int(ema_name.replace("ema", ""))
         await save_ema_phase(symbol, interval, open_time, ema_period, phase)
