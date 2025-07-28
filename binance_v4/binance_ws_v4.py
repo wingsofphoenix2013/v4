@@ -11,6 +11,7 @@ from infra import (
     infra,
     get_binance_listen_key,
     keep_alive_binance_listen_key,
+    run_in_thread
 )
 
 from strategy_registry import (
