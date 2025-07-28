@@ -5,7 +5,7 @@ import aiohttp
 import logging
 import json
 from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from infra import (
     infra,
@@ -32,6 +32,9 @@ filled_order_map: dict[int, dict] = {}  # order_id → {"strategy_id", "directio
 async def run_binance_ws_listener():
     while True:
         try:
+            asyncio.create_task(clean_filled_order_map_loop())   # 🔸 запуск автоочистки
+            await restore_filled_order_map_from_db()             # 🔸 восстановление из БД
+
             log.info("🔌 Запуск подключения к Binance User Data Stream")
 
             listen_key = await get_binance_listen_key()
@@ -73,6 +76,7 @@ async def run_binance_ws_listener():
 
         log.info("⏳ Перезапуск подключения через 5 секунд...")
         await asyncio.sleep(5)
+        
 # 🔸 Обработка FILLED-события: расчёт TP и SL
 async def on_order_filled(order: dict):
     order_id = order["i"]
@@ -325,3 +329,57 @@ async def place_tp_sl_orders(
 
     except Exception as e:
         log.warning(f"⚠️ Ошибка размещения SL: {e}")
+# 🔸 Очистка устаревших записей из filled_order_map
+async def clean_filled_order_map_loop():
+    TTL_MINUTES = 5
+
+    while True:
+        await asyncio.sleep(60)
+
+        now = datetime.utcnow()
+        cutoff = now - timedelta(minutes=TTL_MINUTES)
+
+        expired = [
+            oid for oid, ctx in filled_order_map.items()
+            if ctx.get("timestamp") and ctx["timestamp"] < cutoff
+        ]
+
+        for oid in expired:
+            filled_order_map.pop(oid, None)
+            log.debug(f"🧹 Удалён устаревший orderId={oid} из filled_order_map")
+# 🔸 Восстановление filled_order_map из базы при старте
+async def restore_filled_order_map_from_db():
+    query = """
+        SELECT 
+            binance_order_id,
+            strategy_id,
+            position_uid,
+            side,
+            quantity
+        FROM binance_orders_v4
+        WHERE purpose = 'entry' AND status = 'NEW'
+    """
+    try:
+        rows = await infra.pg_pool.fetch(query)
+
+        for row in rows:
+            order_id = row["binance_order_id"]
+            strategy_id = row["strategy_id"]
+            position_uid = row["position_uid"]
+            quantity = row["quantity"]
+            side = row["side"]
+
+            direction = "long" if side == "BUY" else "short"
+
+            filled_order_map[order_id] = {
+                "strategy_id": strategy_id,
+                "direction": direction,
+                "quantity": quantity,
+                "position_uid": position_uid,
+                "timestamp": datetime.utcnow()
+            }
+
+        log.info(f"♻️ Восстановлено {len(rows)} ордеров в filled_order_map из базы")
+
+    except Exception as e:
+        log.exception("❌ Ошибка при восстановлении filled_order_map из базы")

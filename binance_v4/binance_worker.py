@@ -2,6 +2,7 @@
 
 import logging
 from decimal import Decimal, ROUND_DOWN
+from datetime import datetime
 
 from strategy_registry import (
     get_precision_for_symbol,
@@ -58,8 +59,9 @@ async def handle_open_position(payload: dict):
         filled_order_map[order_id] = {
             "strategy_id": strategy_id,
             "direction": direction,
-            "quantity": qty,               # 🔸 Decimal!
-            "position_uid": position_uid
+            "quantity": qty,
+            "position_uid": position_uid,
+            "timestamp": datetime.utcnow()
         }
 
         log.info(f"✅ Binance order sent: orderId={order_id}")
