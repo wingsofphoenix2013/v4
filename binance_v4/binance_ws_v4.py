@@ -19,7 +19,7 @@ from strategy_registry import (
     get_price_precision_for_symbol,
     get_precision_for_symbol,
     get_tick_size_for_symbol,
-    round_to_tick,
+    round_to_tick
 )
 
 from core_io import insert_binance_position, insert_binance_order, update_binance_order_status
@@ -63,6 +63,45 @@ async def run_binance_ws_listener():
                                     except Exception:
                                         log.exception(f"❌ Ошибка обновления статуса ордера {order_id}")
 
+                                    # 🔸 Если ордер был отменён вручную — отменяем сопарный TP/SL
+                                    if status == "CANCELED":
+                                        try:
+                                            query = """
+                                                SELECT position_uid, purpose
+                                                FROM binance_orders_v4
+                                                WHERE binance_order_id = $1
+                                            """
+                                            row = await infra.pg_pool.fetchrow(query, order_id)
+                                            if row and row["purpose"] in ("tp", "sl"):
+                                                position_uid = row["position_uid"]
+                                                current_purpose = row["purpose"]
+
+                                                query_other = """
+                                                    SELECT binance_order_id, symbol
+                                                    FROM binance_orders_v4
+                                                    WHERE position_uid = $1 AND purpose IN ('tp', 'sl') AND purpose != $2 AND status = 'NEW'
+                                                """
+                                                others = await infra.pg_pool.fetch(query_other, position_uid, current_purpose)
+
+                                                for other in others:
+                                                    oid = other["binance_order_id"]
+                                                    sym = other["symbol"]
+                                                    try:
+                                                        await run_in_thread(infra.binance_client.cancel_order, orderId=oid, symbol=sym)
+                                                        log.info(f"🛑 Ручная отмена: удалён сопарный ордер {oid} (по позиции {position_uid})")
+
+                                                        update_query = """
+                                                            UPDATE binance_orders_v4
+                                                            SET status = 'CANCELED', updated_at = NOW()
+                                                            WHERE binance_order_id = $1
+                                                        """
+                                                        await infra.pg_pool.execute(update_query, oid)
+                                                    except Exception as cancel_exc:
+                                                        log.warning(f"⚠️ Ошибка отмены ордера {oid}: {cancel_exc}")
+
+                                        except Exception as e:
+                                            log.exception(f"❌ Ошибка логики отмены парного ордера при ручной отмене {order_id}")
+
                                 if status == "FILLED":
                                     await on_order_filled(order)
 
@@ -77,7 +116,7 @@ async def run_binance_ws_listener():
 
         log.info("⏳ Перезапуск подключения через 5 секунд...")
         await asyncio.sleep(5)
-        
+                
 # 🔸 Обработка FILLED-события: расчёт TP и SL
 async def on_order_filled(order: dict):
     order_id = order["i"]
@@ -167,7 +206,50 @@ async def on_order_filled(order: dict):
 
     except Exception as e:
         log.warning(f"⚠️ Ошибка расчёта SL: {e}")
+        
+    # 🔸 Отмена оставшихся TP/SL при исполнении одного из них
+    try:
+        current_order_id = order["i"]
 
+        # Получаем позицию по ордеру
+        query_purpose = """
+            SELECT position_uid, purpose
+            FROM binance_orders_v4
+            WHERE binance_order_id = $1
+        """
+        row = await infra.pg_pool.fetchrow(query_purpose, current_order_id)
+        if not row:
+            log.warning(f"⚠️ Не найден order_id={current_order_id} в БД — отмена сопарного TP/SL невозможна")
+        else:
+            position_uid = row["position_uid"]
+            current_purpose = row["purpose"]
+
+            if current_purpose in ("tp", "sl"):
+                query_other_orders = """
+                    SELECT binance_order_id
+                    FROM binance_orders_v4
+                    WHERE position_uid = $1 AND purpose IN ('tp', 'sl') AND purpose != $2 AND status = 'NEW'
+                """
+                other_orders = await infra.pg_pool.fetch(query_other_orders, position_uid, current_purpose)
+
+                for other in other_orders:
+                    oid = other["binance_order_id"]
+                    try:
+                        await run_in_thread(infra.binance_client.cancel_order, orderId=oid, symbol=symbol)
+                        log.info(f"🛑 Отменён противоположный ордер {oid} (по позиции {position_uid})")
+
+                        update_status_query = """
+                            UPDATE binance_orders_v4
+                            SET status = 'CANCELED', updated_at = NOW()
+                            WHERE binance_order_id = $1
+                        """
+                        await infra.pg_pool.execute(update_status_query, oid)
+                    except Exception as cancel_exc:
+                        log.warning(f"⚠️ Ошибка отмены ордера {oid}: {cancel_exc}")
+
+    except Exception as e:
+        log.exception(f"❌ Ошибка логики отмены TP/SL после FILLED {order['i']}: {e}")
+        
     # 🔸 Размещение TP/SL
     await place_tp_sl_orders(
         symbol=symbol,
