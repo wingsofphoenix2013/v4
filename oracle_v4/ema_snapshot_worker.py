@@ -33,8 +33,6 @@ def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]
             ref_value = value
     result.append("=".join(group))
     return result
-
-
 # 🔸 Построение и логирование snapshot
 async def build_snapshot(symbol: str, interval: str, open_time: str):
     redis = infra.redis_client
@@ -61,6 +59,12 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
             ema_value = float(ema_series[0][1])
             items.append((ema_name.upper(), ema_value))
 
+        # 🔍 Вывод всех значений перед сортировкой
+        log.info(f"📋 Значения EMA и PRICE для {symbol} | {interval} | {open_time}:")
+        for name, value in sorted(items, key=lambda x: -x[1]):
+            log.info(f"    • {name:<6} = {value}")
+
+        # 📐 Формируем упорядоченный snapshot с учётом слипания
         ordered = group_by_proximity(items)
         snapshot_str = " > ".join(ordered)
 
@@ -70,8 +74,7 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
         # будущая запись в БД будет здесь
 
     except Exception as e:
-        log.exception(f"❌ Ошибка при формировании snapshot: {symbol} | {interval} | {open_time} → {e}")
-        
+        log.exception(f"❌ Ошибка при формировании snapshot: {symbol} | {interval} | {open_time} → {e}") 
 # 🔸 Обработка одного сообщения из Redis Stream
 async def handle_ema_snapshot_message(message: dict):
     symbol = message.get("symbol")
