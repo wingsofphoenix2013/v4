@@ -66,29 +66,29 @@ async def setup_redis_client():
     infra.redis_client = client
     logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
 
-
-# 🔸 Binance Testnet (официальный коннектор)
+# 🔸 Binance UMFutures: инициализация клиента (MAINNET по умолчанию)
 async def setup_binance_client():
     log = logging.getLogger("INFRA")
 
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
-    testnet_url = "https://testnet.binancefuture.com"
 
     if not api_key or not api_secret:
         raise RuntimeError("❌ BINANCE_API_KEY или BINANCE_API_SECRET не заданы")
 
     try:
-        client = UMFutures(key=api_key, secret=api_secret, base_url=testnet_url)
+        client = UMFutures(key=api_key, secret=api_secret)
         infra.binance_client = client
-        log.info("🔑 Binance (UMFutures) инициализирован для Testnet")
+
+        env = "TESTNET" if "testnet" in client.BASE_URL else "MAINNET"
+        log.info(f"🔑 Binance (UMFutures) инициализирован для: {env}")
 
         # 🔸 Проверка доступности API
         try:
             server_time = client.time()
-            log.info(f"📡 Binance Testnet доступен. Время сервера: {server_time['serverTime']}")
+            log.info(f"📡 Binance {env} доступен. Время сервера: {server_time['serverTime']}")
         except Exception as e:
-            log.exception("❌ Ошибка при /time — Testnet API недоступен")
+            log.exception(f"❌ Ошибка при /time — Binance {env} API недоступен")
 
         # 🔸 Проверка авторизации
         try:
@@ -103,11 +103,11 @@ async def setup_binance_client():
         log.exception("❌ Ошибка инициализации Binance клиента")
         raise
 
-# 🔸 Получение нового listenKey (вызов в binance_ws_v4 или setup)
+# 🔸 Получение нового listenKey
 async def get_binance_listen_key() -> str:
     log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
-    url = "https://testnet.binancefuture.com/fapi/v1/listenKey"
+    url = f"{infra.binance_client.BASE_URL}/fapi/v1/listenKey"
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers={"X-MBX-APIKEY": api_key}) as resp:
@@ -121,12 +121,11 @@ async def get_binance_listen_key() -> str:
                 text = await resp.text()
                 raise RuntimeError(f"❌ Не удалось получить listenKey: {resp.status} — {text}")
 
-
-# 🔸 Продление listenKey каждые 30 минут (в фоне)
+# 🔸 Продление listenKey каждые 30 минут
 async def keep_alive_binance_listen_key():
     log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
-    url = "https://testnet.binancefuture.com/fapi/v1/listenKey"
+    url = f"{infra.binance_client.BASE_URL}/fapi/v1/listenKey"
 
     while True:
         if binance_listen_key is None:
@@ -148,7 +147,7 @@ async def keep_alive_binance_listen_key():
                 log.warning(f"⚠️ Исключение при продлении listenKey: {e}")
 
         await asyncio.sleep(30 * 60)
-        
+
 # 🔸 Выполнение синхронной функции в отдельном потоке
 async def run_in_thread(func: Callable[..., Any], *args, **kwargs) -> Any:
     loop = asyncio.get_event_loop()
