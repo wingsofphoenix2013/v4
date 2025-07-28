@@ -11,7 +11,7 @@ from indicators.compute_and_store import compute_and_store
 
 active_tickers = {}         # symbol -> precision_price
 indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
-required_candles = defaultdict(lambda: 200)  # tf -> сколько свечей загружать
+required_candles = defaultdict(lambda: 400)  # tf -> сколько свечей загружать
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
