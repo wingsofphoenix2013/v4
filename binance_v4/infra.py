@@ -66,7 +66,7 @@ async def setup_redis_client():
     infra.redis_client = client
     logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
 
-# 🔸 Binance UMFutures: инициализация клиента (MAINNET по умолчанию)
+# 🔸 Binance UMFutures: инициализация клиента (только MAINNET)
 async def setup_binance_client():
     log = logging.getLogger("INFRA")
 
@@ -80,15 +80,14 @@ async def setup_binance_client():
         client = UMFutures(key=api_key, secret=api_secret)
         infra.binance_client = client
 
-        env = "TESTNET" if "testnet" in client.BASE_URL else "MAINNET"
-        log.info(f"🔑 Binance (UMFutures) инициализирован для: {env}")
+        log.info("🔑 Binance (UMFutures) инициализирован для MAINNET")
 
         # 🔸 Проверка доступности API
         try:
             server_time = client.time()
-            log.info(f"📡 Binance {env} доступен. Время сервера: {server_time['serverTime']}")
-        except Exception as e:
-            log.exception(f"❌ Ошибка при /time — Binance {env} API недоступен")
+            log.info(f"📡 Binance MAINNET доступен. Время сервера: {server_time['serverTime']}")
+        except Exception:
+            log.exception("❌ Ошибка при /time — Binance MAINNET API недоступен")
 
         # 🔸 Проверка авторизации
         try:
