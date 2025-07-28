@@ -6,6 +6,7 @@ import asyncio
 import asyncpg
 import redis.asyncio as aioredis
 import aiohttp
+from typing import Callable, Any
 from binance.um_futures import UMFutures
 from binance.error import ClientError
 
@@ -147,3 +148,8 @@ async def keep_alive_binance_listen_key():
                 log.warning(f"⚠️ Исключение при продлении listenKey: {e}")
 
         await asyncio.sleep(30 * 60)
+        
+# 🔸 Выполнение синхронной функции в отдельном потоке
+async def run_in_thread(func: Callable[..., Any], *args, **kwargs) -> Any:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))

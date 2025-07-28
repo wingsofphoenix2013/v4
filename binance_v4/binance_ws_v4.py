@@ -238,7 +238,8 @@ async def place_tp_sl_orders(
             continue
 
         try:
-            resp = infra.binance_client.new_order(
+            resp = await run_in_thread(
+                infra.binance_client.new_order,
                 symbol=symbol,
                 side=side,
                 type="LIMIT",
@@ -289,7 +290,8 @@ async def place_tp_sl_orders(
     sl_price_str = f"{sl_price:.{price_precision}f}"
 
     try:
-        resp = infra.binance_client.new_order(
+        resp = await run_in_thread(
+            infra.binance_client.new_order,
             symbol=symbol,
             side=side,
             type="STOP_MARKET",

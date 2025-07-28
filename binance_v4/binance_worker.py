@@ -1,7 +1,6 @@
 # binance_worker.py
 
 import logging
-from infra import infra
 from decimal import Decimal, ROUND_DOWN
 
 from strategy_registry import (
@@ -11,6 +10,8 @@ from strategy_registry import (
 )
 from binance_ws_v4 import filled_order_map
 from core_io import insert_binance_order
+from infra import infra
+from infra import run_in_thread
 
 log = logging.getLogger("BINANCE_WORKER")
 
@@ -37,15 +38,16 @@ async def handle_open_position(payload: dict):
 
     log.info(f"⚙️ Установка плеча {leverage} и режима 'ISOLATED' для {symbol}")
     try:
-        infra.binance_client.change_margin_type(symbol=symbol, marginType="ISOLATED")
-        infra.binance_client.change_leverage(symbol=symbol, leverage=leverage)
+        await run_in_thread(infra.binance_client.change_margin_type, symbol=symbol, marginType="ISOLATED")
+        await run_in_thread(infra.binance_client.change_leverage, symbol=symbol, leverage=leverage)
     except Exception as e:
         log.debug(f"⚠️ Не удалось установить плечо/маржу для {symbol}: {e}")
 
     log.info(f"📤 Отправка MARKET-ордера: {symbol} {side} qty={qty_str} (strategy_id={strategy_id})")
 
     try:
-        resp = infra.binance_client.new_order(
+        resp = await run_in_thread(
+            infra.binance_client.new_order,
             symbol=symbol,
             side=side,
             type="MARKET",
