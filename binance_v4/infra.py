@@ -106,7 +106,7 @@ async def setup_binance_client():
 async def get_binance_listen_key() -> str:
     log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
-    url = f"{infra.binance_client.BASE_URL}/fapi/v1/listenKey"
+    url = "https://fapi.binance.com/fapi/v1/listenKey"
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers={"X-MBX-APIKEY": api_key}) as resp:
@@ -124,7 +124,7 @@ async def get_binance_listen_key() -> str:
 async def keep_alive_binance_listen_key():
     log = logging.getLogger("INFRA")
     api_key = os.getenv("BINANCE_API_KEY")
-    url = f"{infra.binance_client.BASE_URL}/fapi/v1/listenKey"
+    url = "https://fapi.binance.com/fapi/v1/listenKey"
 
     while True:
         if binance_listen_key is None:
