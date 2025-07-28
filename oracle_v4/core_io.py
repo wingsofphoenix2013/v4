@@ -31,3 +31,16 @@ async def save_ema_phase(symbol: str, interval: str, open_time: str, ema_period:
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(query, symbol, interval, open_dt, ema_period, phase)
         log.debug(f"💾 Сохранена фаза EMA {ema_period} для {symbol} @ {interval} → {phase}")
+        
+# 🔸 Сохранение EMA snapshot в БД
+async def save_snapshot(symbol: str, interval: str, open_time: str, ordering: str):
+    query = """
+        INSERT INTO oracle_ema_snapshot_v4 (symbol, interval, open_time, ordering)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT DO NOTHING
+    """
+    open_dt = datetime.fromisoformat(open_time.replace("Z", ""))
+
+    async with infra.pg_pool.acquire() as conn:
+        await conn.execute(query, symbol, interval, open_dt, ordering)
+        log.debug(f"💾 Сохранён EMA snapshot: {symbol} | {interval} | {open_time}")
