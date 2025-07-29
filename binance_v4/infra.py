@@ -102,23 +102,19 @@ async def setup_binance_client():
         log.exception("❌ Ошибка инициализации Binance клиента")
         raise
 
-# 🔸 Получение нового listenKey
+# 🔸 Получение нового listenKey через клиент UMFutures
 async def get_binance_listen_key() -> str:
     log = logging.getLogger("INFRA")
-    api_key = os.getenv("BINANCE_API_KEY")
-    url = "https://fapi.binance.com/fapi/v1/listenKey"
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers={"X-MBX-APIKEY": api_key}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                log.info("🧾 listenKey получен")
-                global binance_listen_key
-                binance_listen_key = data["listenKey"]
-                return binance_listen_key
-            else:
-                text = await resp.text()
-                raise RuntimeError(f"❌ Не удалось получить listenKey: {resp.status} — {text}")
+    try:
+        listen_key = await run_in_thread(infra.binance_client.new_listen_key)
+        log.info(f"🧾 listenKey получен: {listen_key}")
+        global binance_listen_key
+        binance_listen_key = listen_key
+        return listen_key
+    except Exception as e:
+        log.exception(f"❌ Ошибка при получении listenKey через клиент: {e}")
+        raise
 
 # 🔸 Продление listenKey каждые 30 минут
 async def keep_alive_binance_listen_key():
