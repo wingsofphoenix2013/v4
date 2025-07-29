@@ -429,7 +429,7 @@ async def clean_filled_order_map_loop():
 
         for oid in expired:
             filled_order_map.pop(oid, None)
-            log.debug(f"🧹 Удалён устаревший orderId={oid} из filled_order_map")
+            log.info(f"🧹 Удалён устаревший orderId={oid} из filled_order_map")
 # 🔸 Восстановление filled_order_map из базы при старте
 async def restore_filled_order_map_from_db():
     query = """

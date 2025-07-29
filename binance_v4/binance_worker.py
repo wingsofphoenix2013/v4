@@ -42,7 +42,7 @@ async def handle_open_position(payload: dict):
         await run_in_thread(infra.binance_client.change_margin_type, symbol=symbol, marginType="ISOLATED")
         await run_in_thread(infra.binance_client.change_leverage, symbol=symbol, leverage=leverage)
     except Exception as e:
-        log.debug(f"⚠️ Не удалось установить плечо/маржу для {symbol}: {e}")
+        log.info(f"⚠️ Не удалось установить плечо/маржу для {symbol}: {e}")
 
     log.info(f"📤 Отправка MARKET-ордера: {symbol} {side} qty={qty_str} (strategy_id={strategy_id})")
 
