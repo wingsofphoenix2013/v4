@@ -101,7 +101,7 @@ async def run_binance_ws_listener():
                                         except Exception as e:
                                             log.exception(f"❌ Ошибка логики отмены парного ордера при ручной отмене {order_id}")
 
-                                    # 🔸 Если исполнен TP или SL — отменяем сопарный
+                                    # 🔸 Если исполнен TP или SL — отменяем сопарный и закрываем позицию
                                     if status == "FILLED":
                                         try:
                                             query = """
@@ -114,6 +114,7 @@ async def run_binance_ws_listener():
                                                 position_uid = row["position_uid"]
                                                 current_purpose = row["purpose"]
 
+                                                # 🔸 Отменяем другой ордер TP/SL той же позиции
                                                 query_other = """
                                                     SELECT binance_order_id, symbol
                                                     FROM binance_orders_v4
@@ -136,8 +137,21 @@ async def run_binance_ws_listener():
                                                         await infra.pg_pool.execute(update_query, oid)
                                                     except Exception as cancel_exc:
                                                         log.warning(f"⚠️ Ошибка отмены ордера {oid}: {cancel_exc}")
+
+                                                # 🔸 Обновляем статус позиции как закрытую
+                                                execution_price = Decimal(str(order.get("ap") or order.get("L") or "0"))
+                                                update_position = """
+                                                    UPDATE binance_positions_v4
+                                                    SET status = 'closed',
+                                                        closed_at = NOW(),
+                                                        exit_price = $1
+                                                    WHERE position_uid = $2 AND status = 'open'
+                                                """
+                                                await infra.pg_pool.execute(update_position, execution_price, position_uid)
+                                                log.info(f"📌 Позиция {position_uid} закрыта по {execution_price}")
+
                                         except Exception as e:
-                                            log.exception(f"❌ Ошибка логики отмены TP/SL после FILLED по ордеру {order_id}")
+                                            log.exception(f"❌ Ошибка логики при обработке FILLED по TP/SL ордеру {order_id}")
 
                                         # Вызов on_order_filled только если это entry-ордер
                                         if order_id in filled_order_map:
