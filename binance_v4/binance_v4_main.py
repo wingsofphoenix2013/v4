@@ -8,7 +8,8 @@ from infra import (
     setup_logging,
     setup_pg,
     setup_redis_client,
-    setup_binance_client
+    setup_binance_client,
+    log_public_ip
 )
 
 # 🔸 Запуск воркеров
