@@ -15,20 +15,27 @@ CONSUMER_NAME = "binance_open_worker"
 # 🔸 Инициализация консюмер-группы Redis
 async def init_redis_stream_group():
     try:
+        # Попытка удалить старую группу (если существует)
+        await infra.redis_client.xgroup_destroy(REDIS_STREAM_KEY, CONSUMER_GROUP)
+        log.info(f"♻️ Redis group {CONSUMER_GROUP} удалена перед пересозданием")
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось удалить Redis группу (возможно, не существует): {e}")
+
+    try:
+        # Создание новой группы, начиная с новых сообщений
         await infra.redis_client.xgroup_create(
             name=REDIS_STREAM_KEY,
             groupname=CONSUMER_GROUP,
             id="$",
             mkstream=True
         )
-        log.info(f"✅ Redis stream group {CONSUMER_GROUP} создан")
+        log.info(f"✅ Redis stream group {CONSUMER_GROUP} создан с id='$' (только новые сообщения)")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"ℹ️ Redis group {CONSUMER_GROUP} уже существует")
+            log.info(f"ℹ️ Redis group {CONSUMER_GROUP} уже существует (одновременный запуск?)")
         else:
             log.exception("❌ Ошибка при создании Redis группы")
             raise
-
 
 # 🔸 Основной цикл чтения и маршрутизации
 async def run_redis_consumer():
