@@ -66,6 +66,17 @@ async def setup_redis_client():
     infra.redis_client = client
     logging.getLogger("INFRA").info("📡 Подключение к Redis установлено")
 
+# 🔸 Логгирование публичного IP сервиса
+async def log_public_ip():
+    log = logging.getLogger("INFRA")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.ipify.org") as resp:
+                ip = await resp.text()
+                log.info(f"🌍 Текущий публичный IP сервиса: {ip}")
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось получить публичный IP: {e}")
+        
 # 🔸 Binance UMFutures: инициализация клиента (только MAINNET)
 async def setup_binance_client():
     log = logging.getLogger("INFRA")

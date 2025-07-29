@@ -39,6 +39,7 @@ async def main():
     await setup_pg()
     await setup_redis_client()
     await setup_binance_client()
+    await log_public_ip()
 
     await load_binance_enabled_strategies()
     await load_symbol_precisions()
