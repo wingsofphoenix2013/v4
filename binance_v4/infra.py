@@ -108,6 +108,8 @@ async def get_binance_listen_key() -> str:
     log = logging.getLogger("INFRA")
 
     try:
+        log.info("📎 ПОДТВЕРЖДЕНИЕ: используется актуальная версия get_binance_listen_key")
+        
         listen_key = await run_in_thread(infra.binance_client.new_listen_key)
         log.info(f"🧾 listenKey получен: {listen_key}")
         global binance_listen_key
