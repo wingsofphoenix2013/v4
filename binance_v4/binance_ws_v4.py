@@ -98,12 +98,50 @@ async def run_binance_ws_listener():
                                                         await infra.pg_pool.execute(update_query, oid)
                                                     except Exception as cancel_exc:
                                                         log.warning(f"⚠️ Ошибка отмены ордера {oid}: {cancel_exc}")
-
                                         except Exception as e:
                                             log.exception(f"❌ Ошибка логики отмены парного ордера при ручной отмене {order_id}")
 
-                                if status == "FILLED":
-                                    await on_order_filled(order)
+                                    # 🔸 Если исполнен TP или SL — отменяем сопарный
+                                    if status == "FILLED":
+                                        try:
+                                            query = """
+                                                SELECT position_uid, purpose
+                                                FROM binance_orders_v4
+                                                WHERE binance_order_id = $1
+                                            """
+                                            row = await infra.pg_pool.fetchrow(query, order_id)
+                                            if row and row["purpose"] in ("tp", "sl"):
+                                                position_uid = row["position_uid"]
+                                                current_purpose = row["purpose"]
+
+                                                query_other = """
+                                                    SELECT binance_order_id, symbol
+                                                    FROM binance_orders_v4
+                                                    WHERE position_uid = $1 AND purpose IN ('tp', 'sl') AND purpose != $2 AND status = 'NEW'
+                                                """
+                                                others = await infra.pg_pool.fetch(query_other, position_uid, current_purpose)
+
+                                                for other in others:
+                                                    oid = other["binance_order_id"]
+                                                    sym = other["symbol"]
+                                                    try:
+                                                        await run_in_thread(infra.binance_client.cancel_order, orderId=oid, symbol=sym)
+                                                        log.info(f"🛑 FILLED: отменён сопарный ордер {oid} после исполнения {order_id}")
+
+                                                        update_query = """
+                                                            UPDATE binance_orders_v4
+                                                            SET status = 'CANCELED', updated_at = NOW()
+                                                            WHERE binance_order_id = $1
+                                                        """
+                                                        await infra.pg_pool.execute(update_query, oid)
+                                                    except Exception as cancel_exc:
+                                                        log.warning(f"⚠️ Ошибка отмены ордера {oid}: {cancel_exc}")
+                                        except Exception as e:
+                                            log.exception(f"❌ Ошибка логики отмены TP/SL после FILLED по ордеру {order_id}")
+
+                                        # Вызов on_order_filled только если это entry-ордер
+                                        if order_id in filled_order_map:
+                                            await on_order_filled(order)
 
                             log.info(f"📨 Сообщение: {msg.data}")
 
@@ -115,8 +153,7 @@ async def run_binance_ws_listener():
             log.exception(f"❌ Ошибка в Binance WebSocket слушателе: {e}")
 
         log.info("⏳ Перезапуск подключения через 5 секунд...")
-        await asyncio.sleep(5)
-                
+        await asyncio.sleep(5)                
 # 🔸 Обработка FILLED-события: расчёт TP и SL
 async def on_order_filled(order: dict):
     order_id = order["i"]
