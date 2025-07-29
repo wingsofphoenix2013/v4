@@ -103,6 +103,7 @@ async def setup_binance_client():
         raise
 
 # 🔸 Получение нового listenKey через клиент UMFutures
+
 async def get_binance_listen_key() -> str:
     log = logging.getLogger("INFRA")
 
