@@ -41,7 +41,7 @@ async def run_binance_ws_listener():
             listen_key = await get_binance_listen_key()
             asyncio.create_task(keep_alive_binance_listen_key())
 
-            ws_url = f"wss://stream.binancefuture.com/ws/{listen_key}"
+            ws_url = f"wss://fstream.binance.com/ws/{listen_key}"
             log.info(f"🌐 Подключение к WebSocket: {ws_url}")
 
             async with aiohttp.ClientSession() as session:
