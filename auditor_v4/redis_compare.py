@@ -12,7 +12,6 @@ TF_SECONDS = 300
 FIELDS = ["o", "h", "l", "c", "v"]
 EPSILON = 1e-8
 
-
 # 🔸 Сравнение значений Redis TS и БД по тикеру и интервалу
 async def compare_redis_vs_db_once():
     log.info(f"🔍 Сравнение Redis vs БД: {SYMBOL} [{INTERVAL}]")
@@ -42,13 +41,13 @@ async def compare_redis_vs_db_once():
         for field in FIELDS:
             key = f"ts:{SYMBOL}:{INTERVAL}:{field}"
             try:
-                res = await infra.redis_client.execute_command("TS.GET", key, "FILTER_BY_TS", ts)
+                res = await infra.redis_client.execute_command("TS.RANGE", key, ts, ts)
                 if res:
-                    values_redis[field] = float(res[1])
+                    values_redis[field] = float(res[0][1])
                 else:
                     values_redis[field] = None
             except Exception as e:
-                log.warning(f"⚠️ TS.GET ошибка: {key} @ {ts} → {e}")
+                log.warning(f"⚠️ TS.RANGE ошибка: {key} @ {ts} → {e}")
                 values_redis[field] = None
 
         for field in FIELDS:
