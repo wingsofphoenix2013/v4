@@ -14,7 +14,7 @@ from config_loader import (
 )
 from core_io import pg_task, finmonitor_task, treasury_task
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
-from redis_io import run_audit_all_symbols_ts
+from redis_io import run_audit_all_symbols_ts, fix_missing_ts_points
 # from strategy_rating_worker import run_strategy_rating_worker
 # from king_marker_worker import run_king_marker_worker
 
@@ -81,6 +81,7 @@ async def main():
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600),
         loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
         loop_with_interval(run_audit_all_symbols_ts, "REDIS_TS_AUDITOR", 3600, initial_delay=300),
+        loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 3600, initial_delay=420),
 #         loop_with_interval(run_strategy_rating_worker, "STRATEGY_RATER", 300),
 #         loop_with_interval(run_king_marker_worker, "KING_MARKER", 300, initial_delay=120)
     )
