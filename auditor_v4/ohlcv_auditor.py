@@ -58,17 +58,21 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
                 log.warning(f"📉 {symbol} [{tf}] — пропущено {len(missing)} свечей "
                             f"(с {from_time_aligned} по {to_time})")
 
+                inserted_count = 0
                 async with infra.pg_pool.acquire() as conn:
-                    result = await conn.executemany(
-                        """
-                        INSERT INTO ohlcv_gaps_v4 (symbol, interval, open_time)
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT DO NOTHING
-                        """,
-                        [(symbol, tf, ts) for ts in missing]
-                    )
+                    for ts in missing:
+                        result = await conn.execute(
+                            """
+                            INSERT INTO ohlcv_gaps_v4 (symbol, interval, open_time)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            symbol, tf, ts
+                        )
+                        if result.startswith("INSERT"):
+                            inserted_count += 1
 
-                log.info(f"📝 {symbol} [{tf}] — записано новых пропусков: {result}")
+                log.info(f"📝 {symbol} [{tf}] — записано новых пропусков: {inserted_count}")
             else:
                 log.info(f"✅ {symbol} [{tf}] — без пропусков")
 
