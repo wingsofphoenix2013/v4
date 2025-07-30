@@ -15,7 +15,6 @@ TF_SECONDS = {
 
 FIELDS = ["o", "h", "l", "c", "v"]
 
-
 # 🔸 Аудит одного поля Redis TS
 async def audit_symbol_field_ts(symbol: str, tf: str, field: str, semaphore: asyncio.Semaphore):
     async with semaphore:
@@ -27,11 +26,15 @@ async def audit_symbol_field_ts(symbol: str, tf: str, field: str, semaphore: asy
 
             tf_sec = TF_SECONDS[tf]
             tf_ms = tf_sec * 1000
+
             now = datetime.utcnow()
             to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
-            from_time = max(created_at, datetime.fromtimestamp(to_ts - (29 * tf_sec)))
+
+            # 🔧 Глубина: не старше 29 суток, но не раньше created_at
+            from_time = max(created_at, now - timedelta(days=29))
             from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
 
+            # 🔢 Построим ожидаемые timestamps (в мс)
             expected = {
                 from_ts * 1000 + tf_ms * i
                 for i in range((to_ts - from_ts) // tf_sec + 1)
@@ -49,17 +52,16 @@ async def audit_symbol_field_ts(symbol: str, tf: str, field: str, semaphore: asy
 
             log.info(
                 f"[TS] {symbol} [{tf}] → {field}: "
-                f"всего ожидается {len(expected)}, найдено {len(actual)}, пропущено {len(missing)}"
+                f"ожидается {len(expected)}, найдено {len(actual)}, пропущено {len(missing)}"
             )
 
             if missing:
-                for ts in missing[:5]:  # логируем только первые 5 пропусков
+                for ts in missing[:5]:
                     dt = datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
                     log.warning(f"📉 [TS] {symbol} [{tf}] → {field} отсутствует @ {dt}")
 
         except Exception:
             log.exception(f"❌ [TS] Ошибка при проверке {symbol} [{tf}] {field}")
-
 
 # 🔸 Полный аудит Redis TS по всем полям
 async def run_audit_all_symbols_ts():
