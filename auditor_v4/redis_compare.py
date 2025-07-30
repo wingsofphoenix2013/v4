@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 
-from infra import pg_pool, redis_client
+import infra
 
 log = logging.getLogger("REDIS_COMPARE")
 
@@ -13,10 +13,11 @@ FIELDS = ["o", "h", "l", "c", "v"]
 EPSILON = 1e-8
 
 
+# 🔸 Сравнение значений Redis TS и БД по тикеру и интервалу
 async def compare_redis_vs_db_once():
     log.info(f"🔍 Сравнение Redis vs БД: {SYMBOL} [{INTERVAL}]")
 
-    async with pg_pool.acquire() as conn:
+    async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT open_time, open, high, low, close, volume
             FROM {TABLE}
@@ -41,7 +42,7 @@ async def compare_redis_vs_db_once():
         for field in FIELDS:
             key = f"ts:{SYMBOL}:{INTERVAL}:{field}"
             try:
-                res = await redis_client.execute_command("TS.GET", key, "FILTER_BY_TS", ts)
+                res = await infra.redis_client.execute_command("TS.GET", key, "FILTER_BY_TS", ts)
                 if res:
                     values_redis[field] = float(res[1])
                 else:
