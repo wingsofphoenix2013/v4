@@ -31,7 +31,7 @@ async def audit_symbol_field_ts(symbol: str, tf: str, field: str, semaphore: asy
             tf_ms = tf_sec * 1000
             now = datetime.utcnow()
             to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
-            from_time = max(created_at, to_ts - (29 * tf_sec))
+            from_time = max(created_at, datetime.fromtimestamp(to_ts - (29 * tf_sec)))
             from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
 
             expected = {
@@ -93,7 +93,7 @@ async def fix_missing_ts_points():
                 tf_ms = tf_sec * 1000
                 now = datetime.utcnow()
                 to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
-                from_time = max(created_at, to_ts - (29 * tf_sec))
+                from_time = max(created_at, datetime.fromtimestamp(to_ts - (29 * tf_sec)))
                 from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
 
                 expected = {
