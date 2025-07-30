@@ -80,7 +80,7 @@ async def main():
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600, initial_delay=90000),
-        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 240, initial_delay=120)
+        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 120, initial_delay=120)
 #         loop_with_interval(run_audit_all_symbols_ts, "REDIS_TS_AUDITOR", 3600, initial_delay=120),
 #         loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 3600, initial_delay=420),
 #         loop_with_interval(compare_redis_vs_db_once, "REDIS_DB_COMPARE", 3600, initial_delay=90),

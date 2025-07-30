@@ -121,7 +121,7 @@ async def fix_missing_candles():
                 FROM ohlcv_gaps_v4
                 WHERE fixed = false
                 ORDER BY open_time
-                LIMIT 100
+                LIMIT 200
             """)
 
         async def handle_row(row):
