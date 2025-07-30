@@ -78,7 +78,7 @@ async def run_core_io(pg, redis):
 
                 async with pg.acquire() as conn:
                     async with conn.transaction():
-                        inserted = await conn.execute(f"""
+                        await conn.execute(f"""
                             INSERT INTO {table} (symbol, open_time, open, high, low, close, volume, source)
                             VALUES ($1, $2, $3, $4, $5, $6, $7, 'stream')
                             ON CONFLICT (symbol, open_time) DO NOTHING
@@ -89,11 +89,6 @@ async def run_core_io(pg, redis):
                             f"[{interval.upper()}] вставлено={datetime.utcnow().isoformat()}"
                         )
 
-                        deleted = await conn.execute(f"""
-                            DELETE FROM {table}
-                            WHERE open_time < (NOW() - INTERVAL '30 days')
-                        """)
-                        log.debug(f"Удалено старых записей из {table}: {deleted}")
             except Exception as e:
                 log.exception(f"Ошибка вставки в PG для {symbol}: {e}")
 
@@ -110,6 +105,5 @@ async def run_core_io(pg, redis):
                 await asyncio.gather(*tasks)
 
         except Exception as e:
-            # 🔸 Обработка исключений и логирование
             log.error(f"Ошибка: {e}", exc_info=True)
             await asyncio.sleep(2)
