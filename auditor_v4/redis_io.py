@@ -164,3 +164,72 @@ async def fix_missing_ts_points():
 
     await asyncio.gather(*tasks)
     log.info("✅ [FIXER_TS] Восстановление Redis TS завершено")
+from decimal import Decimal, ROUND_DOWN
+
+async def fix_single_ts_point():
+    symbol = "BTCUSDT"
+    tf = "m1"
+    field = "c"
+    precision_qty = 3
+    tf_sec = TF_SECONDS[tf]
+    tf_ms = tf_sec * 1000
+
+    key = f"ts:{symbol}:{tf}:{field}"
+    table = f"ohlcv4_{tf}"
+
+    now = datetime.utcnow()
+    to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
+    from_time = datetime.utcnow() - timedelta(days=29)
+    from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
+
+    expected = {
+        from_ts * 1000 + tf_ms * i
+        for i in range((to_ts - from_ts) // tf_sec + 1)
+    }
+
+    results = await infra.redis_client.ts().range(key, from_ts * 1000, to_ts * 1000)
+    actual = {int(ts) for ts, _ in results}
+    missing = sorted(expected - actual)
+
+    if not missing:
+        log.info(f"🟢 Все точки присутствуют: {symbol} [{tf}] → {field}")
+        return
+
+    ts = missing[0]
+    dt = datetime.utcfromtimestamp(ts / 1000)
+
+    log.info(f"🛠️ Пробуем восстановить: {symbol} [{tf}] → {field} @ {dt}")
+
+    async with infra.pg_pool.acquire() as conn:
+        row = await conn.fetchrow(f"""
+            SELECT open, high, low, close, volume
+            FROM {table}
+            WHERE symbol = $1 AND open_time = $2
+        """, symbol, dt)
+
+        if not row:
+            log.warning(f"❌ Нет данных в БД для {symbol} {tf} @ {dt}")
+            return
+
+        values = {
+            "o": float(row["open"]),
+            "h": float(row["high"]),
+            "l": float(row["low"]),
+            "c": float(row["close"]),
+            "v": float(Decimal(row["volume"]).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN))
+        }
+
+        value = values[field]
+        try:
+            log.info(f"➕ Вставляем: TS.ADD {key} @ {dt} = {value}")
+            await infra.redis_client.execute_command("TS.ADD", key, ts, value)
+        except Exception as e:
+            log.warning(f"⚠️ Ошибка TS.ADD: {e}")
+            return
+
+    # Проверка
+    res = await infra.redis_client.ts().range(key, ts, ts)
+    if res:
+        log.info(f"✅ TS.ADD подтверждён: {key} @ {dt} = {res[0][1]}")
+    else:
+        log.error(f"❌ Вставка не подтверждена: {key} @ {dt}")
