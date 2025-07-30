@@ -14,11 +14,12 @@ TF_SECONDS = {
     "h1": 3600,
 }
 
+FIELDS = ["o", "h", "l", "c", "v"]
 RETENTION_MS = 5184000000  # 60 дней
 
 
-# 🔸 Аудит Redis TimeSeries для одного тикера и таймфрейма
-async def audit_symbol_interval_ts(symbol: str, tf: str, semaphore: asyncio.Semaphore):
+# 🔸 Аудит одного поля Redis TS
+async def audit_symbol_field_ts(symbol: str, tf: str, field: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         try:
             created_at = infra.enabled_tickers[symbol].get("created_at")
@@ -30,9 +31,7 @@ async def audit_symbol_interval_ts(symbol: str, tf: str, semaphore: asyncio.Sema
             tf_ms = tf_sec * 1000
             now = datetime.utcnow()
             to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
-            to_time = datetime.fromtimestamp(to_ts)
-
-            from_time = max(created_at, to_time - timedelta(days=29))
+            from_time = max(created_at, to_ts - (29 * tf_sec))
             from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
 
             expected = {
@@ -40,7 +39,7 @@ async def audit_symbol_interval_ts(symbol: str, tf: str, semaphore: asyncio.Sema
                 for i in range((to_ts - from_ts) // tf_sec + 1)
             }
 
-            key = f"ts:{symbol}:{tf}:c"
+            key = f"ts:{symbol}:{tf}:{field}"
             results = await infra.redis_client.ts().range(
                 key,
                 from_ts * 1000,
@@ -51,33 +50,33 @@ async def audit_symbol_interval_ts(symbol: str, tf: str, semaphore: asyncio.Sema
             missing = sorted(expected - actual)
 
             if missing:
-                log.warning(f"📉 [TS] {symbol} [{tf}] — пропущено {len(missing)} точек в Redis TS")
+                log.warning(f"📉 [TS] {symbol} [{tf}] → {field} — пропущено {len(missing)} точек")
             else:
-                log.info(f"✅ [TS] {symbol} [{tf}] — без пропусков в Redis TS")
+                log.info(f"✅ [TS] {symbol} [{tf}] → {field} — без пропусков")
 
         except Exception:
-            log.exception(f"❌ [TS] Ошибка при аудите Redis TS {symbol} [{tf}]")
+            log.exception(f"❌ [TS] Ошибка в {symbol} [{tf}] {field}")
 
 
-# 🔸 Запуск аудита по всем тикерам и таймфреймам
+# 🔸 Полный аудит Redis TS по всем полям
 async def run_audit_all_symbols_ts():
-    log.info("🔍 [AUDIT_TS] Старт аудита Redis TimeSeries")
+    log.info("🔍 [AUDIT_TS] Запуск аудита Redis TimeSeries")
 
     semaphore = asyncio.Semaphore(50)
     tasks = []
 
     for symbol in infra.enabled_tickers:
         for tf in TF_SECONDS:
-            tasks.append(audit_symbol_interval_ts(symbol, tf, semaphore))
+            for field in FIELDS:
+                tasks.append(audit_symbol_field_ts(symbol, tf, field, semaphore))
 
     await asyncio.gather(*tasks)
+    log.info("✅ [AUDIT_TS] Аудит Redis TS завершён")
 
-    log.info("✅ [AUDIT_TS] Аудит Redis TimeSeries завершён")
 
-
-# 🔸 Восстановление пропусков Redis TS из БД
+# 🔸 Восстановление недостающих точек Redis TS из БД
 async def fix_missing_ts_points():
-    log.info("🔧 [FIXER_TS] Старт восстановления данных Redis TS")
+    log.info("🔧 [FIXER_TS] Запуск восстановления Redis TS")
 
     semaphore = asyncio.Semaphore(50)
 
@@ -94,32 +93,31 @@ async def fix_missing_ts_points():
                 tf_ms = tf_sec * 1000
                 now = datetime.utcnow()
                 to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
-                to_time = datetime.fromtimestamp(to_ts)
-
-                from_time = max(created_at, to_time - timedelta(days=29))
+                from_time = max(created_at, to_ts - (29 * tf_sec))
                 from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
+
                 expected = {
                     from_ts * 1000 + tf_ms * i
                     for i in range((to_ts - from_ts) // tf_sec + 1)
                 }
 
-                key = f"ts:{symbol}:{tf}:c"
-                results = await infra.redis_client.ts().range(
-                    key,
-                    from_ts * 1000,
-                    to_ts * 1000
-                )
-                actual = {int(ts) for ts, _ in results}
-                missing = sorted(expected - actual)
-
-                if not missing:
-                    log.info(f"✅ [FIXER_TS] {symbol} [{tf}] — пропусков нет")
-                    return
+                # Собираем недостающие timestamps по каждому полю
+                missing_by_field = {}
+                for field in FIELDS:
+                    key = f"ts:{symbol}:{tf}:{field}"
+                    results = await infra.redis_client.ts().range(
+                        key,
+                        from_ts * 1000,
+                        to_ts * 1000
+                    )
+                    actual = {int(ts) for ts, _ in results}
+                    missing_by_field[field] = sorted(expected - actual)
 
                 table = f"ohlcv4_{tf}"
                 async with infra.pg_pool.acquire() as conn:
-                    for ts in missing:
+                    for ts in sorted(expected):
                         dt = datetime.utcfromtimestamp(ts / 1000)
+
                         row = await conn.fetchrow(f"""
                             SELECT open, high, low, close, volume
                             FROM {table}
@@ -129,21 +127,28 @@ async def fix_missing_ts_points():
                         if not row:
                             continue
 
-                        o, h, l, c, v = row["open"], row["high"], row["low"], row["close"], row["volume"]
-                        v = float(Decimal(v).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN))
+                        values = {
+                            "o": float(row["open"]),
+                            "h": float(row["high"]),
+                            "l": float(row["low"]),
+                            "c": float(row["close"]),
+                            "v": float(Decimal(row["volume"]).quantize(Decimal(f"1e-{precision_qty}"), rounding=ROUND_DOWN))
+                        }
 
-                        for field, value in zip(("o", "h", "l", "c", "v"), (o, h, l, c, v)):
+                        for field in FIELDS:
+                            if ts not in missing_by_field[field]:
+                                continue
+
                             redis_key = f"ts:{symbol}:{tf}:{field}"
                             try:
-                                await infra.redis_client.execute_command("TS.ADD", redis_key, ts, value)
+                                await infra.redis_client.execute_command("TS.ADD", redis_key, ts, values[field])
                             except Exception as e:
-                                log.warning(f"⚠️ TS.ADD {redis_key} {dt} → {e}")
+                                log.warning(f"⚠️ TS.ADD {redis_key} @ {dt} → {e}")
 
-                log.info(f"🛠️ [FIXER_TS] Восстановлено {len(missing)} точек: {symbol} [{tf}]")
+                log.info(f"🛠️ [FIXER_TS] Восстановлено: {symbol} [{tf}]")
 
             except Exception:
                 log.exception(f"❌ [FIXER_TS] Ошибка при восстановлении {symbol} [{tf}]")
-
 
     tasks = []
     for symbol in infra.enabled_tickers:
@@ -151,5 +156,4 @@ async def fix_missing_ts_points():
             tasks.append(process_symbol_tf(symbol, tf))
 
     await asyncio.gather(*tasks)
-
     log.info("✅ [FIXER_TS] Восстановление Redis TS завершено")
