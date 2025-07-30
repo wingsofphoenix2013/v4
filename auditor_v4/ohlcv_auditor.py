@@ -13,7 +13,6 @@ TF_SECONDS = {
     "h1": 3600,
 }
 
-
 # 🔸 Аудит одного тикера и одного таймфрейма
 async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semaphore):
     async with semaphore:
@@ -58,13 +57,24 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
             if missing:
                 log.warning(f"📉 {symbol} [{tf}] — пропущено {len(missing)} свечей "
                             f"(с {from_time_aligned} по {to_time})")
+
+                async with infra.pg_pool.acquire() as conn:
+                    result = await conn.executemany(
+                        """
+                        INSERT INTO ohlcv_gaps_v4 (symbol, interval, open_time)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        [(symbol, tf, ts) for ts in missing]
+                    )
+
+                log.info(f"📝 {symbol} [{tf}] — записано новых пропусков: {result}")
             else:
                 log.info(f"✅ {symbol} [{tf}] — без пропусков")
 
         except Exception:
             log.exception(f"❌ Ошибка при аудите {symbol} [{tf}]")
-
-
+            
 # 🔸 Запуск аудита по всем тикерам и интервалам
 async def run_audit_all_symbols():
     log.info("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
