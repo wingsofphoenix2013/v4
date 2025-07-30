@@ -74,7 +74,6 @@ async def main():
     log.info("🚀 Запуск фоновых воркеров")
 
     await asyncio.gather(
-#         run_safe_loop(redis_task, "REDIS_RETENTION_UPDATER")
         run_safe_loop(fix_single_ts_point, "REDIS_TS_FIX_ONE"),
 #         run_safe_loop(pg_task, "CORE_IO"),
 #         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
