@@ -30,14 +30,12 @@ def generate_open_times(start, end, timeframe):
 
     return times
 
-async def check_single_pair(pg, symbol, instance, params, min_time, now, semaphore, result_counter):
+async def check_single_pair(pg, symbol, instance, params, now, semaphore, result_counter):
     log = logging.getLogger("GAP_CHECKER")
     try:
         instance_id = instance["id"]
         indicator = instance["indicator"]
         timeframe = instance["timeframe"]
-
-        log.info(f"🔍 Старт: {symbol} / {indicator} / {timeframe} / id={instance_id}")
 
         step = {
             "m1": timedelta(minutes=1),
@@ -46,24 +44,22 @@ async def check_single_pair(pg, symbol, instance, params, min_time, now, semapho
             "h1": timedelta(hours=1),
         }[timeframe]
 
-        end_time = now - step
-        end_time = end_time.replace(second=0, microsecond=0)
+        end_time = now.replace(second=0, microsecond=0) - step
+        min_time = end_time - timedelta(days=7)
+
         open_times = generate_open_times(min_time, end_time, timeframe)
         if not open_times:
-            log.info(f"⏭ Пропуск: нет open_time — {symbol} / {indicator} / id={instance_id}")
+            log.warning(f"⚠️ Нет open_time в диапазоне: {symbol} / {indicator} / {timeframe} / id={instance_id}")
             return
 
         expected_params = get_expected_param_names(indicator, params)
 
         async with pg.acquire() as conn:
             async with semaphore:
-                log.info(f"📥 Чтение из БД: {symbol} / {indicator} / id={instance_id}")
                 rows = await conn.fetch("""
                     SELECT open_time, param_name FROM indicator_values_v4
                     WHERE instance_id = $1 AND symbol = $2 AND open_time BETWEEN $3 AND $4
                 """, instance_id, symbol, min_time, end_time)
-
-        log.info(f"📊 Подсчёт: {symbol} / {indicator} / id={instance_id} — записей в БД: {len(rows)}")
 
         existing = defaultdict(set)
         for row in rows:
@@ -82,7 +78,7 @@ async def check_single_pair(pg, symbol, instance, params, min_time, now, semapho
                 result_counter[instance_id]["params"] = params
                 result_counter[instance_id]["missing"] += missing_count
 
-        log.info(f"✅ Завершено: {symbol} / {indicator} / id={instance_id} → пропущено: {missing_count}")
+        log.info(f"📊 {symbol} / {indicator} / {timeframe} / id={instance_id} → пропущено: {missing_count}")
 
     except Exception:
         log.exception(f"💥 Ошибка при проверке {symbol} / id={instance['id']}")
@@ -129,7 +125,7 @@ async def audit_gaps(pg):
     for symbol in symbols:
         for inst in instances:
             params = param_map.get(inst["id"], {})
-            tasks.append(check_single_pair(pg, symbol, inst, params, min_time, now, semaphore, result_counter))
+            tasks.append(check_single_pair(pg, symbol, inst, params, now, semaphore, result_counter))
 
     log.info(f"🧵 Сформировано задач: {len(tasks)}")
     await asyncio.gather(*tasks, return_exceptions=True)
