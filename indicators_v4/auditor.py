@@ -1,85 +1,22 @@
-# auditor.py — аудит пропусков расчётов без записи в БД
+# auditor.py — отладочная версия: проверка запуска задач
 
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
 import asyncio
 
-from indicators.compute_and_store import get_expected_param_names
-
-# 🔸 Генерация open_time по таймфрейму
-def generate_open_times(start, end, timeframe):
-    step = {
-        "m1": timedelta(minutes=1),
-        "m5": timedelta(minutes=5),
-        "m15": timedelta(minutes=15),
-        "h1": timedelta(hours=1),
-    }[timeframe]
-
-    times = []
-    t = start.replace(second=0, microsecond=0)
-    while t <= end:
-        aligned = (
-            (timeframe == "m1") or
-            (timeframe == "m5" and t.minute % 5 == 0) or
-            (timeframe == "m15" and t.minute % 15 == 0) or
-            (timeframe == "h1" and t.minute == 0)
-        )
-        if aligned:
-            times.append(t)
-        t += step
-
-    return times
-
-# 🔸 Проверка одной связки symbol + instance
-async def check_single_pair(pg, symbol, instance, params, min_time, now, semaphore, result_counter):
+# 🔸 Заглушка задачи проверки
+async def check_single_pair(pg, symbol, instance, params, min_time, now, semaphore):
     log = logging.getLogger("GAP_CHECKER")
     try:
         instance_id = instance["id"]
         indicator = instance["indicator"]
         timeframe = instance["timeframe"]
 
-        step = {
-            "m1": timedelta(minutes=1),
-            "m5": timedelta(minutes=5),
-            "m15": timedelta(minutes=15),
-            "h1": timedelta(hours=1),
-        }[timeframe]
-
-        end_time = now - step
-        end_time = end_time.replace(second=0, microsecond=0)
-        open_times = generate_open_times(min_time, end_time, timeframe)
-        if not open_times:
-            return
-
-        expected_params = get_expected_param_names(indicator, params)
-
-        async with pg.acquire() as conn:
-            async with semaphore:
-                rows = await conn.fetch("""
-                    SELECT open_time, param_name FROM indicator_values_v4
-                    WHERE instance_id = $1 AND symbol = $2 AND open_time BETWEEN $3 AND $4
-                """, instance_id, symbol, min_time, end_time)
-
-        existing = defaultdict(set)
-        for row in rows:
-            existing[row["open_time"]].add(row["param_name"])
-
-        missing_count = 0
-        for ts in open_times:
-            recorded = existing.get(ts, set())
-            if any(p not in recorded for p in expected_params):
-                missing_count += 1
-
-        if missing_count > 0:
-            async with result_counter_lock:
-                result_counter[instance_id]["indicator"] = indicator
-                result_counter[instance_id]["timeframe"] = timeframe
-                result_counter[instance_id]["params"] = params
-                result_counter[instance_id]["missing"] += missing_count
-
-    except Exception as e:
-        log.exception(f"💥 Ошибка при проверке {symbol} / id={instance['id']} / {instance['indicator']}")
+        async with semaphore:
+            log.info(f"👀 Проверка: {symbol} / {indicator} / {timeframe} / id={instance_id}")
+    except Exception:
+        log.exception(f"💥 Ошибка в задаче {symbol} / id={instance['id']}")
 
 # 🔸 Основной вход
 async def audit_gaps(pg):
@@ -87,15 +24,6 @@ async def audit_gaps(pg):
     now = datetime.utcnow()
     min_time = now - timedelta(days=7)
     semaphore = asyncio.Semaphore(10)
-
-    global result_counter_lock
-    result_counter_lock = asyncio.Lock()
-    result_counter = defaultdict(lambda: {
-        "indicator": "",
-        "timeframe": "",
-        "params": {},
-        "missing": 0
-    })
 
     async with pg.acquire() as conn:
         symbols = [r['symbol'] for r in await conn.fetch("""
@@ -120,22 +48,12 @@ async def audit_gaps(pg):
         for r in param_rows:
             param_map[r["instance_id"]][r["param"]] = r["value"]
 
-    # 🔹 Запуск задач
     tasks = []
     for symbol in symbols:
         for inst in instances:
             params = param_map.get(inst["id"], {})
-            tasks.append(check_single_pair(pg, symbol, inst, params, min_time, now, semaphore, result_counter))
+            tasks.append(check_single_pair(pg, symbol, inst, params, min_time, now, semaphore))
 
     log.info(f"Запуск аудита по {len(tasks)} связкам...")
     await asyncio.gather(*tasks, return_exceptions=True)
-
-    # 🔹 Вывод итогов
-    for instance_id, info in result_counter.items():
-        indicator = info["indicator"]
-        timeframe = info["timeframe"]
-        params = ", ".join(f"{k}={v}" for k, v in sorted(info["params"].items()))
-        count = info["missing"]
-        log.info(f"📊 {indicator}({params}) / {timeframe} / id={instance_id} → пропущено: {count}")
-
-    log.info("✅ Аудит пропусков завершён")
+    log.info("✅ Аудит завершён (отладочная версия)")
