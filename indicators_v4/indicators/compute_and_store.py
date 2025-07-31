@@ -112,3 +112,50 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         }))
 
     await asyncio.gather(*tasks, return_exceptions=True)
+# 🔸 Генерация ожидаемых имён параметров для индикатора
+def get_expected_param_names(indicator: str, params: dict) -> list[str]:
+    """
+    Возвращает список ожидаемых param_name, соответствующих результатам индикатора.
+    """
+    if indicator == "macd":
+        base = f"macd{params['fast']}"
+        return [
+            f"{base}_macd",
+            f"{base}_macd_signal",
+            f"{base}_macd_hist",
+        ]
+
+    elif indicator == "bb":
+        length = params["length"]
+        std_raw = round(float(params["std"]), 2)
+        std_str = str(std_raw).replace(".", "_")  # 2.5 → 2_5
+        base = f"bb{length}_{std_str}"
+        return [
+            f"{base}_center",
+            f"{base}_upper",
+            f"{base}_lower",
+        ]
+
+    elif indicator == "adx_dmi":
+        base = f"adx_dmi{params['length']}"
+        return [
+            f"{base}_adx",
+            f"{base}_plus_di",
+            f"{base}_minus_di",
+        ]
+
+    elif indicator == "lr":
+        base = f"lr{params['length']}"
+        return [
+            f"{base}_angle",
+            f"{base}_center",
+            f"{base}_upper",
+            f"{base}_lower",
+        ]
+
+    elif indicator in ("rsi", "mfi", "ema", "kama", "atr"):
+        return [f"{indicator}{params['length']}"]
+
+    else:
+        # fallback: просто имя индикатора
+        return [indicator]
