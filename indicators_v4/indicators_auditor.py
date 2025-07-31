@@ -48,18 +48,6 @@ TIMEFRAME_STEPS = {
     "h1": 3_600_000,
 }
 
-# 🔸 Основной цикл аудита
-async def audit_loop(pg):
-    log = logging.getLogger("AUDITOR")
-    while True:
-        try:
-            log.info("Аудит: запуск проверки расчётов за 7 дней")
-            await run_audit_check(pg, log)
-            log.info("Аудит завершён, пауза 5 минут")
-        except Exception as e:
-            log.exception(f"Ошибка во время аудита: {e}")
-        await asyncio.sleep(300)
-
 # 🔸 Проверка наличия расчётов индикаторов
 async def run_audit_check(pg, log):
     async with pg.acquire() as conn:
@@ -94,40 +82,56 @@ async def run_audit_check(pg, log):
 
         log.info(f"Загружено активных индикаторов: {len(instance_map)}")
 
-        now = datetime.utcnow()
+    now = datetime.utcnow()
+    semaphore = asyncio.Semaphore(10)
+    tasks = []
 
-        for iid, inst in instance_map.items():
-            indicator = inst["indicator"]
-            tf = inst["timeframe"]
-            params = inst["params"]
+    for iid, inst in instance_map.items():
+        indicator = inst["indicator"]
+        tf = inst["timeframe"]
+        params = inst["params"]
 
-            if tf not in TIMEFRAME_STEPS:
-                log.info(f"Пропуск: неизвестный таймфрейм '{tf}' для iid={iid}")
-                continue
+        if tf not in TIMEFRAME_STEPS:
+            log.info(f"Пропуск: неизвестный таймфрейм '{tf}' для iid={iid}")
+            continue
 
-            try:
-                expected = EXPECTED_PARAMS[indicator](params)
-            except Exception as e:
-                log.warning(f"Пропуск: не удалось получить ожидаемые параметры для {indicator} id={iid}: {e}")
-                continue
+        try:
+            expected = EXPECTED_PARAMS[indicator](params)
+        except Exception as e:
+            log.warning(f"Пропуск: не удалось получить ожидаемые параметры для {indicator} id={iid}: {e}")
+            continue
 
-            # Расчёт диапазона времени со строгим выравниванием
-            step_sec = TIMEFRAME_STEPS[tf] // 1000
+        step_sec = TIMEFRAME_STEPS[tf] // 1000
 
-            last_ts = int(now.timestamp())
-            last_ts -= last_ts % step_sec  # округление вниз до ближайшего шага
-            last_ts -= 2 * step_sec        # исключаем текущую и предыдущую свечу
+        last_ts = int(now.timestamp())
+        last_ts -= last_ts % step_sec
+        last_ts -= 2 * step_sec
 
-            start_ts = last_ts - 7 * 86400  # 7 дней назад
+        start_ts = last_ts - 7 * 86400
 
-            open_times = [
-                datetime.utcfromtimestamp(ts).replace(microsecond=0)
-                for ts in range(start_ts, last_ts + 1, step_sec)
-            ]
+        open_times = [
+            datetime.utcfromtimestamp(ts).replace(microsecond=0)
+            for ts in range(start_ts, last_ts + 1, step_sec)
+        ]
 
-            for symbol in active_symbols:
-                for open_time in open_times:
-                    # Получение уже сохранённых параметров
+        for symbol in active_symbols:
+            tasks.append(
+                audit_instance_symbol(pg, iid, symbol, tf, indicator, expected, open_times, semaphore, log)
+            )
+
+    await asyncio.gather(*tasks)
+
+
+# 🔸 Проверка расчётов по одному индикатору и символу с разбиением по чанкам
+async def audit_instance_symbol(pg, iid, symbol, tf, indicator, expected, open_times, semaphore, log):
+    chunk_size = 100
+
+    async with semaphore:
+        for i in range(0, len(open_times), chunk_size):
+            chunk = open_times[i:i + chunk_size]
+
+            async with pg.acquire() as conn:
+                for open_time in chunk:
                     values = await conn.fetch("""
                         SELECT param_name FROM indicator_values_v4
                         WHERE instance_id = $1 AND symbol = $2 AND open_time = $3
@@ -137,14 +141,12 @@ async def run_audit_check(pg, log):
                     missing = [p for p in expected if p not in actual]
 
                     if not missing:
-                        # Обновление статуса, если ранее был пропуск
                         await conn.execute("""
                             UPDATE indicator_gaps_v4
                             SET recovered_at = now(), status = 'recovered'
                             WHERE instance_id = $1 AND symbol = $2 AND open_time = $3 AND status = 'missing'
                         """, iid, symbol, open_time)
                     else:
-                        # Запись нового пропуска, если ещё не зафиксирован
                         await conn.execute("""
                             INSERT INTO indicator_gaps_v4 (instance_id, symbol, open_time)
                             VALUES ($1, $2, $3)
@@ -154,3 +156,7 @@ async def run_audit_check(pg, log):
                             f"Пропущен расчёт: {indicator} id={iid} {symbol} {tf} @ {open_time.isoformat()} "
                             f"→ отсутствуют: {', '.join(missing)}"
                         )
+
+            if i + chunk_size < len(open_times):
+                log.info(f"Ожидание 60 сек перед следующим чанком для {indicator} {symbol}")
+                await asyncio.sleep(60)
