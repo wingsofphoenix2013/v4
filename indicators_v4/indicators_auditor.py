@@ -23,15 +23,12 @@ EXPECTED_PARAMS = {
         f"lr{params['length']}_angle",
     ],
     "bb": lambda params: [
-        f"bb{params['length']}_{params['deviation']}_0_upper",
-        f"bb{params['length']}_{params['deviation']}_0_lower",
-        f"bb{params['length']}_{params['deviation']}_0_center",
-        f"bb{params['length']}_{params['deviation']}_5_upper",
-        f"bb{params['length']}_{params['deviation']}_5_lower",
-        f"bb{params['length']}_{params['deviation']}_5_center",
-        f"bb{params['length']}_{params['deviation']}_upper",
-        f"bb{params['length']}_{params['deviation']}_lower",
-        f"bb{params['length']}_{params['deviation']}_center",
+        f"bb{params['length']}_{params['std']}_0_upper",
+        f"bb{params['length']}_{params['std']}_0_lower",
+        f"bb{params['length']}_{params['std']}_0_center",
+        f"bb{params['length']}_{params['std']}_5_upper",
+        f"bb{params['length']}_{params['std']}_5_lower",
+        f"bb{params['length']}_{params['std']}_5_center",
     ],
     "macd": lambda params: [
         f"macd{params['fast']}_macd",
@@ -117,7 +114,7 @@ async def run_audit_check(pg, log):
         last_ts = int(now.timestamp())
         last_ts -= last_ts % step_sec
         last_ts -= 2 * step_sec
-        start_ts = last_ts - 7 * 86400
+        start_ts = last_ts - 12 * 3600
 
         open_times = [
             datetime.utcfromtimestamp(ts).replace(microsecond=0)
@@ -138,6 +135,9 @@ async def audit_instance_symbol(pg, iid, symbol, tf, indicator, expected, open_t
     async with semaphore:
         for i in range(0, len(open_times), chunk_size):
             chunk = open_times[i:i + chunk_size]
+            log.info(
+                f"Проверка чанка: {indicator.upper()} id={iid} {symbol} {tf}, свечи {chunk[0]} — {chunk[-1]}"
+            )
 
             async with pg.acquire() as conn:
                 for open_time in chunk:
@@ -150,22 +150,22 @@ async def audit_instance_symbol(pg, iid, symbol, tf, indicator, expected, open_t
                     missing = [p for p in expected if p not in actual]
 
                     if not missing:
+                        log.info(f"OK: {indicator} id={iid} {symbol} {tf} @ {open_time}")
                         await conn.execute("""
                             UPDATE indicator_gaps_v4
                             SET recovered_at = now(), status = 'recovered'
                             WHERE instance_id = $1 AND symbol = $2 AND open_time = $3 AND status = 'missing'
                         """, iid, symbol, open_time)
                     else:
+                        log.info(
+                            f"MISSING: {indicator} id={iid} {symbol} {tf} @ {open_time} → отсутствуют: {', '.join(missing)}"
+                        )
                         await conn.execute("""
                             INSERT INTO indicator_gaps_v4 (instance_id, symbol, open_time)
                             VALUES ($1, $2, $3)
                             ON CONFLICT DO NOTHING
                         """, iid, symbol, open_time)
-                        log.info(
-                            f"Пропущен расчёт: {indicator} id={iid} {symbol} {tf} @ {open_time.isoformat()} "
-                            f"→ отсутствуют: {', '.join(missing)}"
-                        )
 
             if i + chunk_size < len(open_times):
-                log.info(f"Ожидание 60 сек перед следующим чанком для {indicator} {symbol}")
+                log.info(f"Ожидание 60 сек перед следующим чанком для {indicator.upper()} id={iid} {symbol} {tf}")
                 await asyncio.sleep(60)
