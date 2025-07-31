@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import asyncio
 
-from indicators.compute_and_store import get_expected_param_names  # реализуется отдельно
+from indicators.compute_and_store import get_expected_param_names
 
 # 🔸 Генерация временных меток open_time по таймфрейму
 def generate_open_times(start, end, timeframe):
@@ -57,36 +57,34 @@ async def check_single_pair(pg, symbol, instance, params, min_time, now, semapho
         log.warning(f"[{symbol}] id={instance_id} {indicator}: ошибка генерации param_name: {e}")
         return
 
-    async with semaphore:
-        async with pg.acquire() as conn:
+    async with pg.acquire() as conn:
+        async with semaphore:
             rows = await conn.fetch("""
                 SELECT open_time, param_name FROM indicator_values_v4
                 WHERE instance_id = $1 AND symbol = $2 AND open_time BETWEEN $3 AND $4
             """, instance_id, symbol, min_time, end_time)
 
-        existing = defaultdict(set)
-        for row in rows:
-            existing[row["open_time"]].add(row["param_name"])
+            existing = defaultdict(set)
+            for row in rows:
+                existing[row["open_time"]].add(row["param_name"])
 
-        missing = []
-        for ts in open_times:
-            recorded = existing.get(ts, set())
-            if any(p not in recorded for p in expected_params):
-                missing.append(ts)
+            missing = []
+            for ts in open_times:
+                recorded = existing.get(ts, set())
+                if any(p not in recorded for p in expected_params):
+                    missing.append(ts)
 
-        if not missing:
-            return
+            if not missing:
+                return
 
-        async with pg.acquire() as conn:
             await conn.executemany("""
                 INSERT INTO indicator_gaps_v4 (instance_id, symbol, open_time)
                 VALUES ($1, $2, $3)
                 ON CONFLICT DO NOTHING
             """, [(instance_id, symbol, ts) for ts in missing])
 
-        # Преобразуем параметры в строку вида length=14, fast=12 и т.д.
-        param_str = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
-        log.info(f"⚠️ Пропуски: {symbol} / {indicator}({param_str}) / {timeframe} / id={instance_id} → {len(missing)}")
+            param_str = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
+            log.info(f"⚠️ Пропуски: {symbol} / {indicator}({param_str}) / {timeframe} / id={instance_id} → {len(missing)}")
 
 # 🔸 Основной вход: аудит всех связок
 async def audit_gaps(pg):
@@ -129,5 +127,12 @@ async def audit_gaps(pg):
             tasks.append(check_single_pair(pg, symbol, inst, params, min_time, now, semaphore))
 
     log.info(f"Запуск аудита по {len(tasks)} связкам...")
-    await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors:
+        log.warning(f"⚠️ Завершено с ошибками: {len(errors)} задач из {len(tasks)}")
+        for err in errors[:5]:
+            log.warning(f"Пример ошибки: {err}")
+
     log.info("✅ Аудит пропусков завершён")
