@@ -83,7 +83,7 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
 
                 log.info(f"📝 {symbol} [{tf}] — записано новых пропусков: {inserted_count}")
             else:
-                log.info(f"✅ {symbol} [{tf}] — без пропусков")
+                log.debug(f"✅ {symbol} [{tf}] — без пропусков")
 
         except Exception:
             log.exception(f"❌ Ошибка при аудите {symbol} [{tf}]")
