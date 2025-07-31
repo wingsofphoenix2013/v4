@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 # 🔸 Ожидаемые имена параметров по типу индикатора
 EXPECTED_PARAMS = {
@@ -47,6 +47,18 @@ TIMEFRAME_STEPS = {
     "m15": 900_000,
     "h1": 3_600_000,
 }
+
+# 🔸 Основной цикл аудита
+async def audit_loop(pg):
+    log = logging.getLogger("AUDITOR")
+    while True:
+        try:
+            log.info("Аудит: запуск проверки расчётов за 7 дней")
+            await run_audit_check(pg, log)
+            log.info("Аудит завершён, пауза 5 минут")
+        except Exception as e:
+            log.exception(f"Ошибка во время аудита: {e}")
+        await asyncio.sleep(300)
 
 # 🔸 Проверка наличия расчётов индикаторов
 async def run_audit_check(pg, log):
@@ -102,11 +114,9 @@ async def run_audit_check(pg, log):
             continue
 
         step_sec = TIMEFRAME_STEPS[tf] // 1000
-
         last_ts = int(now.timestamp())
         last_ts -= last_ts % step_sec
         last_ts -= 2 * step_sec
-
         start_ts = last_ts - 7 * 86400
 
         open_times = [
@@ -120,7 +130,6 @@ async def run_audit_check(pg, log):
             )
 
     await asyncio.gather(*tasks)
-
 
 # 🔸 Проверка расчётов по одному индикатору и символу с разбиением по чанкам
 async def audit_instance_symbol(pg, iid, symbol, tf, indicator, expected, open_times, semaphore, log):
