@@ -111,9 +111,15 @@ async def run_audit_check(pg, log):
                 log.warning(f"Пропуск: не удалось получить ожидаемые параметры для {indicator} id={iid}: {e}")
                 continue
 
+            # Расчёт диапазона времени со строгим выравниванием
             step_sec = TIMEFRAME_STEPS[tf] // 1000
-            last_ts = int((now.timestamp() // step_sec - 2) * step_sec)
-            start_ts = int((now - timedelta(days=7)).timestamp())
+
+            last_ts = int(now.timestamp())
+            last_ts -= last_ts % step_sec  # округление вниз до ближайшего шага
+            last_ts -= 2 * step_sec        # исключаем текущую и предыдущую свечу
+
+            start_ts = last_ts - 7 * 86400  # 7 дней назад
+
             open_times = [
                 datetime.utcfromtimestamp(ts).replace(microsecond=0)
                 for ts in range(start_ts, last_ts + 1, step_sec)
