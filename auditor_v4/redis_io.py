@@ -48,7 +48,7 @@ async def process_symbol_tf(symbol, tf, tf_sec, created_at, semaphore):
             now = datetime.utcnow()
 
             to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
-            from_time = max(created_at, now - timedelta(days=30))
+            from_time = max(created_at, now - timedelta(hours=24))
             from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
 
             expected = {

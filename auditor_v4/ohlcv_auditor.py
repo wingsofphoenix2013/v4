@@ -38,8 +38,8 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
             to_ts = int(now.timestamp()) // tf_sec * tf_sec - tf_sec
             to_time = datetime.fromtimestamp(to_ts)
 
-            # Нижняя граница: либо created_at, либо 30 дней назад
-            from_time = max(created_at, to_time - timedelta(days=30))
+            # Нижняя граница: либо created_at, либо 24 часа назад
+            from_time = max(created_at, to_time - timedelta(hours=24))
             from_ts = int(from_time.timestamp()) // tf_sec * tf_sec
             from_time_aligned = datetime.fromtimestamp(from_ts)
 
@@ -87,7 +87,7 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
 
         except Exception:
             log.exception(f"❌ Ошибка при аудите {symbol} [{tf}]")
-            
+                        
 # 🔸 Запуск аудита по всем тикерам и интервалам
 async def run_audit_all_symbols():
     log.info("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
