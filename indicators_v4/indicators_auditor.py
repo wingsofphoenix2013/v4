@@ -115,7 +115,7 @@ async def run_audit_check(pg, log):
             last_ts = int((now.timestamp() // step_sec - 2) * step_sec)
             start_ts = int((now - timedelta(days=7)).timestamp())
             open_times = [
-                datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0)
+                datetime.utcfromtimestamp(ts).replace(microsecond=0)
                 for ts in range(start_ts, last_ts + 1, step_sec)
             ]
 
