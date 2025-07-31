@@ -1,263 +1,150 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4
+# indicators_auditor.py
 
 import asyncio
-import json
 import logging
-import pandas as pd
-from collections import defaultdict
+from datetime import datetime, timedelta
 
-from infra import init_pg_pool, init_redis_client, setup_logging
-from core_io import run_core_io
-from indicators_auditor import audit_loop
-from indicators.compute_and_store import compute_and_store
+# 🔸 Ожидаемые имена параметров по типу индикатора
+EXPECTED_PARAMS = {
+    "ema": lambda params: [f"ema{params['length']}"],
+    "kama": lambda params: [f"kama{params['length']}"],
+    "atr": lambda params: [f"atr{params['length']}"],
+    "mfi": lambda params: [f"mfi{params['length']}"],
+    "rsi": lambda params: [f"rsi{params['length']}"],
+    "adx_dmi": lambda params: [
+        f"adx_dmi{params['length']}_adx",
+        f"adx_dmi{params['length']}_plus_di",
+        f"adx_dmi{params['length']}_minus_di",
+    ],
+    "lr": lambda params: [
+        f"lr{params['length']}_upper",
+        f"lr{params['length']}_lower",
+        f"lr{params['length']}_center",
+        f"lr{params['length']}_angle",
+    ],
+    "bb": lambda params: [
+        f"bb{params['length']}_{params['deviation']}_0_upper",
+        f"bb{params['length']}_{params['deviation']}_0_lower",
+        f"bb{params['length']}_{params['deviation']}_0_center",
+        f"bb{params['length']}_{params['deviation']}_5_upper",
+        f"bb{params['length']}_{params['deviation']}_5_lower",
+        f"bb{params['length']}_{params['deviation']}_5_center",
+        f"bb{params['length']}_{params['deviation']}_upper",
+        f"bb{params['length']}_{params['deviation']}_lower",
+        f"bb{params['length']}_{params['deviation']}_center",
+    ],
+    "macd": lambda params: [
+        f"macd{params['fast']}_macd",
+        f"macd{params['fast']}_macd_signal",
+        f"macd{params['fast']}_macd_hist",
+    ],
+}
 
-# 🔸 Глобальные переменные
-active_tickers = {}         # symbol -> precision_price
-indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
-required_candles = defaultdict(lambda: 400)  # tf -> сколько свечей загружать
+# 🔸 Длительность таймфреймов в миллисекундах
+TIMEFRAME_STEPS = {
+    "m1": 60_000,
+    "m5": 300_000,
+    "m15": 900_000,
+    "h1": 3_600_000,
+}
 
-# 🔸 Загрузка тикеров из PostgreSQL при старте
-async def load_initial_tickers(pg):
-    log = logging.getLogger("INIT")
+# 🔸 Основной цикл аудита
+async def audit_loop(pg):
+    log = logging.getLogger("AUDITOR")
+    while True:
+        try:
+            log.info("Аудит: запуск проверки расчётов за 7 дней")
+            await run_audit_check(pg, log)
+            log.info("Аудит завершён, пауза 5 минут")
+        except Exception as e:
+            log.exception(f"Ошибка во время аудита: {e}")
+        await asyncio.sleep(300)
+
+# 🔸 Проверка наличия расчётов индикаторов
+async def run_audit_check(pg, log):
     async with pg.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT symbol, precision_price
-            FROM tickers_v4
+        # Загрузка активных тикеров
+        tickers = await conn.fetch("""
+            SELECT symbol FROM tickers_v4
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
-        for row in rows:
-            active_tickers[row["symbol"]] = int(row["precision_price"])
-            log.debug(f"Loaded ticker: {row['symbol']} → precision={row['precision_price']}")
+        active_symbols = {r['symbol'] for r in tickers}
+        log.info(f"Загружено активных тикеров: {len(active_symbols)}")
 
-# 🔸 Загрузка расчётов индикаторов и параметров
-async def load_initial_indicators(pg):
-    log = logging.getLogger("INIT")
-    async with pg.acquire() as conn:
+        # Загрузка включённых индикаторов и параметров
         instances = await conn.fetch("""
-            SELECT id, indicator, timeframe, stream_publish
-            FROM indicator_instances_v4
-            WHERE enabled = true
+            SELECT ii.id, ii.indicator, ii.timeframe,
+                   ip.param, ip.value
+            FROM indicator_instances_v4 ii
+            JOIN indicator_parameters_v4 ip ON ip.instance_id = ii.id
+            WHERE ii.enabled = true
         """)
-        for inst in instances:
-            params = await conn.fetch("""
-                SELECT param, value FROM indicator_parameters_v4
-                WHERE instance_id = $1
-            """, inst["id"])
-            param_map = {p["param"]: p["value"] for p in params}
-            indicator_instances[inst["id"]] = {
-                "indicator": inst["indicator"],
-                "timeframe": inst["timeframe"],
-                "stream_publish": inst["stream_publish"],
-                "params": param_map
-            }
-            log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}")
 
-# 🔸 Подписка на обновления тикеров
-async def watch_ticker_updates(pg, redis):
-    log = logging.getLogger("TICKER_UPDATES")
-    pubsub = redis.pubsub()
-    await pubsub.subscribe("tickers_v4_events")
-
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
-        try:
-            data = json.loads(msg["data"])
-            symbol = data["symbol"]
-            field = data["type"]
-            action = data["action"]
-
-            if field in ("status", "tradepermission"):
-                if action == "enabled":
-                    async with pg.acquire() as conn:
-                        row = await conn.fetchrow("""
-                            SELECT precision_price FROM tickers_v4
-                            WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
-                        """, symbol)
-                        if row:
-                            active_tickers[symbol] = int(row["precision_price"])
-                            log.info(f"Тикер включён: {symbol} → precision = {row['precision_price']}")
-                else:
-                    active_tickers.pop(symbol, None)
-                    log.info(f"Тикер отключён: {symbol}")
-        except Exception as e:
-            log.warning(f"Ошибка в ticker event: {e}")
-
-# 🔸 Подписка на обновления расчётов индикаторов
-async def watch_indicator_updates(pg, redis):
-    log = logging.getLogger("INDICATOR_UPDATES")
-    pubsub = redis.pubsub()
-    await pubsub.subscribe("indicators_v4_events")
-
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
-        try:
-            data = json.loads(msg["data"])
-            iid = int(data["id"])
-            field = data["type"]
-            action = data["action"]
-
-            if field == "enabled":
-                if action == "true":
-                    async with pg.acquire() as conn:
-                        row = await conn.fetchrow("""
-                            SELECT id, indicator, timeframe, stream_publish
-                            FROM indicator_instances_v4 WHERE id = $1
-                        """, iid)
-                        if row:
-                            params = await conn.fetch("""
-                                SELECT param, value FROM indicator_parameters_v4
-                                WHERE instance_id = $1
-                            """, iid)
-                            param_map = {p["param"]: p["value"] for p in params}
-                            indicator_instances[iid] = {
-                                "indicator": row["indicator"],
-                                "timeframe": row["timeframe"],
-                                "stream_publish": row["stream_publish"],
-                                "params": param_map
-                            }
-                            log.info(f"Индикатор включён: id={iid} {row['indicator']} {param_map}")
-                else:
-                    indicator_instances.pop(iid, None)
-                    log.info(f"Индикатор отключён: id={iid}")
-
-            elif field == "stream_publish" and iid in indicator_instances:
-                indicator_instances[iid]["stream_publish"] = (action == "true")
-                log.info(f"stream_publish обновлён: id={iid} → {action}")
-        except Exception as e:
-            log.warning(f"Ошибка в indicator event: {e}")
-
-# 🔸 Загрузка свечей из Redis TimeSeries
-async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
-    log = logging.getLogger("REDIS_LOAD")
-    step_ms = {
-        "m1": 60_000,
-        "m5": 300_000,
-        "m15": 900_000,
-        "h1": 3_600_000
-    }[interval]
-    start_ts = end_ts - (count - 1) * step_ms
-
-    fields = ["o", "h", "l", "c", "v"]
-    keys = {field: f"ts:{symbol}:{interval}:{field}" for field in fields}
-    tasks = {
-        field: redis.execute_command("TS.RANGE", key, start_ts, end_ts)
-        for field, key in keys.items()
-    }
-
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-    series = {}
-    for field, result in zip(tasks.keys(), results):
-        if isinstance(result, Exception):
-            log.warning(f"Ошибка чтения {keys[field]}: {result}")
-            continue
-        try:
-            if result:
-                series[field] = {
-                    int(ts): float(val)
-                    for ts, val in result if val is not None
+        # Сборка инстансов с параметрами
+        instance_map = {}
+        for row in instances:
+            iid = row['id']
+            if iid not in instance_map:
+                instance_map[iid] = {
+                    "indicator": row['indicator'],
+                    "timeframe": row['timeframe'],
+                    "params": {}
                 }
-        except Exception as e:
-            log.warning(f"Ошибка при обработке значений {keys[field]}: {e}")
+            instance_map[iid]["params"][row["param"]] = row["value"]
 
-    df = None
-    for field, values in series.items():
-        s = pd.Series(values)
-        s.index = pd.to_datetime(s.index, unit='ms')
-        s.name = field
-        df = s.to_frame() if df is None else df.join(s, how="outer")
+        log.info(f"Загружено активных индикаторов: {len(instance_map)}")
 
-    if df is None or df.empty or len(df) < count:
-        return None
+        now = datetime.utcnow()
 
-    df.index.name = "open_time"
-    df = df.sort_index()
-    return df
+        for iid, inst in instance_map.items():
+            indicator = inst["indicator"]
+            tf = inst["timeframe"]
+            params = inst["params"]
 
-# 🔸 Обработка событий из канала OHLCV
-async def watch_ohlcv_events(pg, redis):
-    log = logging.getLogger("OHLCV_EVENTS")
-    pubsub = redis.pubsub()
-    await pubsub.subscribe("ohlcv_channel")
-
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
-        try:
-            data = json.loads(msg["data"])
-            symbol = data.get("symbol")
-            interval = data.get("interval")
-            timestamp = data.get("timestamp")
-
-            if symbol not in active_tickers:
+            if tf not in TIMEFRAME_STEPS:
+                log.info(f"Пропуск: неизвестный таймфрейм '{tf}' для iid={iid}")
                 continue
 
-            relevant_instances = [
-                iid for iid, inst in indicator_instances.items()
-                if inst["timeframe"] == interval
+            try:
+                expected = EXPECTED_PARAMS[indicator](params)
+            except Exception as e:
+                log.warning(f"Пропуск: не удалось получить ожидаемые параметры для {indicator} id={iid}: {e}")
+                continue
+
+            step_sec = TIMEFRAME_STEPS[tf] // 1000
+            last_ts = int((now.timestamp() // step_sec - 2) * step_sec)
+            start_ts = int((now - timedelta(days=7)).timestamp())
+            open_times = [
+                datetime.utcfromtimestamp(ts)
+                for ts in range(start_ts, last_ts + 1, step_sec)
             ]
-            if not relevant_instances:
-                continue
 
-            precision = active_tickers.get(symbol, 8)
-            depth = required_candles.get(interval, 200)
-            df = await load_ohlcv_from_redis(redis, symbol, interval, int(timestamp), depth)
-            if df is None:
-                continue
+            for symbol in active_symbols:
+                for open_time in open_times:
+                    # Получение уже сохранённых параметров
+                    values = await conn.fetch("""
+                        SELECT param_name FROM indicator_values_v4
+                        WHERE instance_id = $1 AND symbol = $2 AND open_time = $3
+                    """, iid, symbol, open_time)
 
-            await asyncio.gather(*[
-                compute_and_store(iid, indicator_instances[iid], symbol, df, int(timestamp), pg, redis, precision)
-                for iid in relevant_instances
-            ])
-        except Exception as e:
-            log.warning(f"Ошибка в ohlcv_channel: {e}")
+                    actual = {row["param_name"] for row in values}
+                    missing = [p for p in expected if p not in actual]
 
-# 🔸 Точка входа
-async def main():
-    setup_logging()
-    pg = await init_pg_pool()
-    redis = await init_redis_client()
-
-    await load_initial_tickers(pg)
-    await load_initial_indicators(pg)
-
-    # 🔸 Обёртка для безопасного запуска фоновой задачи
-    async def safe_loop(coro, label):
-        log = logging.getLogger(label)
-        while True:
-            try:
-                log.info("Запуск задачи")
-                await coro()
-            except Exception:
-                log.exception("Ошибка — перезапуск через 5 секунд")
-                await asyncio.sleep(5)
-
-    # 🔸 Периодический запуск с интервалом и опциональной задержкой
-    async def interval_loop(coro_func, label, interval, initial_delay=0):
-        log = logging.getLogger(label)
-
-        if initial_delay > 0:
-            log.info(f"Первая задержка {initial_delay} сек перед запуском")
-            await asyncio.sleep(initial_delay)
-
-        while True:
-            try:
-                log.info("Запуск задачи")
-                await coro_func()
-                log.info(f"Следующий запуск через {interval} сек")
-                await asyncio.sleep(interval)
-            except Exception:
-                log.exception("Ошибка — перезапуск через 5 секунд")
-                await asyncio.sleep(5)
-
-    await asyncio.gather(
-        safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
-        safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
-        safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
-        safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
-        interval_loop(lambda: audit_loop(pg), "INDICATOR_AUDITOR", 3600, initial_delay=120)
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                    if not missing:
+                        # Обновление статуса, если ранее был пропуск
+                        await conn.execute("""
+                            UPDATE indicator_gaps_v4
+                            SET recovered_at = now(), status = 'recovered'
+                            WHERE instance_id = $1 AND symbol = $2 AND open_time = $3 AND status = 'missing'
+                        """, iid, symbol, open_time)
+                    else:
+                        # Запись нового пропуска, если ещё не зафиксирован
+                        await conn.execute("""
+                            INSERT INTO indicator_gaps_v4 (instance_id, symbol, open_time)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT DO NOTHING
+                        """, iid, symbol, open_time)
+                        log.info(
+                            f"Пропущен расчёт: {indicator} id={iid} {symbol} {tf} @ {open_time.isoformat()} "
+                            f"→ отсутствуют: {', '.join(missing)}"
+                        )
