@@ -78,6 +78,17 @@ async def process_symbol_tf(symbol, tf, tf_sec, created_at, semaphore):
             redis = infra.redis_client
             added_counts = {f: 0 for f in FIELDS}
 
+            # Сначала получаем уже существующие метки времени из Redis по каждому полю
+            existing = {}
+            for field in FIELDS:
+                key = f"ts:{symbol}:{tf}:{field}"
+                try:
+                    results = await redis.execute_command("TS.RANGE", key, from_ts * 1000, to_ts * 1000)
+                    existing[field] = {int(ts) for ts, _ in results}
+                except Exception as e:
+                    log.warning(f"[TS_FIX] Ошибка чтения {key}: {e}")
+                    existing[field] = set()
+
             for ts in expected:
                 if ts not in by_time:
                     continue
@@ -93,6 +104,8 @@ async def process_symbol_tf(symbol, tf, tf_sec, created_at, semaphore):
                 }
 
                 for field in FIELDS:
+                    if ts in existing[field]:
+                        continue
                     key = f"ts:{symbol}:{tf}:{field}"
                     try:
                         await redis.execute_command("TS.ADD", key, ts, values[field])
