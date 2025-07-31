@@ -14,7 +14,7 @@ from config_loader import (
 )
 from core_io import pg_task, finmonitor_task, treasury_task
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
-from redis_io import run_audit_all_symbols_ts
+from redis_io import fix_missing_ts_points
 # from redis_compare import compare_redis_vs_db_once
 # from strategy_rating_worker import run_strategy_rating_worker
 # from king_marker_worker import run_king_marker_worker
@@ -79,9 +79,9 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
-        loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 300, initial_delay=120),
-        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
-        loop_with_interval(run_audit_all_symbols_ts, "REDIS_TS_AUDITOR", 3600, initial_delay=240),
+        loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 3600, initial_delay=120),
+        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 3600, initial_delay=180),
+        loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 3600, initial_delay=240),
 #         loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 3600, initial_delay=420),
 #         loop_with_interval(compare_redis_vs_db_once, "REDIS_DB_COMPARE", 3600, initial_delay=90),
 #         loop_with_interval(run_strategy_rating_worker, "STRATEGY_RATER", 300),
