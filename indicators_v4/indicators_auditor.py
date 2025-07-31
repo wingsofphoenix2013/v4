@@ -48,14 +48,12 @@ TIMEFRAME_STEPS = {
 # 🔸 Основной цикл аудита
 async def audit_loop(pg):
     log = logging.getLogger("AUDITOR")
-    while True:
-        try:
-            log.info("Аудит: запуск проверки расчётов за 7 дней")
-            await run_audit_check(pg, log)
-            log.info("Аудит завершён, пауза 5 минут")
-        except Exception as e:
-            log.exception(f"Ошибка во время аудита: {e}")
-        await asyncio.sleep(300)
+    try:
+        log.info("Аудит: запуск проверки расчётов за 7 дней")
+        await run_audit_check(pg, log)
+        log.info("Аудит завершён")
+    except Exception as e:
+        log.exception(f"Ошибка во время аудита: {e}")
 
 # 🔸 Проверка наличия расчётов индикаторов
 async def run_audit_check(pg, log):
@@ -114,7 +112,7 @@ async def run_audit_check(pg, log):
         last_ts = int(now.timestamp())
         last_ts -= last_ts % step_sec
         last_ts -= 2 * step_sec
-        start_ts = last_ts - 12 * 3600
+        start_ts = last_ts - 7 * 86400
 
         open_times = [
             datetime.utcfromtimestamp(ts).replace(microsecond=0)
@@ -172,11 +170,11 @@ async def audit_instance_symbol(pg, iid, symbol, tf, indicator, expected, open_t
             else:
                 result = "OK"
 
-            log.info(
+            log.debug(
                 f"{indicator.upper()} id={iid} {symbol} {tf} | "
                 f"Проверено {total} свечей: {chunk_from} — {chunk_to} → {result}"
             )
 
             if i + chunk_size < len(open_times):
-                log.info(f"Ожидание 60 сек перед следующим чанком: {indicator.upper()} id={iid} {symbol} {tf}")
+                log.debug(f"Ожидание 60 сек перед следующим чанком: {indicator.upper()} id={iid} {symbol} {tf}")
                 await asyncio.sleep(60)
