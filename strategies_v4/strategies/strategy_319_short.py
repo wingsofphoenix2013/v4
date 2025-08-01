@@ -31,7 +31,7 @@ class Strategy319Short:
                 return ("ignore", "недостаточно данных BB")
 
             if direction == "short":
-                bb_limit = bb_upper - (bb_upper - bb_center) * (1 / 3)
+                bb_limit = bb_upper - (bb_upper - bb_center) * (2 / 3)
                 if price >= bb_limit:
                     return True
                 return ("ignore", f"фильтр BB short не пройден: price={price}, limit={bb_limit}")
