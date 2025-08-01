@@ -77,7 +77,7 @@ async def analyze_open_times(pg):
             t += step
 
         if open_times:
-            log.info(f"🧪 {tf} → {len(open_times)} open_time ({open_times[0]} — {open_times[-1]})")
+            log.debug(f"🧪 {tf} → {len(open_times)} open_time ({open_times[0]} — {open_times[-1]})")
         else:
             log.warning(f"⚠️ {tf} → не найдено ни одного open_time")
 # 🔸 Аудит записей в БД по каждому тикеру и индикатору
@@ -98,6 +98,9 @@ async def audit_storage_gaps(pg):
         return datetime.utcfromtimestamp(aligned)
 
     now = datetime.utcnow()
+
+    total_checks = 0
+    total_failures = 0
 
     async with pg.acquire() as conn:
         # 🔹 Активные тикеры
@@ -141,6 +144,8 @@ async def audit_storage_gaps(pg):
         expected_count = len(open_times)
 
         for symbol in symbols:
+            total_checks += 1
+
             async with pg.acquire() as conn:
                 row = await conn.fetchrow("""
                     SELECT COUNT(DISTINCT open_time) AS actual
@@ -153,7 +158,14 @@ async def audit_storage_gaps(pg):
             label = f"{symbol} / id={instance_id} / {indicator}({param_str}) / {timeframe}"
 
             if actual_count == expected_count:
-                log.info(f"✅ {label} → {actual_count} / {expected_count}")
+                log.debug(f"✅ {label} → {actual_count} / {expected_count}")
             else:
+                total_failures += 1
                 missing = expected_count - actual_count
                 log.warning(f"⚠️ {label} → {actual_count} / {expected_count} (не хватает {missing})")
+
+    # 🔸 Суммирующий лог
+    if total_failures == 0:
+        log.info(f"✅ Все записи на месте: {total_checks} связок проверено, 0 отклонений")
+    else:
+        log.warning(f"⚠️ Проверено {total_checks} связок, с ошибками: {total_failures}")
