@@ -80,7 +80,7 @@ async def analyze_open_times(pg):
             log.debug(f"🧪 {tf} → {len(open_times)} open_time ({open_times[0]} — {open_times[-1]})")
         else:
             log.warning(f"⚠️ {tf} → не найдено ни одного open_time")
-# 🔸 Аудит записей в БД по каждому тикеру и индикатору
+# 🔸 Аудит полноты записей по каждому open_time
 async def audit_storage_gaps(pg):
     log = logging.getLogger("GAP_CHECKER")
 
@@ -98,7 +98,6 @@ async def audit_storage_gaps(pg):
         return datetime.utcfromtimestamp(aligned)
 
     now = datetime.utcnow()
-
     total_checks = 0
     total_failures = 0
 
@@ -132,6 +131,13 @@ async def audit_storage_gaps(pg):
         params = param_map.get(instance_id, {})
         step = step_map[timeframe]
 
+        # 🔹 Вычисляем ожидаемые param_name
+        try:
+            expected_params = get_expected_param_names(indicator, params)
+        except Exception as e:
+            log.warning(f"⛔ Ошибка генерации параметров: id={instance_id} {indicator} — {e}")
+            continue
+
         # ⏱ Диапазон open_time (24 часа назад, выровненный)
         end_time = align_down(now - 2 * step, step)
         start_time = end_time - timedelta(hours=24)
@@ -147,24 +153,34 @@ async def audit_storage_gaps(pg):
             total_checks += 1
 
             async with pg.acquire() as conn:
-                row = await conn.fetchrow("""
-                    SELECT COUNT(DISTINCT open_time) AS actual
+                rows = await conn.fetch("""
+                    SELECT open_time, param_name
                     FROM indicator_values_v4
                     WHERE instance_id = $1 AND symbol = $2 AND open_time BETWEEN $3 AND $4
                 """, instance_id, symbol, start_time, end_time)
 
-            actual_count = row["actual"]
+            # 🔹 Группировка param_name по open_time
+            found = defaultdict(set)
+            for r in rows:
+                found[r["open_time"]].add(r["param_name"])
+
+            valid = [
+                ts for ts in open_times
+                if all(p in found.get(ts, set()) for p in expected_params)
+            ]
+            actual_count = len(valid)
+
             param_str = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
             label = f"{symbol} / id={instance_id} / {indicator}({param_str}) / {timeframe}"
 
             if actual_count == expected_count:
-                log.debug(f"✅ {label} → {actual_count} / {expected_count}")
+                log.info(f"✅ {label} → {actual_count} / {expected_count}")
             else:
                 total_failures += 1
                 missing = expected_count - actual_count
-                log.warning(f"⚠️ {label} → {actual_count} / {expected_count} (не хватает {missing})")
+                log.warning(f"⚠️ {label} → {actual_count} / {expected_count} (неполные {missing} точек)")
 
-    # 🔸 Суммирующий лог
+    # 🔹 Суммирующий лог
     if total_failures == 0:
         log.info(f"✅ Все записи на месте: {total_checks} связок проверено, 0 отклонений")
     else:
