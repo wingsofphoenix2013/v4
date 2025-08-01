@@ -258,7 +258,7 @@ async def main():
         safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
         safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
         safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
-        safe_loop(lambda: interval_loop(analyze_open_times, "OPEN_TIME_ANALYZER", interval=300, initial_delay=60), "OPEN_TIME_ANALYZER"),
+        safe_loop(lambda: interval_loop(lambda: analyze_open_times(pg), "OPEN_TIME_ANALYZER", interval=300, initial_delay=60), "OPEN_TIME_ANALYZER"),
     )
 
 if __name__ == "__main__":
