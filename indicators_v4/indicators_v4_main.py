@@ -9,7 +9,7 @@ from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
 from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store
-from auditor import analyze_config_state
+from auditor import analyze_config_state, analyze_open_times
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -258,6 +258,7 @@ async def main():
         safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
         safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
         safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
+        safe_loop(lambda: interval_loop(analyze_open_times, "OPEN_TIME_ANALYZER", interval=300, initial_delay=60), "OPEN_TIME_ANALYZER"),
     )
 
 if __name__ == "__main__":
