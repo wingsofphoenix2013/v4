@@ -18,7 +18,6 @@ from volatility_worker import run_volatility_worker
 from volume_worker import run_volume_worker
 from ema_position_worker import run_ema_position_worker
 from ema_snapshot_worker import run_ema_snapshot_worker
-from generate_all_snapshot_variants import run_generate_all_snapshots
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -63,7 +62,6 @@ async def main():
         run_safe_loop(run_volume_worker, "VOLUME_WORKER"),
         run_safe_loop(run_ema_position_worker, "EMA_POSITION_WORKER"),
         run_safe_loop(run_ema_snapshot_worker, "EMA_SNAPSHOT_WORKER"),
-        run_generate_all_snapshots(),
     )
 
 
