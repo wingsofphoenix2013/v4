@@ -37,11 +37,10 @@ async def analyze_config_state(pg):
     log.debug(f"🧩 Активных индикаторов: {indicator_count}")
     log.debug(f"⏱ Таймфреймы среди индикаторов: {', '.join(timeframes) if timeframes else '—'}")
 
-# 🔸 Генерация библиотеки open_time по каждому таймфрейму (24ч глубина)
-async def analyze_open_times():
+# 🔸 Аудит контрольных open_time по активным таймфреймам (24 часа)
+async def analyze_open_times(pg):
     log = logging.getLogger("GAP_CHECKER")
 
-    timeframes = ["m1", "m5", "m15", "h1"]
     step_map = {
         "m1": timedelta(minutes=1),
         "m5": timedelta(minutes=5),
@@ -49,18 +48,29 @@ async def analyze_open_times():
         "h1": timedelta(hours=1),
     }
 
-    now = datetime.utcnow().replace(second=0, microsecond=0)
+    def align_down(dt: datetime, step: timedelta) -> datetime:
+        seconds = int(step.total_seconds())
+        timestamp = int(dt.timestamp())
+        aligned = timestamp - (timestamp % seconds)
+        return datetime.utcfromtimestamp(aligned)
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT timeframe
+            FROM indicator_instances_v4
+            WHERE enabled = true
+        """)
+        timeframes = sorted(r["timeframe"] for r in rows if r["timeframe"] in step_map)
+
+    now = datetime.utcnow()
 
     for tf in timeframes:
         step = step_map[tf]
-
-        # последний включённый open_time — это now - 2 * step
-        end_time = now - 2 * step
+        end_time = align_down(now - 2 * step, step)         # исключаем текущую и предыдущую свечу
         start_time = end_time - timedelta(hours=24)
 
         open_times = []
         t = start_time
-
         while t <= end_time:
             open_times.append(t)
             t += step
@@ -68,4 +78,4 @@ async def analyze_open_times():
         if open_times:
             log.info(f"🧪 {tf} → {len(open_times)} open_time ({open_times[0]} — {open_times[-1]})")
         else:
-            log.warning(f"⚠️ {tf} → не найдено open_time")
+            log.warning(f"⚠️ {tf} → не найдено ни одного open_time")
