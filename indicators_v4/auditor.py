@@ -166,21 +166,35 @@ async def audit_storage_gaps(pg):
             for r in rows:
                 found[r["open_time"]].add(r["param_name"])
 
-            valid = [
-                ts for ts in open_times
-                if all(p in found.get(ts, set()) for p in expected_params)
-            ]
+            valid = []
+            gaps = []
+
+            for ts in open_times:
+                recorded = found.get(ts, set())
+                if all(p in recorded for p in expected_params):
+                    valid.append(ts)
+                else:
+                    gaps.append(ts)
+
             actual_count = len(valid)
 
             param_str = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
             label = f"{symbol} / id={instance_id} / {indicator}({param_str}) / {timeframe}"
 
             if actual_count == expected_count:
-                log.info(f"✅ {label} → {actual_count} / {expected_count}")
+                log.debug(f"✅ {label} → {actual_count} / {expected_count}")
             else:
                 total_failures += 1
                 missing = expected_count - actual_count
                 log.warning(f"⚠️ {label} → {actual_count} / {expected_count} (неполные {missing} точек)")
+
+                # 🔸 Запись пропущенных open_time в indicator_gaps_v4
+                async with pg.acquire() as conn:
+                    await conn.executemany("""
+                        INSERT INTO indicator_gaps_v4 (instance_id, symbol, open_time)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT DO NOTHING
+                    """, [(instance_id, symbol, ts) for ts in gaps])
 
     # 🔹 Суммирующий лог
     if total_failures == 0:
