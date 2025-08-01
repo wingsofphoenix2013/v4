@@ -1,6 +1,7 @@
 # auditor.py — аудит системы: структура, конфигурация и пропуски
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 # 🔸 Базовый аудит текущей конфигурации системы
