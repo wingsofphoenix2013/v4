@@ -1,6 +1,7 @@
 # auditor.py — аудит системы: структура, конфигурация и пропуски
 
 import logging
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta
 
