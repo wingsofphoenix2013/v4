@@ -1,12 +1,12 @@
-# strategy_329_short.py
+# strategy_319_short.py
 
 import logging
 import json
 from infra import load_indicators, get_price
 
-log = logging.getLogger("strategy_329_short")
+log = logging.getLogger("strategy_319_short")
 
-class Strategy329Short:
+class Strategy319Short:
     async def validate_signal(self, signal, context):
         symbol = signal["symbol"]
         direction = signal["direction"].lower()
@@ -24,7 +24,7 @@ class Strategy329Short:
             bb_center = indicators.get("bb20_2_0_center")
             bb_upper = indicators.get("bb20_2_0_upper")
 
-            log.debug(f"[329_SHORTONLY] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
+            log.debug(f"[319_SHORTONLY] symbol={symbol}, tf={tf}, direction={direction}, price={price}, "
                       f"bb_center={bb_center}, bb_upper={bb_upper}")
 
             if None in (bb_center, bb_upper):
@@ -42,7 +42,7 @@ class Strategy329Short:
             return ("ignore", f"неизвестное направление: {direction}")
 
         except Exception:
-            log.exception("❌ Ошибка в strategy_329_short")
+            log.exception("❌ Ошибка в strategy_319_short")
             return ("ignore", "ошибка в стратегии")
 
     async def run(self, signal, context):
