@@ -4,6 +4,8 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from indicators.compute_and_store import get_expected_param_names
+
 # 🔸 Базовый аудит текущей конфигурации системы
 async def analyze_config_state(pg):
     log = logging.getLogger("GAP_CHECKER")
