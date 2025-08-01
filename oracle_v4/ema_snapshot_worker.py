@@ -18,7 +18,7 @@ pending_snapshots = {}
 
 EPSILON = 0.0005  # 0.05%
 
-# 🔸 Группировка значений с учётом слипания
+# 🔸 Группировка значений с учётом слипания (со стабильной сортировкой внутри групп)
 def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]:
     sorted_items = sorted(items, key=lambda x: -x[1])
     result = []
@@ -30,10 +30,10 @@ def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]
         if delta < eps:
             group.append(name)
         else:
-            result.append("=".join(group))
+            result.append("=".join(sorted(group)))  # ✅ сортировка группы
             group = [name]
             ref_value = value
-    result.append("=".join(group))
+    result.append("=".join(sorted(group)))  # ✅ сортировка последней группы
     return result
 # 🔸 Построение, логирование и сохранение snapshot
 async def build_snapshot(symbol: str, interval: str, open_time: str):
