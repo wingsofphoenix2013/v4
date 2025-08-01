@@ -11,12 +11,16 @@ logging.basicConfig(level=logging.INFO)
 
 EPSILON = 0.0005  # 0.05%
 
-# 🔸 Нормализация ordering: сортировка внутри групп
+# 🔸 Нормализация ordering: сортировка EMA по числу, PRICE — в конец
 def normalize_ordering(ordering: str) -> str:
-    groups = ordering.split(" > ")
-    normalized = ["=".join(sorted(group.split("="))) for group in groups]
-    return " > ".join(normalized)
+    def sort_key(x):
+        if x == "PRICE":
+            return 999
+        return int(x.replace("EMA", ""))
 
+    groups = ordering.split(" > ")
+    normalized = ["=".join(sorted(group.split("="), key=sort_key)) for group in groups]
+    return " > ".join(normalized)
 
 # 🔸 Основная функция
 async def run_snapshot_repair():

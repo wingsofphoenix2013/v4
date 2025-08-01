@@ -18,7 +18,13 @@ pending_snapshots = {}
 
 EPSILON = 0.0005  # 0.05%
 
-# 🔸 Группировка значений с учётом слипания (со стабильной сортировкой внутри групп)
+# 🔸 Функция сортировки по периоду: EMA9 < EMA21 < ... < PRICE
+def sort_key(x):
+    if x == "PRICE":
+        return 999
+    return int(x.replace("EMA", ""))
+
+# 🔸 Группировка значений с учётом слипания и стабильной сортировкой внутри групп
 def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]:
     sorted_items = sorted(items, key=lambda x: -x[1])
     result = []
@@ -30,10 +36,10 @@ def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]
         if delta < eps:
             group.append(name)
         else:
-            result.append("=".join(sorted(group)))  # ✅ сортировка группы
+            result.append("=".join(sorted(group, key=sort_key)))
             group = [name]
             ref_value = value
-    result.append("=".join(sorted(group)))  # ✅ сортировка последней группы
+    result.append("=".join(sorted(group, key=sort_key)))
     return result
 # 🔸 Построение, логирование и сохранение snapshot
 async def build_snapshot(symbol: str, interval: str, open_time: str):
