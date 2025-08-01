@@ -14,7 +14,7 @@ from config_loader import (
 )
 from core_io import pg_task, finmonitor_task, treasury_task
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
-from redis_io import fix_missing_ts_points, compare_redis_vs_db_once
+from redis_io import fix_missing_ts_points
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -78,7 +78,6 @@ async def main():
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 300, initial_delay=120),
         loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
         loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 300, initial_delay=240),
-        loop_with_interval(compare_redis_vs_db_once, "REDIS_TS_COMPARE", 3600, initial_delay=300),
     )
 
 if __name__ == "__main__":
