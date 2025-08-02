@@ -44,3 +44,13 @@ async def save_snapshot(symbol: str, interval: str, open_time: str, ordering: st
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(query, symbol, interval, open_dt, ordering)
         log.debug(f"💾 Сохранён EMA snapshot: {symbol} | {interval} | {open_time}")
+        
+# 🔸 Получение ID snapshot-а из словаря oracle_emasnapshot_dict
+async def get_snapshot_id(ordering: str) -> int:
+    query = "SELECT id FROM oracle_emasnapshot_dict WHERE ordering = $1"
+    async with infra.pg_pool.acquire() as conn:
+        row = await conn.fetchrow(query, ordering)
+        if row:
+            return row["id"]
+        else:
+            raise ValueError(f"❌ ordering не найден в словаре: {ordering}")

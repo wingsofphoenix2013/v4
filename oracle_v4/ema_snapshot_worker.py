@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 
 import infra
-from core_io import save_snapshot
+from core_io import save_snapshot, get_snapshot_id
 
 
 log = logging.getLogger("EMA_SNAPSHOT_WORKER")
@@ -82,7 +82,10 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
         # 💾 Сохраняем в БД
         await save_snapshot(symbol, interval, open_time, snapshot_str)
 
-        # 📡 Публикуем в Redis ключ с TTL
+        # 🔢 Получаем ID snapshot из словаря
+        snapshot_id = await get_snapshot_id(snapshot_str)
+
+        # 📡 Публикуем в Redis ключ с TTL (только ID)
         snapshot_key = f"snapshot:{symbol}:{interval}"
         ttl_by_interval = {
             "m5": 360,
@@ -90,8 +93,8 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
             "h1": 3720,
         }
         ttl = ttl_by_interval.get(interval, 360)
-        await redis.set(snapshot_key, snapshot_str, ex=ttl)
-        log.debug(f"📡 Установлен ключ {snapshot_key} с TTL={ttl}")
+        await redis.set(snapshot_key, snapshot_id, ex=ttl)
+        log.debug(f"📡 Установлен ключ {snapshot_key} = {snapshot_id} с TTL={ttl}")
 
     except Exception as e:
         log.exception(f"❌ Ошибка при формировании snapshot: {symbol} | {interval} | {open_time} → {e}")
