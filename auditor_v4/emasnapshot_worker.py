@@ -49,11 +49,11 @@ async def run_emasnapshot_worker():
 
         # Параллельная отладочная обработка с семафором
         sem = asyncio.Semaphore(10)
-        tasks = [process_position_debug(row, sem) for row in positions]
+        tasks = [process_position(row, sem) for row in positions]
         await asyncio.gather(*tasks)
         
-# 🔸 Обработка одной позиции (отладочный режим, без записи в БД)
-async def process_position_debug(position, sem):
+# 🔸 Обработка одной позиции (боевой режим — с записью в БД)
+async def process_position(position, sem):
     async with sem:
         try:
             import infra  # отложенный импорт
@@ -123,16 +123,36 @@ async def process_position_debug(position, sem):
                 winrate = quantize_decimal(winrate, 4)
                 base_rating = quantize_decimal(base_rating, 6)
 
-                # Лог
-                log.info(
-                    f"[sim] Позиция ID={position['id']} | strategy={strategy_id} | {direction.upper()} | "
-                    f"ordering={ordering} | flag_id={emasnapshot_dict_id} | pnl={pnl} | "
-                    f"{'WIN' if is_win else 'LOSS'}"
-                )
-                log.info(
-                    f"[sim] → num_trades={num_trades}, num_wins={num_wins}, num_losses={num_losses}, "
-                    f"total_pnl={total_pnl}, avg_pnl={avg_pnl}, winrate={winrate}, base_rating={base_rating}"
-                )
+                # Вставка/обновление агрегированной статистики
+                await conn.execute("""
+                    INSERT INTO positions_emasnapshot_m5_stat (
+                        strategy_id, direction, emasnapshot_dict_id,
+                        num_trades, num_wins, num_losses,
+                        total_pnl, avg_pnl, winrate, base_rating, last_updated
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+                    ON CONFLICT (strategy_id, direction, emasnapshot_dict_id)
+                    DO UPDATE SET
+                        num_trades = EXCLUDED.num_trades,
+                        num_wins = EXCLUDED.num_wins,
+                        num_losses = EXCLUDED.num_losses,
+                        total_pnl = EXCLUDED.total_pnl,
+                        avg_pnl = EXCLUDED.avg_pnl,
+                        winrate = EXCLUDED.winrate,
+                        base_rating = EXCLUDED.base_rating,
+                        last_updated = now()
+                """, strategy_id, direction, emasnapshot_dict_id,
+                     num_trades, num_wins, num_losses,
+                     total_pnl, avg_pnl, winrate, base_rating)
+
+                # Обновление позиции: отмечаем, что она обработана
+                await conn.execute("""
+                    UPDATE positions_v4
+                    SET emasnapshot_checked = true
+                    WHERE id = $1
+                """, position["id"])
+
+                log.info(f"✅ Обновлена статистика для позиции id={position['id']} (flag_id={emasnapshot_dict_id})")
 
         except Exception:
-            log.exception(f"❌ Ошибка при отладочной обработке позиции id={position['id']}")
+            log.exception(f"❌ Ошибка при обработке позиции id={position['id']}")
