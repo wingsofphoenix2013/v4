@@ -14,7 +14,7 @@ EPSILON = 1e-8
 
 # 🔸 Сравнение значений Redis TS и БД по тикеру и интервалу
 async def compare_redis_vs_db_once():
-    log.info(f"🔍 Сравнение Redis vs БД: {SYMBOL} [{INTERVAL}]")
+    log.debug(f"🔍 Сравнение Redis vs БД: {SYMBOL} [{INTERVAL}]")
 
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(f"""
@@ -59,4 +59,4 @@ async def compare_redis_vs_db_once():
                 dt = row["open_time"].strftime("%Y-%m-%d %H:%M")
                 log.warning(f"❌ {SYMBOL} {INTERVAL} @ {dt} → {field}: DB={v_db} / Redis={v_r}")
 
-    log.info(f"✅ Проверено {checked} значений, расхождений: {mismatches}")
+    log.debug(f"✅ Проверено {checked} значений, расхождений: {mismatches}")

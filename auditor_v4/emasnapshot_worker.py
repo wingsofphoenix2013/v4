@@ -28,7 +28,8 @@ async def run_emasnapshot_worker():
 
         # Получаем позиции по этим стратегиям
         positions = await conn.fetch("""
-            SELECT id FROM positions_v4
+            SELECT id, symbol, created_at, strategy_id, direction, pnl
+            FROM positions_v4
             WHERE strategy_id = ANY($1)
               AND status = 'closed'
               AND emasnapshot_checked = false

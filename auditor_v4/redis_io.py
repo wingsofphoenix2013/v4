@@ -23,7 +23,7 @@ def clean_decimal(value) -> float:
 
 # 🔸 Фиксация пропущенных точек в Redis TS из базы данных
 async def fix_missing_ts_points():
-    log.info("🔧 [TS_FIX] Запуск восстановления Redis TimeSeries")
+    log.debug("🔧 [TS_FIX] Запуск восстановления Redis TimeSeries")
 
     semaphore = asyncio.Semaphore(10)
     tasks = []
@@ -38,7 +38,7 @@ async def fix_missing_ts_points():
             tasks.append(process_symbol_tf(symbol, tf, tf_sec, created_at, semaphore))
 
     await asyncio.gather(*tasks)
-    log.info("✅ [TS_FIX] Восстановление Redis TS завершено")
+    log.debug("✅ [TS_FIX] Восстановление Redis TS завершено")
     
 async def process_symbol_tf(symbol, tf, tf_sec, created_at, semaphore):
     async with semaphore:

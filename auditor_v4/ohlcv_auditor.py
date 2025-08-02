@@ -81,7 +81,7 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
                         if result.startswith("INSERT"):
                             inserted_count += 1
 
-                log.info(f"📝 {symbol} [{tf}] — записано новых пропусков: {inserted_count}")
+                log.debug(f"📝 {symbol} [{tf}] — записано новых пропусков: {inserted_count}")
             else:
                 log.debug(f"✅ {symbol} [{tf}] — без пропусков")
 
@@ -90,7 +90,7 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
                         
 # 🔸 Запуск аудита по всем тикерам и интервалам
 async def run_audit_all_symbols():
-    log.info("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
+    log.debug("🔍 [AUDIT] Старт аудита всех тикеров и таймфреймов")
 
     semaphore = asyncio.Semaphore(20)  # разумный параллелизм
     tasks = []
@@ -101,14 +101,14 @@ async def run_audit_all_symbols():
 
     await asyncio.gather(*tasks)
 
-    log.info("✅ [AUDIT] Аудит завершён")
+    log.debug("✅ [AUDIT] Аудит завершён")
     
 # 🔸 Обработка пропущенных свечей: запрос с Binance и вставка
 def clean_decimal(value: str) -> Decimal:
     return Decimal(value).normalize()
     
 async def fix_missing_candles():
-    log.info("🔧 [FIXER] Запуск восстановления пропущенных свечей")
+    log.debug("🔧 [FIXER] Запуск восстановления пропущенных свечей")
 
     url = "https://fapi.binance.com/fapi/v1/klines"
     fixed_count = 0
@@ -191,4 +191,4 @@ async def fix_missing_candles():
 
     async with infra.pg_pool.acquire() as conn:
         remaining = await conn.fetchval("SELECT COUNT(*) FROM ohlcv_gaps_v4 WHERE fixed = false")
-        log.info(f"📊 [FIXER] Обработано {fixed_count} свечей, осталось: {remaining}")
+        log.debug(f"📊 [FIXER] Обработано {fixed_count} свечей, осталось: {remaining}")
