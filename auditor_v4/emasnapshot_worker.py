@@ -5,8 +5,10 @@ import logging
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 
-
 import infra
+
+# 🔸 Кэш для ускорения доступа к словарю EMA-флагов
+emasnapshot_dict_cache = {}
 
 # 🔸 Логгер
 log = logging.getLogger("EMASNAPSHOT_WORKER")
@@ -19,20 +21,19 @@ def quantize_decimal(value: Decimal, precision: int) -> Decimal:
 async def run_emasnapshot_worker():
     log.info("🚀 Воркер EMA Snapshot запущен")
 
+    # Получаем стратегии с включённым флагом из кэша
+    strategy_ids = [
+        sid for sid, s in infra.enabled_strategies.items()
+        if s.get("emasnapshot") is True
+    ]
+
+    log.info(f"🔍 Найдено стратегий с emasnapshot = true: {len(strategy_ids)}")
+
+    if not strategy_ids:
+        log.info("⛔ Стратегий для анализа не найдено")
+        return
+
     async with infra.pg_pool.acquire() as conn:
-        # Получаем все стратегии, где включён флаг emasnapshot
-        strategies = await conn.fetch("""
-            SELECT id FROM strategies_v4
-            WHERE emasnapshot = true
-        """)
-
-        strategy_ids = [row["id"] for row in strategies]
-        log.info(f"🔍 Найдено стратегий с emasnapshot = true: {len(strategy_ids)}")
-
-        if not strategy_ids:
-            log.info("⛔ Стратегий для анализа не найдено")
-            return
-
         # Получаем позиции по этим стратегиям
         positions = await conn.fetch("""
             SELECT id, symbol, created_at, strategy_id, direction, pnl
@@ -42,21 +43,18 @@ async def run_emasnapshot_worker():
               AND emasnapshot_checked = false
         """, strategy_ids)
 
-        log.info(f"📦 Найдено позиций для обработки: {len(positions)}")
+    log.info(f"📦 Найдено позиций для обработки: {len(positions)}")
 
-        # Ограничиваем количество обрабатываемых позиций
-        positions = positions[:200]
+    positions = positions[:200]
 
-        # Параллельная отладочная обработка с семафором
-        sem = asyncio.Semaphore(10)
-        tasks = [process_position(row, sem) for row in positions]
-        await asyncio.gather(*tasks)
-        
+    sem = asyncio.Semaphore(10)
+    tasks = [process_position(row, sem) for row in positions]
+    await asyncio.gather(*tasks)
+    
 # 🔸 Обработка одной позиции (боевой режим — с записью в БД)
 async def process_position(position, sem):
     async with sem:
         try:
-            import infra  # отложенный импорт
             async with infra.pg_pool.acquire() as conn:
                 symbol = position["symbol"]
                 created_at = position["created_at"]
@@ -83,19 +81,24 @@ async def process_position(position, sem):
 
                 ordering = snapshot["ordering"]
 
-                # Получаем ID из словаря
-                flag_row = await conn.fetchrow("""
-                    SELECT id FROM oracle_emasnapshot_dict
-                    WHERE ordering = $1
-                """, ordering)
+                # Получаем ID из словаря с кэшированием
+                if ordering in emasnapshot_dict_cache:
+                    emasnapshot_dict_id = emasnapshot_dict_cache[ordering]
+                else:
+                    flag_row = await conn.fetchrow("""
+                        SELECT id FROM oracle_emasnapshot_dict
+                        WHERE ordering = $1
+                    """, ordering)
 
-                if not flag_row:
-                    log.warning(f"⛔ Нет записи в dict для ordering: {ordering}")
-                    return
+                    if not flag_row:
+                        log.warning(f"⛔ Нет записи в dict для ordering: {ordering}")
+                        return
 
-                emasnapshot_dict_id = flag_row["id"]
+                    emasnapshot_dict_id = flag_row["id"]
+                    emasnapshot_dict_cache[ordering] = emasnapshot_dict_id
+
                 is_win = pnl > 0
-
+                
                 # Получаем текущую статистику (если есть)
                 stat = await conn.fetchrow("""
                     SELECT * FROM positions_emasnapshot_m5_stat
