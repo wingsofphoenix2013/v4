@@ -3,6 +3,8 @@
 import asyncio
 import logging
 from decimal import Decimal
+from datetime import datetime
+
 
 import infra
 
@@ -53,19 +55,26 @@ async def process_position_debug(position, sem):
             import infra  # отложенный импорт
             async with infra.pg_pool.acquire() as conn:
                 symbol = position["symbol"]
-                entry_time = position["created_at"]
+                created_at = position["created_at"]
                 strategy_id = position["strategy_id"]
                 direction = position["direction"]
                 pnl = Decimal(position["pnl"] or 0)
+
+                # Приведение времени к началу пятиминутной свечи
+                open_time = created_at.replace(
+                    minute=(created_at.minute // 5) * 5,
+                    second=0,
+                    microsecond=0
+                )
 
                 # Получаем снапшот
                 snapshot = await conn.fetchrow("""
                     SELECT ordering FROM oracle_ema_snapshot_v4
                     WHERE symbol = $1 AND interval = 'm5' AND open_time = $2
-                """, symbol, entry_time)
+                """, symbol, open_time)
 
                 if not snapshot:
-                    log.warning(f"⛔ Нет снапшота для {symbol} @ {entry_time}")
+                    log.warning(f"⛔ Нет снапшота для {symbol} @ {open_time}")
                     return
 
                 ordering = snapshot["ordering"]
@@ -105,7 +114,7 @@ async def process_position_debug(position, sem):
                 base_rating = Decimal(0)
 
                 # Округление
-                from decimal_utils import quantize_decimal  # если выносишь округление
+                from decimal_utils import quantize_decimal
                 total_pnl = quantize_decimal(total_pnl, 4)
                 avg_pnl = quantize_decimal(avg_pnl, 4)
                 winrate = quantize_decimal(winrate, 4)
