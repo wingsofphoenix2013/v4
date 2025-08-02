@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from infra import pg_pool
+import infra
 
 # 🔸 Логгер
 log = logging.getLogger("EMASNAPSHOT_WORKER")
@@ -12,7 +12,7 @@ log = logging.getLogger("EMASNAPSHOT_WORKER")
 async def run_emasnapshot_worker():
     log.info("🚀 Воркер EMA Snapshot запущен")
 
-    async with pg_pool.acquire() as conn:
+    async with infra.pg_pool.acquire() as conn:
         # Получаем все стратегии, где включён флаг emasnapshot
         strategies = await conn.fetch("""
             SELECT id FROM strategies_v4

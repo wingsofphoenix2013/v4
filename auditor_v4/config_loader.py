@@ -64,11 +64,11 @@ async def load_enabled_indicators():
         infra.set_enabled_indicators(indicators)
         log.info(f"✅ Загружено индикаторов: {len(indicators)}")
 
-        log.info("📄 Список загруженных индикаторов:")
+        log.debug("📄 Список загруженных индикаторов:")
         for key, item in indicators.items():
             indicator = item["indicator"]
             tf = item["timeframe"]
-            log.info(f"• {key} → {indicator} ({tf})")
+            log.debug(f"• {key} → {indicator} ({tf})")
 # 🔸 Слушатель PubSub событий
 async def config_event_listener():
     log = logging.getLogger("CONFIG_LOADER")
