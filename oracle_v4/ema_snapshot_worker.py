@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import json
 from datetime import datetime
 
 import infra
-from core_io import save_snapshot, get_snapshot_id
+from core_io import save_snapshot, get_snapshot_id, get_pattern_id
 
 
 log = logging.getLogger("EMA_SNAPSHOT_WORKER")
@@ -81,11 +82,15 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
 
         # 💾 Сохраняем в БД
         await save_snapshot(symbol, interval, open_time, snapshot_str)
-
-        # 🔢 Получаем ID snapshot из словаря
         snapshot_id = await get_snapshot_id(snapshot_str)
 
-        # 📡 Публикуем в Redis ключ с TTL (только ID)
+        # 🧩 Выбираем top-3 значений и нормализуем как pattern
+        reduced = sorted(items, key=lambda x: -x[1])[:3]
+        grouped = group_by_proximity(reduced)
+        pattern_str = " > ".join(grouped)
+        pattern_id = await get_pattern_id(pattern_str)
+
+        # 📡 Публикуем в Redis JSON с TTL
         snapshot_key = f"snapshot:{symbol}:{interval}"
         ttl_by_interval = {
             "m5": 360,
@@ -93,8 +98,13 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
             "h1": 3720,
         }
         ttl = ttl_by_interval.get(interval, 360)
-        await redis.set(snapshot_key, snapshot_id, ex=ttl)
-        log.debug(f"📡 Установлен ключ {snapshot_key} = {snapshot_id} с TTL={ttl}")
+
+        await redis.set(snapshot_key, json.dumps({
+            "snapshot_id": snapshot_id,
+            "pattern_id": pattern_id
+        }), ex=ttl)
+
+        log.debug(f"📡 Redis {snapshot_key} = snapshot_id:{snapshot_id}, pattern_id:{pattern_id} (TTL={ttl})")
 
     except Exception as e:
         log.exception(f"❌ Ошибка при формировании snapshot: {symbol} | {interval} | {open_time} → {e}")

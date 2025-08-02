@@ -54,3 +54,12 @@ async def get_snapshot_id(ordering: str) -> int:
             return row["id"]
         else:
             raise ValueError(f"❌ ordering не найден в словаре: {ordering}")
+# 🔸 Получение ID паттерна из oracle_emasnapshot_pattern
+async def get_pattern_id(pattern: str) -> int:
+    query = "SELECT id FROM oracle_emasnapshot_pattern WHERE pattern = $1"
+    async with infra.pg_pool.acquire() as conn:
+        row = await conn.fetchrow(query, pattern)
+        if row:
+            return row["id"]
+        else:
+            raise ValueError(f"❌ pattern не найден в словаре: {pattern}")
