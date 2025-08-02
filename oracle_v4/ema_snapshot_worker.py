@@ -41,7 +41,7 @@ def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]
             ref_value = value
     result.append("=".join(sorted(group, key=sort_key)))
     return result
-# 🔸 Построение, логирование и сохранение snapshot
+# 🔸 Построение, логирование и сохранение snapshot с публикацией в Redis
 async def build_snapshot(symbol: str, interval: str, open_time: str):
     redis = infra.redis_client
 
@@ -81,6 +81,17 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
 
         # 💾 Сохраняем в БД
         await save_snapshot(symbol, interval, open_time, snapshot_str)
+
+        # 📡 Публикуем в Redis ключ с TTL
+        snapshot_key = f"snapshot:{symbol}:{interval}"
+        ttl_by_interval = {
+            "m5": 360,
+            "m15": 960,
+            "h1": 3720,
+        }
+        ttl = ttl_by_interval.get(interval, 360)
+        await redis.set(snapshot_key, snapshot_str, ex=ttl)
+        log.debug(f"📡 Установлен ключ {snapshot_key} с TTL={ttl}")
 
     except Exception as e:
         log.exception(f"❌ Ошибка при формировании snapshot: {symbol} | {interval} | {open_time} → {e}")
