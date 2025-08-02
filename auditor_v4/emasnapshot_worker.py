@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 
 
@@ -11,6 +11,10 @@ import infra
 # 🔸 Логгер
 log = logging.getLogger("EMASNAPSHOT_WORKER")
 
+# 🔸 Утилита округления Decimal
+def quantize_decimal(value: Decimal, precision: int) -> Decimal:
+    return value.quantize(Decimal(f'1e-{precision}'), rounding=ROUND_HALF_UP)
+    
 # 🔸 Основная точка входа воркера
 async def run_emasnapshot_worker():
     log.info("🚀 Воркер EMA Snapshot запущен")
@@ -114,7 +118,6 @@ async def process_position_debug(position, sem):
                 base_rating = Decimal(0)
 
                 # Округление
-                from decimal_utils import quantize_decimal
                 total_pnl = quantize_decimal(total_pnl, 4)
                 avg_pnl = quantize_decimal(avg_pnl, 4)
                 winrate = quantize_decimal(winrate, 4)
