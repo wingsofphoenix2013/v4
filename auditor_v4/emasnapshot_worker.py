@@ -16,6 +16,27 @@ log = logging.getLogger("EMASNAPSHOT_WORKER")
 # 🔸 Утилита округления Decimal
 def quantize_decimal(value: Decimal, precision: int) -> Decimal:
     return value.quantize(Decimal(f'1e-{precision}'), rounding=ROUND_HALF_UP)
+
+# 🔸 Расчёт времени предыдущей свечи для любого таймфрейма
+def get_previous_tf_open_time(timestamp, tf: str) -> datetime:
+    if tf == "m5":
+        interval = 5
+    elif tf == "m15":
+        interval = 15
+    elif tf == "h1":
+        interval = 60
+    else:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+
+    # Округляем вниз до начала текущей свечи
+    rounded = timestamp.replace(
+        minute=(timestamp.minute // interval) * interval,
+        second=0,
+        microsecond=0
+    )
+
+    # Возвращаем начало предыдущей свечи
+    return rounded - timedelta(minutes=interval)
     
 # 🔸 Основная точка входа воркера
 async def run_emasnapshot_worker():
@@ -48,13 +69,19 @@ async def run_emasnapshot_worker():
     positions = positions[:200]
 
     sem = asyncio.Semaphore(10)
-    tasks = [process_position(row, sem) for row in positions]
+    tasks = []
+
+    # Обрабатываем каждую позицию по всем таймфреймам
+    for tf in ("m5", "m15", "h1"):
+        tasks.extend([process_position_for_tf(row, tf, sem) for row in positions])
+
     await asyncio.gather(*tasks)
-    
-# 🔸 Обработка одной позиции (боевой режим — с записью в БД)
-async def process_position(position, sem):
+
+# 🔸 Обработка одной позиции под заданный таймфрейм (m5, m15, h1)
+async def process_position_for_tf(position, tf: str, sem):
     async with sem:
         try:
+            import infra  # отложенный импорт
             async with infra.pg_pool.acquire() as conn:
                 symbol = position["symbol"]
                 created_at = position["created_at"]
@@ -62,26 +89,22 @@ async def process_position(position, sem):
                 direction = position["direction"]
                 pnl = Decimal(position["pnl"] or 0)
 
-                # Приведение времени к началу пятиминутной свечи
-                open_time = created_at.replace(
-                    minute=(created_at.minute // 5) * 5,
-                    second=0,
-                    microsecond=0
-                )
+                # Приведение ко времени предыдущей свечи данного таймфрейма
+                open_time = get_previous_tf_open_time(created_at, tf)
 
-                # Получаем снапшот
+                # Получаем снапшот нужного таймфрейма
                 snapshot = await conn.fetchrow("""
                     SELECT ordering FROM oracle_ema_snapshot_v4
-                    WHERE symbol = $1 AND interval = 'm5' AND open_time = $2
-                """, symbol, open_time)
+                    WHERE symbol = $1 AND interval = $2 AND open_time = $3
+                """, symbol, tf, open_time)
 
                 if not snapshot:
-                    log.warning(f"⛔ Нет снапшота для {symbol} @ {open_time}")
+                    log.warning(f"⛔ [{tf}] Нет снапшота для {symbol} @ {open_time}")
                     return
 
                 ordering = snapshot["ordering"]
 
-                # Получаем ID из словаря с кэшированием
+                # Кэширование словаря флагов
                 if ordering in emasnapshot_dict_cache:
                     emasnapshot_dict_id = emasnapshot_dict_cache[ordering]
                 else:
@@ -91,17 +114,20 @@ async def process_position(position, sem):
                     """, ordering)
 
                     if not flag_row:
-                        log.warning(f"⛔ Нет записи в dict для ordering: {ordering}")
+                        log.warning(f"⛔ [{tf}] Нет записи в dict для ordering: {ordering}")
                         return
 
                     emasnapshot_dict_id = flag_row["id"]
                     emasnapshot_dict_cache[ordering] = emasnapshot_dict_id
 
                 is_win = pnl > 0
-                
-                # Получаем текущую статистику (если есть)
-                stat = await conn.fetchrow("""
-                    SELECT * FROM positions_emasnapshot_m5_stat
+
+                # Имя целевой таблицы
+                stat_table = f"positions_emasnapshot_{tf}_stat"
+
+                # Получение текущей статистики
+                stat = await conn.fetchrow(f"""
+                    SELECT * FROM {stat_table}
                     WHERE strategy_id = $1 AND direction = $2 AND emasnapshot_dict_id = $3
                 """, strategy_id, direction, emasnapshot_dict_id)
 
@@ -126,14 +152,14 @@ async def process_position(position, sem):
                 winrate = quantize_decimal(winrate, 4)
                 base_rating = quantize_decimal(base_rating, 6)
 
-                # Вставка/обновление агрегированной статистики
-                await conn.execute("""
-                    INSERT INTO positions_emasnapshot_m5_stat (
+                # UPSERT в нужную таблицу
+                await conn.execute(f"""
+                    INSERT INTO {stat_table} (
                         strategy_id, direction, emasnapshot_dict_id,
                         num_trades, num_wins, num_losses,
                         total_pnl, avg_pnl, winrate, base_rating, last_updated
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
                     ON CONFLICT (strategy_id, direction, emasnapshot_dict_id)
                     DO UPDATE SET
                         num_trades = EXCLUDED.num_trades,
@@ -148,14 +174,7 @@ async def process_position(position, sem):
                      num_trades, num_wins, num_losses,
                      total_pnl, avg_pnl, winrate, base_rating)
 
-                # Обновление позиции: отмечаем, что она обработана
-                await conn.execute("""
-                    UPDATE positions_v4
-                    SET emasnapshot_checked = true
-                    WHERE id = $1
-                """, position["id"])
-
-                log.info(f"✅ Обновлена статистика для позиции id={position['id']} (flag_id={emasnapshot_dict_id})")
+                log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position['id']} (flag_id={emasnapshot_dict_id})")
 
         except Exception:
-            log.exception(f"❌ Ошибка при обработке позиции id={position['id']}")
+            log.exception(f"❌ [{tf}] Ошибка при обработке позиции id={position['id']}")
