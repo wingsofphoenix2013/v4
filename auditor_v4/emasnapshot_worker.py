@@ -205,11 +205,11 @@ async def process_position_for_tf(position, tf: str, sem, completed_tfs):
                 except Exception as upsert_exc:
                     log.exception(f"❌ [{tf}] Ошибка при UPSERT позиции id={position_id}: {upsert_exc}")
                     return
-
+                    
+                log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position_id} (flag_id={emasnapshot_dict_id})")
+                
                 # Отмечаем, что позиция успешно обработана по этому таймфрейму
                 completed_tfs[position_id].add(tf)
-
-                log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position_id} (flag_id={emasnapshot_dict_id})")
 
         except Exception:
             log.exception(f"❌ [{tf}] Ошибка при полной обработке позиции id={position['id']}")
