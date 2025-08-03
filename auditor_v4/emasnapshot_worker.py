@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import infra
 
 # 🔸 Кэш для ускорения доступа к словарю EMA-флагов
-emasnapshot_dict_cache = {}
+emasnapshot_dict_cache[ordering] = (flag_id, pattern_id)
 
 # 🔸 Логгер
 log = logging.getLogger("EMASNAPSHOT_WORKER")
@@ -135,10 +135,9 @@ async def process_position_for_tf(position, tf: str, conn) -> bool:
 
         ordering = snapshot["ordering"]
 
-        # Поиск или кеширование флага
+        # Поиск или кеширование флага + pattern_id
         if ordering in emasnapshot_dict_cache:
-            emasnapshot_dict_id = emasnapshot_dict_cache[ordering]
-            pattern_id = None  # не закеширован
+            emasnapshot_dict_id, pattern_id = emasnapshot_dict_cache[ordering]
         else:
             row = await conn.fetchrow("""
                 SELECT id, pattern_id
@@ -152,8 +151,8 @@ async def process_position_for_tf(position, tf: str, conn) -> bool:
 
             emasnapshot_dict_id = row["id"]
             pattern_id = row["pattern_id"]
-            emasnapshot_dict_cache[ordering] = emasnapshot_dict_id
-
+            emasnapshot_dict_cache[ordering] = (emasnapshot_dict_id, pattern_id)
+            
         # Вставка лог-записи
         await conn.execute("""
             INSERT INTO emasnapshot_position_log (
