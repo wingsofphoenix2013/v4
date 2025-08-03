@@ -102,11 +102,19 @@ async def process_position_for_tf(position, tf: str, sem, completed_tfs):
         try:
             import infra  # отложенный импорт
             async with infra.pg_pool.acquire() as conn:
+                position_id = position["id"]
                 symbol = position["symbol"]
                 created_at = position["created_at"]
                 strategy_id = position["strategy_id"]
                 direction = position["direction"]
-                pnl = Decimal(position["pnl"] or 0)
+
+                try:
+                    pnl = Decimal(position["pnl"])
+                except Exception:
+                    log.warning(f"⏭ [{tf}] Пропущена позиция id={position_id} — PnL не распарсился: {position['pnl']}")
+                    return
+
+                log.debug(f"▶️ [{tf}] Начата обработка позиции id={position_id}")
 
                 # Приведение ко времени предыдущей свечи данного таймфрейма
                 open_time = get_previous_tf_open_time(created_at, tf)
@@ -118,7 +126,7 @@ async def process_position_for_tf(position, tf: str, sem, completed_tfs):
                 """, symbol, tf, open_time)
 
                 if not snapshot:
-                    log.warning(f"⛔ [{tf}] Нет снапшота для {symbol} @ {open_time}")
+                    log.warning(f"⏭ [{tf}] Пропущена позиция id={position_id} — нет снапшота @ {open_time}")
                     return
 
                 ordering = snapshot["ordering"]
@@ -133,15 +141,13 @@ async def process_position_for_tf(position, tf: str, sem, completed_tfs):
                     """, ordering)
 
                     if not flag_row:
-                        log.warning(f"⛔ [{tf}] Нет записи в dict для ordering: {ordering}")
+                        log.warning(f"⏭ [{tf}] Пропущена позиция id={position_id} — нет записи в dict для ordering: {ordering}")
                         return
 
                     emasnapshot_dict_id = flag_row["id"]
                     emasnapshot_dict_cache[ordering] = emasnapshot_dict_id
 
                 is_win = pnl > 0
-
-                # Имя целевой таблицы
                 stat_table = f"positions_emasnapshot_{tf}_stat"
 
                 # Получение текущей статистики
@@ -171,32 +177,39 @@ async def process_position_for_tf(position, tf: str, sem, completed_tfs):
                 winrate = quantize_decimal(winrate, 4)
                 base_rating = quantize_decimal(base_rating, 6)
 
+                log.debug(f"🟡 [{tf}] Готов к UPSERT позиции id={position_id}, flag_id={emasnapshot_dict_id}")
+
                 # UPSERT в нужную таблицу
-                await conn.execute(f"""
-                    INSERT INTO {stat_table} (
-                        strategy_id, direction, emasnapshot_dict_id,
-                        num_trades, num_wins, num_losses,
-                        total_pnl, avg_pnl, winrate, base_rating, last_updated
-                    )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
-                    ON CONFLICT (strategy_id, direction, emasnapshot_dict_id)
-                    DO UPDATE SET
-                        num_trades = EXCLUDED.num_trades,
-                        num_wins = EXCLUDED.num_wins,
-                        num_losses = EXCLUDED.num_losses,
-                        total_pnl = EXCLUDED.total_pnl,
-                        avg_pnl = EXCLUDED.avg_pnl,
-                        winrate = EXCLUDED.winrate,
-                        base_rating = EXCLUDED.base_rating,
-                        last_updated = now()
-                """, strategy_id, direction, emasnapshot_dict_id,
-                     num_trades, num_wins, num_losses,
-                     total_pnl, avg_pnl, winrate, base_rating)
+                try:
+                    await conn.execute(f"""
+                        INSERT INTO {stat_table} (
+                            strategy_id, direction, emasnapshot_dict_id,
+                            num_trades, num_wins, num_losses,
+                            total_pnl, avg_pnl, winrate, base_rating, last_updated
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
+                        ON CONFLICT (strategy_id, direction, emasnapshot_dict_id)
+                        DO UPDATE SET
+                            num_trades = EXCLUDED.num_trades,
+                            num_wins = EXCLUDED.num_wins,
+                            num_losses = EXCLUDED.num_losses,
+                            total_pnl = EXCLUDED.total_pnl,
+                            avg_pnl = EXCLUDED.avg_pnl,
+                            winrate = EXCLUDED.winrate,
+                            base_rating = EXCLUDED.base_rating,
+                            last_updated = now()
+                    """, strategy_id, direction, emasnapshot_dict_id,
+                         num_trades, num_wins, num_losses,
+                         total_pnl, avg_pnl, winrate, base_rating)
+
+                except Exception as upsert_exc:
+                    log.exception(f"❌ [{tf}] Ошибка при UPSERT позиции id={position_id}: {upsert_exc}")
+                    return
 
                 # Отмечаем, что позиция успешно обработана по этому таймфрейму
-                completed_tfs[position["id"]].add(tf)
+                completed_tfs[position_id].add(tf)
 
-                log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position['id']} (flag_id={emasnapshot_dict_id})")
+                log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position_id} (flag_id={emasnapshot_dict_id})")
 
         except Exception:
-            log.exception(f"❌ [{tf}] Ошибка при обработке позиции id={position['id']}")
+            log.exception(f"❌ [{tf}] Ошибка при полной обработке позиции id={position['id']}")
