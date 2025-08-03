@@ -42,6 +42,7 @@ def get_previous_tf_open_time(timestamp, tf: str) -> datetime:
 async def process_position_all_tfs(position, sem):
     async with sem:
         try:
+            import infra
             async with infra.pg_pool.acquire() as conn:
                 success = True
 
@@ -97,114 +98,62 @@ async def run_emasnapshot_worker():
     tasks = [process_position_all_tfs(pos, sem) for pos in positions]
     await asyncio.gather(*tasks)
             
-# 🔸 Обработка позиции по одному таймфрейму, возвращает True/False
+# 🔸 Обработка позиции по одному таймфрейму — логируем в raw-таблицу
 async def process_position_for_tf(position, tf: str, conn) -> bool:
     try:
         position_id = position["id"]
-        symbol = position["symbol"]
-        created_at = position["created_at"]
         strategy_id = position["strategy_id"]
         direction = position["direction"]
+        created_at = position["created_at"]
+        symbol = position["symbol"]
 
         try:
             pnl = Decimal(position["pnl"])
         except Exception:
-            log.warning(f"⏭ [{tf}] Пропущена позиция id={position_id} — PnL нераспарсен: {position['pnl']}")
+            log.warning(f"[{tf}] position_id={position_id} — pnl невалиден")
             return False
 
-        # Округляем ко времени предыдущей свечи по ТФ
+        # Приведение времени к предыдущей свече
         open_time = get_previous_tf_open_time(created_at, tf)
 
-        # Ищем снапшот
+        # Поиск снапшота
         snapshot = await conn.fetchrow("""
             SELECT ordering FROM oracle_ema_snapshot_v4
             WHERE symbol = $1 AND interval = $2 AND open_time = $3
         """, symbol, tf, open_time)
 
         if not snapshot:
-            log.warning(f"⏭ [{tf}] Позиция id={position_id} — нет снапшота @ {open_time}")
+            log.warning(f"[{tf}] position_id={position_id} — снапшот отсутствует @ {open_time}")
             return False
 
         ordering = snapshot["ordering"]
 
-        # Ищем flag_id в словаре
+        # Поиск или кеширование флага
         if ordering in emasnapshot_dict_cache:
-            emasnapshot_dict_id = emasnapshot_dict_cache[ordering]
+            flag_id = emasnapshot_dict_cache[ordering]
         else:
-            flag_row = await conn.fetchrow("""
+            row = await conn.fetchrow("""
                 SELECT id FROM oracle_emasnapshot_dict
                 WHERE ordering = $1
             """, ordering)
-
-            if not flag_row:
-                log.warning(f"⏭ [{tf}] Позиция id={position_id} — ordering не найден в dict: {ordering}")
+            if not row:
+                log.warning(f"[{tf}] position_id={position_id} — ordering не найден в dict")
                 return False
+            flag_id = row["id"]
+            emasnapshot_dict_cache[ordering] = flag_id
 
-            emasnapshot_dict_id = flag_row["id"]
-            emasnapshot_dict_cache[ordering] = emasnapshot_dict_id
+        # Вставка лог-записи
+        await conn.execute("""
+            INSERT INTO emasnapshot_position_log (
+                position_id, strategy_id, direction, tf,
+                emasnapshot_dict_id, pnl
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT DO NOTHING
+        """, position_id, strategy_id, direction, tf, flag_id, pnl)
 
-        is_win = pnl > 0
-        stat_table = f"positions_emasnapshot_{tf}_stat"
-
-        # Получаем текущую строку статистики
-        stat = await conn.fetchrow(f"""
-            SELECT * FROM {stat_table}
-            WHERE strategy_id = $1 AND direction = $2 AND emasnapshot_dict_id = $3
-        """, strategy_id, direction, emasnapshot_dict_id)
-
-        if stat:
-            num_trades = stat["num_trades"] + 1
-            num_wins = stat["num_wins"] + (1 if is_win else 0)
-            num_losses = stat["num_losses"] + (0 if is_win else 1)
-            total_pnl = Decimal(stat["total_pnl"]) + pnl
-        else:
-            num_trades = 1
-            num_wins = 1 if is_win else 0
-            num_losses = 0 if is_win else 1
-            total_pnl = pnl
-
-        avg_pnl = total_pnl / num_trades
-        winrate = Decimal(num_wins) / num_trades
-        base_rating = Decimal(0)
-
-        # Округляем
-        total_pnl = quantize_decimal(total_pnl, 4)
-        avg_pnl = quantize_decimal(avg_pnl, 4)
-        winrate = quantize_decimal(winrate, 4)
-        base_rating = quantize_decimal(base_rating, 6)
-
-        log.info(
-            f"[{tf}] ▶️ UPSERT по позиции id={position_id} — pnl={pnl}, total={total_pnl}, "
-            f"avg={avg_pnl}, winrate={winrate}, flag_id={emasnapshot_dict_id}"
-        )
-
-        # Выполняем UPSERT
-        result = await conn.execute(f"""
-            INSERT INTO {stat_table} (
-                strategy_id, direction, emasnapshot_dict_id,
-                num_trades, num_wins, num_losses,
-                total_pnl, avg_pnl, winrate, base_rating, last_updated
-            )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
-            ON CONFLICT (strategy_id, direction, emasnapshot_dict_id)
-            DO UPDATE SET
-                num_trades = EXCLUDED.num_trades,
-                num_wins = EXCLUDED.num_wins,
-                num_losses = EXCLUDED.num_losses,
-                total_pnl = EXCLUDED.total_pnl,
-                avg_pnl = EXCLUDED.avg_pnl,
-                winrate = EXCLUDED.winrate,
-                base_rating = EXCLUDED.base_rating,
-                last_updated = now()
-        """, strategy_id, direction, emasnapshot_dict_id,
-             num_trades, num_wins, num_losses,
-             total_pnl, avg_pnl, winrate, base_rating)
-
-        log.info(f"[{tf}] ✅ UPSERT result: {result}")
-        log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position_id} (flag_id={emasnapshot_dict_id})")
-
+        log.info(f"[{tf}] 📥 Лог сохранён: id={position_id}, flag={flag_id}, pnl={pnl}")
         return True
 
     except Exception:
-        log.exception(f"❌ [{tf}] Ошибка при обработке позиции id={position['id']}")
+        log.exception(f"[{tf}] ❌ Ошибка при логировании позиции id={position['id']}")
         return False
