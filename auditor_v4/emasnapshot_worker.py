@@ -77,6 +77,14 @@ async def run_emasnapshot_worker():
 
     await asyncio.gather(*tasks)
 
+    # Отмечаем позиции как обработанные (после всех ТФ)
+    async with infra.pg_pool.acquire() as conn:
+        await conn.executemany("""
+            UPDATE positions_v4
+            SET emasnapshot_checked = true
+            WHERE id = $1
+        """, [(row["id"],) for row in positions])
+        
 # 🔸 Обработка одной позиции под заданный таймфрейм (m5, m15, h1)
 async def process_position_for_tf(position, tf: str, sem):
     async with sem:
