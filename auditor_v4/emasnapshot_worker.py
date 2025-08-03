@@ -173,8 +173,13 @@ async def process_position_for_tf(position, tf: str, conn) -> bool:
         winrate = quantize_decimal(winrate, 4)
         base_rating = quantize_decimal(base_rating, 6)
 
-        # Пытаемся выполнить UPSERT
-        await conn.execute(f"""
+        log.info(
+            f"[{tf}] ▶️ UPSERT по позиции id={position_id} — pnl={pnl}, total={total_pnl}, "
+            f"avg={avg_pnl}, winrate={winrate}, flag_id={emasnapshot_dict_id}"
+        )
+
+        # Выполняем UPSERT
+        result = await conn.execute(f"""
             INSERT INTO {stat_table} (
                 strategy_id, direction, emasnapshot_dict_id,
                 num_trades, num_wins, num_losses,
@@ -195,7 +200,9 @@ async def process_position_for_tf(position, tf: str, conn) -> bool:
              num_trades, num_wins, num_losses,
              total_pnl, avg_pnl, winrate, base_rating)
 
+        log.info(f"[{tf}] ✅ UPSERT result: {result}")
         log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position_id} (flag_id={emasnapshot_dict_id})")
+
         return True
 
     except Exception:
