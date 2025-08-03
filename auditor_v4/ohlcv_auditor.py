@@ -64,24 +64,35 @@ async def audit_symbol_interval(symbol: str, tf: str, semaphore: asyncio.Semapho
             missing = sorted(expected - actual)
 
             if missing:
-                log.warning(f"📉 {symbol} [{tf}] — пропущено {len(missing)} свечей "
-                            f"(с {from_time_aligned} по {to_time})")
+                await asyncio.sleep(10)
 
-                inserted_count = 0
+                # Повторная проверка через 10 секунд
                 async with infra.pg_pool.acquire() as conn:
-                    for ts in missing:
-                        result = await conn.execute(
-                            """
-                            INSERT INTO ohlcv_gaps_v4 (symbol, interval, open_time)
-                            VALUES ($1, $2, $3)
-                            ON CONFLICT DO NOTHING
-                            """,
-                            symbol, tf, ts
-                        )
-                        if result.startswith("INSERT"):
-                            inserted_count += 1
+                    rows = await conn.fetch(query_data, symbol, from_time_aligned, to_time)
+                    actual = set(row["open_time"] for row in rows)
+                still_missing = sorted(expected - actual)
 
-                log.debug(f"📝 {symbol} [{tf}] — записано новых пропусков: {inserted_count}")
+                if still_missing:
+                    log.warning(f"📉 {symbol} [{tf}] — пропущено {len(still_missing)} свечей "
+                                f"(с {from_time_aligned} по {to_time})")
+
+                    inserted_count = 0
+                    async with infra.pg_pool.acquire() as conn:
+                        for ts in still_missing:
+                            result = await conn.execute(
+                                """
+                                INSERT INTO ohlcv_gaps_v4 (symbol, interval, open_time)
+                                VALUES ($1, $2, $3)
+                                ON CONFLICT DO NOTHING
+                                """,
+                                symbol, tf, ts
+                            )
+                            if result.startswith("INSERT"):
+                                inserted_count += 1
+
+                    log.info(f"📝 {symbol} [{tf}] — записано новых пропусков: {inserted_count}")
+                else:
+                    log.info(f"⏳ {symbol} [{tf}] — задержка устранена, все свечи поступили")
             else:
                 log.debug(f"✅ {symbol} [{tf}] — без пропусков")
 
