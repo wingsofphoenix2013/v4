@@ -17,6 +17,7 @@ from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
 from redis_io import fix_missing_ts_points
 from emasnapshot_worker import run_emasnapshot_worker
 from snapshot_aggregator_worker import run_snapshot_aggregator
+from snapshot_aggregator_worker import sync_snapshot_patterns
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -62,6 +63,7 @@ async def main():
         return
         
     try:
+        await sync_snapshot_patterns()
         await load_enabled_tickers()
         await load_enabled_strategies()
         await load_enabled_indicators()

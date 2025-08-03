@@ -7,6 +7,37 @@ import infra
 
 log = logging.getLogger("SNAPSHOT_AGGREGATOR")
 
+# 🔸 Генерация паттерна из строки ordering
+def extract_pattern_from_ordering(ordering: str) -> str:
+    values = []
+    for group in ordering.split(">"):
+        items = [x.strip() for x in group.split("=")]
+        for item in items:
+            if len(values) < 3:
+                values.append(item)
+            else:
+                break
+        if len(values) >= 3:
+            break
+
+    # Сборка обратно в pattern
+    groups = []
+    buffer = []
+
+    for item in values:
+        if not buffer:
+            buffer = [item]
+        elif "=" in ordering and f"{buffer[-1]}={item}" in ordering:
+            buffer.append(item)
+        else:
+            groups.append("=".join(buffer))
+            buffer = [item]
+
+    if buffer:
+        groups.append("=".join(buffer))
+
+    return " > ".join(groups)
+    
 # 🔸 Фоновый агрегатор по лог-таблице
 async def run_snapshot_aggregator():
     try:
@@ -68,3 +99,50 @@ async def run_snapshot_aggregator():
 
     except Exception:
         log.exception("❌ Ошибка при агрегировании логов")
+# 🔸 Однократная синхронизация pattern_id для oracle_emasnapshot_dict
+
+async def sync_snapshot_patterns():
+    log.info("🚀 Начало синхронизации pattern_id для снапшотов")
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, ordering
+            FROM oracle_emasnapshot_dict
+            WHERE pattern_id IS NULL
+        """)
+
+        updated = 0
+
+        for row in rows:
+            dict_id = row["id"]
+            ordering = row["ordering"]
+
+            # Генерация паттерна
+            try:
+                pattern = extract_pattern_from_ordering(ordering)
+            except Exception as e:
+                log.warning(f"⛔ Не удалось обработать ordering id={dict_id}: {e}")
+                continue
+
+            # Поиск pattern_id
+            pattern_row = await conn.fetchrow("""
+                SELECT id FROM oracle_emasnapshot_pattern
+                WHERE pattern = $1
+            """, pattern)
+
+            if not pattern_row:
+                log.warning(f"❗ Паттерн не найден: '{pattern}' для ordering id={dict_id}")
+                continue
+
+            pattern_id = pattern_row["id"]
+
+            # Обновление pattern_id
+            await conn.execute("""
+                UPDATE oracle_emasnapshot_dict
+                SET pattern_id = $1
+                WHERE id = $2
+            """, pattern_id, dict_id)
+
+            updated += 1
+
+    log.info(f"✅ Синхронизация завершена. Обновлено строк: {updated}")
