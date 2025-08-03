@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import infra
 
 # 🔸 Кэш для ускорения доступа к словарю EMA-флагов
-emasnapshot_dict_cache[ordering] = (flag_id, pattern_id)
+emasnapshot_dict_cache = {}
 
 # 🔸 Логгер
 log = logging.getLogger("EMASNAPSHOT_WORKER")
