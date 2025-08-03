@@ -25,7 +25,7 @@ async def run_snapshot_aggregator():
         if not locked:
             return  # Уже кто-то агрегирует
 
-        log.info("🚀 Начало агрегирования по лог-таблице")
+        log.debug("🚀 Начало агрегирования по лог-таблице")
 
         async with infra.pg_pool.acquire() as conn:
 

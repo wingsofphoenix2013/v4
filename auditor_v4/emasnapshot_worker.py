@@ -58,7 +58,7 @@ async def process_position_all_tfs(position, sem):
                         SET emasnapshot_checked = true
                         WHERE id = $1
                     """, position["id"])
-                    log.info(f"✅ Позиция id={position['id']} полностью обработана по всем ТФ")
+                    log.debug(f"✅ Позиция id={position['id']} полностью обработана по всем ТФ")
                 else:
                     count_logs = await conn.fetchval("""
                         SELECT COUNT(*) FROM emasnapshot_position_log
