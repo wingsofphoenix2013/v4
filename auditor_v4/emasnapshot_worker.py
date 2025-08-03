@@ -58,7 +58,13 @@ async def process_position_all_tfs(position, sem):
                         SET emasnapshot_checked = true
                         WHERE id = $1
                     """, position["id"])
-                    log.debug(f"✅ Позиция id={position['id']} полностью обработана по всем ТФ")
+                    log.info(f"✅ Позиция id={position['id']} полностью обработана по всем ТФ")
+                else:
+                    count_logs = await conn.fetchval("""
+                        SELECT COUNT(*) FROM emasnapshot_position_log
+                        WHERE position_id = $1
+                    """, position["id"])
+                    log.info(f"⚠️ Позиция id={position['id']} частично обработана — логов записано: {count_logs}/3")
 
         except Exception:
             log.exception(f"❌ Ошибка при полной обработке позиции id={position['id']}")
@@ -130,29 +136,35 @@ async def process_position_for_tf(position, tf: str, conn) -> bool:
 
         # Поиск или кеширование флага
         if ordering in emasnapshot_dict_cache:
-            flag_id = emasnapshot_dict_cache[ordering]
+            emasnapshot_dict_id = emasnapshot_dict_cache[ordering]
+            pattern_id = None  # не закеширован
         else:
             row = await conn.fetchrow("""
-                SELECT id FROM oracle_emasnapshot_dict
+                SELECT id, pattern_id
+                FROM oracle_emasnapshot_dict
                 WHERE ordering = $1
             """, ordering)
+
             if not row:
                 log.warning(f"[{tf}] position_id={position_id} — ordering не найден в dict")
                 return False
-            flag_id = row["id"]
-            emasnapshot_dict_cache[ordering] = flag_id
+
+            emasnapshot_dict_id = row["id"]
+            pattern_id = row["pattern_id"]
+            emasnapshot_dict_cache[ordering] = emasnapshot_dict_id
 
         # Вставка лог-записи
         await conn.execute("""
             INSERT INTO emasnapshot_position_log (
                 position_id, strategy_id, direction, tf,
-                emasnapshot_dict_id, pnl
-            ) VALUES ($1, $2, $3, $4, $5, $6)
+                emasnapshot_dict_id, pattern_id, pnl
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT DO NOTHING
-        """, position_id, strategy_id, direction, tf, flag_id, pnl)
+        """, position_id, strategy_id, direction, tf,
+             emasnapshot_dict_id, pattern_id, pnl)
 
-        log.info(f"[{tf}] 📥 Лог сохранён: id={position_id}, flag={flag_id}, pnl={pnl}")
-        
+        log.debug(f"[{tf}] 📥 Лог сохранён: id={position_id}, flag={emasnapshot_dict_id}, pattern={pattern_id}, pnl={pnl}")
+
         # Сигнал агрегатору на пересчёт
         await infra.redis_client.set("emasnapshot:agg:pending", 1)
 
