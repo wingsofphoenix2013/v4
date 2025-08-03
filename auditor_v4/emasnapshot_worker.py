@@ -58,7 +58,7 @@ async def process_position_all_tfs(position, sem):
                         SET emasnapshot_checked = true
                         WHERE id = $1
                     """, position["id"])
-                    log.info(f"✅ Позиция id={position['id']} полностью обработана по всем ТФ")
+                    log.debug(f"✅ Позиция id={position['id']} полностью обработана по всем ТФ")
 
         except Exception:
             log.exception(f"❌ Ошибка при полной обработке позиции id={position['id']}")
@@ -152,6 +152,10 @@ async def process_position_for_tf(position, tf: str, conn) -> bool:
         """, position_id, strategy_id, direction, tf, flag_id, pnl)
 
         log.info(f"[{tf}] 📥 Лог сохранён: id={position_id}, flag={flag_id}, pnl={pnl}")
+        
+        # Сигнал агрегатору на пересчёт
+        await infra.redis_client.set("emasnapshot:agg:pending", 1)
+
         return True
 
     except Exception:

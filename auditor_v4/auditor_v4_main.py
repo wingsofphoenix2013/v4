@@ -16,6 +16,7 @@ from core_io import pg_task, finmonitor_task, treasury_task
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
 from redis_io import fix_missing_ts_points
 from emasnapshot_worker import run_emasnapshot_worker
+from snapshot_aggregator_worker import run_snapshot_aggregator
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -25,7 +26,7 @@ log = logging.getLogger("AUDITOR_MAIN")
 async def run_safe_loop(coro, label: str):
     while True:
         try:
-            log.info(f"[{label}] Запуск задачи")
+            log.debug(f"[{label}] Запуск задачи")
             await coro()
         except Exception:
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
@@ -39,9 +40,9 @@ async def loop_with_interval(coro_func, label: str, interval_sec: int, initial_d
 
     while True:
         try:
-            log.info(f"[{label}] ⏳ Запуск задачи")
+            log.debug(f"[{label}] ⏳ Запуск задачи")
             await coro_func()
-            log.info(f"[{label}] ⏸ Следующий запуск через {interval_sec} сек")
+            log.debug(f"[{label}] ⏸ Следующий запуск через {interval_sec} сек")
             await asyncio.sleep(interval_sec)
         except Exception:
             log.exception(f"[{label}] ❌ Ошибка — перезапуск через 5 секунд")
@@ -76,7 +77,8 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
-        loop_with_interval(run_emasnapshot_worker, "EMASNAPSHOT_WORKER", 120, initial_delay=60),
+        loop_with_interval(run_emasnapshot_worker, "EMASNAPSHOT_WORKER", 180, initial_delay=60),
+        loop_with_interval(run_snapshot_aggregator, "SNAPSHOT_AGGREGATOR", 60, initial_delay=90),
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 300, initial_delay=120),
         loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
         loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 300, initial_delay=240),
