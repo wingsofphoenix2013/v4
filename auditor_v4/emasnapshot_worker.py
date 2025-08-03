@@ -93,7 +93,7 @@ async def run_emasnapshot_worker():
             WHERE strategy_id = ANY($1)
               AND status = 'closed'
               AND emasnapshot_checked = false
-            LIMIT 50
+            LIMIT 200
         """, strategy_ids)
 
     log.info(f"📦 Найдено позиций для обработки: {len(positions)}")
