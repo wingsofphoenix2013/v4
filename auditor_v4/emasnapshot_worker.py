@@ -4,6 +4,7 @@ import asyncio
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import infra
 
@@ -67,26 +68,36 @@ async def run_emasnapshot_worker():
     log.info(f"📦 Найдено позиций для обработки: {len(positions)}")
 
     positions = positions[:200]
-
     sem = asyncio.Semaphore(10)
+    completed_tfs = defaultdict(set)  # {position_id: set of completed tfs}
     tasks = []
 
     # Обрабатываем каждую позицию по всем таймфреймам
     for tf in ("m5", "m15", "h1"):
-        tasks.extend([process_position_for_tf(row, tf, sem) for row in positions])
+        tasks.extend([
+            process_position_for_tf(row, tf, sem, completed_tfs)
+            for row in positions
+        ])
 
     await asyncio.gather(*tasks)
 
-    # Отмечаем позиции как обработанные (после всех ТФ)
+    # Отмечаем только те позиции, которые обработаны по всем трём ТФ
+    complete_ids = [
+        pid for pid, tfs in completed_tfs.items()
+        if {"m5", "m15", "h1"}.issubset(tfs)
+    ]
+
     async with infra.pg_pool.acquire() as conn:
         await conn.executemany("""
             UPDATE positions_v4
             SET emasnapshot_checked = true
             WHERE id = $1
-        """, [(row["id"],) for row in positions])
-        
+        """, [(pid,) for pid in complete_ids])
+
+    log.info(f"✅ Отмечено как обработанных: {len(complete_ids)} позиций")
+            
 # 🔸 Обработка одной позиции под заданный таймфрейм (m5, m15, h1)
-async def process_position_for_tf(position, tf: str, sem):
+async def process_position_for_tf(position, tf: str, sem, completed_tfs):
     async with sem:
         try:
             import infra  # отложенный импорт
@@ -181,6 +192,9 @@ async def process_position_for_tf(position, tf: str, sem):
                 """, strategy_id, direction, emasnapshot_dict_id,
                      num_trades, num_wins, num_losses,
                      total_pnl, avg_pnl, winrate, base_rating)
+
+                # Отмечаем, что позиция успешно обработана по этому таймфрейму
+                completed_tfs[position["id"]].add(tf)
 
                 log.info(f"✅ [{tf}] Обновлена статистика для позиции id={position['id']} (flag_id={emasnapshot_dict_id})")
 
