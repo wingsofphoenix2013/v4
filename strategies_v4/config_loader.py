@@ -277,3 +277,83 @@ async def listen_strategy_update_stream():
                         log.exception("❌ Ошибка обработки записи потока")
         except Exception:
             log.exception("❌ Ошибка чтения из потока")
+            
+# 🔸 Глобальный кэш
+_entry_whitelist = {
+    "long": {"snapshots": [], "patterns": []},
+    "short": {"snapshots": [], "patterns": []}
+}
+
+# 🔸 Геттер
+def get_entry_whitelist() -> dict:
+    return _entry_whitelist
+
+# 🔸 Обновление кэша entry whitelist (раз в 2 минуты)
+log = logging.getLogger("ENTRY_WHITELIST")
+
+async def entry_whitelist_refresher_loop():
+    while True:
+        try:
+            log.debug("🔄 Обновление entry whitelist...")
+            result = await _load_entry_whitelist()
+            _entry_whitelist["long"] = result["long"]
+            _entry_whitelist["short"] = result["short"]
+            log.info("✅ Entry whitelist обновлён")
+        except Exception:
+            log.exception("❌ Ошибка обновления entry whitelist")
+
+        await asyncio.sleep(120)
+
+# 🔸 Запрос в БД и построение кэша
+async def _load_entry_whitelist() -> dict:
+    pool = infra.pg_pool
+    if not pool:
+        raise RuntimeError("❌ PostgreSQL пул не инициализирован")
+
+    result = {
+        "long": {"snapshots": [], "patterns": []},
+        "short": {"snapshots": [], "patterns": []}
+    }
+
+    try:
+        async with pool.acquire() as conn:
+            rows_snapshots = await conn.fetch("""
+                SELECT direction, emasnapshot_dict_id, num_trades, winrate
+                FROM positions_emasnapshot_m5_stat
+                WHERE direction IN ('long', 'short')
+            """)
+
+            rows_patterns = await conn.fetch("""
+                SELECT direction, pattern_id, num_trades, winrate
+                FROM positions_emapattern_m5_stat
+                WHERE direction IN ('long', 'short')
+            """)
+
+            for direction in ["long", "short"]:
+                # 🔹 Snapshots
+                filtered_snap = [r for r in rows_snapshots if r["direction"] == direction]
+                filtered_snap.sort(key=lambda r: -r["num_trades"])
+                limit = int(len(filtered_snap) * 0.75)
+                allowed_snap = {
+                    r["emasnapshot_dict_id"]
+                    for r in filtered_snap[:limit]
+                    if r["winrate"] > 0.6
+                }
+                result[direction]["snapshots"] = list(allowed_snap)
+
+                # 🔹 Patterns
+                filtered_pat = [r for r in rows_patterns if r["direction"] == direction]
+                filtered_pat.sort(key=lambda r: -r["num_trades"])
+                limit = int(len(filtered_pat) * 0.75)
+                allowed_pat = {
+                    r["pattern_id"]
+                    for r in filtered_pat[:limit]
+                    if r["winrate"] > 0.6
+                }
+                result[direction]["patterns"] = list(allowed_pat)
+
+    except Exception:
+        log.exception("❌ Ошибка загрузки whitelist из БД")
+        raise
+
+    return result
