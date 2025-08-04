@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 
 import infra
-from core_io import save_snapshot, get_snapshot_id, get_pattern_id
+from core_io import save_snapshot
 
 
 log = logging.getLogger("EMA_SNAPSHOT_WORKER")
