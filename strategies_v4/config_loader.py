@@ -299,6 +299,12 @@ async def entry_whitelist_refresher_loop():
             _entry_whitelist["long"] = result["long"]
             _entry_whitelist["short"] = result["short"]
             log.info("✅ Entry whitelist обновлён")
+
+            log.debug(f"📌 long.snapshots: {sorted(result['long']['snapshots'])}")
+            log.debug(f"📌 long.patterns:  {sorted(result['long']['patterns'])}")
+            log.debug(f"📌 short.snapshots: {sorted(result['short']['snapshots'])}")
+            log.debug(f"📌 short.patterns:  {sorted(result['short']['patterns'])}")
+
         except Exception:
             log.exception("❌ Ошибка обновления entry whitelist")
 
@@ -318,39 +324,46 @@ async def _load_entry_whitelist() -> dict:
     try:
         async with pool.acquire() as conn:
             rows_snapshots = await conn.fetch("""
-                SELECT direction, emasnapshot_dict_id, num_trades, winrate
+                SELECT direction, emasnapshot_dict_id AS id, num_trades, winrate
                 FROM positions_emasnapshot_m5_stat
                 WHERE direction IN ('long', 'short')
             """)
 
             rows_patterns = await conn.fetch("""
-                SELECT direction, pattern_id, num_trades, winrate
+                SELECT direction, pattern_id AS id, num_trades, winrate
                 FROM positions_emapattern_m5_stat
                 WHERE direction IN ('long', 'short')
             """)
 
             for direction in ["long", "short"]:
-                # 🔹 Snapshots
-                filtered_snap = [r for r in rows_snapshots if r["direction"] == direction]
-                filtered_snap.sort(key=lambda r: -r["num_trades"])
-                limit = int(len(filtered_snap) * 0.75)
-                allowed_snap = {
-                    r["emasnapshot_dict_id"]
-                    for r in filtered_snap[:limit]
-                    if r["winrate"] > 0.6
-                }
-                result[direction]["snapshots"] = list(allowed_snap)
+                for rows, key in [
+                    (rows_snapshots, "snapshots"),
+                    (rows_patterns, "patterns")
+                ]:
+                    grouped: dict[int, dict] = {}
 
-                # 🔹 Patterns
-                filtered_pat = [r for r in rows_patterns if r["direction"] == direction]
-                filtered_pat.sort(key=lambda r: -r["num_trades"])
-                limit = int(len(filtered_pat) * 0.75)
-                allowed_pat = {
-                    r["pattern_id"]
-                    for r in filtered_pat[:limit]
-                    if r["winrate"] > 0.6
-                }
-                result[direction]["patterns"] = list(allowed_pat)
+                    for r in rows:
+                        if r["direction"] != direction:
+                            continue
+
+                        _id = r["id"]
+                        grouped.setdefault(_id, {"total_trades": 0, "weighted_sum": 0.0})
+
+                        grouped[_id]["total_trades"] += r["num_trades"]
+                        grouped[_id]["weighted_sum"] += r["winrate"] * r["num_trades"]
+
+                    enriched = []
+                    for _id, stats in grouped.items():
+                        total = stats["total_trades"]
+                        if total == 0:
+                            continue
+                        weighted_winrate = stats["weighted_sum"] / total
+                        enriched.append((_id, total, weighted_winrate))
+
+                    enriched.sort(key=lambda x: -x[1])  # по убыванию total_trades
+                    cutoff = int(len(enriched) * 0.75)
+                    top_ids = [eid for (eid, _, win) in enriched[:cutoff] if win > 0.6]
+                    result[direction][key] = top_ids
 
     except Exception:
         log.exception("❌ Ошибка загрузки whitelist из БД")
