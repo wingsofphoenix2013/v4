@@ -16,6 +16,7 @@ VALID_INTERVALS = {"m5", "m15", "h1"}
 
 # Ожидания по (symbol, interval, open_time)
 pending_snapshots = {}
+snapshot_dict = {}
 
 EPSILON = 0.0005  # 0.05%
 
@@ -42,6 +43,26 @@ def group_by_proximity(items: list[tuple[str, float]], eps=EPSILON) -> list[str]
             ref_value = value
     result.append("=".join(sorted(group, key=sort_key)))
     return result
+    
+# 🔸 Загрузка словаря снапшотов из БД
+async def load_snapshot_dict():
+    global snapshot_dict
+
+    query = """
+        SELECT id, ordering, pattern_id
+        FROM oracle_emasnapshot_dict
+    """
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(query)
+
+    snapshot_dict = {
+        row["ordering"]: (row["id"], row["pattern_id"])
+        for row in rows
+    }
+
+    log.info(f"📚 Загружено вариантов снапшотов: {len(snapshot_dict)}")
+    
 # 🔸 Построение, логирование и сохранение snapshot с публикацией в Redis
 async def build_snapshot(symbol: str, interval: str, open_time: str):
     redis = infra.redis_client
@@ -68,29 +89,27 @@ async def build_snapshot(symbol: str, interval: str, open_time: str):
             ema_value = float(ema_series[0][1])
             items.append((ema_name.upper(), ema_value))
 
-        # 🔍 Вывод всех значений перед сортировкой
         log.debug(f"📋 Значения EMA и PRICE для {symbol} | {interval} | {open_time}:")
         for name, value in sorted(items, key=lambda x: -x[1]):
             log.debug(f"    • {name:<6} = {value}")
 
-        # 📐 Формируем snapshot с учётом слипания
         ordered = group_by_proximity(items)
         snapshot_str = " > ".join(ordered)
 
         log.debug(f"📸 EMA SNAPSHOT: {symbol} | {interval} | {open_time}")
         log.debug(f"    ➤ {snapshot_str}")
 
+        # 🔹 Поиск snapshot_id и pattern_id через словарь
+        if snapshot_str not in snapshot_dict:
+            log.warning(f"❌ Не найден snapshot в словаре: {snapshot_str}")
+            return
+
+        snapshot_id, pattern_id = snapshot_dict[snapshot_str]
+
         # 💾 Сохраняем в БД
         await save_snapshot(symbol, interval, open_time, snapshot_str)
-        snapshot_id = await get_snapshot_id(snapshot_str)
 
-        # 🧩 Выбираем top-3 значений и нормализуем как pattern
-        reduced = sorted(items, key=lambda x: -x[1])[:3]
-        grouped = group_by_proximity(reduced)
-        pattern_str = " > ".join(grouped)
-        pattern_id = await get_pattern_id(pattern_str)
-
-        # 📡 Публикуем в Redis JSON с TTL
+        # 📡 Публикуем в Redis
         snapshot_key = f"snapshot:{symbol}:{interval}"
         ttl_by_interval = {
             "m5": 360,
@@ -142,6 +161,9 @@ async def handle_ema_snapshot_message(message: dict):
 async def run_ema_snapshot_worker():
     redis = infra.redis_client
     stream_name = "indicator_stream"
+
+    # 🔹 Загрузка словаря снапшотов из БД
+    await load_snapshot_dict()
 
     try:
         stream_info = await redis.xinfo_stream(stream_name)
