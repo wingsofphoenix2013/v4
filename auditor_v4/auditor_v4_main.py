@@ -16,6 +16,7 @@ from core_io import pg_task, finmonitor_task, treasury_task
 from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
 from redis_io import fix_missing_ts_points
 from emasnapshot_worker import run_emasnapshot_worker
+from snapshot_aggregator_worker import run_snapshot_aggregator_worker
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("AUDITOR_MAIN")
@@ -77,6 +78,7 @@ async def main():
         run_safe_loop(finmonitor_task, "FINMONITOR"),
         run_safe_loop(treasury_task, "TREASURY"),
         loop_with_interval(run_emasnapshot_worker, "EMASNAPSHOT_WORKER", 60, initial_delay=90),
+        loop_with_interval(run_snapshot_aggregator_worker, "SNAPSHOT_AGGREGATOR", 30, initial_delay=120),
         loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 300, initial_delay=120),
         loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
         loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 300, initial_delay=240),
