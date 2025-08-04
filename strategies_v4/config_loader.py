@@ -300,10 +300,10 @@ async def entry_whitelist_refresher_loop():
             _entry_whitelist["short"] = result["short"]
             log.info("✅ Entry whitelist обновлён")
 
-            log.info(f"📌 long.snapshots: {sorted(result['long']['snapshots'])}")
-            log.info(f"📌 long.patterns:  {sorted(result['long']['patterns'])}")
-            log.info(f"📌 short.snapshots: {sorted(result['short']['snapshots'])}")
-            log.info(f"📌 short.patterns:  {sorted(result['short']['patterns'])}")
+            log.debug(f"📌 long.snapshots: {sorted(result['long']['snapshots'])}")
+            log.debug(f"📌 long.patterns:  {sorted(result['long']['patterns'])}")
+            log.debug(f"📌 short.snapshots: {sorted(result['short']['snapshots'])}")
+            log.debug(f"📌 short.patterns:  {sorted(result['short']['patterns'])}")
 
         except Exception:
             log.exception("❌ Ошибка обновления entry whitelist")
