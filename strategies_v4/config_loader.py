@@ -347,10 +347,12 @@ async def _load_entry_whitelist() -> dict:
                             continue
 
                         _id = r["id"]
-                        grouped.setdefault(_id, {"total_trades": 0, "weighted_sum": 0.0})
+                        num_trades = int(r["num_trades"])
+                        winrate = float(r["winrate"])
 
-                        grouped[_id]["total_trades"] += r["num_trades"]
-                        grouped[_id]["weighted_sum"] += r["winrate"] * r["num_trades"]
+                        grouped.setdefault(_id, {"total_trades": 0, "weighted_sum": 0.0})
+                        grouped[_id]["total_trades"] += num_trades
+                        grouped[_id]["weighted_sum"] += winrate * num_trades
 
                     enriched = []
                     for _id, stats in grouped.items():
