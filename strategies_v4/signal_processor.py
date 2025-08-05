@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from infra import infra, get_price
-from config_loader import config, get_entry_whitelist
+from config_loader import config
 from position_state_loader import position_registry
 from position_handler import Target, full_protect_stop, apply_sl_replacement, full_reverse_stop
 from log_helpers import route_protect
@@ -180,7 +180,6 @@ async def process_signal(data: dict):
         context = {
             "redis": infra.redis_client,
             "strategy": strategy,
-            "entry_whitelist": get_entry_whitelist()
         }
         result = await strategy_instance.validate_signal(data, context)
 
