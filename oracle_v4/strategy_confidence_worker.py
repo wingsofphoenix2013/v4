@@ -56,7 +56,7 @@ async def run_strategy_confidence_worker():
         log.warning(f"⚠️ Не удалось получить last ID из stream: {e}")
         last_id = "$"
 
-    log.info(f"📡 Подписка на Redis Stream: {STREAM_NAME}")
+    log.debug(f"📡 Подписка на Redis Stream: {STREAM_NAME}")
 
     while True:
         try:
@@ -90,20 +90,20 @@ async def handle_message(msg: dict):
         log.warning(f"⚠️ Не удалось распарсить список стратегий: {strategies_raw}")
         return
 
-    log.info(f"📩 Принято сообщение: table = {table}, strategies = {strategy_ids}")
+    log.debug(f"📩 Принято сообщение: table = {table}, strategies = {strategy_ids}")
 
     async with infra.pg_pool.acquire() as conn:
         for strategy_id in strategy_ids:
             if "emasnapshot" in table and "pattern" not in table:
-                log.info(f"🔍 Обработка snapshot-таблицы: {table} | strategy_id={strategy_id}")
+                log.debug(f"🔍 Обработка snapshot-таблицы: {table} | strategy_id={strategy_id}")
                 await process_snapshot_confidence(conn, table, strategy_id)
 
             elif "emapattern" in table:
-                log.info(f"🔍 Обработка pattern-таблицы: {table} | strategy_id={strategy_id}")
+                log.debug(f"🔍 Обработка pattern-таблицы: {table} | strategy_id={strategy_id}")
                 await process_pattern_confidence(conn, table, strategy_id)
 
             else:
-                log.info(f"⏭ Пропуск: тип таблицы {table} пока не поддерживается")
+                log.debug(f"⏭ Пропуск: тип таблицы {table} пока не поддерживается")
 
 # 🔸 Расчёт и логирование confidence_score V3 для snapshot-таблицы
 async def process_snapshot_confidence(conn, table: str, strategy_id: int):
@@ -116,7 +116,7 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     """, strategy_id)
 
     if not rows:
-        log.info(f"⏭ Пропуск: нет строк в {table} для strategy_id={strategy_id}")
+        log.debug(f"⏭ Пропуск: нет строк в {table} для strategy_id={strategy_id}")
         return
 
     # 🔹 Глобальный winrate и total_trades
@@ -165,7 +165,7 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     fragmentation = fragmented / len(trade_counts)
     frag_modifier = max(0.3, (1 - fragmentation) ** 0.7)
 
-    log.info(f"📊 strategy={strategy_id} tf={tf} → T={threshold_n} by {method}, frag={fragmentation:.3f}")
+    log.debug(f"📊 strategy={strategy_id} tf={tf} → T={threshold_n} by {method}, frag={fragmentation:.3f}")
 
     # 🔹 Первый проход — рассчитываем confidence_raw
     raw_scores = []
@@ -242,7 +242,7 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
     """, strategy_id)
 
     if not rows:
-        log.info(f"⏭ Пропуск: нет строк в {table} для strategy_id={strategy_id}")
+        log.debug(f"⏭ Пропуск: нет строк в {table} для strategy_id={strategy_id}")
         return
 
     global_data = await conn.fetchrow(f"""
@@ -289,7 +289,7 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
     fragmentation = fragmented / len(trade_counts)
     frag_modifier = max(0.3, (1 - fragmentation) ** 0.7)
 
-    log.info(f"📊 strategy={strategy_id} tf={tf} (pattern) → T={threshold_n} by {method}, frag={fragmentation:.3f}")
+    log.debug(f"📊 strategy={strategy_id} tf={tf} (pattern) → T={threshold_n} by {method}, frag={fragmentation:.3f}")
 
     # 🔹 Плотность по паттернам
     snap_table = table.replace("pattern", "snapshot")
@@ -407,7 +407,7 @@ async def run_strategy_confidence_worker():
         log.warning(f"⚠️ Не удалось получить last ID из stream: {e}")
         last_id = "$"
 
-    log.info(f"📡 Подписка на Redis Stream: {STREAM_NAME}")
+    log.debug(f"📡 Подписка на Redis Stream: {STREAM_NAME}")
 
     while True:
         try:
