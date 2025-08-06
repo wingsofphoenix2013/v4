@@ -19,6 +19,7 @@ from volume_worker import run_volume_worker
 from ema_position_worker import run_ema_position_worker
 from ema_snapshot_worker import run_ema_snapshot_worker
 from strategy_confidence_worker import run_strategy_confidence_worker
+from voting_engine import run_voting_engine
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -64,6 +65,7 @@ async def main():
         run_safe_loop(run_ema_position_worker, "EMA_POSITION_WORKER"),
         run_safe_loop(run_ema_snapshot_worker, "EMA_SNAPSHOT_WORKER"),
         run_safe_loop(run_strategy_confidence_worker, "STRATEGY_CONFIDENCE_WORKER"),
+        run_safe_loop(run_voting_engine, "VOTING_ENGINE"),
     )
 
 
