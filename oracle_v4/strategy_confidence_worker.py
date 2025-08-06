@@ -19,7 +19,7 @@ def extract_tf_from_table_name(table: str) -> str:
         return parts[-2]
     raise ValueError(f"❌ Не удалось определить таймфрейм из имени таблицы: {table}")
 
-# 🔸 Публикация доверия в Redis
+# 🔸 Публикация доверия в Redis (расширенная)
 async def publish_confidence_to_redis(
     redis,
     strategy_id: int,
@@ -33,10 +33,13 @@ async def publish_confidence_to_redis(
 ):
     key = f"confidence:{strategy_id}:{direction}:{tf}:{object_type}:{object_id}"
 
+    open_allowed = winrate > 0.5 and confidence_normalized > 1.0
+
     value = {
         "winrate": round(winrate, 6),
         "confidence_raw": round(confidence_raw, 6),
-        "confidence_score": round(confidence_normalized, 6)  # для совместимости
+        "confidence_score": round(confidence_normalized, 6),
+        "open_allowed": open_allowed
     }
 
     await redis.set(key, json.dumps(value))
