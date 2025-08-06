@@ -39,7 +39,7 @@ async def run_voting_engine():
             log.exception("❌ Ошибка чтения из Redis Stream")
             await asyncio.sleep(1)
 
-# 🔸 Обработка запроса голосования (ШАГ 3 — получаем доверие)
+# 🔸 Обработка запроса голосования (Шаг 4 — голосование)
 async def handle_voting_request(msg: dict):
     try:
         strategy_id = int(msg["strategy_id"])
@@ -65,14 +65,11 @@ async def handle_voting_request(msg: dict):
                 data = json.loads(val)
                 snapshot_id = data["snapshot_id"]
                 pattern_id = data["pattern_id"]
-
                 snapshots[tf] = {
                     "snapshot_id": snapshot_id,
                     "pattern_id": pattern_id
                 }
-
                 log.info(f"🔍 {tf}: snapshot_id={snapshot_id}, pattern_id={pattern_id}")
-
             except Exception:
                 log.warning(f"❌ Ошибка парсинга значения {key}")
                 continue
@@ -81,12 +78,11 @@ async def handle_voting_request(msg: dict):
             log.warning(f"⚠️ log_uid={log_uid} → ни одного объекта не найдено")
             return
 
-        # 🔹 Теперь получаем confidence и winrate
+        # 🔹 Читаем confidence и winrate
         votes_raw = {}
-
         for tf, obj in snapshots.items():
             for obj_type in ["snapshot", "pattern"]:
-                object_id = obj[f"{obj_type}_id"] if f"{obj_type}_id" in obj else obj.get(f"{obj_type}_id")
+                object_id = obj.get(f"{obj_type}_id") or obj.get(f"{obj_type}_id")
                 if object_id is None:
                     continue
 
@@ -119,9 +115,76 @@ async def handle_voting_request(msg: dict):
             log.warning(f"⚠️ log_uid={log_uid} → нет данных для голосования")
             return
 
-        log.debug(f"📋 Итоговый набор данных для голосования: {json.dumps(votes_raw, indent=2)}")
+        # 🔹 Голосование
+        votes = []
+        total_score = 0.0
+        veto_count = 0
+        anti_veto_count = 0
 
-        # (дальше — следующий шаг: голосование)
+        for source, v in votes_raw.items():
+            winrate = v["winrate"]
+            confidence = v["confidence_raw"]
+
+            if winrate is None or confidence is None:
+                continue
+
+            if winrate < 0.35:
+                vote = -1.25
+            elif winrate < 0.45:
+                vote = -1.0
+            elif winrate < 0.55:
+                vote = 0.0
+            elif winrate < 0.65:
+                vote = 1.0
+            else:
+                vote = 1.25
+
+            tf_key = source.split("_")[1]
+            weight = TF_WEIGHTS.get(tf_key, 1.0)
+            contribution = vote * confidence * weight
+
+            veto = winrate < 0.35 and confidence >= 0.9
+            anti_veto = winrate > 0.65 and confidence >= 0.7
+
+            if veto:
+                veto_count += 1
+            if anti_veto:
+                anti_veto_count += 1
+
+            votes.append({
+                "source": source,
+                "object_id": v["object_id"],
+                "winrate": winrate,
+                "confidence": confidence,
+                "weight": weight,
+                "vote": vote,
+                "contribution": contribution,
+                "veto": veto,
+                "anti_veto": anti_veto
+            })
+
+            total_score += contribution
+            log.debug(f"🗳️ {source} | vote={vote:+.2f} | conf={confidence:.3f} | contrib={contribution:.3f} | veto={veto} | anti={anti_veto}")
+
+        net_veto = veto_count - anti_veto_count
+
+        if net_veto > 0:
+            decision = "reject"
+            log.info(f"❌ Принудительное отклонение: {veto_count} вето против {anti_veto_count} анти-вето")
+        else:
+            if total_score >= 2:
+                decision = "open"
+            elif total_score <= -2:
+                decision = "reject"
+            else:
+                decision = "neutral"
+
+            if veto_count > 0 or anti_veto_count > 0:
+                log.info(f"⚖️ Баланс вето: {veto_count} vs анти-вето: {anti_veto_count} → голосуем по score")
+
+        log.info(f"✅ Голосование log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
+
+        # TODO: сохранение в БД и публикация в Redis
 
     except Exception:
         log.exception("❌ Ошибка обработки запроса голосования")
