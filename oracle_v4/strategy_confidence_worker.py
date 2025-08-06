@@ -259,7 +259,7 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
             SELECT d.pattern_id, COUNT(*) AS num_snaps,
                    SUM(s.num_trades)::float AS total_trades
             FROM snaps d
-            JOIN {snap_table} s ON d.emasnapshot_dict_id = s.emasnapshot_dict_id
+            JOIN {snap_table} s ON d.id = s.emasnapshot_dict_id
             WHERE s.strategy_id = $1
             GROUP BY d.pattern_id
         ), max_avg AS (
