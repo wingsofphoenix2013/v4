@@ -83,31 +83,41 @@ async def handle_voting_request(msg: dict):
         veto_applied = False
         anti_veto_applied = False
 
+        log.info(f"📥 Новый запрос голосования log_uid={log_uid} | strategy={strategy_id} | direction={direction} | tf={tf}")
+
         for tf_key in ["m5", "m15", "h1"]:
             for obj_type in ["snapshot", "pattern"]:
-                # 🔹 Получение актуального ID объекта
+                source = f"{obj_type}_{tf_key}"
+
+                # 🔹 Получаем ID объекта из snapshot:<strategy_id>:<tf>
                 snap_key = f"snapshot:{strategy_id}:{tf_key}"
                 val = await redis.get(snap_key)
+
                 if not val:
+                    log.warning(f"⛔ [{source}] Нет ключа {snap_key}")
                     continue
 
                 try:
                     data = json.loads(val)
                     object_id = data["snapshot_id"] if obj_type == "snapshot" else data["pattern_id"]
                 except Exception:
+                    log.warning(f"⛔ [{source}] Не удалось извлечь object_id из {snap_key}")
                     continue
 
-                # 🔹 Чтение доверия из Redis
+                # 🔹 Получаем confidence
                 conf_key = f"confidence:{strategy_id}:{direction}:{tf_key}:{obj_type}:{object_id}"
                 conf_raw = await redis.get(conf_key)
+
                 if not conf_raw:
+                    log.warning(f"⛔ [{source}] Нет ключа {conf_key}")
                     continue
 
                 try:
                     conf = json.loads(conf_raw)
-                    winrate = conf.get("winrate", 0)
-                    confidence = conf.get("confidence_raw", 0)
+                    winrate = conf.get("winrate", 0.0)
+                    confidence = conf.get("confidence_raw", 0.0)
                 except Exception:
+                    log.warning(f"⛔ [{source}] Некорректный JSON в {conf_key}")
                     continue
 
                 vote = classify_vote(winrate)
@@ -116,7 +126,7 @@ async def handle_voting_request(msg: dict):
                 contribution = vote * confidence * weight
 
                 votes.append({
-                    "source": f"{obj_type}_{tf_key}",
+                    "source": source,
                     "winrate": winrate,
                     "confidence": confidence,
                     "weight": weight,
@@ -130,7 +140,11 @@ async def handle_voting_request(msg: dict):
                 veto_applied |= veto
                 anti_veto_applied |= anti_veto
 
+                log.info(f"📊 [{source}] winrate={winrate:.3f} | conf={confidence:.3f} | vote={vote:+d} | contrib={contribution:.3f} | veto={veto} | anti={anti_veto}")
+
+        # 🔹 Обработка вето/анти-вето
         if veto_applied and anti_veto_applied:
+            log.info(f"⚖️ Вето и анти-вето аннулированы")
             veto_applied = False
 
         if veto_applied:
@@ -142,6 +156,9 @@ async def handle_voting_request(msg: dict):
         else:
             decision = "neutral"
 
+        log.info(f"✅ Решение по log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
+
+        # 🔸 Лог в БД
         async with infra.pg_pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO strategy_voting_log (
@@ -151,6 +168,7 @@ async def handle_voting_request(msg: dict):
             """, log_uid, strategy_id, direction, tf,
                  total_score, decision, veto_applied, json.dumps(votes))
 
+        # 🔸 Ответ в Redis
         await redis.xadd(RESPONSE_STREAM, {
             "log_uid": log_uid,
             "strategy_id": strategy_id,
@@ -159,8 +177,6 @@ async def handle_voting_request(msg: dict):
             "veto_applied": json.dumps(veto_applied),
             "votes": json.dumps(votes)
         })
-
-        log.info(f"✅ Голосование log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
 
     except Exception:
         log.exception("❌ Ошибка обработки голосования")
