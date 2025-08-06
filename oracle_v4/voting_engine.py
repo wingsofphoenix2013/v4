@@ -9,7 +9,13 @@ import infra
 log = logging.getLogger("VOTING_ENGINE")
 
 REQUEST_STREAM = "strategy_voting_request"
+RESPONSE_STREAM = "strategy_voting_answer"
 
+TF_WEIGHTS = {
+    "m5": 1.0,
+    "m15": 1.0,
+    "h1": 1.0
+}
 
 # 🔸 Основной воркер
 async def run_voting_engine():
