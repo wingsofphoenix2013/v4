@@ -18,6 +18,29 @@ def extract_tf_from_table_name(table: str) -> str:
     if len(parts) >= 3:
         return parts[-2]
     raise ValueError(f"❌ Не удалось определить таймфрейм из имени таблицы: {table}")
+
+# 🔸 Публикация доверия в Redis
+async def publish_confidence_to_redis(
+    redis,
+    strategy_id: int,
+    direction: str,
+    tf: str,
+    object_type: str,  # 'snapshot' или 'pattern'
+    object_id: int,
+    winrate: float,
+    confidence_raw: float,
+    confidence_normalized: float
+):
+    key = f"confidence:{strategy_id}:{direction}:{tf}:{object_type}:{object_id}"
+
+    value = {
+        "winrate": round(winrate, 6),
+        "confidence_raw": round(confidence_raw, 6),
+        "confidence_score": round(confidence_normalized, 6)  # для совместимости
+    }
+
+    await redis.set(key, json.dumps(value))
+    log.debug(f"📡 Redis SET {key} = {value}")
     
 # 🔸 Основной воркер
 async def run_strategy_confidence_worker():
@@ -78,9 +101,6 @@ async def handle_message(msg: dict):
 
             else:
                 log.info(f"⏭ Пропуск: тип таблицы {table} пока не поддерживается")
-
-import math
-from statistics import median
 
 # 🔸 Расчёт и логирование confidence_score V3 для snapshot-таблицы
 async def process_snapshot_confidence(conn, table: str, strategy_id: int):
@@ -163,10 +183,11 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     # 🔹 Вычисляем медиану по стратегии
     median_score = median(raw_scores) or 1e-6
 
-    # 🔹 Второй проход — логирование и обновление
-    for i, (score_raw) in enumerate(raw_scores):
+    # 🔹 Второй проход — логирование, обновление и Redis
+    for i, score_raw in enumerate(raw_scores):
         sid, direction, n, w = objects[i]
         score_norm = score_raw / median_score
+        winrate = w / n if n > 0 else 0.0
 
         # ✅ Обновляем агрегатную таблицу
         await conn.execute(f"""
@@ -176,6 +197,13 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
                 confidence_score_normalized = $2
             WHERE strategy_id = $3 AND direction = $4 AND emasnapshot_dict_id = $5
         """, score_raw, score_norm, strategy_id, direction, sid)
+
+        # ✅ Публикация в Redis
+        await publish_confidence_to_redis(
+            infra.redis_client,
+            strategy_id, direction, tf, "snapshot", sid,
+            winrate, score_raw, score_norm
+        )
 
         # ✅ Запись в лог
         await conn.execute("""
@@ -199,6 +227,7 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
              score_raw, score_raw, score_norm)
 
         log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} raw={score_raw:.4f} norm={score_norm:.4f}")
+        
 # 🔸 Расчёт и логирование confidence_score V3 для pattern-таблицы
 async def process_pattern_confidence(conn, table: str, strategy_id: int):
     tf = extract_tf_from_table_name(table)
@@ -319,10 +348,11 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
 
     median_score = median(raw_scores) or 1e-6
 
-    # 🔹 Второй проход — обновление + лог
+    # 🔹 Второй проход — обновление, логирование и Redis
     for i, score_raw in enumerate(raw_scores):
         pid, direction, n, w, density = objects[i]
         score_norm = score_raw / median_score
+        winrate = w / n if n > 0 else 0.0
 
         # ✅ Обновление агрегатной таблицы
         await conn.execute(f"""
@@ -332,6 +362,13 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
                 confidence_score_normalized = $2
             WHERE strategy_id = $3 AND direction = $4 AND pattern_id = $5
         """, score_raw, score_norm, strategy_id, direction, pid)
+
+        # ✅ Публикация в Redis
+        await publish_confidence_to_redis(
+            infra.redis_client,
+            strategy_id, direction, tf, "pattern", pid,
+            winrate, score_raw, score_norm
+        )
 
         # ✅ Запись в лог
         await conn.execute("""
@@ -355,6 +392,7 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
              score_raw, score_raw, score_norm)
 
         log.debug(f"[OK] strategy={strategy_id} pattern_id={pid} raw={score_raw:.4f} norm={score_norm:.4f}")
+
 # 🔸 Основной воркер
 async def run_strategy_confidence_worker():
     redis = infra.redis_client
