@@ -39,7 +39,7 @@ async def run_voting_engine():
             log.exception("❌ Ошибка чтения из Redis Stream")
             await asyncio.sleep(1)
 
-# 🔸 Обработка запроса голосования (ШАГ 2 — по всем ТФ)
+# 🔸 Обработка запроса голосования (ШАГ 3 — получаем доверие)
 async def handle_voting_request(msg: dict):
     try:
         strategy_id = int(msg["strategy_id"])
@@ -81,8 +81,47 @@ async def handle_voting_request(msg: dict):
             log.warning(f"⚠️ log_uid={log_uid} → ни одного объекта не найдено")
             return
 
-        # пока только логика получения объектов, дальше будет голосование
-        log.debug(f"📦 Готово к голосованию: {snapshots}")
+        # 🔹 Теперь получаем confidence и winrate
+        votes_raw = {}
+
+        for tf, obj in snapshots.items():
+            for obj_type in ["snapshot", "pattern"]:
+                object_id = obj[f"{obj_type}_id"] if f"{obj_type}_id" in obj else obj.get(f"{obj_type}_id")
+                if object_id is None:
+                    continue
+
+                conf_key = f"confidence:{strategy_id}:{direction}:{tf}:{obj_type}:{object_id}"
+                raw = await redis.get(conf_key)
+
+                if not raw:
+                    log.warning(f"⛔ Нет confidence ключа: {conf_key}")
+                    continue
+
+                try:
+                    conf = json.loads(raw)
+                    winrate = conf.get("winrate")
+                    confidence = conf.get("confidence_raw")
+
+                    source_key = f"{obj_type}_{tf}"
+                    votes_raw[source_key] = {
+                        "object_id": object_id,
+                        "winrate": winrate,
+                        "confidence_raw": confidence
+                    }
+
+                    log.info(f"📦 {source_key}: winrate={winrate:.3f}, conf={confidence:.3f}")
+
+                except Exception:
+                    log.warning(f"❌ Ошибка парсинга JSON: {conf_key}")
+                    continue
+
+        if not votes_raw:
+            log.warning(f"⚠️ log_uid={log_uid} → нет данных для голосования")
+            return
+
+        log.debug(f"📋 Итоговый набор данных для голосования: {json.dumps(votes_raw, indent=2)}")
+
+        # (дальше — следующий шаг: голосование)
 
     except Exception:
         log.exception("❌ Ошибка обработки запроса голосования")
