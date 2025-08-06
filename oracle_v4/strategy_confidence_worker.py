@@ -210,7 +210,6 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
     gw = global_data["global_winrate"] or 0.0
     total = global_data["total_trades"] or 0
 
-    # 🔹 Уникальных паттернов
     unique_count = await conn.fetchval(f"""
         SELECT COUNT(DISTINCT pattern_id)
         FROM {table}
@@ -247,33 +246,42 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
 
     log.info(f"📊 strategy={strategy_id} tf={tf} (pattern) → T={threshold_n} by {method}, frag={fragmentation:.3f}")
 
-    # 🔹 Получаем плотность по паттернам через JOIN с snapshot таблицей
+    # 🔹 Плотность по паттернам
     snap_table = table.replace("pattern", "snapshot")
 
     density_rows = await conn.fetch(f"""
-        WITH snaps AS (
-            SELECT pattern_id, emasnapshot_dict_id
+        WITH dict AS (
+            SELECT id AS snapshot_id, pattern_id
             FROM oracle_emasnapshot_dict
             WHERE pattern_id IS NOT NULL
-        ), trade_counts AS (
-            SELECT d.pattern_id, COUNT(*) AS num_snaps,
-                   SUM(s.num_trades)::float AS total_trades
-            FROM snaps d
-            JOIN {snap_table} s ON d.id = s.emasnapshot_dict_id
+        ),
+        joined AS (
+            SELECT d.pattern_id, s.num_trades
+            FROM dict d
+            JOIN {snap_table} s ON s.emasnapshot_dict_id = d.snapshot_id
             WHERE s.strategy_id = $1
-            GROUP BY d.pattern_id
-        ), max_avg AS (
-            SELECT MAX(total_trades / NULLIF(num_snaps, 0)) AS max_density FROM trade_counts
+        ),
+        agg AS (
+            SELECT pattern_id,
+                   COUNT(*) AS num_snaps,
+                   SUM(num_trades)::float AS total_trades
+            FROM joined
+            GROUP BY pattern_id
+        ),
+        max_avg AS (
+            SELECT MAX(total_trades / NULLIF(num_snaps, 0)) AS max_density
+            FROM agg
         )
-        SELECT t.pattern_id,
-               t.total_trades / NULLIF(t.num_snaps, 0) AS avg_density,
-               t.total_trades / NULLIF(t.num_snaps * m.max_density, 0) AS norm_density
-        FROM trade_counts t, max_avg m
+        SELECT
+            a.pattern_id,
+            a.total_trades / NULLIF(a.num_snaps, 0) AS avg_density,
+            a.total_trades / NULLIF(a.num_snaps * m.max_density, 0) AS norm_density
+        FROM agg a, max_avg m
     """, strategy_id)
 
     density_lookup = {r["pattern_id"]: r["norm_density"] for r in density_rows}
 
-    # 🔹 Первый проход — рассчитываем confidence_raw
+    # 🔹 Первый проход — confidence_raw
     raw_scores = []
     objects = []
 
@@ -293,7 +301,7 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
         objects.append((pid, direction, n, w, density_lookup[pid]))
 
     if not raw_scores:
-        log.warning(f"⚠️ Нет валидных строк с плотностью для strategy_id={strategy_id}")
+        log.warning(f"⚠️ Нет подходящих строк с плотностью для strategy_id={strategy_id}")
         return
 
     median_score = median(raw_scores) or 1e-6
@@ -323,7 +331,7 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
              fragmentation, density,
              score_raw, score_raw, score_norm)
 
-        log.debug(f"[OK] strategy={strategy_id} pattern_id={pid} raw={score_raw:.4f} norm={score_norm:.4f}")     
+        log.debug(f"[OK] strategy={strategy_id} pattern_id={pid} raw={score_raw:.4f} norm={score_norm:.4f}")
 # 🔸 Основной воркер
 async def run_strategy_confidence_worker():
     redis = infra.redis_client
