@@ -39,36 +39,50 @@ async def run_voting_engine():
             log.exception("❌ Ошибка чтения из Redis Stream")
             await asyncio.sleep(1)
 
-
-# 🔸 Обработка запроса (ШАГ 1 — только подготовка)
+# 🔸 Обработка запроса голосования (ШАГ 2 — по всем ТФ)
 async def handle_voting_request(msg: dict):
     try:
         strategy_id = int(msg["strategy_id"])
         direction = msg["direction"]
-        tf = msg["tf"]
+        tf_trigger = msg["tf"]
         symbol = msg["symbol"]
         log_uid = msg["log_uid"]
 
-        log.info(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf} | symbol={symbol}")
+        log.info(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf_trigger} | symbol={symbol}")
 
         redis = infra.redis_client
+        snapshots = {}
 
-        # 🔹 Чтение snapshot:<symbol>:<tf>
-        snapshot_key = f"snapshot:{symbol}:{tf}"
-        val = await redis.get(snapshot_key)
+        for tf in ["m5", "m15", "h1"]:
+            key = f"snapshot:{symbol}:{tf}"
+            val = await redis.get(key)
 
-        if not val:
-            log.warning(f"⛔ Не найден ключ {snapshot_key}")
+            if not val:
+                log.warning(f"⛔ Не найден ключ {key}")
+                continue
+
+            try:
+                data = json.loads(val)
+                snapshot_id = data["snapshot_id"]
+                pattern_id = data["pattern_id"]
+
+                snapshots[tf] = {
+                    "snapshot_id": snapshot_id,
+                    "pattern_id": pattern_id
+                }
+
+                log.info(f"🔍 {tf}: snapshot_id={snapshot_id}, pattern_id={pattern_id}")
+
+            except Exception:
+                log.warning(f"❌ Ошибка парсинга значения {key}")
+                continue
+
+        if not snapshots:
+            log.warning(f"⚠️ log_uid={log_uid} → ни одного объекта не найдено")
             return
 
-        try:
-            data = json.loads(val)
-            snapshot_id = data["snapshot_id"]
-            pattern_id = data["pattern_id"]
-            log.info(f"🔍 Найдено: snapshot_id={snapshot_id}, pattern_id={pattern_id}")
-        except Exception:
-            log.warning(f"❌ Ошибка парсинга значения snapshot:{symbol}:{tf}")
-            return
+        # пока только логика получения объектов, дальше будет голосование
+        log.debug(f"📦 Готово к голосованию: {snapshots}")
 
     except Exception:
         log.exception("❌ Ошибка обработки запроса голосования")
