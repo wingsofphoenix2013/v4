@@ -170,7 +170,7 @@ async def handle_voting_request(msg: dict):
             })
 
             total_score += contribution
-            log.debug(f"🗳️ {source} | vote={vote:+.2f} | conf={confidence:.3f} | contrib={contribution:.3f} | veto={veto} | anti={anti_veto}")
+            log.info(f"🗳️ {source} | vote={vote:+.2f} | conf={confidence:.3f} | contrib={contribution:.3f} | veto={veto} | anti={anti_veto}")
 
         net_veto = veto_count - anti_veto_count
 
@@ -189,6 +189,17 @@ async def handle_voting_request(msg: dict):
                 log.info(f"⚖️ Баланс вето: {veto_count} vs анти-вето: {anti_veto_count} → голосуем по score")
 
         log.info(f"✅ Голосование log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
+        log.info(f"✅ DECISION: {decision.upper()}")
+        log.info(f"⚖️ Вето: {veto_count} | Антивето: {anti_veto_count}")
+        log.info(f"🎯 TOTAL SCORE: {total_score:.3f}")
+
+        for v in votes:
+            log.info(
+                f"🗳️ {v['source']} | object={v['object_id']} | "
+                f"winrate={v['winrate']:.3f} | vote={v['vote']:+.2f} | "
+                f"conf={v['confidence']:.3f} | weight={v['weight']:.2f} | "
+                f"contrib={v['contribution']:.3f} | veto={v['veto']} | anti={v['anti_veto']}"
+            )
 
         # TODO: сохранение в БД и публикация в Redis
 
