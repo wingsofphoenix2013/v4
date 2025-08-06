@@ -4,6 +4,7 @@ import asyncio
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
+import json
 
 import infra
 
@@ -22,7 +23,6 @@ async def run_snapshot_aggregator_worker():
         await process_batch()
     except Exception:
         log.exception("Ошибка в snapshot_aggregator_worker")
-
 
 # 🔸 Обработка одной порции необработанных логов
 async def process_batch(batch_size: int = 200):
@@ -46,6 +46,14 @@ async def process_batch(batch_size: int = 200):
             now = datetime.utcnow()
             snapshot_stats = {}  # ключ: (tf, strategy_id, direction, emasnapshot_dict_id)
             pattern_stats = {}   # ключ: (tf, strategy_id, direction, pattern_id)
+            strategies_by_table = {
+                "positions_emasnapshot_m5_stat": set(),
+                "positions_emasnapshot_m15_stat": set(),
+                "positions_emasnapshot_h1_stat": set(),
+                "positions_emapattern_m5_stat": set(),
+                "positions_emapattern_m15_stat": set(),
+                "positions_emapattern_h1_stat": set(),
+            }
 
             for r in rows:
                 tf = r["tf"]
@@ -90,11 +98,13 @@ async def process_batch(batch_size: int = 200):
             # Обновление агрегатов по снапшотам
             for (tf, sid, dir_, snap_id), data in snapshot_stats.items():
                 table = f"positions_emasnapshot_{tf}_stat"
+                strategies_by_table[table].add(sid)
                 await upsert_aggregation(conn, table, sid, dir_, snap_id, data)
 
             # Обновление агрегатов по паттернам
             for (tf, sid, dir_, pattern_id), data in pattern_stats.items():
                 table = f"positions_emapattern_{tf}_stat"
+                strategies_by_table[table].add(sid)
                 await upsert_aggregation(conn, table, sid, dir_, pattern_id, data, is_pattern=True)
 
             # Обновляем статус строк как агрегированных
@@ -108,8 +118,19 @@ async def process_batch(batch_size: int = 200):
                 [(pid, tf, now) for pid, tf in ids]
             )
 
-            log.info(f"Агрегировано строк: {len(rows)}")
+            # Публикация сообщений в Redis Stream
+            for table_name, strategy_ids in strategies_by_table.items():
+                if strategy_ids:
+                    await infra.redis_client.xadd(
+                        "emasnapshot:ratings:commands",
+                        {
+                            "table": table_name,
+                            "strategies": json.dumps(sorted(strategy_ids))
+                        }
+                    )
+                    log.debug(f"Redis XADD → {table_name}: стратегии {sorted(strategy_ids)}")
 
+            log.info(f"Агрегировано строк: {len(rows)}")
 
 # 🔸 Выполнение UPSERT в таблицу агрегации
 async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str, ref_id: int, data: dict, is_pattern=False):
