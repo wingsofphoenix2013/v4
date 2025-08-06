@@ -3,40 +3,12 @@
 import asyncio
 import logging
 import json
-import math
 
 import infra
 
 log = logging.getLogger("VOTING_ENGINE")
 
 REQUEST_STREAM = "strategy_voting_request"
-RESPONSE_STREAM = "strategy_voting_answer"
-
-TF_WEIGHTS = {
-    "m5": 1.0,
-    "m15": 1.0,
-    "h1": 1.0
-}
-
-
-# 🔸 Классификация winrate → голос
-def classify_vote(winrate: float) -> int:
-    if winrate < 0.35:
-        return -1
-    elif winrate < 0.45:
-        return -1
-    elif winrate < 0.55:
-        return 0
-    elif winrate < 0.65:
-        return 1
-    return 1
-
-
-# 🔸 Проверка вето и анти-вето
-def check_veto(winrate: float, confidence: float) -> tuple[bool, bool]:
-    veto = winrate < 0.35 and confidence >= 0.9
-    anti_veto = winrate > 0.65 and confidence >= 0.7
-    return veto, anti_veto
 
 
 # 🔸 Основной воркер
@@ -68,115 +40,35 @@ async def run_voting_engine():
             await asyncio.sleep(1)
 
 
-# 🔸 Обработка одного запроса голосования
+# 🔸 Обработка запроса (ШАГ 1 — только подготовка)
 async def handle_voting_request(msg: dict):
     try:
         strategy_id = int(msg["strategy_id"])
         direction = msg["direction"]
         tf = msg["tf"]
+        symbol = msg["symbol"]
         log_uid = msg["log_uid"]
+
+        log.info(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf} | symbol={symbol}")
 
         redis = infra.redis_client
 
-        votes = []
-        total_score = 0.0
-        veto_applied = False
-        anti_veto_applied = False
+        # 🔹 Чтение snapshot:<symbol>:<tf>
+        snapshot_key = f"snapshot:{symbol}:{tf}"
+        val = await redis.get(snapshot_key)
 
-        log.info(f"📥 Новый запрос голосования log_uid={log_uid} | strategy={strategy_id} | direction={direction} | tf={tf}")
+        if not val:
+            log.warning(f"⛔ Не найден ключ {snapshot_key}")
+            return
 
-        for tf_key in ["m5", "m15", "h1"]:
-            for obj_type in ["snapshot", "pattern"]:
-                source = f"{obj_type}_{tf_key}"
-
-                # 🔹 Получаем ID объекта из snapshot:<strategy_id>:<tf>
-                snap_key = f"snapshot:{strategy_id}:{tf_key}"
-                val = await redis.get(snap_key)
-
-                if not val:
-                    log.warning(f"⛔ [{source}] Нет ключа {snap_key}")
-                    continue
-
-                try:
-                    data = json.loads(val)
-                    object_id = data["snapshot_id"] if obj_type == "snapshot" else data["pattern_id"]
-                except Exception:
-                    log.warning(f"⛔ [{source}] Не удалось извлечь object_id из {snap_key}")
-                    continue
-
-                # 🔹 Получаем confidence
-                conf_key = f"confidence:{strategy_id}:{direction}:{tf_key}:{obj_type}:{object_id}"
-                conf_raw = await redis.get(conf_key)
-
-                if not conf_raw:
-                    log.warning(f"⛔ [{source}] Нет ключа {conf_key}")
-                    continue
-
-                try:
-                    conf = json.loads(conf_raw)
-                    winrate = conf.get("winrate", 0.0)
-                    confidence = conf.get("confidence_raw", 0.0)
-                except Exception:
-                    log.warning(f"⛔ [{source}] Некорректный JSON в {conf_key}")
-                    continue
-
-                vote = classify_vote(winrate)
-                veto, anti_veto = check_veto(winrate, confidence)
-                weight = TF_WEIGHTS.get(tf_key, 1.0)
-                contribution = vote * confidence * weight
-
-                votes.append({
-                    "source": source,
-                    "winrate": winrate,
-                    "confidence": confidence,
-                    "weight": weight,
-                    "vote": vote,
-                    "contribution": contribution,
-                    "veto": veto,
-                    "anti_veto": anti_veto
-                })
-
-                total_score += contribution
-                veto_applied |= veto
-                anti_veto_applied |= anti_veto
-
-                log.info(f"📊 [{source}] winrate={winrate:.3f} | conf={confidence:.3f} | vote={vote:+d} | contrib={contribution:.3f} | veto={veto} | anti={anti_veto}")
-
-        # 🔹 Обработка вето/анти-вето
-        if veto_applied and anti_veto_applied:
-            log.info(f"⚖️ Вето и анти-вето аннулированы")
-            veto_applied = False
-
-        if veto_applied:
-            decision = "reject"
-        elif total_score >= 2:
-            decision = "open"
-        elif total_score <= -2:
-            decision = "reject"
-        else:
-            decision = "neutral"
-
-        log.info(f"✅ Решение по log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
-
-        # 🔸 Лог в БД
-        async with infra.pg_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO strategy_voting_log (
-                    log_uid, strategy_id, direction, tf,
-                    total_score, decision, veto_applied, votes
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            """, log_uid, strategy_id, direction, tf,
-                 total_score, decision, veto_applied, json.dumps(votes))
-
-        # 🔸 Ответ в Redis
-        await redis.xadd(RESPONSE_STREAM, {
-            "log_uid": log_uid,
-            "strategy_id": strategy_id,
-            "decision": decision,
-            "total_score": str(round(total_score, 6)),
-            "veto_applied": json.dumps(veto_applied),
-            "votes": json.dumps(votes)
-        })
+        try:
+            data = json.loads(val)
+            snapshot_id = data["snapshot_id"]
+            pattern_id = data["pattern_id"]
+            log.info(f"🔍 Найдено: snapshot_id={snapshot_id}, pattern_id={pattern_id}")
+        except Exception:
+            log.warning(f"❌ Ошибка парсинга значения snapshot:{symbol}:{tf}")
+            return
 
     except Exception:
-        log.exception("❌ Ошибка обработки голосования")
+        log.exception("❌ Ошибка обработки запроса голосования")
