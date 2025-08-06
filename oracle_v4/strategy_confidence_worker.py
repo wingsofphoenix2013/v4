@@ -79,6 +79,9 @@ async def handle_message(msg: dict):
             else:
                 log.info(f"⏭ Пропуск: тип таблицы {table} пока не поддерживается")
 
+import math
+from statistics import median
+
 # 🔸 Расчёт и логирование confidence_score V3 для snapshot-таблицы
 async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     tf = extract_tf_from_table_name(table)
@@ -160,11 +163,21 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     # 🔹 Вычисляем медиану по стратегии
     median_score = median(raw_scores) or 1e-6
 
-    # 🔹 Второй проход — логирование
+    # 🔹 Второй проход — логирование и обновление
     for i, (score_raw) in enumerate(raw_scores):
         sid, direction, n, w = objects[i]
         score_norm = score_raw / median_score
 
+        # ✅ Обновляем агрегатную таблицу
+        await conn.execute(f"""
+            UPDATE {table}
+            SET
+                confidence_score_raw = $1,
+                confidence_score_normalized = $2
+            WHERE strategy_id = $3 AND direction = $4 AND emasnapshot_dict_id = $5
+        """, score_raw, score_norm, strategy_id, direction, sid)
+
+        # ✅ Запись в лог
         await conn.execute("""
             INSERT INTO strategy_confidence_log (
                 strategy_id, direction, tf, object_type, object_id,
@@ -185,7 +198,7 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
              fragmentation,
              score_raw, score_raw, score_norm)
 
-        log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} raw={score_raw:.4f} norm={score_norm:.4f}")   
+        log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} raw={score_raw:.4f} norm={score_norm:.4f}")
 # 🔸 Расчёт и логирование confidence_score V3 для pattern-таблицы
 async def process_pattern_confidence(conn, table: str, strategy_id: int):
     tf = extract_tf_from_table_name(table)
@@ -306,11 +319,21 @@ async def process_pattern_confidence(conn, table: str, strategy_id: int):
 
     median_score = median(raw_scores) or 1e-6
 
-    # 🔹 Второй проход — логирование
+    # 🔹 Второй проход — обновление + лог
     for i, score_raw in enumerate(raw_scores):
         pid, direction, n, w, density = objects[i]
         score_norm = score_raw / median_score
 
+        # ✅ Обновление агрегатной таблицы
+        await conn.execute(f"""
+            UPDATE {table}
+            SET
+                confidence_score_raw = $1,
+                confidence_score_normalized = $2
+            WHERE strategy_id = $3 AND direction = $4 AND pattern_id = $5
+        """, score_raw, score_norm, strategy_id, direction, pid)
+
+        # ✅ Запись в лог
         await conn.execute("""
             INSERT INTO strategy_confidence_log (
                 strategy_id, direction, tf, object_type, object_id,
