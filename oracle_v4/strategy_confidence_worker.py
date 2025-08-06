@@ -71,11 +71,13 @@ async def handle_message(msg: dict):
             if "emasnapshot" in table and "pattern" not in table:
                 log.info(f"🔍 Обработка snapshot-таблицы: {table} | strategy_id={strategy_id}")
                 await process_snapshot_confidence(conn, table, strategy_id)
-            else:
-                log.info(f"⏭ Пропуск: пока не поддерживается тип таблицы {table}")
 
-import math
-from statistics import median
+            elif "emapattern" in table:
+                log.info(f"🔍 Обработка pattern-таблицы: {table} | strategy_id={strategy_id}")
+                await process_pattern_confidence(conn, table, strategy_id)
+
+            else:
+                log.info(f"⏭ Пропуск: тип таблицы {table} пока не поддерживается")
 
 # 🔸 Расчёт и логирование confidence_score V3 для snapshot-таблицы
 async def process_snapshot_confidence(conn, table: str, strategy_id: int):
@@ -183,7 +185,145 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
              fragmentation,
              score_raw, score_raw, score_norm)
 
-        log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} raw={score_raw:.4f} norm={score_norm:.4f}")        
+        log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} raw={score_raw:.4f} norm={score_norm:.4f}")   
+# 🔸 Расчёт и логирование confidence_score V3 для pattern-таблицы
+async def process_pattern_confidence(conn, table: str, strategy_id: int):
+    tf = extract_tf_from_table_name(table)
+
+    rows = await conn.fetch(f"""
+        SELECT strategy_id, direction, pattern_id, num_trades, num_wins
+        FROM {table}
+        WHERE strategy_id = $1
+    """, strategy_id)
+
+    if not rows:
+        log.info(f"⏭ Пропуск: нет строк в {table} для strategy_id={strategy_id}")
+        return
+
+    global_data = await conn.fetchrow(f"""
+        SELECT SUM(num_wins)::float / NULLIF(SUM(num_trades), 0) AS global_winrate,
+               SUM(num_trades)::int AS total_trades
+        FROM {table}
+        WHERE strategy_id = $1
+    """, strategy_id)
+
+    gw = global_data["global_winrate"] or 0.0
+    total = global_data["total_trades"] or 0
+
+    # 🔹 Уникальных паттернов
+    unique_count = await conn.fetchval(f"""
+        SELECT COUNT(DISTINCT pattern_id)
+        FROM {table}
+        WHERE strategy_id = $1
+    """, strategy_id)
+
+    vweight = min(
+        total / 10,
+        10 + math.log2(unique_count or 1)
+    )
+    alpha = gw * vweight
+    beta = (1 - gw) * vweight
+
+    trade_counts = [r["num_trades"] for r in rows]
+    trade_counts.sort()
+
+    mean = sum(trade_counts) / len(trade_counts)
+    median_val = trade_counts[len(trade_counts) // 2]
+    p25 = trade_counts[int(len(trade_counts) * 0.25)]
+
+    if abs(mean - median_val) / mean < 0.1:
+        threshold_n = round(0.1 * mean)
+        method = "mean*0.1"
+    elif median_val < mean * 0.6:
+        threshold_n = max(5, round(median_val / 2))
+        method = "median/2"
+    else:
+        threshold_n = round(p25)
+        method = "percentile_25"
+
+    fragmented = sum(1 for n in trade_counts if n < threshold_n)
+    fragmentation = fragmented / len(trade_counts)
+    frag_modifier = max(0.3, (1 - fragmentation) ** 0.7)
+
+    log.info(f"📊 strategy={strategy_id} tf={tf} (pattern) → T={threshold_n} by {method}, frag={fragmentation:.3f}")
+
+    # 🔹 Получаем плотность по паттернам через JOIN с snapshot таблицей
+    snap_table = table.replace("pattern", "snapshot")
+
+    density_rows = await conn.fetch(f"""
+        WITH snaps AS (
+            SELECT pattern_id, emasnapshot_dict_id
+            FROM oracle_emasnapshot_dict
+            WHERE pattern_id IS NOT NULL
+        ), trade_counts AS (
+            SELECT d.pattern_id, COUNT(*) AS num_snaps,
+                   SUM(s.num_trades)::float AS total_trades
+            FROM snaps d
+            JOIN {snap_table} s ON d.emasnapshot_dict_id = s.emasnapshot_dict_id
+            WHERE s.strategy_id = $1
+            GROUP BY d.pattern_id
+        ), max_avg AS (
+            SELECT MAX(total_trades / NULLIF(num_snaps, 0)) AS max_density FROM trade_counts
+        )
+        SELECT t.pattern_id,
+               t.total_trades / NULLIF(t.num_snaps, 0) AS avg_density,
+               t.total_trades / NULLIF(t.num_snaps * m.max_density, 0) AS norm_density
+        FROM trade_counts t, max_avg m
+    """, strategy_id)
+
+    density_lookup = {r["pattern_id"]: r["norm_density"] for r in density_rows}
+
+    # 🔹 Первый проход — рассчитываем confidence_raw
+    raw_scores = []
+    objects = []
+
+    for row in rows:
+        w = row["num_wins"]
+        n = row["num_trades"]
+        pid = row["pattern_id"]
+        direction = row["direction"]
+
+        if pid not in density_lookup:
+            continue
+
+        bayes_wr = (w + alpha) / (n + alpha + beta)
+        score = bayes_wr * math.log(1 + n) * frag_modifier * density_lookup[pid]
+
+        raw_scores.append(score)
+        objects.append((pid, direction, n, w, density_lookup[pid]))
+
+    if not raw_scores:
+        log.warning(f"⚠️ Нет валидных строк с плотностью для strategy_id={strategy_id}")
+        return
+
+    median_score = median(raw_scores) or 1e-6
+
+    # 🔹 Второй проход — логирование
+    for i, score_raw in enumerate(raw_scores):
+        pid, direction, n, w, density = objects[i]
+        score_norm = score_raw / median_score
+
+        await conn.execute("""
+            INSERT INTO strategy_confidence_log (
+                strategy_id, direction, tf, object_type, object_id,
+                num_trades, num_wins, global_winrate, alpha, beta,
+                mean, median, percentile_25, threshold_n, threshold_method,
+                fragmentation, density,
+                confidence_score, confidence_raw, confidence_normalized
+            ) VALUES (
+                $1, $2, $3, 'pattern', $4,
+                $5, $6, $7, $8, $9,
+                $10, $11, $12, $13, $14,
+                $15, $16,
+                $17, $18, $19
+            )
+        """, strategy_id, direction, tf, pid,
+             n, w, gw, alpha, beta,
+             mean, median_val, p25, threshold_n, method,
+             fragmentation, density,
+             score_raw, score_raw, score_norm)
+
+        log.debug(f"[OK] strategy={strategy_id} pattern_id={pid} raw={score_raw:.4f} norm={score_norm:.4f}")     
 # 🔸 Основной воркер
 async def run_strategy_confidence_worker():
     redis = infra.redis_client
