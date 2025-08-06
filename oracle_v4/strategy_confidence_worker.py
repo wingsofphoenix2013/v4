@@ -4,6 +4,7 @@ import asyncio
 import logging
 import json
 import math
+from statistics import median
 
 import infra
 
@@ -73,7 +74,10 @@ async def handle_message(msg: dict):
             else:
                 log.info(f"⏭ Пропуск: пока не поддерживается тип таблицы {table}")
 
-# 🔸 Расчёт и логирование confidence_score для snapshot-таблицы
+import math
+from statistics import median
+
+# 🔸 Расчёт и логирование confidence_score V3 для snapshot-таблицы
 async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     tf = extract_tf_from_table_name(table)
 
@@ -87,6 +91,7 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
         log.info(f"⏭ Пропуск: нет строк в {table} для strategy_id={strategy_id}")
         return
 
+    # 🔹 Глобальный winrate и total_trades
     global_data = await conn.fetchrow(f"""
         SELECT SUM(num_wins)::float / NULLIF(SUM(num_trades), 0) AS global_winrate,
                SUM(num_trades)::int AS total_trades
@@ -96,7 +101,18 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
 
     gw = global_data["global_winrate"] or 0.0
     total = global_data["total_trades"] or 0
-    vweight = min(total / 10, 20)
+
+    # 🔹 Кол-во уникальных объектов (emasnapshot_dict_id)
+    unique_count = await conn.fetchval(f"""
+        SELECT COUNT(DISTINCT emasnapshot_dict_id)
+        FROM {table}
+        WHERE strategy_id = $1
+    """, strategy_id)
+
+    vweight = min(
+        total / 10,
+        10 + math.log2(unique_count or 1)
+    )
     alpha = gw * vweight
     beta = (1 - gw) * vweight
 
@@ -104,14 +120,14 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
     trade_counts.sort()
 
     mean = sum(trade_counts) / len(trade_counts)
-    median = trade_counts[len(trade_counts) // 2]
+    median_val = trade_counts[len(trade_counts) // 2]
     p25 = trade_counts[int(len(trade_counts) * 0.25)]
 
-    if abs(mean - median) / mean < 0.1:
+    if abs(mean - median_val) / mean < 0.1:
         threshold_n = round(0.1 * mean)
         method = "mean*0.1"
-    elif median < mean * 0.6:
-        threshold_n = max(5, round(median / 2))
+    elif median_val < mean * 0.6:
+        threshold_n = max(5, round(median_val / 2))
         method = "median/2"
     else:
         threshold_n = round(p25)
@@ -123,6 +139,10 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
 
     log.info(f"📊 strategy={strategy_id} tf={tf} → T={threshold_n} by {method}, frag={fragmentation:.3f}")
 
+    # 🔹 Первый проход — рассчитываем confidence_raw
+    raw_scores = []
+    objects = []
+
     for row in rows:
         w = row["num_wins"]
         n = row["num_trades"]
@@ -132,33 +152,38 @@ async def process_snapshot_confidence(conn, table: str, strategy_id: int):
         bayes_wr = (w + alpha) / (n + alpha + beta)
         score = bayes_wr * math.log(1 + n) * frag_modifier
 
-        # 🔸 Временно отключена запись в агрегатную таблицу
-        # await conn.execute(f"""
-        #     UPDATE {table}
-        #     SET confidence_score_snapshot = $1
-        #     WHERE strategy_id = $2 AND direction = $3 AND emasnapshot_dict_id = $4
-        # """, score, strategy_id, direction, sid)
+        raw_scores.append(score)
+        objects.append((sid, direction, n, w))  # сохраняем для второго прохода
 
-        # 🔸 Запись в лог
+    # 🔹 Вычисляем медиану по стратегии
+    median_score = median(raw_scores) or 1e-6
+
+    # 🔹 Второй проход — логирование
+    for i, (score_raw) in enumerate(raw_scores):
+        sid, direction, n, w = objects[i]
+        score_norm = score_raw / median_score
+
         await conn.execute("""
             INSERT INTO strategy_confidence_log (
                 strategy_id, direction, tf, object_type, object_id,
                 num_trades, num_wins, global_winrate, alpha, beta,
                 mean, median, percentile_25, threshold_n, threshold_method,
-                fragmentation, density, confidence_score
+                fragmentation, density,
+                confidence_score, confidence_raw, confidence_normalized
             ) VALUES (
                 $1, $2, $3, 'snapshot', $4,
                 $5, $6, $7, $8, $9,
                 $10, $11, $12, $13, $14,
-                $15, NULL, $16
+                $15, NULL,
+                $16, $17, $18
             )
         """, strategy_id, direction, tf, sid,
              n, w, gw, alpha, beta,
-             mean, median, p25, threshold_n, method,
-             fragmentation, score)
+             mean, median_val, p25, threshold_n, method,
+             fragmentation,
+             score_raw, score_raw, score_norm)
 
-        log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} score={score:.4f}")
-        
+        log.debug(f"[OK] strategy={strategy_id} snapshot_id={sid} raw={score_raw:.4f} norm={score_norm:.4f}")        
 # 🔸 Основной воркер
 async def run_strategy_confidence_worker():
     redis = infra.redis_client
