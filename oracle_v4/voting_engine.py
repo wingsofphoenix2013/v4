@@ -142,6 +142,19 @@ async def handle_voting_request(msg: dict):
 
         if not votes:
             log.warning(f"⚠️ log_uid={log_uid} → нет допустимых объектов для голосования")
+
+            await save_voting_result(
+                log_uid=log_uid,
+                strategy_id=strategy_id,
+                direction=direction,
+                tf=tf_trigger,
+                symbol=symbol,
+                model="main",
+                total_score=0.0,
+                decision="reject",
+                veto_applied=None,
+                votes=[]
+            )
             return
 
         # 🔹 Основная модель (жёстко: score ≥ 2.0)
