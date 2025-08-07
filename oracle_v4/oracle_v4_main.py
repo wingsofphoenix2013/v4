@@ -20,9 +20,9 @@ from ema_position_worker import run_ema_position_worker
 from ema_snapshot_worker import run_ema_snapshot_worker
 from strategy_confidence_worker import run_strategy_confidence_worker
 from voting_engine import run_voting_engine
+from voter_analyzer import run_voter_analyzer
 
 log = logging.getLogger("ORACLE_MAIN")
-
 
 # 🔸 Обёртка с автоперезапуском воркера
 async def run_safe_loop(coro, label: str):
@@ -34,6 +34,18 @@ async def run_safe_loop(coro, label: str):
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
             await asyncio.sleep(5)
 
+# 🔸 Обёртка для периодического запуска
+async def run_periodic(coro_func, interval_sec: int, label: str, initial_delay: int = 0):
+    if initial_delay > 0:
+        log.info(f"[{label}] ⏳ Ожидание {initial_delay} сек перед первым запуском")
+        await asyncio.sleep(initial_delay)
+    while True:
+        try:
+            log.info(f"[{label}] 🔁 Запуск периодической задачи")
+            await coro_func()
+        except Exception:
+            log.exception(f"[{label}] ❌ Ошибка при выполнении периодической задачи")
+        await asyncio.sleep(interval_sec)
 
 # 🔸 Главная точка входа
 async def main():
@@ -66,8 +78,8 @@ async def main():
         run_safe_loop(run_ema_snapshot_worker, "EMA_SNAPSHOT_WORKER"),
         run_safe_loop(run_strategy_confidence_worker, "STRATEGY_CONFIDENCE_WORKER"),
         run_safe_loop(run_voting_engine, "VOTING_ENGINE"),
+        run_safe_loop(lambda: run_periodic(run_voter_analyzer, 300, "VOTER_ANALYZER", initial_delay=90), "VOTER_ANALYZER"),
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())
