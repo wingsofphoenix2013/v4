@@ -174,21 +174,22 @@ async def handle_voting_request(msg: dict):
 
         net_veto = veto_count - anti_veto_count
 
+        net_veto = veto_count - anti_veto_count
+
         if net_veto > 0:
             decision = "reject"
             log.info(f"❌ Принудительное отклонение: {veto_count} вето против {anti_veto_count} анти-вето")
         else:
             if total_score >= 2:
                 decision = "open"
-            elif total_score <= -2:
-                decision = "reject"
             else:
-                decision = "neutral"
+                decision = "reject"
 
             if veto_count > 0 or anti_veto_count > 0:
                 log.info(f"⚖️ Баланс вето: {veto_count} vs анти-вето: {anti_veto_count} → голосуем по score")
 
         log.info(f"✅ Голосование log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
+        
         log.info(f"✅ DECISION: {decision.upper()}")
         log.info(f"⚖️ Вето: {veto_count} | Антивето: {anti_veto_count}")
         log.info(f"🎯 TOTAL SCORE: {total_score:.3f}")
