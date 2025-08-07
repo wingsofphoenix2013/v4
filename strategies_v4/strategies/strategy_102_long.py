@@ -31,7 +31,20 @@ class Strategy102Long:
         }
 
         try:
+            # Отправка сигнала на открытие позиции
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.debug(f"📤 Сигнал отправлен: {payload}")
+            log.debug(f"📤 [600] Сигнал отправлен: {payload}")
+
+            # Отправка запроса на голосование
+            voting_payload = {
+                "strategy_id": str(signal["strategy_id"]),
+                "direction": signal["direction"],
+                "tf": strategy_meta.get("timeframe", "m5"),  # по умолчанию m5
+                "symbol": signal["symbol"],
+                "log_uid": signal.get("log_uid")
+            }
+            await redis.xadd("strategy_voting_request", voting_payload)
+            log.debug(f"🗳️ [600] Запрос на голосование отправлен: {voting_payload}")
+
         except Exception as e:
-            log.warning(f"⚠️ Ошибка при отправке сигнала: {e}")
+            log.warning(f"⚠️ [600] Ошибка при отправке: {e}")
