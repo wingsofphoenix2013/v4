@@ -1,8 +1,12 @@
+# voting_engine.py
+
 import asyncio
 import logging
 import json
 
 import infra
+
+from voting_core import save_voting_result
 
 log = logging.getLogger("VOTING_ENGINE")
 
@@ -23,7 +27,6 @@ VOTING_MODELS = {
     "conf_035": {"min_confidence_raw": 0.35}
 }
 
-
 # 🔹 Основной цикл чтения сообщений
 async def run_voting_engine():
     redis = infra.redis_client
@@ -34,7 +37,7 @@ async def run_voting_engine():
     except Exception:
         last_id = "$"
 
-    log.info(f"📡 Подписка на Redis Stream: {REQUEST_STREAM} с last_id = {last_id}")
+    log.debug(f"📡 Подписка на Redis Stream: {REQUEST_STREAM} с last_id = {last_id}")
 
     while True:
         try:
@@ -62,7 +65,7 @@ async def handle_voting_request(msg: dict):
         symbol = msg["symbol"]
         log_uid = msg["log_uid"]
 
-        log.info(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf_trigger} | symbol={symbol}")
+        log.debug(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf_trigger} | symbol={symbol}")
 
         redis = infra.redis_client
         snapshots = {}
@@ -80,7 +83,7 @@ async def handle_voting_request(msg: dict):
                     "snapshot_id": data["snapshot_id"],
                     "pattern_id": data["pattern_id"]
                 }
-                log.info(f"🔍 {tf}: snapshot_id={data['snapshot_id']}, pattern_id={data['pattern_id']}")
+                log.debug(f"🔍 {tf}: snapshot_id={data['snapshot_id']}, pattern_id={data['pattern_id']}")
             except Exception:
                 log.warning(f"❌ Ошибка парсинга значения {key}")
                 continue
@@ -93,7 +96,7 @@ async def handle_voting_request(msg: dict):
         votes = []
         for tf, obj in snapshots.items():
             for obj_type in ["snapshot", "pattern"]:
-                object_id = obj[f"{obj_type}_id"] if f"{obj_type}_id" in obj else obj[f"{obj_type}id"]
+                object_id = obj.get(f"{obj_type}_id") or obj.get(f"{obj_type}id")
                 conf_key = f"confidence:{strategy_id}:{direction}:{tf}:{obj_type}:{object_id}"
                 raw = await redis.get(conf_key)
                 if not raw:
@@ -132,7 +135,7 @@ async def handle_voting_request(msg: dict):
                         "anti_veto": anti_veto
                     })
 
-                    log.info(f"📦 {obj_type}_{tf}: winrate={winrate:.3f}, conf={confidence:.3f}")
+                    log.debug(f"📦 {obj_type}_{tf}: winrate={winrate:.3f}, conf={confidence:.3f}")
 
                 except Exception:
                     log.warning(f"❌ Ошибка парсинга JSON: {conf_key}")
@@ -147,7 +150,7 @@ async def handle_voting_request(msg: dict):
         anti_veto_count = 0
 
         for v in votes:
-            weight = 1.0  # дефолт
+            weight = 1.0
             contrib = v["vote"] * v["confidence"] * weight
             v["weight"] = weight
             v["contribution"] = contrib
@@ -156,31 +159,59 @@ async def handle_voting_request(msg: dict):
                 veto_count += 1
             if v["anti_veto"]:
                 anti_veto_count += 1
-            log.info(f"🗳️ {v['source']} | vote={v['vote']:+.2f} | conf={v['confidence']:.3f} | contrib={contrib:.3f} | veto={v['veto']} | anti={v['anti_veto']}")
+            log.debug(f"🗳️ {v['source']} | vote={v['vote']:+.2f} | conf={v['confidence']:.3f} | contrib={contrib:.3f} | veto={v['veto']} | anti={v['anti_veto']}")
 
         net_veto = veto_count - anti_veto_count
         if net_veto > 0:
             decision = "reject"
-            log.info(f"❌ Принудительное отклонение: {veto_count} вето против {anti_veto_count} анти-вето")
+            log.debug(f"❌ Принудительное отклонение: {veto_count} вето против {anti_veto_count} анти-вето")
         else:
             decision = "open" if total_score >= 2.0 else "reject"
             if veto_count > 0 or anti_veto_count > 0:
-                log.info(f"⚖️ Баланс вето: {veto_count} vs анти-вето: {anti_veto_count} → голосуем по score")
+                log.debug(f"⚖️ Баланс вето: {veto_count} vs анти-вето: {anti_veto_count} → голосуем по score")
 
-        log.info(f"✅ Голосование log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
-        log.info(f"🎯 TOTAL SCORE: {total_score:.3f}")
-        log.info(f"✅ DECISION: {decision.upper()}")
-        log.info(f"⚖️ Вето: {veto_count} | Антивето: {anti_veto_count}")
+        log.debug(f"✅ Голосование log_uid={log_uid} → {decision.upper()} (score={total_score:.3f})")
+        log.debug(f"🎯 TOTAL SCORE: {total_score:.3f}")
+        log.debug(f"✅ DECISION: {decision.upper()}")
+        log.debug(f"⚖️ Вето: {veto_count} | Антивето: {anti_veto_count}")
 
-        # 🔬 Модели A/B
-        evaluate_models(votes, log_uid)
+        # ✅ Сохранение основного голосования
+        await save_voting_result(
+            log_uid=log_uid,
+            strategy_id=strategy_id,
+            direction=direction,
+            tf=tf_trigger,
+            symbol=symbol,
+            model="main",
+            total_score=total_score,
+            decision=decision,
+            veto_applied=(net_veto > 0),
+            votes=votes
+        )
+
+        # 🔬 A/B модели
+        await evaluate_models(
+            votes=votes,
+            log_uid=log_uid,
+            strategy_id=strategy_id,
+            direction=direction,
+            tf=tf_trigger,
+            symbol=symbol
+        )
 
     except Exception:
         log.exception("❌ Ошибка обработки запроса голосования")
 
 
 # 🔹 A/B сравнение по всем моделям
-def evaluate_models(votes: list, log_uid: str):
+async def evaluate_models(
+    votes: list,
+    log_uid: str,
+    strategy_id: int,
+    direction: str,
+    tf: str,
+    symbol: str
+):
     for model_name, model_cfg in VOTING_MODELS.items():
         threshold = model_cfg.get("score_threshold", 2.0)
         min_conf = model_cfg.get("min_confidence_raw", 0.0)
@@ -194,7 +225,21 @@ def evaluate_models(votes: list, log_uid: str):
             score += v["vote"] * v["confidence"] * weight
 
         decision = "open" if score >= threshold else "reject"
-        log.info(
+
+        await save_voting_result(
+            log_uid=log_uid,
+            strategy_id=strategy_id,
+            direction=direction,
+            tf=tf,
+            symbol=symbol,
+            model=model_name,
+            total_score=score,
+            decision=decision,
+            veto_applied=None,
+            votes=votes
+        )
+
+        log.debug(
             f"🧪 MODEL={model_name} | threshold={threshold:.2f} | min_conf={min_conf:.2f} | "
             f"score={score:.3f} → decision={decision.upper()}"
         )
