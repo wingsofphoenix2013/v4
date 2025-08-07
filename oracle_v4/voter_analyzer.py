@@ -11,7 +11,7 @@ BATCH_SIZE = 100
 # 🔸 Получение списка необработанных закрытых позиций по стратегиям из strategy_voting_list
 async def fetch_positions_to_evaluate():
     query = """
-        SELECT p.id, p.log_uid, p.strategy_id, p.symbol, p.tf, p.pnl
+        SELECT p.id, p.log_uid, p.strategy_id, p.symbol, p.pnl
         FROM positions_v4 p
         JOIN strategy_voting_list svl ON p.strategy_id = svl.strategy_id
         WHERE p.status = 'closed'
