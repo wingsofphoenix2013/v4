@@ -2,6 +2,7 @@
 
 import logging
 import asyncpg
+import json
 import infra
 
 log = logging.getLogger("VOTING_CORE")
@@ -37,7 +38,8 @@ async def save_voting_result(
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             """, log_uid, strategy_id, direction, tf, symbol,
-                 model, total_score, decision, veto_applied, votes)
+                 model, total_score, decision, veto_applied,
+                 json.dumps(votes))
 
         log.debug(f"[DB] Голосование log_uid={log_uid} model={model} → {decision.upper()}")
 
