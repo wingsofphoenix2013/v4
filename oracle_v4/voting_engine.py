@@ -65,7 +65,7 @@ async def handle_voting_request(msg: dict):
         symbol = msg["symbol"]
         log_uid = msg["log_uid"]
 
-        log.debug(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf_trigger} | symbol={symbol}")
+        log.info(f"📥 log_uid={log_uid} | strategy={strategy_id} | dir={direction} | tf={tf_trigger} | symbol={symbol}")
 
         redis = infra.redis_client
         snapshots = {}
