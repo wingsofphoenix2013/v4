@@ -1,5 +1,3 @@
-# voter_analyzer.py
-
 import asyncio
 import logging
 
@@ -26,3 +24,12 @@ async def fetch_positions_to_evaluate():
         rows = await conn.fetch(query, BATCH_SIZE)
         log.info(f"🔸 Найдено позиций для оценки: {len(rows)}")
         return rows
+
+# 🔸 Основной запуск анализатора
+async def run_voter_analyzer():
+    positions = await fetch_positions_to_evaluate()
+    for pos in positions:
+        log.info(
+            f"🔸 Обработка позиции #{pos['id']} | strategy_id={pos['strategy_id']} | "
+            f"log_uid={pos['log_uid']} | pnl={pos['pnl']}"
+        )
