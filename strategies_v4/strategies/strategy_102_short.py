@@ -18,6 +18,8 @@ class Strategy102Short:
 
     async def run(self, signal, context):
         redis = context.get("redis")
+        strategy_meta = context.get("strategy", {})
+        
         if redis is None:
             raise RuntimeError("❌ Redis клиент не передан в context")
 
@@ -33,7 +35,7 @@ class Strategy102Short:
         try:
             # Отправка сигнала на открытие позиции
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.debug(f"📤 [600] Сигнал отправлен: {payload}")
+            log.debug(f"📤 [102_SHORT] Сигнал отправлен: {payload}")
 
             # Отправка запроса на голосование
             voting_payload = {
@@ -44,7 +46,7 @@ class Strategy102Short:
                 "log_uid": signal.get("log_uid")
             }
             await redis.xadd("strategy_voting_request", voting_payload)
-            log.debug(f"🗳️ [600] Запрос на голосование отправлен: {voting_payload}")
+            log.debug(f"🗳️ [102_SHORT] Запрос на голосование отправлен: {voting_payload}")
 
         except Exception as e:
-            log.warning(f"⚠️ [600] Ошибка при отправке: {e}")
+            log.warning(f"⚠️ [102_SHORT] Ошибка при отправке: {e}")
