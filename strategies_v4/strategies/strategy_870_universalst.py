@@ -4,7 +4,7 @@ from infra import get_price, load_indicators
 
 log = logging.getLogger("strategy_880_universalst")
 
-class Strategy880Universalst:
+class Strategy870Universalst:
     async def validate_signal(self, signal, context):
         redis = context.get("redis")
         strategy_meta = context.get("strategy", {})
