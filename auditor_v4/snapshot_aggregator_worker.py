@@ -237,13 +237,16 @@ async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str,
 
 # 🔹 Периодический полный пересчёт RSI по всем стратегиям с флагом rsi_snapshot_check
 async def rsi_full_refresh():
+    log.info("RSI Full Refresh → запуск цикла")
     try:
         async with infra.pg_pool.acquire() as conn:
             strategies = await conn.fetch(
                 "SELECT id FROM strategies_v4 WHERE rsi_snapshot_check = true"
             )
             strategy_ids = [r["id"] for r in strategies]
+            log.info(f"RSI Full Refresh → найдено стратегий с rsi_snapshot_check = true: {len(strategy_ids)}")
             if not strategy_ids:
+                log.info("RSI Full Refresh → стратегии для расчёта не найдены, выход")
                 return
 
             rsi_data = await conn.fetch(
@@ -264,7 +267,9 @@ async def rsi_full_refresh():
                 strategy_ids
             )
 
+            log.info(f"RSI Full Refresh → найдено записей для обработки: {len(rsi_data)}")
             if not rsi_data:
+                log.info("RSI Full Refresh → нет данных для расчёта, выход")
                 return
 
             stats_snap = {}
@@ -291,6 +296,8 @@ async def rsi_full_refresh():
                     if pnl > 0:
                         agg_pat["wins"] += 1
 
+            log.info(f"RSI Full Refresh → рассчитано {len(stats_snap)} snapshot-групп и {len(stats_pattern)} pattern-групп")
+
             for (tf, sid, snap_id, bucket), agg in stats_snap.items():
                 if agg["num"] == 0:
                     continue
@@ -298,6 +305,7 @@ async def rsi_full_refresh():
                 verdict = "allow" if winrate > 0.5 else "reject"
                 key = f"emarsicheck:{tf}:{sid}:{snap_id}:{bucket}"
                 await infra.redis_client.set(key, verdict)
+                log.debug(f"RSI Full Refresh snapshot → {key} = {verdict} ({agg['wins']}/{agg['num']})")
 
             for (tf, sid, pattern_id, bucket), agg in stats_pattern.items():
                 if agg["num"] == 0:
@@ -306,6 +314,9 @@ async def rsi_full_refresh():
                 verdict = "allow" if winrate > 0.5 else "reject"
                 key = f"emarsicheck_pattern:{tf}:{sid}:{pattern_id}:{bucket}"
                 await infra.redis_client.set(key, verdict)
+                log.debug(f"RSI Full Refresh pattern → {key} = {verdict} ({agg['wins']}/{agg['num']})")
+
+            log.info("RSI Full Refresh → цикл завершён")
 
     except Exception:
         log.exception("RSI Full Refresh → ошибка при обработке")
