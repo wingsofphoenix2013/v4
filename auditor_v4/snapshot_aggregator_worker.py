@@ -40,7 +40,7 @@ async def process_batch(batch_size: int = 200):
             )
 
             if not rows:
-                log.info("Нет новых строк для агрегации")
+                log.debug("Нет новых строк для агрегации")
                 return
 
             now = datetime.utcnow()
@@ -136,7 +136,7 @@ async def process_batch(batch_size: int = 200):
                     )
                     log.debug(f"Redis XADD → {table_name}: стратегии {sorted(strategy_ids)}")
 
-            log.info(f"Агрегировано строк: {len(rows)}")
+            log.debug(f"Агрегировано строк: {len(rows)}")
 
             # 🔹 Фильтрация по стратегиям с rsi_snapshot_check = true
             allowed_strategies = {
@@ -252,3 +252,70 @@ async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str,
         strategy_id, direction, ref_id, num_trades, num_wins, num_losses,
         total_pnl, avg_pnl, winrate, base_rating
     )
+# 🔹 Периодический полный пересчёт RSI по всем стратегиям с флагом rsi_snapshot_check
+async def rsi_full_refresh():
+    try:
+        async with infra.pg_pool.acquire() as conn:
+            # Получаем список стратегий с rsi_snapshot_check = true
+            strategies = await conn.fetch(
+                "SELECT id FROM strategies_v4 WHERE rsi_snapshot_check = true"
+            )
+            strategy_ids = [r["id"] for r in strategies]
+            if not strategy_ids:
+                log.debug("RSI Full Refresh → нет стратегий с rsi_snapshot_check = true")
+                return
+
+            log.info(f"RSI Full Refresh → обрабатываем стратегии: {strategy_ids}")
+
+            # Загружаем все позиции с RSI14 по этим стратегиям
+            rsi_data = await conn.fetch(
+                """
+                SELECT el.tf,
+                       el.emasnapshot_dict_id,
+                       pis.value AS rsi_value,
+                       el.pnl
+                FROM emasnapshot_position_log el
+                JOIN positions_v4 p
+                  ON p.id = el.position_id
+                JOIN position_ind_stat_v4 pis
+                  ON pis.position_uid = p.position_uid
+                 AND pis.param_name = 'rsi14'
+                 AND pis.timeframe = el.tf
+                WHERE el.strategy_id = ANY($1)
+                """,
+                strategy_ids
+            )
+
+            if not rsi_data:
+                log.debug("RSI Full Refresh → нет данных для обработки")
+                return
+
+            # Группировка по tf, snap_id, bucket
+            stats = {}
+            for rec in rsi_data:
+                tf = rec["tf"]
+                snap_id = rec["emasnapshot_dict_id"]
+                rsi_val = rec["rsi_value"]
+                pnl = Decimal(rec["pnl"])
+                bucket = int(rsi_val // 5) * 5
+
+                key = (tf, snap_id, bucket)
+                agg = stats.setdefault(key, {"num": 0, "wins": 0})
+                agg["num"] += 1
+                if pnl > 0:
+                    agg["wins"] += 1
+
+            # Запись в Redis
+            for (tf, snap_id, bucket), agg in stats.items():
+                if agg["num"] == 0:
+                    continue
+                winrate = agg["wins"] / agg["num"]
+                verdict = "allow" if winrate > 0.5 else "reject"
+                redis_key = f"emarsicheck:{tf}:{snap_id}:{bucket}"
+                await infra.redis_client.set(redis_key, verdict)
+                log.debug(f"RSI Full Refresh → {redis_key} = {verdict}")
+
+            log.info(f"RSI Full Refresh → завершено, сформировано ключей: {len(stats)}")
+
+    except Exception:
+        log.exception("RSI Full Refresh → ошибка при обработке")

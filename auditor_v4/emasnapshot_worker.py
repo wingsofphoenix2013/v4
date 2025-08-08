@@ -96,7 +96,7 @@ async def run_emasnapshot_worker():
             LIMIT 200
         """, strategy_ids)
 
-    log.info(f"📦 Найдено позиций для обработки: {len(positions)}")
+    log.debug(f"📦 Найдено позиций для обработки: {len(positions)}")
 
     # Одна асинхронная задача на каждую позицию
     sem = asyncio.Semaphore(10)
