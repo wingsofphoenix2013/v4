@@ -55,6 +55,9 @@ async def process_batch(batch_size: int = 200):
                 "positions_emapattern_h1_stat": set(),
             }
 
+            rsi_targets = set()         # (tf, strategy_id, emasnapshot_dict_id)
+            position_keys_for_rsi = []  # (position_id, tf, strategy_id, emasnapshot_dict_id)
+
             for r in rows:
                 tf = r["tf"]
                 sid = r["strategy_id"]
@@ -95,6 +98,10 @@ async def process_batch(batch_size: int = 200):
                     elif pnl < 0:
                         agg_p["num_losses"] += 1
 
+                # Кандидаты для RSI-анализа
+                rsi_targets.add((tf, sid, snap_id))
+                position_keys_for_rsi.append((r["position_id"], tf, sid, snap_id))
+
             # Обновление агрегатов по снапшотам
             for (tf, sid, dir_, snap_id), data in snapshot_stats.items():
                 table = f"positions_emasnapshot_{tf}_stat"
@@ -108,14 +115,13 @@ async def process_batch(batch_size: int = 200):
                 await upsert_aggregation(conn, table, sid, dir_, pattern_id, data, is_pattern=True)
 
             # Обновляем статус строк как агрегированных
-            ids = [(r["position_id"], r["tf"]) for r in rows]
             await conn.executemany(
                 """
                 UPDATE emasnapshot_position_log
                 SET aggregated_at = $3
                 WHERE position_id = $1 AND tf = $2
                 """,
-                [(pid, tf, now) for pid, tf in ids]
+                [(pid, tf, now) for pid, tf, _, _ in position_keys_for_rsi]
             )
 
             # Публикация сообщений в Redis Stream
@@ -132,6 +138,76 @@ async def process_batch(batch_size: int = 200):
 
             log.info(f"Агрегировано строк: {len(rows)}")
 
+            # 🔹 Фильтрация по стратегиям с rsi_snapshot_check = true
+            allowed_strategies = {
+                r["id"]
+                for r in await conn.fetch(
+                    "SELECT id FROM strategies_v4 WHERE rsi_snapshot_check = true"
+                )
+            }
+            rsi_targets = {
+                t for t in rsi_targets if t[1] in allowed_strategies
+            }
+
+            # 🔹 Если есть что анализировать по RSI
+            rsi_results = []
+            if rsi_targets:
+                # Оставляем только позиции из батча и нужных стратегий/снапшотов
+                filtered_positions = [
+                    (pid, tf) for pid, tf, sid, snap_id in position_keys_for_rsi
+                    if (tf, sid, snap_id) in rsi_targets
+                ]
+
+                if filtered_positions:
+                    rsi_data = await conn.fetch(
+                        """
+                        SELECT el.tf,
+                               el.emasnapshot_dict_id,
+                               pis.value AS rsi_value,
+                               el.pnl
+                        FROM emasnapshot_position_log el
+                        JOIN positions_v4 p
+                          ON p.id = el.position_id
+                        JOIN position_ind_stat_v4 pis
+                          ON pis.position_uid = p.position_uid
+                         AND pis.param_name = 'rsi14'
+                         AND pis.timeframe = el.tf
+                        WHERE (el.position_id, el.tf) = ANY($1::record[])
+                        """,
+                        filtered_positions
+                    )
+
+                    # Группировка по tf, snap_id, bucket
+                    stats = {}
+                    for rec in rsi_data:
+                        tf = rec["tf"]
+                        snap_id = rec["emasnapshot_dict_id"]
+                        rsi_val = rec["rsi_value"]
+                        pnl = Decimal(rec["pnl"])
+                        bucket = int(rsi_val // 5) * 5
+
+                        key = (tf, snap_id, bucket)
+                        agg = stats.setdefault(key, {"num": 0, "wins": 0})
+                        agg["num"] += 1
+                        if pnl > 0:
+                            agg["wins"] += 1
+
+                    # Определение allow/reject
+                    for (tf, snap_id, bucket), agg in stats.items():
+                        num = agg["num"]
+                        if num == 0:
+                            continue
+                        winrate = agg["wins"] / num
+                        verdict = "allow" if winrate > 0.5 else "reject"
+                        rsi_results.append((tf, snap_id, bucket, verdict))
+
+    # 🔹 Запись в Redis (уже после коммита транзакции)
+    if rsi_results:
+        for tf, snap_id, bucket, verdict in rsi_results:
+            key = f"emarsicheck:{tf}:{snap_id}:{bucket}"
+            await infra.redis_client.set(key, verdict)
+            log.info(f"RSI-check → {key} = {verdict}")
+            
 # 🔸 Выполнение UPSERT в таблицу агрегации
 async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str, ref_id: int, data: dict, is_pattern=False):
     num_trades = data["num_trades"]
