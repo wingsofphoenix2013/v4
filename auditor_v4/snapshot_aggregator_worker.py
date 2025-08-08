@@ -159,6 +159,9 @@ async def process_batch(batch_size: int = 200):
                 ]
 
                 if filtered_positions:
+                    position_ids = [pid for pid, tf in filtered_positions]
+                    tfs = [tf for pid, tf in filtered_positions]
+
                     rsi_data = await conn.fetch(
                         """
                         SELECT el.tf,
@@ -172,9 +175,11 @@ async def process_batch(batch_size: int = 200):
                           ON pis.position_uid = p.position_uid
                          AND pis.param_name = 'rsi14'
                          AND pis.timeframe = el.tf
-                        WHERE (el.position_id, el.tf) = ANY($1::record[])
+                        WHERE (el.position_id, el.tf) IN (
+                            SELECT UNNEST($1::int[]), UNNEST($2::text[])
+                        )
                         """,
-                        filtered_positions
+                        position_ids, tfs
                     )
 
                     # Группировка по tf, snap_id, bucket
@@ -200,7 +205,7 @@ async def process_batch(batch_size: int = 200):
                         winrate = agg["wins"] / num
                         verdict = "allow" if winrate > 0.5 else "reject"
                         rsi_results.append((tf, snap_id, bucket, verdict))
-
+                        
     # 🔹 Запись в Redis (уже после коммита транзакции)
     if rsi_results:
         for tf, snap_id, bucket, verdict in rsi_results:
