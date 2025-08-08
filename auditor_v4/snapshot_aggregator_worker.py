@@ -165,6 +165,7 @@ async def process_batch(batch_size: int = 200):
                     rsi_data = await conn.fetch(
                         """
                         SELECT el.tf,
+                               el.strategy_id,
                                el.emasnapshot_dict_id,
                                pis.value AS rsi_value,
                                el.pnl
@@ -182,36 +183,37 @@ async def process_batch(batch_size: int = 200):
                         position_ids, tfs
                     )
 
-                    # Группировка по tf, snap_id, bucket
+                    # Группировка по tf, strategy_id, snap_id, bucket
                     stats = {}
                     for rec in rsi_data:
                         tf = rec["tf"]
+                        sid = rec["strategy_id"]
                         snap_id = rec["emasnapshot_dict_id"]
                         rsi_val = rec["rsi_value"]
                         pnl = Decimal(rec["pnl"])
                         bucket = int(rsi_val // 5) * 5
 
-                        key = (tf, snap_id, bucket)
+                        key = (tf, sid, snap_id, bucket)
                         agg = stats.setdefault(key, {"num": 0, "wins": 0})
                         agg["num"] += 1
                         if pnl > 0:
                             agg["wins"] += 1
 
                     # Определение allow/reject
-                    for (tf, snap_id, bucket), agg in stats.items():
+                    for (tf, sid, snap_id, bucket), agg in stats.items():
                         num = agg["num"]
                         if num == 0:
                             continue
                         winrate = agg["wins"] / num
                         verdict = "allow" if winrate > 0.5 else "reject"
-                        rsi_results.append((tf, snap_id, bucket, verdict))
-                        
+                        rsi_results.append((tf, sid, snap_id, bucket, verdict))
+
     # 🔹 Запись в Redis (уже после коммита транзакции)
     if rsi_results:
-        for tf, snap_id, bucket, verdict in rsi_results:
-            key = f"emarsicheck:{tf}:{snap_id}:{bucket}"
+        for tf, sid, snap_id, bucket, verdict in rsi_results:
+            key = f"emarsicheck:{tf}:{sid}:{snap_id}:{bucket}"
             await infra.redis_client.set(key, verdict)
-            log.info(f"RSI-check → {key} = {verdict}")
+            log.debug(f"RSI-check → {key} = {verdict}")
             
 # 🔸 Выполнение UPSERT в таблицу агрегации
 async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str, ref_id: int, data: dict, is_pattern=False):
@@ -252,25 +254,25 @@ async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str,
         strategy_id, direction, ref_id, num_trades, num_wins, num_losses,
         total_pnl, avg_pnl, winrate, base_rating
     )
+
 # 🔹 Периодический полный пересчёт RSI по всем стратегиям с флагом rsi_snapshot_check
 async def rsi_full_refresh():
     try:
         async with infra.pg_pool.acquire() as conn:
-            # Получаем список стратегий с rsi_snapshot_check = true
             strategies = await conn.fetch(
                 "SELECT id FROM strategies_v4 WHERE rsi_snapshot_check = true"
             )
             strategy_ids = [r["id"] for r in strategies]
             if not strategy_ids:
-                log.debug("RSI Full Refresh → нет стратегий с rsi_snapshot_check = true")
+                log.info("RSI Full Refresh → нет стратегий с rsi_snapshot_check = true")
                 return
 
             log.info(f"RSI Full Refresh → обрабатываем стратегии: {strategy_ids}")
 
-            # Загружаем все позиции с RSI14 по этим стратегиям
             rsi_data = await conn.fetch(
                 """
                 SELECT el.tf,
+                       el.strategy_id,
                        el.emasnapshot_dict_id,
                        pis.value AS rsi_value,
                        el.pnl
@@ -287,31 +289,32 @@ async def rsi_full_refresh():
             )
 
             if not rsi_data:
-                log.debug("RSI Full Refresh → нет данных для обработки")
+                log.info("RSI Full Refresh → нет данных для обработки")
                 return
 
-            # Группировка по tf, snap_id, bucket
+            # Группировка по tf, strategy_id, snap_id, bucket
             stats = {}
             for rec in rsi_data:
                 tf = rec["tf"]
+                sid = rec["strategy_id"]
                 snap_id = rec["emasnapshot_dict_id"]
                 rsi_val = rec["rsi_value"]
                 pnl = Decimal(rec["pnl"])
                 bucket = int(rsi_val // 5) * 5
 
-                key = (tf, snap_id, bucket)
+                key = (tf, sid, snap_id, bucket)
                 agg = stats.setdefault(key, {"num": 0, "wins": 0})
                 agg["num"] += 1
                 if pnl > 0:
                     agg["wins"] += 1
 
             # Запись в Redis
-            for (tf, snap_id, bucket), agg in stats.items():
+            for (tf, sid, snap_id, bucket), agg in stats.items():
                 if agg["num"] == 0:
                     continue
                 winrate = agg["wins"] / agg["num"]
                 verdict = "allow" if winrate > 0.5 else "reject"
-                redis_key = f"emarsicheck:{tf}:{snap_id}:{bucket}"
+                redis_key = f"emarsicheck:{tf}:{sid}:{snap_id}:{bucket}"
                 await infra.redis_client.set(redis_key, verdict)
                 log.debug(f"RSI Full Refresh → {redis_key} = {verdict}")
 
