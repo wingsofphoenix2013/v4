@@ -43,6 +43,8 @@ async def process_batch(batch_size: int = 200):
                 log.info("Нет новых строк для агрегации")
                 return
 
+            log.info(f"Начата агрегация: выбрано {len(rows)} строк")
+
             now = datetime.utcnow()
             snapshot_stats = {}
             pattern_stats = {}
@@ -99,6 +101,8 @@ async def process_batch(batch_size: int = 200):
                 strategies_by_table[table].add(sid)
                 await upsert_aggregation(conn, table, sid, dir_, pattern_id, data, is_pattern=True)
 
+            log.info(f"Агрегированы статистики: снапшотов={len(snapshot_stats)}, паттернов={len(pattern_stats)}")
+
             await conn.executemany(
                 """
                 UPDATE emasnapshot_position_log
@@ -110,6 +114,7 @@ async def process_batch(batch_size: int = 200):
 
             for table_name, strategy_ids in strategies_by_table.items():
                 if strategy_ids:
+                    log.debug(f"Публикация команд в Redis Stream: {table_name} → {sorted(strategy_ids)}")
                     await infra.redis_client.xadd(
                         "emasnapshot:ratings:commands",
                         {"table": table_name, "strategies": json.dumps(sorted(strategy_ids))}
@@ -186,15 +191,18 @@ async def process_batch(batch_size: int = 200):
                         rsi_results_pattern.append((tf, sid, pattern_id, bucket, verdict))
 
     if rsi_results_snap:
+        log.info(f"Запись в Redis snapshot_rsi: {len(rsi_results_snap)} ключей")
         for tf, sid, snap_id, bucket, verdict in rsi_results_snap:
             key = f"emarsicheck:{tf}:{sid}:{snap_id}:{bucket}"
             await infra.redis_client.set(key, verdict)
+            log.debug(f"RSI snapshot → {key} = {verdict}")
 
     if rsi_results_pattern:
+        log.info(f"Запись в Redis pattern_rsi: {len(rsi_results_pattern)} ключей")
         for tf, sid, pattern_id, bucket, verdict in rsi_results_pattern:
             key = f"emarsicheck_pattern:{tf}:{sid}:{pattern_id}:{bucket}"
             await infra.redis_client.set(key, verdict)
-                        
+            log.debug(f"RSI pattern → {key} = {verdict}")                        
 # 🔸 Выполнение UPSERT в таблицу агрегации
 async def upsert_aggregation(conn, table: str, strategy_id: int, direction: str, ref_id: int, data: dict, is_pattern=False):
     num_trades = data["num_trades"]
