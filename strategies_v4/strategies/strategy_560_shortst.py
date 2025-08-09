@@ -1,5 +1,5 @@
-importst logging
-importst json
+import logging
+import json
 
 log = logging.getLogger("strategy_560_shortst")
 
