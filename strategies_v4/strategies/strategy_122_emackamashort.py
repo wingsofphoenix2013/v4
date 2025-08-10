@@ -1,5 +1,6 @@
 import logging
 import json
+import asyncio
 from datetime import datetime, timedelta
 
 log = logging.getLogger("strategy_122_emackamashort")
@@ -25,7 +26,6 @@ class Strategy122Emackamashort:
             current_bar_open = now.replace(second=0, microsecond=0) - timedelta(
                 seconds=now.minute % (tf_sec // 60) * 60
             )
-
             prev_bar_open = current_bar_open - timedelta(seconds=tf_sec)
             n_bars_back_open = prev_bar_open - timedelta(seconds=tf_sec * N)
 
@@ -34,17 +34,28 @@ class Strategy122Emackamashort:
             kama_now = None
             kama_old = None
             for attempt in range(3):
-                kama_now = await redis.ts().get(ts_key, timestamp=int(prev_bar_open.timestamp() * 1000))
-                kama_old = await redis.ts().get(ts_key, timestamp=int(n_bars_back_open.timestamp() * 1000))
+                data_now = await redis.ts().range(
+                    ts_key,
+                    int(prev_bar_open.timestamp() * 1000),
+                    int(prev_bar_open.timestamp() * 1000)
+                )
+                data_old = await redis.ts().range(
+                    ts_key,
+                    int(n_bars_back_open.timestamp() * 1000),
+                    int(n_bars_back_open.timestamp() * 1000)
+                )
 
-                if kama_now and kama_old:
+                if data_now and data_old:
+                    kama_now = float(data_now[0][1])
+                    kama_old = float(data_old[0][1])
                     break
+
                 await asyncio.sleep(10)
 
-            if not kama_now or not kama_old:
+            if kama_now is None or kama_old is None:
                 return ("ignore", f"нет данных KAMA после {attempt+1} попыток")
 
-            slope = (float(kama_now[1]) - float(kama_old[1])) / N
+            slope = (kama_now - kama_old) / N
 
             if slope < 0:
                 return True

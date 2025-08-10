@@ -1,15 +1,19 @@
 import logging
 import json
+import asyncio
+from datetime import datetime, timedelta
 
-log = logging.getLogger("strategy_160_emaclong")
+log = logging.getLogger("strategy_160_emackamalong")
 
-class Strategy160Emaclong:
+class Strategy160Emackamalong:
     async def validate_signal(self, signal, context):
         redis = context.get("redis")
         symbol = signal["symbol"]
-        tf = "m5"
+        tf = "m5"  # таймфрейм
+        tf_sec = 300  # секунд в баре для m5
+        kama_length = 50  # длина KAMA — меняй здесь
+        N = 3  # количество баров для расчёта наклона
 
-        # Только для лонгов
         if signal["direction"].lower() != "long":
             return ("ignore", "short сигналы отключены")
 
@@ -18,23 +22,48 @@ class Strategy160Emaclong:
             return ("ignore", "нет Redis")
 
         try:
-            adx_key = f"ind:{symbol}:{tf}:adx_dmi14_adx"
-            raw_adx = await redis.get(adx_key)
-            if raw_adx is None:
-                return ("ignore", f"нет ADX в Redis: {adx_key}")
+            now = datetime.utcnow()
+            current_bar_open = now.replace(second=0, microsecond=0) - timedelta(
+                seconds=now.minute % (tf_sec // 60) * 60
+            )
+            prev_bar_open = current_bar_open - timedelta(seconds=tf_sec)
+            n_bars_back_open = prev_bar_open - timedelta(seconds=tf_sec * N)
 
-            try:
-                adx_value = float(raw_adx)
-            except ValueError:
-                return ("ignore", f"некорректное значение ADX: {raw_adx}")
+            ts_key = f"ts_ind:{symbol}:{tf}:kama{kama_length}"
 
-            if adx_value > 20:
+            kama_now = None
+            kama_old = None
+            for attempt in range(3):
+                data_now = await redis.ts().range(
+                    ts_key,
+                    int(prev_bar_open.timestamp() * 1000),
+                    int(prev_bar_open.timestamp() * 1000)
+                )
+                data_old = await redis.ts().range(
+                    ts_key,
+                    int(n_bars_back_open.timestamp() * 1000),
+                    int(n_bars_back_open.timestamp() * 1000)
+                )
+
+                if data_now and data_old:
+                    kama_now = float(data_now[0][1])
+                    kama_old = float(data_old[0][1])
+                    break
+
+                await asyncio.sleep(10)
+
+            if kama_now is None or kama_old is None:
+                return ("ignore", f"нет данных KAMA после {attempt+1} попыток")
+
+            slope = (kama_now - kama_old) / N
+
+            if slope > 0:
                 return True
             else:
-                return ("ignore", f"ADX={adx_value} <= 20")
+                return ("ignore", f"slope={slope} <= 0")
 
         except Exception:
-            log.exception("Ошибка в strategy_160_emaclong")
+            log.exception("Ошибка в strategy_160_emackamalong")
             return ("ignore", "ошибка в стратегии")
 
     async def run(self, signal, context):
