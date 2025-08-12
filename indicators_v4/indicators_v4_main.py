@@ -9,7 +9,7 @@ from collections import defaultdict
 from infra import init_pg_pool, init_redis_client, setup_logging
 from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store
-# from auditor import analyze_config_state, analyze_open_times, audit_storage_gaps
+from auditor import analyze_config_state
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
