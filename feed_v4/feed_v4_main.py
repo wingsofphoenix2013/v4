@@ -13,6 +13,7 @@ from feed_and_aggregate import (
     load_all_tickers,
     handle_ticker_events
 )
+from feed_auditor import run_feed_auditor
 
 # 🔸 Главная точка запуска
 async def main():
@@ -59,9 +60,8 @@ async def main():
         ), "FEED+AGGREGATOR:H1"),
 
         run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
-
         run_safe_loop(lambda: run_markprice_watcher(state, redis), "MARKPRICE"),
-
+        run_safe_loop(lambda: run_feed_auditor(pg, redis), "FEED_AUDITOR"),
         run_safe_loop(lambda: listen_ticker_activations(pg, redis), "TICKER_ACTIVATIONS")
     )
 

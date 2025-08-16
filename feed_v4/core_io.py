@@ -72,7 +72,7 @@ async def run_core_io(pg, redis):
 
                 async with pg.acquire() as conn:
                     async with conn.transaction():
-                        await conn.execute(f"""
+                        status = await conn.execute(f"""
                             INSERT INTO {table} (symbol, open_time, open, high, low, close, volume, source)
                             VALUES ($1, $2, $3, $4, $5, $6, $7, 'stream')
                             ON CONFLICT (symbol, open_time) DO NOTHING
@@ -82,6 +82,17 @@ async def run_core_io(pg, redis):
                             f"Вставлена запись в {table}: {symbol} @ {open_time.isoformat()} "
                             f"[{interval.upper()}] вставлено={datetime.utcnow().isoformat()}"
                         )
+
+                # 🔸 если реально вставили новую строку — отправляем триггер аудитору
+                if status == "INSERT 0 1":
+                    try:
+                        await redis.xadd("pg_candle_inserted", {
+                            "symbol": symbol,
+                            "interval": interval,
+                            "timestamp": str(int(open_time.timestamp() * 1000))
+                        })
+                    except Exception as e:
+                        log.warning(f"Не удалось отправить событие в pg_candle_inserted: {e}")
 
             except Exception as e:
                 log.exception(f"Ошибка вставки в PG для {symbol}: {e}")
