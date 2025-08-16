@@ -1,4 +1,4 @@
-# feed_and_aggregate.py — приём и логирование M1 и M5 свечей с реактивным управлением
+# feed_and_aggregate.py — приём и логирование M5/M15/H1 свечей с реактивным управлением
 import asyncio
 import logging
 import time
@@ -43,7 +43,6 @@ async def handle_ticker_events(
     redis: Redis,
     state: dict,
     pg: Pool,
-    refresh_queue_m1: asyncio.Queue,
     refresh_queue_m5: asyncio.Queue,
     refresh_queue_m15: asyncio.Queue,
     refresh_queue_h1: asyncio.Queue
@@ -84,7 +83,6 @@ async def handle_ticker_events(
                     ts = time.time()
                     state["activated_at"][symbol] = ts
                     log.info(f"[{symbol}] Активирован тикер — activated_at={datetime.utcfromtimestamp(ts).isoformat()}Z")
-                    await refresh_queue_m1.put("refresh")
                     await refresh_queue_m5.put("refresh")
                     await refresh_queue_m15.put("refresh")
                     await refresh_queue_h1.put("refresh")
@@ -92,7 +90,6 @@ async def handle_ticker_events(
                 elif action == "disabled" and symbol in state["active"]:
                     state["active"].remove(symbol)
                     log.info(f"[{symbol}] Деактивирован тикер")
-                    await refresh_queue_m1.put("refresh")
                     await refresh_queue_m5.put("refresh")
                     await refresh_queue_m15.put("refresh")
                     await refresh_queue_h1.put("refresh")
@@ -181,28 +178,22 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
 
     async def safe_ts_add(field_key, value, field_name):
         try:
-            # Проверяем: существует ли ключ
             try:
                 await redis.execute_command("TS.INFO", field_key)
             except Exception:
-                # Если нет — создаём
                 await redis.execute_command(
                     "TS.CREATE", field_key,
-                    "RETENTION", 5184000000,  # 2 месяца
+                    "RETENTION", 5184000000,
                     "DUPLICATE_POLICY", "last",
                     "LABELS",
                     "symbol", symbol,
                     "interval", interval,
                     "field", field_name
                 )
-
-            # Добавление значения
             await redis.execute_command("TS.ADD", field_key, ts, value)
-
         except Exception as e:
             log.warning(f"[{symbol}] Ошибка записи TS.ADD {field_key}: {e}")
 
-    # Параллельная запись всех полей
     await asyncio.gather(
         safe_ts_add(f"ts:{symbol}:{interval}:o", o, "o"),
         safe_ts_add(f"ts:{symbol}:{interval}:h", h, "h"),
@@ -213,7 +204,6 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
 
     log.debug(f"[{symbol}] {interval.upper()} TS записана: open_time={open_time}, завершено={datetime.utcnow()}")
 
-    # Публикация в Redis Stream
     await redis.xadd("ohlcv_stream", {
         "symbol": symbol,
         "interval": interval,
@@ -226,47 +216,13 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
     })
     log.debug(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
 
-    # Уведомление через Pub/Sub
     await redis.publish("ohlcv_channel", json.dumps({
         "symbol": symbol,
         "interval": interval,
         "timestamp": str(ts)
     }))
-# 🔸 M1: Реактивный запуск и управление WebSocket-группами
-async def run_feed_and_aggregator(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
-    log.debug("🔸 Запуск приёма M1 свечей с реактивным управлением")
-    queue = asyncio.Queue()
-    state["kline_tasks"] = {}
 
-    for _ in range(5):
-        asyncio.create_task(kline_worker(queue, state, redis, interval="M1"))
-
-    await refresh_queue.put("initial")
-
-    while True:
-        await refresh_queue.get()
-        log.debug("🔁 Пересборка групп WebSocket после изменения активных тикеров")
-
-        active_symbols = sorted(state["active"])
-        log.info(f"[M1] Всего активных тикеров: {len(active_symbols)} → {active_symbols}")
-        new_groups = {
-            f"M1:{','.join(group)}": group
-            for group in chunked(active_symbols, 3)
-        }
-        current_groups = set(state["kline_tasks"].keys())
-        desired_groups = set(new_groups.keys())
-
-        for group_key in desired_groups - current_groups:
-            group_symbols = new_groups[group_key]
-            task = asyncio.create_task(listen_kline_stream(group_key, group_symbols, queue, interval="1m"))
-            state["kline_tasks"][group_key] = task
-
-        for group_key in current_groups - desired_groups:
-            task = state["kline_tasks"].pop(group_key)
-            task.cancel()
-            log.debug(f"[KLINE:{group_key}] Поток остановлен — тикеры неактивны")
-
-# 🔸 M5: Реактивный запуск и логирование M5 свечей
+# 🔸 M5
 async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.debug("🔸 Запуск приёма M5 свечей")
     queue = asyncio.Queue()
@@ -300,7 +256,7 @@ async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queu
             task.cancel()
             log.debug(f"[KLINE:M5:{group_key}] Поток остановлен — тикеры неактивны")
 
-# 🔸 M15: Реактивный запуск и логирование M15 свечей
+# 🔸 M15
 async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.debug("🔸 Запуск приёма M15 свечей")
     queue = asyncio.Queue()
@@ -334,7 +290,8 @@ async def run_feed_and_aggregator_m15(state, redis: Redis, pg: Pool, refresh_que
             task = state["m15_tasks"].pop(group_key)
             task.cancel()
             log.debug(f"[KLINE:M15:{group_key}] Поток остановлен — тикеры неактивны")
-# 🔸 H1: Реактивный запуск и логирование H1 свечей
+
+# 🔸 H1
 async def run_feed_and_aggregator_h1(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.debug("🔸 Запуск приёма H1 свечей")
     queue = asyncio.Queue()
@@ -368,4 +325,3 @@ async def run_feed_and_aggregator_h1(state, redis: Redis, pg: Pool, refresh_queu
             task = state["h1_tasks"].pop(group_key)
             task.cancel()
             log.debug(f"[KLINE:H1:{group_key}] Поток остановлен — тикеры неактивны")
-            

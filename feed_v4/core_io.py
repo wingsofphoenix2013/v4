@@ -7,7 +7,6 @@ import json
 
 # 🔸 Сопоставление интервалов с таблицами
 TABLE_MAP = {
-    "m1": "ohlcv4_m1",
     "m5": "ohlcv4_m5",
     "m15": "ohlcv4_m15",
     "h1": "ohlcv4_h1",
@@ -16,24 +15,19 @@ TABLE_MAP = {
 async def listen_ticker_activations(pg, redis):
     log = logging.getLogger("CORE_IO")
 
-    # Инициализация PubSub и подписка на канал
     pubsub = redis.pubsub()
     await pubsub.subscribe("tickers_v4_events")
     log.info("Подписка на Redis PubSub: tickers_v4_events")
 
-    # Прослушка сообщений
     async for msg in pubsub.listen():
         if msg["type"] != "message":
             continue
 
         try:
             data = json.loads(msg["data"])
-
-            # Обработка только события активации статуса
             if data.get("type") == "status" and data.get("action") == "enabled":
                 symbol = data.get("symbol")
                 if symbol:
-                    # Обновление поля activated_at в tickers_v4
                     async with pg.acquire() as conn:
                         await conn.execute("""
                             UPDATE tickers_v4
@@ -49,9 +43,9 @@ async def listen_ticker_activations(pg, redis):
 async def run_core_io(pg, redis):
     log = logging.getLogger("CORE_IO")
     stream_key = "ohlcv_stream"
-    last_id = "$"  # можно заменить на "$" для чтения только новых
+    last_id = "$"
 
-    semaphore = asyncio.Semaphore(20)  # Ограничение на кол-во одновременных вставок
+    semaphore = asyncio.Semaphore(20)
 
     async def process_message(data):
         async with semaphore:
@@ -86,24 +80,4 @@ async def run_core_io(pg, redis):
 
                         log.debug(
                             f"Вставлена запись в {table}: {symbol} @ {open_time.isoformat()} "
-                            f"[{interval.upper()}] вставлено={datetime.utcnow().isoformat()}"
-                        )
-
-            except Exception as e:
-                log.exception(f"Ошибка вставки в PG для {symbol}: {e}")
-
-    while True:
-        try:
-            response = await redis.xread({stream_key: last_id}, count=10, block=5000)
-
-            if not response:
-                continue  # таймаут
-
-            for stream, messages in response:
-                last_id = messages[-1][0]  # Обновить идентификатор
-                tasks = [process_message(data) for _, data in messages]
-                await asyncio.gather(*tasks)
-
-        except Exception as e:
-            log.error(f"Ошибка: {e}", exc_info=True)
-            await asyncio.sleep(2)
+                            f"[{interval.upper()}] вставлено={
