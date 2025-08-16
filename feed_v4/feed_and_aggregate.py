@@ -132,7 +132,7 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
                     async for msg in ws:
                         data = json.loads(msg)
                         kline = data.get("data", {}).get("k")
-                        if not kline or not kline.get("x"):
+                        if not kline:
                             continue
                         await queue.put(kline)
                 finally:
@@ -142,7 +142,7 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
             log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
             log.info(f"[KLINE:{group_key}] Переподключение через 5 секунд...")
             await asyncio.sleep(5)
-
+            
 # 🔸 Воркер для обработки свечей
 async def kline_worker(queue, state, redis, interval="M1"):
     while True:
@@ -169,6 +169,7 @@ async def kline_worker(queue, state, redis, interval="M1"):
 # 🔸 Универсальная функция сохранения в Redis
 async def store_and_publish_kline(redis, symbol, open_time, kline, interval, precision_price, precision_qty):
     ts = int(open_time.timestamp() * 1000)
+    is_closed = bool(kline.get("x"))
 
     o = float(kline["o"])
     h = float(kline["h"])
@@ -204,24 +205,25 @@ async def store_and_publish_kline(redis, symbol, open_time, kline, interval, pre
 
     log.debug(f"[{symbol}] {interval.upper()} TS записана: open_time={open_time}, завершено={datetime.utcnow()}")
 
-    await redis.xadd("ohlcv_stream", {
-        "symbol": symbol,
-        "interval": interval,
-        "timestamp": str(ts),
-        "o": str(o),
-        "h": str(h),
-        "l": str(l),
-        "c": str(c),
-        "v": str(v),
-    })
-    log.debug(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
+    if is_closed:
+        await redis.xadd("ohlcv_stream", {
+            "symbol": symbol,
+            "interval": interval,
+            "timestamp": str(ts),
+            "o": str(o),
+            "h": str(h),
+            "l": str(l),
+            "c": str(c),
+            "v": str(v),
+        })
+        log.debug(f"[{symbol}] {interval.upper()} отправлена в Redis Stream: open_time={open_time}, отправлено={datetime.utcnow()}")
 
-    await redis.publish("ohlcv_channel", json.dumps({
-        "symbol": symbol,
-        "interval": interval,
-        "timestamp": str(ts)
-    }))
-
+        await redis.publish("ohlcv_channel", json.dumps({
+            "symbol": symbol,
+            "interval": interval,
+            "timestamp": str(ts)
+        }))
+        
 # 🔸 M5
 async def run_feed_and_aggregator_m5(state, redis: Redis, pg: Pool, refresh_queue: asyncio.Queue):
     log.debug("🔸 Запуск приёма M5 свечей")
