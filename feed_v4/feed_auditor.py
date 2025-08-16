@@ -31,7 +31,7 @@ def align_start(ts, step_min):
 async def audit_db_12h(pg, symbol, interval, end_ts):
     table = TABLE_MAP.get(interval)
     if not table:
-        return
+        return 0
 
     step_min = STEP_MIN[interval]
     start_ts = align_start(end_ts - timedelta(hours=12), step_min)
@@ -53,20 +53,17 @@ async def audit_db_12h(pg, symbol, interval, end_ts):
             start_ts, end_ts, step_delta, symbol
         )
 
-        if not missing:
-            log.debug(f"[{symbol}] [{interval}] Нет пропусков за окно {start_ts}..{end_ts}")
-            return
+        if missing:
+            await conn.executemany(
+                """
+                INSERT INTO ohlcv4_gap (symbol, interval, open_time, status)
+                VALUES ($1, $2, $3, 'found')
+                ON CONFLICT (symbol, interval, open_time) DO NOTHING
+                """,
+                [(symbol, interval, r["open_time"]) for r in missing]
+            )
 
-        await conn.executemany(
-            """
-            INSERT INTO ohlcv4_gap (symbol, interval, open_time, status)
-            VALUES ($1, $2, $3, 'found')
-            ON CONFLICT (symbol, interval, open_time) DO NOTHING
-            """,
-            [(symbol, interval, r["open_time"]) for r in missing]
-        )
-
-    log.info(f"[{symbol}] [{interval}] Пропуски зафиксированы: {len(missing)} шт (12ч окно)")
+    return len(missing)
 
 # 🔸 Основной воркер аудитора: слушаем триггеры вставок из PG и запускаем аудит
 async def run_feed_auditor(pg, redis):
@@ -99,7 +96,14 @@ async def run_feed_auditor(pg, redis):
                             continue
 
                         end_ts = datetime.utcfromtimestamp(int(ts_ms) / 1000)
-                        await audit_db_12h(pg, symbol, interval, end_ts)
+
+                        # 🔸 Старт аудита по событию вставки свечи в БД
+                        log.info(f"Запуск аудита: {symbol} [{interval}] @ {end_ts}")
+
+                        missing_count = await audit_db_12h(pg, symbol, interval, end_ts)
+
+                        # 🔸 Завершение аудита (даже если пропусков нет)
+                        log.info(f"Аудит завершён: {symbol} [{interval}] @ {end_ts} — пропусков {missing_count}")
 
                     except Exception as e:
                         log.warning(f"Ошибка аудита {symbol}/{interval}/{ts_ms}: {e}", exc_info=True)
