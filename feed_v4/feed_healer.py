@@ -229,7 +229,7 @@ async def heal_range(pg, session, symbol, interval, a, b):
 
     if healed:
         n = await mark_gaps_healed_db(pg, symbol, interval, healed)
-        log.info(f"[{symbol}] [{interval}] диапазон {a}..{b} — вылечено {n}/{len(expected_times)} (вставляли {inserted_try})")
+        log.debug(f"[{symbol}] [{interval}] диапазон {a}..{b} — вылечено {n}/{len(expected_times)} (вставляли {inserted_try})")
 
     if missing_still:
         await mark_gaps_error(pg, symbol, interval, missing_still, "partial heal: missing after insert")
@@ -237,7 +237,7 @@ async def heal_range(pg, session, symbol, interval, a, b):
 
 # 🔸 основной воркер: находит пропуски, группирует и лечит БД
 async def run_feed_healer(pg, redis):
-    log.info("HEALER запущен (лечение пропусков БД)")
+    log.debug("HEALER запущен (лечение пропусков БД)")
     http_timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=http_timeout) as session:
         while True:
@@ -255,7 +255,7 @@ async def run_feed_healer(pg, redis):
                         total_missing = sum(
                             int((b - a).total_seconds() // (STEP_MIN[interval] * 60) + 1) for a, b in ranges
                         )
-                        log.info(f"[{symbol}] [{interval}] к лечению: пропусков {total_missing}, диапазонов {len(ranges)}")
+                        log.debug(f"[{symbol}] [{interval}] к лечению: пропусков {total_missing}, диапазонов {len(ranges)}")
 
                         for a, b in ranges:
                             await heal_range(pg, session, symbol, interval, a, b)

@@ -98,12 +98,12 @@ async def run_feed_auditor(pg, redis):
                         end_ts = datetime.utcfromtimestamp(int(ts_ms) / 1000)
 
                         # 🔸 Старт аудита по событию вставки свечи в БД
-                        log.info(f"Запуск аудита: {symbol} [{interval}] @ {end_ts}")
+                        log.debug(f"Запуск аудита: {symbol} [{interval}] @ {end_ts}")
 
                         missing_count = await audit_db_12h(pg, symbol, interval, end_ts)
 
                         # 🔸 Завершение аудита (даже если пропусков нет)
-                        log.info(f"Аудит завершён: {symbol} [{interval}] @ {end_ts} — пропусков {missing_count}")
+                        log.debug(f"Аудит завершён: {symbol} [{interval}] @ {end_ts} — пропусков {missing_count}")
 
                     except Exception as e:
                         log.warning(f"Ошибка аудита {symbol}/{interval}/{ts_ms}: {e}", exc_info=True)

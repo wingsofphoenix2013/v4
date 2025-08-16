@@ -128,11 +128,11 @@ async def process_symbol_interval(pg, redis, symbol, interval, times):
 
     # Помечаем healed_ts
     await mark_gaps_healed_ts(pg, symbol, interval, times)
-    log.info(f"[{symbol}] [{interval}] TS заполнен для {len(times)} точек")
+    log.debug(f"[{symbol}] [{interval}] TS заполнен для {len(times)} точек")
 
 # 🔸 основной воркер: берём healed_db из ohlcv4_gap и заполняем TS
 async def run_feed_ts_filler(pg, redis):
-    log.info("TS_FILLER запущен (дозаполнение Redis TS)")
+    log.debug("TS_FILLER запущен (дозаполнение Redis TS)")
     while True:
         try:
             rows = await fetch_healed_db_gaps(pg, limit=500)

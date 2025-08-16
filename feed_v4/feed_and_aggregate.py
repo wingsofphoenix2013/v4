@@ -32,9 +32,9 @@ async def load_all_tickers(pg: Pool):
         if row["status"] == "enabled":
             active.add(symbol)
             activated_at[symbol] = now
-            log.info(f"[{symbol}] Активен по умолчанию — activated_at={datetime.utcfromtimestamp(now).isoformat()}Z")
+            log.debug(f"[{symbol}] Активен по умолчанию — activated_at={datetime.utcfromtimestamp(now).isoformat()}Z")
         else:
-            log.info(f"[{symbol}] Неактивен по умолчанию")
+            log.debug(f"[{symbol}] Неактивен по умолчанию")
 
     return tickers, active, activated_at
 
