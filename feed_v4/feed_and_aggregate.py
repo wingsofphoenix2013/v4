@@ -134,6 +134,18 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
                         kline = data.get("data", {}).get("k")
                         if not kline:
                             continue
+
+                        # троттлинг незакрытых баров: не чаще 1 раза в 5 сек на символ/интервал
+                        is_closed = bool(kline.get("x"))
+                        if not is_closed:
+                            sym = kline.get("s")
+                            now = int(time.time())
+                            last_key = f"__last_enq_{sym}_{interval}__"
+                            last = getattr(listen_kline_stream, last_key, 0)
+                            if now - last < 10:
+                                continue
+                            setattr(listen_kline_stream, last_key, now)
+
                         await queue.put(kline)
                 finally:
                     pong_task.cancel()
@@ -142,7 +154,6 @@ async def listen_kline_stream(group_key, symbols, queue, interval="1m"):
             log.error(f"[KLINE:{group_key}] Ошибка WebSocket: {e}", exc_info=True)
             log.info(f"[KLINE:{group_key}] Переподключение через 5 секунд...")
             await asyncio.sleep(5)
-            
 # 🔸 Воркер для обработки свечей
 async def kline_worker(queue, state, redis, interval="M1"):
     while True:
