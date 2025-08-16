@@ -80,4 +80,24 @@ async def run_core_io(pg, redis):
 
                         log.debug(
                             f"Вставлена запись в {table}: {symbol} @ {open_time.isoformat()} "
-                            f"[{interval.upper()}] вставлено={
+                            f"[{interval.upper()}] вставлено={datetime.utcnow().isoformat()}"
+                        )
+
+            except Exception as e:
+                log.exception(f"Ошибка вставки в PG для {symbol}: {e}")
+
+    while True:
+        try:
+            response = await redis.xread({stream_key: last_id}, count=10, block=5000)
+
+            if not response:
+                continue  # таймаут
+
+            for stream, messages in response:
+                last_id = messages[-1][0]  # Обновить идентификатор
+                tasks = [process_message(data) for _, data in messages]
+                await asyncio.gather(*tasks)
+
+        except Exception as e:
+            log.error(f"Ошибка: {e}", exc_info=True)
+            await asyncio.sleep(2)
