@@ -35,14 +35,14 @@ async def audit_db_12h(pg, symbol, interval, end_ts):
 
     step_min = STEP_MIN[interval]
     start_ts = align_start(end_ts - timedelta(hours=12), step_min)
-    end_ts = end_ts.replace(second=0, microsecond=0)
-    step_literal = f"{step_min} minutes"
+    end_ts = align_start(end_ts, step_min)
+    step_delta = timedelta(minutes=step_min)
 
     async with pg.acquire() as conn:
-        rows = await conn.fetch(
+        missing = await conn.fetch(
             f"""
             WITH gs AS (
-              SELECT generate_series($1::timestamp, $2::timestamp, $3::interval) AS open_time
+              SELECT generate_series($1::timestamp, $2::timestamp, $3) AS open_time
             )
             SELECT gs.open_time
             FROM gs
@@ -50,10 +50,10 @@ async def audit_db_12h(pg, symbol, interval, end_ts):
               ON t.symbol = $4 AND t.open_time = gs.open_time
             WHERE t.open_time IS NULL
             """,
-            start_ts, end_ts, step_literal, symbol
+            start_ts, end_ts, step_delta, symbol
         )
 
-        if not rows:
+        if not missing:
             log.debug(f"[{symbol}] [{interval}] Нет пропусков за окно {start_ts}..{end_ts}")
             return
 
@@ -63,10 +63,10 @@ async def audit_db_12h(pg, symbol, interval, end_ts):
             VALUES ($1, $2, $3, 'found')
             ON CONFLICT (symbol, interval, open_time) DO NOTHING
             """,
-            [(symbol, interval, r["open_time"]) for r in rows]
+            [(symbol, interval, r["open_time"]) for r in missing]
         )
 
-    log.info(f"[{symbol}] [{interval}] Пропуски зафиксированы: {len(rows)} шт (12ч окно)")
+    log.info(f"[{symbol}] [{interval}] Пропуски зафиксированы: {len(missing)} шт (12ч окно)")
 
 # 🔸 Основной воркер аудитора: слушаем триггеры вставок из PG и запускаем аудит
 async def run_feed_auditor(pg, redis):
