@@ -6,15 +6,14 @@ import logging
 import pandas as pd
 from collections import defaultdict
 
-from infra import init_pg_pool, init_redis_client, setup_logging
+from infra import init_pg_pool, init_redis_client, setup_logging, run_safe_loop
 from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store
-from auditor import analyze_config_state
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
 indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
-required_candles = defaultdict(lambda: 500)  # tf -> сколько свечей загружать
+required_candles = defaultdict(lambda: 800)  # tf -> сколько свечей загружать
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
@@ -37,13 +36,16 @@ async def load_initial_indicators(pg):
             SELECT id, indicator, timeframe, stream_publish
             FROM indicator_instances_v4
             WHERE enabled = true
+              AND timeframe IN ('m5','m15','h1')
         """)
         for inst in instances:
             params = await conn.fetch("""
-                SELECT param, value FROM indicator_parameters_v4
+                SELECT param, value
+                FROM indicator_parameters_v4
                 WHERE instance_id = $1
             """, inst["id"])
             param_map = {p["param"]: p["value"] for p in params}
+
             indicator_instances[inst["id"]] = {
                 "indicator": inst["indicator"],
                 "timeframe": inst["timeframe"],
@@ -51,7 +53,7 @@ async def load_initial_indicators(pg):
                 "params": param_map
             }
             log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}")
-
+            
 # 🔸 Подписка на обновления тикеров
 async def watch_ticker_updates(pg, redis):
     log = logging.getLogger("TICKER_UPDATES")
@@ -103,14 +105,23 @@ async def watch_indicator_updates(pg, redis):
                     async with pg.acquire() as conn:
                         row = await conn.fetchrow("""
                             SELECT id, indicator, timeframe, stream_publish
-                            FROM indicator_instances_v4 WHERE id = $1
+                            FROM indicator_instances_v4
+                            WHERE id = $1
                         """, iid)
                         if row:
+                            # страховка: m1 не поддерживаем
+                            if row["timeframe"] == "m1":
+                                indicator_instances.pop(iid, None)
+                                log.info(f"Индикатор m1 проигнорирован: id={iid}")
+                                continue
+
                             params = await conn.fetch("""
-                                SELECT param, value FROM indicator_parameters_v4
+                                SELECT param, value
+                                FROM indicator_parameters_v4
                                 WHERE instance_id = $1
                             """, iid)
                             param_map = {p["param"]: p["value"] for p in params}
+
                             indicator_instances[iid] = {
                                 "indicator": row["indicator"],
                                 "timeframe": row["timeframe"],
@@ -125,18 +136,28 @@ async def watch_indicator_updates(pg, redis):
             elif field == "stream_publish" and iid in indicator_instances:
                 indicator_instances[iid]["stream_publish"] = (action == "true")
                 log.info(f"stream_publish обновлён: id={iid} → {action}")
+
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
+            
 
 # 🔸 Загрузка свечей из Redis TimeSeries
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
-    step_ms = {
-        "m1": 60_000,
+
+    # страховка от m1 и любых неподдерживаемых ТФ
+    if interval == "m1":
+        return None
+
+    step_ms_map = {
         "m5": 300_000,
         "m15": 900_000,
         "h1": 3_600_000
-    }[interval]
+    }
+    step_ms = step_ms_map.get(interval)
+    if step_ms is None:
+        return None
+
     start_ts = end_ts - (count - 1) * step_ms
 
     fields = ["o", "h", "l", "c", "v"]
@@ -174,7 +195,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     df.index.name = "open_time"
     df = df.sort_index()
     return df
-
+    
 # 🔸 Обработка событий из канала OHLCV
 async def watch_ohlcv_events(pg, redis):
     log = logging.getLogger("OHLCV_EVENTS")
@@ -190,6 +211,10 @@ async def watch_ohlcv_events(pg, redis):
             interval = data.get("interval")
             timestamp = data.get("timestamp")
 
+            # страховка: m1 не поддерживаем
+            if interval == "m1":
+                continue
+
             if symbol not in active_tickers:
                 continue
 
@@ -202,24 +227,24 @@ async def watch_ohlcv_events(pg, redis):
 
             precision = active_tickers.get(symbol, 8)
             depth = required_candles.get(interval, 200)
-            df = await load_ohlcv_from_redis(redis, symbol, interval, int(timestamp), depth)
+
+            ts = int(timestamp)
+            df = await load_ohlcv_from_redis(redis, symbol, interval, ts, depth)
             if df is None:
                 continue
 
             await asyncio.gather(*[
-                compute_and_store(iid, indicator_instances[iid], symbol, df, int(timestamp), pg, redis, precision)
+                compute_and_store(iid, indicator_instances[iid], symbol, df, ts, pg, redis, precision)
                 for iid in relevant_instances
             ])
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
-
+            
 # 🔸 Точка входа
 async def main():
     setup_logging()
     pg = await init_pg_pool()
     redis = await init_redis_client()
-
-    await analyze_config_state(pg)
     
     await load_initial_tickers(pg)
     await load_initial_indicators(pg)
@@ -254,12 +279,10 @@ async def main():
                 await asyncio.sleep(5)
 
     await asyncio.gather(
-        safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
-        safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
-        safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
-        safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
-#         safe_loop(lambda: interval_loop(lambda: analyze_open_times(pg), "OPEN_TIME_ANALYZER", interval=300, initial_delay=90), "OPEN_TIME_ANALYZER"),
-#         safe_loop(lambda: interval_loop(lambda: audit_storage_gaps(pg), "STORAGE_AUDITOR", interval=300, initial_delay=120), "STORAGE_AUDITOR"),
+        run_safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
+        run_safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
+        run_safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
+        run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
     )
 
 if __name__ == "__main__":

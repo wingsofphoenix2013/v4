@@ -14,13 +14,24 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 async def init_pg_pool():
     return await asyncpg.create_pool(DATABASE_URL)
 
-# 🔸 Подключение к Redis
-def init_redis_client():
-    return aioredis.from_url(
+# 🔸 Подключение к Redis (async + health-check)
+async def init_redis_client():
+    client = aioredis.from_url(
         REDIS_URL,
         decode_responses=True,
-        encoding="utf-8"
+        encoding="utf-8",
+        socket_connect_timeout=3,
+        socket_keepalive=True,
     )
+    # health-check с короткими ретраями
+    for attempt in range(3):
+        try:
+            await client.ping()
+            return client
+        except Exception:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1 + attempt)
 
 # 🔸 Безопасный запуск фонового воркера
 async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
