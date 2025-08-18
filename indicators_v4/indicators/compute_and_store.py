@@ -151,3 +151,63 @@ def get_expected_param_names(indicator: str, params: dict) -> list[str]:
 
     else:
         return [indicator]
+# 🔸 Чистый расчёт индикатора (без записи в Redis/PG/стримы)
+def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> dict[str, str]:
+
+    log = logging.getLogger("SNAPSHOT")
+
+    indicator = instance["indicator"]
+    params = instance["params"]
+
+    compute_fn = INDICATOR_DISPATCH.get(indicator)
+    if compute_fn is None:
+        log.warning(f"⛔ Неизвестный индикатор: {indicator}")
+        return {}
+
+    try:
+        raw = compute_fn(df, params)
+    except Exception as e:
+        log.error(f"Ошибка расчёта {indicator}: {e}")
+        return {}
+
+    # округление + фильтрация нечисловых значений
+    rounded = {}
+    for k, v in raw.items():
+        try:
+            if v is None or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                continue
+            if "angle" in k:
+                val = round(float(v), 5)
+                rounded[k] = f"{val:.5f}"
+            else:
+                val = round(float(v), precision)
+                rounded[k] = f"{val:.{precision}f}"
+        except Exception as e:
+            log.warning(f"[{indicator}] {symbol}: ошибка округления {k}={v} → {e}")
+
+    if not rounded:
+        return {}
+
+    # 🔸 Построение базового имени (base), как в compute_and_store
+    if indicator == "macd":
+        base = f"{indicator}{params['fast']}"
+    elif "length" in params:
+        base = f"{indicator}{params['length']}"
+    else:
+        base = indicator
+
+    # 🔸 Приведение имён параметров
+    out: dict[str, str] = {}
+    for param, value in rounded.items():
+        if param.startswith(f"{base}_") or param == base:
+            param_name = param
+        else:
+            param_name = f"{base}_{param}" if param != "value" else base
+        out[param_name] = value
+
+    return out
+
+
+# 🔸 Асинхронная обёртка: выполнить sync-расчёт в пуле потоков
+async def compute_snapshot_values_async(instance: dict, symbol: str, df, precision: int) -> dict[str, str]:
+    return await asyncio.to_thread(compute_snapshot_values, instance, symbol, df, precision)
