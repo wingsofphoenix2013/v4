@@ -1,8 +1,11 @@
 # 🔸 indicators/compute_and_store.py
 
 import logging
-import pandas as pd
 import asyncio
+import math
+from datetime import datetime
+
+# импорт индикаторов оставляем как было
 from indicators import ema, atr, lr, mfi, rsi, adx_dmi, macd, bb, kama
 
 # 🔸 Сопоставление имён индикаторов с функциями
@@ -17,6 +20,12 @@ INDICATOR_DISPATCH = {
     "bb": bb.compute,
     "kama": kama.compute,
 }
+
+def _is_finite_number(x) -> bool:
+    try:
+        return x is not None and isinstance(x, (int, float)) and math.isfinite(float(x))
+    except Exception:
+        return False
 
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
@@ -35,28 +44,37 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     try:
         raw_result = compute_fn(df, params)
+        # округление
         result = {}
         for k, v in raw_result.items():
+            if not _is_finite_number(v):
+                log.debug(f"[SKIP] {indicator} {symbol}/{timeframe} → {k} is non-finite ({v})")
+                continue
             if "angle" in k:
-                result[k] = round(v, 5)
+                result[k] = round(float(v), 5)
             else:
-                result[k] = round(v, precision)
+                result[k] = round(float(v), precision)
     except Exception as e:
         log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")
         return
 
+    if not result:
+        log.debug(f"[SKIP] {indicator} {symbol}/{timeframe} → пустой результат после фильтрации")
+        return
+
     log.debug(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
 
-    # 🔸 Построение базового имени (label)
+    # 🔸 Базовое имя (label)
     if indicator == "macd":
         base = f"{indicator}{params['fast']}"
     elif "length" in params:
         base = f"{indicator}{params['length']}"
     else:
         base = indicator
-        
+
     tasks = []
-    open_time_iso = pd.to_datetime(ts, unit="ms").isoformat()
+    # UTC-naive ISO без таймзоны
+    open_time_iso = datetime.utcfromtimestamp(int(ts) / 1000).isoformat()
 
     for param, value in result.items():
         if param.startswith(f"{base}_") or param == base:
@@ -64,32 +82,27 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         else:
             param_name = f"{base}_{param}" if param != "value" else base
 
-        # 🔸 Форматирование строкового значения строго по precision
-        if "angle" in param:
+        # Форматирование значения в строку по precision
+        if "angle" in param_name:
             str_value = f"{value:.5f}"
         else:
             str_value = f"{value:.{precision}f}"
 
-        # Redis key
+        # Redis KV
         redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
-        log.debug(f"SET {redis_key} = {str_value}")
         tasks.append(redis.set(redis_key, str_value))
 
         # Redis TS
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
-        log.debug(f"TS.ADD {ts_key} {ts} {str_value}")
         ts_add = redis.execute_command(
-            "TS.ADD", ts_key, ts, str_value,
-            "RETENTION", 604800000,
+            "TS.ADD", ts_key, int(ts), str_value,
+            "RETENTION", 604800000,  # 7 дней
             "DUPLICATE_POLICY", "last"
         )
         if asyncio.iscoroutine(ts_add):
             tasks.append(ts_add)
-        else:
-            log.warning(f"TS.ADD не вернул coroutine для {ts_key}")
 
         # Redis Stream (core)
-        log.debug(f"XADD indicator_stream_core: {param_name}={str_value}")
         tasks.append(redis.xadd("indicator_stream_core", {
             "symbol": symbol,
             "interval": timeframe,
@@ -102,7 +115,6 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     # Redis Stream (готовность)
     if stream:
-        log.debug(f"XADD indicator_stream: {base} ready for {symbol}/{timeframe}")
         tasks.append(redis.xadd("indicator_stream", {
             "symbol": symbol,
             "indicator": base,
@@ -112,50 +124,30 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         }))
 
     await asyncio.gather(*tasks, return_exceptions=True)
+
 # 🔸 Генерация ожидаемых имён параметров для индикатора
 def get_expected_param_names(indicator: str, params: dict) -> list[str]:
-    """
-    Возвращает список ожидаемых param_name, соответствующих результатам индикатора.
-    """
     if indicator == "macd":
         base = f"macd{params['fast']}"
-        return [
-            f"{base}_macd",
-            f"{base}_macd_signal",
-            f"{base}_macd_hist",
-        ]
+        return [f"{base}_macd", f"{base}_macd_signal", f"{base}_macd_hist"]
 
     elif indicator == "bb":
         length = params["length"]
         std_raw = round(float(params["std"]), 2)
-        std_str = str(std_raw).replace(".", "_")  # 2.5 → 2_5
+        std_str = str(std_raw).replace(".", "_")
         base = f"bb{length}_{std_str}"
-        return [
-            f"{base}_center",
-            f"{base}_upper",
-            f"{base}_lower",
-        ]
+        return [f"{base}_center", f"{base}_upper", f"{base}_lower"]
 
     elif indicator == "adx_dmi":
         base = f"adx_dmi{params['length']}"
-        return [
-            f"{base}_adx",
-            f"{base}_plus_di",
-            f"{base}_minus_di",
-        ]
+        return [f"{base}_adx", f"{base}_plus_di", f"{base}_minus_di"]
 
     elif indicator == "lr":
         base = f"lr{params['length']}"
-        return [
-            f"{base}_angle",
-            f"{base}_center",
-            f"{base}_upper",
-            f"{base}_lower",
-        ]
+        return [f"{base}_angle", f"{base}_center", f"{base}_upper", f"{base}_lower"]
 
     elif indicator in ("rsi", "mfi", "ema", "kama", "atr"):
         return [f"{indicator}{params['length']}"]
 
     else:
-        # fallback: просто имя индикатора
         return [indicator]

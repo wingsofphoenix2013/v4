@@ -13,7 +13,11 @@ from indicators.compute_and_store import compute_and_store
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
 indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params)
-required_candles = defaultdict(lambda: 800)  # tf -> сколько свечей загружать
+required_candles = {
+    "m5": 800,
+    "m15": 800,
+    "h1": 800,
+}
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
@@ -248,35 +252,6 @@ async def main():
     
     await load_initial_tickers(pg)
     await load_initial_indicators(pg)
-
-    # 🔸 Обёртка для безопасного запуска фоновой задачи
-    async def safe_loop(coro, label):
-        log = logging.getLogger(label)
-        while True:
-            try:
-                log.info("Запуск задачи")
-                await coro()
-            except Exception:
-                log.exception("Ошибка — перезапуск через 5 секунд")
-                await asyncio.sleep(5)
-
-    # 🔸 Периодический запуск с интервалом и опциональной задержкой
-    async def interval_loop(coro_func, label, interval, initial_delay=0):
-        log = logging.getLogger(label)
-
-        if initial_delay > 0:
-            log.info(f"Первая задержка {initial_delay} сек перед запуском")
-            await asyncio.sleep(initial_delay)
-
-        while True:
-            try:
-                log.info("Запуск задачи")
-                await coro_func()
-                log.info(f"Следующий запуск через {interval} сек")
-                await asyncio.sleep(interval)
-            except Exception:
-                log.exception("Ошибка — перезапуск через 5 секунд")
-                await asyncio.sleep(5)
 
     await asyncio.gather(
         run_safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
