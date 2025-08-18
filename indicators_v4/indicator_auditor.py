@@ -19,6 +19,18 @@ def align_start(ts, step_min: int) -> datetime:
         ts -= timedelta(minutes=rem)
     return ts
 
+# 🔸 Выравнивание времени вперёд (ceil) по шагу таймфрейма
+def align_forward(ts: datetime, step_min: int) -> datetime:
+    """
+    Округляет время вперёд к ближайшей границе шага.
+    Если ts уже попадает на границу — возвращает его же.
+    """
+    ts = ts.replace(second=0, microsecond=0)
+    rem = ts.minute % step_min
+    if rem == 0:
+        return ts
+    return ts - timedelta(minutes=rem) + timedelta(minutes=step_min)
+
 # 🔸 Активные инстансы по ТФ с параметрами и enabled_at
 async def fetch_enabled_instances_for_tf(pg, timeframe: str):
     async with pg.acquire() as conn:
@@ -140,10 +152,11 @@ async def run_indicator_auditor(pg, redis, window_hours: int = 12):
                     params = inst["params"]
                     enabled_at = inst["enabled_at"]
 
-                    # 🔸 Учитываем enabled_at: раньше момента включения не проверяем
+                    # 🔸 Учитываем enabled_at: старт не раньше момента включения и выровнен ВПЕРЁД по сетке TF
                     eff_start = start_dt
                     if enabled_at:
-                        eff_start = max(eff_start, enabled_at.replace(tzinfo=None))
+                        cand = max(start_dt, enabled_at.replace(tzinfo=None))
+                        eff_start = align_forward(cand, step_min)
 
                     # 🔸 Генерация сетки open_time
                     times = []
