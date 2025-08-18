@@ -90,17 +90,12 @@ async def insert_gaps(pg, gaps):
 
 # 🔸 Основной воркер аудитора
 async def run_indicator_auditor(pg, redis, window_hours: int = 12):
-    """
-    Слушает iv4_inserted и по каждому событию проверяет окно (по умолчанию 12 часов)
-    с учётом enabled_at. Недостающие (param_name) фиксируются в indicator_gap_v4.
-    """
     log.info("Аудитор индикаторов запущен (iv4_inserted)")
 
     stream = "iv4_inserted"
     group = "ind_audit_group"
     consumer = "ind_audit_1"
 
-    # 🔸 Создать consumer group (если уже есть — игнорируем)
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
     except Exception as e:
@@ -136,8 +131,14 @@ async def run_indicator_auditor(pg, redis, window_hours: int = 12):
             # 🔸 Обработка агрегированных ключей
             for (symbol, interval), end_dt in latest.items():
                 step_min = STEP_MIN[interval]
+                step = timedelta(minutes=step_min)
+
+                # выравниваем полученное время и сдвигаем НАЗАД на один бар — исключаем текущий
                 end_dt = end_dt.replace(second=0, microsecond=0)
-                start_dt = align_start(end_dt - timedelta(hours=window_hours), step_min)
+                audit_end = end_dt - step
+
+                # окно: последние window_hours до audit_end
+                start_dt = align_start(audit_end - timedelta(hours=window_hours), step_min)
 
                 instances = await fetch_enabled_instances_for_tf(pg, interval)
                 if not instances:
@@ -158,11 +159,14 @@ async def run_indicator_auditor(pg, redis, window_hours: int = 12):
                         cand = max(start_dt, enabled_at.replace(tzinfo=None))
                         eff_start = align_forward(cand, step_min)
 
-                    # 🔸 Генерация сетки open_time
+                    # если окно выродилось (активация позже audit_end) — пропускаем
+                    if eff_start > audit_end:
+                        continue
+
+                    # 🔸 Генерация сетки open_time [eff_start .. audit_end]
                     times = []
                     t = eff_start
-                    step = timedelta(minutes=step_min)
-                    while t <= end_dt:
+                    while t <= audit_end:
                         times.append(t)
                         t += step
                     if not times:
@@ -172,7 +176,7 @@ async def run_indicator_auditor(pg, redis, window_hours: int = 12):
                     expected = set(get_expected_param_names(indicator, params))
 
                     # 🔸 Что уже есть в БД
-                    have = await existing_params_in_db(pg, iid, symbol, eff_start, end_dt)
+                    have = await existing_params_in_db(pg, iid, symbol, eff_start, audit_end)
 
                     # 🔸 Вычисление пропусков
                     gaps = []
@@ -188,9 +192,8 @@ async def run_indicator_auditor(pg, redis, window_hours: int = 12):
                         inserted = await insert_gaps(pg, gaps)
                         total_found += inserted
 
-                log.debug(f"[AUDIT] {symbol}/{interval} окно {start_dt}..{end_dt} — добавлено пропусков: {total_found}")
+                log.info(f"[AUDIT] {symbol}/{interval} окно {start_dt}..{audit_end} — добавлено пропусков: {total_found}")
 
-            # 🔸 ACK обработанных сообщений
             if to_ack:
                 await redis.xack(stream, group, *to_ack)
 
