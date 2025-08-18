@@ -10,6 +10,7 @@ from indicators.compute_and_store import compute_snapshot_values_async
 log = logging.getLogger("IND_HEALER")
 
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
+REQUIRED_BARS_DEFAULT = 800
 
 # 🔸 Выборка «дыр» со статусом found и группировка по (instance_id, symbol, timeframe)
 async def fetch_found_gaps_grouped(pg, limit_pairs: int = 1000):
@@ -201,7 +202,8 @@ async def run_indicator_healer(pg, redis, pause_sec: int = 2):
                         continue
 
                     precision = await fetch_precision(pg, sym)
-                    depth = estimate_depth_bars(instance["indicator"], instance["params"])
+                    # унификация глубины с online-расчётом: минимум REQUIRED_BARS_DEFAULT
+                    depth = max(REQUIRED_BARS_DEFAULT, estimate_depth_bars(instance["indicator"], instance["params"]))
 
                     for ot, missing in by_time.items():
                         end_ts = int(ot.timestamp() * 1000)

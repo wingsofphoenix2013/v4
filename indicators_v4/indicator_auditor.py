@@ -192,7 +192,7 @@ async def run_indicator_auditor(pg, redis, window_hours: int = 12):
                         inserted = await insert_gaps(pg, gaps)
                         total_found += inserted
 
-                log.info(f"[AUDIT] {symbol}/{interval} окно {start_dt}..{audit_end} — добавлено пропусков: {total_found}")
+                log.debug(f"[AUDIT] {symbol}/{interval} окно {start_dt}..{audit_end} — добавлено пропусков: {total_found}")
 
             if to_ack:
                 await redis.xack(stream, group, *to_ack)
