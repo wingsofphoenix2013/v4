@@ -37,7 +37,7 @@ async def load_initial_indicators(pg):
     log = logging.getLogger("INIT")
     async with pg.acquire() as conn:
         instances = await conn.fetch("""
-            SELECT id, indicator, timeframe, stream_publish
+            SELECT id, indicator, timeframe, stream_publish, enabled_at
             FROM indicator_instances_v4
             WHERE enabled = true
               AND timeframe IN ('m5','m15','h1')
@@ -54,9 +54,10 @@ async def load_initial_indicators(pg):
                 "indicator": inst["indicator"],
                 "timeframe": inst["timeframe"],
                 "stream_publish": inst["stream_publish"],
-                "params": param_map
+                "params": param_map,
+                "enabled_at": inst["enabled_at"],
             }
-            log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}")
+            log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}, enabled_at={inst['enabled_at']}")
             
 # 🔸 Подписка на обновления тикеров
 async def watch_ticker_updates(pg, redis):
