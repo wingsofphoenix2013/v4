@@ -35,11 +35,14 @@ async def run_core_io(pg, redis):
             records = []
             to_ack = []
 
+            # для публикации в iv4_inserted агрегируем по (symbol, interval, open_time, instance_id)
+            event_counts = {}  # key -> count
+
             for _, messages in response:
                 for msg_id, data in messages:
                     try:
                         symbol = data["symbol"]
-                        interval = data["interval"]
+                        interval = data["interval"]  # передаётся из compute_and_store
                         instance_id = int(data["instance_id"])
                         open_time = datetime.fromisoformat(data["open_time"])
                         param_name = data["param_name"]
@@ -49,6 +52,10 @@ async def run_core_io(pg, redis):
 
                         records.append((instance_id, symbol, open_time, param_name, value))
                         to_ack.append(msg_id)
+
+                        key = (symbol, interval, open_time, instance_id)
+                        event_counts[key] = event_counts.get(key, 0) + 1
+
                     except Exception as e:
                         log.error(f"Ошибка при обработке записи из Stream: {e}")
 
@@ -64,6 +71,19 @@ async def run_core_io(pg, redis):
                         """, records)
 
                 log.debug(f"PG ← записано {len(records)} параметров")
+
+                # 🔸 публикация факта вставки (триггер для аудитора индикаторов)
+                for (symbol, interval, open_time, instance_id), cnt in event_counts.items():
+                    try:
+                        await redis.xadd("iv4_inserted", {
+                            "symbol": symbol,
+                            "interval": interval,
+                            "open_time": open_time.isoformat(),
+                            "instance_id": str(instance_id),
+                            "param_count": str(cnt),
+                        })
+                    except Exception as e:
+                        log.warning(f"Не удалось отправить событие в iv4_inserted: {e}")
 
             # Подтверждение обработки сообщений
             if to_ack:

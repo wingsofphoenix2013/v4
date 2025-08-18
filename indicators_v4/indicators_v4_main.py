@@ -7,6 +7,7 @@ import pandas as pd
 from collections import defaultdict
 
 from infra import init_pg_pool, init_redis_client, setup_logging, run_safe_loop
+from indicator_auditor import run_indicator_auditor
 from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store
 
@@ -266,6 +267,7 @@ async def main():
         run_safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
         run_safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
         run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
+        run_safe_loop(lambda: run_indicator_auditor(pg, redis), "IND_AUDITOR"),
     )
 
 if __name__ == "__main__":
