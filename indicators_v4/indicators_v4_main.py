@@ -119,6 +119,12 @@ async def watch_indicator_updates(pg, redis):
                                 log.info(f"Индикатор m1 проигнорирован: id={iid}")
                                 continue
 
+                            # фиксируем момент активации
+                            await conn.execute(
+                                "UPDATE indicator_instances_v4 SET enabled_at = NOW() WHERE id = $1",
+                                iid
+                            )
+
                             params = await conn.fetch("""
                                 SELECT param, value
                                 FROM indicator_parameters_v4
@@ -130,7 +136,9 @@ async def watch_indicator_updates(pg, redis):
                                 "indicator": row["indicator"],
                                 "timeframe": row["timeframe"],
                                 "stream_publish": row["stream_publish"],
-                                "params": param_map
+                                "params": param_map,
+                                # кладём enabled_at в память для будущего аудита/лечения
+                                "enabled_at": None,  # прочитаем фактическое значение на следующем шаге загрузкой
                             }
                             log.info(f"Индикатор включён: id={iid} {row['indicator']} {param_map}")
                 else:
@@ -144,7 +152,6 @@ async def watch_indicator_updates(pg, redis):
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
             
-
 # 🔸 Загрузка свечей из Redis TimeSeries
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
