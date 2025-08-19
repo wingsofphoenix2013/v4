@@ -5,13 +5,15 @@ import json
 import logging
 import pandas as pd
 from collections import defaultdict
+import math
+from datetime import datetime, timedelta
 
 from infra import init_pg_pool, init_redis_client, setup_logging, run_safe_loop
 from indicator_auditor import run_indicator_auditor
 from indicator_healer import run_indicator_healer
 from indicator_ts_filler import run_indicator_ts_filler
 from core_io import run_core_io
-from indicators.compute_and_store import compute_and_store
+from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -254,6 +256,117 @@ async def watch_ohlcv_events(pg, redis):
             ])
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
+# 🔸 On-demand расчёт индикаторов: indicator_request → indicator_response
+async def watch_indicator_requests(pg, redis):
+
+    log = logging.getLogger("IND_ONDEMAND")
+
+    step_min = {"m5": 5, "m15": 15, "h1": 60}
+    stream = "indicator_request"
+    group = "ind_req_group"
+    consumer = "ind_req_1"
+
+    # helper: floor к началу бара
+    def floor_to_bar(ts_ms: int, tf: str) -> int:
+        step = step_min[tf] * 60_000
+        return (ts_ms // step) * step
+
+    # создать consumer group
+    try:
+        await redis.xgroup_create(stream, group, id="$", mkstream=True)
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            log.warning(f"xgroup_create error: {e}")
+
+    while True:
+        try:
+            resp = await redis.xreadgroup(group, consumer, streams={stream: ">"}, count=50, block=2000)
+            if not resp:
+                continue
+
+            to_ack = []
+            for _, messages in resp:
+                for msg_id, data in messages:
+                    to_ack.append(msg_id)
+                    try:
+                        symbol = data.get("symbol")
+                        interval = data.get("timeframe") or data.get("interval")
+                        iid_raw = data.get("instance_id")
+                        ts_raw = data.get("timestamp_ms")
+
+                        if not symbol or interval not in step_min or not iid_raw or not ts_raw:
+                            await redis.xadd("indicator_response", {
+                                "req_id": msg_id, "status": "error", "error": "bad_request"
+                            })
+                            continue
+
+                        instance_id = int(iid_raw)
+                        ts_ms = int(ts_raw)
+
+                        inst = indicator_instances.get(instance_id)
+                        if not inst or inst.get("timeframe") != interval:
+                            await redis.xadd("indicator_response", {
+                                "req_id": msg_id, "status": "error", "error": "instance_not_active"
+                            })
+                            continue
+
+                        enabled_at = inst.get("enabled_at")
+                        bar_open_ms = floor_to_bar(ts_ms, interval)
+
+                        if enabled_at:
+                            enabled_ms = int(enabled_at.replace(tzinfo=None).timestamp() * 1000)
+                            if bar_open_ms < enabled_ms:
+                                await redis.xadd("indicator_response", {
+                                    "req_id": msg_id, "status": "error", "error": "before_enabled_at"
+                                })
+                                continue
+
+                        precision = active_tickers.get(symbol)
+                        if precision is None:
+                            await redis.xadd("indicator_response", {
+                                "req_id": msg_id, "status": "error", "error": "symbol_not_active"
+                            })
+                            continue
+
+                        depth = required_candles.get(interval, 800)
+                        df = await load_ohlcv_from_redis(redis, symbol, interval, bar_open_ms, depth)
+                        if df is None or df.empty:
+                            await redis.xadd("indicator_response", {
+                                "req_id": msg_id, "status": "error", "error": "no_ohlcv"
+                            })
+                            continue
+
+                        values = await compute_snapshot_values_async(inst, symbol, df, precision)
+                        if not values:
+                            await redis.xadd("indicator_response", {
+                                "req_id": msg_id, "status": "error", "error": "no_values"
+                            })
+                            continue
+
+                        await redis.xadd("indicator_response", {
+                            "req_id": msg_id,
+                            "status": "ok",
+                            "symbol": symbol,
+                            "timeframe": interval,
+                            "instance_id": str(instance_id),
+                            "open_time": datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat(),
+                            "using_current_bar": "true",
+                            "is_final": "false",
+                            "results": json.dumps(values),
+                        })
+
+                    except Exception as e:
+                        log.warning(f"request error: {e}", exc_info=True)
+                        await redis.xadd("indicator_response", {
+                            "req_id": msg_id, "status": "error", "error": "exception"
+                        })
+
+            if to_ack:
+                await redis.xack(stream, group, *to_ack)
+
+        except Exception as e:
+            logging.getLogger("IND_ONDEMAND").error(f"loop error: {e}", exc_info=True)
+            await asyncio.sleep(2)
             
 # 🔸 Точка входа
 async def main():
@@ -272,6 +385,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_auditor(pg, redis), "IND_AUDITOR"),
         run_safe_loop(lambda: run_indicator_healer(pg, redis), "IND_HEALER"),
         run_safe_loop(lambda: run_indicator_ts_filler(pg, redis), "IND_TS_FILLER"),
+        run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
     )
 
 if __name__ == "__main__":
