@@ -24,6 +24,8 @@ required_candles = {
     "h1": 800,
 }
 
+AUDIT_WINDOW_HOURS = 12
+
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
     log = logging.getLogger("INIT")
@@ -382,7 +384,7 @@ async def main():
         run_safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
         run_safe_loop(lambda: watch_ohlcv_events(pg, redis), "OHLCV_EVENTS"),
         run_safe_loop(lambda: run_core_io(pg, redis), "CORE_IO"),
-        run_safe_loop(lambda: run_indicator_auditor(pg, redis), "IND_AUDITOR"),
+        run_safe_loop(lambda: run_indicator_auditor(pg, redis, window_hours=AUDIT_WINDOW_HOURS), "IND_AUDITOR"),
         run_safe_loop(lambda: run_indicator_healer(pg, redis), "IND_HEALER"),
         run_safe_loop(lambda: run_indicator_ts_filler(pg, redis), "IND_TS_FILLER"),
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
