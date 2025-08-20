@@ -27,6 +27,24 @@ required_candles = {
 
 AUDIT_WINDOW_HOURS = 12
 
+# 🔸 Вспомогательные геттеры для воркеров
+def get_instances_by_tf(tf: str):
+    return [
+        {
+            "id": iid,
+            "indicator": inst["indicator"],
+            "timeframe": inst["timeframe"],
+            "enabled_at": inst.get("enabled_at"),
+            "params": inst["params"],
+        }
+        for iid, inst in indicator_instances.items()
+        if inst["timeframe"] == tf
+    ]
+
+
+def get_precision(symbol: str) -> int:
+    return active_tickers.get(symbol, 8)
+    
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
     log = logging.getLogger("INIT")
@@ -389,7 +407,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_healer(pg, redis), "IND_HEALER"),
         run_safe_loop(lambda: run_indicator_ts_filler(pg, redis), "IND_TS_FILLER"),
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
-        run_safe_loop(lambda: run_position_snapshot_worker(redis), "IND_POS_SNAPSHOT"),
+        run_safe_loop(lambda: run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision), "IND_POS_SNAPSHOT"),
     )
 
 if __name__ == "__main__":
