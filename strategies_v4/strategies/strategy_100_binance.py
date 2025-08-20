@@ -1,20 +1,18 @@
-# strategy_107_long.py
+# strategy_100_test.py
 
 import logging
 import json
 
-log = logging.getLogger("strategy_107_long")
+log = logging.getLogger("STRATEGY_100_TEST")
 
-class Strategy107Long:
+class Strategy100Test:
     async def validate_signal(self, signal, context):
+        symbol = signal["symbol"]
         direction = signal["direction"].lower()
+        tf = context["strategy"]["timeframe"].lower()
 
-        if direction == "long":
-            return True
-        elif direction == "short":
-            return ("ignore", "short сигналы отключены")
-        else:
-            return ("ignore", f"неизвестное направление: {direction}")
+        log.info(f"🚀 [100 TEST] чистый сигнал: symbol={symbol}, direction={direction}, tf={tf}")
+        return True
 
     async def run(self, signal, context):
         redis = context.get("redis")
@@ -32,6 +30,6 @@ class Strategy107Long:
 
         try:
             await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-            log.debug(f"📤 Сигнал отправлен: {payload}")
+            log.info(f"📤 Сигнал отправлен: {payload}")
         except Exception as e:
             log.warning(f"⚠️ Ошибка при отправке сигнала: {e}")
