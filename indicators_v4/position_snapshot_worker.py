@@ -25,10 +25,10 @@ def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
-        log.info(f"Группа {GROUP} создана для {STREAM}")
+        log.debug(f"Группа {GROUP} создана для {STREAM}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"Группа {GROUP} уже существует")
+            log.debug(f"Группа {GROUP} уже существует")
         else:
             log.exception("Ошибка создания consumer group")
             return
@@ -58,7 +58,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         side  = data.get("direction")
                         created_iso = data.get("created_at")
 
-                        log.info(f"[OPENED] uid={uid} {sym} strategy={strat} dir={side} created_at={created_iso}")
+                        log.debug(f"[OPENED] uid={uid} {sym} strategy={strat} dir={side} created_at={created_iso}")
 
                         created_dt = datetime.fromisoformat(created_iso)
                         created_ms = int(created_dt.timestamp() * 1000)
@@ -120,7 +120,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                                 # лог по инстансу
                                 kv = ", ".join(f"{k}={v}" for k, v in values.items())
-                                log.info(f"[SNAPSHOT] uid={uid} TF={tf} inst={inst['id']} {kv}")
+                                log.debug(f"[SNAPSHOT] uid={uid} TF={tf} inst={inst['id']} {kv}")
 
                                 # формируем строки для вставки
                                 bar_open_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
@@ -158,11 +158,11 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         )
 
                             bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
-                            log.info(f"[SUMMARY] uid={uid} TF={tf} bar={bar_iso} indicators={tf_inst_count} params={tf_param_count}")
+                            log.debug(f"[SUMMARY] uid={uid} TF={tf} bar={bar_iso} indicators={tf_inst_count} params={tf_param_count}")
                             total_ind += tf_inst_count
                             total_params += tf_param_count
 
-                        log.info(f"[SUMMARY_ALL] uid={uid} indicators_total={total_ind} params_total={total_params}")
+                        log.debug(f"[SUMMARY_ALL] uid={uid} indicators_total={total_ind} params_total={total_params}")
 
                     except Exception:
                         log.exception("Ошибка обработки события positions_open_stream")

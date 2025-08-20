@@ -96,7 +96,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
         ts_add = redis.execute_command(
             "TS.ADD", ts_key, int(ts), str_value,
-            "RETENTION", 604800000,  # 7 дней
+            "RETENTION", 1209600000,  # 14 дней
             "DUPLICATE_POLICY", "last"
         )
         if asyncio.iscoroutine(ts_add):

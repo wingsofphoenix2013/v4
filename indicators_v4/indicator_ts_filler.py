@@ -63,7 +63,7 @@ async def write_ts_and_mark(pg, redis, instance_id: int, symbol: str, timeframe:
 
         cmd = redis.execute_command(
             "TS.ADD", key, ts_ms, str(val),
-            "RETENTION", 604_800_000,  # 7 дней
+            "RETENTION", 1_209_600_000,  # 14 дней
             "DUPLICATE_POLICY", "last"
         )
         if asyncio.iscoroutine(cmd):
