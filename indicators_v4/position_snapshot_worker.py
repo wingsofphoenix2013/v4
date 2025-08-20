@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import json
 from datetime import datetime
 
 from indicators.compute_and_store import compute_snapshot_values_async
@@ -20,7 +21,7 @@ def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
     step_ms = STEP_MIN[tf] * 60_000
     return (ts_ms // step_ms) * step_ms
 
-# 🔸 Основной воркер: читаем открытия, считаем on-demand и логируем (с суммарной статистикой по TF)
+# 🔸 Основной воркер: читаем открытия, считаем on-demand и пишем в БД (с суммарной статистикой)
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -53,7 +54,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                     try:
                         uid   = data.get("position_uid")
                         sym   = data.get("symbol")
-                        strat = data.get("strategy_id")
+                        strat = int(data.get("strategy_id"))
                         side  = data.get("direction")
                         created_iso = data.get("created_at")
 
@@ -64,16 +65,18 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                         precision = get_precision(sym)
 
+                        total_ind = 0
+                        total_params = 0
+
                         for tf in ("m5", "m15", "h1"):
                             instances = get_instances_by_tf(tf)
                             if not instances:
                                 continue
 
                             bar_open_ms = floor_to_bar_ms(created_ms, tf)
-
-                            # загружаем OHLCV из TS
                             step_ms = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}[tf]
                             start_ts = bar_open_ms - (REQUIRED_BARS_DEFAULT - 1) * step_ms
+
                             fields = ["o", "h", "l", "c", "v"]
                             keys = {f: f"ts:{sym}:{tf}:{f}" for f in fields}
                             tasks = {f: redis.execute_command("TS.RANGE", keys[f], start_ts, bar_open_ms) for f in fields}
@@ -99,6 +102,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                             tf_inst_count = 0
                             tf_param_count = 0
+                            rows = []  # батч для БД
 
                             for inst in instances:
                                 en = inst.get("enabled_at")
@@ -114,11 +118,51 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 tf_inst_count += 1
                                 tf_param_count += len(values)
 
+                                # лог по инстансу
                                 kv = ", ".join(f"{k}={v}" for k, v in values.items())
                                 log.info(f"[SNAPSHOT] uid={uid} TF={tf} inst={inst['id']} {kv}")
 
+                                # формируем строки для вставки
+                                bar_open_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
+                                enabled_at = inst.get("enabled_at")
+                                params_json = json.dumps(inst.get("params", {}))
+                                for pname, vstr in values.items():
+                                    try:
+                                        vnum = float(vstr)
+                                    except Exception:
+                                        vnum = None
+                                    rows.append((
+                                        uid, strat, side, tf,
+                                        int(inst["id"]), pname, vstr, vnum,
+                                        bar_open_dt,  # bar_open_time
+                                        enabled_at,   # enabled_at
+                                        params_json   # params_json
+                                    ))
+
+                            # запись в БД по TF одним батчем
+                            if rows:
+                                async with pg.acquire() as conn:
+                                    async with conn.transaction():
+                                        await conn.executemany(
+                                            """
+                                            INSERT INTO positions_indicators_stat
+                                            (position_uid, strategy_id, direction, timeframe,
+                                             instance_id, param_name, value_str, value_num,
+                                             bar_open_time, enabled_at, params_json)
+                                            VALUES
+                                            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                                            ON CONFLICT (position_uid, timeframe, instance_id, param_name, bar_open_time)
+                                            DO NOTHING
+                                            """,
+                                            rows
+                                        )
+
                             bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
                             log.info(f"[SUMMARY] uid={uid} TF={tf} bar={bar_iso} indicators={tf_inst_count} params={tf_param_count}")
+                            total_ind += tf_inst_count
+                            total_params += tf_param_count
+
+                        log.info(f"[SUMMARY_ALL] uid={uid} indicators_total={total_ind} params_total={total_params}")
 
                     except Exception:
                         log.exception("Ошибка обработки события positions_open_stream")
