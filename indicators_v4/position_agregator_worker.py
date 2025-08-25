@@ -1,4 +1,4 @@
-# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread, EMA, KAMA)
+# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread, EMA, KAMA, ATR)
 
 import asyncio
 import logging
@@ -7,20 +7,24 @@ from decimal import Decimal, ROUND_FLOOR
 
 log = logging.getLogger("IND_AGG")
 
-STREAM   = "signal_log_queue"   # читаем post-commit события (post-commit)
+STREAM   = "signal_log_queue"   # post-commit поток из модуля позиций
 GROUP    = "indicators_agg_group"
 CONSUMER = "ind_agg_1"
 
 READ_COUNT = 50
 READ_BLOCK_MS = 2000
 
+# шаги/границы бинирования
 RSI_BUCKET_STEP = 5
 MFI_BUCKET_STEP = 5
 ADX_BUCKET_STEP = 5
 DMI_SPREAD_STEP = 5
 
-EMA_KAMA_PCT_CLAMP = 5.0      # диапазон ±5.0%
-EMA_KAMA_PCT_STEP  = 0.1      # шаг 0.1%
+EMA_KAMA_PCT_CLAMP = 5.0   # диапазон для signed_dist_pct: [-5.0%, 5.0%)
+EMA_KAMA_PCT_STEP  = 0.1   # квантация вниз для EMA/KAMA: 0.1%
+
+ATR_PCT_CLAMP = 10.0       # диапазон для atr_pct: [0.0%, 10.0%)
+ATR_PCT_STEP  = 0.1        # квантация вниз для ATR: 0.1%
 
 
 # 🔸 Загрузка позиции по uid из positions_v4
@@ -66,10 +70,10 @@ def _partition_snapshots_by_indicator(rows):
         "adx_dmi": [],
         "ema": [],
         "kama": [],
+        "atr": [],
         "macd": [],
         "bb": [],
         "lr": [],
-        "atr": [],
     }
     for r in rows or []:
         p = r["param_name"]
@@ -78,10 +82,10 @@ def _partition_snapshots_by_indicator(rows):
         elif p.startswith("adx_dmi"): buckets["adx_dmi"].append(r)
         elif p.startswith("ema"):     buckets["ema"].append(r)
         elif p.startswith("kama"):    buckets["kama"].append(r)
+        elif p.startswith("atr"):     buckets["atr"].append(r)
         elif p.startswith("macd"):    buckets["macd"].append(r)
         elif p.startswith("bb"):      buckets["bb"].append(r)
         elif p.startswith("lr"):      buckets["lr"].append(r)
-        elif p.startswith("atr"):     buckets["atr"].append(r)
     return buckets
 
 
@@ -115,21 +119,35 @@ def _bucket_minus100_100(value: float, step: int) -> int | None:
     return int(math.floor(v / step) * step)
 
 
-# 🔸 Квантация вниз к сетке 0.1% в пределах ±5.0% → (from, to)
-def _pct_bin_range_0_1(val_pct: float) -> tuple[float, float] | None:
+# 🔸 Квантация вниз к сетке 0.1% (EMA/KAMA) в пределах ±5.0% → (from, to)
+def _pct_bin_range_ema_kama(val_pct: float) -> tuple[float, float] | None:
     try:
         v = float(val_pct)
     except Exception:
         return None
     if not math.isfinite(v):
         return None
-    # клэмп в [-5.0, 5.0)
     if v < -EMA_KAMA_PCT_CLAMP:
         v = -EMA_KAMA_PCT_CLAMP
     if v >= EMA_KAMA_PCT_CLAMP:
         v = EMA_KAMA_PCT_CLAMP - 1e-6
-    # квантуем вниз до 0.1 с использованием Decimal для стабильности
-    d = (Decimal(v).quantize(Decimal("0.1"), rounding=ROUND_FLOOR))
+    d = Decimal(v).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+    frm = float(d)
+    to  = float(d + Decimal("0.1"))
+    return frm, to
+
+
+# 🔸 Квантация вниз к сетке 0.1% (ATR) в пределах [0.0, 10.0) → (from, to)
+def _pct_bin_range_atr(val_pct: float) -> tuple[float, float] | None:
+    try:
+        v = float(val_pct)
+    except Exception:
+        return None
+    if not math.isfinite(v) or v < 0.0:
+        v = 0.0
+    if v >= ATR_PCT_CLAMP:
+        v = ATR_PCT_CLAMP - 1e-6
+    d = Decimal(v).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
     frm = float(d)
     to  = float(d + Decimal("0.1"))
     return frm, to
@@ -272,17 +290,7 @@ def _collect_adx_dmi_deltas(snaps, strategy_id: int, pnl: float):
     return deltas
 
 
-# 🔸 Вспомогательное: извлечь длину из param_name вида 'ema21'/'kama50'
-def _extract_len_from_param(param_name: str, prefix: str) -> int | None:
-    try:
-        if not param_name.startswith(prefix):
-            return None
-        return int(param_name[len(prefix):])
-    except Exception:
-        return None
-
-
-# 🔸 Сбор дельт по EMA (range/signed_dist_pct) с шагом 0.1%
+# 🔸 Сбор дельт по EMA (range/signed_dist_pct, шаг 0.1%, ±5%)
 def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | None, entry_price) -> list:
     deltas = []
     if entry_price is None:
@@ -298,7 +306,7 @@ def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | No
 
     for s in snaps:
         tf = s["timeframe"]
-        param = s["param_name"]     # 'ema9', 'ema21', ...
+        param = s["param_name"]     # 'ema9','ema21',...
         val = s["value_num"]
         try:
             ema_val = float(val)
@@ -309,7 +317,7 @@ def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | No
 
         dist_pct = ((ep - ema_val) / ep) * 100.0
         signed = dist_pct * dir_sign
-        rng = _pct_bin_range_0_1(signed)
+        rng = _pct_bin_range_ema_kama(signed)
         if not rng:
             continue
         frm, to = rng
@@ -318,7 +326,7 @@ def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | No
             "strategy_id": strategy_id,
             "timeframe": tf,
             "indicator": "ema",
-            "param_name": param,                 # сохраняем как 'ema<L>'
+            "param_name": param,                 # 'ema<L>'
             "bucket_type": "range",
             "bucket_key": "signed_dist_pct",
             "bucket_from": frm,
@@ -330,7 +338,7 @@ def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | No
     return deltas
 
 
-# 🔸 Сбор дельт по KAMA (range/signed_dist_pct) с шагом 0.1%
+# 🔸 Сбор дельт по KAMA (range/signed_dist_pct, шаг 0.1%, ±5%)
 def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | None, entry_price) -> list:
     deltas = []
     if entry_price is None:
@@ -346,7 +354,7 @@ def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | N
 
     for s in snaps:
         tf = s["timeframe"]
-        param = s["param_name"]     # 'kama9', 'kama21', ...
+        param = s["param_name"]     # 'kama9','kama21',...
         val = s["value_num"]
         try:
             kama_val = float(val)
@@ -357,7 +365,7 @@ def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | N
 
         dist_pct = ((ep - kama_val) / ep) * 100.0
         signed = dist_pct * dir_sign
-        rng = _pct_bin_range_0_1(signed)
+        rng = _pct_bin_range_ema_kama(signed)
         if not rng:
             continue
         frm, to = rng
@@ -377,6 +385,53 @@ def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | N
         })
     return deltas
 
+
+# 🔸 Сбор дельт по ATR (range/atr_pct, шаг 0.1%, [0,10))
+def _collect_atr_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> list:
+    deltas = []
+    if entry_price is None:
+        return deltas
+    try:
+        ep = float(entry_price)
+    except Exception:
+        return deltas
+    if not math.isfinite(ep) or ep <= 0:
+        return deltas
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+
+    for s in snaps:
+        tf = s["timeframe"]
+        param = s["param_name"]     # 'atr14',...
+        val = s["value_num"]
+        try:
+            atr_val = float(val)
+        except Exception:
+            continue
+        if not math.isfinite(atr_val) or atr_val <= 0.0:
+            continue
+
+        atr_pct = (atr_val / ep) * 100.0
+        rng = _pct_bin_range_atr(atr_pct)
+        if not rng:
+            continue
+        frm, to = rng
+
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "atr",
+            "param_name": param,                 # 'atr<L>'
+            "bucket_type": "range",
+            "bucket_key": "atr_pct",
+            "bucket_from": frm,
+            "bucket_to": to,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+    return deltas
+
+
 # 🔸 Применение дельт к таблице агрегатов (value_bin и range) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
     if not deltas:
@@ -389,6 +444,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
 
     async with pg.acquire() as conn:
         async with conn.transaction():
+            # агрегация одинаковых ключей в пределах одной позиции
             agg = {}
             for d in deltas:
                 if d["bucket_type"] == "value_bin":
@@ -525,6 +581,8 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                 "UPDATE positions_v4 SET audited = TRUE WHERE position_uid = $1 AND audited = FALSE",
                 position_uid,
             )
+
+
 # 🔸 Основной воркер: читаем закрытия, собираем дельты и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
@@ -594,6 +652,8 @@ async def run_position_aggregator_worker(pg, redis):
                             deltas += _collect_ema_deltas(parts["ema"], strategy_id, pnl, direction, entry_price)
                         if parts["kama"]:
                             deltas += _collect_kama_deltas(parts["kama"], strategy_id, pnl, direction, entry_price)
+                        if parts["atr"]:
+                            deltas += _collect_atr_deltas(parts["atr"], strategy_id, pnl, entry_price)
 
                         if not deltas:
                             log.info(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
@@ -601,7 +661,7 @@ async def run_position_aggregator_worker(pg, redis):
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI/EMA/KAMA)")
+                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI/EMA/KAMA/ATR)")
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
