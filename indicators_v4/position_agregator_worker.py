@@ -902,15 +902,123 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                 "UPDATE positions_v4 SET audited = TRUE WHERE position_uid = $1 AND audited = FALSE",
                 position_uid,
             )
+            
+# 🔸 Демон бэкфилла: первый запуск через initial_delay, затем раз в interval секунд
+async def run_position_aggregator_backfill_daemon(pg, redis, initial_delay: int = 120, interval: int = 86400, batch_size: int = 500):
+    log = logging.getLogger("IND_AGG_BACKFILL")
+    # первый запуск с задержкой (2 минуты по умолчанию)
+    if initial_delay and initial_delay > 0:
+        await asyncio.sleep(initial_delay)
 
+    while True:
+        try:
+            await run_position_aggregator_backfill(pg, batch_size=batch_size)
+        except Exception as e:
+            log.error(f"[BACKFILL] ошибка верхнего уровня: {e}", exc_info=True)
+            # маленькая пауза перед следующим циклом, чтобы не крутиться в жареную
+            await asyncio.sleep(5)
+
+        # пауза до следующего суточного прогона
+        await asyncio.sleep(interval)
+        
+# 🔸 Бэкфилл: разовый проход по всем закрытым позициям без audited (партиями, без Redis)
+async def run_position_aggregator_backfill(pg, batch_size: int = 500):
+    log = logging.getLogger("IND_AGG_BACKFILL")
+    log.info(f"Бэкфилл стартовал: batch_size={batch_size}")
+
+    last_closed_at = None
+    last_id = None
+    total = 0
+
+    while True:
+        async with pg.acquire() as conn:
+            if last_closed_at is None:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, position_uid, closed_at
+                    FROM positions_v4
+                    WHERE status='closed' AND audited=false
+                    ORDER BY closed_at, id
+                    LIMIT $1
+                    """,
+                    batch_size,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, position_uid, closed_at
+                    FROM positions_v4
+                    WHERE status='closed' AND audited=false
+                      AND (closed_at > $1 OR (closed_at = $1 AND id > $2))
+                    ORDER BY closed_at, id
+                    LIMIT $3
+                    """,
+                    last_closed_at, last_id, batch_size,
+                )
+
+        if not rows:
+            break
+
+        for r in rows:
+            uid = r["position_uid"]
+            try:
+                row = await _fetch_position(pg, uid)
+                if not row:
+                    continue
+                if row["audited"]:
+                    continue
+                if row["status"] != "closed" or row["pnl"] is None:
+                    continue
+
+                strategy_id = row["strategy_id"]
+                pnl = float(row["pnl"]) if row["pnl"] is not None else 0.0
+                direction = row["direction"]
+                entry_price = row["entry_price"]
+
+                snaps_all = await _fetch_snapshots_all(pg, uid)
+                parts = _partition_snapshots_by_indicator(snaps_all)
+
+                deltas = []
+                if parts["rsi"]:
+                    deltas += _collect_rsi_deltas(parts["rsi"], strategy_id, pnl)
+                if parts["mfi"]:
+                    deltas += _collect_mfi_deltas(parts["mfi"], strategy_id, pnl)
+                if parts["adx_dmi"]:
+                    deltas += _collect_adx_dmi_deltas(parts["adx_dmi"], strategy_id, pnl)
+                if parts["ema"]:
+                    deltas += _collect_ema_deltas(parts["ema"], strategy_id, pnl, direction, entry_price)
+                if parts["kama"]:
+                    deltas += _collect_kama_deltas(parts["kama"], strategy_id, pnl, direction, entry_price)
+                if parts["atr"]:
+                    deltas += _collect_atr_deltas(parts["atr"], strategy_id, pnl, entry_price)
+                if parts["macd"]:
+                    deltas += _collect_macd_deltas(parts["macd"], strategy_id, pnl, entry_price)
+                if parts["bb"]:
+                    deltas += _collect_bb_deltas(parts["bb"], strategy_id, pnl, entry_price)
+
+                await _apply_aggregates_and_mark_audited(pg, uid, deltas)
+                total += 1
+
+                if total % 200 == 0:
+                    log.info(f"[BACKFILL] обработано позиций: {total}")
+
+            except Exception:
+                log.exception(f"[BACKFILL] ошибка обработки позиции uid={uid}")
+
+        last = rows[-1]
+        last_closed_at = last["closed_at"]
+        last_id = last["id"]
+
+    log.info(f"Бэкфилл завершён. Всего обработано: {total}")
+    
 # 🔸 Основной воркер: читаем закрытия, собираем дельты и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
-        log.info(f"Группа {GROUP} создана для {STREAM}")
+        log.debug(f"Группа {GROUP} создана для {STREAM}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"Группа {GROUP} уже существует")
+            log.debug(f"Группа {GROUP} уже существует")
         else:
             log.exception("Ошибка создания consumer group")
             return
@@ -980,12 +1088,12 @@ async def run_position_aggregator_worker(pg, redis):
                             deltas += _collect_bb_deltas(parts["bb"], strategy_id, pnl, entry_price)
 
                         if not deltas:
-                            log.info(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
+                            log.debug(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
                             await _apply_aggregates_and_mark_audited(pg, uid, [])
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-                        log.info(
+                        log.debug(
                             f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт "
                             f"(RSI/MFI/ADX/DMI/EMA/KAMA/ATR/MACD/BB)"
                         )
