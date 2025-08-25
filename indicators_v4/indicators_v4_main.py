@@ -16,6 +16,7 @@ from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
 from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
+from position_agregator_worker import run_position_aggregator_worker
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -410,6 +411,7 @@ async def main():
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
         run_safe_loop(lambda: run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision), "IND_POS_SNAPSHOT"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
+        run_safe_loop(lambda: run_position_aggregator_worker(pg, redis), "IND_AGG"),
     )
 
 if __name__ == "__main__":
