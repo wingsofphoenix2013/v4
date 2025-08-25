@@ -1,8 +1,9 @@
-# position_agregator_worker.py — воркер агрегации позиций (шаг 1: чтение post-commit закрытий)
+# position_agregator_worker.py — воркер агрегации позиций (шаг 2: выборка RSI и расчёт корзин)
 
 import asyncio
 import logging
 import json
+import math
 from datetime import datetime
 
 log = logging.getLogger("IND_AGG")
@@ -13,6 +14,8 @@ CONSUMER = "ind_agg_1"
 
 READ_COUNT = 50
 READ_BLOCK_MS = 2000
+
+RSI_BUCKET_STEP = 5  # шаг корзинки RSI
 
 
 # 🔸 Универсальный парсер ISO-строк (поддерживает 'Z' и смещения)
@@ -45,7 +48,39 @@ async def _fetch_position(pg, position_uid: str):
         )
 
 
-# 🔸 Основной воркер: читаем post-commit события и фильтруем закрытия
+# 🔸 Выборка RSI-снимков позиции из positions_indicators_stat
+async def _fetch_rsi_snapshots(pg, position_uid: str):
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT timeframe, param_name, value_num
+            FROM positions_indicators_stat
+            WHERE position_uid = $1
+              AND param_name ILIKE 'rsi%%'
+              AND value_num IS NOT NULL
+              AND value_num BETWEEN 0 AND 100
+            """,
+            position_uid,
+        )
+        return rows
+
+
+# 🔸 Расчёт корзины для значения RSI
+def _rsi_bucket(value: float, step: int = RSI_BUCKET_STEP) -> int:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    if v < 0:
+        v = 0.0
+    if v > 100:
+        v = 100.0
+    return int(math.floor(v / step) * step)
+
+
+# 🔸 Основной воркер: читаем post-commit события, фильтруем закрытия, считаем RSI-бакеты (лог)
 async def run_position_aggregator_worker(pg, redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -89,13 +124,34 @@ async def run_position_aggregator_worker(pg, redis):
                             continue
 
                         if row["audited"]:
-                            log.debug(f"[SKIP] uid={uid} already audited")
+                            log.info(f"[SKIP] uid={uid} already audited")
                             continue
                         if row["status"] != "closed" or row["pnl"] is None:
                             log.warning(f"[SKIP] uid={uid} post-commit status mismatch (status={row['status']}, pnl={row['pnl']})")
                             continue
 
-                        log.info(f"[READY] uid={uid} strategy={row['strategy_id']} pnl={row['pnl']} closed_at={row['closed_at']} → готово к агрегации RSI")
+                        strategy_id = row["strategy_id"]
+                        pnl = float(row["pnl"]) if row["pnl"] is not None else None
+                        closed_at = row["closed_at"]
+
+                        log.info(f"[READY] uid={uid} strategy={strategy_id} pnl={pnl} closed_at={closed_at} → считаем RSI-бакеты")
+
+                        snaps = await _fetch_rsi_snapshots(pg, uid)
+                        if not snaps:
+                            log.info(f"[NO-RSI] uid={uid} нет RSI-снимков в positions_indicators_stat")
+                            continue
+
+                        for s in snaps:
+                            tf = s["timeframe"]
+                            param = s["param_name"]
+                            value = s["value_num"]
+                            bucket = _rsi_bucket(value)
+                            if bucket is None:
+                                log.info(f"[SKIP-RSI] uid={uid} tf={tf} param={param} value={value} → non-finite")
+                                continue
+                            log.info(f"[BUCKET] uid={uid} tf={tf} param={param} value={value:.4f} → bucket={bucket}")
+
+                        # на этом шаге только логируем бакеты; запись агрегатов будет на шаге 3
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
