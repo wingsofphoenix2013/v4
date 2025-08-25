@@ -1,4 +1,4 @@
-# position_agregator_worker.py — воркер агрегации позиций (шаг 2: выборка RSI и расчёт корзин)
+# position_agregator_worker.py — воркер агрегации позиций (шаг 3: запись агрегатов RSI + audited=true)
 
 import asyncio
 import logging
@@ -80,7 +80,122 @@ def _rsi_bucket(value: float, step: int = RSI_BUCKET_STEP) -> int:
     return int(math.floor(v / step) * step)
 
 
-# 🔸 Основной воркер: читаем post-commit события, фильтруем закрытия, считаем RSI-бакеты (лог)
+# 🔸 Сбор дельт по RSI для одной позиции (ключ → (dc, dp, dw))
+def _collect_rsi_deltas(snaps, strategy_id: int, pnl: float):
+    deltas = []  # список словарей с ключом агрегата и метриками
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+    for s in snaps:
+        tf = s["timeframe"]
+        param = s["param_name"]
+        value = s["value_num"]
+        bucket = _rsi_bucket(value)
+        if bucket is None:
+            continue
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "rsi",
+            "param_name": param,
+            "bucket_type": "value_bin",
+            "bucket_key": "value",
+            "bucket_int": bucket,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+    return deltas
+
+
+# 🔸 Применение дельт к таблице агрегатов (транзакция, без UPSERT по partial unique)
+async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
+    if not deltas:
+        async with pg.acquire() as conn:
+            await conn.execute(
+                "UPDATE positions_v4 SET audited = TRUE WHERE position_uid = $1 AND audited = FALSE",
+                position_uid,
+            )
+        return
+
+    async with pg.acquire() as conn:
+        async with conn.transaction():
+            # сгруппируем дельты по ключу (на всякий случай, если в snaps будут дубли)
+            agg = {}
+            for d in deltas:
+                key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
+                       d["bucket_type"], d["bucket_key"], d["bucket_int"])
+                cur = agg.get(key, {"dc": 0, "dp": 0.0, "dw": 0})
+                cur["dc"] += d["dc"]
+                cur["dp"] += d["dp"]
+                cur["dw"] += d["dw"]
+                agg[key] = cur
+
+            for key, m in agg.items():
+                strategy_id, timeframe, indicator, param_name, bucket_type, bucket_key, bucket_int = key
+                dc, dp, dw = m["dc"], m["dp"], m["dw"]
+
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, positions_closed, pnl_sum, wins
+                    FROM indicator_aggregates_v4
+                    WHERE strategy_id = $1
+                      AND timeframe   = $2
+                      AND indicator   = $3
+                      AND param_name  = $4
+                      AND bucket_type = 'value_bin'
+                      AND bucket_key  = 'value'
+                      AND bucket_int  = $5
+                    FOR UPDATE
+                    """,
+                    strategy_id, timeframe, indicator, param_name, bucket_int
+                )
+
+                if row:
+                    new_count = int(row["positions_closed"]) + dc
+                    new_pnl   = float(row["pnl_sum"]) + dp
+                    new_wins  = int(row["wins"]) + dw
+                    new_avg   = new_pnl / new_count if new_count else 0.0
+                    new_wr    = (new_wins / new_count) if new_count else 0.0
+
+                    await conn.execute(
+                        """
+                        UPDATE indicator_aggregates_v4
+                        SET positions_closed = $1,
+                            pnl_sum          = $2,
+                            wins             = $3,
+                            avg_pnl          = $4,
+                            winrate          = $5,
+                            updated_at       = NOW()
+                        WHERE id = $6
+                        """,
+                        new_count, new_pnl, new_wins, new_avg, new_wr, row["id"]
+                    )
+                else:
+                    new_count = dc
+                    new_pnl   = dp
+                    new_wins  = dw
+                    new_avg   = new_pnl / new_count if new_count else 0.0
+                    new_wr    = (new_wins / new_count) if new_count else 0.0
+
+                    await conn.execute(
+                        """
+                        INSERT INTO indicator_aggregates_v4 (
+                            strategy_id, timeframe, indicator, param_name,
+                            bucket_type, bucket_key, bucket_int,
+                            positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
+                        ) VALUES ($1,$2,$3,$4,'value_bin','value',$5,$6,$7,$8,$9,$10,NOW())
+                        """,
+                        strategy_id, timeframe, indicator, param_name,
+                        bucket_int,
+                        new_count, new_pnl, new_wins, new_avg, new_wr
+                    )
+
+            await conn.execute(
+                "UPDATE positions_v4 SET audited = TRUE WHERE position_uid = $1 AND audited = FALSE",
+                position_uid,
+            )
+
+
+# 🔸 Основной воркер: читаем post-commit события, считаем RSI-бакеты и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -124,34 +239,31 @@ async def run_position_aggregator_worker(pg, redis):
                             continue
 
                         if row["audited"]:
-                            log.info(f"[SKIP] uid={uid} already audited")
+                            log.debug(f"[SKIP] uid={uid} already audited")
                             continue
                         if row["status"] != "closed" or row["pnl"] is None:
                             log.warning(f"[SKIP] uid={uid} post-commit status mismatch (status={row['status']}, pnl={row['pnl']})")
                             continue
 
                         strategy_id = row["strategy_id"]
-                        pnl = float(row["pnl"]) if row["pnl"] is not None else None
+                        pnl = float(row["pnl"]) if row["pnl"] is not None else 0.0
                         closed_at = row["closed_at"]
-
-                        log.info(f"[READY] uid={uid} strategy={strategy_id} pnl={pnl} closed_at={closed_at} → считаем RSI-бакеты")
 
                         snaps = await _fetch_rsi_snapshots(pg, uid)
                         if not snaps:
-                            log.info(f"[NO-RSI] uid={uid} нет RSI-снимков в positions_indicators_stat")
+                            log.info(f"[NO-RSI] uid={uid} → помечаем audited=true без изменения агрегатов")
+                            await _apply_aggregates_and_mark_audited(pg, uid, [])
                             continue
 
-                        for s in snaps:
-                            tf = s["timeframe"]
-                            param = s["param_name"]
-                            value = s["value_num"]
-                            bucket = _rsi_bucket(value)
-                            if bucket is None:
-                                log.info(f"[SKIP-RSI] uid={uid} tf={tf} param={param} value={value} → non-finite")
-                                continue
-                            log.info(f"[BUCKET] uid={uid} tf={tf} param={param} value={value:.4f} → bucket={bucket}")
+                        deltas = _collect_rsi_deltas(snaps, strategy_id, pnl)
+                        if not deltas:
+                            log.info(f"[NO-RSI] uid={uid} → нет валидных RSI значений, ставим audited=true")
+                            await _apply_aggregates_and_mark_audited(pg, uid, [])
+                            continue
 
-                        # на этом шаге только логируем бакеты; запись агрегатов будет на шаге 3
+                        await _apply_aggregates_and_mark_audited(pg, uid, deltas)
+
+                        log.info(f"[AGG] uid={uid} strategy={strategy_id} pnl={pnl} closed_at={closed_at} → записаны {len(deltas)} RSI-дельт")
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
