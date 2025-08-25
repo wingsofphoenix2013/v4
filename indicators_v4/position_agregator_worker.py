@@ -1,4 +1,4 @@
-# position_agregator_worker.py — воркер агрегации позиций (шаг 3: запись агрегатов RSI + audited=true)
+# position_agregator_worker.py — воркер агрегации позиций (шаг 4: единая выборка снимков, обработка RSI и MFI)
 
 import asyncio
 import logging
@@ -15,15 +15,8 @@ CONSUMER = "ind_agg_1"
 READ_COUNT = 50
 READ_BLOCK_MS = 2000
 
-RSI_BUCKET_STEP = 5  # шаг корзинки RSI
-
-
-# 🔸 Универсальный парсер ISO-строк (поддерживает 'Z' и смещения)
-def _parse_iso(dt: str) -> datetime:
-    s = dt.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
+RSI_BUCKET_STEP = 5
+MFI_BUCKET_STEP = 5
 
 
 # 🔸 Загрузка позиции по uid из positions_v4
@@ -34,13 +27,10 @@ async def _fetch_position(pg, position_uid: str):
             SELECT
                 position_uid,
                 strategy_id,
-                symbol,
-                direction,
                 status,
-                created_at,
-                closed_at,
                 pnl,
-                audited
+                audited,
+                closed_at
             FROM positions_v4
             WHERE position_uid = $1
             """,
@@ -48,47 +38,71 @@ async def _fetch_position(pg, position_uid: str):
         )
 
 
-# 🔸 Выборка RSI-снимков позиции из positions_indicators_stat
-async def _fetch_rsi_snapshots(pg, position_uid: str):
+# 🔸 Единая выборка всех снимков позиции
+async def _fetch_snapshots_all(pg, position_uid: str):
     async with pg.acquire() as conn:
-        rows = await conn.fetch(
+        return await conn.fetch(
             """
             SELECT timeframe, param_name, value_num
             FROM positions_indicators_stat
             WHERE position_uid = $1
-              AND param_name ILIKE 'rsi%%'
               AND value_num IS NOT NULL
-              AND value_num BETWEEN 0 AND 100
             """,
             position_uid,
         )
-        return rows
 
 
-# 🔸 Расчёт корзины для значения RSI
-def _rsi_bucket(value: float, step: int = RSI_BUCKET_STEP) -> int:
+# 🔸 Разбиение снимков по индикаторам по префиксу param_name
+def _partition_snapshots_by_indicator(rows):
+    buckets = {
+        "rsi": [],
+        "mfi": [],
+        "adx_dmi": [],
+        "macd": [],
+        "bb": [],
+        "ema": [],
+        "kama": [],
+        "lr": [],
+        "atr": [],
+    }
+    for r in rows or []:
+        p = r["param_name"]
+        if   p.startswith("rsi"):     buckets["rsi"].append(r)
+        elif p.startswith("mfi"):     buckets["mfi"].append(r)
+        elif p.startswith("adx_dmi"): buckets["adx_dmi"].append(r)
+        elif p.startswith("macd"):    buckets["macd"].append(r)
+        elif p.startswith("bb"):      buckets["bb"].append(r)
+        elif p.startswith("ema"):     buckets["ema"].append(r)
+        elif p.startswith("kama"):    buckets["kama"].append(r)
+        elif p.startswith("lr"):      buckets["lr"].append(r)
+        elif p.startswith("atr"):     buckets["atr"].append(r)
+    return buckets
+
+
+# 🔸 Расчёт корзины для значения [0..100] (RSI/MFI)
+def _bucket_0_100(value: float, step: int) -> int | None:
     try:
         v = float(value)
     except Exception:
         return None
     if not math.isfinite(v):
         return None
-    if v < 0:
+    if v < 0.0:
         v = 0.0
-    if v > 100:
-        v = 100.0
+    if v >= 100.0:
+        v = 99.9999
     return int(math.floor(v / step) * step)
 
 
-# 🔸 Сбор дельт по RSI для одной позиции (ключ → (dc, dp, dw))
+# 🔸 Сбор дельт по RSI для одной позиции
 def _collect_rsi_deltas(snaps, strategy_id: int, pnl: float):
-    deltas = []  # список словарей с ключом агрегата и метриками
+    deltas = []
     win = 1 if pnl is not None and float(pnl) > 0 else 0
     for s in snaps:
         tf = s["timeframe"]
         param = s["param_name"]
         value = s["value_num"]
-        bucket = _rsi_bucket(value)
+        bucket = _bucket_0_100(value, RSI_BUCKET_STEP)
         if bucket is None:
             continue
         deltas.append({
@@ -106,7 +120,33 @@ def _collect_rsi_deltas(snaps, strategy_id: int, pnl: float):
     return deltas
 
 
-# 🔸 Применение дельт к таблице агрегатов (транзакция, без UPSERT по partial unique)
+# 🔸 Сбор дельт по MFI для одной позиции
+def _collect_mfi_deltas(snaps, strategy_id: int, pnl: float):
+    deltas = []
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+    for s in snaps:
+        tf = s["timeframe"]
+        param = s["param_name"]
+        value = s["value_num"]
+        bucket = _bucket_0_100(value, MFI_BUCKET_STEP)
+        if bucket is None:
+            continue
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "mfi",
+            "param_name": param,
+            "bucket_type": "value_bin",
+            "bucket_key": "value",
+            "bucket_int": bucket,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+    return deltas
+
+
+# 🔸 Применение дельт к таблице агрегатов (value_bin/value) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
     if not deltas:
         async with pg.acquire() as conn:
@@ -118,7 +158,6 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
 
     async with pg.acquire() as conn:
         async with conn.transaction():
-            # сгруппируем дельты по ключу (на всякий случай, если в snaps будут дубли)
             agg = {}
             for d in deltas:
                 key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
@@ -195,7 +234,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
             )
 
 
-# 🔸 Основной воркер: читаем post-commit события, считаем RSI-бакеты и пишем агрегаты
+# 🔸 Основной воркер: читаем закрытия, считаем RSI/MFI и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -247,23 +286,23 @@ async def run_position_aggregator_worker(pg, redis):
 
                         strategy_id = row["strategy_id"]
                         pnl = float(row["pnl"]) if row["pnl"] is not None else 0.0
-                        closed_at = row["closed_at"]
 
-                        snaps = await _fetch_rsi_snapshots(pg, uid)
-                        if not snaps:
-                            log.info(f"[NO-RSI] uid={uid} → помечаем audited=true без изменения агрегатов")
-                            await _apply_aggregates_and_mark_audited(pg, uid, [])
-                            continue
+                        snaps_all = await _fetch_snapshots_all(pg, uid)
+                        parts = _partition_snapshots_by_indicator(snaps_all)
 
-                        deltas = _collect_rsi_deltas(snaps, strategy_id, pnl)
+                        deltas = []
+                        if parts["rsi"]:
+                            deltas += _collect_rsi_deltas(parts["rsi"], strategy_id, pnl)
+                        if parts["mfi"]:
+                            deltas += _collect_mfi_deltas(parts["mfi"], strategy_id, pnl)
+
                         if not deltas:
-                            log.info(f"[NO-RSI] uid={uid} → нет валидных RSI значений, ставим audited=true")
+                            log.info(f"[NO-RSI-MFI] uid={uid} → ставим audited=true без изменения агрегатов")
                             await _apply_aggregates_and_mark_audited(pg, uid, [])
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-
-                        log.info(f"[AGG] uid={uid} strategy={strategy_id} pnl={pnl} closed_at={closed_at} → записаны {len(deltas)} RSI-дельт")
+                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI)")
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
