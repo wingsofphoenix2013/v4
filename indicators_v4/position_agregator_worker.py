@@ -1,13 +1,13 @@
-# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread)
+# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread, EMA, KAMA)
 
 import asyncio
 import logging
-import json
 import math
+from decimal import Decimal, ROUND_FLOOR
 
 log = logging.getLogger("IND_AGG")
 
-STREAM   = "signal_log_queue"   # читаем post-commit события
+STREAM   = "signal_log_queue"   # читаем post-commit события (post-commit)
 GROUP    = "indicators_agg_group"
 CONSUMER = "ind_agg_1"
 
@@ -19,6 +19,9 @@ MFI_BUCKET_STEP = 5
 ADX_BUCKET_STEP = 5
 DMI_SPREAD_STEP = 5
 
+EMA_KAMA_PCT_CLAMP = 5.0      # диапазон ±5.0%
+EMA_KAMA_PCT_STEP  = 0.1      # шаг 0.1%
+
 
 # 🔸 Загрузка позиции по uid из positions_v4
 async def _fetch_position(pg, position_uid: str):
@@ -29,6 +32,8 @@ async def _fetch_position(pg, position_uid: str):
                 position_uid,
                 strategy_id,
                 status,
+                direction,
+                entry_price,
                 pnl,
                 audited,
                 closed_at
@@ -59,10 +64,10 @@ def _partition_snapshots_by_indicator(rows):
         "rsi": [],
         "mfi": [],
         "adx_dmi": [],
-        "macd": [],
-        "bb": [],
         "ema": [],
         "kama": [],
+        "macd": [],
+        "bb": [],
         "lr": [],
         "atr": [],
     }
@@ -71,10 +76,10 @@ def _partition_snapshots_by_indicator(rows):
         if   p.startswith("rsi"):     buckets["rsi"].append(r)
         elif p.startswith("mfi"):     buckets["mfi"].append(r)
         elif p.startswith("adx_dmi"): buckets["adx_dmi"].append(r)
-        elif p.startswith("macd"):    buckets["macd"].append(r)
-        elif p.startswith("bb"):      buckets["bb"].append(r)
         elif p.startswith("ema"):     buckets["ema"].append(r)
         elif p.startswith("kama"):    buckets["kama"].append(r)
+        elif p.startswith("macd"):    buckets["macd"].append(r)
+        elif p.startswith("bb"):      buckets["bb"].append(r)
         elif p.startswith("lr"):      buckets["lr"].append(r)
         elif p.startswith("atr"):     buckets["atr"].append(r)
     return buckets
@@ -107,11 +112,30 @@ def _bucket_minus100_100(value: float, step: int) -> int | None:
         v = -100.0
     if v >= 100.0:
         v = 99.9999
-    # пример: step=5 → -100,-95,...,-5,0,5,...,95
     return int(math.floor(v / step) * step)
 
 
-# 🔸 Сбор дельт по RSI для одной позиции
+# 🔸 Квантация вниз к сетке 0.1% в пределах ±5.0% → (from, to)
+def _pct_bin_range_0_1(val_pct: float) -> tuple[float, float] | None:
+    try:
+        v = float(val_pct)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    # клэмп в [-5.0, 5.0)
+    if v < -EMA_KAMA_PCT_CLAMP:
+        v = -EMA_KAMA_PCT_CLAMP
+    if v >= EMA_KAMA_PCT_CLAMP:
+        v = EMA_KAMA_PCT_CLAMP - 1e-6
+    # квантуем вниз до 0.1 с использованием Decimal для стабильности
+    d = (Decimal(v).quantize(Decimal("0.1"), rounding=ROUND_FLOOR))
+    frm = float(d)
+    to  = float(d + Decimal("0.1"))
+    return frm, to
+
+
+# 🔸 Сбор дельт по RSI для одной позиции (value_bin/value)
 def _collect_rsi_deltas(snaps, strategy_id: int, pnl: float):
     deltas = []
     win = 1 if pnl is not None and float(pnl) > 0 else 0
@@ -137,7 +161,7 @@ def _collect_rsi_deltas(snaps, strategy_id: int, pnl: float):
     return deltas
 
 
-# 🔸 Сбор дельт по MFI для одной позиции
+# 🔸 Сбор дельт по MFI для одной позиции (value_bin/value)
 def _collect_mfi_deltas(snaps, strategy_id: int, pnl: float):
     deltas = []
     win = 1 if pnl is not None and float(pnl) > 0 else 0
@@ -168,12 +192,11 @@ def _parse_adx_dmi_param_name(param_name: str) -> tuple[str | None, str | None]:
     try:
         if not param_name.startswith("adx_dmi"):
             return None, None
-        # ищем последний '_' как разделитель суффикса
         idx = param_name.rfind("_")
         if idx == -1:
             return None, None
-        base = param_name[:idx]   # adx_dmi14
-        suffix = param_name[idx+1:]  # adx / plus_di / minus_di
+        base = param_name[:idx]
+        suffix = param_name[idx+1:]
         return base, suffix
     except Exception:
         return None, None
@@ -201,14 +224,13 @@ def _group_adx_dmi(snaps):
     return groups
 
 
-# 🔸 Сбор дельт по ADX (value_bin по adx, шаг 5) и DMI-spread (value_bin по spread, шаг 5)
+# 🔸 Сбор дельт по ADX (value_bin/adx) и DMI-spread (value_bin/dmi_spread)
 def _collect_adx_dmi_deltas(snaps, strategy_id: int, pnl: float):
     deltas = []
     win = 1 if pnl is not None and float(pnl) > 0 else 0
     groups = _group_adx_dmi(snaps)
 
     for (tf, base), vals in groups.items():
-        # ADX → value_bin adx
         adx = vals.get("adx")
         adx_bucket = _bucket_0_100(adx, ADX_BUCKET_STEP) if adx is not None else None
         if adx_bucket is not None:
@@ -216,7 +238,7 @@ def _collect_adx_dmi_deltas(snaps, strategy_id: int, pnl: float):
                 "strategy_id": strategy_id,
                 "timeframe": tf,
                 "indicator": "adx_dmi",
-                "param_name": base,                 # adx_dmi{L}
+                "param_name": base,
                 "bucket_type": "value_bin",
                 "bucket_key": "adx",
                 "bucket_int": adx_bucket,
@@ -225,11 +247,9 @@ def _collect_adx_dmi_deltas(snaps, strategy_id: int, pnl: float):
                 "dw": win,
             })
 
-        # DMI spread → value_bin dmi_spread
         plus_di = vals.get("plus_di")
         minus_di = vals.get("minus_di")
         if plus_di is not None and minus_di is not None:
-            # spread = plus_di - minus_di
             try:
                 spread = float(plus_di) - float(minus_di)
             except Exception:
@@ -252,7 +272,113 @@ def _collect_adx_dmi_deltas(snaps, strategy_id: int, pnl: float):
     return deltas
 
 
-# 🔸 Применение дельт к таблице агрегатов (value_bin с произвольным bucket_key) и отметка audited
+# 🔸 Вспомогательное: извлечь длину из param_name вида 'ema21'/'kama50'
+def _extract_len_from_param(param_name: str, prefix: str) -> int | None:
+    try:
+        if not param_name.startswith(prefix):
+            return None
+        return int(param_name[len(prefix):])
+    except Exception:
+        return None
+
+
+# 🔸 Сбор дельт по EMA (range/signed_dist_pct) с шагом 0.1%
+def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | None, entry_price) -> list:
+    deltas = []
+    if entry_price is None:
+        return deltas
+    try:
+        ep = float(entry_price)
+    except Exception:
+        return deltas
+    if not math.isfinite(ep) or ep <= 0:
+        return deltas
+    dir_sign = 1.0 if (direction or "").lower() == "long" else -1.0 if (direction or "").lower() == "short" else 1.0
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+
+    for s in snaps:
+        tf = s["timeframe"]
+        param = s["param_name"]     # 'ema9', 'ema21', ...
+        val = s["value_num"]
+        try:
+            ema_val = float(val)
+        except Exception:
+            continue
+        if not math.isfinite(ema_val):
+            continue
+
+        dist_pct = ((ep - ema_val) / ep) * 100.0
+        signed = dist_pct * dir_sign
+        rng = _pct_bin_range_0_1(signed)
+        if not rng:
+            continue
+        frm, to = rng
+
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "ema",
+            "param_name": param,                 # сохраняем как 'ema<L>'
+            "bucket_type": "range",
+            "bucket_key": "signed_dist_pct",
+            "bucket_from": frm,
+            "bucket_to": to,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+    return deltas
+
+
+# 🔸 Сбор дельт по KAMA (range/signed_dist_pct) с шагом 0.1%
+def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | None, entry_price) -> list:
+    deltas = []
+    if entry_price is None:
+        return deltas
+    try:
+        ep = float(entry_price)
+    except Exception:
+        return deltas
+    if not math.isfinite(ep) or ep <= 0:
+        return deltas
+    dir_sign = 1.0 if (direction or "").lower() == "long" else -1.0 if (direction or "").lower() == "short" else 1.0
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+
+    for s in snaps:
+        tf = s["timeframe"]
+        param = s["param_name"]     # 'kama9', 'kama21', ...
+        val = s["value_num"]
+        try:
+            kama_val = float(val)
+        except Exception:
+            continue
+        if not math.isfinite(kama_val):
+            continue
+
+        dist_pct = ((ep - kama_val) / ep) * 100.0
+        signed = dist_pct * dir_sign
+        rng = _pct_bin_range_0_1(signed)
+        if not rng:
+            continue
+        frm, to = rng
+
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "kama",
+            "param_name": param,                 # 'kama<L>'
+            "bucket_type": "range",
+            "bucket_key": "signed_dist_pct",
+            "bucket_from": frm,
+            "bucket_to": to,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+    return deltas
+
+
+# 🔸 Применение дельт к таблице агрегатов (value_bin и range) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
     if not deltas:
         async with pg.acquire() as conn:
@@ -264,11 +390,15 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
 
     async with pg.acquire() as conn:
         async with conn.transaction():
-            # сгруппируем одинаковые ключи внутри одной позиции
+            # агрегируем идентичные ключи в пределах одной позиции
             agg = {}
             for d in deltas:
-                key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
-                       d["bucket_type"], d["bucket_key"], d["bucket_int"])
+                if d["bucket_type"] == "value_bin":
+                    key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
+                           "value_bin", d["bucket_key"], d.get("bucket_int"))
+                else:  # 'range'
+                    key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
+                           "range", d["bucket_key"], float(d.get("bucket_from")), float(d.get("bucket_to")))
                 cur = agg.get(key, {"dc": 0, "dp": 0.0, "dw": 0})
                 cur["dc"] += d["dc"]
                 cur["dp"] += d["dp"]
@@ -276,64 +406,119 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                 agg[key] = cur
 
             for key, m in agg.items():
-                strategy_id, timeframe, indicator, param_name, bucket_type, bucket_key, bucket_int = key
+                strategy_id, timeframe, indicator, param_name, btype, bkey, bA, *rest = key
                 dc, dp, dw = m["dc"], m["dp"], m["dw"]
 
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, positions_closed, pnl_sum, wins
-                    FROM indicator_aggregates_v4
-                    WHERE strategy_id = $1
-                      AND timeframe   = $2
-                      AND indicator   = $3
-                      AND param_name  = $4
-                      AND bucket_type = 'value_bin'
-                      AND bucket_key  = $5
-                      AND bucket_int  = $6
-                    FOR UPDATE
-                    """,
-                    strategy_id, timeframe, indicator, param_name, bucket_key, bucket_int
-                )
-
-                if row:
-                    new_count = int(row["positions_closed"]) + dc
-                    new_pnl   = float(row["pnl_sum"]) + dp
-                    new_wins  = int(row["wins"]) + dw
-                    new_avg   = new_pnl / new_count if new_count else 0.0
-                    new_wr    = (new_wins / new_count) if new_count else 0.0
-
-                    await conn.execute(
+                if btype == "value_bin":
+                    bucket_int = bA
+                    row = await conn.fetchrow(
                         """
-                        UPDATE indicator_aggregates_v4
-                        SET positions_closed = $1,
-                            pnl_sum          = $2,
-                            wins             = $3,
-                            avg_pnl          = $4,
-                            winrate          = $5,
-                            updated_at       = NOW()
-                        WHERE id = $6
+                        SELECT id, positions_closed, pnl_sum, wins
+                        FROM indicator_aggregates_v4
+                        WHERE strategy_id = $1
+                          AND timeframe   = $2
+                          AND indicator   = $3
+                          AND param_name  = $4
+                          AND bucket_type = 'value_bin'
+                          AND bucket_key  = $5
+                          AND bucket_int  = $6
+                        FOR UPDATE
                         """,
-                        new_count, new_pnl, new_wins, new_avg, new_wr, row["id"]
+                        strategy_id, timeframe, indicator, param_name, bkey, bucket_int
                     )
-                else:
-                    new_count = dc
-                    new_pnl   = dp
-                    new_wins  = dw
-                    new_avg   = new_pnl / new_count if new_count else 0.0
-                    new_wr    = (new_wins / new_count) if new_count else 0.0
-
-                    await conn.execute(
-                        """
-                        INSERT INTO indicator_aggregates_v4 (
+                    if row:
+                        new_count = int(row["positions_closed"]) + dc
+                        new_pnl   = float(row["pnl_sum"]) + dp
+                        new_wins  = int(row["wins"]) + dw
+                        new_avg   = new_pnl / new_count if new_count else 0.0
+                        new_wr    = (new_wins / new_count) if new_count else 0.0
+                        await conn.execute(
+                            """
+                            UPDATE indicator_aggregates_v4
+                            SET positions_closed = $1,
+                                pnl_sum          = $2,
+                                wins             = $3,
+                                avg_pnl          = $4,
+                                winrate          = $5,
+                                updated_at       = NOW()
+                            WHERE id = $6
+                            """,
+                            new_count, new_pnl, new_wins, new_avg, new_wr, row["id"]
+                        )
+                    else:
+                        new_count = dc
+                        new_pnl   = dp
+                        new_wins  = dw
+                        new_avg   = new_pnl / new_count if new_count else 0.0
+                        new_wr    = (new_wins / new_count) if new_count else 0.0
+                        await conn.execute(
+                            """
+                            INSERT INTO indicator_aggregates_v4 (
+                                strategy_id, timeframe, indicator, param_name,
+                                bucket_type, bucket_key, bucket_int,
+                                positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
+                            ) VALUES ($1,$2,$3,$4,'value_bin',$5,$6,$7,$8,$9,$10,$11,NOW())
+                            """,
                             strategy_id, timeframe, indicator, param_name,
-                            bucket_type, bucket_key, bucket_int,
-                            positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
-                        ) VALUES ($1,$2,$3,$4,'value_bin',$5,$6,$7,$8,$9,$10,$11,NOW())
+                            bkey, bucket_int,
+                            new_count, new_pnl, new_wins, new_avg, new_wr
+                        )
+                else:
+                    bucket_from = bA
+                    bucket_to   = rest[0]
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id, positions_closed, pnl_sum, wins
+                        FROM indicator_aggregates_v4
+                        WHERE strategy_id   = $1
+                          AND timeframe     = $2
+                          AND indicator     = $3
+                          AND param_name    = $4
+                          AND bucket_type   = 'range'
+                          AND bucket_key    = $5
+                          AND bucket_num_from = $6
+                          AND bucket_num_to   = $7
+                        FOR UPDATE
                         """,
-                        strategy_id, timeframe, indicator, param_name,
-                        bucket_key, bucket_int,
-                        new_count, new_pnl, new_wins, new_avg, new_wr
+                        strategy_id, timeframe, indicator, param_name, bkey, bucket_from, bucket_to
                     )
+                    if row:
+                        new_count = int(row["positions_closed"]) + dc
+                        new_pnl   = float(row["pnl_sum"]) + dp
+                        new_wins  = int(row["wins"]) + dw
+                        new_avg   = new_pnl / new_count if new_count else 0.0
+                        new_wr    = (new_wins / new_count) if new_count else 0.0
+                        await conn.execute(
+                            """
+                            UPDATE indicator_aggregates_v4
+                            SET positions_closed = $1,
+                                pnl_sum          = $2,
+                                wins             = $3,
+                                avg_pnl          = $4,
+                                winrate          = $5,
+                                updated_at       = NOW()
+                            WHERE id = $6
+                            """,
+                            new_count, new_pnl, new_wins, new_avg, new_wr, row["id"]
+                        )
+                    else:
+                        new_count = dc
+                        new_pnl   = dp
+                        new_wins  = dw
+                        new_avg   = new_pnl / new_count if new_count else 0.0
+                        new_wr    = (new_wins / new_count) if new_count else 0.0
+                        await conn.execute(
+                            """
+                            INSERT INTO indicator_aggregates_v4 (
+                                strategy_id, timeframe, indicator, param_name,
+                                bucket_type, bucket_key, bucket_num_from, bucket_num_to,
+                                positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
+                            ) VALUES ($1,$2,$3,$4,'range',$5,$6,$7,$8,$9,$10,$11,NOW())
+                            """,
+                            strategy_id, timeframe, indicator, param_name,
+                            bkey, bucket_from, bucket_to,
+                            new_count, new_pnl, new_wins, new_avg, new_wr
+                        )
 
             await conn.execute(
                 "UPDATE positions_v4 SET audited = TRUE WHERE position_uid = $1 AND audited = FALSE",
@@ -341,7 +526,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
             )
 
 
-# 🔸 Основной воркер: читаем закрытия, считаем RSI/MFI/ADX/DMI-spread и пишем агрегаты
+# 🔸 Основной воркер: читаем закрытия, собираем дельты и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -393,18 +578,23 @@ async def run_position_aggregator_worker(pg, redis):
 
                         strategy_id = row["strategy_id"]
                         pnl = float(row["pnl"]) if row["pnl"] is not None else 0.0
+                        direction = row["direction"]
+                        entry_price = row["entry_price"]
 
                         snaps_all = await _fetch_snapshots_all(pg, uid)
                         parts = _partition_snapshots_by_indicator(snaps_all)
 
                         deltas = []
-
                         if parts["rsi"]:
                             deltas += _collect_rsi_deltas(parts["rsi"], strategy_id, pnl)
                         if parts["mfi"]:
                             deltas += _collect_mfi_deltas(parts["mfi"], strategy_id, pnl)
                         if parts["adx_dmi"]:
                             deltas += _collect_adx_dmi_deltas(parts["adx_dmi"], strategy_id, pnl)
+                        if parts["ema"]:
+                            deltas += _collect_ema_deltas(parts["ema"], strategy_id, pnl, direction, entry_price)
+                        if parts["kama"]:
+                            deltas += _collect_kama_deltas(parts["kama"], strategy_id, pnl, direction, entry_price)
 
                         if not deltas:
                             log.info(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
@@ -412,7 +602,7 @@ async def run_position_aggregator_worker(pg, redis):
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI)")
+                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI/EMA/KAMA)")
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
