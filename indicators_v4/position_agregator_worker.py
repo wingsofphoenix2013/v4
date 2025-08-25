@@ -459,11 +459,11 @@ def _parse_macd_param_name(param_name: str) -> tuple[str | None, str | None]:
     try:
         if not param_name.startswith("macd"):
             return None, None
-        idx = param_name.rfind("_")
+        idx = param_name.find("_")
         if idx == -1:
-            return None, None
-        base = param_name[:idx]
-        suffix = param_name[idx+1:]
+            return param_name, None  # например, 'macd12'
+        base = param_name[:idx]          # 'macd12'
+        suffix = param_name[idx+1:]      # 'macd' | 'macd_signal' | 'macd_hist'
         return base, suffix
     except Exception:
         return None, None
