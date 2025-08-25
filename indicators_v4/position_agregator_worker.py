@@ -1,4 +1,4 @@
-# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread, EMA, KAMA, ATR)
+# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread, EMA, KAMA, ATR, MACD)
 
 import asyncio
 import logging
@@ -25,6 +25,10 @@ EMA_KAMA_PCT_STEP  = 0.1   # квантация вниз для EMA/KAMA: 0.1%
 
 ATR_PCT_CLAMP = 10.0       # диапазон для atr_pct: [0.0%, 10.0%)
 ATR_PCT_STEP  = 0.1        # квантация вниз для ATR: 0.1%
+
+MACD_PCT_CLAMP = 2.0       # диапазон для hist_pct: [-2.0%, 2.0%)
+MACD_PCT_STEP  = 0.1       # квантация вниз для MACD hist_pct: 0.1%
+MACD_FLAT_EPS  = 0.05      # |hist_pct| < 0.05% → 'flat'
 
 
 # 🔸 Загрузка позиции по uid из positions_v4
@@ -147,6 +151,24 @@ def _pct_bin_range_atr(val_pct: float) -> tuple[float, float] | None:
         v = 0.0
     if v >= ATR_PCT_CLAMP:
         v = ATR_PCT_CLAMP - 1e-6
+    d = Decimal(v).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+    frm = float(d)
+    to  = float(d + Decimal("0.1"))
+    return frm, to
+
+
+# 🔸 Квантация вниз к сетке 0.1% (MACD hist_pct) в пределах ±2.0% → (from, to)
+def _pct_bin_range_macd(val_pct: float) -> tuple[float, float] | None:
+    try:
+        v = float(val_pct)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    if v < -MACD_PCT_CLAMP:
+        v = -MACD_PCT_CLAMP
+    if v >= MACD_PCT_CLAMP:
+        v = MACD_PCT_CLAMP - 1e-6
     d = Decimal(v).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
     frm = float(d)
     to  = float(d + Decimal("0.1"))
@@ -306,7 +328,7 @@ def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | No
 
     for s in snaps:
         tf = s["timeframe"]
-        param = s["param_name"]     # 'ema9','ema21',...
+        param = s["param_name"]
         val = s["value_num"]
         try:
             ema_val = float(val)
@@ -326,7 +348,7 @@ def _collect_ema_deltas(snaps, strategy_id: int, pnl: float, direction: str | No
             "strategy_id": strategy_id,
             "timeframe": tf,
             "indicator": "ema",
-            "param_name": param,                 # 'ema<L>'
+            "param_name": param,
             "bucket_type": "range",
             "bucket_key": "signed_dist_pct",
             "bucket_from": frm,
@@ -354,7 +376,7 @@ def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | N
 
     for s in snaps:
         tf = s["timeframe"]
-        param = s["param_name"]     # 'kama9','kama21',...
+        param = s["param_name"]
         val = s["value_num"]
         try:
             kama_val = float(val)
@@ -374,7 +396,7 @@ def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | N
             "strategy_id": strategy_id,
             "timeframe": tf,
             "indicator": "kama",
-            "param_name": param,                 # 'kama<L>'
+            "param_name": param,
             "bucket_type": "range",
             "bucket_key": "signed_dist_pct",
             "bucket_from": frm,
@@ -401,7 +423,7 @@ def _collect_atr_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> lis
 
     for s in snaps:
         tf = s["timeframe"]
-        param = s["param_name"]     # 'atr14',...
+        param = s["param_name"]
         val = s["value_num"]
         try:
             atr_val = float(val)
@@ -420,7 +442,7 @@ def _collect_atr_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> lis
             "strategy_id": strategy_id,
             "timeframe": tf,
             "indicator": "atr",
-            "param_name": param,                 # 'atr<L>'
+            "param_name": param,
             "bucket_type": "range",
             "bucket_key": "atr_pct",
             "bucket_from": frm,
@@ -432,7 +454,119 @@ def _collect_atr_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> lis
     return deltas
 
 
-# 🔸 Применение дельт к таблице агрегатов (value_bin и range) и отметка audited
+# 🔸 Парсинг base/suffix для MACD: macd{F}_suffix → (base='macd{F}', suffix)
+def _parse_macd_param_name(param_name: str) -> tuple[str | None, str | None]:
+    try:
+        if not param_name.startswith("macd"):
+            return None, None
+        idx = param_name.rfind("_")
+        if idx == -1:
+            return None, None
+        base = param_name[:idx]
+        suffix = param_name[idx+1:]
+        return base, suffix
+    except Exception:
+        return None, None
+
+
+# 🔸 Группировка снимков MACD по (timeframe, base='macd{F}')
+def _group_macd(snaps):
+    groups = {}
+    for r in snaps:
+        tf = r["timeframe"]
+        param = r["param_name"]
+        base, suffix = _parse_macd_param_name(param)
+        if not base or not suffix:
+            continue
+        key = (tf, base)
+        g = groups.get(key, {"macd": None, "signal": None, "hist": None})
+        val = r["value_num"]
+        if suffix == "macd":
+            g["macd"] = val
+        elif suffix == "macd_signal":
+            g["signal"] = val
+        elif suffix == "macd_hist":
+            g["hist"] = val
+        groups[key] = g
+    return groups
+
+
+# 🔸 Сбор дельт по MACD: category(hist_sign) + range(hist_pct)
+def _collect_macd_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> list:
+    deltas = []
+    if entry_price is None:
+        return deltas
+    try:
+        ep = float(entry_price)
+    except Exception:
+        return deltas
+    if not math.isfinite(ep) or ep <= 0:
+        return deltas
+
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+    groups = _group_macd(snaps)
+
+    for (tf, base), vals in groups.items():
+        hist = vals.get("hist")
+        if hist is None:
+            macd_v = vals.get("macd")
+            sig_v  = vals.get("signal")
+            if macd_v is not None and sig_v is not None:
+                try:
+                    hist = float(macd_v) - float(sig_v)
+                except Exception:
+                    hist = None
+
+        if hist is None or not math.isfinite(float(hist)):
+            continue
+
+        try:
+            hist_f = float(hist)
+        except Exception:
+            continue
+
+        hist_pct = (hist_f / ep) * 100.0
+        # category: hist_sign
+        if abs(hist_pct) < MACD_FLAT_EPS:
+            cat = "flat"
+        else:
+            cat = "above" if hist_pct > 0 else "below"
+
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "macd",
+            "param_name": base,                 # 'macd{fast}'
+            "bucket_type": "category",
+            "bucket_key": "hist_sign",
+            "bucket_text": cat,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+
+        # range: hist_pct
+        rng = _pct_bin_range_macd(hist_pct)
+        if rng:
+            frm, to = rng
+            deltas.append({
+                "strategy_id": strategy_id,
+                "timeframe": tf,
+                "indicator": "macd",
+                "param_name": base,
+                "bucket_type": "range",
+                "bucket_key": "hist_pct",
+                "bucket_from": frm,
+                "bucket_to": to,
+                "dc": 1,
+                "dp": float(pnl) if pnl is not None else 0.0,
+                "dw": win,
+            })
+
+    return deltas
+
+
+# 🔸 Применение дельт к таблице агрегатов (value_bin, range, category) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
     if not deltas:
         async with pg.acquire() as conn:
@@ -447,12 +581,16 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
             # агрегация одинаковых ключей в пределах одной позиции
             agg = {}
             for d in deltas:
-                if d["bucket_type"] == "value_bin":
+                bt = d["bucket_type"]
+                if bt == "value_bin":
                     key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
                            "value_bin", d["bucket_key"], d.get("bucket_int"))
-                else:  # 'range'
+                elif bt == "range":
                     key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
                            "range", d["bucket_key"], float(d.get("bucket_from")), float(d.get("bucket_to")))
+                else:  # category
+                    key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
+                           "category", d["bucket_key"], str(d.get("bucket_text")))
                 cur = agg.get(key, {"dc": 0, "dp": 0.0, "dw": 0})
                 cur["dc"] += d["dc"]
                 cur["dp"] += d["dp"]
@@ -480,7 +618,6 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                         """,
                         strategy_id, timeframe, indicator, param_name, bkey, bucket_int
                     )
-
                     if row:
                         new_count = int(row["positions_closed"]) + dc
                         new_pnl   = float(row["pnl_sum"]) + dp
@@ -519,7 +656,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                             new_count, new_pnl, new_wins, new_avg, new_wr
                         )
 
-                else:
+                elif btype == "range":
                     bucket_from = bA
                     bucket_to   = rest[0]
                     row = await conn.fetchrow(
@@ -538,7 +675,6 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                         """,
                         strategy_id, timeframe, indicator, param_name, bkey, bucket_from, bucket_to
                     )
-
                     if row:
                         new_count = int(row["positions_closed"]) + dc
                         new_pnl   = float(row["pnl_sum"]) + dp
@@ -574,6 +710,61 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                             """,
                             strategy_id, timeframe, indicator, param_name,
                             bkey, bucket_from, bucket_to,
+                            new_count, new_pnl, new_wins, new_avg, new_wr
+                        )
+
+                else:  # category
+                    bucket_text = bA
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id, positions_closed, pnl_sum, wins
+                        FROM indicator_aggregates_v4
+                        WHERE strategy_id  = $1
+                          AND timeframe    = $2
+                          AND indicator    = $3
+                          AND param_name   = $4
+                          AND bucket_type  = 'category'
+                          AND bucket_key   = $5
+                          AND bucket_text  = $6
+                        FOR UPDATE
+                        """,
+                        strategy_id, timeframe, indicator, param_name, bkey, bucket_text
+                    )
+                    if row:
+                        new_count = int(row["positions_closed"]) + dc
+                        new_pnl   = float(row["pnl_sum"]) + dp
+                        new_wins  = int(row["wins"]) + dw
+                        new_avg   = new_pnl / new_count if new_count else 0.0
+                        new_wr    = (new_wins / new_count) if new_count else 0.0
+                        await conn.execute(
+                            """
+                            UPDATE indicator_aggregates_v4
+                            SET positions_closed = $1,
+                                pnl_sum          = $2,
+                                wins             = $3,
+                                avg_pnl          = $4,
+                                winrate          = $5,
+                                updated_at       = NOW()
+                            WHERE id = $6
+                            """,
+                            new_count, new_pnl, new_wins, new_avg, new_wr, row["id"]
+                        )
+                    else:
+                        new_count = dc
+                        new_pnl   = dp
+                        new_wins  = dw
+                        new_avg   = new_pnl / new_count if new_count else 0.0
+                        new_wr    = (new_wins / new_count) if new_count else 0.0
+                        await conn.execute(
+                            """
+                            INSERT INTO indicator_aggregates_v4 (
+                                strategy_id, timeframe, indicator, param_name,
+                                bucket_type, bucket_key, bucket_text,
+                                positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
+                            ) VALUES ($1,$2,$3,$4,'category',$5,$6,$7,$8,$9,$10,$11,NOW())
+                            """,
+                            strategy_id, timeframe, indicator, param_name,
+                            bkey, bucket_text,
                             new_count, new_pnl, new_wins, new_avg, new_wr
                         )
 
@@ -654,6 +845,8 @@ async def run_position_aggregator_worker(pg, redis):
                             deltas += _collect_kama_deltas(parts["kama"], strategy_id, pnl, direction, entry_price)
                         if parts["atr"]:
                             deltas += _collect_atr_deltas(parts["atr"], strategy_id, pnl, entry_price)
+                        if parts["macd"]:
+                            deltas += _collect_macd_deltas(parts["macd"], strategy_id, pnl, entry_price)
 
                         if not deltas:
                             log.info(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
@@ -661,7 +854,7 @@ async def run_position_aggregator_worker(pg, redis):
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI/EMA/KAMA/ATR)")
+                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI/EMA/KAMA/ATR/MACD)")
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
