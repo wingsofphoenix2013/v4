@@ -1,14 +1,13 @@
-# position_agregator_worker.py — воркер агрегации позиций (шаг 4: единая выборка снимков, обработка RSI и MFI)
+# position_agregator_worker.py — воркер агрегации позиций (RSI, MFI, ADX, DMI-spread)
 
 import asyncio
 import logging
 import json
 import math
-from datetime import datetime
 
 log = logging.getLogger("IND_AGG")
 
-STREAM   = "signal_log_queue"          # читаем post-commit события
+STREAM   = "signal_log_queue"   # читаем post-commit события
 GROUP    = "indicators_agg_group"
 CONSUMER = "ind_agg_1"
 
@@ -17,6 +16,8 @@ READ_BLOCK_MS = 2000
 
 RSI_BUCKET_STEP = 5
 MFI_BUCKET_STEP = 5
+ADX_BUCKET_STEP = 5
+DMI_SPREAD_STEP = 5
 
 
 # 🔸 Загрузка позиции по uid из positions_v4
@@ -79,7 +80,7 @@ def _partition_snapshots_by_indicator(rows):
     return buckets
 
 
-# 🔸 Расчёт корзины для значения [0..100] (RSI/MFI)
+# 🔸 Общая бин-функция для диапазона [0..100) (RSI/MFI/ADX)
 def _bucket_0_100(value: float, step: int) -> int | None:
     try:
         v = float(value)
@@ -91,6 +92,22 @@ def _bucket_0_100(value: float, step: int) -> int | None:
         v = 0.0
     if v >= 100.0:
         v = 99.9999
+    return int(math.floor(v / step) * step)
+
+
+# 🔸 Бин-функция для DMI spread в диапазоне [-100..100)
+def _bucket_minus100_100(value: float, step: int) -> int | None:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    if v < -100.0:
+        v = -100.0
+    if v >= 100.0:
+        v = 99.9999
+    # пример: step=5 → -100,-95,...,-5,0,5,...,95
     return int(math.floor(v / step) * step)
 
 
@@ -146,7 +163,96 @@ def _collect_mfi_deltas(snaps, strategy_id: int, pnl: float):
     return deltas
 
 
-# 🔸 Применение дельт к таблице агрегатов (value_bin/value) и отметка audited
+# 🔸 Парсинг base param_name для ADX_DMI: adx_dmi{L}_suffix → (base='adx_dmi{L}', suffix)
+def _parse_adx_dmi_param_name(param_name: str) -> tuple[str | None, str | None]:
+    try:
+        if not param_name.startswith("adx_dmi"):
+            return None, None
+        # ищем последний '_' как разделитель суффикса
+        idx = param_name.rfind("_")
+        if idx == -1:
+            return None, None
+        base = param_name[:idx]   # adx_dmi14
+        suffix = param_name[idx+1:]  # adx / plus_di / minus_di
+        return base, suffix
+    except Exception:
+        return None, None
+
+
+# 🔸 Группировка снимков ADX_DMI по (timeframe, base='adx_dmi{L}')
+def _group_adx_dmi(snaps):
+    groups = {}
+    for r in snaps:
+        tf = r["timeframe"]
+        param = r["param_name"]
+        base, suffix = _parse_adx_dmi_param_name(param)
+        if not base or not suffix:
+            continue
+        key = (tf, base)
+        g = groups.get(key, {"adx": None, "plus_di": None, "minus_di": None})
+        val = r["value_num"]
+        if suffix == "adx":
+            g["adx"] = val
+        elif suffix == "plus_di":
+            g["plus_di"] = val
+        elif suffix == "minus_di":
+            g["minus_di"] = val
+        groups[key] = g
+    return groups
+
+
+# 🔸 Сбор дельт по ADX (value_bin по adx, шаг 5) и DMI-spread (value_bin по spread, шаг 5)
+def _collect_adx_dmi_deltas(snaps, strategy_id: int, pnl: float):
+    deltas = []
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+    groups = _group_adx_dmi(snaps)
+
+    for (tf, base), vals in groups.items():
+        # ADX → value_bin adx
+        adx = vals.get("adx")
+        adx_bucket = _bucket_0_100(adx, ADX_BUCKET_STEP) if adx is not None else None
+        if adx_bucket is not None:
+            deltas.append({
+                "strategy_id": strategy_id,
+                "timeframe": tf,
+                "indicator": "adx_dmi",
+                "param_name": base,                 # adx_dmi{L}
+                "bucket_type": "value_bin",
+                "bucket_key": "adx",
+                "bucket_int": adx_bucket,
+                "dc": 1,
+                "dp": float(pnl) if pnl is not None else 0.0,
+                "dw": win,
+            })
+
+        # DMI spread → value_bin dmi_spread
+        plus_di = vals.get("plus_di")
+        minus_di = vals.get("minus_di")
+        if plus_di is not None and minus_di is not None:
+            # spread = plus_di - minus_di
+            try:
+                spread = float(plus_di) - float(minus_di)
+            except Exception:
+                spread = None
+            bucket = _bucket_minus100_100(spread, DMI_SPREAD_STEP) if spread is not None else None
+            if bucket is not None:
+                deltas.append({
+                    "strategy_id": strategy_id,
+                    "timeframe": tf,
+                    "indicator": "adx_dmi",
+                    "param_name": base,
+                    "bucket_type": "value_bin",
+                    "bucket_key": "dmi_spread",
+                    "bucket_int": bucket,
+                    "dc": 1,
+                    "dp": float(pnl) if pnl is not None else 0.0,
+                    "dw": win,
+                })
+
+    return deltas
+
+
+# 🔸 Применение дельт к таблице агрегатов (value_bin с произвольным bucket_key) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
     if not deltas:
         async with pg.acquire() as conn:
@@ -158,6 +264,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
 
     async with pg.acquire() as conn:
         async with conn.transaction():
+            # сгруппируем одинаковые ключи внутри одной позиции
             agg = {}
             for d in deltas:
                 key = (d["strategy_id"], d["timeframe"], d["indicator"], d["param_name"],
@@ -181,11 +288,11 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                       AND indicator   = $3
                       AND param_name  = $4
                       AND bucket_type = 'value_bin'
-                      AND bucket_key  = 'value'
-                      AND bucket_int  = $5
+                      AND bucket_key  = $5
+                      AND bucket_int  = $6
                     FOR UPDATE
                     """,
-                    strategy_id, timeframe, indicator, param_name, bucket_int
+                    strategy_id, timeframe, indicator, param_name, bucket_key, bucket_int
                 )
 
                 if row:
@@ -221,10 +328,10 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                             strategy_id, timeframe, indicator, param_name,
                             bucket_type, bucket_key, bucket_int,
                             positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
-                        ) VALUES ($1,$2,$3,$4,'value_bin','value',$5,$6,$7,$8,$9,$10,NOW())
+                        ) VALUES ($1,$2,$3,$4,'value_bin',$5,$6,$7,$8,$9,$10,$11,NOW())
                         """,
                         strategy_id, timeframe, indicator, param_name,
-                        bucket_int,
+                        bucket_key, bucket_int,
                         new_count, new_pnl, new_wins, new_avg, new_wr
                     )
 
@@ -234,7 +341,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
             )
 
 
-# 🔸 Основной воркер: читаем закрытия, считаем RSI/MFI и пишем агрегаты
+# 🔸 Основной воркер: читаем закрытия, считаем RSI/MFI/ADX/DMI-spread и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -291,18 +398,21 @@ async def run_position_aggregator_worker(pg, redis):
                         parts = _partition_snapshots_by_indicator(snaps_all)
 
                         deltas = []
+
                         if parts["rsi"]:
                             deltas += _collect_rsi_deltas(parts["rsi"], strategy_id, pnl)
                         if parts["mfi"]:
                             deltas += _collect_mfi_deltas(parts["mfi"], strategy_id, pnl)
+                        if parts["adx_dmi"]:
+                            deltas += _collect_adx_dmi_deltas(parts["adx_dmi"], strategy_id, pnl)
 
                         if not deltas:
-                            log.info(f"[NO-RSI-MFI] uid={uid} → ставим audited=true без изменения агрегатов")
+                            log.info(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
                             await _apply_aggregates_and_mark_audited(pg, uid, [])
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI)")
+                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI)")
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
