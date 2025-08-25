@@ -377,7 +377,6 @@ def _collect_kama_deltas(snaps, strategy_id: int, pnl: float, direction: str | N
         })
     return deltas
 
-
 # 🔸 Применение дельт к таблице агрегатов (value_bin и range) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
     if not deltas:
@@ -390,7 +389,6 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
 
     async with pg.acquire() as conn:
         async with conn.transaction():
-            # агрегируем идентичные ключи в пределах одной позиции
             agg = {}
             for d in deltas:
                 if d["bucket_type"] == "value_bin":
@@ -426,6 +424,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                         """,
                         strategy_id, timeframe, indicator, param_name, bkey, bucket_int
                     )
+
                     if row:
                         new_count = int(row["positions_closed"]) + dc
                         new_pnl   = float(row["pnl_sum"]) + dp
@@ -463,6 +462,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                             bkey, bucket_int,
                             new_count, new_pnl, new_wins, new_avg, new_wr
                         )
+
                 else:
                     bucket_from = bA
                     bucket_to   = rest[0]
@@ -470,18 +470,19 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                         """
                         SELECT id, positions_closed, pnl_sum, wins
                         FROM indicator_aggregates_v4
-                        WHERE strategy_id   = $1
-                          AND timeframe     = $2
-                          AND indicator     = $3
-                          AND param_name    = $4
-                          AND bucket_type   = 'range'
-                          AND bucket_key    = $5
+                        WHERE strategy_id     = $1
+                          AND timeframe       = $2
+                          AND indicator       = $3
+                          AND param_name      = $4
+                          AND bucket_type     = 'range'
+                          AND bucket_key      = $5
                           AND bucket_num_from = $6
                           AND bucket_num_to   = $7
                         FOR UPDATE
                         """,
                         strategy_id, timeframe, indicator, param_name, bkey, bucket_from, bucket_to
                     )
+
                     if row:
                         new_count = int(row["positions_closed"]) + dc
                         new_pnl   = float(row["pnl_sum"]) + dp
@@ -513,7 +514,7 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                                 strategy_id, timeframe, indicator, param_name,
                                 bucket_type, bucket_key, bucket_num_from, bucket_num_to,
                                 positions_closed, pnl_sum, wins, avg_pnl, winrate, updated_at
-                            ) VALUES ($1,$2,$3,$4,'range',$5,$6,$7,$8,$9,$10,$11,NOW())
+                            ) VALUES ($1,$2,$3,$4,'range',$5,$6,$7,$8,$9,$10,$11,$12,NOW())
                             """,
                             strategy_id, timeframe, indicator, param_name,
                             bkey, bucket_from, bucket_to,
@@ -524,8 +525,6 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                 "UPDATE positions_v4 SET audited = TRUE WHERE position_uid = $1 AND audited = FALSE",
                 position_uid,
             )
-
-
 # 🔸 Основной воркер: читаем закрытия, собираем дельты и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
