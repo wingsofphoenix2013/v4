@@ -30,6 +30,9 @@ MACD_PCT_CLAMP = 2.0       # диапазон для hist_pct: [-2.0%, 2.0%)
 MACD_PCT_STEP  = 0.1       # квантация вниз для MACD hist_pct: 0.1%
 MACD_FLAT_EPS  = 0.05      # |hist_pct| < 0.05% → 'flat'
 
+BB_SLICES_PER_HALF = 3   # 3 внутренних «кирпича» от L→C и C→U
+BB_OUTER_SLICES    = 3   # 3 внешних «кирпича» ниже L и выше U (в сумме 12 зон)
+BB_EPS             = 1e-9  # числовая толерантность для сравнений границ
 
 # 🔸 Загрузка позиции по uid из positions_v4
 async def _fetch_position(pg, position_uid: str):
@@ -565,6 +568,133 @@ def _collect_macd_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> li
 
     return deltas
 
+# 🔸 Парсинг base/suffix для BB: bb{len}_{std}_{part} → (base='bb{len}_{std}', suffix='center|upper|lower')
+def _parse_bb_param_name(param_name: str) -> tuple[str | None, str | None]:
+    try:
+        if not param_name.startswith("bb"):
+            return None, None
+        idx = param_name.rfind("_")
+        if idx == -1:
+            return None, None
+        base = param_name[:idx]       # 'bb20_2_0'
+        suffix = param_name[idx+1:]   # 'center'|'upper'|'lower'
+        return base, suffix
+    except Exception:
+        return None, None
+
+
+# 🔸 Группировка снимков BB по (timeframe, base='bb{len}_{std}')
+def _group_bb(snaps):
+    groups = {}
+    for r in snaps:
+        tf = r["timeframe"]
+        param = r["param_name"]
+        base, suffix = _parse_bb_param_name(param)
+        if not base or suffix not in ("center", "upper", "lower"):
+            continue
+        key = (tf, base)
+        g = groups.get(key, {"center": None, "upper": None, "lower": None})
+        g[suffix] = r["value_num"]
+        groups[key] = g
+    return groups
+
+# 🔸 Определение 12-зонной категории BB для цены входа
+def _bb_zone12(entry_price: float, center: float, upper: float, lower: float) -> str | None:
+    try:
+        ep = float(entry_price)
+        c = float(center)
+        u = float(upper)
+        l = float(lower)
+    except Exception:
+        return None
+    if not (math.isfinite(ep) and math.isfinite(c) and math.isfinite(u) and math.isfinite(l)):
+        return None
+    if u <= l:
+        return None
+
+    # половина ширины канала и базовый шаг
+    h = (u - l) / 2.0
+    s = h / 3.0
+
+    # внутренние границы
+    c_m2 = c - 2*s
+    c_m1 = c - 1*s
+    c_p1 = c + 1*s
+    c_p2 = c + 2*s
+
+    # внешние границы около L/U
+    l_m3 = l - 3*s
+    l_m2 = l - 2*s
+    l_m1 = l - 1*s
+
+    u_p1 = u + 1*s
+    u_p2 = u + 2*s
+    u_p3 = u + 3*s
+
+    x = ep
+
+    # нижние внешние 3
+    if x < l_m3:              return "below_3"
+    if l_m3 <= x < l_m2:      return "below_3"
+    if l_m2 <= x < l_m1:      return "below_2"
+    if l_m1 <= x < l:         return "below_1"
+
+    # от нижней к центру (3)
+    if l <= x < c_m2:         return "low_3"
+    if c_m2 <= x < c_m1:      return "low_2"
+    if c_m1 <= x < c:         return "low_1"
+
+    # от центра к верхней (3)
+    if c <= x < c_p1:         return "high_1"
+    if c_p1 <= x < c_p2:      return "high_2"
+    if c_p2 <= x < u:         return "high_3"
+
+    # верхние внешние 3
+    if u <= x < u_p1:         return "above_1"
+    if u_p1 <= x < u_p2:      return "above_2"
+    if u_p2 <= x:             return "above_3"
+    return None
+
+
+# 🔸 Сбор дельт по BB: category(bb_zone12) по каждой паре (TF, bb{len}_{std})
+def _collect_bb_deltas(snaps, strategy_id: int, pnl: float, entry_price) -> list:
+    deltas = []
+    if entry_price is None:
+        return deltas
+    try:
+        ep = float(entry_price)
+    except Exception:
+        return deltas
+    if not math.isfinite(ep) or ep <= 0:
+        return deltas
+
+    win = 1 if pnl is not None and float(pnl) > 0 else 0
+    groups = _group_bb(snaps)
+
+    for (tf, base), vals in groups.items():
+        center = vals.get("center")
+        upper  = vals.get("upper")
+        lower  = vals.get("lower")
+        if center is None or upper is None or lower is None:
+            continue
+
+        zone = _bb_zone12(ep, center, upper, lower)
+        if not zone:
+            continue
+
+        deltas.append({
+            "strategy_id": strategy_id,
+            "timeframe": tf,
+            "indicator": "bb",
+            "param_name": base,               # 'bb20_2_0'
+            "bucket_type": "category",
+            "bucket_key": "bb_zone12",
+            "bucket_text": zone,
+            "dc": 1,
+            "dp": float(pnl) if pnl is not None else 0.0,
+            "dw": win,
+        })
+    return deltas
 
 # 🔸 Применение дельт к таблице агрегатов (value_bin, range, category) и отметка audited
 async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list):
@@ -773,7 +903,6 @@ async def _apply_aggregates_and_mark_audited(pg, position_uid: str, deltas: list
                 position_uid,
             )
 
-
 # 🔸 Основной воркер: читаем закрытия, собираем дельты и пишем агрегаты
 async def run_position_aggregator_worker(pg, redis):
     try:
@@ -847,6 +976,8 @@ async def run_position_aggregator_worker(pg, redis):
                             deltas += _collect_atr_deltas(parts["atr"], strategy_id, pnl, entry_price)
                         if parts["macd"]:
                             deltas += _collect_macd_deltas(parts["macd"], strategy_id, pnl, entry_price)
+                        if parts["bb"]:
+                            deltas += _collect_bb_deltas(parts["bb"], strategy_id, pnl, entry_price)
 
                         if not deltas:
                             log.info(f"[NO-AGG] uid={uid} → ставим audited=true без изменения агрегатов")
@@ -854,7 +985,10 @@ async def run_position_aggregator_worker(pg, redis):
                             continue
 
                         await _apply_aggregates_and_mark_audited(pg, uid, deltas)
-                        log.info(f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт (RSI/MFI/ADX/DMI/EMA/KAMA/ATR/MACD)")
+                        log.info(
+                            f"[AGG] uid={uid} strategy={strategy_id} → записаны {len(deltas)} дельт "
+                            f"(RSI/MFI/ADX/DMI/EMA/KAMA/ATR/MACD/BB)"
+                        )
 
                     except Exception:
                         log.exception("Ошибка обработки сообщения signal_log_queue")
