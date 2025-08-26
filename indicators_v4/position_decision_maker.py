@@ -1,8 +1,9 @@
-# position_decision_maker.py — этап 1: слушатель decision_request, базовая валидация и заглушка-ответ
+# position_decision_maker.py — универсальный решатель: этап 2 (EMA-паттерны, on-demand)
 
 import asyncio
 import logging
 import json
+import time
 from datetime import datetime
 
 log = logging.getLogger("POSITION_DECISION_MAKER")
@@ -12,7 +13,20 @@ RESPONSE_STREAM = "decision_response"
 GROUP           = "decision_maker_group"
 CONSUMER        = "decision_maker_1"
 
-# 🔸 Создание consumer group для decision_request
+EPSILON_REL = 0.0005  # 0.05%
+TIMEFRAMES_DEFAULT = ("m5", "m15", "h1")
+EMA_NAMES  = ("ema9", "ema21", "ema50", "ema100", "ema200")
+EMA_LEN = {"EMA9": 9, "EMA21": 21, "EMA50": 50, "EMA100": 100, "EMA200": 200}
+
+# кэш: pattern_text -> id
+_PATTERN_ID = {}
+# кэш инстансов: {"m5": {9: iid, 21: iid, ...}, ...}
+_EMA_INSTANCES = {}
+# указатель чтения indicator_response (для XREAD)
+_IND_RESP_LAST_ID = "0-0"
+
+
+# 🔸 consumer group
 async def _ensure_group(redis):
     try:
         await redis.xgroup_create(REQUEST_STREAM, GROUP, id="$", mkstream=True)
@@ -24,7 +38,8 @@ async def _ensure_group(redis):
             log.exception("Ошибка создания consumer group")
             raise
 
-# 🔸 Отправка ответа в decision_response
+
+# 🔸 ответ
 async def _send_response(redis, req_id: str, decision: str, reason: str):
     payload = {
         "req_id": req_id or "",
@@ -35,7 +50,8 @@ async def _send_response(redis, req_id: str, decision: str, reason: str):
     await redis.xadd(RESPONSE_STREAM, payload)
     log.info(f"[RESP] req_id={req_id} decision={decision} reason={reason}")
 
-# 🔸 Валидация минимально необходимых полей запроса
+
+# 🔸 валидация
 def _validate_request(data: dict) -> tuple[bool, str]:
     required = ("req_id", "strategy_id", "symbol", "direction", "checks")
     for k in required:
@@ -47,7 +63,244 @@ def _validate_request(data: dict) -> tuple[bool, str]:
         return False, "empty_checks"
     return True, "ok"
 
-# 🔸 Основной цикл: читаем decision_request и отвечаем заглушкой
+
+# 🔸 относительное равенство
+def _rel_equal(a: float, b: float) -> bool:
+    m = max(abs(a), abs(b), 1e-12)
+    return abs(a - b) <= EPSILON_REL * m
+
+
+# 🔸 построение паттерна
+def _build_pattern(price: float, ema_vals: dict[str, float]) -> str:
+    pairs = [("PRICE", float(price))]
+    for name in EMA_NAMES:
+        pairs.append((name.upper(), float(ema_vals[name])))
+
+    pairs.sort(key=lambda kv: kv[1], reverse=True)
+
+    groups = []
+    cur = []
+    for token, val in pairs:
+        if not cur:
+            cur = [(token, val)]
+            continue
+        ref = cur[0][1]
+        if _rel_equal(val, ref):
+            cur.append((token, val))
+        else:
+            groups.append([t for t, _ in cur])
+            cur = [(token, val)]
+    if cur:
+        groups.append([t for t, _ in cur])
+
+    canon_groups = []
+    for g in groups:
+        if "PRICE" in g:
+            rest = [t for t in g if t != "PRICE"]
+            rest.sort(key=lambda t: EMA_LEN[t])
+            canon_groups.append(["PRICE"] + rest)
+        else:
+            gg = list(g)
+            gg.sort(key=lambda t: EMA_LEN[t])
+            canon_groups.append(gg)
+
+    return " > ".join(" = ".join(g) for g in canon_groups)
+
+
+# 🔸 загрузка словаря EMA-паттернов в кэш
+async def _ensure_pattern_cache(pg):
+    if _PATTERN_ID:
+        return
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("SELECT id, pattern_text FROM indicator_emapattern_dict")
+    for r in rows:
+        _PATTERN_ID[r["pattern_text"]] = int(r["id"])
+    log.info(f"[CACHE_LOADED] patterns={len(_PATTERN_ID)}")
+
+
+# 🔸 загрузка iid для EMA (по длинам) в кэш
+async def _ensure_ema_instances(pg):
+    if _EMA_INSTANCES:
+        return
+    # ищем активные инстансы по EMA и TF {m5,m15,h1}, тянем длины
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT i.id, i.timeframe, p.value AS length
+            FROM indicator_instances_v4 i
+            JOIN indicator_parameters_v4 p ON p.instance_id = i.id AND p.param='length'
+            WHERE i.enabled = true AND i.indicator = 'ema' AND i.timeframe IN ('m5','m15','h1')
+            """
+        )
+    by_tf = {"m5": {}, "m15": {}, "h1": {}}
+    for r in rows:
+        try:
+            tf = r["timeframe"]
+            ln = int(r["length"])
+            if ln in (9,21,50,100,200):
+                by_tf[tf][ln] = int(r["id"])
+        except Exception:
+            continue
+    _EMA_INSTANCES.update(by_tf)
+    log.info(f"[CACHE_LOADED] ema_instances={_EMA_INSTANCES}")
+
+
+# 🔸 on-demand вызов индикатора (синхронный ответ из indicator_response)
+async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int = 2500):
+    global _IND_RESP_LAST_ID
+    now_ms = int(time.time() * 1000)
+
+    req_id = await redis.xadd("indicator_request", {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "instance_id": str(instance_id),
+        "timestamp_ms": str(now_ms),
+    })
+
+    # ждём ответ с matching req_id
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_id = _IND_RESP_LAST_ID
+    while time.time() < deadline:
+        resp = await redis.xread(streams={"indicator_response": last_id}, count=50, block=500)
+        if not resp:
+            continue
+        for _, messages in resp:
+            for mid, data in messages:
+                last_id = mid
+                if data.get("req_id") == req_id and data.get("status") == "ok":
+                    _IND_RESP_LAST_ID = last_id
+                    try:
+                        return json.loads(data.get("results") or "{}")
+                    except Exception:
+                        return {}
+        _IND_RESP_LAST_ID = last_id
+
+    return None  # timeout / нет ответа
+
+
+# 🔸 текущая цена
+async def _get_price(redis, symbol: str) -> float | None:
+    val = await redis.get(f"price:{symbol}")
+    try:
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+# 🔸 чтение агрегата из Redis
+async def _read_aggr(redis, strategy_id: int, direction: str, tf: str, pattern_id: int):
+    key = f"aggr:emapattern:{strategy_id}:{direction}:{tf}:{pattern_id}"
+    res = await redis.hgetall(key)
+    if not res:
+        return None, key
+    try:
+        ct = int(res.get("count_trades", "0"))
+        wr = float(res.get("winrate", "0"))
+        return (ct, wr), key
+    except Exception:
+        return None, key
+
+
+# 🔸 определение mirror-стратегии
+async def _resolve_mirror(pg, strategy_id: int, direction: str, mirror_field: str | int | None):
+    # явный mirror id в запросе (число) имеет приоритет
+    if isinstance(mirror_field, int):
+        return mirror_field
+    # auto: читаем из strategies_v4
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT emamirrow, emamirrow_long, emamirrow_short
+            FROM strategies_v4 WHERE id = $1
+            """, strategy_id
+        )
+    if not row:
+        return None
+    if direction == "long" and row["emamirrow_long"]:
+        return int(row["emamirrow_long"])
+    if direction == "short" and row["emamirrow_short"]:
+        return int(row["emamirrow_short"])
+    if row["emamirrow"]:
+        return int(row["emamirrow"])
+    return None
+
+
+# 🔸 обработка одного check kind=ema_pattern
+async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction: str, check: dict) -> str:
+    # timeframes из запроса
+    tfs = check.get("timeframes") or list(TIMEFRAMES_DEFAULT)
+
+    # подготовить кэши
+    await _ensure_pattern_cache(pg)
+    await _ensure_ema_instances(pg)
+
+    # mirror стратегия
+    mirror = check.get("mirror")
+    if mirror == "auto":
+        mirror_id = await _resolve_mirror(pg, strategy_id, direction, "auto")
+    elif isinstance(mirror, int):
+        mirror_id = mirror
+    else:
+        # если в check не передали, пробуем auto по стратегии
+        mirror_id = await _resolve_mirror(pg, strategy_id, direction, "auto")
+    # если зеркала нет — стратегия живёт сама → читаем агрегаты по текущему strategy_id
+    target_strategy = mirror_id if mirror_id else strategy_id
+
+    # текущая цена
+    price = await _get_price(redis, symbol)
+    if price is None:
+        log.info(f"[EMA] no_price symbol={symbol}")
+        return "ignore"
+
+    # по каждому TF: получить 5 EMA on-demand
+    for tf in tfs:
+        iid_map = _EMA_INSTANCES.get(tf) or {}
+        lengths_needed = (9, 21, 50, 100, 200)
+        if any(ln not in iid_map for ln in lengths_needed):
+            log.info(f"[EMA] not all EMA instances present tf={tf}")
+            return "ignore"
+
+        ema_vals = {}
+        for ln in lengths_needed:
+            iid = iid_map[ln]
+            res = await _ondemand_indicator(redis, symbol, tf, iid, timeout_ms=2500)
+            if not res:
+                log.info(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
+                return "ignore"
+            # res содержит {"ema{length}": "123.4567"} — берём строковое значение
+            key = f"ema{ln}"
+            v = res.get(key)
+            if v is None:
+                log.info(f"[EMA] ondemand no key tf={tf} len={ln}")
+                return "ignore"
+            try:
+                ema_vals[key] = float(v)
+            except Exception:
+                return "ignore"
+
+        # построить паттерн -> id
+        pattern_text = _build_pattern(price, ema_vals)
+        pid = _PATTERN_ID.get(pattern_text)
+        if pid is None:
+            log.info(f"[EMA] pattern_not_found tf={tf} text={pattern_text}")
+            return "ignore"
+
+        # прочитать агрегат по зеркальной/текущей стратегии
+        aggr, key = await _read_aggr(redis, target_strategy, direction, tf, pid)
+        if aggr is None:
+            log.info(f"[EMA] no_agg key={key}")
+            return "ignore"
+
+        count_trades, winrate = aggr
+        if not (count_trades > 2 and winrate > 0.5):
+            log.info(f"[EMA] below_threshold tf={tf} count={count_trades} winrate={winrate}")
+            return "deny"
+
+    # все TF из списка прошли пороги
+    return "allow"
+
+
+# 🔸 главный цикл
 async def run_position_decision_maker(pg, redis):
     await _ensure_group(redis)
 
@@ -57,7 +310,7 @@ async def run_position_decision_maker(pg, redis):
                 groupname=GROUP,
                 consumername=CONSUMER,
                 streams={REQUEST_STREAM: ">"},
-                count=50,
+                count=20,
                 block=2000
             )
             if not resp:
@@ -68,19 +321,23 @@ async def run_position_decision_maker(pg, redis):
                 for msg_id, data in messages:
                     to_ack.append(msg_id)
                     try:
-                        # берём req_id и базовые поля
                         req_id      = data.get("req_id")
-                        strategy_id = data.get("strategy_id")
+                        strategy_id = int(data.get("strategy_id")) if data.get("strategy_id") else None
                         symbol      = data.get("symbol")
-                        direction   = data.get("direction")
+                        direction   = (data.get("direction") or "").lower()
                         checks_raw  = data.get("checks")
+                        mirror_in   = data.get("mirror", "auto")
 
-                        # попытка распарсить checks из строки JSON, если нужно
+                        # checks может прийти строкой
+                        checks = None
                         if isinstance(checks_raw, str):
                             try:
-                                data["checks"] = json.loads(checks_raw)
+                                checks = json.loads(checks_raw)
                             except Exception:
-                                pass
+                                checks = None
+                        else:
+                            checks = checks_raw
+                        data["checks"] = checks
 
                         ok, reason = _validate_request(data)
                         if not ok:
@@ -88,14 +345,26 @@ async def run_position_decision_maker(pg, redis):
                             await _send_response(redis, req_id, "ignore", reason)
                             continue
 
-                        # лог входящего запроса (укороченно)
-                        log.info(f"[REQ] req_id={req_id} strat={strategy_id} {symbol} dir={direction} checks={len(data['checks'])}")
+                        log.info(f"[REQ] req_id={req_id} strat={strategy_id} {symbol} dir={direction} checks={len(checks)}")
 
-                        # заглушка: пока всегда ignore (дальше добавим реальную логику)
-                        await _send_response(redis, req_id, "ignore", "not_implemented")
+                        # поддерживаем пока только ema_pattern (следующие kind добавим позже)
+                        # правило объединения по одному check — AND по его timeframes
+                        decision = "ignore"
+                        for check in checks:
+                            kind = check.get("kind")
+                            if kind != "ema_pattern":
+                                decision = "ignore"
+                                break
+                            # прокинем mirror внутрь check, если пришёл на верхнем уровне
+                            if mirror_in is not None and "mirror" not in check:
+                                check["mirror"] = mirror_in
+                            decision = await _process_ema_check(pg, redis, strategy_id, symbol, direction, check)
+                            # один check в текущей версии; если позже будет несколько — комбинировать по AND
+                        await _send_response(redis, req_id, decision, "ok" if decision=="allow" else ("below_thresholds" if decision=="deny" else "no_data"))
 
                     except Exception:
                         log.exception("Ошибка обработки decision_request")
+
             if to_ack:
                 await redis.xack(REQUEST_STREAM, GROUP, *to_ack)
 
