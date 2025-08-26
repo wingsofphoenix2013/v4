@@ -144,11 +144,18 @@ async def _ensure_ema_instances(pg):
     _EMA_INSTANCES.update(by_tf)
     log.debug(f"[CACHE_LOADED] ema_instances={_EMA_INSTANCES}")
 
-
-# 🔸 on-demand вызов индикатора (локальный XREAD-указатель, без глобальной гонки)
-async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int = 5000):
+# 🔸 on-demand вызов индикатора: без глобального курсора; без гонок; быстрый фейл на error
+async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int = 10000):
     now_ms = int(time.time() * 1000)
 
+    # 1) фиксируем текущий последний id в indicator_response ДО отправки запроса
+    try:
+        last = await redis.xrevrange("indicator_response", count=1)
+        last_id = last[0][0] if last else "0-0"
+    except Exception:
+        last_id = "0-0"
+
+    # 2) отправляем запрос
     req_id = await redis.xadd("indicator_request", {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -156,31 +163,34 @@ async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: i
         "timestamp_ms": str(now_ms),
     })
 
+    # 3) ждём только НОВЫЕ записи после last_id; обрабатываем и ok, и error
     deadline = time.time() + (timeout_ms / 1000.0)
-    last_id = "$"  # только новые сообщения
     while time.time() < deadline:
-        # блокируемся до 500 мс за раз, чтобы успевать обновлять deadline
         block = int(min(500, (deadline - time.time()) * 1000))
         if block <= 0:
             break
 
-        resp = await redis.xread(streams={"indicator_response": last_id}, count=50, block=block)
+        resp = await redis.xread(streams={"indicator_response": last_id}, count=64, block=block)
         if not resp:
             continue
 
-        # обновляем указатель и ищем свой req_id
-        for _, messages in resp:
-            for mid, data in messages:
-                last_id = mid  # для следующих проходов читать дальше
-                if data.get("req_id") == req_id and data.get("status") == "ok":
-                    try:
-                        return json.loads(data.get("results") or "{}")
-                    except Exception:
-                        return {}
+        _, messages = resp[0]
+        for mid, data in messages:
+            last_id = mid
+            if data.get("req_id") != req_id:
+                continue
+            status = (data.get("status") or "").lower()
+            if status == "ok":
+                try:
+                    return json.loads(data.get("results") or "{}")
+                except Exception:
+                    return {}
+            else:
+                # быстрый выход на любой error (no_ohlcv, before_enabled_at, symbol_not_active, ...)
+                return {}
 
-    return None  # timeout/нет ответа
-
-
+    return None  # timeout
+    
 # 🔸 текущая цена
 async def _get_price(redis, symbol: str) -> float | None:
     val = await redis.get(f"price:{symbol}")
