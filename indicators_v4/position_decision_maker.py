@@ -30,7 +30,7 @@ _IND_RESP_LAST_ID = "0-0"
 async def _ensure_group(redis):
     try:
         await redis.xgroup_create(REQUEST_STREAM, GROUP, id="$", mkstream=True)
-        log.info(f"Создана consumer group {GROUP} для {REQUEST_STREAM}")
+        log.debug(f"Создана consumer group {GROUP} для {REQUEST_STREAM}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
             log.debug(f"Consumer group {GROUP} уже существует")
@@ -48,7 +48,7 @@ async def _send_response(redis, req_id: str, decision: str, reason: str):
         "responded_at": datetime.utcnow().isoformat(),
     }
     await redis.xadd(RESPONSE_STREAM, payload)
-    log.info(f"[RESP] req_id={req_id} decision={decision} reason={reason}")
+    log.debug(f"[RESP] req_id={req_id} decision={decision} reason={reason}")
 
 
 # 🔸 валидация
@@ -115,7 +115,7 @@ async def _ensure_pattern_cache(pg):
         rows = await conn.fetch("SELECT id, pattern_text FROM indicator_emapattern_dict")
     for r in rows:
         _PATTERN_ID[r["pattern_text"]] = int(r["id"])
-    log.info(f"[CACHE_LOADED] patterns={len(_PATTERN_ID)}")
+    log.debug(f"[CACHE_LOADED] patterns={len(_PATTERN_ID)}")
 
 
 # 🔸 загрузка iid для EMA (по длинам) в кэш
@@ -142,7 +142,7 @@ async def _ensure_ema_instances(pg):
         except Exception:
             continue
     _EMA_INSTANCES.update(by_tf)
-    log.info(f"[CACHE_LOADED] ema_instances={_EMA_INSTANCES}")
+    log.debug(f"[CACHE_LOADED] ema_instances={_EMA_INSTANCES}")
 
 
 # 🔸 on-demand вызов индикатора (синхронный ответ из indicator_response)
@@ -249,7 +249,7 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
     # текущая цена
     price = await _get_price(redis, symbol)
     if price is None:
-        log.info(f"[EMA] no_price symbol={symbol}")
+        log.debug(f"[EMA] no_price symbol={symbol}")
         return "ignore"
 
     # по каждому TF: получить 5 EMA on-demand
@@ -257,7 +257,7 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
         iid_map = _EMA_INSTANCES.get(tf) or {}
         lengths_needed = (9, 21, 50, 100, 200)
         if any(ln not in iid_map for ln in lengths_needed):
-            log.info(f"[EMA] not all EMA instances present tf={tf}")
+            log.debug(f"[EMA] not all EMA instances present tf={tf}")
             return "ignore"
 
         ema_vals = {}
@@ -265,13 +265,13 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
             iid = iid_map[ln]
             res = await _ondemand_indicator(redis, symbol, tf, iid, timeout_ms=2500)
             if not res:
-                log.info(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
+                log.debug(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
                 return "ignore"
             # res содержит {"ema{length}": "123.4567"} — берём строковое значение
             key = f"ema{ln}"
             v = res.get(key)
             if v is None:
-                log.info(f"[EMA] ondemand no key tf={tf} len={ln}")
+                log.debug(f"[EMA] ondemand no key tf={tf} len={ln}")
                 return "ignore"
             try:
                 ema_vals[key] = float(v)
@@ -282,18 +282,18 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
         pattern_text = _build_pattern(price, ema_vals)
         pid = _PATTERN_ID.get(pattern_text)
         if pid is None:
-            log.info(f"[EMA] pattern_not_found tf={tf} text={pattern_text}")
+            log.debug(f"[EMA] pattern_not_found tf={tf} text={pattern_text}")
             return "ignore"
 
         # прочитать агрегат по зеркальной/текущей стратегии
         aggr, key = await _read_aggr(redis, target_strategy, direction, tf, pid)
         if aggr is None:
-            log.info(f"[EMA] no_agg key={key}")
+            log.debug(f"[EMA] no_agg key={key}")
             return "ignore"
 
         count_trades, winrate = aggr
         if not (count_trades > 2 and winrate > 0.5):
-            log.info(f"[EMA] below_threshold tf={tf} count={count_trades} winrate={winrate}")
+            log.debug(f"[EMA] below_threshold tf={tf} count={count_trades} winrate={winrate}")
             return "deny"
 
     # все TF из списка прошли пороги
@@ -345,7 +345,7 @@ async def run_position_decision_maker(pg, redis):
                             await _send_response(redis, req_id, "ignore", reason)
                             continue
 
-                        log.info(f"[REQ] req_id={req_id} strat={strategy_id} {symbol} dir={direction} checks={len(checks)}")
+                        log.debug(f"[REQ] req_id={req_id} strat={strategy_id} {symbol} dir={direction} checks={len(checks)}")
 
                         # поддерживаем пока только ema_pattern (следующие kind добавим позже)
                         # правило объединения по одному check — AND по его timeframes
