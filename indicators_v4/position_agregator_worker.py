@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+import re
 from decimal import Decimal, ROUND_FLOOR
 
 log = logging.getLogger("IND_AGG")
@@ -230,16 +231,15 @@ def _collect_mfi_deltas(snaps, strategy_id: int, pnl: float):
     return deltas
 
 
-# 🔸 Парсинг base param_name для ADX_DMI: adx_dmi{L}_suffix → (base='adx_dmi{L}', suffix)
+# 🔸 Парсинг base/suffix для ADX_DMI: adx_dmi{L}_{adx|plus_di|minus_di}
+_ADX_DMI_RE = re.compile(r"^(adx_dmi\d+)_(adx|plus_di|minus_di)$")
+
 def _parse_adx_dmi_param_name(param_name: str) -> tuple[str | None, str | None]:
     try:
-        if not param_name.startswith("adx_dmi"):
+        m = _ADX_DMI_RE.match(param_name)
+        if not m:
             return None, None
-        idx = param_name.rfind("_")
-        if idx == -1:
-            return None, None
-        base = param_name[:idx]
-        suffix = param_name[idx+1:]
+        base, suffix = m.group(1), m.group(2)  # base='adx_dmi14', suffix in {'adx','plus_di','minus_di'}
         return base, suffix
     except Exception:
         return None, None
