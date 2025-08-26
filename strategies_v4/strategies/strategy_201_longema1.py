@@ -10,7 +10,7 @@ log = logging.getLogger("strategy_201_longema1")
 
 REQUEST_STREAM  = "decision_request"
 RESPONSE_STREAM = "decision_response"
-DECISION_TIMEOUT_MS = 3000  # таймаут ожидания ответа решателя (мс)
+DECISION_TIMEOUT_MS = 10000  # таймаут ожидания ответа решателя (мс)
 
 
 # 🔸 Отправить запрос решателю и дождаться ответа (только m5)

@@ -10,7 +10,7 @@ log = logging.getLogger("strategy_203_longema2")
 
 REQUEST_STREAM  = "decision_request"
 RESPONSE_STREAM = "decision_response"
-DECISION_TIMEOUT_MS = 3000  # таймаут ожидания ответа решателя (мс)
+DECISION_TIMEOUT_MS = 10000  # таймаут ожидания ответа решателя (мс)
 
 
 async def _ask_ema_m5_m15_decision(redis, strategy_id: int, symbol: str, direction: str) -> tuple[str, str]:
