@@ -56,7 +56,7 @@ async def _ask_ema_m5_decision(redis, strategy_id: int, symbol: str, direction: 
                     return (decision, reason)
 
 
-class Strategy214LongEma1:
+class Strategy214Longema1:
     async def validate_signal(self, signal, context):
         direction = (signal["direction"] or "").lower()
 
