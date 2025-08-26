@@ -145,9 +145,8 @@ async def _ensure_ema_instances(pg):
     log.debug(f"[CACHE_LOADED] ema_instances={_EMA_INSTANCES}")
 
 
-# 🔸 on-demand вызов индикатора (синхронный ответ из indicator_response)
-async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int = 2500):
-    global _IND_RESP_LAST_ID
+# 🔸 on-demand вызов индикатора (локальный XREAD-указатель, без глобальной гонки)
+async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int = 5000):
     now_ms = int(time.time() * 1000)
 
     req_id = await redis.xadd("indicator_request", {
@@ -157,25 +156,29 @@ async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: i
         "timestamp_ms": str(now_ms),
     })
 
-    # ждём ответ с matching req_id
     deadline = time.time() + (timeout_ms / 1000.0)
-    last_id = _IND_RESP_LAST_ID
+    last_id = "$"  # только новые сообщения
     while time.time() < deadline:
-        resp = await redis.xread(streams={"indicator_response": last_id}, count=50, block=500)
+        # блокируемся до 500 мс за раз, чтобы успевать обновлять deadline
+        block = int(min(500, (deadline - time.time()) * 1000))
+        if block <= 0:
+            break
+
+        resp = await redis.xread(streams={"indicator_response": last_id}, count=50, block=block)
         if not resp:
             continue
+
+        # обновляем указатель и ищем свой req_id
         for _, messages in resp:
             for mid, data in messages:
-                last_id = mid
+                last_id = mid  # для следующих проходов читать дальше
                 if data.get("req_id") == req_id and data.get("status") == "ok":
-                    _IND_RESP_LAST_ID = last_id
                     try:
                         return json.loads(data.get("results") or "{}")
                     except Exception:
                         return {}
-        _IND_RESP_LAST_ID = last_id
 
-    return None  # timeout / нет ответа
+    return None  # timeout/нет ответа
 
 
 # 🔸 текущая цена
