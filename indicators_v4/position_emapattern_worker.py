@@ -1,4 +1,4 @@
-# position_emapattern_worker.py — генерация всех total preorders для EMA/PRICE (4683 вариантов)
+# position_emapattern_worker.py — генерация всех total preorders для EMA/PRICE (ожидаемо 4683)
 
 import asyncio
 import logging
@@ -10,7 +10,7 @@ log = logging.getLogger("IND_EMA_PATTERN_DICT")
 
 EMA_LENGTHS = [9, 21, 50, 100, 200]
 TOKENS = ["PRICE"] + [f"EMA{l}" for l in EMA_LENGTHS]
-IDLE_SLEEP_SEC = 3600
+IDLE_SLEEP_SEC = 7200
 BATCH = 2000
 
 
@@ -32,9 +32,9 @@ def _canonicalize_group(group: Set[str]) -> List[str]:
 def _pattern_text_from_blocks(blocks: List[Set[str]]) -> str:
     parts = []
     for blk in blocks:
-        inner = " = ".join(_canonicalize_group(blk))
+        inner = " = ".join(_canonicalize_group(blk))  # равные значения через '='
         parts.append(inner)
-    return " > ".join(parts)
+    return " > ".join(parts)  # группы по убыванию через ' > '
 
 
 # 🔸 Сборка json-формы паттерна
@@ -42,12 +42,14 @@ def _pattern_json_from_blocks(blocks: List[Set[str]]) -> List[List[str]]:
     return [_canonicalize_group(blk) for blk in blocks]
 
 
-# 🔸 Генерация всех разбиений множества (Stirling S(n,k)) с помощью RGS
+# 🔸 Генерация всех разбиений множества (Stirling S(n,k)) корректным RGS
 def _generate_set_partitions(items: List[str]) -> List[List[Set[str]]]:
     n = len(items)
     if n == 0:
         return [[]]
     results: List[List[Set[str]]] = []
+
+    # первый элемент всегда метится 0
     rgs = [0] * n
 
     def backtrack(i: int, max_label: int):
@@ -58,6 +60,8 @@ def _generate_set_partitions(items: List[str]) -> List[List[Set[str]]]:
                 blocks[lbl].add(items[idx])
             results.append(blocks)
             return
+
+        # разрешённые метки: 0..max_label (существующие блоки) и новый max_label+1
         for lbl in range(max_label + 2):
             rgs[i] = lbl
             if lbl == max_label + 1:
@@ -65,11 +69,12 @@ def _generate_set_partitions(items: List[str]) -> List[List[Set[str]]]:
             else:
                 backtrack(i + 1, max_label)
 
-    backtrack(0, 0)
+    # старт с i=1, max_label=0, т.к. rgs[0]=0 фиксирован
+    backtrack(1, 0)
     return results
 
 
-# 🔸 Генерация всех упорядоченных разбиений (total preorders): перестановки блоков для каждого разбиения
+# 🔸 Генерация всех упорядоченных разбиений (total preorders): перестановки блоков
 def _generate_ordered_partitions(items: List[str]) -> List[List[Set[str]]]:
     ordered: List[List[Set[str]]] = []
     partitions = _generate_set_partitions(items)
@@ -123,8 +128,7 @@ async def _generate_and_store_catalog(pg):
         pjson = json.dumps(_pattern_json_from_blocks(blocks), ensure_ascii=False)
         rows.append((ptext, pjson))
 
-    # ожидание 4683 уникальных паттернов
-    log.debug(f"Сгенерировано уникальных паттернов: {len(rows)}")
+    log.debug(f"Сгенерировано уникальных паттернов: {len(rows)}")  # ожидаемо 4683
 
     # вставка пачками
     total = 0
