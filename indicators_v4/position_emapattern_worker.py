@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from decimal import Decimal, ROUND_HALF_UP
-from itertools import permutations  # не используется здесь, но оставлено на случай расширений
 
 log = logging.getLogger("IND_EMA_PATTERN_DICT")
 
@@ -202,12 +201,12 @@ async def _write_redis_aggr(redis, strategy_id: int, direction: str, tf: str, pa
         "timeframe": tf,
         "pattern_id": str(pattern_id),
         "count_trades": str(count_trades),
-        "winrate": str(_q4(winrate)),  # доля, 4 знака
+        "winrate": str(_q4(winrate)),
     })
     log.debug(f"[REDIS_AGGR] key={key} count_trades={count_trades} winrate={_q4(winrate)}")
 
 
-# 🔸 Точка входа: читаем закрытия → строим паттерны → апдейтим агрегаты → Redis → отмечаем позицию
+# 🔸 Точка входа: читаем закрытия → проверка флага стратегии → строим паттерны → апдейтим агрегаты → Redis → отмечаем позицию
 async def run_position_emapattern_worker(pg, redis):
     await _ensure_group(redis)
 
@@ -235,7 +234,7 @@ async def run_position_emapattern_worker(pg, redis):
                         if not position_uid:
                             continue
 
-                        # защитный пропуск повторов
+                        # проверка повтора
                         async with pg.acquire() as conn:
                             already = await conn.fetchval(
                                 "SELECT emasnapshot_checked FROM positions_v4 WHERE position_uid = $1",
@@ -256,22 +255,31 @@ async def run_position_emapattern_worker(pg, redis):
                         entry_price = float(pos["entry_price"])
                         pnl         = float(pos["pnl"]) if pos["pnl"] is not None else 0.0
 
+                        # проверка флага стратегии (emasnapshot must be TRUE)
+                        async with pg.acquire() as conn:
+                            flag = await conn.fetchval(
+                                "SELECT emasnapshot FROM strategies_v4 WHERE id = $1",
+                                strategy_id
+                            )
+                        if not flag:
+                            log.debug(f"[SKIP_FLAG_OFF] position_uid={position_uid} strat={strategy_id}")
+                            continue
+
                         # загрузка EMA
                         emas_by_tf = await _load_position_emas(pg, position_uid)
 
-                        # проверка полноты: по каждому TF все 5 EMA
+                        # проверка полноты: по каждому TF нужны все 5 EMA
                         incomplete = [
                             tf for tf in TIMEFRAMES
                             if any(n not in emas_by_tf.get(tf, {}) for n in EMA_NAMES)
                         ]
                         if incomplete:
-                            # данных уже не появится — отмечаем позицию и выходим
                             async with pg.acquire() as conn:
                                 await conn.execute(
                                     "UPDATE positions_v4 SET emasnapshot_checked = TRUE WHERE position_uid = $1",
                                     position_uid
                                 )
-                            log.debug(f"[MARKED_INCOMPLETE] position_uid={position_uid} emasnapshot_checked=true missing={incomplete}")
+                            log.debug(f"[MARKED_INCOMPLETE] position_uid={position_uid} missing={incomplete}")
                             continue
 
                         # расчёт и апдейт по всем TF
@@ -294,7 +302,7 @@ async def run_position_emapattern_worker(pg, redis):
                                 "UPDATE positions_v4 SET emasnapshot_checked = TRUE WHERE position_uid = $1",
                                 position_uid
                             )
-                        log.debug(f"[MARKED_DONE] position_uid={position_uid} emasnapshot_checked=true")
+                        log.debug(f"[MARKED_DONE] position_uid={position_uid}")
 
                     except Exception:
                         log.exception("Ошибка обработки события closed")
