@@ -224,8 +224,7 @@ async def _resolve_mirror(pg, strategy_id: int, direction: str, mirror_field: st
         return int(row["emamirrow"])
     return None
 
-
-# 🔸 обработка одного check kind=ema_pattern
+# 🔸 обработка одного check kind=ema_pattern (с параллельным on-demand по 5 EMA внутри каждого TF)
 async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction: str, check: dict) -> str:
     # timeframes из запроса
     tfs = check.get("timeframes") or list(TIMEFRAMES_DEFAULT)
@@ -241,9 +240,7 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
     elif isinstance(mirror, int):
         mirror_id = mirror
     else:
-        # если в check не передали, пробуем auto по стратегии
         mirror_id = await _resolve_mirror(pg, strategy_id, direction, "auto")
-    # если зеркала нет — стратегия живёт сама → читаем агрегаты по текущему strategy_id
     target_strategy = mirror_id if mirror_id else strategy_id
 
     # текущая цена
@@ -252,22 +249,27 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
         log.debug(f"[EMA] no_price symbol={symbol}")
         return "ignore"
 
-    # по каждому TF: получить 5 EMA on-demand
+    lengths_needed = (9, 21, 50, 100, 200)
+
+    # по каждому TF: получить 5 EMA on-demand (параллельно)
     for tf in tfs:
         iid_map = _EMA_INSTANCES.get(tf) or {}
-        lengths_needed = (9, 21, 50, 100, 200)
         if any(ln not in iid_map for ln in lengths_needed):
             log.debug(f"[EMA] not all EMA instances present tf={tf}")
             return "ignore"
 
-        ema_vals = {}
-        for ln in lengths_needed:
-            iid = iid_map[ln]
-            res = await _ondemand_indicator(redis, symbol, tf, iid, timeout_ms=2500)
-            if not res:
+        # параллельные запросы on-demand для всех длин EMA
+        tasks = [
+            _ondemand_indicator(redis, symbol, tf, iid_map[ln], timeout_ms=2500)
+            for ln in lengths_needed
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        ema_vals: dict[str, float] = {}
+        for ln, res in zip(lengths_needed, results):
+            if isinstance(res, Exception) or not res:
                 log.debug(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
                 return "ignore"
-            # res содержит {"ema{length}": "123.4567"} — берём строковое значение
             key = f"ema{ln}"
             v = res.get(key)
             if v is None:
@@ -276,6 +278,7 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
             try:
                 ema_vals[key] = float(v)
             except Exception:
+                log.debug(f"[EMA] parse_error tf={tf} len={ln} val={v!r}")
                 return "ignore"
 
         # построить паттерн -> id
@@ -298,7 +301,6 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
 
     # все TF из списка прошли пороги
     return "allow"
-
 
 # 🔸 главный цикл
 async def run_position_decision_maker(pg, redis):
