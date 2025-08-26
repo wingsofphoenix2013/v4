@@ -144,18 +144,20 @@ async def _ensure_ema_instances(pg):
     _EMA_INSTANCES.update(by_tf)
     log.debug(f"[CACHE_LOADED] ema_instances={_EMA_INSTANCES}")
 
-# 🔸 on-demand вызов индикатора: без глобального курсора; без гонок; быстрый фейл на error
-async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int = 10000):
+# 🔸 on-demand вызов индикатора: без таймаута, без гонок; ждём ровно свой ответ
+async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int, timeout_ms: int | None = None):
+    import time, json
+
     now_ms = int(time.time() * 1000)
 
-    # 1) фиксируем текущий последний id в indicator_response ДО отправки запроса
+    # зафиксировать последний id ДО отправки запроса (чтобы не пропустить быстрый ответ)
     try:
         last = await redis.xrevrange("indicator_response", count=1)
         last_id = last[0][0] if last else "0-0"
     except Exception:
         last_id = "0-0"
 
-    # 2) отправляем запрос
+    # отправить запрос
     req_id = await redis.xadd("indicator_request", {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -163,14 +165,9 @@ async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: i
         "timestamp_ms": str(now_ms),
     })
 
-    # 3) ждём только НОВЫЕ записи после last_id; обрабатываем и ok, и error
-    deadline = time.time() + (timeout_ms / 1000.0)
-    while time.time() < deadline:
-        block = int(min(500, (deadline - time.time()) * 1000))
-        if block <= 0:
-            break
-
-        resp = await redis.xread(streams={"indicator_response": last_id}, count=64, block=block)
+    # блокирующее ожидание: XREAD BLOCK 0 — ждём ответ бесконечно
+    while True:
+        resp = await redis.xread(streams={"indicator_response": last_id}, count=64, block=0)
         if not resp:
             continue
 
@@ -186,10 +183,8 @@ async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: i
                 except Exception:
                     return {}
             else:
-                # быстрый выход на любой error (no_ohlcv, before_enabled_at, symbol_not_active, ...)
+                # любой error — мгновенный выход (без ожиданий)
                 return {}
-
-    return None  # timeout
     
 # 🔸 текущая цена
 async def _get_price(redis, symbol: str) -> float | None:
