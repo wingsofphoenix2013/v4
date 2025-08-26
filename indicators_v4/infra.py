@@ -47,11 +47,6 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
 
 # 🔸 Настройка централизованного логирования
 def setup_logging():
-    """
-    Централизованная настройка логирования для всех компонентов системы.
-    Если DEBUG_MODE=True — показываются debug/info/warning/error,
-    если DEBUG_MODE=False — только info/warning/error.
-    """
     level = logging.DEBUG if DEBUG_MODE else logging.INFO
     logging.basicConfig(
         level=level,
