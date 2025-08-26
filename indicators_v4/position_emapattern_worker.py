@@ -1,8 +1,9 @@
-# position_emapattern_worker.py — этап 4: апдейт агрегатов по закрытиям (без флага и Redis)
+# position_emapattern_worker.py — обработка закрытий позиций: расчёт EMA-паттернов, апдейт агрегатов, Redis, отметка позиции
 
 import asyncio
 import logging
-import json
+from decimal import Decimal, ROUND_HALF_UP
+from itertools import permutations  # не используется здесь, но оставлено на случай расширений
 
 log = logging.getLogger("IND_EMA_PATTERN_DICT")
 
@@ -16,7 +17,6 @@ EPSILON_REL = 0.0005  # 0.05%
 
 EMA_LEN = {"ema9": 9, "ema21": 21, "ema50": 50, "ema100": 100, "ema200": 200}
 
-# кэш pattern_text -> id
 _PATTERN_ID_CACHE: dict[str, int] = {}
 
 
@@ -31,6 +31,11 @@ async def _ensure_group(redis):
         else:
             log.exception("Ошибка создания consumer group")
             raise
+
+
+# 🔸 Округление Decimal до 4 знаков
+def _q4(x) -> Decimal:
+    return (Decimal(str(x))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
 # 🔸 Относительное равенство с порогом 0.05%
@@ -76,7 +81,7 @@ def _build_pattern_text(price: float, emas: dict[str, float]) -> str:
     return " > ".join(" = ".join(g) for g in canon_groups)
 
 
-# 🔸 Загрузка позиции
+# 🔸 Загрузка позиции (entry_price, strategy_id, direction, pnl)
 async def _load_position(pg, position_uid: str):
     async with pg.acquire() as conn:
         return await conn.fetchrow(
@@ -85,7 +90,7 @@ async def _load_position(pg, position_uid: str):
         )
 
 
-# 🔸 Загрузка EMA по трём ТФ
+# 🔸 Загрузка 15 EMA по трём ТФ для позиции
 async def _load_position_emas(pg, position_uid: str) -> dict[str, dict[str, float]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -98,7 +103,9 @@ async def _load_position_emas(pg, position_uid: str) -> dict[str, dict[str, floa
               AND param_name = ANY($3::text[])
             ORDER BY timeframe, param_name, snapshot_at DESC
             """,
-            position_uid, list(TIMEFRAMES), list(EMA_NAMES),
+            position_uid,
+            list(TIMEFRAMES),
+            list(EMA_NAMES),
         )
 
     by_tf: dict[str, dict[str, float]] = {tf: {} for tf in TIMEFRAMES}
@@ -111,6 +118,7 @@ async def _load_position_emas(pg, position_uid: str) -> dict[str, dict[str, floa
             val = None
         if val is not None and tf in by_tf:
             by_tf[tf][pn] = val
+
     return by_tf
 
 
@@ -130,9 +138,8 @@ async def _get_pattern_id(pg, pattern_text: str) -> int:
     return _PATTERN_ID_CACHE[pattern_text]
 
 
-# 🔸 Применить сделку к агрегату (апдейт в Python, upsert в БД)
+# 🔸 Применить сделку к агрегату (расчёт в Python, запись Decimal-значений)
 async def _apply_trade_to_aggregate(pg, strategy_id: int, direction: str, tf: str, pattern_id: int, pnl: float):
-    # читаем текущее состояние агрегата
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -145,23 +152,22 @@ async def _apply_trade_to_aggregate(pg, strategy_id: int, direction: str, tf: st
 
         if row:
             count_trades = int(row["count_trades"])
-            sum_pnl = float(row["sum_pnl"])
+            sum_pnl = Decimal(str(row["sum_pnl"]))
             count_wins = int(row["count_wins"])
         else:
             count_trades = 0
-            sum_pnl = 0.0
+            sum_pnl = Decimal("0")
             count_wins = 0
 
-        # обновляем счётчики в Python
         count_trades += 1
-        sum_pnl += float(pnl)
+        sum_pnl += Decimal(str(pnl))
         if float(pnl) > 0:
             count_wins += 1
 
-        winrate = round(count_wins / count_trades, 4)
-        avg_pnl = round(sum_pnl / count_trades, 4)
+        winrate = _q4(Decimal(count_wins) / Decimal(count_trades))
+        avg_pnl = _q4(sum_pnl / Decimal(count_trades))
+        sum_pnl_q = _q4(sum_pnl)
 
-        # upsert с уже посчитанными значениями
         await conn.execute(
             """
             INSERT INTO indicators_emapattern_aggregates_v4
@@ -170,22 +176,38 @@ async def _apply_trade_to_aggregate(pg, strategy_id: int, direction: str, tf: st
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
             ON CONFLICT (strategy_id, direction, timeframe, pattern_id)
             DO UPDATE SET
-                count_trades = $5,
-                sum_pnl      = $6,
-                count_wins   = $7,
-                winrate      = $8,
-                avg_pnl      = $9
+                count_trades = EXCLUDED.count_trades,
+                sum_pnl      = EXCLUDED.sum_pnl,
+                count_wins   = EXCLUDED.count_wins,
+                winrate      = EXCLUDED.winrate,
+                avg_pnl      = EXCLUDED.avg_pnl
             """,
             strategy_id, direction, tf, pattern_id,
-            count_trades, sum_pnl, count_wins, winrate, avg_pnl,
+            count_trades, sum_pnl_q, count_wins, winrate, avg_pnl,
         )
         log.info(
             f"[AGGR_UPSERT] strat={strategy_id} dir={direction} tf={tf} pattern_id={pattern_id} "
-            f"count={count_trades} sum_pnl={sum_pnl:.4f} wins={count_wins} winrate={winrate:.4f} avg_pnl={avg_pnl:.4f}"
+            f"count={count_trades} sum_pnl={sum_pnl_q} wins={count_wins} winrate={winrate} avg_pnl={avg_pnl}"
         )
+    return count_trades, winrate
 
 
-# 🔸 Точка входа: читаем закрытия → строим паттерны → апдейтим агрегаты (флаг и Redis — позже)
+# 🔸 Запись Redis-ключа по агрегату
+async def _write_redis_aggr(redis, strategy_id: int, direction: str, tf: str, pattern_id: int,
+                            count_trades: int, winrate: Decimal):
+    key = f"aggr:emapattern:{strategy_id}:{direction}:{tf}:{pattern_id}"
+    await redis.hset(key, mapping={
+        "strategy_id": str(strategy_id),
+        "direction": direction,
+        "timeframe": tf,
+        "pattern_id": str(pattern_id),
+        "count_trades": str(count_trades),
+        "winrate": str(_q4(winrate)),  # доля, 4 знака
+    })
+    log.debug(f"[REDIS_AGGR] key={key} count_trades={count_trades} winrate={_q4(winrate)}")
+
+
+# 🔸 Точка входа: читаем закрытия → строим паттерны → апдейтим агрегаты → Redis → отмечаем позицию
 async def run_position_emapattern_worker(pg, redis):
     await _ensure_group(redis)
 
@@ -213,33 +235,66 @@ async def run_position_emapattern_worker(pg, redis):
                         if not position_uid:
                             continue
 
+                        # защитный пропуск повторов
+                        async with pg.acquire() as conn:
+                            already = await conn.fetchval(
+                                "SELECT emasnapshot_checked FROM positions_v4 WHERE position_uid = $1",
+                                position_uid
+                            )
+                        if already:
+                            log.debug(f"[SKIP_ALREADY_MARKED] position_uid={position_uid}")
+                            continue
+
+                        # загрузка позиции
                         pos = await _load_position(pg, position_uid)
-                        if not pos:
-                            log.warning(f"[SKIP_NO_POS] position_uid={position_uid}")
+                        if not pos or pos["entry_price"] is None or pos["direction"] is None:
+                            log.warning(f"[SKIP_BAD_POS] position_uid={position_uid}")
                             continue
 
                         strategy_id = int(pos["strategy_id"])
                         direction   = pos["direction"]
-                        entry_price = pos["entry_price"]
+                        entry_price = float(pos["entry_price"])
                         pnl         = float(pos["pnl"]) if pos["pnl"] is not None else 0.0
 
-                        if entry_price is None or direction is None:
-                            log.warning(f"[SKIP_BAD_POS] position_uid={position_uid} entry_price={entry_price} direction={direction}")
-                            continue
-
+                        # загрузка EMA
                         emas_by_tf = await _load_position_emas(pg, position_uid)
 
-                        incomplete = [tf for tf in TIMEFRAMES if any(n not in emas_by_tf.get(tf, {}) for n in EMA_NAMES)]
+                        # проверка полноты: по каждому TF все 5 EMA
+                        incomplete = [
+                            tf for tf in TIMEFRAMES
+                            if any(n not in emas_by_tf.get(tf, {}) for n in EMA_NAMES)
+                        ]
                         if incomplete:
-                            miss = {tf: [n for n in EMA_NAMES if n not in emas_by_tf.get(tf, {})] for tf in incomplete}
-                            log.info(f"[SKIP_INCOMPLETE] position_uid={position_uid} missing={miss}")
+                            # данных уже не появится — отмечаем позицию и выходим
+                            async with pg.acquire() as conn:
+                                await conn.execute(
+                                    "UPDATE positions_v4 SET emasnapshot_checked = TRUE WHERE position_uid = $1",
+                                    position_uid
+                                )
+                            log.info(f"[MARKED_INCOMPLETE] position_uid={position_uid} emasnapshot_checked=true missing={incomplete}")
                             continue
 
-                        # считаем и применяем по всем TF
+                        # расчёт и апдейт по всем TF
+                        last_counts: dict[str, tuple[int, Decimal, int]] = {}
                         for tf in TIMEFRAMES:
-                            pattern_text = _build_pattern_text(float(entry_price), emas_by_tf[tf])
+                            pattern_text = _build_pattern_text(entry_price, emas_by_tf[tf])
                             pattern_id = await _get_pattern_id(pg, pattern_text)
-                            await _apply_trade_to_aggregate(pg, strategy_id, direction, tf, pattern_id, pnl)
+                            count_trades, winrate = await _apply_trade_to_aggregate(
+                                pg, strategy_id, direction, tf, pattern_id, pnl
+                            )
+                            last_counts[tf] = (count_trades, winrate, pattern_id)
+
+                        # запись в Redis
+                        for tf, (ct, wr, pid) in last_counts.items():
+                            await _write_redis_aggr(redis, strategy_id, direction, tf, pid, ct, wr)
+
+                        # финальная отметка позиции
+                        async with pg.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE positions_v4 SET emasnapshot_checked = TRUE WHERE position_uid = $1",
+                                position_uid
+                            )
+                        log.info(f"[MARKED_DONE] position_uid={position_uid} emasnapshot_checked=true")
 
                     except Exception:
                         log.exception("Ошибка обработки события closed")
