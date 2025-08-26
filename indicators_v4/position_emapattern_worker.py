@@ -1,154 +1,67 @@
-# position_emapattern_worker.py — генерация всех total preorders для EMA/PRICE (ожидаемо 4683)
+# position_emapattern_worker.py — слушатель закрытий позиций для EMA-паттернов (этап 2: логирование)
 
 import asyncio
 import logging
-import json
-from typing import List, Set, Tuple
-from itertools import permutations
 
 log = logging.getLogger("IND_EMA_PATTERN_DICT")
 
-EMA_LENGTHS = [9, 21, 50, 100, 200]
-TOKENS = ["PRICE"] + [f"EMA{l}" for l in EMA_LENGTHS]
-IDLE_SLEEP_SEC = 7200
-BATCH = 2000
+STREAM   = "signal_log_queue"
+GROUP    = "ema_pattern_aggr_group"
+CONSUMER = "ema_aggr_1"
 
 
-# 🔸 Канонизация порядка внутри группы равенства
-def _canonicalize_group(group: Set[str]) -> List[str]:
-    ordered: List[str] = []
-    if "PRICE" in group:
-        ordered.append("PRICE")
-    emas = [t for t in group if t.startswith("EMA")]
-    emas_sorted = sorted(emas, key=lambda t: int(t[3:]))
-    if "PRICE" not in group:
-        ordered = emas_sorted
-    else:
-        ordered.extend(emas_sorted)
-    return ordered
-
-
-# 🔸 Сборка текстовой формы паттерна
-def _pattern_text_from_blocks(blocks: List[Set[str]]) -> str:
-    parts = []
-    for blk in blocks:
-        inner = " = ".join(_canonicalize_group(blk))  # равные значения через '='
-        parts.append(inner)
-    return " > ".join(parts)  # группы по убыванию через ' > '
-
-
-# 🔸 Сборка json-формы паттерна
-def _pattern_json_from_blocks(blocks: List[Set[str]]) -> List[List[str]]:
-    return [_canonicalize_group(blk) for blk in blocks]
-
-
-# 🔸 Генерация всех разбиений множества (Stirling S(n,k)) корректным RGS
-def _generate_set_partitions(items: List[str]) -> List[List[Set[str]]]:
-    n = len(items)
-    if n == 0:
-        return [[]]
-    results: List[List[Set[str]]] = []
-
-    # первый элемент всегда метится 0
-    rgs = [0] * n
-
-    def backtrack(i: int, max_label: int):
-        if i == n:
-            k = max_label + 1
-            blocks = [set() for _ in range(k)]
-            for idx, lbl in enumerate(rgs):
-                blocks[lbl].add(items[idx])
-            results.append(blocks)
-            return
-
-        # разрешённые метки: 0..max_label (существующие блоки) и новый max_label+1
-        for lbl in range(max_label + 2):
-            rgs[i] = lbl
-            if lbl == max_label + 1:
-                backtrack(i + 1, max_label + 1)
-            else:
-                backtrack(i + 1, max_label)
-
-    # старт с i=1, max_label=0, т.к. rgs[0]=0 фиксирован
-    backtrack(1, 0)
-    return results
-
-
-# 🔸 Генерация всех упорядоченных разбиений (total preorders): перестановки блоков
-def _generate_ordered_partitions(items: List[str]) -> List[List[Set[str]]]:
-    ordered: List[List[Set[str]]] = []
-    partitions = _generate_set_partitions(items)
-    for blocks in partitions:
-        k = len(blocks)
-        if k == 0:
-            continue
-        for perm in permutations(range(k)):
-            ordered.append([blocks[i] for i in perm])
-    return ordered
-
-
-# 🔸 Вставка паттернов пачкой в БД
-async def _insert_patterns(pg, rows: List[Tuple[str, str]]):
-    if not rows:
-        return
-    async with pg.acquire() as conn:
-        async with conn.transaction():
-            await conn.executemany(
-                """
-                INSERT INTO indicator_emapattern_dict (pattern_text, pattern_json)
-                VALUES ($1, $2::jsonb)
-                ON CONFLICT (pattern_text) DO NOTHING
-                """,
-                rows,
-            )
-
-
-# 🔸 Полная генерация каталога и запись в БД
-async def _generate_and_store_catalog(pg):
-    log.info("Старт генерации полного каталога EMA/PRICE (total preorders)")
-
-    # быстрый выход, если таблица уже содержит данные
-    async with pg.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM indicator_emapattern_dict")
-    if count and int(count) > 0:
-        log.info(f"Словарь уже содержит {count} записей — генерация пропущена")
-        return
-
-    # генерация всех упорядоченных разбиений
-    opartitions = _generate_ordered_partitions(TOKENS)
-
-    # построение строковой и json-формы, защита от дубликатов
-    seen = set()
-    rows: List[Tuple[str, str]] = []
-    for blocks in opartitions:
-        ptext = _pattern_text_from_blocks(blocks)
-        if ptext in seen:
-            continue
-        seen.add(ptext)
-        pjson = json.dumps(_pattern_json_from_blocks(blocks), ensure_ascii=False)
-        rows.append((ptext, pjson))
-
-    log.debug(f"Сгенерировано уникальных паттернов: {len(rows)}")  # ожидаемо 4683
-
-    # вставка пачками
-    total = 0
-    for i in range(0, len(rows), BATCH):
-        chunk = rows[i : i + BATCH]
-        await _insert_patterns(pg, chunk)
-        total += len(chunk)
-        log.debug(f"Вставлено {total}/{len(rows)} записей")
-
-    # финальная проверка
-    async with pg.acquire() as conn:
-        final_count = await conn.fetchval("SELECT COUNT(*) FROM indicator_emapattern_dict")
-    log.info(f"Генерация завершена: {final_count} записей в словаре")
-
-
-# 🔸 Точка входа воркера для run_safe_loop
-async def run_position_emapattern_worker(pg, redis):
+# 🔸 Инициализация consumer group для стрима
+async def _ensure_group(redis):
     try:
-        await _generate_and_store_catalog(pg)
-    except Exception:
-        log.exception("Ошибка генерации словаря паттернов")
+        await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
+        log.info(f"Создана consumer group {GROUP} для {STREAM}")
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.debug(f"Consumer group {GROUP} уже существует")
+        else:
+            log.exception("Ошибка создания consumer group")
+            raise
+
+
+# 🔸 Точка входа воркера: читаем закрытия и логируем
+async def run_position_emapattern_worker(pg, redis):
+    await _ensure_group(redis)
+
     while True:
-        await asyncio.sleep(IDLE_SLEEP_SEC)
+        try:
+            resp = await redis.xreadgroup(
+                groupname=GROUP,
+                consumername=CONSUMER,
+                streams={STREAM: ">"},
+                count=50,
+                block=2000
+            )
+            if not resp:
+                continue
+
+            to_ack = []
+            for _, messages in resp:
+                for msg_id, data in messages:
+                    to_ack.append(msg_id)
+                    try:
+                        status = data.get("status")
+                        if status != "closed":
+                            continue
+
+                        position_uid = data.get("position_uid")
+                        strategy_id  = data.get("strategy_id")
+                        direction    = data.get("direction")  # может не приходить — ок
+                        logged_at    = data.get("logged_at")
+
+                        # логируем факт получения закрытия; дальнейшие этапы добавим потом
+                        log.info(f"[CLOSED] position_uid={position_uid} strategy_id={strategy_id} direction={direction} logged_at={logged_at}")
+
+                    except Exception:
+                        log.exception("Ошибка обработки события из stream signal_log_queue")
+
+            if to_ack:
+                await redis.xack(STREAM, GROUP, *to_ack)
+
+        except Exception as e:
+            log.error(f"Ошибка в цикле IND_EMA_PATTERN_DICT: {e}", exc_info=True)
+            await asyncio.sleep(2)
