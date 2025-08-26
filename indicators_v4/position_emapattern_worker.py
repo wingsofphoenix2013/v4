@@ -24,7 +24,7 @@ _PATTERN_ID_CACHE: dict[str, int] = {}
 async def _ensure_group(redis):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
-        log.info(f"Создана consumer group {GROUP} для {STREAM}")
+        log.debug(f"Создана consumer group {GROUP} для {STREAM}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
             log.debug(f"Consumer group {GROUP} уже существует")
@@ -185,7 +185,7 @@ async def _apply_trade_to_aggregate(pg, strategy_id: int, direction: str, tf: st
             strategy_id, direction, tf, pattern_id,
             count_trades, sum_pnl_q, count_wins, winrate, avg_pnl,
         )
-        log.info(
+        log.debug(
             f"[AGGR_UPSERT] strat={strategy_id} dir={direction} tf={tf} pattern_id={pattern_id} "
             f"count={count_trades} sum_pnl={sum_pnl_q} wins={count_wins} winrate={winrate} avg_pnl={avg_pnl}"
         )
@@ -271,7 +271,7 @@ async def run_position_emapattern_worker(pg, redis):
                                     "UPDATE positions_v4 SET emasnapshot_checked = TRUE WHERE position_uid = $1",
                                     position_uid
                                 )
-                            log.info(f"[MARKED_INCOMPLETE] position_uid={position_uid} emasnapshot_checked=true missing={incomplete}")
+                            log.debug(f"[MARKED_INCOMPLETE] position_uid={position_uid} emasnapshot_checked=true missing={incomplete}")
                             continue
 
                         # расчёт и апдейт по всем TF
@@ -294,7 +294,7 @@ async def run_position_emapattern_worker(pg, redis):
                                 "UPDATE positions_v4 SET emasnapshot_checked = TRUE WHERE position_uid = $1",
                                 position_uid
                             )
-                        log.info(f"[MARKED_DONE] position_uid={position_uid} emasnapshot_checked=true")
+                        log.debug(f"[MARKED_DONE] position_uid={position_uid} emasnapshot_checked=true")
 
                     except Exception:
                         log.exception("Ошибка обработки события closed")

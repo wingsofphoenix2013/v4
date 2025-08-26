@@ -18,6 +18,7 @@ from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
 from position_agregator_worker import run_position_aggregator_worker, run_position_aggregator_backfill_daemon
 from position_emapattern_worker import run_position_emapattern_worker
+from position_emapattern_backfill_worker import run_position_emapattern_backfill_worker
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -415,6 +416,7 @@ async def main():
         run_safe_loop(lambda: run_position_aggregator_worker(pg, redis), "IND_AGG"),
         run_safe_loop(lambda: run_position_aggregator_backfill_daemon(pg, redis, initial_delay=120, interval=86400, batch_size=200), "IND_AGG_BACKFILL"),
         run_safe_loop(lambda: run_position_emapattern_worker(pg, redis), "IND_EMA_PATTERN_DICT"),
+        run_safe_loop(lambda: run_position_emapattern_backfill_worker(pg, redis), "IND_EMA_PATTERN_BACKFILL"),
     )
 
 if __name__ == "__main__":
