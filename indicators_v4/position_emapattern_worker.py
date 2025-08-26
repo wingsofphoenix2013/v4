@@ -1,7 +1,8 @@
-# position_emapattern_worker.py — этап 3: считаем EMA-паттерны по закрытиям и логируем
+# position_emapattern_worker.py — этап 4: апдейт агрегатов по закрытиям (без флага и Redis)
 
 import asyncio
 import logging
+import json
 
 log = logging.getLogger("IND_EMA_PATTERN_DICT")
 
@@ -14,6 +15,9 @@ EMA_NAMES  = ("ema9", "ema21", "ema50", "ema100", "ema200")
 EPSILON_REL = 0.0005  # 0.05%
 
 EMA_LEN = {"ema9": 9, "ema21": 21, "ema50": 50, "ema100": 100, "ema200": 200}
+
+# кэш pattern_text -> id
+_PATTERN_ID_CACHE: dict[str, int] = {}
 
 
 # 🔸 Инициализация consumer group для стрима
@@ -35,17 +39,14 @@ def _rel_equal(a: float, b: float) -> bool:
     return abs(a - b) <= EPSILON_REL * m
 
 
-# 🔸 Построение паттерна из значений PRICE и 5 EMA
+# 🔸 Построение паттерна из PRICE и 5 EMA
 def _build_pattern_text(price: float, emas: dict[str, float]) -> str:
-    # собираем список токенов с числами
     pairs = [("PRICE", float(price))]
     for ename in EMA_NAMES:
         pairs.append((ename.upper(), float(emas[ename])))
 
-    # сортировка по убыванию значения
     pairs.sort(key=lambda kv: kv[1], reverse=True)
 
-    # нарезаем на группы равенства по соседям
     groups: list[list[str]] = []
     cur_group: list[tuple[str, float]] = []
     for token, val in pairs:
@@ -61,7 +62,6 @@ def _build_pattern_text(price: float, emas: dict[str, float]) -> str:
     if cur_group:
         groups.append([t for t, _ in cur_group])
 
-    # канонизация порядка внутри группы
     canon_groups: list[list[str]] = []
     for g in groups:
         if "PRICE" in g:
@@ -73,25 +73,19 @@ def _build_pattern_text(price: float, emas: dict[str, float]) -> str:
             gg.sort(key=lambda t: EMA_LEN[t.lower()])
             canon_groups.append(gg)
 
-    # склейка в строку
     return " > ".join(" = ".join(g) for g in canon_groups)
 
 
-# 🔸 Загрузка позиции (entry_price, strategy_id, direction, pnl)
+# 🔸 Загрузка позиции
 async def _load_position(pg, position_uid: str):
     async with pg.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT strategy_id, direction, entry_price, pnl
-            FROM positions_v4
-            WHERE position_uid = $1
-            """,
+        return await conn.fetchrow(
+            "SELECT strategy_id, direction, entry_price, pnl FROM positions_v4 WHERE position_uid = $1",
             position_uid,
         )
-    return row
 
 
-# 🔸 Загрузка 15 EMA по трём ТФ для позиции (берём последние по snapshot_at на всякий случай)
+# 🔸 Загрузка EMA по трём ТФ
 async def _load_position_emas(pg, position_uid: str) -> dict[str, dict[str, float]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -104,28 +98,94 @@ async def _load_position_emas(pg, position_uid: str) -> dict[str, dict[str, floa
               AND param_name = ANY($3::text[])
             ORDER BY timeframe, param_name, snapshot_at DESC
             """,
-            position_uid,
-            list(TIMEFRAMES),
-            list(EMA_NAMES),
+            position_uid, list(TIMEFRAMES), list(EMA_NAMES),
         )
 
     by_tf: dict[str, dict[str, float]] = {tf: {} for tf in TIMEFRAMES}
     for r in rows:
-        tf = r["timeframe"]
-        pn = r["param_name"]
-        vnum = r["value_num"]
-        vstr = r["value_str"]
+        tf, pn = r["timeframe"], r["param_name"]
+        vnum, vstr = r["value_num"], r["value_str"]
         try:
             val = float(vnum) if vnum is not None else float(vstr) if vstr is not None else None
         except Exception:
             val = None
         if val is not None and tf in by_tf:
             by_tf[tf][pn] = val
-
     return by_tf
 
 
-# 🔸 Точка входа воркера: читаем закрытия, тянем данные, строим паттерны и логируем
+# 🔸 Получить id паттерна по тексту (с кэшем)
+async def _get_pattern_id(pg, pattern_text: str) -> int:
+    pid = _PATTERN_ID_CACHE.get(pattern_text)
+    if pid is not None:
+        return pid
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM indicator_emapattern_dict WHERE pattern_text = $1",
+            pattern_text,
+        )
+    if not row:
+        raise RuntimeError(f"pattern not found in dict: {pattern_text}")
+    _PATTERN_ID_CACHE[pattern_text] = int(row["id"])
+    return _PATTERN_ID_CACHE[pattern_text]
+
+
+# 🔸 Применить сделку к агрегату (апдейт в Python, upsert в БД)
+async def _apply_trade_to_aggregate(pg, strategy_id: int, direction: str, tf: str, pattern_id: int, pnl: float):
+    # читаем текущее состояние агрегата
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT count_trades, sum_pnl, count_wins
+            FROM indicators_emapattern_aggregates_v4
+            WHERE strategy_id=$1 AND direction=$2 AND timeframe=$3 AND pattern_id=$4
+            """,
+            strategy_id, direction, tf, pattern_id,
+        )
+
+        if row:
+            count_trades = int(row["count_trades"])
+            sum_pnl = float(row["sum_pnl"])
+            count_wins = int(row["count_wins"])
+        else:
+            count_trades = 0
+            sum_pnl = 0.0
+            count_wins = 0
+
+        # обновляем счётчики в Python
+        count_trades += 1
+        sum_pnl += float(pnl)
+        if float(pnl) > 0:
+            count_wins += 1
+
+        winrate = round(count_wins / count_trades, 4)
+        avg_pnl = round(sum_pnl / count_trades, 4)
+
+        # upsert с уже посчитанными значениями
+        await conn.execute(
+            """
+            INSERT INTO indicators_emapattern_aggregates_v4
+                (strategy_id, direction, timeframe, pattern_id,
+                 count_trades, sum_pnl, count_wins, winrate, avg_pnl)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ON CONFLICT (strategy_id, direction, timeframe, pattern_id)
+            DO UPDATE SET
+                count_trades = $5,
+                sum_pnl      = $6,
+                count_wins   = $7,
+                winrate      = $8,
+                avg_pnl      = $9
+            """,
+            strategy_id, direction, tf, pattern_id,
+            count_trades, sum_pnl, count_wins, winrate, avg_pnl,
+        )
+        log.info(
+            f"[AGGR_UPSERT] strat={strategy_id} dir={direction} tf={tf} pattern_id={pattern_id} "
+            f"count={count_trades} sum_pnl={sum_pnl:.4f} wins={count_wins} winrate={winrate:.4f} avg_pnl={avg_pnl:.4f}"
+        )
+
+
+# 🔸 Точка входа: читаем закрытия → строим паттерны → апдейтим агрегаты (флаг и Redis — позже)
 async def run_position_emapattern_worker(pg, redis):
     await _ensure_group(redis)
 
@@ -153,37 +213,33 @@ async def run_position_emapattern_worker(pg, redis):
                         if not position_uid:
                             continue
 
-                        # грузим позицию
                         pos = await _load_position(pg, position_uid)
                         if not pos:
                             log.warning(f"[SKIP_NO_POS] position_uid={position_uid}")
                             continue
 
-                        strategy_id = pos["strategy_id"]
+                        strategy_id = int(pos["strategy_id"])
                         direction   = pos["direction"]
                         entry_price = pos["entry_price"]
-                        pnl         = pos["pnl"]
+                        pnl         = float(pos["pnl"]) if pos["pnl"] is not None else 0.0
 
                         if entry_price is None or direction is None:
                             log.warning(f"[SKIP_BAD_POS] position_uid={position_uid} entry_price={entry_price} direction={direction}")
                             continue
 
-                        # грузим EMA
                         emas_by_tf = await _load_position_emas(pg, position_uid)
 
-                        # проверяем полноту: нужны 5 EMA на каждом TF
                         incomplete = [tf for tf in TIMEFRAMES if any(n not in emas_by_tf.get(tf, {}) for n in EMA_NAMES)]
                         if incomplete:
                             miss = {tf: [n for n in EMA_NAMES if n not in emas_by_tf.get(tf, {})] for tf in incomplete}
                             log.info(f"[SKIP_INCOMPLETE] position_uid={position_uid} missing={miss}")
                             continue
 
-                        # считаем паттерны по всем TF
+                        # считаем и применяем по всем TF
                         for tf in TIMEFRAMES:
                             pattern_text = _build_pattern_text(float(entry_price), emas_by_tf[tf])
-                            log.info(
-                                f"[PATTERN] position_uid={position_uid} strategy_id={strategy_id} dir={direction} tf={tf} pnl={pnl} pattern={pattern_text}"
-                            )
+                            pattern_id = await _get_pattern_id(pg, pattern_text)
+                            await _apply_trade_to_aggregate(pg, strategy_id, direction, tf, pattern_id, pnl)
 
                     except Exception:
                         log.exception("Ошибка обработки события closed")
