@@ -34,10 +34,10 @@ _ADX_INSTANCES: dict[str, dict[int, int]] = {}   # tf -> {length -> instance_id}
 async def _ensure_group(redis):
     try:
         await redis.xgroup_create(REQUEST_STREAM, GROUP, id="$", mkstream=True)
-        log.info(f"Создана consumer group {GROUP} для {REQUEST_STREAM}")
+        log.debug(f"Создана consumer group {GROUP} для {REQUEST_STREAM}")
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info(f"Consumer group {GROUP} уже существует")
+            log.debug(f"Consumer group {GROUP} уже существует")
         else:
             log.exception("Ошибка создания consumer group")
             raise
@@ -51,7 +51,7 @@ async def _send_response(redis, req_id: str, decision: str, reason: str):
         "responded_at": datetime.utcnow().isoformat(),
     }
     await redis.xadd(RESPONSE_STREAM, payload)
-    log.info(f"[RESP] req_id={req_id} decision={decision} reason={reason}")
+    log.debug(f"[RESP] req_id={req_id} decision={decision} reason={reason}")
 
 # 🔸 валидация
 def _validate_request(data: dict) -> tuple[bool, str]:
@@ -119,7 +119,7 @@ async def _ensure_pattern_cache(pg):
         rows = await conn.fetch("SELECT id, pattern_text FROM indicator_emapattern_dict")
     for r in rows:
         _PATTERN_ID[r["pattern_text"]] = int(r["id"])
-    log.info(f"[CACHE_LOADED] patterns={len(_PATTERN_ID)}")
+    log.debug(f"[CACHE_LOADED] patterns={len(_PATTERN_ID)}")
 
 # 🔸 загрузка iid для EMA/RSI/MFI/ADX (по длинам) в кэш
 async def _ensure_indicator_instances(pg):
@@ -156,7 +156,7 @@ async def _ensure_indicator_instances(pg):
         _RSI_INSTANCES.update(rsi_by_tf)
         _MFI_INSTANCES.update(mfi_by_tf)
         _ADX_INSTANCES.update(adx_by_tf)
-        log.info(f"[CACHE_LOADED] ema={_EMA_INSTANCES} rsi={_RSI_INSTANCES} mfi={_MFI_INSTANCES} adx={_ADX_INSTANCES}")
+        log.debug(f"[CACHE_LOADED] ema={_EMA_INSTANCES} rsi={_RSI_INSTANCES} mfi={_MFI_INSTANCES} adx={_ADX_INSTANCES}")
 
 # 🔸 текущая цена
 async def _get_price(redis, symbol: str) -> float | None:
@@ -266,14 +266,14 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
 
     price = await _get_price(redis, symbol)
     if price is None:
-        log.info(f"[EMA] no_price symbol={symbol}")
+        log.debug(f"[EMA] no_price symbol={symbol}")
         return "ignore"
 
     lengths_needed = (9, 21, 50, 100, 200)
     for tf in tfs:
         iid_map = _EMA_INSTANCES.get(tf) or {}
         if any(ln not in iid_map for ln in lengths_needed):
-            log.info(f"[EMA] not all EMA instances present tf={tf}")
+            log.debug(f"[EMA] not all EMA instances present tf={tf}")
             return "ignore"
 
         # параллельный on-demand по 5 EMA
@@ -283,33 +283,33 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
         ema_vals = {}
         for ln, res in zip(lengths_needed, results):
             if isinstance(res, Exception) or not res:
-                log.info(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
+                log.debug(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
                 return "ignore"
             key = f"ema{ln}"
             v = res.get(key)
             if v is None:
-                log.info(f"[EMA] ondemand no key tf={tf} len={ln}")
+                log.debug(f"[EMA] ondemand no key tf={tf} len={ln}")
                 return "ignore"
             try:
                 ema_vals[key] = float(v)
             except Exception:
-                log.info(f"[EMA] parse_error tf={tf} len={ln} val={v!r}")
+                log.debug(f"[EMA] parse_error tf={tf} len={ln} val={v!r}")
                 return "ignore"
 
         pattern_text = _build_pattern(price, ema_vals)
         pid = _PATTERN_ID.get(pattern_text)
         if pid is None:
-            log.info(f"[EMA] pattern_not_found tf={tf} text={pattern_text}")
+            log.debug(f"[EMA] pattern_not_found tf={tf} text={pattern_text}")
             return "ignore"
 
         aggr, key = await _read_ema_aggr(redis, target_strategy, direction, tf, pid)
         if aggr is None:
-            log.info(f"[EMA] no_agg key={key}")
+            log.debug(f"[EMA] no_agg key={key}")
             return "ignore"
 
         count_trades, winrate = aggr
         if not (count_trades > 2 and winrate > 0.5):
-            log.info(f"[EMA] below_threshold tf={tf} count={count_trades} winrate={winrate}")
+            log.debug(f"[EMA] below_threshold tf={tf} count={count_trades} winrate={winrate}")
             return "deny"
 
     return "allow"
@@ -377,17 +377,17 @@ async def _process_rsi_bucket_check(pg, redis, strategy_id: int, symbol: str, di
         for ln in lens:
             val = await _ondemand_param_value(redis, symbol, tf, _RSI_INSTANCES, ln, f"rsi{ln}")
             if val is None:
-                log.info(f"[RSI] ondemand no value tf={tf} len={ln}")
+                log.debug(f"[RSI] ondemand no value tf={tf} len={ln}")
                 return "ignore"
             spec = _bin_value_0_100(val, step=step)  # bucket_spec
             param_name = f"rsi{ln}"
             aggr, key = await _read_bucket_aggr(redis, target_strategy, direction, tf, "rsi", param_name, "value", spec)
             if aggr is None:
-                log.info(f"[RSI] no_agg key={key}")
+                log.debug(f"[RSI] no_agg key={key}")
                 return "ignore"
             count_trades, winrate = aggr
             if not (count_trades > 2 and winrate > 0.5):
-                log.info(f"[RSI] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
+                log.debug(f"[RSI] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
                 return "deny"
     return "allow"
 
@@ -412,17 +412,17 @@ async def _process_mfi_bucket_check(pg, redis, strategy_id: int, symbol: str, di
         for ln in lens:
             val = await _ondemand_param_value(redis, symbol, tf, _MFI_INSTANCES, ln, f"mfi{ln}")
             if val is None:
-                log.info(f"[MFI] ondemand no value tf={tf} len={ln}")
+                log.debug(f"[MFI] ondemand no value tf={tf} len={ln}")
                 return "ignore"
             spec = _bin_value_0_100(val, step=step)
             param_name = f"mfi{ln}"
             aggr, key = await _read_bucket_aggr(redis, target_strategy, direction, tf, "mfi", param_name, "value", spec)
             if aggr is None:
-                log.info(f"[MFI] no_agg key={key}")
+                log.debug(f"[MFI] no_agg key={key}")
                 return "ignore"
             count_trades, winrate = aggr
             if not (count_trades > 2 and winrate > 0.5):
-                log.info(f"[MFI] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
+                log.debug(f"[MFI] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
                 return "deny"
     return "allow"
 
@@ -449,11 +449,11 @@ async def _process_adx_bucket_check(pg, redis, strategy_id: int, symbol: str, di
             iid_map = _ADX_INSTANCES.get(tf) or {}
             iid = iid_map.get(ln)
             if not iid:
-                log.info(f"[ADX] no instance tf={tf} len={ln}")
+                log.debug(f"[ADX] no instance tf={tf} len={ln}")
                 return "ignore"
             res = await _ondemand_indicator(redis, symbol, tf, iid)
             if not res:
-                log.info(f"[ADX] ondemand empty tf={tf} len={ln}")
+                log.debug(f"[ADX] ondemand empty tf={tf} len={ln}")
                 return "ignore"
             key = f"adx_dmi{ln}_adx"
             try:
@@ -461,18 +461,18 @@ async def _process_adx_bucket_check(pg, redis, strategy_id: int, symbol: str, di
             except Exception:
                 val = None
             if val is None:
-                log.info(f"[ADX] ondemand no key tf={tf} len={ln}")
+                log.debug(f"[ADX] ondemand no key tf={tf} len={ln}")
                 return "ignore"
 
             spec = _bin_value_0_100(val, step=step)
             param_name = f"adx_dmi{ln}"
             aggr, key_r = await _read_bucket_aggr(redis, target_strategy, direction, tf, "adx_dmi", param_name, "adx", spec)
             if aggr is None:
-                log.info(f"[ADX] no_agg key={key_r}")
+                log.debug(f"[ADX] no_agg key={key_r}")
                 return "ignore"
             count_trades, winrate = aggr
             if not (count_trades > 2 and winrate > 0.5):
-                log.info(f"[ADX] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
+                log.debug(f"[ADX] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
                 return "deny"
     return "allow"
 
@@ -524,7 +524,7 @@ async def run_position_decision_maker(pg, redis):
                             await _send_response(redis, req_id, "ignore", reason)
                             continue
 
-                        log.info(f"[REQ] req_id={req_id} strat={strategy_id} {symbol} dir={direction} checks={len(checks)}")
+                        log.debug(f"[REQ] req_id={req_id} strat={strategy_id} {symbol} dir={direction} checks={len(checks)}")
 
                         decision = "ignore"
                         overall_ok = True
@@ -545,7 +545,7 @@ async def run_position_decision_maker(pg, redis):
                             else:
                                 d = "ignore"
                                 overall_ok = False
-                                log.info(f"[REQ_BAD_KIND] {kind}")
+                                log.debug(f"[REQ_BAD_KIND] {kind}")
 
                             if d == "ignore":
                                 decision = "ignore"
