@@ -1,9 +1,8 @@
-# position_decision_maker.py — универсальный решатель (EMA-паттерны + RSI/MFI/ADX buckets), без таймаутов
+# position_decision_maker.py — универсальный решатель (EMA-паттерны + RSI/MFI/ADX buckets) без on-demand
 
 import asyncio
 import logging
 import json
-import time
 from datetime import datetime
 
 log = logging.getLogger("POSITION_DECISION_MAKER")
@@ -19,12 +18,9 @@ TIMEFRAMES_DEFAULT = ("m5", "m15", "h1")
 EMA_NAMES  = ("ema9", "ema21", "ema50", "ema100", "ema200")
 EMA_LEN = {"EMA9": 9, "EMA21": 21, "EMA50": 50, "EMA100": 100, "EMA200": 200}
 
-# ---- Кэши ----
-_PATTERN_ID: dict[str, int] = {}             # pattern_text -> id (EMA)
-_EMA_INSTANCES: dict[str, dict[int, int]] = {}   # tf -> {length -> instance_id}
-_RSI_INSTANCES: dict[str, dict[int, int]] = {}   # tf -> {length -> instance_id}
-_MFI_INSTANCES: dict[str, dict[int, int]] = {}   # tf -> {length -> instance_id}
-_ADX_INSTANCES: dict[str, dict[int, int]] = {}   # tf -> {length -> instance_id}
+# ---- Кэш паттернов ----
+_PATTERN_ID: dict[str, int] = {}  # pattern_text -> id
+
 
 # ==========================
 # Инфраструктура
@@ -64,6 +60,7 @@ def _validate_request(data: dict) -> tuple[bool, str]:
     if not isinstance(data.get("checks"), (list, tuple)) or len(data["checks"]) == 0:
         return False, "empty_checks"
     return True, "ok"
+
 
 # ==========================
 # Вспомогательное (EMA)
@@ -121,44 +118,7 @@ async def _ensure_pattern_cache(pg):
         _PATTERN_ID[r["pattern_text"]] = int(r["id"])
     log.debug(f"[CACHE_LOADED] patterns={len(_PATTERN_ID)}")
 
-# 🔸 загрузка iid для EMA/RSI/MFI/ADX (по длинам) в кэш
-async def _ensure_indicator_instances(pg):
-    # EMA
-    if not _EMA_INSTANCES:
-        async with pg.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT i.id, i.indicator, i.timeframe, p.value AS length
-                FROM indicator_instances_v4 i
-                JOIN indicator_parameters_v4 p ON p.instance_id = i.id AND p.param='length'
-                WHERE i.enabled = true
-                  AND i.indicator IN ('ema','rsi','mfi','adx_dmi')
-                  AND i.timeframe IN ('m5','m15','h1')
-                """
-            )
-        ema_by_tf, rsi_by_tf, mfi_by_tf, adx_by_tf = {"m5": {}, "m15": {}, "h1": {}}, {"m5": {}, "m15": {}, "h1": {}}, {"m5": {}, "m15": {}, "h1": {}}, {"m5": {}, "m15": {}, "h1": {}}
-        for r in rows:
-            ind = r["indicator"]
-            tf = r["timeframe"]
-            try:
-                ln = int(r["length"])
-            except Exception:
-                continue
-            if ind == "ema" and ln in (9,21,50,100,200):
-                ema_by_tf[tf][ln] = int(r["id"])
-            elif ind == "rsi" and ln in (7,14,21):
-                rsi_by_tf[tf][ln] = int(r["id"])
-            elif ind == "mfi" and ln in (14,):
-                mfi_by_tf[tf][ln] = int(r["id"])
-            elif ind == "adx_dmi" and ln in (14,28):
-                adx_by_tf[tf][ln] = int(r["id"])
-        _EMA_INSTANCES.update(ema_by_tf)
-        _RSI_INSTANCES.update(rsi_by_tf)
-        _MFI_INSTANCES.update(mfi_by_tf)
-        _ADX_INSTANCES.update(adx_by_tf)
-        log.debug(f"[CACHE_LOADED] ema={_EMA_INSTANCES} rsi={_RSI_INSTANCES} mfi={_MFI_INSTANCES} adx={_ADX_INSTANCES}")
-
-# 🔸 текущая цена
+# 🔸 текущая цена (mark-price)
 async def _get_price(redis, symbol: str) -> float | None:
     val = await redis.get(f"price:{symbol}")
     try:
@@ -179,47 +139,6 @@ async def _read_ema_aggr(redis, strategy_id: int, direction: str, tf: str, patte
     except Exception:
         return None, key
 
-# ==========================
-# On-demand запрос индикатора (без таймаутов)
-# ==========================
-
-# 🔸 on-demand вызов индикатора: без таймаута; ждём ровно свой ответ
-async def _ondemand_indicator(redis, symbol: str, timeframe: str, instance_id: int):
-    # зафиксировать текущий «хвост» до запроса
-    try:
-        last = await redis.xrevrange("indicator_response", count=1)
-        last_id = last[0][0] if last else "0-0"
-    except Exception:
-        last_id = "0-0"
-
-    # отправить запрос
-    now_ms = int(time.time() * 1000)
-    req_id = await redis.xadd("indicator_request", {
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "instance_id": str(instance_id),
-        "timestamp_ms": str(now_ms),
-    })
-
-    # блокирующее ожидание
-    while True:
-        resp = await redis.xread(streams={"indicator_response": last_id}, count=64, block=0)  # BLOCK 0
-        if not resp:
-            continue
-        _, messages = resp[0]
-        for mid, data in messages:
-            last_id = mid
-            if data.get("req_id") != req_id:
-                continue
-            status = (data.get("status") or "").lower()
-            if status == "ok":
-                try:
-                    return json.loads(data.get("results") or "{}")
-                except Exception:
-                    return {}
-            else:
-                # любой error → мгновенно возвращаем пустой результат
-                return {}
 
 # ==========================
 # Зеркало
@@ -245,15 +164,28 @@ async def _resolve_mirror(pg, strategy_id: int, direction: str, mirror_field):
         return int(row["emamirrow"])
     return None
 
+
+# ==========================
+# Чтение индикаторов (без on-demand)
+# ==========================
+
+async def _get_ind_value(redis, symbol: str, tf: str, param_name: str) -> float | None:
+    # KV пишет compute_and_store: ind:{symbol}:{tf}:{param_name}
+    val = await redis.get(f"ind:{symbol}:{tf}:{param_name}")
+    try:
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
 # ==========================
 # EMA-паттерны
 # ==========================
 
-# 🔸 обработка одного check kind=ema_pattern (параллельно 5 EMA внутри каждого TF)
+# 🔸 обработка одного check kind=ema_pattern (берём EMA из KV + PRICE из mark-price)
 async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction: str, check: dict) -> str:
     tfs = check.get("timeframes") or list(TIMEFRAMES_DEFAULT)
     await _ensure_pattern_cache(pg)
-    await _ensure_indicator_instances(pg)
 
     mirror = check.get("mirror")
     if mirror == "auto":
@@ -269,32 +201,15 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
         log.debug(f"[EMA] no_price symbol={symbol}")
         return "ignore"
 
-    lengths_needed = (9, 21, 50, 100, 200)
     for tf in tfs:
-        iid_map = _EMA_INSTANCES.get(tf) or {}
-        if any(ln not in iid_map for ln in lengths_needed):
-            log.debug(f"[EMA] not all EMA instances present tf={tf}")
-            return "ignore"
-
-        # параллельный on-demand по 5 EMA
-        tasks = [_ondemand_indicator(redis, symbol, tf, iid_map[ln]) for ln in lengths_needed]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        # читаем 5 EMA из KV последнего закрытого бара
         ema_vals = {}
-        for ln, res in zip(lengths_needed, results):
-            if isinstance(res, Exception) or not res:
-                log.debug(f"[EMA] ondemand timeout/empty tf={tf} len={ln}")
-                return "ignore"
-            key = f"ema{ln}"
-            v = res.get(key)
+        for ename in EMA_NAMES:
+            v = await _get_ind_value(redis, symbol, tf, ename)
             if v is None:
-                log.debug(f"[EMA] ondemand no key tf={tf} len={ln}")
+                log.debug(f"[EMA] no_kv tf={tf} param={ename}")
                 return "ignore"
-            try:
-                ema_vals[key] = float(v)
-            except Exception:
-                log.debug(f"[EMA] parse_error tf={tf} len={ln} val={v!r}")
-                return "ignore"
+            ema_vals[ename] = v
 
         pattern_text = _build_pattern(price, ema_vals)
         pid = _PATTERN_ID.get(pattern_text)
@@ -313,6 +228,7 @@ async def _process_ema_check(pg, redis, strategy_id: int, symbol: str, direction
             return "deny"
 
     return "allow"
+
 
 # ==========================
 # Buckets (RSI/MFI/ADX)
@@ -340,25 +256,8 @@ async def _read_bucket_aggr(redis, strategy_id: int, direction: str, tf: str,
         log.warning(f"[BUCKET] error reading key={key}: {e}")
         return None, key
 
-# 🔸 on-demand чтение значения RSI/MFI/ADX (возвращает float или None)
-async def _ondemand_param_value(redis, symbol: str, tf: str, instances_map: dict[str, dict[int, int]],
-                                length: int, out_key: str) -> float | None:
-    iid_map = instances_map.get(tf) or {}
-    iid = iid_map.get(length)
-    if not iid:
-        return None
-    res = await _ondemand_indicator(redis, symbol, tf, iid)
-    if not res:
-        return None
-    v = res.get(out_key)
-    try:
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
 # 🔸 обработчик RSI-bucket
 async def _process_rsi_bucket_check(pg, redis, strategy_id: int, symbol: str, direction: str, check: dict) -> str:
-    await _ensure_indicator_instances(pg)
     tfs = check.get("timeframes") or []
     lengths = check.get("lengths") or {}
     step = int(check.get("bin_step") or 5)
@@ -375,9 +274,9 @@ async def _process_rsi_bucket_check(pg, redis, strategy_id: int, symbol: str, di
     for tf in tfs:
         lens = lengths.get(tf) or []
         for ln in lens:
-            val = await _ondemand_param_value(redis, symbol, tf, _RSI_INSTANCES, ln, f"rsi{ln}")
+            val = await _get_ind_value(redis, symbol, tf, f"rsi{ln}")
             if val is None:
-                log.debug(f"[RSI] ondemand no value tf={tf} len={ln}")
+                log.debug(f"[RSI] no_kv tf={tf} len={ln}")
                 return "ignore"
             spec = _bin_value_0_100(val, step=step)  # bucket_spec
             param_name = f"rsi{ln}"
@@ -393,7 +292,6 @@ async def _process_rsi_bucket_check(pg, redis, strategy_id: int, symbol: str, di
 
 # 🔸 обработчик MFI-bucket
 async def _process_mfi_bucket_check(pg, redis, strategy_id: int, symbol: str, direction: str, check: dict) -> str:
-    await _ensure_indicator_instances(pg)
     tfs = check.get("timeframes") or []
     lengths = check.get("lengths") or {}
     step = int(check.get("bin_step") or 5)
@@ -410,9 +308,9 @@ async def _process_mfi_bucket_check(pg, redis, strategy_id: int, symbol: str, di
     for tf in tfs:
         lens = lengths.get(tf) or []
         for ln in lens:
-            val = await _ondemand_param_value(redis, symbol, tf, _MFI_INSTANCES, ln, f"mfi{ln}")
+            val = await _get_ind_value(redis, symbol, tf, f"mfi{ln}")
             if val is None:
-                log.debug(f"[MFI] ondemand no value tf={tf} len={ln}")
+                log.debug(f"[MFI] no_kv tf={tf} len={ln}")
                 return "ignore"
             spec = _bin_value_0_100(val, step=step)
             param_name = f"mfi{ln}"
@@ -426,9 +324,8 @@ async def _process_mfi_bucket_check(pg, redis, strategy_id: int, symbol: str, di
                 return "deny"
     return "allow"
 
-# 🔸 обработчик ADX-bucket (берём _adx из adx_dmi)
+# 🔸 обработчик ADX-bucket (берём _adx из KV)
 async def _process_adx_bucket_check(pg, redis, strategy_id: int, symbol: str, direction: str, check: dict) -> str:
-    await _ensure_indicator_instances(pg)
     tfs = check.get("timeframes") or []
     lengths = check.get("lengths") or {}
     step = int(check.get("bin_step") or 5)
@@ -445,25 +342,10 @@ async def _process_adx_bucket_check(pg, redis, strategy_id: int, symbol: str, di
     for tf in tfs:
         lens = lengths.get(tf) or []
         for ln in lens:
-            # on-demand возвращает adx_dmi{L}_adx
-            iid_map = _ADX_INSTANCES.get(tf) or {}
-            iid = iid_map.get(ln)
-            if not iid:
-                log.debug(f"[ADX] no instance tf={tf} len={ln}")
-                return "ignore"
-            res = await _ondemand_indicator(redis, symbol, tf, iid)
-            if not res:
-                log.debug(f"[ADX] ondemand empty tf={tf} len={ln}")
-                return "ignore"
-            key = f"adx_dmi{ln}_adx"
-            try:
-                val = float(res.get(key)) if res.get(key) is not None else None
-            except Exception:
-                val = None
+            val = await _get_ind_value(redis, symbol, tf, f"adx_dmi{ln}_adx")
             if val is None:
-                log.debug(f"[ADX] ondemand no key tf={tf} len={ln}")
+                log.debug(f"[ADX] no_kv tf={tf} len={ln}")
                 return "ignore"
-
             spec = _bin_value_0_100(val, step=step)
             param_name = f"adx_dmi{ln}"
             aggr, key_r = await _read_bucket_aggr(redis, target_strategy, direction, tf, "adx_dmi", param_name, "adx", spec)
@@ -475,6 +357,7 @@ async def _process_adx_bucket_check(pg, redis, strategy_id: int, symbol: str, di
                 log.debug(f"[ADX] below_threshold tf={tf} len={ln} count={count_trades} winrate={winrate}")
                 return "deny"
     return "allow"
+
 
 # ==========================
 # Главный цикл
@@ -508,7 +391,6 @@ async def run_position_decision_maker(pg, redis):
                         mirror_in   = data.get("mirror", "auto")
 
                         # распакуем checks (могут прийти строкой)
-                        checks = None
                         if isinstance(checks_raw, str):
                             try:
                                 checks = json.loads(checks_raw)
