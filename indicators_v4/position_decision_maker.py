@@ -324,30 +324,21 @@ def _bin_value_0_100(value: float, step: int = 5) -> int:
     b = int(v // step) * step
     return min(100, b)
 
-# 🔸 чтение bucket-агрегата (поддержка и Hash, и JSON-строки)
+# 🔸 чтение bucket-агрегата (строго JSON-строка)
 async def _read_bucket_aggr(redis, strategy_id: int, direction: str, tf: str,
                             indicator: str, param_name: str, bucket_key: str, spec: str | int):
     key = f"agg:{strategy_id}:{direction}:{tf}:{indicator}:{param_name}:{bucket_key}:{spec}"
-    # пробуем Hash-схему
-    h = await redis.hgetall(key)
-    if h:
-        try:
-            ct = int(h.get("count_trades") or h.get("positions_closed") or "0")
-            wr = float(h.get("winrate") or "0")
-            return (ct, wr), key
-        except Exception:
+    try:
+        s = await redis.get(key)
+        if not s:
             return None, key
-    # пробуем JSON-значение
-    s = await redis.get(key)
-    if s:
-        try:
-            obj = json.loads(s)
-            ct = int(obj.get("positions_closed") or obj.get("count_trades") or 0)
-            wr = float(obj.get("winrate") or 0)
-            return (ct, wr), key
-        except Exception:
-            return None, key
-    return None, key
+        obj = json.loads(s)
+        ct = int(obj.get("positions_closed") or obj.get("count_trades") or 0)
+        wr = float(obj.get("winrate") or 0)
+        return (ct, wr), key
+    except Exception as e:
+        log.warning(f"[BUCKET] error reading key={key}: {e}")
+        return None, key
 
 # 🔸 on-demand чтение значения RSI/MFI/ADX (возвращает float или None)
 async def _ondemand_param_value(redis, symbol: str, tf: str, instances_map: dict[str, dict[int, int]],
