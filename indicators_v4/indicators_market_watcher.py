@@ -260,7 +260,7 @@ async def handle_bucket(symbol: str, tf: str, open_time_ms: int, redis, pg):
         if feats is not None:
             code, diag = classify_bar(tf, feats)
             await publish_regime(redis, pg, symbol, tf, open_time_ms, code, diag)
-            log.info(f"[REGIME] {symbol}/{tf} @ {open_time_ms} → code={code} "
+            log.debug(f"[REGIME] {symbol}/{tf} @ {open_time_ms} → code={code} "
                      f"(adx={diag['adx']:.2f}/{diag['adx_low']:.2f}-{diag['adx_high']:.2f}, "
                      f"bbw={diag['bb_width']:.4f}/{diag['bb_low']:.4f}-{diag['bb_high']:.4f}, "
                      f"zΔ={diag['z_d_hist']:.2f})")
