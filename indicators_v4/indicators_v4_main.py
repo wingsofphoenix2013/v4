@@ -20,6 +20,7 @@ from position_agregator_worker import run_position_aggregator_worker, run_positi
 from position_emapattern_worker import run_position_emapattern_worker
 from position_emapattern_backfill_worker import run_position_emapattern_backfill_worker
 from position_decision_maker import run_position_decision_maker
+from indicators_market_watcher import run_market_watcher
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -419,6 +420,7 @@ async def main():
         run_safe_loop(lambda: run_position_emapattern_worker(pg, redis), "IND_EMA_PATTERN_DICT"),
         run_safe_loop(lambda: run_position_emapattern_backfill_worker(pg, redis), "IND_EMA_PATTERN_BACKFILL"),
         run_safe_loop(lambda: run_position_decision_maker(pg, redis), "POSITION_DECISION_MAKER"),
+        run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
     )
 
 if __name__ == "__main__":
