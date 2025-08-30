@@ -263,7 +263,7 @@ async def handle_bucket(symbol: str, tf: str, open_time_ms: int, redis, pg):
         await _save_state(redis, symbol, tf, new_state)
         await publish_regime(redis, pg, symbol, tf, open_time_ms, code, diag)
 
-        log.info(
+        log.debug(
             f"[REGIME] {symbol}/{tf} @ {open_time_ms} → code={code} "
             f"(adx={diag['adx']:.2f}/{diag['adx_low']:.2f}-{diag['adx_high']:.2f}, "
             f"bbw={diag['bb_width']:.4f}/{diag['bb_low']:.4f}-{diag['bb_high']:.4f}, "
@@ -277,7 +277,7 @@ async def handle_bucket(symbol: str, tf: str, open_time_ms: int, redis, pg):
 # 🔸 Основной цикл компонента (XREADGROUP)
 async def run_market_watcher(pg, redis):
     log = logging.getLogger("MRW")
-    log.info("market_watcher starting: XGROUP init")
+    log.debug("market_watcher starting: XGROUP init")
 
     try:
         await redis.xgroup_create(READY_STREAM, GROUP_NAME, id="$", mkstream=True)

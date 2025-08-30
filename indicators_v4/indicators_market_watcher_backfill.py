@@ -137,7 +137,7 @@ async def _backfill_symbol_tf(pg, redis, symbol, tf, start_ms, end_ms):
     # шкала времени — по EMA (репрезентативный ряд)
     ts_list = [ts for ts in sorted(ema_map.keys()) if start_ms <= ts <= end_ms]
     if not ts_list:
-        log.info(f"[EMPTY] {symbol}/{tf} — нет данных за окно")
+        log.debug(f"[EMPTY] {symbol}/{tf} — нет данных за окно")
         return
 
     # in-memory состояние гистерезиса для данного символа/ТФ
@@ -241,30 +241,30 @@ async def run_market_watcher_backfill_regular():
     redis = await init_redis_client()
 
     while True:
-        log.info(f"regular backfill: sleep {START_DELAY_SEC}s before run")
+        log.debug(f"regular backfill: sleep {START_DELAY_SEC}s before run")
         await asyncio.sleep(START_DELAY_SEC)
 
         try:
             symbols = await _load_active_symbols(pg)
             if not symbols:
-                log.info("no active symbols, nothing to do")
+                log.debug("no active symbols, nothing to do")
             else:
                 end_dt = datetime.utcnow()
                 start_dt = end_dt - timedelta(days=BF_DAYS)
                 start_ms = int(start_dt.timestamp() * 1000)
                 end_ms   = int(end_dt.timestamp() * 1000)
 
-                log.info(f"regular backfill: start window [{start_dt.isoformat()} .. {end_dt.isoformat()}], symbols={len(symbols)}")
+                log.debug(f"regular backfill: start window [{start_dt.isoformat()} .. {end_dt.isoformat()}], symbols={len(symbols)}")
 
                 # последовательный проход: символ → TF (h1 → m15 → m5)
                 for sym in symbols:
                     for tf in REQUIRED_TFS:
                         await _backfill_symbol_tf(pg, redis, sym, tf, start_ms, end_ms)
 
-                log.info("regular backfill: finished")
+                log.debug("regular backfill: finished")
 
         except Exception as e:
             log.error(f"regular backfill error: {e}", exc_info=True)
 
-        log.info(f"regular backfill: sleep {SLEEP_AFTER_SEC}s before next run")
+        log.debug(f"regular backfill: sleep {SLEEP_AFTER_SEC}s before next run")
         await asyncio.sleep(SLEEP_AFTER_SEC)
