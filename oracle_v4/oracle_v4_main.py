@@ -16,6 +16,7 @@ from config_loader import (
 
 from oracle_marketwatcher_aggregator import run_oracle_marketwatcher_aggregator
 from oracle_marketwatcher_backfill import run_oracle_marketwatcher_backfill_periodic
+from oracle_indicatorwatcher_aggregator import run_oracle_indicatorwatcher_aggregator
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -81,6 +82,7 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(run_oracle_marketwatcher_aggregator, "ORACLE_MW_AGG"),
         run_safe_loop(run_oracle_marketwatcher_backfill_periodic, "ORACLE_MW_BF"),
+        run_safe_loop(run_oracle_indicatorwatcher_aggregator, "ORACLE_IND_MW_AGG"),
     )
 
 
