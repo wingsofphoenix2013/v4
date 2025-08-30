@@ -14,6 +14,8 @@ from config_loader import (
     config_event_listener,
 )
 
+from oracle_marketwatcher_aggregator import run_oracle_marketwatcher_aggregator
+
 log = logging.getLogger("ORACLE_MAIN")
 
 
@@ -76,6 +78,7 @@ async def main():
     # Слушатель конфигурационных событий (тикеры + стратегии)
     await asyncio.gather(
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
+        run_safe_loop(run_oracle_marketwatcher_aggregator, "ORACLE_MW_AGG"),
     )
 
 
