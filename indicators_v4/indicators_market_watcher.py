@@ -1,11 +1,13 @@
-# 🔸 indicators_market_watcher.py — Этап 4: запись в Redis KV/TS и PG (indicator_marketwatcher_v4)
+# 🔸 indicators_market_watcher.py — regime9_code v2: гистерезис + нормированный наклон, запись в Redis KV/TS и PG
 
 import os
 import asyncio
 import json
 import logging
 from datetime import datetime
-from statistics import median
+
+# 🔸 regime9 v2 core
+from regime9_core import RegimeState, RegimeParams, decide_regime_code
 
 # 🔸 Константы и конфиг
 READY_STREAM = "indicator_stream"
@@ -19,13 +21,17 @@ MAX_PER_SYMBOL = int(os.getenv("MRW_MAX_PER_SYMBOL", "4"))
 XREAD_BLOCK_MS = int(os.getenv("MRW_BLOCK_MS", "1000"))
 XREAD_COUNT = int(os.getenv("MRW_COUNT", "50"))
 
-N_PCT = int(os.getenv("MRW_N_PCT", "200"))     # окно для p30/p70
-N_ACC = int(os.getenv("MRW_N_ACC", "50"))      # окно для z-score Δhist
-EPS_Z = float(os.getenv("MRW_EPS_Z", "0.5"))   # порог ускорения
+N_PCT = int(os.getenv("MRW_N_PCT", "200"))     # окно p30/p70
+N_ACC = int(os.getenv("MRW_N_ACC", "50"))      # окно z-score ΔMACD
+EPS_Z = float(os.getenv("MRW_EPS_Z", "0.5"))   # порог ускорения для z-score
 
 RETENTION_TS_MS = 14 * 24 * 60 * 60 * 1000     # 14 суток
-REGIME_VERSION = 1                              # версия правил
+REGIME_VERSION = 2                              # версия правил regime9 v2
 REGIME_PARAM = "regime9_code"                   # имя параметра в KV/TS
+
+# Гистерезис (подтверждения смены состояния)
+HYST_TREND_BARS = int(os.getenv("MRW_R9_HYST_TREND_BARS", "2"))  # тренд↔флет
+HYST_SUB_BARS = int(os.getenv("MRW_R9_HYST_SUB_BARS", "1"))      # accel/stable/decel
 
 # 🔸 Глобальные структуры параллелизма
 task_gate = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -41,29 +47,35 @@ def _iso_to_ms(iso_str: str) -> int:
 def _tf_step_ms(tf: str) -> int:
     return 300_000 if tf == "m5" else (900_000 if tf == "m15" else 3_600_000)
 
-def _p30(vals: list[float]) -> float:
-    if not vals:
-        return float("nan")
-    k = max(0, int(0.30 * (len(vals) - 1)))
-    return sorted(vals)[k]
 
-def _p70(vals: list[float]) -> float:
-    if not vals:
-        return float("nan")
-    k = max(0, int(0.70 * (len(vals) - 1)))
-    return sorted(vals)[k]
+# 🔸 Хранилище состояния гистерезиса в Redis (Hash)
+def _state_key(symbol: str, tf: str) -> str:
+    return f"mrw_state:{symbol}:{tf}"
 
-def _mad(vals: list[float]) -> float:
-    if not vals:
-        return 0.0
-    m = median(vals)
-    dev = [abs(x - m) for x in vals]
-    return median(dev) or 1e-9  # защита от деления на ноль
+async def _load_state(redis, symbol: str, tf: str) -> RegimeState:
+    data = await redis.hgetall(_state_key(symbol, tf))
+    if not data:
+        return RegimeState()
+    try:
+        return RegimeState(
+            core=data.get("core", "flat"),
+            core_cnt=int(data.get("core_cnt", 0)),
+            sub=data.get("sub", "stable"),
+            sub_cnt=int(data.get("sub_cnt", 0)),
+        )
+    except Exception:
+        return RegimeState()
 
-def _zscore(x: float, vals: list[float]) -> float:
-    m = median(vals)
-    s = _mad(vals)
-    return (x - m) / s
+async def _save_state(redis, symbol: str, tf: str, st: RegimeState) -> None:
+    await redis.hset(
+        _state_key(symbol, tf),
+        mapping={
+            "core": st.core,
+            "core_cnt": str(st.core_cnt),
+            "sub": st.sub,
+            "sub_cnt": str(st.sub_cnt),
+        },
+    )
 
 
 # 🔸 Чтение фич на бар: проверяем комплект и подгружаем окна
@@ -78,6 +90,7 @@ async def fetch_features_for_bar(redis, symbol: str, tf: str, open_time_ms: int)
     bb_c = f"ts_ind:{symbol}:{tf}:bb20_2_0_center"
     atr_key = f"ts_ind:{symbol}:{tf}:atr14" if tf in {"m5", "m15"} else None
 
+    # Проверка наличия точки ровно на open_time у всех ключей
     keys_now = [adx_key, ema_key, macd_key, bb_u, bb_l, bb_c] + ([atr_key] if atr_key else [])
     now_calls = [redis.execute_command("TS.RANGE", k, open_time_ms, open_time_ms) for k in keys_now]
     now_results = await asyncio.gather(*now_calls, return_exceptions=True)
@@ -86,15 +99,16 @@ async def fetch_features_for_bar(redis, symbol: str, tf: str, open_time_ms: int)
             logging.getLogger("MRW").debug(f"[INCOMPLETE] {symbol}/{tf} @ {open_time_ms} → missing {k}")
             return None
 
+    # Окна
     step_ms = _tf_step_ms(tf)
     t_prev = open_time_ms - step_ms
     t_start_pct = open_time_ms - (N_PCT - 1) * step_ms
     t_start_acc = open_time_ms - N_ACC * step_ms
 
     window_calls = [
-        redis.execute_command("TS.RANGE", ema_key, t_prev, open_time_ms),
-        redis.execute_command("TS.RANGE", macd_key, t_start_acc, open_time_ms),
-        redis.execute_command("TS.RANGE", adx_key, t_start_pct, open_time_ms),
+        redis.execute_command("TS.RANGE", ema_key, t_prev, open_time_ms),        # 2 точки
+        redis.execute_command("TS.RANGE", macd_key, t_start_acc, open_time_ms),  # N_ACC+1
+        redis.execute_command("TS.RANGE", adx_key, t_start_pct, open_time_ms),   # N_PCT
         redis.execute_command("TS.RANGE", bb_u,   t_start_pct, open_time_ms),
         redis.execute_command("TS.RANGE", bb_l,   t_start_pct, open_time_ms),
         redis.execute_command("TS.RANGE", bb_c,   t_start_pct, open_time_ms),
@@ -123,80 +137,52 @@ async def fetch_features_for_bar(redis, symbol: str, tf: str, open_time_ms: int)
     )
 
     return {
-        "ema_vals": ema_vals,
-        "macd_vals": macd_vals,
-        "adx_vals": adx_vals,
-        "bb_u": bbu_vals,
-        "bb_l": bbl_vals,
-        "bb_c": bbc_vals,
-        "atr_vals": atr_vals,
+        "ema_vals": ema_vals,          # [t-1, t]
+        "macd_vals": macd_vals,        # N_ACC+1
+        "adx_vals": adx_vals,          # N_PCT
+        "bb_u": bbu_vals,              # N_PCT
+        "bb_l": bbl_vals,              # N_PCT
+        "bb_c": bbc_vals,              # N_PCT
+        "atr_vals": atr_vals,          # N_PCT (только m5/m15) или None
     }
 
 
-# 🔸 Классификация бара → code 0..8 и диагностика
-def classify_bar(tf: str, features: dict) -> tuple[int, dict]:
-    ema_t1, ema_t = features["ema_vals"][-2], features["ema_vals"][-1]
-    ema_slope = ema_t - ema_t1
+# 🔸 Подготовка features для ядра v2
+def _build_features(tf: str, feats: dict) -> dict:
+    ema_vals = feats["ema_vals"]
+    macd_vals = feats["macd_vals"]
+    adx_vals = feats["adx_vals"]
+    bb_u = feats["bb_u"]
+    bb_l = feats["bb_l"]
+    bb_c = feats["bb_c"]
+    atr_vals = feats.get("atr_vals")
 
-    macd_hist_t1, macd_hist_t = features["macd_vals"][-2], features["macd_vals"][-1]
-    d_hist = macd_hist_t - macd_hist_t1
-    z_vals = [features["macd_vals"][i+1] - features["macd_vals"][i] for i in range(len(features["macd_vals"]) - 1)]
-    z_d_hist = _zscore(d_hist, z_vals[-N_ACC:]) if z_vals else 0.0
-
-    adx = features["adx_vals"][-1]
-    adx_low_p = _p30(features["adx_vals"])
-    adx_high_p = _p70(features["adx_vals"])
-    adx_low = max(adx_low_p, 15.0)
-    adx_high = min(adx_high_p, 30.0)
-
-    bb_width_series = []
-    for u, l, c in zip(features["bb_u"], features["bb_l"], features["bb_c"]):
-        bb_width_series.append(0.0 if c == 0 else (u - l) / c)
-    bb_width = bb_width_series[-1]
-    bb_low = _p30(bb_width_series)
-    bb_high = _p70(bb_width_series)
-
-    atr = atr_low = atr_high = None
-    if tf in {"m5", "m15"} and features.get("atr_vals"):
-        atr = features["atr_vals"][-1]
-        atr_low = _p30(features["atr_vals"])
-        atr_high = _p70(features["atr_vals"])
-
-    is_trend = adx >= adx_high
-    is_flat = adx <= adx_low
-
-    if is_flat:
-        if bb_width <= bb_low and (atr is None or atr <= atr_low):
-            code = 0  # F_CONS
-        elif bb_width >= bb_high:
-            code = 1  # F_EXP
-        else:
-            code = 2  # F_DRIFT
+    # ΔMACD окно (разности соседних значений)
+    if len(macd_vals) >= 2:
+        dhist = [macd_vals[i + 1] - macd_vals[i] for i in range(len(macd_vals) - 1)]
     else:
-        direction_up = ema_slope > 0.0
-        if z_d_hist > +EPS_Z:
-            accel = 0  # ACCEL
-        elif abs(z_d_hist) <= EPS_Z:
-            accel = 1  # STABLE
-        else:
-            accel = 2  # DECEL
-        code = (3 + accel) if direction_up else (6 + accel)
+        dhist = []
 
-    diag = {
-        "adx": adx, "adx_low": adx_low, "adx_high": adx_high,
-        "bb_width": bb_width, "bb_low": bb_low, "bb_high": bb_high,
-        "atr": atr, "atr_low": atr_low, "atr_high": atr_high,
-        "ema_slope": ema_slope, "macd_hist": macd_hist_t,
-        "d_hist": d_hist, "z_d_hist": z_d_hist
+    return {
+        "ema_t1": ema_vals[-2],
+        "ema_t":  ema_vals[-1],
+        "macd_t1": macd_vals[-2],
+        "macd_t":  macd_vals[-1],
+        "dhist_win": dhist[-N_ACC:],         # окно ΔMACD
+        "adx_win":   adx_vals[-N_PCT:],      # окно ADX
+        "bb_u_win":  bb_u[-N_PCT:],
+        "bb_l_win":  bb_l[-N_PCT:],
+        "bb_c_win":  bb_c[-N_PCT:],
+        "atr_t": (atr_vals[-1] if (atr_vals and tf in {"m5", "m15"}) else None),
+        "atr_win": (atr_vals[-N_PCT:] if (atr_vals and tf in {"m5", "m15"}) else None),
     }
-    return code, diag
 
 
 # 🔸 Запись результата: Redis KV/TS + PostgreSQL (indicator_marketwatcher_v4)
 async def publish_regime(redis, pg, symbol: str, tf: str, open_time_ms: int, code: int, diag: dict):
     open_time_iso = datetime.utcfromtimestamp(open_time_ms / 1000).isoformat()
 
-    # KV и TS
+    # Пишем KV и TS параллельно
     kv_key = f"ind:{symbol}:{tf}:{REGIME_PARAM}"
     ts_key = f"ts_ind:{symbol}:{tf}:{REGIME_PARAM}"
 
@@ -207,7 +193,7 @@ async def publish_regime(redis, pg, symbol: str, tf: str, open_time_ms: int, cod
         "DUPLICATE_POLICY", "last"
     )
 
-    # PG upsert
+    # Запись в PG (upsert) в indicator_marketwatcher_v4
     async with pg.acquire() as conn:
         await conn.execute("""
             INSERT INTO indicator_marketwatcher_v4
@@ -250,27 +236,45 @@ async def publish_regime(redis, pg, symbol: str, tf: str, open_time_ms: int, cod
     await asyncio.gather(kv, ts, return_exceptions=True)
 
 
-# 🔸 Обработка бакета: debounce → фичи → классификация → запись
+# 🔸 Обработка бакета: debounce → фичи → ядро v2 (гистерезис) → запись
 async def handle_bucket(symbol: str, tf: str, open_time_ms: int, redis, pg):
     log = logging.getLogger("MRW")
     await asyncio.sleep(DEBOUNCE_MS / 1000)
 
     for attempt in range(2):
-        feats = await fetch_features_for_bar(redis, symbol, tf, open_time_ms)
-        if feats is not None:
-            code, diag = classify_bar(tf, feats)
-            await publish_regime(redis, pg, symbol, tf, open_time_ms, code, diag)
-            log.debug(f"[REGIME] {symbol}/{tf} @ {open_time_ms} → code={code} "
-                     f"(adx={diag['adx']:.2f}/{diag['adx_low']:.2f}-{diag['adx_high']:.2f}, "
-                     f"bbw={diag['bb_width']:.4f}/{diag['bb_low']:.4f}-{diag['bb_high']:.4f}, "
-                     f"zΔ={diag['z_d_hist']:.2f})")
-            return
-        await asyncio.sleep(0.15)
+        feats_raw = await fetch_features_for_bar(redis, symbol, tf, open_time_ms)
+        if feats_raw is None:
+            await asyncio.sleep(0.15)
+            continue
+
+        # Загружаем стейт гистерезиса из Redis
+        state = await _load_state(redis, symbol, tf)
+
+        # Готовим features для ядра и принимаем решение
+        features = _build_features(tf, feats_raw)
+        code, new_state, diag = decide_regime_code(
+            tf,
+            features,
+            state,
+            RegimeParams(hyst_trend_bars=HYST_TREND_BARS, hyst_sub_bars=HYST_SUB_BARS, eps_z=EPS_Z)
+        )
+
+        # Сохраняем стейт, публикуем результат
+        await _save_state(redis, symbol, tf, new_state)
+        await publish_regime(redis, pg, symbol, tf, open_time_ms, code, diag)
+
+        log.info(
+            f"[REGIME] {symbol}/{tf} @ {open_time_ms} → code={code} "
+            f"(adx={diag['adx']:.2f}/{diag['adx_low']:.2f}-{diag['adx_high']:.2f}, "
+            f"bbw={diag['bb_width']:.4f}/{diag['bb_low']:.4f}-{diag['bb_high']:.4f}, "
+            f"zΔ={diag['z_d_hist']:.2f})"
+        )
+        return
 
     log.debug(f"[SKIP] features incomplete: {symbol}/{tf} @ {open_time_ms}")
 
 
-# 🔸 Основной цикл компонента (XREADGROUP). Логи этапов 1–2 переведены на debug
+# 🔸 Основной цикл компонента (XREADGROUP)
 async def run_market_watcher(pg, redis):
     log = logging.getLogger("MRW")
     log.info("market_watcher starting: XGROUP init")
