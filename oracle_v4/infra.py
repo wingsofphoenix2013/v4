@@ -1,4 +1,4 @@
-# infra.py
+# 🔸 infra.py — инфраструктура oracle_v4: логирование, PG/Redis, кэши тикеров и стратегий
 
 import os
 import logging
@@ -8,12 +8,13 @@ import redis.asyncio as aioredis
 # 🔸 Глобальные переменные
 pg_pool = None
 redis_client = None
-enabled_tickers = {}
+enabled_tickers: dict[str, dict] = {}
+market_watcher_strategies: set[int] = set()
 
 # 🔸 Переменные окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-# 🔸 Логгер для инфраструктуры
+# 🔸 Логгер
 log = logging.getLogger("ORACLE_INFRA")
 
 
@@ -23,7 +24,7 @@ def setup_logging():
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     log.debug("Логирование настроено (DEBUG_MODE=%s)", DEBUG_MODE)
 
@@ -38,9 +39,12 @@ async def setup_pg():
         dsn=db_url,
         min_size=2,
         max_size=10,
-        timeout=30.0
+        timeout=30.0,
     )
-    await pool.execute("SELECT 1")
+    # быстрый health-check
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT 1")
+
     globals()["pg_pool"] = pool
     log.info("🛢️ Подключение к PostgreSQL установлено")
 
@@ -58,10 +62,12 @@ async def setup_redis_client():
     client = aioredis.from_url(
         redis_url,
         password=password,
-        decode_responses=True
+        decode_responses=True,  # строки на вход/выход
     )
 
+    # health-check
     await client.ping()
+
     globals()["redis_client"] = client
     log.info("📡 Подключение к Redis установлено")
 
@@ -69,5 +75,24 @@ async def setup_redis_client():
 # 🔸 Обновление кэша тикеров
 def set_enabled_tickers(new_dict: dict):
     global enabled_tickers
-    enabled_tickers = new_dict
-    log.debug("Кэш тикеров обновлён (%d)", len(new_dict))
+    enabled_tickers = new_dict or {}
+    log.debug("Кэш тикеров обновлён (%d)", len(enabled_tickers))
+
+
+# 🔸 Обновление кэша стратегий (market_watcher=true)
+def set_market_watcher_strategies(id_set: set[int]):
+    global market_watcher_strategies
+    market_watcher_strategies = set(int(x) for x in (id_set or set()))
+    log.info("🧠 Кэш стратегий market_watcher обновлён (%d)", len(market_watcher_strategies))
+
+
+# 🔸 Точечное добавление стратегии в кэш
+def add_market_watcher_strategy(sid: int):
+    market_watcher_strategies.add(int(sid))
+    log.debug("Добавлена стратегия в кэш market_watcher: %s (итого %d)", sid, len(market_watcher_strategies))
+
+
+# 🔸 Точечное удаление стратегии из кэша
+def remove_market_watcher_strategy(sid: int):
+    market_watcher_strategies.discard(int(sid))
+    log.debug("Удалена стратегия из кэша market_watcher: %s (итого %d)", sid, len(market_watcher_strategies))
