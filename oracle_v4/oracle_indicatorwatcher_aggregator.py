@@ -1,4 +1,5 @@
 # 🔸 oracle_indicatorwatcher_aggregator.py — Этап 2: индикаторные агрегаты (per-TF и composite) + публикация Redis-ключей
+# учитываем, что на h1 нет MFI/ADX; композиты: RSI/BB → m5-m15-h1, MFI/ADX → m5-m15
 
 import os
 import json
@@ -18,6 +19,20 @@ XREAD_BLOCKMS = int(os.getenv("ORACLE_IND_MW_BLOCK_MS", "1000"))
 
 log = logging.getLogger("ORACLE_IND_MW_AGG")
 
+# доступность индикаторов по TF
+IND_TF_MAP = {
+    "RSI": ("m5", "m15", "h1"),
+    "MFI": ("m5", "m15"),           # нет на h1
+    "ADX": ("m5", "m15"),           # нет на h1
+    "BB" : ("m5", "m15", "h1"),
+}
+# отображение param_name
+PARAMS = {
+    "RSI": ("rsi14",),
+    "MFI": ("mfi14",),
+    "ADX": ("adx_dmi14_adx",),
+    "BB" : ("bb20_2_0_lower", "bb20_2_0_center", "bb20_2_0_upper"),
+}
 
 # 🔸 Вспомогательные: floor времени (UTC) под TF
 def _floor_to_step_utc(dt: datetime, minutes: int) -> datetime:
@@ -27,23 +42,17 @@ def _floor_to_step_utc(dt: datetime, minutes: int) -> datetime:
     floored_minute = (base.minute // minutes) * minutes
     return base.replace(minute=floored_minute)
 
-
 # 🔸 Бин для RSI/MFI/ADX (0..100, шаг 5)
-def _bin_0_100_step5(val: float) -> str:
+def _bin_0_100_step5(val: float) -> str | None:
     if val is None:
         return None
     v = max(0.0, min(100.0, float(val)))
-    bin_floor = int(v // 5) * 5
-    # 100 остаётся 100
-    return str(bin_floor if bin_floor <= 100 else 100)
-
+    return str(int(v // 5) * 5)
 
 # 🔸 BB-сектор 1..12 по цене входа и уровням Bollinger 20/2.0
 def _bb_sector(entry_price: float, lower: float, center: float, upper: float) -> str | None:
     try:
-        p = float(entry_price)
-        l = float(lower)
-        u = float(upper)
+        p = float(entry_price); l = float(lower); u = float(upper)
     except Exception:
         return None
     width = u - l
@@ -52,31 +61,94 @@ def _bb_sector(entry_price: float, lower: float, center: float, upper: float) ->
     sector_h = width / 6.0
 
     if p < l:
-        below_idx = int((l - p) / sector_h + 0.999999)  # ceil
+        below_idx = int((l - p) / sector_h + 0.999999)   # ceil
         return str(min(3, below_idx))                    # 1..3
     if p >= u:
-        above_idx = int((p - u) / sector_h + 0.999999)  # ceil
-        return str(min(12, 9 + above_idx))              # 10..12
+        above_idx = int((p - u) / sector_h + 0.999999)   # ceil
+        return str(min(12, 9 + above_idx))               # 10..12
 
-    # inside
-    inside_idx = int((p - l) // sector_h)               # 0..5
-    return str(4 + inside_idx)                          # 4..9
+    inside_idx = int((p - l) // sector_h)                # 0..5
+    return str(4 + inside_idx)                           # 4..9
 
-
-# 🔸 Redis ключ для per-TF
+# 🔸 Redis ключи
 def tf_stat_key(strategy_id: int, direction: str, marker3: str, indicator: str, tf: str, bucket: str) -> str:
     return f"oracle:indmw:stat:{strategy_id}:{direction}:{marker3}:{indicator}:{tf}:{bucket}"
 
-# 🔸 Redis ключ для composite
 def comp_stat_key(strategy_id: int, direction: str, marker3: str, indicator: str, triplet: str) -> str:
     return f"oracle:indmw:stat:{strategy_id}:{direction}:{marker3}:{indicator}:comp:{triplet}"
 
+# 🔸 UPSERT помощники
+async def _upsert_tf(conn, strategy_id: int, direction: str, marker3: str,
+                     ind: str, tf: str, bucket: str, pnl: Decimal, is_win: int):
+    stat = await conn.fetchrow("""
+        SELECT closed_trades, won_trades, pnl_sum
+        FROM positions_indicators_mw_stat_tf
+        WHERE strategy_id=$1 AND direction=$2 AND marker3_code=$3
+          AND indicator=$4 AND timeframe=$5 AND bucket=$6
+        FOR UPDATE
+    """, strategy_id, direction, marker3, ind, tf, bucket)
+    if stat:
+        c = int(stat["closed_trades"]) + 1
+        w = int(stat["won_trades"]) + is_win
+        s = (Decimal(str(stat["pnl_sum"])) + pnl).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    else:
+        c, w, s = 1, is_win, pnl
+    wr = (Decimal(w) / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    ap = (s / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    await conn.execute("""
+        INSERT INTO positions_indicators_mw_stat_tf
+          (strategy_id, direction, marker3_code, indicator, timeframe, bucket,
+           closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+        ON CONFLICT (strategy_id, direction, marker3_code, indicator, timeframe, bucket)
+        DO UPDATE SET
+          closed_trades=$7, won_trades=$8, pnl_sum=$9, winrate=$10, avg_pnl=$11, updated_at=NOW()
+    """, strategy_id, direction, marker3, ind, tf, bucket, c, w, str(s), str(wr), str(ap))
+    # Redis
+    try:
+        value = json.dumps({"closed_trades": c, "winrate": float(wr)})
+        await infra.redis_client.set(tf_stat_key(strategy_id, direction, marker3, ind, tf, bucket), value)
+    except Exception:
+        log.exception("Redis SET failed (per-TF)")
 
-# 🔸 Транзакционная обработка одной позиции
+async def _upsert_comp(conn, strategy_id: int, direction: str, marker3: str,
+                       ind: str, triplet: str, pnl: Decimal, is_win: int):
+    stat = await conn.fetchrow("""
+        SELECT closed_trades, won_trades, pnl_sum
+        FROM positions_indicators_mw_stat_comp
+        WHERE strategy_id=$1 AND direction=$2 AND marker3_code=$3
+          AND indicator=$4 AND bucket_triplet=$5
+        FOR UPDATE
+    """, strategy_id, direction, marker3, ind, triplet)
+    if stat:
+        c = int(stat["closed_trades"]) + 1
+        w = int(stat["won_trades"]) + is_win
+        s = (Decimal(str(stat["pnl_sum"])) + pnl).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    else:
+        c, w, s = 1, is_win, pnl
+    wr = (Decimal(w) / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    ap = (s / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    await conn.execute("""
+        INSERT INTO positions_indicators_mw_stat_comp
+          (strategy_id, direction, marker3_code, indicator, bucket_triplet,
+           closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+        ON CONFLICT (strategy_id, direction, marker3_code, indicator, bucket_triplet)
+        DO UPDATE SET
+          closed_trades=$6, won_trades=$7, pnl_sum=$8, winrate=$9, avg_pnl=$10, updated_at=NOW()
+    """, strategy_id, direction, marker3, ind, triplet, c, w, str(s), str(wr), str(ap))
+    # Redis
+    try:
+        value = json.dumps({"closed_trades": c, "winrate": float(wr)})
+        await infra.redis_client.set(comp_stat_key(strategy_id, direction, marker3, ind, triplet), value)
+    except Exception:
+        log.exception("Redis SET failed (comp)")
+
+# 🔸 Обработка одной закрытой позиции (транзакция)
 async def _process_closed_position(position_uid: str):
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # 1) Позиция FOR UPDATE
+            # позиция FOR UPDATE
             pos = await conn.fetchrow("""
                 SELECT p.id, p.strategy_id, p.symbol, p.direction, p.created_at, p.entry_price, p.pnl, p.status,
                        COALESCE(p.mrk_indwatch_checked, false) AS checked
@@ -87,7 +159,7 @@ async def _process_closed_position(position_uid: str):
             if not pos or pos["status"] != "closed" or pos["checked"]:
                 return False, "skip"
 
-            # 2) Стратегия активна и market_watcher=true?
+            # стратегия активна + market_watcher
             strat = await conn.fetchrow("""
                 SELECT id, enabled, COALESCE(market_watcher, false) AS mw
                 FROM strategies_v4
@@ -96,158 +168,107 @@ async def _process_closed_position(position_uid: str):
             if not strat or not strat["enabled"] or not strat["mw"]:
                 return False, "inactive_strategy"
 
-            # 3) market-флаг по трём TF ровно по bar_open
+            # вычисляем bar_open по TF
             created_at: datetime = pos["created_at"]
             m5_open  = _floor_to_step_utc(created_at, 5)
             m15_open = _floor_to_step_utc(created_at, 15)
             h1_open  = _floor_to_step_utc(created_at, 60)
 
+            # market-флаг (3 из 3)
             rows = await conn.fetch("""
                 SELECT timeframe, regime_code
                 FROM indicator_marketwatcher_v4
-                WHERE symbol = $1 AND timeframe = ANY($2::text[]) AND open_time = ANY($3::timestamp[])
-            """, pos["symbol"], ["m5","m15","h1"], [m5_open, m15_open, h1_open])
+                WHERE symbol = $1
+                  AND timeframe IN ('m5','m15','h1')
+                  AND open_time IN ($2, $3, $4)
+            """, pos["symbol"], m5_open, m15_open, h1_open)
             markers = {r["timeframe"]: int(r["regime_code"]) for r in rows}
             if not all(tf in markers for tf in ("m5","m15","h1")):
                 return False, "marker_missing"
-
             marker3 = f"{markers['m5']}-{markers['m15']}-{markers['h1']}"
 
-            # 4) читаем snapshots индикаторов (position_uid + bar_open_time совпадает по TF)
+            # читаем snapshots ровно TF→open_time и using_current_bar=true
             snaps = await conn.fetch("""
                 SELECT timeframe, param_name, value_num
                 FROM positions_indicators_stat
                 WHERE position_uid = $1
-                  AND timeframe IN ('m5','m15','h1')
-                  AND bar_open_time = ANY($2::timestamp[])
+                  AND using_current_bar = true
+                  AND (
+                       (timeframe='m5'  AND bar_open_time=$2) OR
+                       (timeframe='m15' AND bar_open_time=$3) OR
+                       (timeframe='h1'  AND bar_open_time=$4)
+                  )
                   AND param_name IN ('rsi14','mfi14','adx_dmi14_adx',
                                      'bb20_2_0_center','bb20_2_0_upper','bb20_2_0_lower')
-            """, position_uid, [m5_open, m15_open, h1_open])
+            """, position_uid, m5_open, m15_open, h1_open)
 
-            by_tf = { 'm5': {}, 'm15': {}, 'h1': {} }
+            vals = { 'm5': {}, 'm15': {}, 'h1': {} }
             for r in snaps:
-                by_tf[r["timeframe"]][r["param_name"]] = r["value_num"]
+                vals[r["timeframe"]][r["param_name"]] = r["value_num"]
 
-            # проверяем, что есть всё необходимое
-            for tf in ('m5','m15','h1'):
-                need = ('rsi14','mfi14','adx_dmi14_adx','bb20_2_0_center','bb20_2_0_upper','bb20_2_0_lower')
-                if not all(k in by_tf[tf] for k in need):
-                    return False, "indicator_missing"
-
-            # 5) рассчитываем корзины per-TF
             entry_price = float(pos["entry_price"])
-            tf_bins = { 'RSI': {}, 'MFI': {}, 'ADX': {}, 'BB': {} }
-            for tf in ('m5','m15','h1'):
-                rsi_bin = _bin_0_100_step5(by_tf[tf]['rsi14'])
-                mfi_bin = _bin_0_100_step5(by_tf[tf]['mfi14'])
-                adx_bin = _bin_0_100_step5(by_tf[tf]['adx_dmi14_adx'])
-                bb_bin  = _bb_sector(entry_price,
-                                     by_tf[tf]['bb20_2_0_lower'],
-                                     by_tf[tf]['bb20_2_0_center'],
-                                     by_tf[tf]['bb20_2_0_upper'])
-                if None in (rsi_bin, mfi_bin, adx_bin, bb_bin):
-                    return False, "bin_error"
-
-                tf_bins['RSI'][tf] = rsi_bin
-                tf_bins['MFI'][tf] = mfi_bin
-                tf_bins['ADX'][tf] = adx_bin
-                tf_bins['BB'][tf]  = bb_bin
-
-            # 6) композитные корзины
-            comp_bins = {
-                'RSI': f"{tf_bins['RSI']['m5']}-{tf_bins['RSI']['m15']}-{tf_bins['RSI']['h1']}",
-                'MFI': f"{tf_bins['MFI']['m5']}-{tf_bins['MFI']['m15']}-{tf_bins['MFI']['h1']}",
-                'ADX': f"{tf_bins['ADX']['m5']}-{tf_bins['ADX']['m15']}-{tf_bins['ADX']['h1']}",
-                'BB' : f"{tf_bins['BB']['m5']}-{tf_bins['BB']['m15']}-{tf_bins['BB']['h1']}",
-            }
-
-            # 7) пересчёт агрегатов (Decimal, 4 знака)
+            strategy_id = int(pos["strategy_id"])
             direction: str = pos["direction"]
             pnl = Decimal(str(pos["pnl"])).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-            is_win = 1 if pnl > Decimal("0.0000") else 0
+            is_win = 1 if pnl > Decimal("0") else 0
 
-            # helper upsert функций
-            async def upsert_tf(ind: str, tf: str, bucket: str):
-                stat = await conn.fetchrow("""
-                    SELECT closed_trades, won_trades, pnl_sum
-                    FROM positions_indicators_mw_stat_tf
-                    WHERE strategy_id=$1 AND direction=$2 AND marker3_code=$3
-                      AND indicator=$4 AND timeframe=$5 AND bucket=$6
-                    FOR UPDATE
-                """, int(pos["strategy_id"]), direction, marker3, ind, tf, bucket)
-                if stat:
-                    c = int(stat["closed_trades"]) + 1
-                    w = int(stat["won_trades"]) + is_win
-                    s = (Decimal(str(stat["pnl_sum"])) + pnl).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-                else:
-                    c, w, s = 1, is_win, pnl
-                wr = (Decimal(w) / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-                ap = (s / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-                await conn.execute("""
-                    INSERT INTO positions_indicators_mw_stat_tf
-                      (strategy_id, direction, marker3_code, indicator, timeframe, bucket,
-                       closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-                    ON CONFLICT (strategy_id, direction, marker3_code, indicator, timeframe, bucket)
-                    DO UPDATE SET
-                      closed_trades=$7, won_trades=$8, pnl_sum=$9, winrate=$10, avg_pnl=$11, updated_at=NOW()
-                """, int(pos["strategy_id"]), direction, marker3, ind, tf, bucket, c, w, str(s), str(wr), str(ap))
-                # redis
-                try:
-                    value = json.dumps({"closed_trades": c, "winrate": float(wr)})
-                    await infra.redis_client.set(
-                        tf_stat_key(int(pos["strategy_id"]), direction, marker3, ind, tf, bucket),
-                        value
-                    )
-                except Exception:
-                    log.exception("Redis SET failed (per-TF)")
+            # --- PER-TF агрегаты ---
+            # RSI/MFI/ADX: по доступным TF согласно IND_TF_MAP; BB: по всем трём TF
+            # собираем корзины, где есть все нужные значения для индикатора/TF
+            rsi_bins = {}
+            mfi_bins = {}
+            adx_bins = {}
+            bb_bins  = {}
 
-            async def upsert_comp(ind: str, triplet: str):
-                stat = await conn.fetchrow("""
-                    SELECT closed_trades, won_trades, pnl_sum
-                    FROM positions_indicators_mw_stat_comp
-                    WHERE strategy_id=$1 AND direction=$2 AND marker3_code=$3
-                      AND indicator=$4 AND bucket_triplet=$5
-                    FOR UPDATE
-                """, int(pos["strategy_id"]), direction, marker3, ind, triplet)
-                if stat:
-                    c = int(stat["closed_trades"]) + 1
-                    w = int(stat["won_trades"]) + is_win
-                    s = (Decimal(str(stat["pnl_sum"])) + pnl).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-                else:
-                    c, w, s = 1, is_win, pnl
-                wr = (Decimal(w) / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-                ap = (s / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-                await conn.execute("""
-                    INSERT INTO positions_indicators_mw_stat_comp
-                      (strategy_id, direction, marker3_code, indicator, bucket_triplet,
-                       closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-                    ON CONFLICT (strategy_id, direction, marker3_code, indicator, bucket_triplet)
-                    DO UPDATE SET
-                      closed_trades=$6, won_trades=$7, pnl_sum=$8, winrate=$9, avg_pnl=$10, updated_at=NOW()
-                """, int(pos["strategy_id"]), direction, marker3, ind, triplet, c, w, str(s), str(wr), str(ap))
-                # redis
-                try:
-                    value = json.dumps({"closed_trades": c, "winrate": float(wr)})
-                    await infra.redis_client.set(
-                        comp_stat_key(int(pos["strategy_id"]), direction, marker3, ind, triplet),
-                        value
-                    )
-                except Exception:
-                    log.exception("Redis SET failed (comp)")
+            for tf in ("m5", "m15", "h1"):
+                # RSI
+                if tf in IND_TF_MAP["RSI"] and ("rsi14" in vals[tf]):
+                    b = _bin_0_100_step5(vals[tf]["rsi14"])
+                    if b is not None:
+                        await _upsert_tf(conn, strategy_id, direction, marker3, "RSI", tf, b, pnl, is_win)
+                        rsi_bins[tf] = b
+                # MFI (нет на h1)
+                if tf in IND_TF_MAP["MFI"] and ("mfi14" in vals[tf]):
+                    b = _bin_0_100_step5(vals[tf]["mfi14"])
+                    if b is not None:
+                        await _upsert_tf(conn, strategy_id, direction, marker3, "MFI", tf, b, pnl, is_win)
+                        mfi_bins[tf] = b
+                # ADX (нет на h1)
+                if tf in IND_TF_MAP["ADX"] and ("adx_dmi14_adx" in vals[tf]):
+                    b = _bin_0_100_step5(vals[tf]["adx_dmi14_adx"])
+                    if b is not None:
+                        await _upsert_tf(conn, strategy_id, direction, marker3, "ADX", tf, b, pnl, is_win)
+                        adx_bins[tf] = b
+                # BB (нужны три уровня)
+                if tf in IND_TF_MAP["BB"] and all(k in vals[tf] for k in PARAMS["BB"]):
+                    b = _bb_sector(entry_price, vals[tf]["bb20_2_0_lower"], vals[tf]["bb20_2_0_center"], vals[tf]["bb20_2_0_upper"])
+                    if b is not None:
+                        await _upsert_tf(conn, strategy_id, direction, marker3, "BB", tf, b, pnl, is_win)
+                        bb_bins[tf] = b
 
-            # 8) апдейты per-TF
-            for ind in ('RSI','MFI','ADX','BB'):
-                await upsert_tf(ind, 'm5',  tf_bins[ind]['m5'])
-                await upsert_tf(ind, 'm15', tf_bins[ind]['m15'])
-                await upsert_tf(ind, 'h1',  tf_bins[ind]['h1'])
+            # --- COMPOSITE агрегаты ---
+            # RSI/BB → m5-m15-h1 если все три bins есть
+            if all(tf in rsi_bins for tf in ("m5", "m15", "h1")):
+                triplet = f"{rsi_bins['m5']}-{rsi_bins['m15']}-{rsi_bins['h1']}"
+                await _upsert_comp(conn, strategy_id, direction, marker3, "RSI", triplet, pnl, is_win)
+            if all(tf in bb_bins for tf in ("m5", "m15", "h1")):
+                triplet = f"{bb_bins['m5']}-{bb_bins['m15']}-{bb_bins['h1']}"
+                await _upsert_comp(conn, strategy_id, direction, marker3, "BB", triplet, pnl, is_win)
 
-            # 9) апдейты composite
-            for ind in ('RSI','MFI','ADX','BB'):
-                await upsert_comp(ind, comp_bins[ind])
+            # MFI/ADX → композит только m5-m15 (фиксированный порядок)
+            if all(tf in mfi_bins for tf in ("m5", "m15")):
+                pair = f"{mfi_bins['m5']}-{mfi_bins['m15']}"
+                await _upsert_comp(conn, strategy_id, direction, marker3, "MFI", pair, pnl, is_win)
+            if all(tf in adx_bins for tf in ("m5", "m15")):
+                pair = f"{adx_bins['m5']}-{adx_bins['m15']}"
+                await _upsert_comp(conn, strategy_id, direction, marker3, "ADX", pair, pnl, is_win)
 
-            # 10) отметка позиции
+            # если вообще ничего не удалось записать — пусть вернём причину
+            wrote_any = any([rsi_bins, mfi_bins, adx_bins, bb_bins])
+            if not wrote_any:
+                return False, "no_bins"
+
+            # отметим позицию как учтённую индикаторным агрегатором
             await conn.execute("""
                 UPDATE positions_v4
                 SET mrk_indwatch_checked = true
@@ -256,10 +277,8 @@ async def _process_closed_position(position_uid: str):
 
             return True, "ok"
 
-
 # 🔸 Чтение стрима и обработка closed
 async def run_oracle_indicatorwatcher_aggregator():
-    # ensure group
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
         log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
@@ -294,8 +313,6 @@ async def run_oracle_indicatorwatcher_aggregator():
                             continue
 
                         pos_uid = data.get("position_uid")
-                        log.info("[IND-STAGE2] closed pos=%s", pos_uid)
-
                         ok, reason = await _process_closed_position(pos_uid)
                         if not ok and reason != "skip":
                             log.info("[IND-DEFER] pos=%s reason=%s", pos_uid, reason)
