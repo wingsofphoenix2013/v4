@@ -27,10 +27,10 @@ log = logging.getLogger("ORACLE_MW_AGG")
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -69,15 +69,15 @@ async def _process_closed_position(position_uid: str, strategy_id_str: str):
                 FOR UPDATE
             """, position_uid)
             if not pos:
-                log.info("[SKIP] pos_uid=%s не найдена в positions_v4", position_uid)
+                log.debug("[SKIP] pos_uid=%s не найдена в positions_v4", position_uid)
                 return
 
             if pos["status"] != "closed":
-                log.info("[SKIP] pos_uid=%s статус не 'closed' (%s)", position_uid, pos["status"])
+                log.debug("[SKIP] pos_uid=%s статус не 'closed' (%s)", position_uid, pos["status"])
                 return
 
             if pos["checked"]:
-                log.info("[SKIP] pos_uid=%s уже отмечена mrk_watcher_checked=true", position_uid)
+                log.debug("[SKIP] pos_uid=%s уже отмечена mrk_watcher_checked=true", position_uid)
                 return
 
             # 2) Проверяем, что стратегия активна и market_watcher=true
@@ -87,7 +87,7 @@ async def _process_closed_position(position_uid: str, strategy_id_str: str):
                 WHERE id = $1
             """, int(pos["strategy_id"]))
             if not strat or not strat["enabled"] or not strat["mw"]:
-                log.info("[SKIP] pos_uid=%s: стратегия %s не активна для market_watcher", position_uid, pos["strategy_id"])
+                log.debug("[SKIP] pos_uid=%s: стратегия %s не активна для market_watcher", position_uid, pos["strategy_id"])
                 # помечать checked нельзя — её вообще не учитываем
                 return
 
@@ -108,7 +108,7 @@ async def _process_closed_position(position_uid: str, strategy_id_str: str):
             markers = {r["timeframe"]: r["regime_code"] for r in rows}
             if not all(tf in markers for tf in ("m5","m15","h1")):
                 # Не все готовы — отложим на бэкофилл
-                log.info("[DEFER] pos_uid=%s: не все маркеры доступны (m5=%s, m15=%s, h1=%s)",
+                log.debug("[DEFER] pos_uid=%s: не все маркеры доступны (m5=%s, m15=%s, h1=%s)",
                          position_uid, markers.get("m5"), markers.get("m15"), markers.get("h1"))
                 return
 
@@ -174,9 +174,9 @@ async def _process_closed_position(position_uid: str, strategy_id_str: str):
             "winrate": float(winrate)  # или строкой с 4 знаками: format(winrate, ".4f")
         })
         await infra.redis_client.set(stat_key(int(pos["strategy_id"]), direction, marker3_code), value)
-        log.info("[AGG] strat=%s dir=%s marker=%s → closed=%d won=%d winrate=%.4f avg_pnl=%s",
+        log.debug("[AGG] strat=%s dir=%s marker=%s → closed=%d won=%d winrate=%.4f avg_pnl=%s",
                  pos["strategy_id"], direction, marker3_code, closed_trades, won_trades, float(winrate), str(avg_pnl))
-        log.info("[SET] %s = %s", stat_key(int(pos["strategy_id"]), direction, marker3_code), value)
+        log.debug("[SET] %s = %s", stat_key(int(pos["strategy_id"]), direction, marker3_code), value)
     except Exception as e:
         log.exception("❌ Ошибка публикации Redis-ключа для стратегии %s / %s / %s: %s",
                       pos["strategy_id"], direction, marker3_code, e)
@@ -185,7 +185,7 @@ async def _process_closed_position(position_uid: str, strategy_id_str: str):
 # 🔸 Запуск агрегатора: XREADGROUP, обработка только status='closed'
 async def run_oracle_marketwatcher_aggregator():
     await _ensure_group()
-    log.info("🚀 Этап 2: слушаем stream '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 Этап 2: слушаем stream '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
 
     while True:
         try:
@@ -211,7 +211,7 @@ async def run_oracle_marketwatcher_aggregator():
                         position_uid = data.get("position_uid")
                         strategy_id_str = data.get("strategy_id")
 
-                        log.info("[STAGE2] closed-event: pos=%s strat=%s", position_uid, strategy_id_str)
+                        log.debug("[STAGE2] closed-event: pos=%s strat=%s", position_uid, strategy_id_str)
 
                         # транзакционная обработка
                         await _process_closed_position(position_uid, strategy_id_str)
@@ -226,7 +226,7 @@ async def run_oracle_marketwatcher_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ Аггрегатор остановлен")
+            log.debug("⏹️ Аггрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ Ошибка XREADGROUP: %s", e)
