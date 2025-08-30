@@ -5,7 +5,8 @@ import asyncio
 import logging
 
 import infra
-from infra import set_enabled_tickers, (
+from infra import (
+    set_enabled_tickers,
     set_market_watcher_strategies,
     add_market_watcher_strategy,
     remove_market_watcher_strategy,
