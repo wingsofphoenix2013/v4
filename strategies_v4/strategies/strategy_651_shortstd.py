@@ -9,7 +9,7 @@ class Strategy651Shortstd:
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
 
-        if direction == "shortstd":
+        if direction == "short":
             return True
         elif direction == "long":
             return ("ignore", "long сигналы отключены")
