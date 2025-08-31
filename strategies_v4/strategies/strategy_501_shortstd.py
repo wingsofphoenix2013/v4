@@ -1,7 +1,7 @@
 # strategy_501_shortstd.py
 
-importstd logging
-importstd json
+import logging
+import json
 
 log = logging.getLogger("strategy_501_shortstd")
 
