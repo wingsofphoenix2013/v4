@@ -11,8 +11,8 @@ import time
 import infra
 
 # 🔸 Параметры бэкофилла
-START_DELAY_SEC = int(os.getenv("ORACLE_MW_BF_START_DELAY_SEC", "120"))  # 2 минуты до первого прогона
-BF_BATCH_LIMIT = int(os.getenv("ORACLE_MW_BF_BATCH_LIMIT", "200"))       # размер батча
+START_DELAY_SEC = int(os.getenv("ORACLE_MW_BF_START_DELAY_SEC", "120"))   # 2 минуты до первого прогона
+BF_BATCH_LIMIT = int(os.getenv("ORACLE_MW_BF_BATCH_LIMIT", "200"))        # размер батча
 BF_SLEEP_BETWEEN_BATCH_MS = int(os.getenv("ORACLE_MW_BF_SLEEP_BETWEEN_BATCH_MS", "100"))
 BF_MAX_RUN_SECONDS = int(os.getenv("ORACLE_MW_BF_MAX_RUN_SECONDS", "600"))  # бюджет времени на один проход (10 мин)
 
@@ -178,12 +178,17 @@ async def run_oracle_marketwatcher_backfill_once():
             break
 
         async with infra.pg_pool.acquire() as conn:
+            # ⚠️ Фильтруем кандидатов по стратегиям (enabled=true AND market_watcher=true),
+            # чтобы не зацикливаться на нерелевантных позициях
             rows = await conn.fetch("""
-                SELECT position_uid
-                FROM positions_v4
-                WHERE status = 'closed'
-                  AND COALESCE(mrk_watcher_checked, false) = false
-                ORDER BY created_at ASC
+                SELECT p.position_uid
+                FROM positions_v4 p
+                JOIN strategies_v4 s ON s.id = p.strategy_id
+                WHERE p.status = 'closed'
+                  AND COALESCE(p.mrk_watcher_checked, false) = false
+                  AND s.enabled = true
+                  AND COALESCE(s.market_watcher, false) = true
+                ORDER BY p.created_at ASC
                 LIMIT $1
             """, BF_BATCH_LIMIT)
 
