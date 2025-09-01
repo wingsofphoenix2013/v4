@@ -1,4 +1,4 @@
-# indicators_ema_status_live.py — ежеминутный on-demand EMA-status: Этап 4 (классификация t с snapshot-инстансами)
+# indicators_ema_status_live.py — ежеминутный on-demand EMA-status: Этап 5 (KV + композиты m5-m15-h1)
 
 import os
 import asyncio
@@ -21,6 +21,7 @@ EPS1 = float(os.getenv("EMA_STATUS_LIVE_EPS1", "0.02"))
 
 MAX_CONCURRENCY = int(os.getenv("EMA_STATUS_LIVE_MAX_CONCURRENCY", "16"))
 MAX_PER_SYMBOL = int(os.getenv("EMA_STATUS_LIVE_MAX_PER_SYMBOL", "2"))
+TTL_SEC = int(os.getenv("EMA_STATUS_LIVE_TTL_SEC", "120"))
 
 # 🔸 Вспомогательные мапы
 _STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
@@ -211,7 +212,6 @@ async def _features_t_via_snapshot(instances_tf: list, symbol: str, df: pd.DataF
     ema_t_map = {}
     for L, inst in ema_by_len.items():
         vals = await compute_snapshot_values_async(inst, symbol, df, precision)
-        # ожидаем ключ 'ema{L}'
         key = f"ema{L}"
         if key in vals:
             try:
@@ -233,8 +233,6 @@ async def _features_t_via_snapshot(instances_tf: list, symbol: str, df: pd.DataF
                 scale_t = vnum
         if scale_t is None and bb_20_2 is not None:
             v = await compute_snapshot_values_async(bb_20_2, symbol, df, precision)
-            # имя базовое bb20_2_0_* (с подчёркиванием вместо точки в std)
-            # ищем upper/lower
             bbu = None; bbl = None
             for k, s in (v or {}).items():
                 if k.endswith("_upper"):
@@ -286,7 +284,7 @@ def _classify(close_t: float, close_p: float,
 
     return code, STATE_LABELS[code], nd_t, d_t, delta_d
 
-# 🔸 Основной воркер (Этап 4: DF + prev + классификация; запись в KV — на Этапе 5)
+# 🔸 Основной воркер (Этап 5: запись индивидуальных KV + композиты)
 async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols):
     symbol_semaphores: dict[str, asyncio.Semaphore] = {}
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -298,6 +296,10 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
             log.debug("[TICK] start @ %s, symbols=%d", tick_iso, len(symbols))
 
             now_ms = int(datetime.utcnow().timestamp() * 1000)
+
+            # собираем коды для композитов: {(sym, L): {"m5":code, "m15":code, "h1":code}}
+            triplet_cache: dict[tuple, dict] = {}
+            cache_lock = asyncio.Lock()
 
             async def handle_pair(sym: str, tf: str):
                 async with gate:
@@ -324,10 +326,7 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                             close_t, ema_t_map, scale_t = await _features_t_via_snapshot(instances_tf, sym, df, precision, tf)
 
                             # prev из TS (с fallback через snapshot на df[:prev])
-                            # close_prev
                             close_prev = await _ts_get_exact(redis, _k_close(sym, tf), prev_ms)
-
-                            # scale_prev
                             if tf in ("m5", "m15"):
                                 atr_prev = await _ts_get_exact(redis, _k_atr(sym, tf), prev_ms)
                                 if atr_prev is not None and atr_prev > 0.0:
@@ -341,12 +340,10 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                                 bbl = await _ts_get_exact(redis, _k_bb(sym, tf, "lower"), prev_ms)
                                 scale_prev = (bbu - bbl) if (bbu is not None and bbl is not None) else None
 
-                            # ema_prev
                             ema_prev_map = {}
                             for L in EMA_LENS:
                                 ema_prev_map[L] = await _ts_get_exact(redis, _k_ema(sym, tf, L), prev_ms)
 
-                            # fallback prev через snapshot, если чего-то нет
                             if (close_prev is None) or (scale_prev is None) or any(ema_prev_map[L] is None for L in EMA_LENS):
                                 try:
                                     pos = df.index.get_loc(pd.to_datetime(prev_ms, unit="ms"))
@@ -354,16 +351,13 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                                 except KeyError:
                                     df_prev = df.iloc[:-1] if len(df) > 1 else df
 
-                                # close_prev
                                 if close_prev is None and not df_prev.empty:
                                     close_prev = float(df_prev["c"].iloc[-1])
 
-                                # scale_prev
                                 if scale_prev is None and not df_prev.empty:
                                     ema_by_len, atr14, bb_20_2 = _pick_required_instances(instances_tf, EMA_LENS)
                                     if tf in ("m5", "m15") and atr14 is not None:
                                         v = await compute_snapshot_values_async(atr14, sym, df_prev, precision)
-                                        vnum = None
                                         try:
                                             vnum = float(v.get("atr14")) if v and "atr14" in v else None
                                         except Exception:
@@ -381,7 +375,6 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                                         if bbu is not None and bbl is not None and (bbu - bbl) > 0.0:
                                             scale_prev = bbu - bbl
 
-                                # ema_prev
                                 if not df_prev.empty:
                                     ema_by_len, _, _ = _pick_required_instances(instances_tf, EMA_LENS)
                                     for L, inst in ema_by_len.items():
@@ -409,8 +402,18 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                                     continue
 
                                 code, label, nd, d, delta_d = cls
-                                log.info("[STATE] %s/%s ema%d code=%d label=%s nd=%.4f d=%.4f Δd=%.4f @ %s",
-                                         sym, tf, L, code, label, nd, d, delta_d, open_iso)
+                                # Этап 5: запись индивидуального статуса в KV
+                                key_ind = f"ind_live:{sym}:{tf}:ema{L}_status"
+                                try:
+                                    await redis.setex(key_ind, TTL_SEC, str(code))
+                                    log.info("[SET] %s=%s ttl=%ds", key_ind, code, TTL_SEC)
+                                except Exception as e:
+                                    log.error("[SETERR] %s err=%s", key_ind, e)
+
+                                # копим для композита
+                                async with cache_lock:
+                                    slot = triplet_cache.setdefault((sym, L), {})
+                                    slot[tf] = code
 
                         except Exception as e:
                             log.error("[PAIR] error %s/%s: %s", sym, tf, e, exc_info=True)
@@ -421,7 +424,22 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                     tasks.append(asyncio.create_task(handle_pair(sym, tf)))
 
             await asyncio.gather(*tasks)
-            log.debug("[TICK] end")
+
+            # 🔸 Формирование и запись композитов (m5-m15-h1) после обработки всех TF
+            written_triplets = 0
+            async with cache_lock:
+                for (sym, L), tf_map in triplet_cache.items():
+                    if all(t in tf_map for t in ("m5", "m15", "h1")):
+                        triplet_val = f"{tf_map['m5']}-{tf_map['m15']}-{tf_map['h1']}"
+                        key_trip = f"ind_live:{sym}:ema{L}_status_triplet"
+                        try:
+                            await redis.setex(key_trip, TTL_SEC, triplet_val)
+                            written_triplets += 1
+                            log.info("[SET] %s=%s ttl=%ds", key_trip, triplet_val, TTL_SEC)
+                        except Exception as e:
+                            log.error("[SETERR] %s err=%s", key_trip, e)
+
+            log.debug("[TICK] end, triplets=%d", written_triplets)
 
         except Exception as e:
             log.error("loop error: %s", e, exc_info=True)
