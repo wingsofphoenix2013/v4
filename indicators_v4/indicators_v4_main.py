@@ -16,12 +16,8 @@ from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
 from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
-# from position_agregator_worker import run_position_aggregator_worker, run_position_aggregator_backfill_daemon
-# from position_emapattern_worker import run_position_emapattern_worker
-# from position_emapattern_backfill_worker import run_position_emapattern_backfill_worker
-# from position_decision_maker import run_position_decision_maker
 from indicators_market_watcher import run_market_watcher
-# from indicators_market_watcher_backfill import run_market_watcher_backfill_regular
+from indicators_ema_status import run_indicators_ema_status
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -416,13 +412,8 @@ async def main():
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
         run_safe_loop(lambda: run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision), "IND_POS_SNAPSHOT"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
-#         run_safe_loop(lambda: run_position_aggregator_worker(pg, redis), "IND_AGG"),
-#         run_safe_loop(lambda: run_position_aggregator_backfill_daemon(pg, redis, initial_delay=120, interval=3600, batch_size=200), "IND_AGG_BACKFILL"),
-#         run_safe_loop(lambda: run_position_emapattern_worker(pg, redis), "IND_EMA_PATTERN_DICT"),
-#         run_safe_loop(lambda: run_position_emapattern_backfill_worker(pg, redis), "IND_EMA_PATTERN_BACKFILL"),
-#         run_safe_loop(lambda: run_position_decision_maker(pg, redis), "POSITION_DECISION_MAKER"),
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
-#         run_safe_loop(lambda: run_market_watcher_backfill_regular(), "MR_WATCHER_BF_REG"),
+        run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
     )
 
 if __name__ == "__main__":
