@@ -406,7 +406,7 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                                 key_ind = f"ind_live:{sym}:{tf}:ema{L}_status"
                                 try:
                                     await redis.setex(key_ind, TTL_SEC, str(code))
-                                    log.info("[SET] %s=%s ttl=%ds", key_ind, code, TTL_SEC)
+                                    log.debug("[SET] %s=%s ttl=%ds", key_ind, code, TTL_SEC)
                                 except Exception as e:
                                     log.error("[SETERR] %s err=%s", key_ind, e)
 
@@ -435,7 +435,7 @@ async def run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_pre
                         try:
                             await redis.setex(key_trip, TTL_SEC, triplet_val)
                             written_triplets += 1
-                            log.info("[SET] %s=%s ttl=%ds", key_trip, triplet_val, TTL_SEC)
+                            log.debug("[SET] %s=%s ttl=%ds", key_trip, triplet_val, TTL_SEC)
                         except Exception as e:
                             log.error("[SETERR] %s err=%s", key_trip, e)
 
