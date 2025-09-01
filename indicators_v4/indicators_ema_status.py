@@ -285,7 +285,7 @@ async def handle_bucket(symbol: str, tf: str, open_time_ms: int, redis, pg):
     scale_p  = feats["scale_p"]
 
     if close_t is None or close_p is None or scale_t is None or scale_p is None:
-        log.info("[SKIP] %s/%s @ %d → missing close/scale", symbol, tf, open_time_ms)
+        log.debug("[SKIP] %s/%s @ %d → missing close/scale", symbol, tf, open_time_ms)
         return
 
     # предыдущий суффикс: в первой версии не храним, используем None → будет towards при малых Δ
@@ -306,23 +306,23 @@ async def handle_bucket(symbol: str, tf: str, open_time_ms: int, redis, pg):
         # публикация
         await _publish_status(redis, pg, symbol, tf, L, open_time_ms, code, label, nd, d, delta_d, EPS0, EPS1)
 
-        log.info("[STATE] %s/%s/ema%d @ %d → code=%d label=%s nd=%.4f d=%.4f Δd=%.4f",
+        log.debug("[STATE] %s/%s/ema%d @ %d → code=%d label=%s nd=%.4f d=%.4f Δd=%.4f",
                  symbol, tf, L, open_time_ms, code, label, nd, d, delta_d)
 
 # 🔸 Основной цикл: XREADGROUP по indicator_stream
 async def run_indicators_ema_status(pg, redis):
-    log.info("EMA Status: init consumer-group")
+    log.debug("EMA Status: init consumer-group")
     try:
         await redis.xgroup_create(READY_STREAM, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ consumer-group '%s' создана на '%s'", GROUP_NAME, READY_STREAM)
+        log.debug("✅ consumer-group '%s' создана на '%s'", GROUP_NAME, READY_STREAM)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ consumer-group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ consumer-group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ XGROUP CREATE error: %s", e)
             raise
 
-    log.info("🚀 Этап 3–4: слушаем '%s' (group=%s, consumer=%s)", READY_STREAM, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 Этап 3–4: слушаем '%s' (group=%s, consumer=%s)", READY_STREAM, GROUP_NAME, CONSUMER_NAME)
 
     while True:
         try:
@@ -359,7 +359,7 @@ async def run_indicators_ema_status(pg, redis):
                         if symbol not in symbol_semaphores:
                             symbol_semaphores[symbol] = asyncio.Semaphore(MAX_PER_SYMBOL)
 
-                        log.info("[READY] %s/%s @ %s → schedule EMA-status", symbol, tf, open_iso)
+                        log.debug("[READY] %s/%s @ %s → schedule EMA-status", symbol, tf, open_iso)
 
                         async def bucket_runner():
                             async with task_gate:
