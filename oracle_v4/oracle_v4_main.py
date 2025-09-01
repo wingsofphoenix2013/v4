@@ -18,6 +18,8 @@ from oracle_marketwatcher_aggregator import run_oracle_marketwatcher_aggregator
 from oracle_marketwatcher_backfill import run_oracle_marketwatcher_backfill_periodic
 from oracle_indicatorwatcher_aggregator import run_oracle_indicatorwatcher_aggregator
 from oracle_indicatorwatcher_backfill import run_oracle_indicatorwatcher_backfill_periodic
+from oracle_ema_snapshot_aggregator import run_oracle_ema_snapshot_aggregator
+from oracle_ema_snapshot_backfill import run_oracle_ema_snapshot_backfill_periodic
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -85,8 +87,9 @@ async def main():
         run_safe_loop(run_oracle_marketwatcher_backfill_periodic, "ORACLE_MW_BF"),
         run_safe_loop(run_oracle_indicatorwatcher_aggregator, "ORACLE_IND_MW_AGG"),
         run_safe_loop(run_oracle_indicatorwatcher_backfill_periodic, "ORACLE_IND_MW_BF"),
+        run_safe_loop(run_oracle_ema_snapshot_aggregator, "ORACLE_EMA_SNAP"),
+        run_safe_loop(run_oracle_ema_snapshot_backfill_periodic, "ORACLE_EMA_SNAP_BF"),
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())
