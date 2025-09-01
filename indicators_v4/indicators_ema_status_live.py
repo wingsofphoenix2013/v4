@@ -1,4 +1,4 @@
-# 🔸 indicators_ema_status_live.py — live: on-demand EMA-status для всех тикеров раз в минуту, публикация в Redis KV (без групп)
+# 🔸 indicators_ema_status_live.py — live: on-demand EMA-status для всех тикеров раз в минуту, публикация в Redis KV (через consumer-group)
 
 import os
 import asyncio
@@ -6,19 +6,25 @@ import json
 import logging
 from datetime import datetime, timezone
 
+# 🔸 Логгер
 log = logging.getLogger("EMA_STATUS_LIVE")
 
 # 🔸 Конфиг
 EMA_LENS = [int(x) for x in os.getenv("EMA_STATUS_EMA_LENS", "9,21,50,100,200").split(",")]
-INTERVAL_SEC = int(os.getenv("EMA_STATUS_LIVE_INTERVAL", "60"))
-CONCURRENCY  = int(os.getenv("EMA_STATUS_LIVE_CONCURRENCY", "8"))
-EPS0 = float(os.getenv("EMA_STATUS_EPS0", "0.05"))
-EPS1 = float(os.getenv("EMA_STATUS_EPS1", "0.02"))
-PRICE_KEY_FMT = os.getenv("EMA_STATUS_LIVE_PRICE_KEY_FMT", "mark:{symbol}:price")
+INTERVAL_SEC = int(os.getenv("EMA_STATUS_LIVE_INTERVAL", "60"))      # период пересчёта
+CONCURRENCY  = int(os.getenv("EMA_STATUS_LIVE_CONCURRENCY", "8"))    # параллелизм по тикерам
+EPS0 = float(os.getenv("EMA_STATUS_EPS0", "0.05"))                   # зона equal
+EPS1 = float(os.getenv("EMA_STATUS_EPS1", "0.02"))                   # значимое изменение ΔD
+
+# 🔹 КЛЮЧ ТЕКУЩЕЙ ЦЕНЫ — У ТЕБЯ: price:{symbol}
+PRICE_KEY_FMT = os.getenv("EMA_STATUS_LIVE_PRICE_KEY_FMT", "price:{symbol}")
 
 REQ_STREAM  = "indicator_request"
 RESP_STREAM = "indicator_response"
+RESP_GROUP  = os.getenv("EMA_STATUS_LIVE_RESP_GROUP", "ema_status_live")
+RESP_CONSUM = os.getenv("EMA_STATUS_LIVE_CONSUMER",   "ema_status_live_1")
 
+# 🔸 Маппинг кода → label
 STATE_LABELS = {
     0: "below_away",
     1: "below_towards",
@@ -27,7 +33,7 @@ STATE_LABELS = {
     4: "above_away",
 }
 
-# 🔸 утилиты времени
+# 🔸 Утилиты времени
 def _to_ms(dt: datetime) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
@@ -55,7 +61,7 @@ def kv_tf(symbol: str, tf: str, L: int) -> str:
 def kv_comp(symbol: str, L: int) -> str:
     return f"indlive:{symbol}:ema{L}_triplet"
 
-# 🔸 простое точечное чтение из TS
+# 🔸 Простой TS.RANGE точечного чтения
 async def ts_get(redis, key: str, ts_ms: int):
     try:
         r = await redis.execute_command("TS.RANGE", key, ts_ms, ts_ms)
@@ -65,8 +71,15 @@ async def ts_get(redis, key: str, ts_ms: int):
         log.debug("[TSERR] key=%s err=%s", key, e)
     return None
 
-# 🔸 загрузка instance_id для on-demand (EMA/ATR/BB), кеш в памяти
+# 🔸 Загрузка instance_id для on-demand (EMA/ATR/BB), кеш в памяти
 async def load_instance_map(pg) -> dict:
+    """
+    Возвращает структуру:
+    {
+      'm5':  {'ema': {9:id,...}, 'atr14': id_or_None, 'bb': id_bb},
+      'm15': {...}, 'h1': {'ema': {...}, 'atr14': None, 'bb': id_bb}
+    }
+    """
     out = {'m5': {'ema': {}, 'atr14': None, 'bb': None},
            'm15': {'ema': {}, 'atr14': None, 'bb': None},
            'h1': {'ema': {}, 'atr14': None, 'bb': None}}
@@ -101,14 +114,26 @@ async def load_instance_map(pg) -> dict:
         """)
         for r in rows:
             out[r['timeframe']]['bb'] = int(r['id'])
-    # лог диагностики
+    # Диагностика
     for tf in ('m5','m15','h1'):
         miss = [L for L in EMA_LENS if L not in out[tf]['ema']]
-        log.info("[LIVE] TF=%s EMA ids: %s; ATR14 id=%s; BB id=%s; missing EMA=%s",
+        log.info("[LIVE] TF=%s EMA ids=%s; ATR14 id=%s; BB id=%s; missing EMA=%s",
                  tf, out[tf]['ema'], out[tf]['atr14'], out[tf]['bb'], miss)
     return out
 
-# 🔸 отправить пакет on-demand запросов по TF на bar_open
+# 🔸 Создание consumer-group для indicator_response (идемпотентно)
+async def ensure_resp_group(redis):
+    try:
+        await redis.xgroup_create(RESP_STREAM, RESP_GROUP, id="$", mkstream=True)
+        log.info("✅ resp-group '%s' создана на '%s'", RESP_GROUP, RESP_STREAM)
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.info("ℹ️ resp-group '%s' уже существует", RESP_GROUP)
+        else:
+            log.exception("❌ XGROUP CREATE (resp) error: %s", e)
+            raise
+
+# 🔸 Отправить пакет on-demand запросов по TF на bar_open
 async def send_requests_for_tf(redis, symbol: str, tf: str, bar_open_ms: int, inst_map: dict) -> dict:
     pending = {}
     # EMA
@@ -127,7 +152,7 @@ async def send_requests_for_tf(redis, symbol: str, tf: str, bar_open_ms: int, in
             "instance_id": str(inst_map[tf]['atr14']), "timestamp_ms": str(bar_open_ms)
         })
         pending[req_id] = ('atr', None)
-    # BB 20/2.0 (upper/center/lower придут одним ответом)
+    # BB 20/2.0
     if inst_map[tf].get('bb'):
         req_id = await redis.xadd(REQ_STREAM, {
             "symbol": symbol, "timeframe": tf,
@@ -136,29 +161,37 @@ async def send_requests_for_tf(redis, symbol: str, tf: str, bar_open_ms: int, in
         pending[req_id] = ('bb', None)
     return pending
 
-# 🔸 дождаться ответов по нашим req_id через XREAD (без consumer-group)
-async def collect_responses(redis, pending: dict, timeout_ms: int = 1500) -> dict:
+# 🔸 Дождаться ответов через нашу consumer-group и собрать значения по нашим req_id
+async def collect_responses(redis, pending: dict, timeout_ms: int = 2000) -> dict:
     results = {'ema': {}, 'atr': None, 'bb': {}}
     want = set(pending.keys())
-    last_id = '$'  # читать только новые
     deadline = _to_ms(datetime.utcnow()) + timeout_ms
 
     while want and _to_ms(datetime.utcnow()) < deadline:
         try:
-            resp = await redis.xread({RESP_STREAM: last_id}, count=200, block=200)
+            resp = await redis.xreadgroup(
+                groupname=RESP_GROUP,
+                consumername=RESP_CONSUM,
+                streams={RESP_STREAM: ">"},
+                count=200,
+                block=200
+            )
         except Exception:
             resp = None
         if not resp:
             continue
+
+        to_ack = []
         for _, messages in resp:
             for msg_id, data in messages:
-                last_id = msg_id  # продвигаем курсор
+                to_ack.append(msg_id)
                 req_id = data.get("req_id")
                 if req_id not in want:
                     continue
                 if data.get("status") != "ok":
                     want.discard(req_id)
                     continue
+                # parse results
                 try:
                     parsed = json.loads(data.get("results", "{}"))
                 except Exception:
@@ -181,10 +214,16 @@ async def collect_responses(redis, pending: dict, timeout_ms: int = 1500) -> dic
                         elif "lower" in k:results['bb']['lower']  = float(v)
                         elif "center" in k:results['bb']['center'] = float(v)
                 want.discard(req_id)
-        # цикл пойдёт дальше до таймаута или пока все наши req_id не придут
+
+        if to_ack:
+            try:
+                await redis.xack(RESP_STREAM, RESP_GROUP, *to_ack)
+            except Exception:
+                pass
+
     return results
 
-# 🔸 классификация статуса (один TF×EMA)
+# 🔸 Классификация статуса (один TF×EMA)
 def classify(price_t, price_p, ema_t, ema_p, scale_t, scale_p) -> int | None:
     if None in (price_t, price_p, ema_t, ema_p, scale_t, scale_p):
         return None
@@ -205,39 +244,40 @@ def classify(price_t, price_p, ema_t, ema_p, scale_t, scale_p) -> int | None:
     else:
         return 3 if above else 1  # консервативно towards
 
-# 🔸 один символ целиком: on-demand по TF → статусы → KV
+# 🔸 Обработка одного символа: on-demand по TF → статусы → KV
 async def process_symbol(pg, redis, symbol: str, inst_map: dict):
     now_ms = _to_ms(datetime.utcnow())
-    tf_list = ('m5','m15','h1')
+    tf_list = ('m5', 'm15', 'h1')
 
     # цена сейчас
-    price_now = await redis.get(PRICE_KEY_FMT.format(symbol=symbol))
+    price_key = PRICE_KEY_FMT.format(symbol=symbol)
+    price_now = await redis.get(price_key)
     if price_now is None:
-        log.debug("[LIVE] %s: нет текущей цены (%s) → skip", symbol, PRICE_KEY_FMT.format(symbol=symbol))
+        log.info("[LIVE] %s: нет текущей цены (%s) → skip", symbol, price_key)
         return
     price_now = float(price_now)
 
     tf_status: dict[str, dict[int, int]] = {tf: {} for tf in tf_list}
 
     for tf in tf_list:
-        # проверка, что есть нужные инстансы
+        # проверка инстансов
         if not inst_map[tf]['ema'] or inst_map[tf]['bb'] is None or (tf in ('m5','m15') and inst_map[tf]['atr14'] is None):
-            # ATR на h1 не обязателен
             if tf == 'h1' and inst_map[tf]['bb'] is not None and inst_map[tf]['ema']:
                 pass
             else:
-                log.debug("[LIVE] %s/%s: нет инстансов EMA/BB/ATR → skip", symbol, tf)
+                log.info("[LIVE] %s/%s: нет инстансов EMA/BB/ATR → skip", symbol, tf)
                 continue
 
         bar_open = _floor_to_bar_ms(now_ms, tf)
         prev_ms  = _prev_bar_ms(bar_open, tf)
 
-        # отправить on-demand для текущего бара
+        # on-demand для текущего бара
         pending = await send_requests_for_tf(redis, symbol, tf, bar_open, inst_map)
-        od = await collect_responses(redis, pending, timeout_ms=1500)
+        od = await collect_responses(redis, pending, timeout_ms=2000)
 
         # prev из TS
         price_prev = await ts_get(redis, k_close(symbol, tf), prev_ms)
+
         # scale_prev
         if tf in ('m5','m15'):
             atr_prev = await ts_get(redis, k_atr(symbol, tf), prev_ms)
@@ -264,7 +304,7 @@ async def process_symbol(pg, redis, symbol: str, inst_map: dict):
             scale_now = (bu - bl) if (bu is not None and bl is not None and (bu - bl) > 0.0) else None
 
         if price_prev is None or scale_prev is None or scale_now is None:
-            log.debug("[LIVE] %s/%s: нет prev/scale → skip", symbol, tf)
+            log.info("[LIVE] %s/%s: нет prev/scale → skip", symbol, tf)
             continue
 
         # статусы по всем EMA длинам
@@ -280,7 +320,7 @@ async def process_symbol(pg, redis, symbol: str, inst_map: dict):
             except Exception:
                 pass
 
-    # композиты
+    # композиты по каждой L
     for L in EMA_LENS:
         if all(L in tf_status[tf] for tf in ('m5','m15','h1')):
             triplet = f"{tf_status['m5'][L]}-{tf_status['m15'][L]}-{tf_status['h1'][L]}"
@@ -289,12 +329,18 @@ async def process_symbol(pg, redis, symbol: str, inst_map: dict):
             except Exception:
                 pass
 
-# 🔸 основной цикл: раз в INTERVAL_SEC, параллельная обработка символов
+# 🔸 Основной цикл: раз в INTERVAL_SEC, параллельная обработка тикеров
 async def run_indicators_ema_status_live(pg, redis):
     log.info("🚀 EMA Status LIVE: interval=%ds, concurrency=%d, eps0=%.3f eps1=%.3f",
              INTERVAL_SEC, CONCURRENCY, EPS0, EPS1)
 
+    # ⚠️ создаём consumer-group для indicator_response (идемпотентно)
+    await ensure_resp_group(redis)
+
+    # грузим карту инстансов on-demand
     inst_map = await load_instance_map(pg)
+
+    # активные тикеры
     async with pg.acquire() as conn:
         rows = await conn.fetch("""
             SELECT symbol
@@ -302,6 +348,7 @@ async def run_indicators_ema_status_live(pg, redis):
             WHERE status='enabled' AND tradepermission='enabled'
         """)
     symbols = [r['symbol'] for r in rows]
+
     sem = asyncio.Semaphore(CONCURRENCY)
 
     while True:
@@ -315,7 +362,6 @@ async def run_indicators_ema_status_live(pg, redis):
         except Exception as e:
             log.exception("❌ LIVE loop error: %s", e)
 
-        # ждём до следующего интервала
         elapsed = (datetime.utcnow() - start).total_seconds()
         sleep_s = max(0.0, INTERVAL_SEC - elapsed)
         await asyncio.sleep(sleep_s)
