@@ -1,4 +1,4 @@
-# 🔸 indicators_ema_status_backfill.py — EMA Status backfill: 14 суток, батчи по времени, суммарные INFO-логи
+# 🔸 indicators_ema_status_backfill.py — EMA Status backfill: 14 суток, параллельно (4 воркера), бюджет 12 часов, перезапуск каждые 96 часов
 
 import os
 import asyncio
@@ -10,16 +10,18 @@ from decimal import Decimal, ROUND_HALF_UP
 log = logging.getLogger("EMA_STATUS_BF")
 
 # 🔸 Конфиг бэкофилла
-START_DELAY_SEC = int(os.getenv("EMA_STATUS_BF_START_DELAY_SEC", "120"))     # 2 мин до первого прогона
-BF_MAX_RUN_SECONDS = int(os.getenv("EMA_STATUS_BF_MAX_RUN_SECONDS", "900"))  # бюджет на цикл (15 мин)
-WINDOW_DAYS = int(os.getenv("EMA_STATUS_BF_WINDOW_DAYS", "14"))              # глубина истории
-BATCH_SLEEP_MS = int(os.getenv("EMA_STATUS_BF_SLEEP_MS", "100"))             # пауза между символами
-EMA_LENS = [int(x) for x in (os.getenv("EMA_STATUS_EMA_LENS", "9,21,50,100,200").split(","))]
-EPS0 = float(os.getenv("EMA_STATUS_EPS0", "0.05"))
-EPS1 = float(os.getenv("EMA_STATUS_EPS1", "0.02"))
-REQUIRED_TFS = ("m5", "m15", "h1")
+START_DELAY_SEC    = int(os.getenv("EMA_STATUS_BF_START_DELAY_SEC", "120"))       # 2 мин до первого прогона
+BF_MAX_RUN_SECONDS = int(os.getenv("EMA_STATUS_BF_MAX_RUN_SECONDS", "43200"))     # бюджет на цикл (12 часов)
+RESTART_EVERY_SEC  = int(os.getenv("EMA_STATUS_BF_RESTART_SEC",  str(96*3600)))   # 96 часов
+WINDOW_DAYS        = int(os.getenv("EMA_STATUS_BF_WINDOW_DAYS", "14"))            # глубина истории
+BATCH_SLEEP_MS     = int(os.getenv("EMA_STATUS_BF_SLEEP_MS", "50"))               # короткая пауза между заданиями
+MAX_CONCURRENCY    = int(os.getenv("EMA_STATUS_BF_CONCURRENCY", "4"))             # одновременных задач
+EMA_LENS           = [int(x) for x in (os.getenv("EMA_STATUS_EMA_LENS", "9,21,50,100,200").split(","))]
+EPS0               = float(os.getenv("EMA_STATUS_EPS0", "0.05"))
+EPS1               = float(os.getenv("EMA_STATUS_EPS1", "0.02"))
+REQUIRED_TFS       = ("m5", "m15", "h1")
 
-RETENTION_TS_MS = 14 * 24 * 60 * 60 * 1000  # 14d
+RETENTION_TS_MS    = 14 * 24 * 60 * 60 * 1000  # 14d
 
 # 🔸 Ключи TS
 def k_close(sym: str, tf: str) -> str:
@@ -77,8 +79,8 @@ def classify(close_t: float, close_p: float,
 
     nd_t = (close_t - ema_t) / scale_t
     nd_p = (close_p - ema_p) / scale_p
-    d_t = abs(nd_t)
-    d_p = abs(nd_p)
+    d_t  = abs(nd_t)
+    d_p  = abs(nd_p)
     delta_d = d_t - d_p
 
     if d_t <= eps0:
@@ -90,7 +92,7 @@ def classify(close_t: float, close_p: float,
     elif delta_d <= -eps1:
         code = 3 if above else 1
     else:
-        # без памяти суффикса, консервативно towards
+        # без памяти суффикса — консервативно towards
         code = 3 if above else 1
 
     return code, STATE_LABELS[code], nd_t, d_t, delta_d
@@ -135,7 +137,7 @@ async def publish_one(redis, pg, symbol: str, tf: str, L: int, t_ms: int,
     except Exception as e:
         log.debug("[PG] upsert err %s/%s/ema%d @ %s: %s", symbol, tf, L, _to_dt(t_ms), e)
 
-# 🔸 Прогон одного символа × TF
+# 🔸 Прогон одного символа × TF за окно
 async def backfill_symbol_tf(pg, redis, symbol: str, tf: str, start_ms: int, end_ms: int) -> tuple[int, int]:
     step = _tf_step_ms(tf)
     # серийные данные
@@ -149,7 +151,6 @@ async def backfill_symbol_tf(pg, redis, symbol: str, tf: str, start_ms: int, end
     bb_up = await ts_range_map(redis, k_bb(symbol, tf, "upper"), start_ms - step, end_ms)
     bb_lo = await ts_range_map(redis, k_bb(symbol, tf, "lower"), start_ms - step, end_ms)
 
-    # набор баров по close
     bars = sorted(ts for ts in close_map.keys() if start_ms <= ts <= end_ms)
     processed = 0
     skipped = 0
@@ -158,7 +159,7 @@ async def backfill_symbol_tf(pg, redis, symbol: str, tf: str, start_ms: int, end
         t_prev = t - step
         close_t = close_map.get(t)
         close_p = close_map.get(t_prev)
-        # масштабы
+
         if need_atr:
             scale_t = atr_map.get(t) if atr_map.get(t, 0.0) > 0.0 else (
                 (bb_up.get(t) - bb_lo.get(t)) if (t in bb_up and t in bb_lo and (bb_up[t] - bb_lo[t]) > 0.0) else None
@@ -174,7 +175,6 @@ async def backfill_symbol_tf(pg, redis, symbol: str, tf: str, start_ms: int, end
             skipped += 1
             continue
 
-        # по всем EMA длинам
         for L in EMA_LENS:
             ema_t = ema_maps[L].get(t)
             ema_p = ema_maps[L].get(t_prev)
@@ -189,7 +189,7 @@ async def backfill_symbol_tf(pg, redis, symbol: str, tf: str, start_ms: int, end
 
     return processed, skipped
 
-# 🔸 Получение списка активных символов из БД
+# 🔸 Получение списка активных символов
 async def load_active_symbols(pg) -> list[str]:
     async with pg.acquire() as conn:
         rows = await conn.fetch("""
@@ -199,7 +199,7 @@ async def load_active_symbols(pg) -> list[str]:
         """)
     return [r["symbol"] for r in rows]
 
-# 🔸 Один проход бэкофилла за WINDOW_DAYS
+# 🔸 Один прогон бэкофилла за WINDOW_DAYS (с параллелизмом)
 async def run_indicators_ema_status_backfill_once(pg, redis):
     end_dt = datetime.utcnow()
     start_dt = end_dt - timedelta(days=WINDOW_DAYS)
@@ -207,32 +207,60 @@ async def run_indicators_ema_status_backfill_once(pg, redis):
     start_ms = int(start_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
     symbols = await load_active_symbols(pg)
+    pairs = [(sym, tf) for sym in symbols for tf in REQUIRED_TFS]
+
+    start_time = datetime.utcnow()
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
     processed_total = 0
     skipped_total = 0
-    started = datetime.utcnow()
+    done = 0
 
-    for sym in symbols:
-        for tf in REQUIRED_TFS:
+    async def worker(sym: str, tf: str):
+        nonlocal processed_total, skipped_total, done
+        # бюджет: если истёк — не стартуем новые
+        if BF_MAX_RUN_SECONDS > 0:
+            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            if elapsed >= BF_MAX_RUN_SECONDS:
+                return
+        async with sem:
             try:
-                processed, skipped = await backfill_symbol_tf(pg, redis, sym, tf, start_ms, end_ms)
-                processed_total += processed
-                skipped_total += skipped
+                p, s = await backfill_symbol_tf(pg, redis, sym, tf, start_ms, end_ms)
+                processed_total += p
+                skipped_total += s
             except Exception as e:
                 log.debug("[BF] error %s/%s: %s", sym, tf, e)
-        await asyncio.sleep(BATCH_SLEEP_MS / 1000)
+            finally:
+                done += 1
+                if done % 10 == 0:
+                    log.info("[BF] progress: pairs_done=%d/%d processed=%d skipped=%d",
+                             done, len(pairs), processed_total, skipped_total)
+                await asyncio.sleep(BATCH_SLEEP_MS / 1000)
 
-        # бюджет времени
-        if (datetime.utcnow() - started).total_seconds() >= BF_MAX_RUN_SECONDS:
-            log.info("[BF] time budget reached: processed=%d skipped=%d symbols_done=%d",
-                     processed_total, skipped_total, symbols.index(sym) + 1)
-            return
+    tasks = [asyncio.create_task(worker(sym, tf)) for sym, tf in pairs]
 
-    log.info("[BF] finished: processed=%d skipped=%d symbols=%d", processed_total, skipped_total, len(symbols))
+    # Если бюджет задан и может истечь, мониторим
+    if BF_MAX_RUN_SECONDS > 0:
+        while True:
+            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            if elapsed >= BF_MAX_RUN_SECONDS:
+                log.info("[BF] time budget reached: processed=%d skipped=%d pairs_done=%d/%d",
+                         processed_total, skipped_total, done, len(pairs))
+                # Отменять текущие таски не будем — пусть корректно завершатся те, что уже стартовали.
+                break
+            if all(t.done() for t in tasks):
+                break
+            await asyncio.sleep(2)
 
-# 🔸 Периодический цикл: старт через 2 минуты, далее каждый час
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    if BF_MAX_RUN_SECONDS == 0 or all(t.done() for t in tasks):
+        log.info("[BF] finished: processed=%d skipped=%d pairs=%d", processed_total, skipped_total, len(pairs))
+
+# 🔸 Периодический цикл: старт через 2 минуты, далее каждые 96 часов
 async def run_indicators_ema_status_backfill(pg, redis):
-    log.info("🚀 EMA Status BF: старт через %d с, окно %d дней, бюджет %d с",
-             START_DELAY_SEC, WINDOW_DAYS, BF_MAX_RUN_SECONDS)
+    log.info("🚀 EMA Status BF: старт через %d с, окно %d дней, бюджет %d с, параллелизм %d, цикл %d ч",
+             START_DELAY_SEC, WINDOW_DAYS, BF_MAX_RUN_SECONDS, MAX_CONCURRENCY, RESTART_EVERY_SEC // 3600)
     await asyncio.sleep(START_DELAY_SEC)
     while True:
         try:
@@ -242,4 +270,6 @@ async def run_indicators_ema_status_backfill(pg, redis):
             raise
         except Exception as e:
             log.exception("❌ EMA Status BF error: %s", e)
-        await asyncio.sleep(3600)  # час
+
+        # Спим 96 часов (или как задано), затем следующий цикл
+        await asyncio.sleep(RESTART_EVERY_SEC)
