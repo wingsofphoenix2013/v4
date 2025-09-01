@@ -19,7 +19,7 @@ from cleanup_worker import run_indicators_cleanup
 from indicators_market_watcher import run_market_watcher
 from indicators_ema_status import run_indicators_ema_status
 from indicators_ema_status_backfill import run_indicators_ema_status_backfill
-# from indicators_ema_status_live import run_indicators_ema_status_live
+from indicators_ema_status_live import run_indicators_ema_status_live
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -49,7 +49,10 @@ def get_instances_by_tf(tf: str):
 
 def get_precision(symbol: str) -> int:
     return active_tickers.get(symbol, 8)
-    
+
+def get_active_symbols():
+    return list(active_tickers.keys())
+
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
     log = logging.getLogger("INIT")
@@ -417,7 +420,7 @@ async def main():
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
         run_safe_loop(lambda: run_indicators_ema_status_backfill(pg, redis), "EMA_STATUS_BF"),
-#         run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis), "EMA_STATUS_LIVE"),
+        run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
     )
 
 if __name__ == "__main__":
