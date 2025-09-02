@@ -61,10 +61,10 @@ async def _process_uid(uid: str):
 async def run_oracle_rsibins_snapshot_backfill():
     # задержка старта, чтобы не конкурировать с другими инстансами
     if START_DELAY_SEC > 0:
-        log.info("⏳ RSI-BINS BF: задержка старта %d сек", START_DELAY_SEC)
+        log.debug("⏳ RSI-BINS BF: задержка старта %d сек", START_DELAY_SEC)
         await asyncio.sleep(START_DELAY_SEC)
 
-    log.info("🚀 RSI-BINS BF: старт, batch=%d, max_conc=%d, sleep=%dms",
+    log.debug("🚀 RSI-BINS BF: старт, batch=%d, max_conc=%d, sleep=%dms",
              BATCH_SIZE, MAX_CONCURRENCY, SLEEP_MS)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -92,11 +92,11 @@ async def run_oracle_rsibins_snapshot_backfill():
             skipped = sum(1 for r in results if r[0] == "skip")
             errors  = sum(1 for r in results if r[0] == "error")
 
-            log.info("[RSI-BINS BF] batch_done total=%d updated=%d skipped=%d errors=%d",
+            log.debug("[RSI-BINS BF] batch_done total=%d updated=%d skipped=%d errors=%d",
                      len(results), updated, skipped, errors)
 
         except asyncio.CancelledError:
-            log.info("⏹️ RSI-BINS backfill остановлен")
+            log.debug("⏹️ RSI-BINS backfill остановлен")
             raise
         except Exception as e:
             log.exception("❌ RSI-BINS BF loop error: %s", e)
