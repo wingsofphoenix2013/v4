@@ -1,4 +1,4 @@
-# oracle_rsibins_snapshot_aggregator.py — RSI-bins snapshot агрегатор: Этап 2 (чтение позиции + валидация стратегии/флага)
+# oracle_rsibins_snapshot_aggregator.py — RSI-bins snapshot агрегатор: Этап 3 (чтение rsi14 из PIS и биннинг)
 
 import os
 import asyncio
@@ -59,10 +59,38 @@ async def _load_position_and_strategy(position_uid: str):
             if not strat or not strat["enabled"] or not strat["mw"]:
                 return pos, strat, ("skip", "strategy_inactive_or_no_mw")
 
-            # На Этапе 2: только подтверждаем, что позиция подходит для дальнейшей агрегации
             return pos, strat, ("ok", "eligible")
 
-# 🔸 Основной цикл: читаем закрытия; Этап 1 лог → debug, Этап 2 — info на результат валидации
+# 🔸 Этап 3: чтение rsi14 из PIS и биннинг по корзинам
+async def _load_rsi_bins(position_uid: str):
+    pg = infra.pg_pool
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT timeframe, value_num
+            FROM positions_indicators_stat
+            WHERE position_uid = $1
+              AND using_current_bar = true
+              AND param_name = 'rsi14'
+              AND timeframe IN ('m5','m15','h1')
+        """, position_uid)
+
+    per_tf_bins = {}
+    for r in rows:
+        tf = r["timeframe"]
+        val = r["value_num"]
+        if val is None:
+            continue
+        # клип в [0,100]
+        v = max(0.0, min(100.0, float(val)))
+        # бинирование шагом 5
+        bin_val = int(v // 5) * 5
+        if bin_val == 100:  # крайнее значение уходит в 95
+            bin_val = 95
+        per_tf_bins[tf] = bin_val
+
+    return per_tf_bins
+
+# 🔸 Основной цикл
 async def run_oracle_rsibins_snapshot_aggregator():
     await _ensure_group()
     log.info("🚀 RSI-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
@@ -88,16 +116,17 @@ async def run_oracle_rsibins_snapshot_aggregator():
                             continue
 
                         pos_uid = data.get("position_uid")
-                        # Этап 1 был info → теперь debug
                         log.debug("[RSI-BINS SNAP] closed position received: uid=%s", pos_uid)
 
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
 
                         if v_code == "ok":
-                            log.info("[RSI-BINS SNAP] eligible uid=%s strat=%s dir=%s pnl=%s",
-                                     pos["position_uid"], pos["strategy_id"], pos["direction"], pos["pnl"])
-                            # На следующем этапе здесь начнём вытягивать rsi14 из PIS и обновлять агрегаты.
+                            bins = await _load_rsi_bins(pos_uid)
+                            if not bins:
+                                log.info("[RSI-BINS SNAP] skip uid=%s reason=no_rsi14", pos_uid)
+                            else:
+                                log.info("[RSI-BINS SNAP] rsi_bins uid=%s %s", pos_uid, bins)
                         else:
                             log.info("[RSI-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
 
