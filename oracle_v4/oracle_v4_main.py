@@ -22,6 +22,7 @@ from oracle_ema_snapshot_aggregator import run_oracle_ema_snapshot_aggregator
 from oracle_ema_snapshot_backfill import run_oracle_ema_snapshot_backfill_periodic
 from oracle_rsibins_snapshot_aggregator import run_oracle_rsibins_snapshot_aggregator
 from oracle_rsibins_snapshot_backfill import run_oracle_rsibins_snapshot_backfill
+from oracle_bbbins_snapshot_aggregator import run_oracle_bbbins_snapshot_aggregator
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -93,6 +94,7 @@ async def main():
         run_safe_loop(run_oracle_ema_snapshot_backfill_periodic, "ORACLE_EMA_SNAP_BF"),
         run_safe_loop(run_oracle_rsibins_snapshot_aggregator, "RSIBINS_SNAP"),
         run_safe_loop(run_oracle_rsibins_snapshot_backfill, "RSI_BINS_BF"),
+        run_safe_loop(run_oracle_bbbins_snapshot_aggregator, "BB_BINS_SNAP"),
     )
 
 if __name__ == "__main__":
