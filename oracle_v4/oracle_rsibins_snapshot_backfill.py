@@ -1,11 +1,10 @@
-# oracle_rsibins_snapshot_backfill.py — RSI-bins backfill: Этап B (обработка UID'ов, апдейт агрегатов)
+# oracle_rsibins_snapshot_backfill.py — RSI-bins backfill: Этап 3 (задержка старта + полировка логов)
 
 import os
 import asyncio
 import logging
 
 import infra
-# переиспользуем готовые функции из онлайн-агрегатора
 from oracle_rsibins_snapshot_aggregator import (
     _load_position_and_strategy,
     _load_rsi_bins,
@@ -18,6 +17,7 @@ log = logging.getLogger("ORACLE_RSIBINS_BF")
 BATCH_SIZE        = int(os.getenv("RSI_BF_BATCH_SIZE", "200"))
 MAX_CONCURRENCY   = int(os.getenv("RSI_BF_MAX_CONCURRENCY", "8"))
 SLEEP_MS          = int(os.getenv("RSI_BF_SLEEP_MS", "200"))
+START_DELAY_SEC   = int(os.getenv("RSI_BF_START_DELAY_SEC", "120"))
 
 _CANDIDATES_SQL = """
 SELECT p.position_uid
@@ -38,7 +38,7 @@ async def _fetch_candidates(batch_size: int):
         rows = await conn.fetch(_CANDIDATES_SQL, batch_size)
     return [r["position_uid"] for r in rows]
 
-# 🔸 Обработать один UID (валидация → rsi_bins → апдейт)
+# 🔸 Обработать один UID
 async def _process_uid(uid: str):
     try:
         pos, strat, verdict = await _load_position_and_strategy(uid)
@@ -57,10 +57,16 @@ async def _process_uid(uid: str):
         log.exception("❌ BF uid=%s error: %s", uid, e)
         return ("error", "exception", uid)
 
-# 🔸 Основной цикл backfill'а (Этап B: обработка пачек, сводка)
+# 🔸 Основной цикл backfill'а
 async def run_oracle_rsibins_snapshot_backfill():
+    # задержка старта, чтобы не конкурировать с другими инстансами
+    if START_DELAY_SEC > 0:
+        log.info("⏳ RSI-BINS BF: задержка старта %d сек", START_DELAY_SEC)
+        await asyncio.sleep(START_DELAY_SEC)
+
     log.info("🚀 RSI-BINS BF: старт, batch=%d, max_conc=%d, sleep=%dms",
              BATCH_SIZE, MAX_CONCURRENCY, SLEEP_MS)
+
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
@@ -70,7 +76,7 @@ async def run_oracle_rsibins_snapshot_backfill():
                 await asyncio.sleep(SLEEP_MS / 1000)
                 continue
 
-            # план обработки
+            # план пачки — теперь в DEBUG
             log.debug("[RSI-BINS BF] planned uids=%d (пример: %s)", len(uids), uids[:3])
 
             results = []
@@ -79,10 +85,9 @@ async def run_oracle_rsibins_snapshot_backfill():
                     res = await _process_uid(uid)
                     results.append(res)
 
-            tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*[asyncio.create_task(worker(uid)) for uid in uids])
 
-            # сводка
+            # сводка — INFO
             updated = sum(1 for r in results if r[0] == "updated")
             skipped = sum(1 for r in results if r[0] == "skip")
             errors  = sum(1 for r in results if r[0] == "error")
