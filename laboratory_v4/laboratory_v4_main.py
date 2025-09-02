@@ -6,6 +6,7 @@ import logging
 from laboratory_v4_infra import setup_logging, init_pg_pool, init_redis_client, run_safe_loop
 from laboratory_v4_config import LAB_START_DELAY_SEC, LAB_REFRESH_SEC
 from laboratory_v4_repo import load_active_strategies, load_active_tickers
+from lab_seeder_adx import seed as seed_adx
 
 log = logging.getLogger("LAB_MAIN")
 
@@ -30,7 +31,7 @@ async def refresher(pg):
             active_tickers.clear()
             active_tickers.extend(tickers)
 
-            log.info(f"✅ Загрузлено стратегий: {len(active_strategies)} | тикеров: {len(active_tickers)}")
+            log.info(f"✅ Загружено стратегий: {len(active_strategies)} | тикеров: {len(active_tickers)}")
         except Exception as e:
             log.error(f"❌ Ошибка обновления кешей: {e}", exc_info=True)
 
@@ -43,10 +44,18 @@ async def main():
     pg    = await init_pg_pool()
     _redis = await init_redis_client()  # подключение держим живым; на будущее пригодится
 
+    # 🔸 один раз прогоняем сидер ADX (идемпотентно)
+    try:
+        log.info("🧩 ADX seeder: запуск")
+        await seed_adx(pg)
+        log.info("🧩 ADX seeder: завершён")
+    except Exception as e:
+        log.error(f"❌ ADX seeder error: {e}", exc_info=True)
+
     # здесь позже добавим планировщики/раннеры тестов
     await asyncio.gather(
         run_safe_loop(lambda: refresher(pg), "CONFIG_LOADER"),
-    )
+        # r
 
 if __name__ == "__main__":
     asyncio.run(main())
