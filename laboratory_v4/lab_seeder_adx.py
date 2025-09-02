@@ -107,19 +107,25 @@ async def ensure_adx_params(conn, lab_id: int, variant: str, tfs: list[str]):
         await upsert_param(conn, lab_id, 'adx', 'solo', tf, spec)
 
 async def upsert_param(conn, lab_id: int, test_name: str, test_type: str, test_tf: str | None, param_spec: dict):
+    import json as _json
+
     row = await conn.fetchrow("""
-        SELECT id FROM laboratory_parameters_v4
-         WHERE lab_id=$1 AND test_name=$2 AND test_type=$3
-           AND ((test_tf IS NULL AND $4 IS NULL) OR (test_tf = $4))
+        SELECT id
+          FROM laboratory_parameters_v4
+         WHERE lab_id   = $1
+           AND test_name= $2
+           AND test_type= $3
+           AND COALESCE(test_tf, '') = COALESCE($4::text, '')
            AND param_spec = $5::jsonb
-    """, lab_id, test_name, test_type, test_tf, json.dumps(param_spec))
+    """, lab_id, test_name, test_type, test_tf, _json.dumps(param_spec))
+
     if row:
         return row["id"], False
     else:
         r = await conn.fetchrow("""
             INSERT INTO laboratory_parameters_v4
                 (lab_id, test_name, test_type, test_tf, param_spec)
-            VALUES ($1,$2,$3,$4,$5::jsonb)
+            VALUES ($1,     $2,        $3,       $4::text, $5::jsonb)
             RETURNING id
-        """, lab_id, test_name, test_type, test_tf, json.dumps(param_spec))
+        """, lab_id, test_name, test_type, test_tf, _json.dumps(param_spec))
         return r["id"], True
