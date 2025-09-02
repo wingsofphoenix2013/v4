@@ -23,10 +23,10 @@ BB_STD = Decimal("2.0")
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -220,7 +220,7 @@ async def _update_bb_aggregates(pos, bins):
 # 🔸 Основной цикл: теперь пишем в БД/Redis и отмечаем bb_checked
 async def run_oracle_bbbins_snapshot_aggregator():
     await _ensure_group()
-    log.info("🚀 BB-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 BB-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
     while True:
         try:
             resp = await infra.redis_client.xreadgroup(
@@ -246,16 +246,16 @@ async def run_oracle_bbbins_snapshot_aggregator():
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
                         if v_code != "ok":
-                            log.info("[BB-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
+                            log.debug("[BB-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
                             to_ack.append(msg_id); continue
 
                         entry = pos["entry_price"]
                         bins = await _load_bb_bins(pos_uid, float(entry) if entry is not None else None)
                         if not bins:
-                            log.info("[BB-BINS SNAP] skip uid=%s reason=no_bb_bounds_or_entry", pos_uid)
+                            log.debug("[BB-BINS SNAP] skip uid=%s reason=no_bb_bounds_or_entry", pos_uid)
                         else:
                             await _update_bb_aggregates(pos, bins)
-                            log.info("[BB-BINS SNAP] updated uid=%s bins=%s", pos_uid, bins)
+                            log.debug("[BB-BINS SNAP] updated uid=%s bins=%s", pos_uid, bins)
 
                         to_ack.append(msg_id)
 
@@ -267,7 +267,7 @@ async def run_oracle_bbbins_snapshot_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ BB-BINS snapshot агрегатор остановлен")
+            log.debug("⏹️ BB-BINS snapshot агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ XREADGROUP loop error: %s", e)
