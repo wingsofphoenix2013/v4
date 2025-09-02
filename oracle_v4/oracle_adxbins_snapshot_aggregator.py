@@ -114,7 +114,8 @@ async def _update_adx_aggregates(pos, bins):
         async with conn.transaction():
             # per-TF
             for tf, bin_code in bins.items():
-                adx_len = 14 if tf in ("m5","m15") else 28
+                adx_len = 14 if tf in ("m5", "m15") else 28
+
                 stat = await conn.fetchrow("""
                     SELECT closed_trades, won_trades, pnl_sum
                     FROM positions_adxbins_stat_tf
@@ -154,8 +155,9 @@ async def _update_adx_aggregates(pos, bins):
                     log.debug("Redis SET failed (ADX per-TF)")
 
             # композит: если есть три TF
-            if all(tf in bins for tf in ("m5","m15","h1")):
+            if all(tf in bins for tf in ("m5", "m15", "h1")):
                 triplet = f"{bins['m5']}-{bins['m15']}-{bins['h1']}"
+
                 stat = await conn.fetchrow("""
                     SELECT closed_trades, won_trades, pnl_sum
                     FROM positions_adxbins_stat_comp
@@ -173,11 +175,12 @@ async def _update_adx_aggregates(pos, bins):
                 wr = (Decimal(w) / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
                 ap = (s / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
+                # ✅ ВАЖНАЯ ПРАВКА: 8 плейсхолдеров + NOW()
                 await conn.execute("""
                     INSERT INTO positions_adxbins_stat_comp
                       (strategy_id, direction, status_triplet,
                        closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
                     ON CONFLICT (strategy_id,direction,status_triplet)
                     DO UPDATE SET
                       closed_trades=$4, won_trades=$5, pnl_sum=$6, winrate=$7, avg_pnl=$8, updated_at=NOW()
@@ -194,8 +197,10 @@ async def _update_adx_aggregates(pos, bins):
                     log.debug("Redis SET failed (ADX comp)")
 
             # отметить позицию
-            await conn.execute("UPDATE positions_v4 SET adx_checked=true WHERE position_uid=$1", pos["position_uid"])
-
+            await conn.execute(
+                "UPDATE positions_v4 SET adx_checked=true WHERE position_uid=$1",
+                pos["position_uid"]
+            )
 # 🔸 Основной цикл: запись в БД/Redis и отметка adx_checked
 async def run_oracle_adxbins_snapshot_aggregator():
     await _ensure_group()
