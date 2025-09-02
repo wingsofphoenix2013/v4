@@ -25,6 +25,7 @@ from oracle_rsibins_snapshot_backfill import run_oracle_rsibins_snapshot_backfil
 from oracle_bbbins_snapshot_aggregator import run_oracle_bbbins_snapshot_aggregator
 from oracle_bbbins_snapshot_backfill import run_oracle_bbbins_snapshot_backfill
 from oracle_adxbins_snapshot_aggregator import run_oracle_adxbins_snapshot_aggregator
+from oracle_adxbins_snapshot_backfill import run_oracle_adxbins_snapshot_backfill
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -99,6 +100,7 @@ async def main():
         run_safe_loop(run_oracle_bbbins_snapshot_aggregator, "BB_BINS_SNAP"),
         run_safe_loop(run_oracle_bbbins_snapshot_backfill, "BB_BINS_BF"),
         run_safe_loop(run_oracle_adxbins_snapshot_aggregator, "ADX_BINS_SNAP"),
+        run_safe_loop(run_oracle_adxbins_snapshot_backfill, "ADX_BINS_BF"),
     )
 
 if __name__ == "__main__":
