@@ -1,4 +1,4 @@
-# oracle_adxbins_snapshot_aggregator.py — ADX-bins snapshot агрегатор: Этап 2 (позиция + валидация)
+# oracle_adxbins_snapshot_aggregator.py — ADX-bins snapshot агрегатор: Этап 3 (чтение ADX из PIS и биннинг)
 
 import os
 import asyncio
@@ -27,7 +27,7 @@ async def _ensure_group():
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
 
-# 🔸 Загрузка позиции и стратегии под FOR UPDATE + базовые проверки
+# 🔸 Этап 2: позиция + стратегия
 async def _load_position_and_strategy(position_uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
@@ -40,7 +40,6 @@ async def _load_position_and_strategy(position_uid: str):
                 WHERE p.position_uid = $1
                 FOR UPDATE
             """, position_uid)
-
             if not pos:
                 return None, None, ("skip", "position_not_found")
             if pos["status"] != "closed":
@@ -55,10 +54,52 @@ async def _load_position_and_strategy(position_uid: str):
             """, int(pos["strategy_id"]))
             if not strat or not strat["enabled"] or not strat["mw"]:
                 return pos, strat, ("skip", "strategy_inactive_or_no_mw")
-
             return pos, strat, ("ok", "eligible")
 
-# 🔸 Основной цикл: Этап 1 → debug; Этап 2 — info по валидации
+# 🔸 Биннинг ADX (0..100 шагом 5; 100 → 95)
+def _bin_adx(value: float) -> int | None:
+    try:
+        v = max(0.0, min(100.0, float(value)))
+        b = int(v // 5) * 5
+        if b == 100:
+            b = 95
+        return b
+    except Exception:
+        return None
+
+# 🔸 Чтение ADX из PIS и расчёт бинов по TF (m5/m15 → 14; h1 → 28)
+async def _load_adx_bins(position_uid: str):
+    pg = infra.pg_pool
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT timeframe, param_name, value_num
+            FROM positions_indicators_stat
+            WHERE position_uid = $1
+              AND using_current_bar = true
+              AND param_name IN ('adx_dmi14_adx','adx_dmi28_adx')
+              AND timeframe IN ('m5','m15','h1')
+        """, position_uid)
+
+    by_tf = { 'm5': None, 'm15': None, 'h1': None }
+    for r in rows:
+        tf = r["timeframe"]
+        name = r["param_name"]
+        val = r["value_num"]
+        if tf in ("m5","m15") and name == "adx_dmi14_adx":
+            by_tf[tf] = val
+        elif tf == "h1" and name == "adx_dmi28_adx":
+            by_tf[tf] = val
+
+    bins = {}
+    for tf, val in by_tf.items():
+        if val is None:
+            continue
+        code = _bin_adx(float(val))
+        if code is not None:
+            bins[tf] = code
+    return bins
+
+# 🔸 Основной цикл: читаем, валидируем, биним и логируем (без записи)
 async def run_oracle_adxbins_snapshot_aggregator():
     await _ensure_group()
     log.info("🚀 ADX-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
@@ -86,12 +127,16 @@ async def run_oracle_adxbins_snapshot_aggregator():
 
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
-                        if v_code == "ok":
-                            log.info("[ADX-BINS SNAP] eligible uid=%s strat=%s dir=%s pnl=%s",
-                                     pos["position_uid"], pos["strategy_id"], pos["direction"], pos["pnl"])
-                            # следующий этап: читаем adx из PIS, биним и логируем
-                        else:
+                        if v_code != "ok":
                             log.info("[ADX-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
+                            to_ack.append(msg_id); continue
+
+                        bins = await _load_adx_bins(pos_uid)
+                        if not bins:
+                            log.info("[ADX-BINS SNAP] skip uid=%s reason=no_adx_in_pis", pos_uid)
+                        else:
+                            log.info("[ADX-BINS SNAP] adx_bins uid=%s %s", pos_uid, bins)
+                            # Следующий этап: UPSERT в positions_adxbins_stat_tf/_comp + Redis + adx_checked=true
 
                         to_ack.append(msg_id)
 
@@ -105,4 +150,5 @@ async def run_oracle_adxbins_snapshot_aggregator():
         except asyncio.CancelledError:
             log.info("⏹️ ADX-BINS snapshot агрегатор остановлен"); raise
         except Exception as e:
-            log.exception("❌ XREADGROUP loop error: %s", e); await asyncio.sleep(1)
+            log.exception("❌ XREADGROUP loop error: %s", e)
+            await asyncio.sleep(1)
