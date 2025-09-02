@@ -1,4 +1,4 @@
-# oracle_bbbins_snapshot_aggregator.py — BB-bins snapshot агрегатор: Этап 2 (позиция + валидация)
+# oracle_bbbins_snapshot_aggregator.py — BB-bins snapshot агрегатор: Этап 3 (чтение BB из PIS и биннинг entry_price)
 
 import os
 import asyncio
@@ -27,7 +27,7 @@ async def _ensure_group():
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
 
-# 🔸 Загрузка позиции и стратегии под FOR UPDATE + базовые проверки
+# 🔸 Загрузка позиции и стратегии под FOR UPDATE + базовые проверки (из Этапа 2)
 async def _load_position_and_strategy(position_uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
@@ -58,7 +58,67 @@ async def _load_position_and_strategy(position_uid: str):
 
             return pos, strat, ("ok", "eligible")
 
-# 🔸 Основной цикл: Этап 1 лог → debug, Этап 2 — info по валидации
+# 🔸 Биннинг entry_price по 12 корзинам (0..11 сверху вниз) на основе BB20/2.0
+def _bin_entry_price(entry: float, lower: float, upper: float):
+    try:
+        width = float(upper) - float(lower)
+        if width <= 0:
+            return None
+        bucket = width / 6.0  # одинаковая ширина всех 12 корзин
+        # верхние корзины (открытый верх)
+        if entry >= upper + 2*bucket:
+            return 0
+        if entry >= upper + 1*bucket:
+            return 1
+        if entry >= upper:
+            return 2
+        # внутри канала [lower .. upper)
+        if entry >= lower:
+            k = int((entry - lower) // bucket)  # 0..5
+            if k < 0: k = 0
+            if k > 5: k = 5
+            return 8 - k  # 3..8 сверху вниз
+        # нижние корзины (открытый низ)
+        if entry <= lower - 2*bucket:
+            return 11
+        if entry <= lower - 1*bucket:
+            return 10
+        # (entry < lower)
+        return 9
+    except Exception:
+        return None
+
+# 🔸 Чтение BB20/2.0 (upper/lower) из PIS и расчёт корзин для m5/m15/h1
+async def _load_bb_bins(position_uid: str, entry_price: float):
+    pg = infra.pg_pool
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT timeframe, param_name, value_num
+            FROM positions_indicators_stat
+            WHERE position_uid = $1
+              AND using_current_bar = true
+              AND param_name IN ('bb20_2_0_upper','bb20_2_0_lower')
+              AND timeframe IN ('m5','m15','h1')
+        """, position_uid)
+
+    by_tf = { 'm5': {}, 'm15': {}, 'h1': {} }
+    for r in rows:
+        tf = r["timeframe"]
+        name = r["param_name"]
+        by_tf[tf][name] = r["value_num"]
+
+    bins = {}
+    for tf, vals in by_tf.items():
+        upper = vals.get('bb20_2_0_upper')
+        lower = vals.get('bb20_2_0_lower')
+        if upper is None or lower is None or entry_price is None:
+            continue
+        code = _bin_entry_price(float(entry_price), float(lower), float(upper))
+        if code is not None:
+            bins[tf] = code
+    return bins
+
+# 🔸 Основной цикл: теперь считаем корзины и логируем их (без записи в БД/Redis)
 async def run_oracle_bbbins_snapshot_aggregator():
     await _ensure_group()
     log.info("🚀 BB-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
@@ -79,21 +139,24 @@ async def run_oracle_bbbins_snapshot_aggregator():
                 for msg_id, data in records:
                     try:
                         if data.get("status") != "closed":
-                            to_ack.append(msg_id)
-                            continue
+                            to_ack.append(msg_id); continue
 
                         pos_uid = data.get("position_uid")
-                        # Этап 1 был info → теперь debug
                         log.debug("[BB-BINS SNAP] closed position received: uid=%s", pos_uid)
 
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
-                        if v_code == "ok":
-                            log.info("[BB-BINS SNAP] eligible uid=%s strat=%s dir=%s entry=%s",
-                                     pos["position_uid"], pos["strategy_id"], pos["direction"], pos["entry_price"])
-                            # На следующем этапе: тянем BB upper/lower из PIS и биним entry_price → корзины.
-                        else:
+                        if v_code != "ok":
                             log.info("[BB-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
+                            to_ack.append(msg_id); continue
+
+                        entry = pos["entry_price"]
+                        bins = await _load_bb_bins(pos_uid, float(entry) if entry is not None else None)
+                        if not bins:
+                            log.info("[BB-BINS SNAP] skip uid=%s reason=no_bb_bounds_or_entry", pos_uid)
+                        else:
+                            log.info("[BB-BINS SNAP] bb_bins uid=%s %s", pos_uid, bins)
+                            # На следующем этапе: UPSERT в positions_bbbins_stat_tf/_comp + Redis + bb_checked=true
 
                         to_ack.append(msg_id)
 
@@ -105,8 +168,6 @@ async def run_oracle_bbbins_snapshot_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ BB-BINS snapshot агрегатор остановлен")
-            raise
+            log.info("⏹️ BB-BINS snapshot агрегатор остановлен"); raise
         except Exception as e:
-            log.exception("❌ XREADGROUP loop error: %s", e)
-            await asyncio.sleep(1)
+            log.exception("❌ XREADGROUP loop error: %s", e); await asyncio.sleep(1)
