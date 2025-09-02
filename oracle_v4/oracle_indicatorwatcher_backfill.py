@@ -280,7 +280,7 @@ async def run_oracle_indicatorwatcher_backfill_once():
 
     while True:
         if (time.monotonic() - start_ts) >= BF_MAX_RUN_SECONDS:
-            log.info("[IND-BF] время вышло: processed=%d deferred=%d batches=%d", processed, deferred, batches)
+            log.debug("[IND-BF] время вышло: processed=%d deferred=%d batches=%d", processed, deferred, batches)
             break
 
         async with infra.pg_pool.acquire() as conn:
@@ -297,7 +297,7 @@ async def run_oracle_indicatorwatcher_backfill_once():
             """, BF_BATCH_LIMIT)
 
             if not rows:
-                log.info("[IND-BF] хвост пуст: processed=%d deferred=%d batches=%d", processed, deferred, batches)
+                log.debug("[IND-BF] хвост пуст: processed=%d deferred=%d batches=%d", processed, deferred, batches)
                 break
 
             for r in rows:
@@ -315,11 +315,11 @@ async def run_oracle_indicatorwatcher_backfill_once():
                     log.exception("❌ Ошибка индикаторного бэкофилла, позиция %s: %s", uid, e)
 
         batches += 1
-        log.info("[IND-BF] batch processed: %d (total %d), deferred=%d",
+        log.debug("[IND-BF] batch processed: %d (total %d), deferred=%d",
                  len(rows), processed, deferred)
 
         if len(rows) < BF_BATCH_LIMIT:
-            log.info("[IND-BF] завершено: processed=%d deferred=%d batches=%d", processed, deferred, batches)
+            log.debug("[IND-BF] завершено: processed=%d deferred=%d batches=%d", processed, deferred, batches)
             break
 
         await asyncio.sleep(BF_SLEEP_BETWEEN_BATCH_MS / 1000)
@@ -327,7 +327,7 @@ async def run_oracle_indicatorwatcher_backfill_once():
 
 # 🔸 Периодический цикл: старт через 2 минуты, затем каждый час
 async def run_oracle_indicatorwatcher_backfill_periodic():
-    log.info("🚀 IND-BF: старт через %d сек, батчи по %d, бюджет %d сек, затем каждый час",
+    log.debug("🚀 IND-BF: старт через %d сек, батчи по %d, бюджет %d сек, затем каждый час",
              START_DELAY_SEC, BF_BATCH_LIMIT, BF_MAX_RUN_SECONDS)
     await asyncio.sleep(START_DELAY_SEC)
 
@@ -335,7 +335,7 @@ async def run_oracle_indicatorwatcher_backfill_periodic():
         try:
             await run_oracle_indicatorwatcher_backfill_once()
         except asyncio.CancelledError:
-            log.info("⏹️ Индикаторный бэкофилл остановлен")
+            log.debug("⏹️ Индикаторный бэкофилл остановлен")
             raise
         except Exception as e:
             log.exception("❌ Ошибка в индикаторном бэкофилле: %s", e)

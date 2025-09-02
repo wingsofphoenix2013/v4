@@ -281,15 +281,15 @@ async def _process_closed_position(position_uid: str):
 async def run_oracle_indicatorwatcher_aggregator():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
 
-    log.info("🚀 Этап 2 (IND-MW): слушаем stream '%s' (group=%s, consumer=%s)",
+    log.debug("🚀 Этап 2 (IND-MW): слушаем stream '%s' (group=%s, consumer=%s)",
              STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
 
     while True:
@@ -315,7 +315,7 @@ async def run_oracle_indicatorwatcher_aggregator():
                         pos_uid = data.get("position_uid")
                         ok, reason = await _process_closed_position(pos_uid)
                         if not ok and reason != "skip":
-                            log.info("[IND-DEFER] pos=%s reason=%s", pos_uid, reason)
+                            log.debug("[IND-DEFER] pos=%s reason=%s", pos_uid, reason)
 
                         to_ack.append(msg_id)
 
@@ -327,7 +327,7 @@ async def run_oracle_indicatorwatcher_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ Индикаторный агрегатор остановлен")
+            log.debug("⏹️ Индикаторный агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ Ошибка XREADGROUP: %s", e)
