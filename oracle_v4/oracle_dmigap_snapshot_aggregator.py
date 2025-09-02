@@ -36,10 +36,10 @@ def _k_minus(tf_len: int, sym: str, tf: str) -> str:
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -356,7 +356,7 @@ async def _update_dmigap_aggregates(pos, bins: dict, trends: dict):
 # 🔸 Основной цикл: приём закрытий, расчёт gap/тренда, апдейты
 async def run_oracle_dmigap_snapshot_aggregator():
     await _ensure_group()
-    log.info("🚀 DMI-GAP SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 DMI-GAP SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
     while True:
         try:
             resp = await infra.redis_client.xreadgroup(
@@ -382,7 +382,7 @@ async def run_oracle_dmigap_snapshot_aggregator():
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
                         if v_code != "ok":
-                            log.info("[DMI-GAP SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
+                            log.debug("[DMI-GAP SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
                             to_ack.append(msg_id); continue
 
                         symbol = pos["symbol"]
@@ -390,10 +390,10 @@ async def run_oracle_dmigap_snapshot_aggregator():
                         bins, trends = await _load_dmigap_bins_trends(pos_uid, symbol, created_at)
 
                         if not bins:
-                            log.info("[DMI-GAP SNAP] skip uid=%s reason=no_gap_values", pos_uid)
+                            log.debug("[DMI-GAP SNAP] skip uid=%s reason=no_gap_values", pos_uid)
                         else:
                             await _update_dmigap_aggregates(pos, bins, trends)
-                            log.info("[DMI-GAP SNAP] updated uid=%s bins=%s trends=%s", pos_uid, bins, trends)
+                            log.debug("[DMI-GAP SNAP] updated uid=%s bins=%s trends=%s", pos_uid, bins, trends)
 
                         to_ack.append(msg_id)
 
@@ -405,7 +405,7 @@ async def run_oracle_dmigap_snapshot_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ DMI-GAP snapshot агрегатор остановлен"); raise
+            log.debug("⏹️ DMI-GAP snapshot агрегатор остановлен"); raise
         except Exception as e:
             log.exception("❌ XREADGROUP loop error: %s", e)
             await asyncio.sleep(1)
