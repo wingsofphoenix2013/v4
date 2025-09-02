@@ -38,6 +38,11 @@ async def refresher(pg):
         await asyncio.sleep(LAB_REFRESH_SEC)
 
 # 🔸 Точка входа Laboratory v4
+# laboratory_v4_main.py
+
+from lab_seeder_adx import seed as seed_adx   # ← импорт сидера
+
+# 🔸 Точка входа Laboratory v4
 async def main():
     setup_logging()
     log.info("📦 Laboratory v4: инициализация соединений")
@@ -55,7 +60,8 @@ async def main():
     # здесь позже добавим планировщики/раннеры тестов
     await asyncio.gather(
         run_safe_loop(lambda: refresher(pg), "CONFIG_LOADER"),
-        # r
+        # run_safe_loop(lambda: lab_runner_adx(pg, _redis), "LAB_RUNNER_ADX"),  # позже
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
