@@ -1,40 +1,24 @@
-# lab_runner_adx.py — авто-раннер ADX: каждые 6 часов создаёт run’ы для активных ADX-инстансов и прогоняет closed позиции
+# lab_runner_adx.py — авто-раннер ADX (set-based): каждые 6 часов создаёт run’ы для активных ADX-инстансов и обрабатывает пакетно
 
 import asyncio
 import logging
 from decimal import Decimal
 
-from laboratory_v4_config import (
-    LAB_BATCH_SIZE,      # используем 1000 по твоей настройке
-)
-
 log = logging.getLogger("LAB_RUNNER_ADX")
 
-# 🔸 Константы/параметры цикла
-START_DELAY_SEC   = 120          # стартовая задержка
+# 🔸 Параметры цикла
+START_DELAY_SEC   = 120          # задержка перед первым стартом
 SLEEP_BETWEEN_RUN = 6 * 3600     # 6 часов
-BATCH_SIZE        = 1000         # подтверждено
-MAX_CONCURRENCY   = 8            # подтверждено
+MAX_CONCURRENCY   = 10           # одновременно обрабатываем до 10 инстансов
 
-# 🔸 Вспомогалки
+# 🔸 Определение длины ADX для TF
 def _adx_len(tf: str) -> int:
     return 14 if tf in ("m5", "m15") else 28
 
-def _bin_adx(val: float) -> int | None:
-    try:
-        v = float(val)
-        if v < 0: v = 0.0
-        if v > 100.0: v = 100.0
-        b = int(v // 5) * 5
-        if b == 100: b = 95
-        return b
-    except Exception:
-        return None
-
-# 🔸 Загрузка активных ADX-инстансов и их параметров
-async def load_active_adx_instances(pg):
+# 🔸 Загрузка активных ADX-инстансов и их параметров (одним заходом)
+async def load_active_adx_instances_and_params(pg):
     async with pg.acquire() as conn:
-        rows = await conn.fetch("""
+        inst_rows = await conn.fetch("""
             SELECT i.id, i.min_trade_type, i.min_trade_value, i.min_winrate
             FROM laboratory_instances_v4 i
             WHERE i.active = true
@@ -44,29 +28,33 @@ async def load_active_adx_instances(pg):
               )
             ORDER BY i.id
         """)
-        inst = [{
-            "id": int(r["id"]),
-            "min_trade_type": r["min_trade_type"],
-            "min_trade_value": Decimal(str(r["min_trade_value"])),
-            "min_winrate": Decimal(str(r["min_winrate"]))
-        } for r in rows]
-
-        # параметры по инстансам
-        params_map = {}
-        for rinst in inst:
-            p_rows = await conn.fetch("""
-                SELECT id, test_name, test_type, test_tf, param_spec
+        # параметры всех нужных инстансов одним запросом
+        lab_ids = [int(r["id"]) for r in inst_rows]
+        params_rows = []
+        if lab_ids:
+            params_rows = await conn.fetch("""
+                SELECT lab_id, test_type, test_tf, param_spec
                 FROM laboratory_parameters_v4
-                WHERE lab_id = $1 AND test_name = 'adx'
-                ORDER BY id
-            """, rinst["id"])
-            params_map[rinst["id"]] = [{
-                "id": int(pr["id"]),
-                "test_type": pr["test_type"],      # 'solo' or 'comp'
-                "test_tf": pr["test_tf"],          # 'm5'|'m15'|'h1' or None
-                "param_spec": pr["param_spec"],    # jsonb
-            } for pr in p_rows]
-        return inst, params_map
+                WHERE test_name='adx' AND lab_id = ANY($1::int[])
+                ORDER BY lab_id, id
+            """, lab_ids)
+
+    inst = [{
+        "id": int(r["id"]),
+        "min_trade_type": r["min_trade_type"],
+        "min_trade_value": Decimal(str(r["min_trade_value"])),
+        "min_winrate": Decimal(str(r["min_winrate"]))
+    } for r in inst_rows]
+
+    # сгруппировать параметры по lab_id
+    params_map = {i["id"]: [] for i in inst}
+    for r in params_rows:
+        params_map[int(r["lab_id"])].append({
+            "test_type": r["test_type"],      # 'solo' or 'comp'
+            "test_tf": r["test_tf"],          # 'm5'|'m15'|'h1' or None
+            "param_spec": r["param_spec"],    # jsonb
+        })
+    return inst, params_map
 
 # 🔸 Создать или взять running run по инстансу
 async def ensure_run_for_instance(conn, lab_id: int):
@@ -83,202 +71,200 @@ async def ensure_run_for_instance(conn, lab_id: int):
     """, lab_id)
     return int(rr["id"]), True
 
-# 🔸 Стратегии MW=true
-async def load_active_mw_strategies(pg):
+# 🔸 Выполнить пакетную обработку одного ADX-инстанса
+async def run_one_adx_setbased(pg, lab: dict, lab_params: list[dict]):
+    lab_id  = lab["id"]
+    min_type= lab["min_trade_type"]
+    min_val = lab["min_trade_value"]
+    min_wr  = lab["min_winrate"]
+
+    # определить, какие TF нужны (solo) и нужен ли композит
+    need_comp = any(p["test_type"] == "comp" for p in lab_params)
+    need_tf   = sorted({p["test_tf"] for p in lab_params if p["test_type"] == "solo"})
+
     async with pg.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id FROM strategies_v4
-            WHERE enabled = true AND COALESCE(market_watcher, false) = true
-            ORDER BY id
-        """)
-    return [int(r["id"]) for r in rows]
-
-# 🔸 total_closed по strategy_id (все направления)
-async def get_total_closed_for_strategy(conn, strategy_id: int) -> int:
-    r = await conn.fetchrow("""
-        SELECT COUNT(*) AS c FROM positions_v4
-        WHERE strategy_id=$1 AND status='closed'
-    """, strategy_id)
-    return int(r["c"] or 0)
-
-# 🔸 Итератор закрытых позиций по стратегии (батчами)
-async def iter_closed_positions(pg, strategy_id: int, batch_size: int):
-    offset = 0
-    while True:
-        async with pg.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT position_uid, direction
-                FROM positions_v4
-                WHERE strategy_id=$1 AND status='closed'
-                ORDER BY id
-                LIMIT $2 OFFSET $3
-            """, strategy_id, batch_size, offset)
-        if not rows:
-            break
-        yield [{"uid": r["position_uid"], "direction": r["direction"]} for r in rows]
-        offset += batch_size
-
-# 🔸 PIS: достать ADX значение на входе по TF (14 для m5/m15, 28 для h1)
-async def get_pis_adx_for_position(conn, position_uid: str, tf: str) -> float | None:
-    adx_len = _adx_len(tf)
-    pname = f"adx_dmi{adx_len}_adx"
-    r = await conn.fetchrow("""
-        SELECT value_num FROM positions_indicators_stat
-        WHERE position_uid=$1 AND using_current_bar=true
-          AND timeframe=$2 AND param_name=$3
-        LIMIT 1
-    """, position_uid, tf, pname)
-    if not r or r["value_num"] is None:
-        return None
-    return float(r["value_num"])
-
-# 🔸 Проверка одного параметра ADX (solo TF)
-async def check_param_adx_solo(conn, strategy_id: int, direction: str,
-                               min_type: str, min_val: Decimal, min_wr: Decimal,
-                               tf: str, position_uid: str, total_closed: int) -> tuple[bool, str | None]:
-    # PIS -> bin
-    val = await get_pis_adx_for_position(conn, position_uid, tf)
-    if val is None:
-        return False, f"no_pis_value:{tf}"
-    bin_code = _bin_adx(val)
-    if bin_code is None:
-        return False, f"bin_error:{tf}"
-
-    adx_len = _adx_len(tf)
-    # агрегатная строка
-    s = await conn.fetchrow("""
-        SELECT closed_trades, winrate
-        FROM positions_adxbins_stat_tf
-        WHERE strategy_id=$1 AND direction=$2 AND timeframe=$3
-          AND adx_len=$4 AND bin_code=$5
-        LIMIT 1
-    """, strategy_id, direction, tf, adx_len, bin_code)
-    if not s:
-        return False, f"no_agg_row:{tf}"
-
-    closed = int(s["closed_trades"] or 0)
-    wr = Decimal(str(s["winrate"] or "0"))
-    # порог closed
-    if min_type == "absolute":
-        if closed < int(min_val):
-            return False, f"closed_lt_min:{tf}"
-    else:
-        # percent от total_closed по стратегии
-        need = (Decimal(total_closed) * min_val).quantize(Decimal("0.0001"))
-        if Decimal(closed) < need:
-            return False, f"closed_lt_min_pct:{tf}"
-    # порог winrate
-    if wr < min_wr:
-        return False, f"winrate_lt_min:{tf}"
-    return True, None
-
-# 🔸 Проверка композита ADX (триплет)
-async def check_param_adx_comp(conn, strategy_id: int, direction: str,
-                               min_type: str, min_val: Decimal, min_wr: Decimal,
-                               position_uid: str, total_closed: int) -> tuple[bool, str | None]:
-    # bins из PIS
-    vals = {}
-    for tf in ("m5","m15","h1"):
-        v = await get_pis_adx_for_position(conn, position_uid, tf)
-        if v is None:
-            return False, f"no_pis_value:{tf}"
-        b = _bin_adx(v)
-        if b is None:
-            return False, f"bin_error:{tf}"
-        vals[tf] = b
-    triplet = f"{vals['m5']}-{vals['m15']}-{vals['h1']}"
-
-    s = await conn.fetchrow("""
-        SELECT closed_trades, winrate
-        FROM positions_adxbins_stat_comp
-        WHERE strategy_id=$1 AND direction=$2 AND status_triplet=$3
-        LIMIT 1
-    """, strategy_id, direction, triplet)
-    if not s:
-        return False, "no_agg_row:triplet"
-    closed = int(s["closed_trades"] or 0)
-    wr = Decimal(str(s["winrate"] or "0"))
-
-    if min_type == "absolute":
-        if closed < int(min_val):
-            return False, "closed_lt_min:triplet"
-    else:
-        need = (Decimal(total_closed) * min_val).quantize(Decimal("0.0001"))
-        if Decimal(closed) < need:
-            return False, "closed_lt_min_pct:triplet"
-
-    if wr < min_wr:
-        return False, "winrate_lt_min:triplet"
-    return True, None
-
-# 🔸 Обработка одной позиции для заданного инстанса
-async def process_position_for_instance(pg, run_id: int, lab_id: int, strategy_id: int, direction: str,
-                                        min_type: str, min_val: Decimal, min_wr: Decimal,
-                                        params: list[dict], position_uid: str, total_closed: int):
-    # short-circuit: по порядку параметров
-    async with pg.acquire() as conn:
-        for p in params:
-            if p["test_type"] == "solo":
-                ok, reason = await check_param_adx_solo(conn, strategy_id, direction,
-                                                        min_type, min_val, min_wr,
-                                                        p["test_tf"], position_uid, total_closed)
-            else:
-                ok, reason = await check_param_adx_comp(conn, strategy_id, direction,
-                                                        min_type, min_val, min_wr,
-                                                        position_uid, total_closed)
-            if not ok:
-                await conn.execute("""
-                    INSERT INTO laboratory_results_v4
-                        (run_id, lab_id, position_uid, strategy_id, test_id, test_result, reason)
-                    VALUES ($1,$2,$3,$4,$2,'ignored',$5)
-                    ON CONFLICT (run_id, position_uid, test_id) DO NOTHING
-                """, run_id, lab_id, position_uid, strategy_id, reason)
-                return
-
-        # все параметры прошли
-        await conn.execute("""
-            INSERT INTO laboratory_results_v4
-                (run_id, lab_id, position_uid, strategy_id, test_id, test_result, reason)
-            VALUES ($1,$2,$3,$4,$2,'approved',NULL)
-            ON CONFLICT (run_id, position_uid, test_id) DO NOTHING
-        """, run_id, lab_id, position_uid, strategy_id)
-
-# 🔸 Прогон одного run’а по всем стратегиям
-async def run_one_adx(pg, lab, lab_params):
-    lab_id = lab["id"]
-    min_type = lab["min_trade_type"]
-    min_val  = lab["min_trade_value"]
-    min_wr   = lab["min_winrate"]
-
-    # создаём/берём run
-    async with pg.acquire() as conn:
+        # создать/взять run
         run_id, created = await ensure_run_for_instance(conn, lab_id)
         if created:
             log.info("RUN created: lab_id=%d run_id=%d", lab_id, run_id)
 
-    strategies = await load_active_mw_strategies(pg)
-    gate = asyncio.Semaphore(MAX_CONCURRENCY)
+        # TEMP таблица closed позиций стратегий MW (strategy_id, position_uid, direction)
+        await conn.execute("DROP TABLE IF EXISTS tmp_lab_pos")
+        await conn.execute("""
+            CREATE TEMP TABLE tmp_lab_pos AS
+            SELECT p.strategy_id, p.position_uid, p.direction
+            FROM positions_v4 p
+            JOIN strategies_v4 s ON s.id = p.strategy_id
+            WHERE s.enabled=true AND COALESCE(s.market_watcher,false)=true
+              AND p.status='closed'
+        """)
+        await conn.execute("CREATE INDEX ON tmp_lab_pos(strategy_id)")
+        await conn.execute("CREATE INDEX ON tmp_lab_pos(position_uid)")
+        await conn.execute("CREATE INDEX ON tmp_lab_pos(strategy_id, direction)")
 
-    for sid in strategies:
-        async with pg.acquire() as conn:
-            total_closed = await get_total_closed_for_strategy(conn, sid)
+        # TEMP таблица total_closed по стратегии (для percent)
+        await conn.execute("DROP TABLE IF EXISTS tmp_lab_totals")
+        await conn.execute("""
+            CREATE TEMP TABLE tmp_lab_totals AS
+            SELECT strategy_id, COUNT(*)::int AS total_closed
+            FROM positions_v4
+            WHERE status='closed'
+            GROUP BY strategy_id
+        """)
+        await conn.execute("CREATE INDEX ON tmp_lab_totals(strategy_id)")
 
-        async def worker_batch(batch_rows):
-            tasks = []
-            for row in batch_rows:
-                tasks.append(process_position_for_instance(
-                    pg, run_id, lab_id, sid, row["direction"],
-                    min_type, min_val, min_wr,
-                    lab_params, row["uid"], total_closed
-                ))
-            async with gate:
-                await asyncio.gather(*tasks)
+        # TEMP таблица ключей ADX-бинов из PIS (m5_bin, m15_bin, h1_bin, triplet)
+        await conn.execute("DROP TABLE IF EXISTS tmp_lab_adx_keys")
+        await conn.execute("""
+            CREATE TEMP TABLE tmp_lab_adx_keys AS
+            WITH pis AS (
+              SELECT position_uid, timeframe, value_num,
+                     CASE
+                       WHEN param_name IN ('adx_dmi14_adx','adx_dmi28_adx') THEN value_num
+                       ELSE NULL
+                     END AS adx_val
+              FROM positions_indicators_stat
+              WHERE using_current_bar=true
+                AND param_name IN ('adx_dmi14_adx','adx_dmi28_adx')
+                AND timeframe IN ('m5','m15','h1')
+            ),
+            bins AS (
+              SELECT position_uid, timeframe,
+                     CASE
+                       WHEN adx_val IS NULL THEN NULL
+                       WHEN adx_val >= 100 THEN 95
+                       WHEN adx_val < 0 THEN 0
+                       ELSE (floor(adx_val/5))*5
+                     END::int AS bin_code
+              FROM pis
+            )
+            SELECT
+              p.position_uid,
+              max(CASE WHEN timeframe='m5'  THEN bin_code END)::int  AS m5_bin,
+              max(CASE WHEN timeframe='m15' THEN bin_code END)::int  AS m15_bin,
+              max(CASE WHEN timeframe='h1'  THEN bin_code END)::int  AS h1_bin
+            FROM tmp_lab_pos p
+            LEFT JOIN bins b USING(position_uid)
+            GROUP BY p.position_uid
+        """)
+        await conn.execute("""
+            ALTER TABLE tmp_lab_adx_keys
+            ADD COLUMN triplet text;
+        """)
+        await conn.execute("""
+            UPDATE tmp_lab_adx_keys
+               SET triplet = (m5_bin::text || '-' || m15_bin::text || '-' || h1_bin::text)
+        """)
+        await conn.execute("CREATE INDEX ON tmp_lab_adx_keys(position_uid)")
+        await conn.execute("CREATE INDEX ON tmp_lab_adx_keys(triplet)")
 
-        async for batch in iter_closed_positions(pg, sid, BATCH_SIZE):
-            await worker_batch(batch)
+        # TEMP таблица проходов по параметрам: (position_uid, pass_idx)
+        await conn.execute("DROP TABLE IF EXISTS tmp_lab_pass")
+        await conn.execute("""
+            CREATE TEMP TABLE tmp_lab_pass (
+              position_uid text NOT NULL,
+              pass_idx     int  NOT NULL
+            )
+        """)
+        pass_idx = 0
 
-    # пометить run завершённым
-    async with pg.acquire() as conn:
+        # SOLO TF параметры: один INSERT … SELECT на каждый TF параметр
+        for tf in need_tf:
+            pass_idx += 1
+            adx_len = _adx_len(tf)
+            # абсолют/процент порог по closed
+            if min_type == 'absolute':
+                closed_cond = f"t.closed_trades >= {int(min_val)}"
+            else:
+                # percent: closed_trades >= totals.total_closed * min_val
+                closed_cond = "t.closed_trades >= (tot.total_closed * $1)"  # $1 -> min_val (Decimal)
+
+            # winrate условие
+            wr_cond = "t.winrate >= $2"  # $2 -> min_wr
+
+            await conn.execute(f"""
+                INSERT INTO tmp_lab_pass (position_uid, pass_idx)
+                SELECT pos.position_uid, {pass_idx}
+                FROM tmp_lab_pos pos
+                JOIN tmp_lab_adx_keys k  ON k.position_uid = pos.position_uid
+                JOIN positions_adxbins_stat_tf t
+                  ON t.strategy_id = pos.strategy_id
+                 AND t.direction  = pos.direction
+                 AND t.timeframe  = $3
+                 AND t.adx_len    = $4
+                 AND t.bin_code   = CASE $5 WHEN 'm5' THEN k.m5_bin WHEN 'm15' THEN k.m15_bin ELSE k.h1_bin END
+                LEFT JOIN tmp_lab_totals tot ON tot.strategy_id = pos.strategy_id
+                WHERE {closed_cond}
+                  AND {wr_cond}
+            """, (min_val if min_type != 'absolute' else Decimal(0)), min_wr, tf, adx_len, tf)
+
+        # COMP параметр: один INSERT … SELECT, если нужен
+        if need_comp:
+            pass_idx += 1
+            if min_type == 'absolute':
+                closed_cond_comp = f"t.closed_trades >= {int(min_val)}"
+            else:
+                closed_cond_comp = "t.closed_trades >= (tot.total_closed * $1)"  # $1 -> min_val
+
+            wr_cond_comp = "t.winrate >= $2"  # $2 -> min_wr
+
+            await conn.execute(f"""
+                INSERT INTO tmp_lab_pass (position_uid, pass_idx)
+                SELECT pos.position_uid, {pass_idx}
+                FROM tmp_lab_pos pos
+                JOIN tmp_lab_adx_keys k  ON k.position_uid = pos.position_uid
+                JOIN positions_adxbins_stat_comp t
+                  ON t.strategy_id = pos.strategy_id
+                 AND t.direction  = pos.direction
+                 AND t.status_triplet = k.triplet
+                LEFT JOIN tmp_lab_totals tot ON tot.strategy_id = pos.strategy_id
+                WHERE {closed_cond_comp}
+                  AND {wr_cond_comp}
+            """, (min_val if min_type != 'absolute' else Decimal(0)), min_wr)
+
+        # Количество параметров в инстансе
+        required_passes = pass_idx
+
+        # INSERT approved: те позиции, у которых есть все pass_idx
+        await conn.execute("""
+            INSERT INTO laboratory_results_v4
+                (run_id, lab_id, position_uid, strategy_id, test_id, test_result, reason)
+            SELECT $1::bigint AS run_id,
+                   $2::int     AS lab_id,
+                   pos.position_uid,
+                   pos.strategy_id,
+                   $2::int     AS test_id,
+                   'approved'  AS test_result,
+                   NULL        AS reason
+            FROM tmp_lab_pos pos
+            JOIN (
+              SELECT position_uid, COUNT(*) AS c
+              FROM tmp_lab_pass
+              GROUP BY position_uid
+            ) p ON p.position_uid = pos.position_uid
+            WHERE p.c = $3
+            ON CONFLICT (run_id, position_uid, test_id) DO NOTHING
+        """, run_id, lab_id, required_passes)
+
+        # INSERT ignored: все closed позиции минус approved
+        await conn.execute("""
+            INSERT INTO laboratory_results_v4
+                (run_id, lab_id, position_uid, strategy_id, test_id, test_result, reason)
+            SELECT $1::bigint AS run_id,
+                   $2::int     AS lab_id,
+                   pos.position_uid,
+                   pos.strategy_id,
+                   $2::int     AS test_id,
+                   'ignored'   AS test_result,
+                   'failed'    AS reason
+            FROM tmp_lab_pos pos
+            LEFT JOIN laboratory_results_v4 r
+              ON r.run_id=$1 AND r.test_id=$2 AND r.position_uid=pos.position_uid
+            WHERE r.run_id IS NULL
+            ON CONFLICT (run_id, position_uid, test_id) DO NOTHING
+        """, run_id, lab_id)
+
+        # закрыть run и обновить last_used
         await conn.execute("""
             UPDATE laboratory_runs_v4
             SET status='done', finished_at=NOW()
@@ -289,32 +275,37 @@ async def run_one_adx(pg, lab, lab_params):
             SET last_used=NOW()
             WHERE id=$1
         """, lab_id)
+
     log.info("RUN done: lab_id=%d", lab_id)
 
-# 🔸 Основной цикл раннера
+# 🔸 Основной цикл раннера (параллельно до 10 инстансов)
 async def run_lab_runner_adx(pg):
-    # задержка старта
+    # задержка перед первым стартом
     if START_DELAY_SEC > 0:
         log.info("⏳ ADX runner: задержка старта %d с", START_DELAY_SEC)
         await asyncio.sleep(START_DELAY_SEC)
 
     while True:
         try:
-            # загрузить библиотеку инстансов и их параметров
-            instances, params_map = await load_active_adx_instances(pg)
+            instances, params_map = await load_active_adx_instances_and_params(pg)
             if not instances:
                 log.info("ADX runner: активных инстансов нет")
             else:
                 log.info("ADX runner: найдено инстансов=%d", len(instances))
-                for lab in instances:
+                gate = asyncio.Semaphore(MAX_CONCURRENCY)
+
+                async def worker(lab):
                     lab_params = params_map.get(lab["id"], [])
                     if not lab_params:
-                        continue
-                    await run_one_adx(pg, lab, lab_params)
+                        return
+                    async with gate:
+                        await run_one_adx_setbased(pg, lab, lab_params)
+
+                tasks = [asyncio.create_task(worker(lab)) for lab in instances]
+                await asyncio.gather(*tasks)
 
         except Exception as e:
             log.error("ADX runner error: %s", e, exc_info=True)
 
-        # спим 6 часов
         log.info("ADX runner: сон на 6 часов")
         await asyncio.sleep(SLEEP_BETWEEN_RUN)
