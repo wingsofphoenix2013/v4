@@ -95,10 +95,10 @@ def key_comp(strategy_id: int, direction: str, ema_len: int, triplet: str) -> st
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -316,7 +316,7 @@ async def _process_closed(position_uid: str):
 
 async def run_oracle_ema_snapshot_aggregator():
     await _ensure_group()
-    log.info("🚀 EMA-SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 EMA-SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
     while True:
         try:
             resp = await infra.redis_client.xreadgroup(
@@ -337,7 +337,7 @@ async def run_oracle_ema_snapshot_aggregator():
                         pos_uid = data.get("position_uid")
                         ok, reason = await _process_closed(pos_uid)
                         if not ok and reason != "skip":
-                            log.info("[EMA-SNAP DEFER] pos=%s reason=%s", pos_uid, reason)
+                            log.debug("[EMA-SNAP DEFER] pos=%s reason=%s", pos_uid, reason)
                         to_ack.append(msg_id)
                     except Exception as e:
                         to_ack.append(msg_id)
@@ -345,6 +345,6 @@ async def run_oracle_ema_snapshot_aggregator():
             if to_ack:
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
         except asyncio.CancelledError:
-            log.info("⏹️ EMA snapshot агрегатор остановлен"); raise
+            log.debug("⏹️ EMA snapshot агрегатор остановлен"); raise
         except Exception as e:
             log.exception("❌ XREADGROUP loop error: %s", e); await asyncio.sleep(1)

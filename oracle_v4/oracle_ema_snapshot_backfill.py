@@ -47,7 +47,7 @@ async def _process_one(uid: str) -> tuple[bool, str]:
 # 🔸 Один батч: параллельно CONCURRENCY задач, суммарные логи
 async def _run_batch(candidates: list[str]) -> None:
     if not candidates:
-        log.info("[EMA-SNAP BF] хвост пуст, ждём %d сек", EMPTY_SLEEP_SEC)
+        log.debug("[EMA-SNAP BF] хвост пуст, ждём %d сек", EMPTY_SLEEP_SEC)
         await asyncio.sleep(EMPTY_SLEEP_SEC)
         return
 
@@ -82,12 +82,12 @@ async def _run_batch(candidates: list[str]) -> None:
         await asyncio.sleep(2)
 
     await asyncio.gather(*tasks, return_exceptions=True)
-    log.info("[EMA-SNAP BF] batch processed: %d, deferred=%d, skipped=%d (total=%d)",
+    log.debug("[EMA-SNAP BF] batch processed: %d, deferred=%d, skipped=%d (total=%d)",
              processed, deferred, skipped, len(candidates))
 
 # 🔸 Непрерывный цикл: берём батч → обрабатываем параллельно → повторяем
 async def run_oracle_ema_snapshot_backfill_periodic():
-    log.info("🚀 EMA-SNAP BF: старт через %d сек, параллелизм=%d, батч=%d, без лимита времени",
+    log.debug("🚀 EMA-SNAP BF: старт через %d сек, параллелизм=%d, батч=%d, без лимита времени",
              START_DELAY_SEC, CONCURRENCY, BATCH_LIMIT)
     await asyncio.sleep(START_DELAY_SEC)
 
@@ -99,7 +99,7 @@ async def run_oracle_ema_snapshot_backfill_periodic():
             log.debug("[EMA-SNAP BF] цикл занял ~%ds, следующий через %ds",
                       int((datetime.utcnow() - start_ts).total_seconds()), AFTER_CYCLE_SLEEP)
         except asyncio.CancelledError:
-            log.info("⏹️ EMA-SNAP BF остановлен")
+            log.debug("⏹️ EMA-SNAP BF остановлен")
             raise
         except Exception as e:
             log.exception("❌ EMA-SNAP BF loop error: %s", e)
