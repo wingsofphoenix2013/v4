@@ -26,6 +26,7 @@ from oracle_bbbins_snapshot_aggregator import run_oracle_bbbins_snapshot_aggrega
 from oracle_bbbins_snapshot_backfill import run_oracle_bbbins_snapshot_backfill
 from oracle_adxbins_snapshot_aggregator import run_oracle_adxbins_snapshot_aggregator
 from oracle_adxbins_snapshot_backfill import run_oracle_adxbins_snapshot_backfill
+from oracle_dmigap_snapshot_aggregator import run_oracle_dmigap_snapshot_aggregator
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -101,6 +102,7 @@ async def main():
         run_safe_loop(run_oracle_bbbins_snapshot_backfill, "BB_BINS_BF"),
         run_safe_loop(run_oracle_adxbins_snapshot_aggregator, "ADX_BINS_SNAP"),
         run_safe_loop(run_oracle_adxbins_snapshot_backfill, "ADX_BINS_BF"),
+        run_safe_loop(run_oracle_dmigap_snapshot_aggregator, "DMI_GAP_SNAP"),
     )
 
 if __name__ == "__main__":
