@@ -20,10 +20,10 @@ XREAD_BLOCKMS = int(os.getenv("ORACLE_ADXBINS_BLOCK_MS", "1000"))
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -204,7 +204,7 @@ async def _update_adx_aggregates(pos, bins):
 # 🔸 Основной цикл: запись в БД/Redis и отметка adx_checked
 async def run_oracle_adxbins_snapshot_aggregator():
     await _ensure_group()
-    log.info("🚀 ADX-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 ADX-BINS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
     while True:
         try:
             resp = await infra.redis_client.xreadgroup(
@@ -230,15 +230,15 @@ async def run_oracle_adxbins_snapshot_aggregator():
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
                         if v_code != "ok":
-                            log.info("[ADX-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
+                            log.debug("[ADX-BINS SNAP] skip uid=%s reason=%s", pos_uid, v_reason)
                             to_ack.append(msg_id); continue
 
                         bins = await _load_adx_bins(pos_uid)
                         if not bins:
-                            log.info("[ADX-BINS SNAP] skip uid=%s reason=no_adx_in_pis", pos_uid)
+                            log.debug("[ADX-BINS SNAP] skip uid=%s reason=no_adx_in_pis", pos_uid)
                         else:
                             await _update_adx_aggregates(pos, bins)
-                            log.info("[ADX-BINS SNAP] updated uid=%s bins=%s", pos_uid, bins)
+                            log.debug("[ADX-BINS SNAP] updated uid=%s bins=%s", pos_uid, bins)
 
                         to_ack.append(msg_id)
 
@@ -250,7 +250,7 @@ async def run_oracle_adxbins_snapshot_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ ADX-BINS snapshot агрегатор остановлен"); raise
+            log.debug("⏹️ ADX-BINS snapshot агрегатор остановлен"); raise
         except Exception as e:
             log.exception("❌ XREADGROUP loop error: %s", e)
             await asyncio.sleep(1)

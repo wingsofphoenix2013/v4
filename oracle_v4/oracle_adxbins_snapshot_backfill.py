@@ -61,10 +61,10 @@ async def _process_uid(uid: str):
 # 🔸 Основной цикл backfill'а
 async def run_oracle_adxbins_snapshot_backfill():
     if START_DELAY_SEC > 0:
-        log.info("⏳ ADX-BINS BF: задержка старта %d сек", START_DELAY_SEC)
+        log.debug("⏳ ADX-BINS BF: задержка старта %d сек", START_DELAY_SEC)
         await asyncio.sleep(START_DELAY_SEC)
 
-    log.info("🚀 ADX-BINS BF: старт, batch=%d, max_conc=%d, sleep=%dms",
+    log.debug("🚀 ADX-BINS BF: старт, batch=%d, max_conc=%d, sleep=%dms",
              BATCH_SIZE, MAX_CONCURRENCY, SLEEP_MS)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -89,11 +89,11 @@ async def run_oracle_adxbins_snapshot_backfill():
             updated = sum(1 for r in results if r[0] == "updated")
             skipped = sum(1 for r in results if r[0] == "skip")
             errors  = sum(1 for r in results if r[0] == "error")
-            log.info("[ADX-BINS BF] batch_done total=%d updated=%d skipped=%d errors=%d",
+            log.debug("[ADX-BINS BF] batch_done total=%d updated=%d skipped=%d errors=%d",
                      len(results), updated, skipped, errors)
 
         except asyncio.CancelledError:
-            log.info("⏹️ ADX-BINS backfill остановлен")
+            log.debug("⏹️ ADX-BINS backfill остановлен")
             raise
         except Exception as e:
             log.exception("❌ ADX-BINS BF loop error: %s", e)
