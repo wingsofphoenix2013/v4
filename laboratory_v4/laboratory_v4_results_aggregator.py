@@ -1,4 +1,4 @@
-# 🔸 Агрегатор итогов лаборатории: читает сигналы завершения ранa и пишет свод по стратегии
+# 🔸 Агрегатор итогов лаборатории: читает сигналы завершения ранa, пишет свод по стратегии и очищает per-position результаты
 
 import os
 import asyncio
@@ -17,6 +17,10 @@ XREAD_COUNT   = int(os.getenv("LAB_RESULTS_COUNT",    "50"))
 XREAD_BLOCKMS = int(os.getenv("LAB_RESULTS_BLOCK_MS", "1000"))
 RESET_GROUP   = os.getenv("LAB_RESULTS_RESET_GROUP", "false").lower() == "true"
 
+# 🔸 Параметры очистки per-position результатов после агрегации
+PURGE_AFTER_AGG = os.getenv("LAB_PURGE_RESULTS_AFTER_AGG", "true").lower() == "true"
+PURGE_CHUNK     = int(os.getenv("LAB_PURGE_CHUNK", "50000"))  # размер одного чанка DELETE
+
 
 # 🔸 Инициализация consumer-group (вариант A: reset-группы по ENV)
 async def _ensure_group():
@@ -26,7 +30,6 @@ async def _ensure_group():
                 await infra.redis_client.xgroup_destroy(STREAM_NAME, GROUP_NAME)
                 log.info("Сброс consumer-group '%s' на стриме '%s'", GROUP_NAME, STREAM_NAME)
             except Exception:
-                # если группы не было — просто игнорируем
                 pass
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
         log.info("Создана consumer-group '%s' на стриме '%s' (id=$)", GROUP_NAME, STREAM_NAME)
@@ -111,11 +114,40 @@ async def _upsert_strategy_results(lab_id: int, strategy_id: int, run_id: int,
         )
 
 
-# 🔸 Проверка наличия run перед апдейтом (защита от «битых» сообщений)
+# 🔸 Проверка наличия run перед апдейтом
 async def _run_exists(run_id: int) -> bool:
     async with infra.pg_pool.acquire() as conn:
         row = await conn.fetchval("SELECT 1 FROM laboratory_runs_v4 WHERE id=$1", run_id)
     return bool(row)
+
+
+# 🔸 Пакетная очистка per-position результатов по run_id
+async def _purge_run_results(run_id: int):
+    total = 0
+    while True:
+        async with infra.pg_pool.acquire() as conn:
+            async with conn.transaction():
+                status = await conn.execute(
+                    """
+                    DELETE FROM laboratory_results_v4
+                    WHERE ctid IN (
+                        SELECT ctid
+                        FROM laboratory_results_v4
+                        WHERE run_id = $1
+                        LIMIT $2
+                    )
+                    """,
+                    run_id, PURGE_CHUNK,
+                )
+        try:
+            deleted = int(status.split()[-1])
+        except Exception:
+            deleted = 0
+        total += deleted
+        if deleted == 0:
+            break
+        await asyncio.sleep(0)
+    log.debug("PURGE DONE run_id=%s removed=%s rows", run_id, total)
 
 
 # 🔸 Обработка одного сообщения из стрима
@@ -128,13 +160,18 @@ async def _handle_message(fields: dict):
         log.error("Неверные поля сообщения: %s", fields)
         return
 
-    # защита от ситуации, когда БД очищали/трункатили
     if not await _run_exists(run_id):
         log.debug("Пропуск сообщения: run_id=%s отсутствует в laboratory_runs_v4", run_id)
         return
 
     approved_cnt, pnl_sum, winrate, roi = await _aggregate_run(lab_id, strategy_id, run_id)
     await _upsert_strategy_results(lab_id, strategy_id, run_id, pnl_sum, winrate, roi)
+
+    if PURGE_AFTER_AGG:
+        try:
+            await _purge_run_results(run_id)
+        except Exception as e:
+            log.exception("Ошибка очистки per-position результатов для run_id=%s: %s", run_id, e)
 
     log.debug(
         "AGG DONE lab=%s strategy=%s run_id=%s: approved=%s pnl_sum=%s winrate=%s roi=%s",

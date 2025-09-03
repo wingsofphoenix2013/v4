@@ -7,14 +7,12 @@ import laboratory_v4_infra as infra
 log = logging.getLogger("LAB_SEEDER")
 
 # 🔸 Общие сетки параметров
-WINRATE_VARIANTS = [0.50, 0.55, 0.60, 0.65]
+WINRATE_VARIANTS = [0.45, 0.50, 0.55, 0.60]
 MIN_TRADE_VARIANTS = [
-    ("absolute", 5),
     ("absolute", 10),
-    ("absolute", 15),
-    ("percent", 0.05),
-    ("percent", 0.10),
-    ("percent", 0.15),
+    ("percent", 0.02),
+    ("percent", 0.04),
+    ("percent", 0.06),
 ]
 
 # 🔸 Компоненты (15 комбинаций без пустого множества)
