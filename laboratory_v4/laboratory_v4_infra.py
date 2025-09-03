@@ -17,7 +17,7 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 MAX_CONCURRENCY = int(os.getenv("LAB_MAX_CONCURRENCY", "10"))
 POSITIONS_BATCH = int(os.getenv("LAB_POSITIONS_BATCH", "500"))
 FINISH_STREAM = os.getenv("LAB_FINISH_STREAM", "lab_results_stream")
-LOCK_TTL_SEC = int(os.getenv("LAB_LOCK_TTL_SEC", "1800"))
+LOCK_TTL_SEC = int(os.getenv("LAB_LOCK_TTL_SEC", "300"))
 
 # 🔸 Семафор параллелизма (на процесс)
 concurrency_sem = asyncio.Semaphore(MAX_CONCURRENCY)
