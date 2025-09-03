@@ -3,7 +3,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 
 import laboratory_v4_infra as infra
 import laboratory_v4_loader as loader
@@ -23,11 +23,16 @@ async def process_run(lab: dict, strategy_id: int):
         async with infra.redis_lock(lock_key, ttl_sec=infra.LOCK_TTL_SEC):
             await infra.mark_run_started(run_id)
 
-            # параметры теста (для порядка, ADX/BB и т. п. будут читать свои агрегаты в профильных воркерах)
+            # параметры теста (компоненты). Доменные агрегаты грузят профильные воркеры (ADX и др.)
             params = await loader.load_lab_parameters(lab_id)
-            log.debug("Старт ранa lab_id=%s strategy_id=%s run_id=%s components=%d", lab_id, strategy_id, run_id, len(params))
+            log.debug(
+                "Старт ранa lab_id=%s strategy_id=%s run_id=%s components=%d",
+                lab_id, strategy_id, run_id, len(params)
+            )
 
-            cutoff = datetime.now(timezone.utc)
+            # cutoff — naive UTC для сопоставления с TIMESTAMP (без TZ) в БД
+            cutoff = datetime.utcnow()
+
             processed = approved = filtered = skipped = 0
             batch_uids: list[str] = []
 
@@ -40,7 +45,7 @@ async def process_run(lab: dict, strategy_id: int):
                 # 1) подтянуть PIS для uids (только нужные поля под профильный фильтр)
                 # 2) принять решения (approved/filtered/skipped_no_data) в Python
                 # 3) записать batch результатов в laboratory_results_v4
-                # Пока — заглушка на прогресс.
+                # Пока — считаем прогресс.
                 processed += len(uids)
 
             # итерация по позициям пачками (batch=infra.POSITIONS_BATCH)
@@ -51,7 +56,7 @@ async def process_run(lab: dict, strategy_id: int):
                     batch_uids.clear()
 
                 # периодически обновляем прогресс
-                if processed % 100 == 0:
+                if processed and processed % 100 == 0:
                     await infra.update_progress_json(run_id, {
                         "cutoff_at": cutoff.isoformat(),
                         "processed": processed,
@@ -85,7 +90,7 @@ async def process_run(lab: dict, strategy_id: int):
         await infra.mark_run_failed(run_id, reason=str(e))
 
 
-# 🔸 Обёртка для семафора (не более 10 одновременных ранoв)
+# 🔸 Обёртка для семафора (не более N одновременных ранoв)
 async def run_guarded(lab: dict, sid: int):
     await infra.concurrency_sem.acquire()
     try:
@@ -102,7 +107,7 @@ async def scheduler_loop():
             tasks: list[asyncio.Task] = []
 
             for lab_id, sid in plan:
-                lab_dict = {"lab_id": lab_id}  # компактно передаём только нужное
+                lab_dict = {"lab_id": lab_id}
                 tasks.append(asyncio.create_task(run_guarded(lab_dict, sid)))
 
             if tasks:

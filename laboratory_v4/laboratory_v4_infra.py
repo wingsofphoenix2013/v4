@@ -7,9 +7,8 @@ import asyncio
 import asyncpg
 import redis.asyncio as aioredis
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
-# 🔸 Глобальные переменные/настройки
+# 🔸 Глобальные переменные и настройки
 pg_pool = None
 redis_client = None
 log = logging.getLogger("LAB_INFRA")
@@ -32,7 +31,10 @@ def setup_logging():
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    log.debug("Логирование настроено (DEBUG_MODE=%s, MAX_CONCURRENCY=%s, BATCH=%s)", DEBUG_MODE, MAX_CONCURRENCY, POSITIONS_BATCH)
+    log.debug(
+        "Логирование настроено (DEBUG_MODE=%s, MAX_CONCURRENCY=%s, BATCH=%s)",
+        DEBUG_MODE, MAX_CONCURRENCY, POSITIONS_BATCH
+    )
 
 
 # 🔸 Инициализация подключения к PostgreSQL
@@ -82,17 +84,16 @@ async def redis_lock(key: str, ttl_sec: int = LOCK_TTL_SEC):
             log.debug("Не удалось освободить лок (key=%s)", key)
 
 
-# 🔸 Создание записи о ранe (status=queued)
+# 🔸 Создание записи о ранe (status=queued; started_at выставит БД)
 async def create_run(lab_id: int, strategy_id: int) -> int:
-    started_at_ts = datetime.now(timezone.utc)
     async with pg_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO laboratory_runs_v4 (lab_id, strategy_id, started_at, status, progress_json)
-            VALUES ($1, $2, $3, 'queued', '{}')
+            INSERT INTO laboratory_runs_v4 (lab_id, strategy_id, status, progress_json)
+            VALUES ($1, $2, 'queued', '{}')
             RETURNING id
             """,
-            lab_id, strategy_id, started_at_ts,
+            lab_id, strategy_id,
         )
         return int(row["id"])
 
