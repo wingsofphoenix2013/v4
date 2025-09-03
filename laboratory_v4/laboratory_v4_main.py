@@ -9,12 +9,13 @@ import laboratory_v4_infra as infra
 import laboratory_v4_loader as loader
 import laboratory_v4_results_aggregator as results_agg
 import laboratory_v4_adx_worker as adx
+import laboratory_v4_bb_worker as bb
+
 import laboratory_v4_seeder as seeder
 
 log = logging.getLogger("LAB_MAIN")
 
 LAB_LOOP_SLEEP_SEC = int(os.getenv("LAB_LOOP_SLEEP_SEC", "21600"))
-
 
 # 🔸 Обработка одного рана (lab_id × strategy_id)
 async def process_run(lab: dict, strategy_id: int):
@@ -53,7 +54,7 @@ async def process_run(lab: dict, strategy_id: int):
                         "UPDATE laboratory_instances_v4 SET last_used = NOW() WHERE id=$1",
                         lab_id,
                     )
-                    
+
                 # 3) компоненты теста (для упорядочивания проверки)
                 params = await loader.load_lab_parameters(lab_id)
                 log.debug(
@@ -61,46 +62,76 @@ async def process_run(lab: dict, strategy_id: int):
                     lab_id, strategy_id, run_id, len(params)
                 )
 
-                # 4) фиксируем точку отсечения и подготавливаем кэши (ADX агрегаты + тоталы по направлениям)
+                # 4) фиксируем cutoff и подготавливаем кэши по сущности теста
                 cutoff = datetime.now()
-                per_tf_cache, comp_cache = await adx.load_adx_aggregates_for_strategy(strategy_id)
-                totals_by_dir = await adx.load_total_closed_by_direction(strategy_id, cutoff)
 
-                # 5) счётчики и батч-буфер
+                is_adx = any(p["test_name"] == "adx" for p in params)
+                is_bb  = any(p["test_name"] == "bb"  for p in params)
+
                 processed = approved = filtered = skipped = 0
                 batch_uids: list[str] = []
 
-                # внутренний обработчик пачки (реальная работа через ADX-воркер)
-                async def process_batch(uids: list[str]):
-                    nonlocal processed, approved, filtered, skipped
-                    if not uids:
+                if is_adx and not is_bb:
+                    per_tf_cache, comp_cache = await adx.load_adx_aggregates_for_strategy(strategy_id)
+                    totals_by_dir = await adx.load_total_closed_by_direction(strategy_id, cutoff)
+
+                    async def process_batch(uids: list[str]):
+                        nonlocal processed, approved, filtered, skipped
+                        if not uids:
+                            return
+                        a, f, s = await adx.process_adx_batch(
+                            lab=lab_cfg,
+                            strategy_id=strategy_id,
+                            run_id=run_id,
+                            cutoff=cutoff,
+                            lab_params=params,
+                            position_uids=uids,
+                            per_tf_cache=per_tf_cache,
+                            comp_cache=comp_cache,
+                            totals_by_dir=totals_by_dir,
+                        )
+                        processed += len(uids); approved += a; filtered += f; skipped += s
+                        await infra.update_progress_json(run_id, {
+                            "cutoff_at": cutoff.isoformat(),
+                            "processed": processed,
+                            "approved": approved,
+                            "filtered": filtered,
+                            "skipped_no_data": skipped,
+                        })
+
+                elif is_bb and not is_adx:
+                    per_tf_cache, comp_cache = await bb.load_bb_aggregates_for_strategy(strategy_id)
+                    totals_by_dir = await bb.load_total_closed_by_direction(strategy_id, cutoff)
+
+                    async def process_batch(uids: list[str]):
+                        nonlocal processed, approved, filtered, skipped
+                        if not uids:
+                            return
+                        a, f, s = await bb.process_bb_batch(
+                            lab=lab_cfg,
+                            strategy_id=strategy_id,
+                            run_id=run_id,
+                            cutoff=cutoff,
+                            lab_params=params,
+                            position_uids=uids,
+                            per_tf_cache=per_tf_cache,
+                            comp_cache=comp_cache,
+                            totals_by_dir=totals_by_dir,
+                        )
+                        processed += len(uids); approved += a; filtered += f; skipped += s
+                        await infra.update_progress_json(run_id, {
+                            "cutoff_at": cutoff.isoformat(),
+                            "processed": processed,
+                            "approved": approved,
+                            "filtered": filtered,
+                            "skipped_no_data": skipped,
+                        })
+
+                else:
+                    async def process_batch(uids: list[str]):
                         return
-                    a, f, s = await adx.process_adx_batch(
-                        lab=lab_cfg,
-                        strategy_id=strategy_id,
-                        run_id=run_id,
-                        cutoff=cutoff,
-                        lab_params=params,
-                        position_uids=uids,
-                        per_tf_cache=per_tf_cache,
-                        comp_cache=comp_cache,
-                        totals_by_dir=totals_by_dir,
-                    )
-                    processed += len(uids)
-                    approved  += a
-                    filtered  += f
-                    skipped   += s
 
-                    # прогресс после каждой пачки
-                    await infra.update_progress_json(run_id, {
-                        "cutoff_at": cutoff.isoformat(),
-                        "processed": processed,
-                        "approved": approved,
-                        "filtered": filtered,
-                        "skipped_no_data": skipped,
-                    })
-
-                # 6) проходим закрытые позиции пачками
+                # 5) проходим закрытые позиции пачками
                 async for uid in loader.iter_closed_positions_uids(strategy_id, cutoff, infra.POSITIONS_BATCH):
                     batch_uids.append(uid)
                     if len(batch_uids) >= infra.POSITIONS_BATCH:
@@ -112,7 +143,7 @@ async def process_run(lab: dict, strategy_id: int):
                     await process_batch(batch_uids)
                     batch_uids.clear()
 
-                # 7) финальный прогресс + завершение + сигнал
+                # 6) финальный прогресс + завершение + сигнал
                 await infra.update_progress_json(run_id, {
                     "cutoff_at": cutoff.isoformat(),
                     "processed": processed,
@@ -128,7 +159,6 @@ async def process_run(lab: dict, strategy_id: int):
                 )
 
         except RuntimeError as e:
-            # лок занят — это не ошибка логики, просто другая корутина уже обрабатывает пару
             if str(e).startswith("lock_busy:"):
                 log.debug("Пропуск: лок занят для lab=%s strategy=%s (%s)", lab_id, strategy_id, e)
                 return
@@ -139,7 +169,7 @@ async def process_run(lab: dict, strategy_id: int):
         raise
     except Exception as e:
         log.exception("Ошибка ранa lab=%s strategy=%s: %s", lab_id, strategy_id, e)
-
+        
 # 🔸 Обёртка для семафора (не более N одновременных ранoв)
 async def run_guarded(lab: dict, sid: int):
     await infra.concurrency_sem.acquire()
