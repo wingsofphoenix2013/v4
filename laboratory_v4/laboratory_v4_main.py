@@ -180,6 +180,7 @@ async def main():
     await infra.setup_redis_client()
     
     await seeder.run_adx_seeder()
+    await seeder.run_bb_seeder()
 
     # Запускаем оба воркера под автоперезапуском
     await asyncio.gather(
