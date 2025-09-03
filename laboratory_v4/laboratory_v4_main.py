@@ -12,6 +12,7 @@ import laboratory_v4_adx_worker as adx
 import laboratory_v4_bb_worker as bb
 import laboratory_v4_rsi_worker as rsi
 import laboratory_v4_dmigaptrend_worker as dmigt
+import laboratory_v4_dmigap_worker as dmigap
 
 import laboratory_v4_seeder as seeder
 
@@ -59,7 +60,7 @@ async def process_run(lab: dict, strategy_id: int):
 
                 # 3) компоненты теста (для упорядочивания проверки)
                 params = await loader.load_lab_parameters(lab_id)
-                log.debug(
+                log.info(
                     "Старт ранa lab_id=%s strategy_id=%s run_id=%s components=%d",
                     lab_id, strategy_id, run_id, len(params)
                 )
@@ -67,15 +68,16 @@ async def process_run(lab: dict, strategy_id: int):
                 # 4) фиксируем cutoff и подготавливаем кэши по сущности теста
                 cutoff = datetime.now()
 
-                is_adx   = any(p["test_name"] == "adx"            for p in params)
-                is_bb    = any(p["test_name"] == "bb"             for p in params)
-                is_rsi   = any(p["test_name"] == "rsi"            for p in params)
-                is_dmigt = any(p["test_name"] == "dmigap_trend"   for p in params)
+                is_adx    = any(p["test_name"] == "adx"            for p in params)
+                is_bb     = any(p["test_name"] == "bb"             for p in params)
+                is_rsi    = any(p["test_name"] == "rsi"            for p in params)
+                is_dmigt  = any(p["test_name"] == "dmigap_trend"   for p in params)
+                is_dmigap = any(p["test_name"] == "dmigap"         for p in params)
 
                 processed = approved = filtered = skipped = 0
                 batch_uids: list[str] = []
 
-                if is_adx and not (is_bb or is_rsi or is_dmigt):
+                if is_adx and not (is_bb or is_rsi or is_dmigt or is_dmigap):
                     per_tf_cache, comp_cache = await adx.load_adx_aggregates_for_strategy(strategy_id)
                     totals_by_dir = await adx.load_total_closed_by_direction(strategy_id, cutoff)
 
@@ -103,7 +105,7 @@ async def process_run(lab: dict, strategy_id: int):
                             "skipped_no_data": skipped,
                         })
 
-                elif is_bb and not (is_adx or is_rsi or is_dmigt):
+                elif is_bb and not (is_adx or is_rsi or is_dmigt or is_dmigap):
                     per_tf_cache, comp_cache = await bb.load_bb_aggregates_for_strategy(strategy_id)
                     totals_by_dir = await bb.load_total_closed_by_direction(strategy_id, cutoff)
 
@@ -131,7 +133,7 @@ async def process_run(lab: dict, strategy_id: int):
                             "skipped_no_data": skipped,
                         })
 
-                elif is_rsi and not (is_adx or is_bb or is_dmigt):
+                elif is_rsi and not (is_adx or is_bb or is_dmigt or is_dmigap):
                     per_tf_cache, comp_cache = await rsi.load_rsi_aggregates_for_strategy(strategy_id)
                     totals_by_dir = await rsi.load_total_closed_by_direction(strategy_id, cutoff)
 
@@ -159,7 +161,7 @@ async def process_run(lab: dict, strategy_id: int):
                             "skipped_no_data": skipped,
                         })
 
-                elif is_dmigt and not (is_adx or is_bb or is_rsi):
+                elif is_dmigt and not (is_adx or is_bb or is_rsi or is_dmigap):
                     per_tf_cache, comp_cache = await dmigt.load_dmigaptrend_aggregates_for_strategy(strategy_id)
                     totals_by_dir = await dmigt.load_total_closed_by_direction(strategy_id, cutoff)
 
@@ -187,10 +189,38 @@ async def process_run(lab: dict, strategy_id: int):
                             "skipped_no_data": skipped,
                         })
 
+                elif is_dmigap and not (is_adx or is_bb or is_rsi or is_dmigt):
+                    per_tf_cache, comp_cache = await dmigap.load_dmigap_aggregates_for_strategy(strategy_id)
+                    totals_by_dir = await dmigap.load_total_closed_by_direction(strategy_id, cutoff)
+
+                    async def process_batch(uids: list[str]):
+                        nonlocal processed, approved, filtered, skipped
+                        if not uids:
+                            return
+                        a, f, s = await dmigap.process_dmigap_batch(
+                            lab=lab_cfg,
+                            strategy_id=strategy_id,
+                            run_id=run_id,
+                            cutoff=cutoff,
+                            lab_params=params,
+                            position_uids=uids,
+                            per_tf_cache=per_tf_cache,
+                            comp_cache=comp_cache,
+                            totals_by_dir=totals_by_dir,
+                        )
+                        processed += len(uids); approved += a; filtered += f; skipped += s
+                        await infra.update_progress_json(run_id, {
+                            "cutoff_at": cutoff.isoformat(),
+                            "processed": processed,
+                            "approved": approved,
+                            "filtered": filtered,
+                            "skipped_no_data": skipped,
+                        })
+
                 else:
                     async def process_batch(uids: list[str]):
                         return
-                                                
+                                                                        
                 # 5) проходим закрытые позиции пачками
                 async for uid in loader.iter_closed_positions_uids(strategy_id, cutoff, infra.POSITIONS_BATCH):
                     batch_uids.append(uid)
@@ -213,14 +243,14 @@ async def process_run(lab: dict, strategy_id: int):
                 })
                 await infra.mark_run_finished(run_id)
                 await infra.send_finish_signal(lab_id, strategy_id, run_id)
-                log.debug(
+                log.info(
                     "RUN DONE lab=%s strategy=%s run_id=%s processed=%s approved=%s filtered=%s skipped=%s",
                     lab_id, strategy_id, run_id, processed, approved, filtered, skipped
                 )
 
         except RuntimeError as e:
             if str(e).startswith("lock_busy:"):
-                log.debug("Пропуск: лок занят для lab=%s strategy=%s (%s)", lab_id, strategy_id, e)
+                log.info("Пропуск: лок занят для lab=%s strategy=%s (%s)", lab_id, strategy_id, e)
                 return
             raise
 
@@ -273,6 +303,7 @@ async def main():
     await seeder.run_bb_seeder()
     await seeder.run_rsi_seeder()
     await seeder.run_dmigaptrend_seeder()
+    await seeder.run_dmigap_seeder()
 
     # Запускаем оба воркера под автоперезапуском
     await asyncio.gather(

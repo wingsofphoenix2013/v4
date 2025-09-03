@@ -61,6 +61,12 @@ def make_name_dmigt(components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
     trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
     return f"DMItrend | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
+
+# 🔸 Имя теста DMI Gap
+def make_name_dmigap(components, min_trade_type, min_trade_value, wr):
+    comp_str = "+".join(components)
+    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    return f"DMIgap | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
     
 # 🔸 Сидер ADX (как было)
 async def run_adx_seeder():
@@ -282,3 +288,58 @@ async def run_dmigaptrend_seeder():
                                 )
 
     log.info("Сидер: успешно создано %d DMItrend-тестов", len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS))
+
+# 🔸 Сидер DMI Gap (новый)
+async def run_dmigap_seeder():
+    async with infra.pg_pool.acquire() as conn:
+        existing = await conn.fetchval("SELECT COUNT(*) FROM laboratory_instances_v4 WHERE name LIKE 'DMIgap | %'")
+        if existing and existing > 0:
+            log.info("Сидер: DMIgap-тесты уже есть (%s шт.), сид не нужен", existing)
+            return
+
+    log.info("Сидер: начинаем генерацию DMIgap-тестов")
+
+    async with infra.pg_pool.acquire() as conn:
+        async with conn.transaction():
+            for wr in WINRATE_VARIANTS:
+                for mt_type, mt_value in MIN_TRADE_VARIANTS:
+                    for comps in COMPONENTS:
+                        name = make_name_dmigap(comps, mt_type, mt_value, wr)
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO laboratory_instances_v4
+                              (name, active, min_trade_type, min_trade_value, min_winrate)
+                            VALUES ($1, false, $2, $3, $4)
+                            RETURNING id
+                            """,
+                            name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
+                        )
+                        lab_id = row["id"]
+
+                        for c in comps:
+                            if c == "m5":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'dmigap', 'solo', 'm5',  '{}')",
+                                    lab_id,
+                                )
+                            elif c == "m15":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'dmigap', 'solo', 'm15', '{}')",
+                                    lab_id,
+                                )
+                            elif c == "h1":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'dmigap', 'solo', 'h1',  '{}')",
+                                    lab_id,
+                                )
+                            elif c == "comp":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'dmigap', 'comp', NULL,  '{}')",
+                                    lab_id,
+                                )
+
+    log.info("Сидер: успешно создано %d DMIgap-тестов", len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS))
