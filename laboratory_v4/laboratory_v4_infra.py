@@ -17,7 +17,7 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 MAX_CONCURRENCY = int(os.getenv("LAB_MAX_CONCURRENCY", "10"))
 POSITIONS_BATCH = int(os.getenv("LAB_POSITIONS_BATCH", "500"))
 FINISH_STREAM = os.getenv("LAB_FINISH_STREAM", "lab_results_stream")
-LOCK_TTL_SEC = int(os.getenv("LAB_LOCK_TTL_SEC", "300"))
+LOCK_TTL_SEC = int(os.getenv("LAB_LOCK_TTL_SEC", "600"))
 
 # 🔸 Семафор параллелизма (на процесс)
 concurrency_sem = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -66,16 +66,12 @@ async def setup_redis_client():
 @asynccontextmanager
 async def redis_lock(key: str, ttl_sec: int = LOCK_TTL_SEC):
     token = os.urandom(8).hex()
-
-    # попытка захвата
     ok = await redis_client.set(key, token, nx=True, ex=ttl_sec)
     if not ok:
         raise RuntimeError(f"lock_busy:{key}")
-
     try:
         yield
     finally:
-        # безопасный релиз (только владельцем)
         try:
             cur = await redis_client.get(key)
             if cur == token:
@@ -151,3 +147,17 @@ async def send_finish_signal(lab_id: int, strategy_id: int, run_id: int):
         )
     except Exception:
         log.exception("Ошибка XADD finish-сигнала (lab_id=%s, strategy_id=%s, run_id=%s)", lab_id, strategy_id, run_id)
+
+
+# 🔸 Обёртка автоперезапуска фоновых задач (в стиле oracle_v4)
+async def run_safe_loop(coro, label: str):
+    while True:
+        try:
+            log.info("[%s] 🚀 Запуск задачи", label)
+            await coro()
+        except asyncio.CancelledError:
+            log.info("[%s] ⏹️ Остановлено по сигналу", label)
+            raise
+        except Exception:
+            log.exception("[%s] ❌ Упал с ошибкой — перезапуск через 5 секунд", label)
+            await asyncio.sleep(5)
