@@ -12,7 +12,7 @@ import laboratory_v4_adx_worker as adx
 
 log = logging.getLogger("LAB_MAIN")
 
-LAB_LOOP_SLEEP_SEC = int(os.getenv("LAB_LOOP_SLEEP_SEC", "3600"))
+LAB_LOOP_SLEEP_SEC = int(os.getenv("LAB_LOOP_SLEEP_SEC", "21600"))
 
 
 # 🔸 Обработка одного рана (lab_id × strategy_id)
@@ -150,6 +150,9 @@ async def run_guarded(lab: dict, sid: int):
 
 # 🔸 Планировщик запусков (периодический рефреш активных тестов/стратегий)
 async def scheduler_loop():
+    
+    await asyncio.sleep(120)
+    
     while True:
         try:
             plan = await loader.build_run_plan()
