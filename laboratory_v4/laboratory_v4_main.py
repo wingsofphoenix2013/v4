@@ -60,7 +60,7 @@ async def process_run(lab: dict, strategy_id: int):
 
                 # 3) компоненты теста (для упорядочивания проверки)
                 params = await loader.load_lab_parameters(lab_id)
-                log.info(
+                log.debug(
                     "Старт ранa lab_id=%s strategy_id=%s run_id=%s components=%d",
                     lab_id, strategy_id, run_id, len(params)
                 )
@@ -243,7 +243,7 @@ async def process_run(lab: dict, strategy_id: int):
                 })
                 await infra.mark_run_finished(run_id)
                 await infra.send_finish_signal(lab_id, strategy_id, run_id)
-                log.info(
+                log.debug(
                     "RUN DONE lab=%s strategy=%s run_id=%s processed=%s approved=%s filtered=%s skipped=%s",
                     lab_id, strategy_id, run_id, processed, approved, filtered, skipped
                 )

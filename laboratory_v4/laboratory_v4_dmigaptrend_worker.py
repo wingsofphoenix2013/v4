@@ -39,7 +39,7 @@ async def _ts_get_exact(key: str, ts_ms: int):
         if r and int(r[0][0]) == ts_ms:
             return float(r[0][1])
     except Exception as e:
-        log.debug("[TSERR] key=%s err=%s", key, e)
+        log.info("[TSERR] key=%s err=%s", key, e)
     return None
 
 
