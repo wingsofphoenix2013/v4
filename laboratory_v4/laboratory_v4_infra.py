@@ -14,8 +14,8 @@ redis_client = None
 log = logging.getLogger("LAB_INFRA")
 
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-MAX_CONCURRENCY = int(os.getenv("LAB_MAX_CONCURRENCY", "10"))
-POSITIONS_BATCH = int(os.getenv("LAB_POSITIONS_BATCH", "500"))
+MAX_CONCURRENCY = int(os.getenv("LAB_MAX_CONCURRENCY", "20"))
+POSITIONS_BATCH = int(os.getenv("LAB_POSITIONS_BATCH", "1000"))
 FINISH_STREAM = os.getenv("LAB_FINISH_STREAM", "lab_results_stream")
 LOCK_TTL_SEC = int(os.getenv("LAB_LOCK_TTL_SEC", "600"))
 
@@ -42,7 +42,7 @@ async def setup_pg():
     dsn = os.getenv("DATABASE_URL")
     if not dsn:
         raise RuntimeError("DATABASE_URL не задан")
-    pool = await asyncpg.create_pool(dsn=dsn, min_size=2, max_size=10, timeout=30.0)
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=4, max_size=40, timeout=30.0)
     async with pool.acquire() as conn:
         await conn.execute("SELECT 1")
     globals()["pg_pool"] = pool
