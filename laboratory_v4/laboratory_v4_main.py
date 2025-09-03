@@ -31,7 +31,7 @@ async def process_run(lab: dict, strategy_id: int):
             )
 
             # cutoff — naive UTC для сопоставления с TIMESTAMP (без TZ) в БД
-            cutoff = datetime.utcnow()
+            cutoff = datetime.now()
 
             processed = approved = filtered = skipped = 0
             batch_uids: list[str] = []
