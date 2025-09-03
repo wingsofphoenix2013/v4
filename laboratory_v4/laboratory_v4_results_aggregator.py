@@ -20,7 +20,7 @@ XREAD_BLOCKMS = int(os.getenv("LAB_RESULTS_BLOCK_MS", "1000"))
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(infra.FINISH_STREAM, GROUP_NAME, id="$", mkstream=True)
-        log.info("Создана consumer group '%s' на стриме '%s'", GROUP_NAME, infra.FINISH_STREAM)
+        log.debug("Создана consumer group '%s' на стриме '%s'", GROUP_NAME, infra.FINISH_STREAM)
     except Exception as e:
         if "BUSYGROUP" in str(e):
             log.debug("Consumer group '%s' уже существует", GROUP_NAME)
@@ -116,7 +116,7 @@ async def _handle_message(fields: dict):
     approved_cnt, pnl_sum, winrate, roi = await _aggregate_run(lab_id, strategy_id, run_id)
     await _upsert_strategy_results(lab_id, strategy_id, run_id, pnl_sum, winrate, roi)
 
-    log.info(
+    log.debug(
         "AGG DONE lab=%s strategy=%s run_id=%s: approved=%s pnl_sum=%s winrate=%s roi=%s",
         lab_id, strategy_id, run_id, approved_cnt, str(pnl_sum), str(winrate), str(roi)
     )
@@ -125,7 +125,7 @@ async def _handle_message(fields: dict):
 # 🔸 Главный цикл аггрегатора результатов
 async def run_laboratory_results_aggregator():
     await _ensure_group()
-    log.info("Слушаем стрим '%s' (group=%s, consumer=%s)", infra.FINISH_STREAM, GROUP_NAME, CONSUMER_NAME)
+    log.debug("Слушаем стрим '%s' (group=%s, consumer=%s)", infra.FINISH_STREAM, GROUP_NAME, CONSUMER_NAME)
 
     while True:
         try:
@@ -153,7 +153,7 @@ async def run_laboratory_results_aggregator():
                 await infra.redis_client.xack(infra.FINISH_STREAM, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("Агрегатор результатов остановлен по сигналу")
+            log.debug("Агрегатор результатов остановлен по сигналу")
             raise
         except Exception as e:
             log.exception("Ошибка в XREADGROUP цикле: %s", e)

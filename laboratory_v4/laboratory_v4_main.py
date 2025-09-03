@@ -9,6 +9,7 @@ import laboratory_v4_infra as infra
 import laboratory_v4_loader as loader
 import laboratory_v4_results_aggregator as results_agg
 import laboratory_v4_adx_worker as adx
+import laboratory_v4_seeder as seeder
 
 log = logging.getLogger("LAB_MAIN")
 
@@ -177,6 +178,8 @@ async def main():
 
     await infra.setup_pg()
     await infra.setup_redis_client()
+    
+    await seeder.run_adx_seeder()
 
     # Запускаем оба воркера под автоперезапуском
     await asyncio.gather(
