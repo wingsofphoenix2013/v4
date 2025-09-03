@@ -50,7 +50,12 @@ def make_name_bb(components, min_trade_type, min_trade_value, wr):
     trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
     return f"BB20/2.0 | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
 
-
+# 🔸 Имя теста RSI
+def make_name_rsi(components, min_trade_type, min_trade_value, wr):
+    comp_str = "+".join(components)
+    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    return f"RSI14 | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
+    
 # 🔸 Сидер ADX (как было)
 async def run_adx_seeder():
     async with infra.pg_pool.acquire() as conn:
@@ -161,3 +166,58 @@ async def run_bb_seeder():
                                 )
 
     log.info("Сидер: успешно создано %d BB-тестов", len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS))
+
+# 🔸 Сидер RSI (новый)
+async def run_rsi_seeder():
+    async with infra.pg_pool.acquire() as conn:
+        existing = await conn.fetchval("SELECT COUNT(*) FROM laboratory_instances_v4 WHERE name LIKE 'RSI14 | %'")
+        if existing and existing > 0:
+            log.info("Сидер: RSI-тесты уже есть (%s шт.), сид не нужен", existing)
+            return
+
+    log.info("Сидер: начинаем генерацию RSI-тестов (rsi14)")
+
+    async with infra.pg_pool.acquire() as conn:
+        async with conn.transaction():
+            for wr in WINRATE_VARIANTS:
+                for mt_type, mt_value in MIN_TRADE_VARIANTS:
+                    for comps in COMPONENTS:
+                        name = make_name_rsi(comps, mt_type, mt_value, wr)
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO laboratory_instances_v4
+                              (name, active, min_trade_type, min_trade_value, min_winrate)
+                            VALUES ($1, false, $2, $3, $4)
+                            RETURNING id
+                            """,
+                            name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
+                        )
+                        lab_id = row["id"]
+
+                        for c in comps:
+                            if c == "m5":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'rsi', 'solo', 'm5',  '{\"rsi_len\":14}')",
+                                    lab_id,
+                                )
+                            elif c == "m15":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'rsi', 'solo', 'm15', '{\"rsi_len\":14}')",
+                                    lab_id,
+                                )
+                            elif c == "h1":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'rsi', 'solo', 'h1',  '{\"rsi_len\":14}')",
+                                    lab_id,
+                                )
+                            elif c == "comp":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 (lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'rsi', 'comp', NULL,  '{\"rsi_len\":14}')",
+                                    lab_id,
+                                )
+
+    log.info("Сидер: успешно создано %d RSI-тестов", len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS))
