@@ -10,22 +10,31 @@ import laboratory_v4_infra as infra
 # 🔸 Логгер и настройки чтения стрима
 log = logging.getLogger("LAB_RESULTS_AGG")
 
+STREAM_NAME   = infra.FINISH_STREAM
 GROUP_NAME    = os.getenv("LAB_RESULTS_GROUP",    "lab_results_aggregator")
 CONSUMER_NAME = os.getenv("LAB_RESULTS_CONSUMER", "lab_results_aggregator_1")
 XREAD_COUNT   = int(os.getenv("LAB_RESULTS_COUNT",    "50"))
 XREAD_BLOCKMS = int(os.getenv("LAB_RESULTS_BLOCK_MS", "1000"))
+RESET_GROUP   = os.getenv("LAB_RESULTS_RESET_GROUP", "false").lower() == "true"
 
 
-# 🔸 Идемпотентное создание consumer-group
+# 🔸 Инициализация consumer-group (вариант A: reset-группы по ENV)
 async def _ensure_group():
     try:
-        await infra.redis_client.xgroup_create(infra.FINISH_STREAM, GROUP_NAME, id="$", mkstream=True)
-        log.debug("Создана consumer group '%s' на стриме '%s'", GROUP_NAME, infra.FINISH_STREAM)
+        if RESET_GROUP:
+            try:
+                await infra.redis_client.xgroup_destroy(STREAM_NAME, GROUP_NAME)
+                log.info("Сброс consumer-group '%s' на стриме '%s'", GROUP_NAME, STREAM_NAME)
+            except Exception:
+                # если группы не было — просто игнорируем
+                pass
+        await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
+        log.info("Создана consumer-group '%s' на стриме '%s' (id=$)", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.debug("Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("Consumer-group '%s' уже существует", GROUP_NAME)
         else:
-            log.exception("Ошибка создания consumer group: %s", e)
+            log.exception("Ошибка создания consumer-group: %s", e)
             raise
 
 
@@ -44,7 +53,6 @@ async def _load_strategy_deposit(strategy_id: int) -> Decimal:
 # 🔸 Подсчёт метрик по approved-позициям рана
 async def _aggregate_run(lab_id: int, strategy_id: int, run_id: int):
     async with infra.pg_pool.acquire() as conn:
-        # approved-позиции данного рана
         row = await conn.fetchrow(
             """
             WITH approved AS (
@@ -103,6 +111,13 @@ async def _upsert_strategy_results(lab_id: int, strategy_id: int, run_id: int,
         )
 
 
+# 🔸 Проверка наличия run перед апдейтом (защита от «битых» сообщений)
+async def _run_exists(run_id: int) -> bool:
+    async with infra.pg_pool.acquire() as conn:
+        row = await conn.fetchval("SELECT 1 FROM laboratory_runs_v4 WHERE id=$1", run_id)
+    return bool(row)
+
+
 # 🔸 Обработка одного сообщения из стрима
 async def _handle_message(fields: dict):
     try:
@@ -111,6 +126,11 @@ async def _handle_message(fields: dict):
         run_id      = int(fields.get("run_id"))
     except Exception:
         log.error("Неверные поля сообщения: %s", fields)
+        return
+
+    # защита от ситуации, когда БД очищали/трункатили
+    if not await _run_exists(run_id):
+        log.debug("Пропуск сообщения: run_id=%s отсутствует в laboratory_runs_v4", run_id)
         return
 
     approved_cnt, pnl_sum, winrate, roi = await _aggregate_run(lab_id, strategy_id, run_id)
@@ -125,14 +145,14 @@ async def _handle_message(fields: dict):
 # 🔸 Главный цикл аггрегатора результатов
 async def run_laboratory_results_aggregator():
     await _ensure_group()
-    log.debug("Слушаем стрим '%s' (group=%s, consumer=%s)", infra.FINISH_STREAM, GROUP_NAME, CONSUMER_NAME)
+    log.debug("Слушаем стрим '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
 
     while True:
         try:
             resp = await infra.redis_client.xreadgroup(
                 groupname=GROUP_NAME,
                 consumername=CONSUMER_NAME,
-                streams={infra.FINISH_STREAM: ">"},
+                streams={STREAM_NAME: ">"},
                 count=XREAD_COUNT,
                 block=XREAD_BLOCKMS,
             )
@@ -150,7 +170,7 @@ async def run_laboratory_results_aggregator():
                         to_ack.append(msg_id)
 
             if to_ack:
-                await infra.redis_client.xack(infra.FINISH_STREAM, GROUP_NAME, *to_ack)
+                await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
             log.debug("Агрегатор результатов остановлен по сигналу")
