@@ -302,7 +302,7 @@ async def main():
     await seeder.run_adx_seeder()
     await seeder.run_bb_seeder()
     await seeder.run_rsi_seeder()
-    await seeder.run_dmigaptrend_seeder()
+#     await seeder.run_dmigaptrend_seeder()
     await seeder.run_dmigap_seeder()
 
     # Запускаем оба воркера под автоперезапуском

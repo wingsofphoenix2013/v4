@@ -7,12 +7,11 @@ import laboratory_v4_infra as infra
 log = logging.getLogger("LAB_SEEDER")
 
 # 🔸 Общие сетки параметров
-WINRATE_VARIANTS = [0.45, 0.50, 0.55, 0.60]
+WINRATE_VARIANTS = [0.55, 0.60]
 MIN_TRADE_VARIANTS = [
     ("absolute", 10),
-    ("percent", 0.02),
-    ("percent", 0.04),
-    ("percent", 0.06),
+    ("absolute", 20),
+    ("absolute", 30),
 ]
 
 # 🔸 Компоненты (15 комбинаций без пустого множества)
@@ -66,7 +65,7 @@ def make_name_dmigap(components, min_trade_type, min_trade_value, wr):
     trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
     return f"DMIgap | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
     
-# 🔸 Сидер ADX (как было)
+# 🔸 Сидер ADX
 async def run_adx_seeder():
     async with infra.pg_pool.acquire() as conn:
         existing = await conn.fetchval("SELECT COUNT(*) FROM laboratory_instances_v4 WHERE name LIKE 'ADX | %'")
@@ -86,7 +85,7 @@ async def run_adx_seeder():
                             """
                             INSERT INTO laboratory_instances_v4
                               (name, active, min_trade_type, min_trade_value, min_winrate)
-                            VALUES ($1, false, $2, $3, $4)
+                            VALUES ($1, true, $2, $3, $4)
                             RETURNING id
                             """,
                             name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
@@ -142,7 +141,7 @@ async def run_bb_seeder():
                             """
                             INSERT INTO laboratory_instances_v4
                               (name, active, min_trade_type, min_trade_value, min_winrate)
-                            VALUES ($1, false, $2, $3, $4)
+                            VALUES ($1, true, $2, $3, $4)
                             RETURNING id
                             """,
                             name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
@@ -197,7 +196,7 @@ async def run_rsi_seeder():
                             """
                             INSERT INTO laboratory_instances_v4
                               (name, active, min_trade_type, min_trade_value, min_winrate)
-                            VALUES ($1, false, $2, $3, $4)
+                            VALUES ($1, true, $2, $3, $4)
                             RETURNING id
                             """,
                             name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
@@ -307,7 +306,7 @@ async def run_dmigap_seeder():
                             """
                             INSERT INTO laboratory_instances_v4
                               (name, active, min_trade_type, min_trade_value, min_winrate)
-                            VALUES ($1, false, $2, $3, $4)
+                            VALUES ($1, true, $2, $3, $4)
                             RETURNING id
                             """,
                             name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))

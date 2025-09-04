@@ -13,13 +13,18 @@ log = logging.getLogger("LAB_RESULTS_AGG")
 STREAM_NAME   = infra.FINISH_STREAM
 GROUP_NAME    = os.getenv("LAB_RESULTS_GROUP",    "lab_results_aggregator")
 CONSUMER_NAME = os.getenv("LAB_RESULTS_CONSUMER", "lab_results_aggregator_1")
-XREAD_COUNT   = int(os.getenv("LAB_RESULTS_COUNT",    "50"))
-XREAD_BLOCKMS = int(os.getenv("LAB_RESULTS_BLOCK_MS", "1000"))
+# фиксируем «ширину глотка» и таймауты (можно переопределить ENV при желании)
+XREAD_COUNT   = int(os.getenv("LAB_RESULTS_COUNT",    "250"))   # сколько сообщений забираем за тик
+XREAD_BLOCKMS = int(os.getenv("LAB_RESULTS_BLOCK_MS", "200"))   # блокировка XREADGROUP, мс
 RESET_GROUP   = os.getenv("LAB_RESULTS_RESET_GROUP", "false").lower() == "true"
 
-# 🔸 Параметры очистки per-position результатов после агрегации
+# 🔸 Параллелизм агрегации и параметры очистки
+AGG_CONCURRENCY = int(os.getenv("LAB_RESULTS_AGG_CONCURRENCY", "6"))  # одновременно агрегируемых run’ов
 PURGE_AFTER_AGG = os.getenv("LAB_PURGE_RESULTS_AFTER_AGG", "true").lower() == "true"
-PURGE_CHUNK     = int(os.getenv("LAB_PURGE_CHUNK", "50000"))  # размер одного чанка DELETE
+PURGE_CHUNK     = int(os.getenv("LAB_PURGE_CHUNK", "100000"))  # размер одного чанка DELETE
+
+# 🔸 Семафор для ограничения параллелизма
+_sem = asyncio.Semaphore(AGG_CONCURRENCY)
 
 
 # 🔸 Инициализация consumer-group (вариант A: reset-группы по ENV)
@@ -150,7 +155,7 @@ async def _purge_run_results(run_id: int):
     log.debug("PURGE DONE run_id=%s removed=%s rows", run_id, total)
 
 
-# 🔸 Обработка одного сообщения из стрима
+# 🔸 Обработка одного сообщения (одного run_id)
 async def _handle_message(fields: dict):
     try:
         lab_id      = int(fields.get("lab_id"))
@@ -179,6 +184,12 @@ async def _handle_message(fields: dict):
     )
 
 
+# 🔸 Обработчик с ограничением параллелизма
+async def _handle_message_guarded(fields: dict):
+    async with _sem:
+        await _handle_message(fields)
+
+
 # 🔸 Главный цикл аггрегатора результатов
 async def run_laboratory_results_aggregator():
     await _ensure_group()
@@ -197,14 +208,16 @@ async def run_laboratory_results_aggregator():
                 continue
 
             to_ack = []
+            tasks: list[asyncio.Task] = []
+
             for _, records in resp:
                 for msg_id, data in records:
-                    try:
-                        await _handle_message(data)
-                        to_ack.append(msg_id)
-                    except Exception as e:
-                        log.exception("Ошибка обработки сообщения %s: %s", msg_id, e)
-                        to_ack.append(msg_id)
+                    tasks.append(asyncio.create_task(_handle_message_guarded(data)))
+                    to_ack.append(msg_id)
+
+            if tasks:
+                # Дождаться завершения пачки; исключения уже залогируются внутри обработчика
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             if to_ack:
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
