@@ -21,7 +21,10 @@ STREAM_LIMITS = {
 PIS_BATCH_SIZE        = 10_000   # сколько ID выбираем за один проход
 PIS_DELETE_CHUNK_SIZE = 1_000    # сколько ID удаляем в одном SQL-запросе
 PIS_CONCURRENCY       = 10       # параллельных задач удаления
-PIS_FIRST_RUN_DELAY   = timedelta(minutes=2)
+
+# ⚠️ ВРЕМЕННО для диагностики: первый запуск через 15 секунд (потом вернём 2 минуты)
+PIS_FIRST_RUN_DELAY   = timedelta(seconds=15)
+# PIS_FIRST_RUN_DELAY = timedelta(minutes=2)
 PIS_RUN_PERIOD        = timedelta(days=1)
 
 # 🔸 Пройтись по ts_ind:* и выставить RETENTION=14 суток (идемпотентно)
@@ -94,7 +97,6 @@ async def cleanup_positions_indicators_stat(pg,
             if not ids:
                 break
 
-            # разбиваем на чанки и удаляем параллельно (ограничивая семафором)
             tasks = []
             for i in range(0, len(ids), chunk_size):
                 chunk = ids[i:i+chunk_size]
@@ -128,13 +130,13 @@ async def trim_streams(redis):
 
 # 🔸 Основной воркер: запускает периодические задачи
 async def run_indicators_cleanup(pg, redis):
-    log.debug("IND_CLEANUP запущен")
-    # Циклы: TS/Streams — почаще; БД — раз в сутки
+    log.info("IND_CLEANUP started")  # ← видно всегда при INFO
     last_db = datetime.min
 
-    # расписание очистки PIS — первый запуск через 2 минуты, далее раз в сутки
+    # расписание очистки PIS — первый запуск через 15 секунд (диагностика), далее раз в сутки
     now = datetime.utcnow()
     next_pis_run_at = now + PIS_FIRST_RUN_DELAY
+    log.info(f"[DB] PIS cleanup scheduled at (UTC): {next_pis_run_at.isoformat()}")
 
     while True:
         try:
@@ -154,6 +156,7 @@ async def run_indicators_cleanup(pg, redis):
                 await cleanup_positions_indicators_stat(pg)
                 log.info("[DB] PIS cleanup: done")
                 next_pis_run_at = now + PIS_RUN_PERIOD
+                log.info(f"[DB] PIS next run at (UTC): {next_pis_run_at.isoformat()}")
 
             # динамический сон: до ближайшего события, но не больше 300 сек
             now = datetime.utcnow()
