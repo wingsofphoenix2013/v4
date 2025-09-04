@@ -1,11 +1,13 @@
-# position_snapshot_worker.py — чтение positions_open_stream и on-demand срез индикаторов (без записи в БД)
+# position_snapshot_worker.py — чтение positions_open_stream и on-demand срез индикаторов + EMA-status
 
 import asyncio
 import logging
 import json
 from datetime import datetime
 
+import pandas as pd
 from indicators.compute_and_store import compute_snapshot_values_async
+from indicators_ema_status import _classify_with_prev, EPS0, EPS1  # импортируем готовую классификацию
 
 log = logging.getLogger("IND_POS_SNAPSHOT")
 
@@ -21,7 +23,8 @@ def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
     step_ms = STEP_MIN[tf] * 60_000
     return (ts_ms // step_ms) * step_ms
 
-# 🔸 Основной воркер: читаем открытия, считаем on-demand и пишем в БД (с суммарной статистикой)
+
+# 🔸 Основной воркер
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw=lambda _sid: True):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
@@ -48,7 +51,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                 continue
 
             to_ack = []
-            
+
             for _, messages in resp:
                 for msg_id, data in messages:
                     to_ack.append(msg_id)
@@ -59,7 +62,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         side  = data.get("direction")
                         created_iso = data.get("created_at")
 
-                        # 🔸 фильтр по стратегиям с market_watcher = true
+                        # 🔸 фильтр по стратегиям
                         try:
                             if not get_strategy_mw(strat):
                                 log.debug(f"[SKIP] uid={uid} strategy_id={strat}: market_watcher=false")
@@ -104,7 +107,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 log.warning(f"[SKIP] uid={uid} TF={tf} нет OHLCV для среза")
                                 continue
 
-                            import pandas as pd
                             idx = sorted(series["c"].keys())
                             df = {f: [series.get(f, {}).get(ts) for ts in idx] for f in fields}
                             pdf = pd.DataFrame(df, index=pd.to_datetime(idx, unit="ms"))
@@ -113,6 +115,13 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             tf_inst_count = 0
                             tf_param_count = 0
                             rows = []  # батч для БД
+
+                            # значения close_t/prev для EMA-status
+                            close_t = float(pdf["c"].iloc[-1])
+                            if len(pdf) > 1:
+                                close_prev = float(pdf["c"].iloc[-2])
+                            else:
+                                close_prev = None
 
                             for inst in instances:
                                 en = inst.get("enabled_at")
@@ -132,7 +141,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 kv = ", ".join(f"{k}={v}" for k, v in values.items())
                                 log.debug(f"[SNAPSHOT] uid={uid} TF={tf} inst={inst['id']} {kv}")
 
-                                # формируем строки для вставки
+                                # формируем строки для обычных индикаторов
                                 bar_open_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
                                 enabled_at = inst.get("enabled_at")
                                 params_json = json.dumps(inst.get("params", {}))
@@ -148,6 +157,57 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         enabled_at,   # enabled_at
                                         params_json   # params_json
                                     ))
+
+                                # 🔸 Дополнительно: EMA-status
+                                if inst.get("indicator") == "ema":
+                                    try:
+                                        L = int(inst["params"].get("length"))
+                                    except Exception:
+                                        continue
+                                    ema_t = None
+                                    ema_p = None
+                                    try:
+                                        if f"ema{L}" in values:
+                                            ema_t = float(values[f"ema{L}"])
+                                    except Exception:
+                                        ema_t = None
+                                    # предыдущая EMA через pdf[:-1]
+                                    if len(pdf) > 1:
+                                        async with sem:
+                                            prev_vals = await compute_snapshot_values_async(inst, sym, pdf.iloc[:-1], precision)
+                                        if prev_vals and f"ema{L}" in prev_vals:
+                                            try:
+                                                ema_p = float(prev_vals[f"ema{L}"])
+                                            except Exception:
+                                                ema_p = None
+
+                                    # scale_t/scale_prev пока берём из std dev диапазона (BB/ATR нужно подтянуть аналогично EMA-status)
+                                    scale_t = None
+                                    scale_prev = None
+                                    # (упрощённо: ширина high-low как scale)
+                                    try:
+                                        scale_t = float(pdf["h"].iloc[-1]) - float(pdf["l"].iloc[-1])
+                                        if len(pdf) > 1:
+                                            scale_prev = float(pdf["h"].iloc[-2]) - float(pdf["l"].iloc[-2])
+                                    except Exception:
+                                        pass
+
+                                    cls = _classify_with_prev(
+                                        close_t, close_prev,
+                                        ema_t, ema_p,
+                                        scale_t, scale_prev,
+                                        EPS0, EPS1,
+                                        None
+                                    )
+                                    if cls is not None:
+                                        code, label, nd, d, delta_d = cls
+                                        rows.append((
+                                            uid, strat, side, tf,
+                                            int(inst["id"]), f"ema{L}_status", str(code), code,
+                                            bar_open_dt,
+                                            enabled_at,
+                                            params_json
+                                        ))
 
                             # запись в БД по TF одним батчем
                             if rows:
