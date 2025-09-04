@@ -17,9 +17,9 @@ STREAM_LIMITS = {
     "indicator_response":    10000,
 }
 
-# 🔹 Новое: настройки очистки positions_indicators_stat
-PIS_BATCH_SIZE        = 10_000   # сколько ID за один цикл выборки
-PIS_DELETE_CHUNK_SIZE = 1_000    # сколько ID удаляем в одном запросе
+# 🔹 Настройки очистки positions_indicators_stat
+PIS_BATCH_SIZE        = 10_000   # сколько ID выбираем за один проход
+PIS_DELETE_CHUNK_SIZE = 1_000    # сколько ID удаляем в одном SQL-запросе
 PIS_CONCURRENCY       = 10       # параллельных задач удаления
 PIS_FIRST_RUN_DELAY   = timedelta(minutes=2)
 PIS_RUN_PERIOD        = timedelta(days=1)
@@ -59,7 +59,7 @@ async def cleanup_db(pg):
     except Exception as e:
         log.error(f"[DB] cleanup_db error: {e}", exc_info=True)
 
-# 🔹 Новое: выборка батча ID для удаления из positions_indicators_stat
+# 🔹 Выборка батча ID для удаления из positions_indicators_stat
 async def _fetch_pis_batch_ids(pg, limit: int) -> list[int]:
     sql = """
         SELECT pis.id
@@ -72,7 +72,7 @@ async def _fetch_pis_batch_ids(pg, limit: int) -> list[int]:
         rows = await conn.fetch(sql, limit)
     return [r["id"] for r in rows]
 
-# 🔹 Новое: удаление пачки ID (одним запросом)
+# 🔹 Удаление пачки ID (одним запросом)
 async def _delete_pis_ids_chunk(pg, ids: list[int]):
     if not ids:
         return
@@ -80,8 +80,11 @@ async def _delete_pis_ids_chunk(pg, ids: list[int]):
     async with pg.acquire() as conn:
         await conn.execute(sql, ids)
 
-# 🔹 Новое: полная очистка PIS батчами с параллелизмом
-async def cleanup_positions_indicators_stat(pg, batch_size=PIS_BATCH_SIZE, chunk_size=PIS_DELETE_CHUNK_SIZE, concurrency=PIS_CONCURRENCY):
+# 🔹 Полная очистка PIS батчами с параллелизмом
+async def cleanup_positions_indicators_stat(pg,
+                                            batch_size: int = PIS_BATCH_SIZE,
+                                            chunk_size: int = PIS_DELETE_CHUNK_SIZE,
+                                            concurrency: int = PIS_CONCURRENCY):
     try:
         total_deleted = 0
         sem = asyncio.Semaphore(concurrency)
@@ -104,12 +107,12 @@ async def cleanup_positions_indicators_stat(pg, batch_size=PIS_BATCH_SIZE, chunk
 
             await asyncio.gather(*tasks, return_exceptions=False)
             total_deleted += len(ids)
-            log.info(f"[DB] positions_indicators_stat удалено батчем: {len(ids)} (накопительно: {total_deleted})")
+            log.debug(f"[DB] positions_indicators_stat удалено батчем: {len(ids)} (накопительно: {total_deleted})")
 
         if total_deleted:
-            log.info(f"[DB] Очистка PIS завершена, удалено строк: {total_deleted}")
+            log.info(f"[DB] PIS cleanup removed rows: {total_deleted}")
         else:
-            log.info("[DB] Очистка PIS: подходящих строк не найдено")
+            log.info("[DB] PIS cleanup: nothing to delete")
 
     except Exception as e:
         log.error(f"[DB] cleanup_positions_indicators_stat error: {e}", exc_info=True)
@@ -129,7 +132,7 @@ async def run_indicators_cleanup(pg, redis):
     # Циклы: TS/Streams — почаще; БД — раз в сутки
     last_db = datetime.min
 
-    # 🔹 Новое: расписание очистки PIS — первый запуск через 2 минуты, далее раз в сутки
+    # расписание очистки PIS — первый запуск через 2 минуты, далее раз в сутки
     now = datetime.utcnow()
     next_pis_run_at = now + PIS_FIRST_RUN_DELAY
 
@@ -145,12 +148,17 @@ async def run_indicators_cleanup(pg, redis):
                 await cleanup_db(pg)
                 last_db = now
 
-            # 🔹 Новое: очистка PIS по расписанию
+            # очистка PIS по расписанию
             if now >= next_pis_run_at:
+                log.info("[DB] PIS cleanup: start")
                 await cleanup_positions_indicators_stat(pg)
+                log.info("[DB] PIS cleanup: done")
                 next_pis_run_at = now + PIS_RUN_PERIOD
 
-            await asyncio.sleep(300)  # 5 минут пауза
+            # динамический сон: до ближайшего события, но не больше 300 сек
+            now = datetime.utcnow()
+            sleep_sec = min(300, max(1, int((next_pis_run_at - now).total_seconds())))
+            await asyncio.sleep(sleep_sec)
 
         except Exception as e:
             log.error(f"IND_CLEANUP loop error: {e}", exc_info=True)

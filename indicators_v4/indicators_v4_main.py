@@ -18,7 +18,7 @@ from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
 from indicators_market_watcher import run_market_watcher
 from indicators_ema_status import run_indicators_ema_status
-from indicators_ema_status_backfill import run_indicators_ema_status_backfill
+# from indicators_ema_status_backfill import run_indicators_ema_status_backfill
 from indicators_ema_status_live import run_indicators_ema_status_live
 
 # 🔸 Глобальные переменные
@@ -29,7 +29,7 @@ required_candles = {
     "m15": 800,
     "h1": 800,
 }
-# 🔹 Новое: кэш стратегий (id -> market_watcher)
+# 🔸 Новое: кэш стратегий (id -> market_watcher)
 active_strategies = {}
 
 AUDIT_WINDOW_HOURS = 12
@@ -54,7 +54,7 @@ def get_precision(symbol: str) -> int:
 def get_active_symbols():
     return list(active_tickers.keys())
 
-# 🔹 Новое: геттер признака market_watcher по стратегии
+# 🔸 Новое: геттер признака market_watcher по стратегии
 def get_strategy_mw(strategy_id: int) -> bool:
     return bool(active_strategies.get(int(strategy_id), False))
 
@@ -98,7 +98,7 @@ async def load_initial_indicators(pg):
             }
             log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}, enabled_at={inst['enabled_at']}")
 
-# 🔹 Новое: загрузка стратегий (market_watcher) при старте
+# 🔸 Новое: загрузка стратегий (market_watcher) при старте
 async def load_initial_strategies(pg):
     log = logging.getLogger("INIT")
     async with pg.acquire() as conn:
@@ -205,7 +205,7 @@ async def watch_indicator_updates(pg, redis):
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
 
-# 🔹 (Опционально) Подписка на изменения стратегий
+# 🔸 (Опционально) Подписка на изменения стратегий
 # Канал событий для стратегий в текущем контуре не используется; при появлении — можно активировать аналогичную логику.
 # Пример заготовки (не подключена):
 # async def watch_strategy_updates(pg, redis):
@@ -449,7 +449,7 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
-        run_safe_loop(lambda: run_indicators_ema_status_backfill(pg, redis), "EMA_STATUS_BF"),
+#         run_safe_loop(lambda: run_indicators_ema_status_backfill(pg, redis), "EMA_STATUS_BF"),
         run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
     )
 
