@@ -29,14 +29,16 @@ def tf_table(tf: str) -> str:
         return "ohlcv4_m15"
     return "ohlcv4_h1"
 
-# 🔸 Кандидаты к обработке
+# 🔸 Кандидаты к обработке (только стратегии с market_watcher=true)
 async def fetch_positions_batch(pg, limit: int):
     sql = """
-        SELECT position_uid, symbol, strategy_id, direction, created_at
-        FROM positions_v4
-        WHERE status = 'closed'
-          AND emastatus_checked = false
-        ORDER BY created_at ASC
+        SELECT p.position_uid, p.symbol, p.strategy_id, p.direction, p.created_at
+        FROM positions_v4 p
+        JOIN strategies_v4 s ON s.id = p.strategy_id
+        WHERE p.status = 'closed'
+          AND p.emastatus_checked = false
+          AND s.market_watcher = true
+        ORDER BY p.created_at ASC
         LIMIT $1
     """
     async with pg.acquire() as conn:
