@@ -22,7 +22,7 @@ def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
     return (ts_ms // step_ms) * step_ms
 
 # 🔸 Основной воркер: читаем открытия, считаем on-demand и пишем в БД (с суммарной статистикой)
-async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision):
+async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw=lambda _sid: True):
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
         log.debug(f"Группа {GROUP} создана для {STREAM}")
@@ -48,6 +48,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                 continue
 
             to_ack = []
+            
             for _, messages in resp:
                 for msg_id, data in messages:
                     to_ack.append(msg_id)
@@ -57,6 +58,15 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         strat = int(data.get("strategy_id"))
                         side  = data.get("direction")
                         created_iso = data.get("created_at")
+
+                        # 🔸 фильтр по стратегиям с market_watcher = true
+                        try:
+                            if not get_strategy_mw(strat):
+                                log.debug(f"[SKIP] uid={uid} strategy_id={strat}: market_watcher=false")
+                                continue
+                        except Exception:
+                            log.exception(f"[SKIP] uid={uid} strategy_id={strat}: ошибка проверки market_watcher")
+                            continue
 
                         log.debug(f"[OPENED] uid={uid} {sym} strategy={strat} dir={side} created_at={created_iso}")
 

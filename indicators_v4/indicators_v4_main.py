@@ -29,6 +29,8 @@ required_candles = {
     "m15": 800,
     "h1": 800,
 }
+# 🔹 Новое: кэш стратегий (id -> market_watcher)
+active_strategies = {}
 
 AUDIT_WINDOW_HOURS = 12
 
@@ -46,12 +48,15 @@ def get_instances_by_tf(tf: str):
         if inst["timeframe"] == tf
     ]
 
-
 def get_precision(symbol: str) -> int:
     return active_tickers.get(symbol, 8)
 
 def get_active_symbols():
     return list(active_tickers.keys())
+
+# 🔹 Новое: геттер признака market_watcher по стратегии
+def get_strategy_mw(strategy_id: int) -> bool:
+    return bool(active_strategies.get(int(strategy_id), False))
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте
 async def load_initial_tickers(pg):
@@ -92,7 +97,20 @@ async def load_initial_indicators(pg):
                 "enabled_at": inst["enabled_at"],
             }
             log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}, enabled_at={inst['enabled_at']}")
-            
+
+# 🔹 Новое: загрузка стратегий (market_watcher) при старте
+async def load_initial_strategies(pg):
+    log = logging.getLogger("INIT")
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, market_watcher
+            FROM strategies_v4
+            WHERE enabled = true AND archived = false
+        """)
+        for row in rows:
+            active_strategies[int(row["id"])] = bool(row["market_watcher"])
+            log.debug(f"Loaded strategy: id={row['id']} → market_watcher={row['market_watcher']}")
+
 # 🔸 Подписка на обновления тикеров
 async def watch_ticker_updates(pg, redis):
     log = logging.getLogger("TICKER_UPDATES")
@@ -186,7 +204,17 @@ async def watch_indicator_updates(pg, redis):
 
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
-            
+
+# 🔹 (Опционально) Подписка на изменения стратегий
+# Канал событий для стратегий в текущем контуре не используется; при появлении — можно активировать аналогичную логику.
+# Пример заготовки (не подключена):
+# async def watch_strategy_updates(pg, redis):
+#     log = logging.getLogger("STRATEGY_UPDATES")
+#     pubsub = redis.pubsub()
+#     await pubsub.subscribe("strategies_v4_events")
+#     async for msg in pubsub.listen():
+#         ...
+
 # 🔸 Загрузка свечей из Redis TimeSeries
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
@@ -241,7 +269,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     df.index.name = "open_time"
     df = df.sort_index()
     return df
-    
+
 # 🔸 Обработка событий из канала OHLCV
 async def watch_ohlcv_events(pg, redis):
     log = logging.getLogger("OHLCV_EVENTS")
@@ -285,6 +313,7 @@ async def watch_ohlcv_events(pg, redis):
             ])
         except Exception as e:
             log.warning(f"Ошибка в ohlcv_channel: {e}")
+
 # 🔸 On-demand расчёт индикаторов: indicator_request → indicator_response
 async def watch_indicator_requests(pg, redis):
 
@@ -396,15 +425,16 @@ async def watch_indicator_requests(pg, redis):
         except Exception as e:
             logging.getLogger("IND_ONDEMAND").error(f"loop error: {e}", exc_info=True)
             await asyncio.sleep(2)
-            
+
 # 🔸 Точка входа
 async def main():
     setup_logging()
     pg = await init_pg_pool()
     redis = await init_redis_client()
-    
+
     await load_initial_tickers(pg)
     await load_initial_indicators(pg)
+    await load_initial_strategies(pg)
 
     await asyncio.gather(
         run_safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
@@ -415,7 +445,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_healer(pg, redis), "IND_HEALER"),
         run_safe_loop(lambda: run_indicator_ts_filler(pg, redis), "IND_TS_FILLER"),
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
-        run_safe_loop(lambda: run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision), "IND_POS_SNAPSHOT"),
+        run_safe_loop(lambda: run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw), "IND_POS_SNAPSHOT"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
