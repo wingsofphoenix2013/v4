@@ -1,5 +1,4 @@
 # indicators_ema_status_backfill.py — бэкофилл EMA-status по закрытым позициям
-# Этап 3 (WRITE): считаем EMA-status на момент открытия, пишем в positions_indicators_stat, ставим флаг emastatus_checked
 
 import os
 import asyncio
@@ -11,8 +10,8 @@ log = logging.getLogger("EMA_STATUS_BF")
 from indicators_ema_status import _classify_with_prev, EPS0, EPS1
 
 # 🔸 Конфиг (ENV)
-BATCH_SIZE = int(os.getenv("EMA_BF_BATCH_SIZE", "500"))           # позиций за проход
-SLEEP_SEC  = int(os.getenv("EMA_BF_LOOP_SLEEP_SEC", "30"))        # пауза между проходами
+BATCH_SIZE = int(os.getenv("EMA_BF_BATCH_SIZE", "1000"))           # позиций за проход
+SLEEP_SEC  = int(os.getenv("EMA_BF_LOOP_SLEEP_SEC", "300"))        # пауза между проходами
 EMA_LENS   = [int(x) for x in os.getenv("EMA_BF_EMA_LENS", "9,21,50,100,200").split(",")]
 REQUIRED_TFS = ("m5", "m15", "h1")
 

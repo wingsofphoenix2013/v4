@@ -18,7 +18,6 @@ from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
 from indicators_market_watcher import run_market_watcher
 from indicators_ema_status import run_indicators_ema_status
-from indicators_ema_status_backfill import run_indicators_ema_status_backfill
 from indicators_ema_status_live import run_indicators_ema_status_live
 
 # 🔸 Глобальные переменные
@@ -449,7 +448,6 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
-        run_safe_loop(lambda: run_indicators_ema_status_backfill(pg, redis), "EMA_STATUS_BF"),
         run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
     )
 
