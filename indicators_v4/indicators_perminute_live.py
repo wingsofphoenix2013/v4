@@ -45,8 +45,7 @@ def _k_atr14(sym: str, tf: str) -> Optional[str]:
     return f"ts_ind:{sym}:{tf}:atr14" if tf in ("m5", "m15") else None
 
 def _k_bb(sym: str, tf: str, part: str) -> str:
-    # В TS исторически встречаются и bb20_2_* и bb20_2_0_*; для live берём расчёт через snapshot, а не из TS
-    return f"ts_ind:{sym}:{tf}:bb20_2_{part}"
+    return f"ts_ind:{sym}:{tf}:bb20_2_0_{part}"
 
 def _k_ema(sym: str, tf: str, L: int) -> str:
     return f"ts_ind:{sym}:{tf}:ema{L}"
@@ -327,9 +326,9 @@ async def run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_prec
                                     vals = await compute_snapshot_values_async(bb_inst, sym, df, precision)
                                     # значения полос
                                     for suffix in ("center", "upper", "lower"):
-                                        pname = f"bb20_2_{suffix}"
-                                        if pname in vals:
-                                            await redis.setex(f"ind_live:{sym}:{tf}:{pname}_value", TTL_SEC, vals[pname])
+                                        v = (vals.get(f"bb20_2_0_{suffix}") or vals.get(f"bb20_2_{suffix}"))
+                                        if v is not None:
+                                            await redis.setex(f"ind_live:{sym}:{tf}:bb20_2_0_{suffix}_value", TTL_SEC, v)
                                             written += 1
 
                                     # корзина по mark price
@@ -341,15 +340,21 @@ async def run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_prec
 
                                     if mark is not None:
                                         try:
-                                            upper = float(vals.get("bb20_2_upper")) if vals and "bb20_2_upper" in vals else None
-                                            lower = float(vals.get("bb20_2_lower")) if vals and "bb20_2_lower" in vals else None
+                                            upper = (float(vals.get("bb20_2_0_upper"))
+                                                     if vals and "bb20_2_0_upper" in vals
+                                                     else float(vals.get("bb20_2_upper")) if vals and "bb20_2_upper" in vals
+                                                     else None)
+                                            lower = (float(vals.get("bb20_2_0_lower"))
+                                                     if vals and "bb20_2_0_lower" in vals
+                                                     else float(vals.get("bb20_2_lower")) if vals and "bb20_2_lower" in vals
+                                                     else None)
                                         except Exception:
                                             upper = lower = None
 
                                         if upper is not None and lower is not None:
                                             bb_bin_this_tf = _bb_bin_by_price(mark, lower, upper)
                                             if bb_bin_this_tf is not None:
-                                                await redis.setex(f"ind_live:{sym}:{tf}:bb20_2_bin", TTL_SEC, str(bb_bin_this_tf))
+                                                await redis.setex(f"ind_live:{sym}:{tf}:bb20_2_0_bin", TTL_SEC, str(bb_bin_this_tf))
                                                 written += 1
                                                 async with cache_lock:
                                                     bb_bins_trip.setdefault(sym, {})[tf] = bb_bin_this_tf
@@ -392,7 +397,7 @@ async def run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_prec
                     if all(t in tf_map for t in ("m5", "m15", "h1")):
                         trip = f"{tf_map['m5']}-{tf_map['m15']}-{tf_map['h1']}"
                         try:
-                            await redis.setex(f"ind_live:{sym}:bb20_2_bin_triplet", TTL_SEC, trip)
+                            await redis.setex(f"ind_live:{sym}:bb20_2_0_bin_triplet", TTL_SEC, trip)
                         except Exception:
                             pass
 
