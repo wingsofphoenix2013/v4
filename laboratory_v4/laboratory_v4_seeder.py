@@ -65,6 +65,12 @@ def make_name_dmigap(components, min_trade_type, min_trade_value, wr):
     trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
     return f"DMIgap | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
     
+# 🔸 Имя теста EMAstatus
+def make_name_emastatus(ema_len, components, min_trade_type, min_trade_value, wr):
+    comp_str = "+".join(components)
+    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    return f"EMAstatus({ema_len}) | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
+    
 # 🔸 Сидер ADX
 async def run_adx_seeder():
     async with infra.pg_pool.acquire() as conn:
@@ -340,3 +346,56 @@ async def run_dmigap_seeder():
                                 )
 
     log.info("Сидер: успешно создано %d DMIgap-тестов", len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS))
+
+# 🔸 Сидер EMAstatus (новый)
+async def run_emastatus_seeder():
+    async with infra.pg_pool.acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT COUNT(*) FROM laboratory_instances_v4 WHERE name LIKE 'EMAstatus(%' "
+        )
+        if existing and existing > 0:
+            log.info("Сидер: EMAstatus-тесты уже есть (%s шт.), сид не нужен", existing)
+            return
+
+    log.info("Сидер: начинаем генерацию EMAstatus-тестов")
+
+    EMA_LENS = [9, 21, 50, 100, 200]
+
+    async with infra.pg_pool.acquire() as conn:
+        async with conn.transaction():
+            for ema_len in EMA_LENS:
+                for wr in WINRATE_VARIANTS:
+                    for mt_type, mt_value in MIN_TRADE_VARIANTS:
+                        for comps in COMPONENTS:
+                            name = make_name_emastatus(ema_len, comps, mt_type, mt_value, wr)
+                            row = await conn.fetchrow(
+                                """
+                                INSERT INTO laboratory_instances_v4
+                                  (name, active, min_trade_type, min_trade_value, min_winrate)
+                                VALUES ($1, true, $2, $3, $4)
+                                RETURNING id
+                                """,
+                                name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
+                            )
+                            lab_id = row["id"]
+
+                            for c in comps:
+                                if c in ("m5", "m15", "h1"):
+                                    await conn.execute(
+                                        "INSERT INTO laboratory_parameters_v4 "
+                                        "(lab_id, test_name, test_type, test_tf, param_spec) "
+                                        "VALUES ($1, 'emastatus', 'solo', $2, $3)",
+                                        lab_id, c, {"ema_len": ema_len}
+                                    )
+                                elif c == "comp":
+                                    await conn.execute(
+                                        "INSERT INTO laboratory_parameters_v4 "
+                                        "(lab_id, test_name, test_type, test_tf, param_spec) "
+                                        "VALUES ($1, 'emastatus', 'comp', NULL, $2)",
+                                        lab_id, {"ema_len": ema_len}
+                                    )
+
+    log.info(
+        "Сидер: успешно создано %d EMAstatus-тестов",
+        len(EMA_LENS) * len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS),
+    )

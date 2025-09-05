@@ -58,32 +58,40 @@ async def _load_strategy_deposit(strategy_id: int) -> Decimal:
     return Decimal(str(row["deposit"]))
 
 
-# 🔸 Подсчёт метрик по approved-позициям рана
+# 🔸 Подсчёт метрик по approved-позициям рана + масштаб выборки
 async def _aggregate_run(lab_id: int, strategy_id: int, run_id: int):
     async with infra.pg_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            WITH approved AS (
+            WITH all_rows AS (
+              SELECT position_uid
+              FROM laboratory_results_v4
+              WHERE run_id=$1 AND lab_id=$2 AND strategy_id=$3
+            ),
+            approved AS (
               SELECT position_uid
               FROM laboratory_results_v4
               WHERE run_id=$1 AND lab_id=$2 AND strategy_id=$3 AND test_result='approved'
             )
             SELECT
-              COUNT(p.position_uid)                                   AS approved_trades,
-              SUM(CASE WHEN p.pnl > 0 THEN 1 ELSE 0 END)              AS won_trades,
-              COALESCE(SUM(p.pnl), 0)                                 AS pnl_sum
+              (SELECT COUNT(*) FROM all_rows)   AS raw_positions,
+              (SELECT COUNT(*) FROM approved)   AS approved_positions,
+              COUNT(p.position_uid)             AS approved_trades,   -- по join с positions_v4
+              SUM(CASE WHEN p.pnl > 0 THEN 1 ELSE 0 END) AS won_trades,
+              COALESCE(SUM(p.pnl), 0)           AS pnl_sum
             FROM positions_v4 p
             JOIN approved a ON a.position_uid = p.position_uid
             """,
             run_id, lab_id, strategy_id,
         )
 
-    approved_trades = int(row["approved_trades"] or 0)
-    won_trades      = int(row["won_trades"] or 0)
-    pnl_sum_raw     = Decimal(str(row["pnl_sum"] or "0"))
+    raw_positions      = int(row["raw_positions"] or 0)
+    approved_positions = int(row["approved_positions"] or 0)
+    won_trades         = int(row["won_trades"] or 0)
+    pnl_sum_raw        = Decimal(str(row["pnl_sum"] or "0"))
 
-    if approved_trades > 0:
-        winrate = (Decimal(won_trades) / Decimal(approved_trades)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    if approved_positions > 0:
+        winrate = (Decimal(won_trades) / Decimal(approved_positions)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
     else:
         winrate = Decimal("0")
 
@@ -95,27 +103,37 @@ async def _aggregate_run(lab_id: int, strategy_id: int, run_id: int):
     else:
         roi = Decimal("0")
 
-    return approved_trades, pnl_sum, winrate, roi
+    return raw_positions, approved_positions, pnl_sum, winrate, roi
 
 
 # 🔸 UPSERT результатов в laboratory_strategy_results_v4
 async def _upsert_strategy_results(lab_id: int, strategy_id: int, run_id: int,
+                                   raw_positions: int, approved_positions: int,
                                    pnl_sum: Decimal, winrate: Decimal, roi: Decimal):
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO laboratory_strategy_results_v4
-              (run_id, lab_id, strategy_id, pnl_sum_approved, winrate_approved, roi_approved, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+              (run_id, lab_id, strategy_id,
+               pnl_sum_approved, winrate_approved, roi_approved,
+               raw_positions, approved_positions,
+               created_at)
+            VALUES ($1, $2, $3,
+                    $4, $5, $6,
+                    $7, $8,
+                    NOW())
             ON CONFLICT (run_id, lab_id, strategy_id)
             DO UPDATE SET
-              pnl_sum_approved = EXCLUDED.pnl_sum_approved,
-              winrate_approved = EXCLUDED.winrate_approved,
-              roi_approved     = EXCLUDED.roi_approved,
-              created_at       = NOW()
+              pnl_sum_approved   = EXCLUDED.pnl_sum_approved,
+              winrate_approved   = EXCLUDED.winrate_approved,
+              roi_approved       = EXCLUDED.roi_approved,
+              raw_positions      = EXCLUDED.raw_positions,
+              approved_positions = EXCLUDED.approved_positions,
+              created_at         = NOW()
             """,
             run_id, lab_id, strategy_id,
             str(pnl_sum), str(winrate), str(roi),
+            int(raw_positions), int(approved_positions),
         )
 
 
@@ -169,8 +187,10 @@ async def _handle_message(fields: dict):
         log.debug("Пропуск сообщения: run_id=%s отсутствует в laboratory_runs_v4", run_id)
         return
 
-    approved_cnt, pnl_sum, winrate, roi = await _aggregate_run(lab_id, strategy_id, run_id)
-    await _upsert_strategy_results(lab_id, strategy_id, run_id, pnl_sum, winrate, roi)
+    raw_cnt, approved_cnt, pnl_sum, winrate, roi = await _aggregate_run(lab_id, strategy_id, run_id)
+    await _upsert_strategy_results(lab_id, strategy_id, run_id,
+                                   raw_cnt, approved_cnt,
+                                   pnl_sum, winrate, roi)
 
     if PURGE_AFTER_AGG:
         try:
@@ -179,8 +199,8 @@ async def _handle_message(fields: dict):
             log.exception("Ошибка очистки per-position результатов для run_id=%s: %s", run_id, e)
 
     log.debug(
-        "AGG DONE lab=%s strategy=%s run_id=%s: approved=%s pnl_sum=%s winrate=%s roi=%s",
-        lab_id, strategy_id, run_id, approved_cnt, str(pnl_sum), str(winrate), str(roi)
+        "AGG DONE lab=%s strategy=%s run_id=%s: raw=%s approved=%s pnl_sum=%s winrate=%s roi=%s",
+        lab_id, strategy_id, run_id, raw_cnt, approved_cnt, str(pnl_sum), str(winrate), str(roi)
     )
 
 
