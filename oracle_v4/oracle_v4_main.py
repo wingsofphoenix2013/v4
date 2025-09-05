@@ -23,6 +23,7 @@ from oracle_adxbins_snapshot_backfill import run_oracle_adxbins_snapshot_backfil
 from oracle_dmigap_snapshot_aggregator import run_oracle_dmigap_snapshot_aggregator
 from oracle_dmigap_snapshot_backfill import run_oracle_dmigap_snapshot_backfill
 from oracle_emastatus_snapshot_aggregator import run_oracle_emastatus_snapshot_aggregator
+from oracle_emastatus_snapshot_backfill import run_oracle_emastatus_snapshot_backfill
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -95,6 +96,7 @@ async def main():
         run_safe_loop(run_oracle_dmigap_snapshot_aggregator, "DMI_GAP_SNAP"),
         run_safe_loop(run_oracle_dmigap_snapshot_backfill, "DMI_GAP_BF"),
         run_safe_loop(run_oracle_emastatus_snapshot_aggregator, "EMA_STATUS_SNAP"),
+        run_safe_loop(run_oracle_emastatus_snapshot_backfill, "EMA_STATUS_BF"),
     )
 
 if __name__ == "__main__":
