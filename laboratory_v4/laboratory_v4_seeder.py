@@ -3,6 +3,7 @@
 import logging
 from decimal import Decimal
 import laboratory_v4_infra as infra
+import json
 
 log = logging.getLogger("LAB_SEEDER")
 
@@ -384,15 +385,15 @@ async def run_emastatus_seeder():
                                     await conn.execute(
                                         "INSERT INTO laboratory_parameters_v4 "
                                         "(lab_id, test_name, test_type, test_tf, param_spec) "
-                                        "VALUES ($1, 'emastatus', 'solo', $2, $3)",
-                                        lab_id, c, {"ema_len": ema_len}
+                                        "VALUES ($1, 'emastatus', 'solo', $2, $3::jsonb)",
+                                        lab_id, c, json.dumps({"ema_len": ema_len})
                                     )
                                 elif c == "comp":
                                     await conn.execute(
                                         "INSERT INTO laboratory_parameters_v4 "
                                         "(lab_id, test_name, test_type, test_tf, param_spec) "
-                                        "VALUES ($1, 'emastatus', 'comp', NULL, $2)",
-                                        lab_id, {"ema_len": ema_len}
+                                        "VALUES ($1, 'emastatus', 'comp', NULL, $2::jsonb)",
+                                        lab_id, json.dumps({"ema_len": ema_len})
                                     )
 
     log.info(
