@@ -442,7 +442,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         )
                                         # флаги по факту успешной записи
                                         await conn.execute(
-                                            "UPDATE positions_v4 SET emastatus_checked = true, mrk_watcher_checked = true WHERE position_uid = $1",
+                                            "UPDATE positions_v4 SET mrk_watcher_checked = true WHERE position_uid = $1",
                                             uid
                                         )
 
