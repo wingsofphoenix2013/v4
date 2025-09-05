@@ -1,5 +1,6 @@
-# position_snapshot_worker.py — чтение positions_open_stream и on-demand срез индикаторов + EMA-status + MW(regime9)
+# position_snapshot_worker.py — чтение positions_open_stream и on-demand срез индикаторов + EMA-status + MW(regime9) + EMA-pattern
 
+# 🔸 Импорты
 import os
 import asyncio
 import logging
@@ -11,36 +12,49 @@ from indicators.compute_and_store import compute_snapshot_values_async
 from indicators_ema_status import _classify_with_prev, EPS0, EPS1
 from regime9_core import RegimeState, RegimeParams, decide_regime_code
 
+# 🔸 Логгер
 log = logging.getLogger("IND_POS_SNAPSHOT")
 
+# 🔸 Конфиг потоков
 STREAM   = "positions_open_stream"
 GROUP    = "indicators_position_group"
 CONSUMER = "ind_pos_1"
 
+# 🔸 Общие тайминги
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 REQUIRED_BARS_DEFAULT = 800
+STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 
-# MW (regime9 v2) — окна/пороги из ENV (как в live)
+# 🔸 Market Watcher (regime9 v2): окна/пороги из ENV (как в live)
 N_PCT = int(os.getenv("MRW_N_PCT", "200"))
 N_ACC = int(os.getenv("MRW_N_ACC", "50"))
 EPS_Z = float(os.getenv("MRW_EPS_Z", "0.5"))
 HYST_TREND_BARS = int(os.getenv("MRW_R9_HYST_TREND_BARS", "2"))
 HYST_SUB_BARS   = int(os.getenv("MRW_R9_HYST_SUB_BARS", "1"))
 
-# Захардкоженные instance_id для MW (по TF)
+# 🔸 Захардкоженные instance_id для MW (по TF)
 MW_INSTANCE_ID = {
     "m5": 1001,
     "m15": 1002,
     "h1": 1003,
 }
 
-STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
+# 🔸 EMA-паттерн: константы, фейковые instance_id и кэш словаря
+EMA_NAMES  = ("ema9", "ema21", "ema50", "ema100", "ema200")
+EMA_LEN    = {"ema9": 9, "ema21": 21, "ema50": 50, "ema100": 100, "ema200": 200}
+EPSILON_REL = 0.0005  # 0.05% относительное равенство
 
+EMAPATTERN_INSTANCE_ID = {"m5": 1004, "m15": 1005, "h1": 1006}
+_EMA_PATTERN_DICT: dict[str, int] = {}
+
+
+# 🔸 Флор времени к началу бара TF
 def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
     step_ms = STEP_MIN[tf] * 60_000
     return (ts_ms // step_ms) * step_ms
 
-# TS ключи
+
+# 🔸 TS ключи
 def ts_adx_key(sym: str, tf: str) -> str:
     return f"ts_ind:{sym}:{tf}:adx_dmi14_adx" if tf in ("m5", "m15") else f"ts_ind:{sym}:{tf}:adx_dmi28_adx"
 
@@ -57,6 +71,8 @@ def ts_bb_keys(sym: str, tf: str):
 def ts_atr14_key(sym: str, tf: str):
     return f"ts_ind:{sym}:{tf}:atr14" if tf in ("m5", "m15") else None
 
+
+# 🔸 Чтение диапазона из TS в dict
 async def ts_range_map(redis, key: str, start_ms: int, end_ms: int):
     if not key:
         return {}
@@ -67,7 +83,8 @@ async def ts_range_map(redis, key: str, start_ms: int, end_ms: int):
         log.debug(f"[TSERR] key={key} err={e}")
         return {}
 
-# выбор требуемых инстансов на TF
+
+# 🔸 Подбор требуемых инстансов на TF
 def pick_required_instances(instances_tf: list, ema_lens: list[int] = None):
     ema_by_len = {}
     atr14 = None
@@ -94,7 +111,60 @@ def pick_required_instances(instances_tf: list, ema_lens: list[int] = None):
             continue
     return ema_by_len, atr14, bb_20_2, macd12, adx_14_or_28
 
-# построение features для MW на текущем баре: окна из TS (до t-1) + on-demand t
+
+# 🔸 Относительное равенство для EMA-паттерна
+def _rel_equal(a: float, b: float) -> bool:
+    m = max(abs(a), abs(b), 1e-12)
+    return abs(a - b) <= EPSILON_REL * m
+
+
+# 🔸 Построение текста EMA-паттерна из entry_price и 5 EMA
+def _build_emapattern_text(entry_price: float, emas: dict[str, float]) -> str:
+    pairs = [("PRICE", float(entry_price))]
+    for name in EMA_NAMES:
+        pairs.append((name.upper(), float(emas[name])))
+
+    pairs.sort(key=lambda kv: kv[1], reverse=True)
+
+    groups: list[list[str]] = []
+    cur: list[tuple[str, float]] = []
+    for token, val in pairs:
+        if not cur:
+            cur = [(token, val)]
+            continue
+        ref_val = cur[0][1]
+        if _rel_equal(val, ref_val):
+            cur.append((token, val))
+        else:
+            groups.append([t for t, _ in cur])
+            cur = [(token, val)]
+    if cur:
+        groups.append([t for t, _ in cur])
+
+    canon: list[list[str]] = []
+    for g in groups:
+        if "PRICE" in g:
+            rest = [t for t in g if t != "PRICE"]
+            rest.sort(key=lambda t: EMA_LEN[t.lower()])
+            canon.append(["PRICE"] + rest)
+        else:
+            gg = list(g)
+            gg.sort(key=lambda t: EMA_LEN[t.lower()])
+            canon.append(gg)
+
+    return " > ".join(" = ".join(g) for g in canon)
+
+
+# 🔸 Разовая загрузка словаря EMA-паттернов (pattern_text -> id)
+async def _load_emapattern_dict(pg) -> None:
+    global _EMA_PATTERN_DICT
+    async with pg.acquire() as conn:
+        rows = await conn.fetch("SELECT id, pattern_text FROM indicator_emapattern_dict")
+    _EMA_PATTERN_DICT = {str(r["pattern_text"]): int(r["id"]) for r in rows}
+    log.debug(f"[EMA_DICT] loaded={len(_EMA_PATTERN_DICT)}")
+
+
+# 🔸 Построение features для MW на текущем баре: окна из TS (до t-1) + on-demand t
 async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.DataFrame, precision: int, instances_tf: list):
     step = STEP_MS[tf]
     start_win = bar_open_ms - max((N_PCT - 1), N_ACC) * step
@@ -134,8 +204,7 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.
     adx_t = None
     if adx_inst is not None:
         v = await compute_snapshot_values_async(adx_inst, sym, pdf, precision)
-        # имя параметра зависит от длины, но TS-часть выше уже привязана к нужному; возьмём по известным ключам
-        for k in ( "adx_dmi14_adx", "adx_dmi28_adx" ):
+        for k in ("adx_dmi14_adx", "adx_dmi28_adx"):
             if v and k in v:
                 try:
                     adx_t = float(v[k])
@@ -170,22 +239,21 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.
 
     # проверка t-значений
     if None in (ema_t, macd_t, adx_t, bbu_t, bbl_t, bbc_t) or (tf in ("m5","m15") and atr_t is None):
-        return None  # неполные фичи
+        return None
 
-    # собрать окна (теперь включая t)
+    # собрать окна (включая t)
     def tail_vals(series_map, n):
         ks = [t for t in series_map.keys()]
         ks.sort()
         return [series_map[k] for k in ks[-n:]] if ks else []
 
-    # ema: нужен t-1 для наклона
+    # ema: нужен t-1
     ema_t1 = None
     if ema_map:
         ks = [t for t in ema_map.keys()]
         ks.sort()
         ema_t1 = ema_map.get(ks[-1], None)
     if ema_t1 is None and len(pdf) > 1:
-        # fallback: предыдущий бар из pdf
         try:
             prev_vals = await compute_snapshot_values_async(ema_by_len[21], sym, pdf.iloc[:-1], precision)
             ema_t1 = float(prev_vals.get("ema21")) if prev_vals and "ema21" in prev_vals else None
@@ -215,16 +283,11 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.
         return None
     dhist = [macd_series[i+1] - macd_series[i] for i in range(len(macd_series)-1)]
 
-    # окна ADX/BB/ATR
-    adx_win = tail_vals(adx_map, N_PCT)
-    bb_u_win = tail_vals(bbu_map, N_PCT)
-    bb_l_win = tail_vals(bbl_map, N_PCT)
-    bb_c_win = tail_vals(bbc_map, N_PCT)
-    # добавить t
-    adx_win.append(adx_t)
-    bb_u_win.append(bbu_t)
-    bb_l_win.append(bbl_t)
-    bb_c_win.append(bbc_t)
+    # окна ADX/BB/ATR + добавление t
+    adx_win = tail_vals(adx_map, N_PCT);   adx_win.append(adx_t)
+    bb_u_win = tail_vals(bbu_map, N_PCT);  bb_u_win.append(bbu_t)
+    bb_l_win = tail_vals(bbl_map, N_PCT);  bb_l_win.append(bbl_t)
+    bb_c_win = tail_vals(bbc_map, N_PCT);  bb_c_win.append(bbc_t)
 
     atr_win = None
     if tf in ("m5","m15"):
@@ -241,7 +304,10 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.
         "atr_win": atr_win[-N_PCT:] if (atr_win and tf in ("m5","m15")) else None,
     }
 
+
+# 🔸 Основной воркер
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw=lambda _sid: True):
+    # 🔸 Инициализация consumer group
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
         log.debug(f"Группа {GROUP} создана для {STREAM}")
@@ -251,6 +317,13 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
         else:
             log.exception("Ошибка создания consumer group")
             return
+
+    # 🔸 Разовая загрузка словаря EMA-паттернов
+    if not _EMA_PATTERN_DICT:
+        try:
+            await _load_emapattern_dict(pg)
+        except Exception:
+            log.exception("Не удалось загрузить словарь EMA-паттернов (indicator_emapattern_dict)")
 
     sem = asyncio.Semaphore(4)
 
@@ -278,6 +351,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         side  = data.get("direction")
                         created_iso = data.get("created_at")
 
+                        # 🔸 Фильтр по market_watcher
                         try:
                             if not get_strategy_mw(strat):
                                 log.debug(f"[SKIP] uid={uid} strategy_id={strat}: market_watcher=false")
@@ -291,6 +365,16 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         created_dt = datetime.fromisoformat(created_iso)
                         created_ms = int(created_dt.timestamp() * 1000)
                         precision = get_precision(sym)
+
+                        # 🔸 entry_price позиции (для EMA-паттерна)
+                        async with pg.acquire() as conn:
+                            ep_row = await conn.fetchrow(
+                                "SELECT entry_price FROM positions_v4 WHERE position_uid = $1",
+                                uid
+                            )
+                        entry_price = float(ep_row["entry_price"]) if (ep_row and ep_row["entry_price"] is not None) else None
+                        if entry_price is None:
+                            log.debug(f"[SKIP_EMAPATTERN] uid={uid} нет entry_price")
 
                         total_ind = 0
                         total_params = 0
@@ -333,6 +417,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             close_t = float(pdf["c"].iloc[-1])
                             close_prev = float(pdf["c"].iloc[-2]) if len(pdf) > 1 else None
 
+                            # 🔸 Пробег по инстансам индикаторов TF
                             for inst in instances:
                                 en = inst.get("enabled_at")
                                 if en and bar_open_ms < int(en.replace(tzinfo=None).timestamp() * 1000):
@@ -366,7 +451,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         params_json
                                     ))
 
-                                # EMA-status
+                                # 🔸 EMA-status
                                 if inst.get("indicator") == "ema":
                                     try:
                                         L = int(inst["params"].get("length"))
@@ -409,7 +494,50 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             params_json
                                         ))
 
-                            # MW (regime9 v2) on-demand
+                            # 🔸 EMA-паттерн для TF (по entry_price)
+                            if entry_price is not None:
+                                try:
+                                    # собрать 5 EMA через актуальные инстансы
+                                    ema_map_for_tf: dict[str, float] = {}
+                                    for inst in instances:
+                                        if inst.get("indicator") != "ema":
+                                            continue
+                                        L = inst.get("params", {}).get("length")
+                                        try:
+                                            L = int(L)
+                                        except Exception:
+                                            continue
+                                        if L not in (9, 21, 50, 100, 200):
+                                            continue
+                                        key = f"ema{L}"
+                                        async with sem:
+                                            v = await compute_snapshot_values_async(inst, sym, pdf, precision)
+                                        if v and key in v:
+                                            try:
+                                                ema_map_for_tf[key] = float(v[key])
+                                            except Exception:
+                                                pass
+
+                                    if all(name in ema_map_for_tf for name in EMA_NAMES):
+                                        pattern_text = _build_emapattern_text(entry_price, ema_map_for_tf)
+                                        pattern_id = _EMA_PATTERN_DICT.get(pattern_text)
+                                        rows.append((
+                                            uid, strat, side, tf,
+                                            EMAPATTERN_INSTANCE_ID[tf], "emapattern",
+                                            pattern_text,
+                                            (pattern_id if pattern_id is not None else None),
+                                            datetime.utcfromtimestamp(bar_open_ms / 1000),
+                                            None,
+                                            None
+                                        ))
+                                        tf_param_count += 1
+                                        log.debug(f"[EMA_PATTERN] uid={uid} TF={tf} → {pattern_text} (id={pattern_id})")
+                                    else:
+                                        log.debug(f"[EMA_PATTERN_SKIP] uid={uid} TF={tf} неполный набор EMA: {sorted(ema_map_for_tf.keys())}")
+                                except Exception:
+                                    log.exception(f"[EMA_PATTERN_ERR] uid={uid} TF={tf}")
+
+                            # 🔸 MW (regime9 v2) on-demand
                             feats = await build_mw_features(redis, sym, tf, bar_open_ms, pdf, precision, instances)
                             if feats is not None:
                                 state = RegimeState()  # on-demand снимок без побочного влияния на live-гистерезис
@@ -424,6 +552,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 ))
                                 tf_param_count += 1
 
+                            # 🔸 Запись в БД и отметка флагов
                             if rows:
                                 async with pg.acquire() as conn:
                                     async with conn.transaction():
@@ -440,9 +569,8 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             """,
                                             rows
                                         )
-                                        # флаги по факту успешной записи
                                         await conn.execute(
-                                            "UPDATE positions_v4 SET mrk_watcher_checked = true WHERE position_uid = $1",
+                                            "UPDATE positions_v4 SET mrk_watcher_checked = true, emapattern_checked = true WHERE position_uid = $1",
                                             uid
                                         )
 
