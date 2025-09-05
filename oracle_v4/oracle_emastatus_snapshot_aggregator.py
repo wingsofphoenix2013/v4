@@ -20,10 +20,10 @@ XREAD_BLOCKMS = int(os.getenv("ORACLE_EMASTATUS_BLOCK_MS", "1000"))
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -32,7 +32,7 @@ async def _ensure_group():
 # 🔸 Основной цикл (Этап 1 — только слушаем закрытия)
 async def run_oracle_emastatus_snapshot_aggregator():
     await _ensure_group()
-    log.debug("🚀 EMA-STATUS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.info("🚀 EMA-STATUS SNAP: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
 
     while True:
         try:
@@ -58,7 +58,7 @@ async def run_oracle_emastatus_snapshot_aggregator():
                         symbol = data.get("symbol")
 
                         if status != "closed":
-                            log.debug("[EMA-STATUS SNAP] skip msg_id=%s uid=%s reason=status=%s", msg_id, pos_uid, status)
+                            log.info("[EMA-STATUS SNAP] skip msg_id=%s uid=%s reason=status=%s", msg_id, pos_uid, status)
                             continue
 
                         # Этап 1: только фиксация факта закрытия (без чтения БД/обновления агрегатов)
@@ -78,7 +78,7 @@ async def run_oracle_emastatus_snapshot_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.debug("⏹️ EMA-STATUS snapshot агрегатор остановлен")
+            log.info("⏹️ EMA-STATUS snapshot агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ XREADGROUP loop error: %s", e)
