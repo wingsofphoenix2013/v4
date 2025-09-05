@@ -14,10 +14,6 @@ from config_loader import (
     config_event_listener,
 )
 
-from oracle_marketwatcher_aggregator import run_oracle_marketwatcher_aggregator
-from oracle_marketwatcher_backfill import run_oracle_marketwatcher_backfill_periodic
-from oracle_ema_snapshot_aggregator import run_oracle_ema_snapshot_aggregator
-from oracle_ema_snapshot_backfill import run_oracle_ema_snapshot_backfill_periodic
 from oracle_rsibins_snapshot_aggregator import run_oracle_rsibins_snapshot_aggregator
 from oracle_rsibins_snapshot_backfill import run_oracle_rsibins_snapshot_backfill
 from oracle_bbbins_snapshot_aggregator import run_oracle_bbbins_snapshot_aggregator
@@ -89,10 +85,6 @@ async def main():
     # Слушатель конфигурационных событий (тикеры + стратегии)
     await asyncio.gather(
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
-        run_safe_loop(run_oracle_marketwatcher_aggregator, "ORACLE_MW_AGG"),
-        run_safe_loop(run_oracle_marketwatcher_backfill_periodic, "ORACLE_MW_BF"),
-        run_safe_loop(run_oracle_ema_snapshot_aggregator, "ORACLE_EMA_SNAP"),
-        run_safe_loop(run_oracle_ema_snapshot_backfill_periodic, "ORACLE_EMA_SNAP_BF"),
         run_safe_loop(run_oracle_rsibins_snapshot_aggregator, "RSIBINS_SNAP"),
         run_safe_loop(run_oracle_rsibins_snapshot_backfill, "RSI_BINS_BF"),
         run_safe_loop(run_oracle_bbbins_snapshot_aggregator, "BB_BINS_SNAP"),
