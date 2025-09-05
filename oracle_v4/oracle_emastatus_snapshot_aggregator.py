@@ -97,7 +97,6 @@ async def _load_ema_status_bins(position_uid: str):
         result.setdefault(ema_len, {})[tf] = int(val)
     return result
 
-
 # 🔸 Апдейт агрегатов + Redis + отметка позиции
 async def _update_aggregates_and_mark(pos, ema_bins):
     pg = infra.pg_pool
@@ -144,7 +143,7 @@ async def _update_aggregates_and_mark(pos, ema_bins):
                         DO UPDATE SET
                           closed_trades=$6, won_trades=$7, pnl_sum=$8, winrate=$9, avg_pnl=$10, updated_at=NOW()
                         """,
-                        strategy_id, direction, tf, int(em a_len), int(status_code),
+                        strategy_id, direction, tf, int(ema_len), int(status_code),
                         c, w, str(s), str(wr), str(ap)
                     )
 
@@ -206,7 +205,6 @@ async def _update_aggregates_and_mark(pos, ema_bins):
                 "UPDATE positions_v4 SET emastatus_checked = true WHERE position_uid = $1",
                 pos["position_uid"]
             )
-
 
 # 🔸 Основной цикл
 async def run_oracle_emastatus_snapshot_aggregator():
