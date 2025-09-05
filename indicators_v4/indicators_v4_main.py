@@ -330,7 +330,7 @@ async def watch_indicator_requests(pg, redis):
         step = step_min[tf] * 60_000
         return (ts_ms // step) * step
 
-    # создать consumer group
+    # создать consumer-group
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
     except Exception as e:
