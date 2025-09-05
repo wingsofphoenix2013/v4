@@ -135,8 +135,7 @@ async def _upsert_strategy_results(lab_id: int, strategy_id: int, run_id: int,
             str(pnl_sum), str(winrate), str(roi),
             int(raw_positions), int(approved_positions),
         )
-
-
+        
 # 🔸 Проверка наличия run перед апдейтом
 async def _run_exists(run_id: int) -> bool:
     async with infra.pg_pool.acquire() as conn:

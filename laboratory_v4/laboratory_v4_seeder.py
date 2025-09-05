@@ -8,11 +8,11 @@ import json
 log = logging.getLogger("LAB_SEEDER")
 
 # 🔸 Общие сетки параметров
-WINRATE_VARIANTS = [0.55, 0.60]
+WINRATE_VARIANTS = [0.50, 0.55, 0.60]
 MIN_TRADE_VARIANTS = [
+    ("absolute", 5),
     ("absolute", 10),
-    ("absolute", 20),
-    ("absolute", 30),
+    ("absolute", 15),
 ]
 
 # 🔸 Компоненты (15 комбинаций без пустого множества)

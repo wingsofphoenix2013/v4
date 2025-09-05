@@ -18,9 +18,19 @@ CompValue  = Tuple[int, float, float]    # (closed_trades, winrate, pnl_sum)
 
 # 🔸 Вытащить ema_len из параметров теста (ожидается одна длина на тест)
 def _extract_ema_len(lab_params: List[dict]) -> Optional[int]:
+    import json
     for p in lab_params:
         if p.get("test_name") == "emastatus":
-            spec = p.get("param_spec") or {}
+            spec_raw = p.get("param_spec")
+            if isinstance(spec_raw, str):
+                try:
+                    spec = json.loads(spec_raw)
+                except Exception:
+                    spec = {}
+            elif isinstance(spec_raw, dict):
+                spec = spec_raw
+            else:
+                spec = {}
             val = spec.get("ema_len")
             if val is not None:
                 try:
