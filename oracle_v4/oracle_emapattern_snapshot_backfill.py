@@ -1,4 +1,4 @@
-# 🔸 oracle_emastatus_snapshot_backfill.py — EMA-status backfill: batch=500, conc=10, отчёт по батчам; детерминированные апдейты как в live
+# 🔸 oracle_emapattern_snapshot_backfill.py — EMA-pattern backfill: batch=500, conc=10, отчёт по батчам; детерминированные апдейты как в live
 
 import os
 import asyncio
@@ -6,27 +6,27 @@ import logging
 from typing import List, Tuple
 
 import infra
-from oracle_emastatus_snapshot_aggregator import (
+from oracle_emapattern_snapshot_aggregator import (
     _load_position_and_strategy,
-    _load_ema_status_bins,
+    _load_pattern_codes,
     _update_aggregates_and_mark,
 )
 
-log = logging.getLogger("ORACLE_EMASTATUS_BF")
+log = logging.getLogger("ORACLE_EMAPATTERN_BF")
 
 # 🔸 Конфиг backfill'а
-BATCH_SIZE           = int(os.getenv("EMA_BF_BATCH_SIZE", "500"))
-MAX_CONCURRENCY      = int(os.getenv("EMA_BF_MAX_CONCURRENCY", "10"))
-SHORT_SLEEP_MS       = int(os.getenv("EMA_BF_SLEEP_MS", "250"))
-START_DELAY_SEC      = int(os.getenv("EMA_BF_START_DELAY_SEC", "120"))
-RECHECK_INTERVAL_SEC = int(os.getenv("EMA_BF_RECHECK_INTERVAL_SEC", str(4 * 3600)))
+BATCH_SIZE           = int(os.getenv("EMAPATTERN_BF_BATCH_SIZE", "500"))
+MAX_CONCURRENCY      = int(os.getenv("EMAPATTERN_BF_MAX_CONCURRENCY", "10"))
+SHORT_SLEEP_MS       = int(os.getenv("EMAPATTERN_BF_SLEEP_MS", "250"))
+START_DELAY_SEC      = int(os.getenv("EMAPATTERN_BF_START_DELAY_SEC", "120"))
+RECHECK_INTERVAL_SEC = int(os.getenv("EMAPATTERN_BF_RECHECK_INTERVAL_SEC", str(4 * 3600)))
 
 _CANDIDATES_SQL = """
 SELECT p.position_uid
 FROM positions_v4 p
 JOIN strategies_v4 s ON s.id = p.strategy_id
 WHERE p.status = 'closed'
-  AND COALESCE(p.emastatus_checked, false) = false
+  AND COALESCE(p.emapattern_checked, false) = false
   AND s.enabled = true
   AND COALESCE(s.market_watcher, false) = true
 ORDER BY p.closed_at NULLS LAST, p.id
@@ -38,7 +38,7 @@ SELECT COUNT(*)
 FROM positions_v4 p
 JOIN strategies_v4 s ON s.id = p.strategy_id
 WHERE p.status = 'closed'
-  AND COALESCE(p.emastatus_checked, false) = false
+  AND COALESCE(p.emapattern_checked, false) = false
   AND s.enabled = true
   AND COALESCE(s.market_watcher, false) = true
 """
@@ -60,7 +60,7 @@ async def _count_remaining() -> int:
     return int(val or 0)
 
 
-# 🔸 Обработка одного UID (идемпотент; в случае дедлока — мягкий ретрай)
+# 🔸 Обработка одного UID (идемпотент; ретрай на дедлок)
 async def _process_uid(uid: str) -> Tuple[str, str]:
     attempts = 0
     while True:
@@ -71,33 +71,32 @@ async def _process_uid(uid: str) -> Tuple[str, str]:
             if v_code != "ok":
                 return ("skip", v_reason)
 
-            ema_bins = await _load_ema_status_bins(uid)
-            await _update_aggregates_and_mark(pos, ema_bins)
-            return ("updated", "ok" if ema_bins else "no_ema_status")
+            per_tf_codes = await _load_pattern_codes(uid)
+            await _update_aggregates_and_mark(pos, per_tf_codes)
+            return ("updated", "ok" if per_tf_codes else "no_emapattern")
 
         except Exception as e:
             msg = str(e)
             if "deadlock detected" in msg and attempts < 3:
-                # мягкий ретрай с небольшим джиттером
                 delay = 0.05 * attempts
-                log.warning("⚠️ EMA-BF uid=%s deadlock, retry %d in %.2fs", uid, attempts, delay)
+                log.warning("⚠️ EMAPATTERN-BF uid=%s deadlock, retry %d in %.2fs", uid, attempts, delay)
                 await asyncio.sleep(delay)
                 continue
-            log.exception("❌ EMA-BF uid=%s error: %s", uid, e)
+            log.exception("❌ EMAPATTERN-BF uid=%s error: %s", uid, e)
             return ("error", "exception")
 
 
-# 🔸 Основной цикл backfill'а: до исчерпания кандидатов, затем пауза RECHECK_INTERVAL_SEC
-async def run_oracle_emastatus_snapshot_backfill():
+# 🔸 Основной цикл backfill'а
+async def run_oracle_emapattern_snapshot_backfill():
     if START_DELAY_SEC > 0:
-        log.debug("⏳ EMA-BF: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.debug("⏳ EMAPATTERN-BF: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.debug("🚀 EMA-BF: старт прохода")
+            log.debug("🚀 EMAPATTERN-BF: старт прохода")
             batch_idx = 0
             total_updated = total_skipped = total_errors = 0
 
@@ -137,22 +136,22 @@ async def run_oracle_emastatus_snapshot_backfill():
                         remaining = None
 
                 if remaining is None:
-                    log.debug("[EMA-BF] batch=%d size=%d updated=%d skipped=%d errors=%d",
+                    log.debug("[EMAPATTERN-BF] batch=%d size=%d updated=%d skipped=%d errors=%d",
                              batch_idx, len(uids), updated, skipped, errors)
                 else:
-                    log.debug("[EMA-BF] batch=%d size=%d updated=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[EMAPATTERN-BF] batch=%d size=%d updated=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), updated, skipped, errors, remaining)
 
                 await asyncio.sleep(SHORT_SLEEP_MS / 1000)
 
-            log.debug("✅ EMA-BF: проход завершён batches=%d updated=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ EMAPATTERN-BF: проход завершён batches=%d updated=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, total_updated, total_skipped, total_errors, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.debug("⏹️ EMA-BF остановлен")
+            log.debug("⏹️ EMAPATTERN-BF остановлен")
             raise
         except Exception as e:
-            log.exception("❌ EMA-BF loop error: %s", e)
+            log.exception("❌ EMAPATTERN-BF loop error: %s", e)
             await asyncio.sleep(1)
