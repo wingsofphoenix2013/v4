@@ -19,7 +19,7 @@ import laboratory_v4_seeder as seeder
 
 log = logging.getLogger("LAB_MAIN")
 
-LAB_LOOP_SLEEP_SEC = int(os.getenv("LAB_LOOP_SLEEP_SEC", "43200"))
+LAB_LOOP_SLEEP_SEC = int(os.getenv("LAB_LOOP_SLEEP_SEC", "21600"))
 
 # 🔸 Обработка одного рана (lab_id × strategy_id)
 async def process_run(lab: dict, strategy_id: int):
