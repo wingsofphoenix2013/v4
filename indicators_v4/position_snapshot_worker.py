@@ -569,10 +569,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             """,
                                             rows
                                         )
-                                        await conn.execute(
-                                            "UPDATE positions_v4 SET mrk_watcher_checked = true, emapattern_checked = true WHERE position_uid = $1",
-                                            uid
-                                        )
 
                             bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
                             log.debug(f"[SUMMARY] uid={uid} TF={tf} bar={bar_iso} indicators={tf_inst_count} params={tf_param_count}")

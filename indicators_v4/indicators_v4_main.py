@@ -455,12 +455,10 @@ async def main():
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
         run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
-        run_safe_loop(lambda: run_positions_mw_backfill(pg), "MW_POS_BF"),
         run_safe_loop(lambda: run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "PERMIN_LIVE"),
         run_safe_loop(lambda: run_indicators_dmigaptrend_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "DMIGAP_LIVE"),
         run_safe_loop(lambda: run_indicators_market_watcher_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "MR_WATCHER_LIVE"),
         run_safe_loop(lambda: run_indicators_ema_pattern_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_PATTERN_LIVE"),
-        run_safe_loop(lambda: run_indicators_ema_pattern_backfill(pg, redis), "EMA_PATTERN_BACKFILL"),
     )
 
 if __name__ == "__main__":

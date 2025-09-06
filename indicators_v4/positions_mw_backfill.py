@@ -17,7 +17,7 @@ log = logging.getLogger("MW_POS_BF")
 
 # Конфиг
 BATCH_SIZE = int(os.getenv("MW_BF_BATCH_SIZE", "500"))
-SLEEP_SEC  = int(os.getenv("MW_BF_SLEEP_SEC", "30"))
+SLEEP_SEC  = int(os.getenv("MW_BF_SLEEP_SEC", "300"))
 START_DELAY_SEC = int(os.getenv("MW_BF_START_DELAY_SEC", "120"))
 
 # Окна/пороги regime9 v2 (как в live/backfill)
