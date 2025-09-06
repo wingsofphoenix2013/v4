@@ -1,7 +1,7 @@
 # 🔸 Сидер для лаборатории: генерация тестов ADX и BB (каждый — 24 комплекта × 15 комбинаций), active=false
 
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import laboratory_v4_infra as infra
 import json
 
@@ -34,42 +34,48 @@ COMPONENTS = [
 #     ["m5", "m15", "h1", "comp"],
 ]
 
+# 🔸 Хелпер для форматирования trade-порогов
+def format_trade(min_trade_type, min_trade_value):
+    if min_trade_type == "absolute":
+        return f"abs:{int(min_trade_value)}"
+    pct = (Decimal(str(min_trade_value)) * Decimal("100")).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    s = f"{pct}".rstrip("0").rstrip(".")  # 0.20 -> 0.2, 10.0 -> 10
+    return f"percent:{s}%"
 
 # 🔸 Имя теста ADX
 def make_name_adx(components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
-    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    trade_str = format_trade(min_trade_type, min_trade_value)
     return f"ADX | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
-
 
 # 🔸 Имя теста BB (фиксированные bb20/2.0)
 def make_name_bb(components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
-    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    trade_str = format_trade(min_trade_type, min_trade_value)
     return f"BB20/2.0 | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
 
 # 🔸 Имя теста RSI
 def make_name_rsi(components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
-    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    trade_str = format_trade(min_trade_type, min_trade_value)
     return f"RSI14 | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
 
 # 🔸 Имя теста DMI GapTrend
 def make_name_dmigt(components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
-    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    trade_str = format_trade(min_trade_type, min_trade_value)
     return f"DMItrend | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
 
 # 🔸 Имя теста DMI Gap
 def make_name_dmigap(components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
-    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    trade_str = format_trade(min_trade_type, min_trade_value)
     return f"DMIgap | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
-    
+
 # 🔸 Имя теста EMAstatus
 def make_name_emastatus(ema_len, components, min_trade_type, min_trade_value, wr):
     comp_str = "+".join(components)
-    trade_str = f"abs:{min_trade_value}" if min_trade_type == "absolute" else f"percent:{int(min_trade_value*100)}%"
+    trade_str = format_trade(min_trade_type, min_trade_value)
     return f"EMAstatus({ema_len}) | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
     
 # 🔸 Сидер ADX
