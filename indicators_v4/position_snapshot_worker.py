@@ -25,6 +25,9 @@ STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 REQUIRED_BARS_DEFAULT = 800
 STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 
+# 🔸 Параллелизм on-demand расчётов (настраивается через ENV)
+SNAPSHOT_MAX_CONCURRENCY = int(os.getenv("SNAPSHOT_MAX_CONCURRENCY", "16"))
+
 # 🔸 Market Watcher (regime9 v2): окна/пороги из ENV (как в live)
 N_PCT = int(os.getenv("MRW_N_PCT", "200"))
 N_ACC = int(os.getenv("MRW_N_ACC", "50"))
@@ -33,26 +36,20 @@ HYST_TREND_BARS = int(os.getenv("MRW_R9_HYST_TREND_BARS", "2"))
 HYST_SUB_BARS   = int(os.getenv("MRW_R9_HYST_SUB_BARS", "1"))
 
 # 🔸 Захардкоженные instance_id для MW (по TF)
-MW_INSTANCE_ID = {
-    "m5": 1001,
-    "m15": 1002,
-    "h1": 1003,
-}
+MW_INSTANCE_ID = {"m5": 1001, "m15": 1002, "h1": 1003}
 
 # 🔸 EMA-паттерн: константы, фейковые instance_id и кэш словаря
 EMA_NAMES  = ("ema9", "ema21", "ema50", "ema100", "ema200")
 EMA_LEN    = {"ema9": 9, "ema21": 21, "ema50": 50, "ema100": 100, "ema200": 200}
-EPSILON_REL = 0.0005  # 0.05% относительное равенство
+EPSILON_REL = 0.0005  # относительное равенство 0.05%
 
 EMAPATTERN_INSTANCE_ID = {"m5": 1004, "m15": 1005, "h1": 1006}
 _EMA_PATTERN_DICT: dict[str, int] = {}
-
 
 # 🔸 Флор времени к началу бара TF
 def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
     step_ms = STEP_MIN[tf] * 60_000
     return (ts_ms // step_ms) * step_ms
-
 
 # 🔸 TS ключи
 def ts_adx_key(sym: str, tf: str) -> str:
@@ -71,7 +68,6 @@ def ts_bb_keys(sym: str, tf: str):
 def ts_atr14_key(sym: str, tf: str):
     return f"ts_ind:{sym}:{tf}:atr14" if tf in ("m5", "m15") else None
 
-
 # 🔸 Чтение диапазона из TS в dict
 async def ts_range_map(redis, key: str, start_ms: int, end_ms: int):
     if not key:
@@ -83,40 +79,17 @@ async def ts_range_map(redis, key: str, start_ms: int, end_ms: int):
         log.debug(f"[TSERR] key={key} err={e}")
         return {}
 
-
-# 🔸 Подбор требуемых инстансов на TF
-def pick_required_instances(instances_tf: list, ema_lens: list[int] = None):
-    ema_by_len = {}
-    atr14 = None
-    bb_20_2 = None
-    macd12 = None
-    adx_14_or_28 = None
-    for inst in instances_tf:
-        ind = inst.get("indicator")
-        p = inst.get("params", {})
-        try:
-            if ind == "ema":
-                L = int(p.get("length"))
-                if ema_lens is None or L in ema_lens:
-                    ema_by_len[L] = inst
-            elif ind == "atr" and int(p.get("length", 0)) == 14 and atr14 is None:
-                atr14 = inst
-            elif ind == "bb" and int(p.get("length", 0)) == 20 and abs(float(p.get("std", 0)) - 2.0) < 1e-9 and bb_20_2 is None:
-                bb_20_2 = inst
-            elif ind == "macd" and int(p.get("fast", 0)) == 12 and macd12 is None:
-                macd12 = inst
-            elif ind == "adx_dmi" and adx_14_or_28 is None:
-                adx_14_or_28 = inst  # длина проверяется через TS-ключи, on-demand нам нужен текущий t
-        except Exception:
-            continue
-    return ema_by_len, atr14, bb_20_2, macd12, adx_14_or_28
-
+# 🔸 Чтение одной точки по точному штампу
+async def ts_get_point(redis, key: str, ts_ms: int):
+    m = await ts_range_map(redis, key, ts_ms, ts_ms)
+    if not m:
+        return None
+    return m.get(ts_ms)
 
 # 🔸 Относительное равенство для EMA-паттерна
 def _rel_equal(a: float, b: float) -> bool:
     m = max(abs(a), abs(b), 1e-12)
     return abs(a - b) <= EPSILON_REL * m
-
 
 # 🔸 Построение текста EMA-паттерна из entry_price и 5 EMA
 def _build_emapattern_text(entry_price: float, emas: dict[str, float]) -> str:
@@ -154,7 +127,6 @@ def _build_emapattern_text(entry_price: float, emas: dict[str, float]) -> str:
 
     return " > ".join(" = ".join(g) for g in canon)
 
-
 # 🔸 Разовая загрузка словаря EMA-паттернов (pattern_text -> id)
 async def _load_emapattern_dict(pg) -> None:
     global _EMA_PATTERN_DICT
@@ -163,12 +135,40 @@ async def _load_emapattern_dict(pg) -> None:
     _EMA_PATTERN_DICT = {str(r["pattern_text"]): int(r["id"]) for r in rows}
     log.debug(f"[EMA_DICT] loaded={len(_EMA_PATTERN_DICT)}")
 
+# 🔸 Подбор требуемых инстансов на TF
+def pick_required_instances(instances_tf: list, ema_lens: list[int] = None):
+    ema_by_len = {}
+    atr14 = None
+    bb_20_2 = None
+    macd12 = None
+    adx_14_or_28 = None
+    for inst in instances_tf:
+        ind = inst.get("indicator")
+        p = inst.get("params", {})
+        try:
+            if ind == "ema":
+                L = int(p.get("length"))
+                if ema_lens is None or L in ema_lens:
+                    ema_by_len[L] = inst
+            elif ind == "atr" and int(p.get("length", 0)) == 14 and atr14 is None:
+                atr14 = inst
+            elif ind == "bb" and int(p.get("length", 0)) == 20 and abs(float(p.get("std", 0)) - 2.0) < 1e-9 and bb_20_2 is None:
+                bb_20_2 = inst
+            elif ind == "macd" and int(p.get("fast", 0)) == 12 and macd12 is None:
+                macd12 = inst
+            elif ind == "adx_dmi" and adx_14_or_28 is None:
+                adx_14_or_28 = inst  # длина определяется через TS-ключи/TF
+        except Exception:
+            continue
+    return ema_by_len, atr14, bb_20_2, macd12, adx_14_or_28
 
-# 🔸 Построение features для MW на текущем баре: окна из TS (до t-1) + on-demand t
-async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.DataFrame, precision: int, instances_tf: list):
+# 🔸 Построение MW-фич на текущем баре (окна из TS до t-1 + on-demand t, с использованием кэша t)
+async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int,
+                            pdf: pd.DataFrame, precision: int, instances_tf: list,
+                            tf_cache_values: dict[int, dict[str, str]] | None = None):
     step = STEP_MS[tf]
     start_win = bar_open_ms - max((N_PCT - 1), N_ACC) * step
-    # окна из TS до t-1
+
     ema_map  = await ts_range_map(redis, ts_ema21_key(sym, tf), start_win, bar_open_ms - step)
     macd_map = await ts_range_map(redis, ts_macd_hist_key(sym, tf), start_win, bar_open_ms - step)
     adx_map  = await ts_range_map(redis, ts_adx_key(sym, tf), start_win, bar_open_ms - step)
@@ -179,98 +179,138 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.
     atr_key = ts_atr14_key(sym, tf)
     atr_map = await ts_range_map(redis, atr_key, start_win, bar_open_ms - step) if atr_key else {}
 
-    # on-demand t через snapshot-инстансы
     ema_by_len, atr14, bb_20_2, macd12, adx_inst = pick_required_instances(instances_tf, ema_lens=[21])
 
-    # ema21_t
+    # ema21_t — из кэша или пересчёт
     ema_t = None
     if 21 in ema_by_len:
-        v = await compute_snapshot_values_async(ema_by_len[21], sym, pdf, precision)
-        try:
-            ema_t = float(v.get("ema21")) if v and "ema21" in v else None
-        except Exception:
-            ema_t = None
+        if tf_cache_values:
+            vals = tf_cache_values.get(int(ema_by_len[21]["id"]))
+            if vals and "ema21" in vals:
+                try:
+                    ema_t = float(vals["ema21"])
+                except Exception:
+                    ema_t = None
+        if ema_t is None:
+            v = await compute_snapshot_values_async(ema_by_len[21], sym, pdf, precision)
+            try:
+                ema_t = float(v.get("ema21")) if v and "ema21" in v else None
+            except Exception:
+                ema_t = None
 
-    # macd12_hist_t
+    # macd12_hist_t — из кэша или пересчёт
     macd_t = None
     if macd12 is not None:
-        v = await compute_snapshot_values_async(macd12, sym, pdf, precision)
-        try:
-            macd_t = float(v.get("macd12_macd_hist")) if v and "macd12_macd_hist" in v else None
-        except Exception:
-            macd_t = None
+        if tf_cache_values:
+            vals = tf_cache_values.get(int(macd12["id"]))
+            if vals and "macd12_macd_hist" in vals:
+                try:
+                    macd_t = float(vals["macd12_macd_hist"])
+                except Exception:
+                    macd_t = None
+        if macd_t is None:
+            v = await compute_snapshot_values_async(macd12, sym, pdf, precision)
+            try:
+                macd_t = float(v.get("macd12_macd_hist")) if v and "macd12_macd_hist" in v else None
+            except Exception:
+                macd_t = None
 
-    # adx_t
+    # adx_t — как и раньше, пробуем оба имени параметра и берём то, что есть
     adx_t = None
     if adx_inst is not None:
-        v = await compute_snapshot_values_async(adx_inst, sym, pdf, precision)
-        for k in ("adx_dmi14_adx", "adx_dmi28_adx"):
-            if v and k in v:
-                try:
-                    adx_t = float(v[k])
-                    break
-                except Exception:
-                    pass
+        if tf_cache_values:
+            vals = tf_cache_values.get(int(adx_inst["id"]))
+            for k in ("adx_dmi14_adx", "adx_dmi28_adx"):
+                if vals and k in vals:
+                    try:
+                        adx_t = float(vals[k])
+                        break
+                    except Exception:
+                        adx_t = None
+        if adx_t is None:
+            v = await compute_snapshot_values_async(adx_inst, sym, pdf, precision)
+            for k in ("adx_dmi14_adx", "adx_dmi28_adx"):
+                if v and k in v:
+                    try:
+                        adx_t = float(v[k])
+                        break
+                    except Exception:
+                        pass
 
-    # bb_t
+    # bb_t — из кэша или пересчёт
     bbu_t = bbl_t = bbc_t = None
     if bb_20_2 is not None:
-        v = await compute_snapshot_values_async(bb_20_2, sym, pdf, precision)
-        if v:
-            for k, s in v.items():
-                try:
-                    if k.endswith("_upper"):
-                        bbu_t = float(s)
-                    elif k.endswith("_lower"):
-                        bbl_t = float(s)
-                    elif k.endswith("_center"):
-                        bbc_t = float(s)
-                except Exception:
-                    pass
+        if tf_cache_values:
+            vals = tf_cache_values.get(int(bb_20_2["id"]))
+            if vals:
+                for name, sval in vals.items():
+                    try:
+                        if name.endswith("_upper"):
+                            bbu_t = float(sval)
+                        elif name.endswith("_lower"):
+                            bbl_t = float(sval)
+                        elif name.endswith("_center"):
+                            bbc_t = float(sval)
+                    except Exception:
+                        pass
+        if None in (bbu_t, bbl_t, bbc_t):
+            v = await compute_snapshot_values_async(bb_20_2, sym, pdf, precision)
+            if v:
+                for k, s in v.items():
+                    try:
+                        if k.endswith("_upper"):
+                            bbu_t = float(s)
+                        elif k.endswith("_lower"):
+                            bbl_t = float(s)
+                        elif k.endswith("_center"):
+                            bbc_t = float(s)
+                    except Exception:
+                        pass
 
-    # atr_t (только m5/m15)
+    # atr_t (только m5/m15) — из кэша или пересчёт
     atr_t = None
     if atr14 is not None and tf in ("m5", "m15"):
-        v = await compute_snapshot_values_async(atr14, sym, pdf, precision)
-        try:
-            atr_t = float(v.get("atr14")) if v and "atr14" in v else None
-        except Exception:
-            atr_t = None
+        if tf_cache_values:
+            vals = tf_cache_values.get(int(atr14["id"]))
+            if vals and "atr14" in vals:
+                try:
+                    atr_t = float(vals["atr14"])
+                except Exception:
+                    atr_t = None
+        if atr_t is None:
+            v = await compute_snapshot_values_async(atr14, sym, pdf, precision)
+            try:
+                atr_t = float(v.get("atr14")) if v and "atr14" in v else None
+            except Exception:
+                atr_t = None
 
-    # проверка t-значений
-    if None in (ema_t, macd_t, adx_t, bbu_t, bbl_t, bbc_t) or (tf in ("m5","m15") and atr_t is None):
+    if None in (ema_t, macd_t, adx_t, bbu_t, bbl_t, bbc_t) or (tf in ("m5", "m15") and atr_t is None):
         return None
 
-    # собрать окна (включая t)
     def tail_vals(series_map, n):
-        ks = [t for t in series_map.keys()]
-        ks.sort()
+        ks = sorted(series_map.keys())
         return [series_map[k] for k in ks[-n:]] if ks else []
 
-    # ema: нужен t-1
     ema_t1 = None
     if ema_map:
-        ks = [t for t in ema_map.keys()]
-        ks.sort()
+        ks = sorted(ema_map.keys())
         ema_t1 = ema_map.get(ks[-1], None)
-    if ema_t1 is None and len(pdf) > 1:
+    if ema_t1 is None and 21 in ema_by_len and len(pdf) > 1:
+        prev_vals = await compute_snapshot_values_async(ema_by_len[21], sym, pdf.iloc[:-1], precision)
         try:
-            prev_vals = await compute_snapshot_values_async(ema_by_len[21], sym, pdf.iloc[:-1], precision)
             ema_t1 = float(prev_vals.get("ema21")) if prev_vals and "ema21" in prev_vals else None
         except Exception:
             ema_t1 = None
     if ema_t1 is None:
         return None
 
-    # macd: нужен t-1 и окно Δ
     macd_t1 = None
     if macd_map:
-        ks = [t for t in macd_map.keys()]
-        ks.sort()
+        ks = sorted(macd_map.keys())
         macd_t1 = macd_map.get(ks[-1], None)
     if macd_t1 is None and len(pdf) > 1 and macd12 is not None:
+        prev_vals = await compute_snapshot_values_async(macd12, sym, pdf.iloc[:-1], precision)
         try:
-            prev_vals = await compute_snapshot_values_async(macd12, sym, pdf.iloc[:-1], precision)
             macd_t1 = float(prev_vals.get("macd12_macd_hist")) if prev_vals and "macd12_macd_hist" in prev_vals else None
         except Exception:
             macd_t1 = None
@@ -281,33 +321,29 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int, pdf: pd.
     macd_series.append(macd_t)
     if len(macd_series) < 2:
         return None
-    dhist = [macd_series[i+1] - macd_series[i] for i in range(len(macd_series)-1)]
+    dhist = [macd_series[i+1] - macd_series[i] for i in range(len(macd_series) - 1)]
 
-    # окна ADX/BB/ATR + добавление t
-    adx_win = tail_vals(adx_map, N_PCT);   adx_win.append(adx_t)
-    bb_u_win = tail_vals(bbu_map, N_PCT);  bb_u_win.append(bbu_t)
-    bb_l_win = tail_vals(bbl_map, N_PCT);  bb_l_win.append(bbl_t)
-    bb_c_win = tail_vals(bbc_map, N_PCT);  bb_c_win.append(bbc_t)
+    adx_win  = (tail_vals(adx_map, N_PCT)  + [adx_t])[-N_PCT:]
+    bb_u_win = (tail_vals(bbu_map, N_PCT) + [bbu_t])[-N_PCT:]
+    bb_l_win = (tail_vals(bbl_map, N_PCT) + [bbl_t])[-N_PCT:]
+    bb_c_win = (tail_vals(bbc_map, N_PCT) + [bbc_t])[-N_PCT:]
 
     atr_win = None
-    if tf in ("m5","m15"):
-        atr_win = tail_vals(atr_map, N_PCT)
-        atr_win.append(atr_t)
+    if tf in ("m5", "m15"):
+        atr_win = (tail_vals(atr_map, N_PCT) + [atr_t])[-N_PCT:]
 
     return {
         "ema_t1": ema_t1, "ema_t": ema_t,
         "macd_t1": macd_t1, "macd_t": macd_t,
         "dhist_win": dhist[-N_ACC:],
-        "adx_win": adx_win[-N_PCT:],
-        "bb_u_win": bb_u_win[-N_PCT:], "bb_l_win": bb_l_win[-N_PCT:], "bb_c_win": bb_c_win[-N_PCT:],
-        "atr_t": atr_t if tf in ("m5","m15") else None,
-        "atr_win": atr_win[-N_PCT:] if (atr_win and tf in ("m5","m15")) else None,
+        "adx_win": adx_win,
+        "bb_u_win": bb_u_win, "bb_l_win": bb_l_win, "bb_c_win": bb_c_win,
+        "atr_t": atr_t if tf in ("m5", "m15") else None,
+        "atr_win": atr_win if (atr_win and tf in ("m5", "m15")) else None,
     }
-
 
 # 🔸 Основной воркер
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw=lambda _sid: True):
-    # 🔸 Инициализация consumer group
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
         log.debug(f"Группа {GROUP} создана для {STREAM}")
@@ -318,14 +354,13 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
             log.exception("Ошибка создания consumer group")
             return
 
-    # 🔸 Разовая загрузка словаря EMA-паттернов
     if not _EMA_PATTERN_DICT:
         try:
             await _load_emapattern_dict(pg)
         except Exception:
             log.exception("Не удалось загрузить словарь EMA-паттернов (indicator_emapattern_dict)")
 
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(SNAPSHOT_MAX_CONCURRENCY)
 
     while True:
         try:
@@ -351,7 +386,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         side  = data.get("direction")
                         created_iso = data.get("created_at")
 
-                        # 🔸 Фильтр по market_watcher
                         try:
                             if not get_strategy_mw(strat):
                                 log.debug(f"[SKIP] uid={uid} strategy_id={strat}: market_watcher=false")
@@ -366,7 +400,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         created_ms = int(created_dt.timestamp() * 1000)
                         precision = get_precision(sym)
 
-                        # 🔸 entry_price позиции (для EMA-паттерна)
                         async with pg.acquire() as conn:
                             ep_row = await conn.fetchrow(
                                 "SELECT entry_price FROM positions_v4 WHERE position_uid = $1",
@@ -378,6 +411,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                         total_ind = 0
                         total_params = 0
+                        rows_all = []
 
                         for tf in ("m5", "m15", "h1"):
                             instances = get_instances_by_tf(tf)
@@ -405,7 +439,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 log.warning(f"[SKIP] uid={uid} TF={tf} нет OHLCV для среза")
                                 continue
 
-                            idx = sorted(series["c"].keys())
+                            idx = sorted(series["c"].keys"])
                             df = {f: [series.get(f, {}).get(ts) for ts in idx] for f in fields}
                             pdf = pd.DataFrame(df, index=pd.to_datetime(idx, unit="ms"))
                             pdf.index.name = "open_time"
@@ -417,7 +451,8 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             close_t = float(pdf["c"].iloc[-1])
                             close_prev = float(pdf["c"].iloc[-2]) if len(pdf) > 1 else None
 
-                            # 🔸 Пробег по инстансам индикаторов TF
+                            tf_cache_values: dict[int, dict[str, str]] = {}
+
                             for inst in instances:
                                 en = inst.get("enabled_at")
                                 if en and bar_open_ms < int(en.replace(tzinfo=None).timestamp() * 1000):
@@ -425,9 +460,13 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                                 async with sem:
                                     values = await compute_snapshot_values_async(inst, sym, pdf, precision)
-
                                 if not values:
                                     continue
+
+                                try:
+                                    tf_cache_values[int(inst["id"])] = values
+                                except Exception:
+                                    pass
 
                                 tf_inst_count += 1
                                 tf_param_count += len(values)
@@ -451,20 +490,27 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         params_json
                                     ))
 
-                                # 🔸 EMA-status
                                 if inst.get("indicator") == "ema":
                                     try:
                                         L = int(inst["params"].get("length"))
                                     except Exception:
                                         continue
+
                                     ema_t = None
+                                    vals = tf_cache_values.get(int(inst["id"]))
+                                    if vals and f"ema{L}" in vals:
+                                        try:
+                                            ema_t = float(vals[f"ema{L}"])
+                                        except Exception:
+                                            ema_t = None
+
                                     ema_p = None
+                                    prev_ms = bar_open_ms - STEP_MS[tf]
                                     try:
-                                        if f"ema{L}" in values:
-                                            ema_t = float(values[f"ema{L}"])
+                                        ema_p = await ts_get_point(redis, f"ts_ind:{sym}:{tf}:ema{L}", prev_ms)
                                     except Exception:
-                                        ema_t = None
-                                    if len(pdf) > 1:
+                                        ema_p = None
+                                    if ema_p is None and len(pdf) > 1:
                                         async with sem:
                                             prev_vals = await compute_snapshot_values_async(inst, sym, pdf.iloc[:-1], precision)
                                         if prev_vals and f"ema{L}" in prev_vals:
@@ -473,7 +519,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             except Exception:
                                                 ema_p = None
 
-                                    # упрощённый scale: high-low (как запасной вариант)
                                     scale_t = None
                                     scale_prev = None
                                     try:
@@ -494,10 +539,8 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             params_json
                                         ))
 
-                            # 🔸 EMA-паттерн для TF (по entry_price)
                             if entry_price is not None:
                                 try:
-                                    # собрать 5 EMA через актуальные инстансы
                                     ema_map_for_tf: dict[str, float] = {}
                                     for inst in instances:
                                         if inst.get("indicator") != "ema":
@@ -510,11 +553,10 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         if L not in (9, 21, 50, 100, 200):
                                             continue
                                         key = f"ema{L}"
-                                        async with sem:
-                                            v = await compute_snapshot_values_async(inst, sym, pdf, precision)
-                                        if v and key in v:
+                                        vals = tf_cache_values.get(int(inst["id"]))
+                                        if vals and key in vals:
                                             try:
-                                                ema_map_for_tf[key] = float(v[key])
+                                                ema_map_for_tf[key] = float(vals[key])
                                             except Exception:
                                                 pass
 
@@ -537,10 +579,9 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 except Exception:
                                     log.exception(f"[EMA_PATTERN_ERR] uid={uid} TF={tf}")
 
-                            # 🔸 MW (regime9 v2) on-demand
-                            feats = await build_mw_features(redis, sym, tf, bar_open_ms, pdf, precision, instances)
+                            feats = await build_mw_features(redis, sym, tf, bar_open_ms, pdf, precision, instances, tf_cache_values=tf_cache_values)
                             if feats is not None:
-                                state = RegimeState()  # on-demand снимок без побочного влияния на live-гистерезис
+                                state = RegimeState()
                                 params = RegimeParams(hyst_trend_bars=HYST_TREND_BARS, hyst_sub_bars=HYST_SUB_BARS, eps_z=EPS_Z)
                                 code, _, diag = decide_regime_code(tf, feats, state, params)
                                 rows.append((
@@ -552,28 +593,30 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 ))
                                 tf_param_count += 1
 
-                            # 🔸 Запись в БД и отметка флагов
                             if rows:
-                                async with pg.acquire() as conn:
-                                    async with conn.transaction():
-                                        await conn.executemany(
-                                            """
-                                            INSERT INTO positions_indicators_stat
-                                            (position_uid, strategy_id, direction, timeframe,
-                                             instance_id, param_name, value_str, value_num,
-                                             bar_open_time, enabled_at, params_json)
-                                            VALUES
-                                            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                                            ON CONFLICT (position_uid, timeframe, instance_id, param_name, bar_open_time)
-                                            DO NOTHING
-                                            """,
-                                            rows
-                                        )
+                                rows_all.extend(rows)
 
                             bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
                             log.debug(f"[SUMMARY] uid={uid} TF={tf} bar={bar_iso} indicators={tf_inst_count} params={tf_param_count}")
                             total_ind += tf_inst_count
                             total_params += tf_param_count
+
+                        if rows_all:
+                            async with pg.acquire() as conn:
+                                async with conn.transaction():
+                                    await conn.executemany(
+                                        """
+                                        INSERT INTO positions_indicators_stat
+                                        (position_uid, strategy_id, direction, timeframe,
+                                         instance_id, param_name, value_str, value_num,
+                                         bar_open_time, enabled_at, params_json)
+                                        VALUES
+                                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                                        ON CONFLICT (position_uid, timeframe, instance_id, param_name, bar_open_time)
+                                        DO NOTHING
+                                        """,
+                                        rows_all
+                                    )
 
                         log.debug(f"[SUMMARY_ALL] uid={uid} indicators_total={total_ind} params_total={total_params}")
 

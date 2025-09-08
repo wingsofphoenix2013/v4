@@ -18,13 +18,13 @@ from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
 from indicators_market_watcher import run_market_watcher
 from indicators_ema_status import run_indicators_ema_status
-from indicators_ema_status_live import run_indicators_ema_status_live
-from positions_mw_backfill import run_positions_mw_backfill
-from indicators_perminute_live import run_indicators_perminute_live
-from indicators_dmigaptrend_live import run_indicators_dmigaptrend_live
-from indicators_market_watcher_live import run_indicators_market_watcher_live
-from indicators_ema_pattern_live import run_indicators_ema_pattern_live
-from indicators_ema_pattern_backfill import run_indicators_ema_pattern_backfill
+# from indicators_ema_status_live import run_indicators_ema_status_live
+# from positions_mw_backfill import run_positions_mw_backfill
+# from indicators_perminute_live import run_indicators_perminute_live
+# from indicators_dmigaptrend_live import run_indicators_dmigaptrend_live
+# from indicators_market_watcher_live import run_indicators_market_watcher_live
+# from indicators_ema_pattern_live import run_indicators_ema_pattern_live
+# from indicators_ema_pattern_backfill import run_indicators_ema_pattern_backfill
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -209,16 +209,6 @@ async def watch_indicator_updates(pg, redis):
 
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
-
-# 🔸 (Опционально) Подписка на изменения стратегий
-# Канал событий для стратегий в текущем контуре не используется; при появлении — можно активировать аналогичную логику.
-# Пример заготовки (не подключена):
-# async def watch_strategy_updates(pg, redis):
-#     log = logging.getLogger("STRATEGY_UPDATES")
-#     pubsub = redis.pubsub()
-#     await pubsub.subscribe("strategies_v4_events")
-#     async for msg in pubsub.listen():
-#         ...
 
 # 🔸 Загрузка свечей из Redis TimeSeries
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
@@ -454,11 +444,11 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
-        run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
-        run_safe_loop(lambda: run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "PERMIN_LIVE"),
-        run_safe_loop(lambda: run_indicators_dmigaptrend_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "DMIGAP_LIVE"),
-        run_safe_loop(lambda: run_indicators_market_watcher_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "MR_WATCHER_LIVE"),
-        run_safe_loop(lambda: run_indicators_ema_pattern_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_PATTERN_LIVE"),
+#         run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
+#         run_safe_loop(lambda: run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "PERMIN_LIVE"),
+#         run_safe_loop(lambda: run_indicators_dmigaptrend_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "DMIGAP_LIVE"),
+#         run_safe_loop(lambda: run_indicators_market_watcher_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "MR_WATCHER_LIVE"),
+#         run_safe_loop(lambda: run_indicators_ema_pattern_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_PATTERN_LIVE"),
     )
 
 if __name__ == "__main__":
