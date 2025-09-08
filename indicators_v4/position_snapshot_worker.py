@@ -439,7 +439,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 log.warning(f"[SKIP] uid={uid} TF={tf} нет OHLCV для среза")
                                 continue
 
-                            idx = sorted(series["c"].keys"])
+                            idx = sorted(series["c"].keys())
                             df = {f: [series.get(f, {}).get(ts) for ts in idx] for f in fields}
                             pdf = pd.DataFrame(df, index=pd.to_datetime(idx, unit="ms"))
                             pdf.index.name = "open_time"
