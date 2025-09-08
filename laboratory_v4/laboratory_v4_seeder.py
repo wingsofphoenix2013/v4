@@ -17,21 +17,21 @@ MIN_TRADE_VARIANTS = [
 
 # 🔸 Компоненты (15 комбинаций без пустого множества)
 COMPONENTS = [
-    ["m5"],
-    ["m15"],
-    ["h1"],
+#     ["m5"],
+#     ["m15"],
+#     ["h1"],
     ["comp"],
-    ["m5", "m15"],
-    ["m5", "h1"],
-    ["m5", "comp"],
-    ["m15", "h1"],
-    ["m15", "comp"],
-    ["h1", "comp"],
-    ["m5", "m15", "h1"],
-    ["m5", "m15", "comp"],
-    ["m5", "h1", "comp"],
-    ["m15", "h1", "comp"],
-    ["m5", "m15", "h1", "comp"],
+#     ["m5", "m15"],
+#     ["m5", "h1"],
+#     ["m5", "comp"],
+#     ["m15", "h1"],
+#     ["m15", "comp"],
+#     ["h1", "comp"],
+#     ["m5", "m15", "h1"],
+#     ["m5", "m15", "comp"],
+#     ["m5", "h1", "comp"],
+#     ["m15", "h1", "comp"],
+#     ["m5", "m15", "h1", "comp"],
 ]
 
 # 🔸 Хелпер для форматирования trade-порогов
@@ -433,7 +433,7 @@ async def run_emapattern_seeder():
                             """
                             INSERT INTO laboratory_instances_v4
                               (name, active, min_trade_type, min_trade_value, min_winrate)
-                            VALUES ($1, true, $2, $3, $4)
+                            VALUES ($1, false, $2, $3, $4)
                             RETURNING id
                             """,
                             name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
