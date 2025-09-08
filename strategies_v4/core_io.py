@@ -518,14 +518,13 @@ async def _publish_strategy_counters_after_close(event: dict):
     В Redis Hash strategy:stats:{strategy_id} инкрементируем:
       closed_total / closed_long / closed_short
       pnl_total / pnl_long / pnl_short
-    Идемпотентность на позицию: SADD strategy:closed_seen:{sid} {position_uid} → инкрементируем только при 1.
+    Идемпотентность: SADD strategy:closed_seen:{sid} {position_uid} → инкрементируем только при 1.
     Условие: стратегия должна иметь market_watcher=true.
+    Надёжность: если в event нет direction/pnl, добираем их из positions_v4 по position_uid.
     """
     try:
         sid = int(event["strategy_id"])
         uid = event["position_uid"]
-        direction = str(event["direction"]).lower()  # 'long' | 'short'
-        pnl = Decimal(str(event["pnl"]))
 
         # фильтр: только для стратегий с market_watcher=true
         row = await infra.pg_pool.fetchrow(
@@ -534,6 +533,29 @@ async def _publish_strategy_counters_after_close(event: dict):
         )
         if not row or not row["mw"]:
             return
+
+        # извлечь direction/pnl из события, при необходимости — добрать из БД
+        direction = event.get("direction") or event.get("original_direction")
+        pnl = event.get("pnl")
+
+        if direction is None or pnl is None:
+            pos_row = await infra.pg_pool.fetchrow(
+                "SELECT direction, pnl FROM positions_v4 WHERE position_uid = $1",
+                uid
+            )
+            if pos_row:
+                if direction is None:
+                    direction = pos_row["direction"]
+                if pnl is None:
+                    pnl = pos_row["pnl"]
+
+        # если так и не получили необходимые данные — пропускаем
+        if direction is None or pnl is None:
+            log.debug(f"📊 [STRAT_STATS_SKIP] sid={sid} uid={uid}: нет direction/pnl")
+            return
+
+        direction = str(direction).lower()
+        pnl = Decimal(str(pnl))
 
         redis = infra.redis_client
         seen_key = f"strategy:closed_seen:{sid}"
@@ -561,7 +583,6 @@ async def _publish_strategy_counters_after_close(event: dict):
 
     except Exception:
         log.exception("❌ Ошибка публикации счётчиков стратегии")
-
 
 # 🔸 Формирование и отправка реверсного сигнала
 async def _send_reverse_signal_from_event(event: dict):
