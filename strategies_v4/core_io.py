@@ -512,19 +512,16 @@ async def run_position_update_writer():
             await asyncio.sleep(5)
 
 
-# 🔸 Публикация счётчиков стратегии (market_watcher=true) после закрытия позиции
+# 🔸 Публикация счётчиков стратегии (market_watcher=true) после закрытия позиции — полная пересборка из БД
 async def _publish_strategy_counters_after_close(event: dict):
     """
-    В Redis Hash strategy:stats:{strategy_id} инкрементируем:
+    Пересчитывает из БД и публикует в Redis Hash strategy:stats:{sid}:
       closed_total / closed_long / closed_short
       pnl_total / pnl_long / pnl_short
-    Идемпотентность: SADD strategy:closed_seen:{sid} {position_uid} → инкрементируем только при 1.
     Условие: стратегия должна иметь market_watcher=true.
-    Надёжность: если в event нет direction/pnl, добираем их из positions_v4 по position_uid.
     """
     try:
         sid = int(event["strategy_id"])
-        uid = event["position_uid"]
 
         # фильтр: только для стратегий с market_watcher=true
         row = await infra.pg_pool.fetchrow(
@@ -534,56 +531,54 @@ async def _publish_strategy_counters_after_close(event: dict):
         if not row or not row["mw"]:
             return
 
-        # извлечь direction/pnl из события, при необходимости — добрать из БД
-        direction = event.get("direction") or event.get("original_direction")
-        pnl = event.get("pnl")
+        # агрегаты по направлениям
+        rows = await infra.pg_pool.fetch(
+            """
+            SELECT direction, COUNT(*) AS cnt, COALESCE(SUM(pnl), 0) AS pnl
+            FROM positions_v4
+            WHERE strategy_id = $1 AND status = 'closed'
+            GROUP BY direction
+            """,
+            sid,
+        )
 
-        if direction is None or pnl is None:
-            pos_row = await infra.pg_pool.fetchrow(
-                "SELECT direction, pnl FROM positions_v4 WHERE position_uid = $1",
-                uid
-            )
-            if pos_row:
-                if direction is None:
-                    direction = pos_row["direction"]
-                if pnl is None:
-                    pnl = pos_row["pnl"]
+        closed_long = closed_short = 0
+        pnl_long = pnl_short = Decimal("0")
 
-        # если так и не получили необходимые данные — пропускаем
-        if direction is None or pnl is None:
-            log.debug(f"📊 [STRAT_STATS_SKIP] sid={sid} uid={uid}: нет direction/pnl")
-            return
+        for r in rows:
+            d = (r["direction"] or "").lower()
+            c = int(r["cnt"])
+            s = Decimal(str(r["pnl"]))
+            if d == "long":
+                closed_long = c
+                pnl_long = s
+            elif d == "short":
+                closed_short = c
+                pnl_short = s
 
-        direction = str(direction).lower()
-        pnl = Decimal(str(pnl))
+        closed_total = closed_long + closed_short
+        pnl_total = pnl_long + pnl_short
 
-        redis = infra.redis_client
-        seen_key = f"strategy:closed_seen:{sid}"
+        # запись абсолютных значений в Redis Hash (без TTL)
         stats_key = f"strategy:stats:{sid}"
-
-        # дедупликация по position_uid
-        added = await redis.sadd(seen_key, uid)
-        if added != 1:
-            return
-
-        # атомарные инкременты (пайплайн)
-        pipe = redis.pipeline()
-        pipe.hincrby(stats_key, "closed_total", 1)
-        pipe.hincrbyfloat(stats_key, "pnl_total", float(pnl))
-
-        if direction == "long":
-            pipe.hincrby(stats_key, "closed_long", 1)
-            pipe.hincrbyfloat(stats_key, "pnl_long", float(pnl))
-        elif direction == "short":
-            pipe.hincrby(stats_key, "closed_short", 1)
-            pipe.hincrbyfloat(stats_key, "pnl_short", float(pnl))
-
-        await pipe.execute()
-        log.debug(f"📊 [STRAT_STATS] sid={sid} uid={uid} dir={direction} pnl={pnl}")
+        await infra.redis_client.hset(
+            stats_key,
+            mapping={
+                "closed_total": str(closed_total),
+                "closed_long": str(closed_long),
+                "closed_short": str(closed_short),
+                "pnl_total": f"{pnl_total}",
+                "pnl_long": f"{pnl_long}",
+                "pnl_short": f"{pnl_short}",
+            },
+        )
+        log.debug(
+            f"📊 [STRAT_STATS_FULL] sid={sid} total={closed_total} "
+            f"(L={closed_long}, S={closed_short}) pnl={pnl_total}"
+        )
 
     except Exception:
-        log.exception("❌ Ошибка публикации счётчиков стратегии")
-
+        log.exception("❌ Ошибка публикации счётчиков стратегии (full recompute)")
 # 🔸 Формирование и отправка реверсного сигнала
 async def _send_reverse_signal_from_event(event: dict):
     try:
