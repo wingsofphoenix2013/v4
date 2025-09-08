@@ -14,10 +14,10 @@ from indicators.compute_and_store import compute_snapshot_values_async
 log = logging.getLogger("EMA_PATTERN_LIVE")
 
 # 🔸 Конфиг
-INTERVAL_SEC = int(os.getenv("EMA_PATTERN_LIVE_INTERVAL_SEC", "60"))
-TTL_SEC = int(os.getenv("EMA_PATTERN_LIVE_TTL_SEC", "120"))
-MAX_CONCURRENCY = int(os.getenv("EMA_PATTERN_LIVE_MAX_CONCURRENCY", "16"))
-MAX_PER_SYMBOL = int(os.getenv("EMA_PATTERN_LIVE_MAX_PER_SYMBOL", "2"))
+INTERVAL_SEC = int(os.getenv("EMA_PATTERN_LIVE_INTERVAL_SEC", "30"))
+TTL_SEC = int(os.getenv("EMA_PATTERN_LIVE_TTL_SEC", "60"))
+MAX_CONCURRENCY = int(os.getenv("EMA_PATTERN_LIVE_MAX_CONCURRENCY", "45"))
+MAX_PER_SYMBOL = int(os.getenv("EMA_PATTERN_LIVE_MAX_PER_SYMBOL", "3"))
 REQUIRED_BARS_DEFAULT = int(os.getenv("EMA_PATTERN_LIVE_REQUIRED_BARS", "800"))
 
 # 🔸 Таймфреймы и шаги

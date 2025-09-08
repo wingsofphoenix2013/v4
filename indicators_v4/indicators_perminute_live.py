@@ -14,13 +14,13 @@ from indicators.compute_and_store import compute_snapshot_values_async
 log = logging.getLogger("PERMIN_LIVE")
 
 # 🔸 Конфиг
-INTERVAL_SEC = int(os.getenv("PERMIN_LIVE_INTERVAL_SEC", "60"))
+INTERVAL_SEC = int(os.getenv("PERMIN_LIVE_INTERVAL_SEC", "30"))
 REQUIRED_BARS_DEFAULT = int(os.getenv("PERMIN_LIVE_REQUIRED_BARS", "800"))
-TTL_SEC = int(os.getenv("PERMIN_LIVE_TTL_SEC", "120"))
+TTL_SEC = int(os.getenv("PERMIN_LIVE_TTL_SEC", "60"))
 RETRY_SEC = int(os.getenv("PERMIN_LIVE_RETRY_SEC", "15"))
 
-MAX_CONCURRENCY = int(os.getenv("PERMIN_LIVE_MAX_CONCURRENCY", "16"))
-MAX_PER_SYMBOL = int(os.getenv("PERMIN_LIVE_MAX_PER_SYMBOL", "2"))
+MAX_CONCURRENCY = int(os.getenv("PERMIN_LIVE_MAX_CONCURRENCY", "45"))
+MAX_PER_SYMBOL = int(os.getenv("PERMIN_LIVE_MAX_PER_SYMBOL", "3"))
 
 # 🔸 Таймфреймы и поля TS
 _STEP_MS: Dict[str, int] = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}

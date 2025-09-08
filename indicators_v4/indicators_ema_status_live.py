@@ -11,7 +11,7 @@ from indicators.compute_and_store import compute_snapshot_values_async
 log = logging.getLogger("EMA_STATUS_LIVE")
 
 # 🔸 Конфиг
-INTERVAL_SEC = int(os.getenv("EMA_STATUS_LIVE_INTERVAL_SEC", "60"))
+INTERVAL_SEC = int(os.getenv("EMA_STATUS_LIVE_INTERVAL_SEC", "30"))
 REQUIRED_TFS = ("m5", "m15", "h1")
 REQUIRED_BARS_DEFAULT = int(os.getenv("EMA_STATUS_LIVE_REQUIRED_BARS", "800"))
 RETRY_SEC = int(os.getenv("EMA_STATUS_LIVE_RETRY_SEC", "15"))
@@ -19,9 +19,9 @@ RETRY_SEC = int(os.getenv("EMA_STATUS_LIVE_RETRY_SEC", "15"))
 EPS0 = float(os.getenv("EMA_STATUS_LIVE_EPS0", "0.05"))
 EPS1 = float(os.getenv("EMA_STATUS_LIVE_EPS1", "0.02"))
 
-MAX_CONCURRENCY = int(os.getenv("EMA_STATUS_LIVE_MAX_CONCURRENCY", "16"))
-MAX_PER_SYMBOL = int(os.getenv("EMA_STATUS_LIVE_MAX_PER_SYMBOL", "2"))
-TTL_SEC = int(os.getenv("EMA_STATUS_LIVE_TTL_SEC", "120"))
+MAX_CONCURRENCY = int(os.getenv("EMA_STATUS_LIVE_MAX_CONCURRENCY", "45"))
+MAX_PER_SYMBOL = int(os.getenv("EMA_STATUS_LIVE_MAX_PER_SYMBOL", "3"))
+TTL_SEC = int(os.getenv("EMA_STATUS_LIVE_TTL_SEC", "60"))
 
 # 🔸 Вспомогательные мапы
 _STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}

@@ -14,13 +14,13 @@ from indicators.compute_and_store import compute_snapshot_values_async
 log = logging.getLogger("DMIGAP_LIVE")
 
 # 🔸 Конфиг
-INTERVAL_SEC = int(os.getenv("DMIGAP_LIVE_INTERVAL_SEC", "60"))
+INTERVAL_SEC = int(os.getenv("DMIGAP_LIVE_INTERVAL_SEC", "30"))
 REQUIRED_BARS_DEFAULT = int(os.getenv("DMIGAP_LIVE_REQUIRED_BARS", "800"))
-TTL_SEC = int(os.getenv("DMIGAP_LIVE_TTL_SEC", "120"))
+TTL_SEC = int(os.getenv("DMIGAP_LIVE_TTL_SEC", "60"))
 RETRY_SEC = int(os.getenv("DMIGAP_LIVE_RETRY_SEC", "15"))
 
-MAX_CONCURRENCY = int(os.getenv("DMIGAP_LIVE_MAX_CONCURRENCY", "16"))
-MAX_PER_SYMBOL = int(os.getenv("DMIGAP_LIVE_MAX_PER_SYMBOL", "2"))
+MAX_CONCURRENCY = int(os.getenv("DMIGAP_LIVE_MAX_CONCURRENCY", "45"))
+MAX_PER_SYMBOL = int(os.getenv("DMIGAP_LIVE_MAX_PER_SYMBOL", "3"))
 
 # 🔸 Пороговые параметры тренда (см. oracle_dmigap_snapshot_aggregator.py)
 S0 = float(os.getenv("DMI_GAP_S0", "2.0"))
