@@ -14,6 +14,7 @@ import laboratory_v4_rsi_worker as rsi
 import laboratory_v4_dmigaptrend_worker as dmigt
 import laboratory_v4_dmigap_worker as dmigap
 import laboratory_v4_emastatus_worker as emastatus
+import laboratory_v4_emapattern_worker as emapattern
 
 import laboratory_v4_seeder as seeder
 
@@ -74,6 +75,7 @@ async def process_run(lab: dict, strategy_id: int):
                 is_dmigt      = any(p["test_name"] == "dmigap_trend" for p in params)
                 is_dmigap     = any(p["test_name"] == "dmigap"     for p in params)
                 is_emastatus  = any(p["test_name"] == "emastatus"  for p in params)
+                is_emapattern = any(p["test_name"] == "emapattern"  for p in params)
 
                 processed = approved = filtered = skipped = 0
                 batch_uids: list[str] = []
@@ -245,7 +247,35 @@ async def process_run(lab: dict, strategy_id: int):
                             "filtered": filtered,
                             "skipped_no_data": skipped,
                         })
+                        
+                elif is_emapattern and not (is_adx or is_bb or is_rsi or is_dmigt or is_dmigap or is_emastatus):
+                    per_tf_cache, comp_cache = await emapattern.load_emapattern_aggregates_for_strategy(strategy_id)
+                    totals_by_dir = await emapattern.load_total_closed_by_direction(strategy_id, cutoff)
 
+                    async def process_batch(uids: list[str]):
+                        nonlocal processed, approved, filtered, skipped
+                        if not uids:
+                            return
+                        a, f, s = await emapattern.process_emapattern_batch(
+                            lab=lab_cfg,
+                            strategy_id=strategy_id,
+                            run_id=run_id,
+                            cutoff=cutoff,
+                            lab_params=params,
+                            position_uids=uids,
+                            per_tf_cache=per_tf_cache,
+                            comp_cache=comp_cache,
+                            totals_by_dir=totals_by_dir,
+                        )
+                        processed += len(uids); approved += a; filtered += f; skipped += s
+                        await infra.update_progress_json(run_id, {
+                            "cutoff_at": cutoff.isoformat(),
+                            "processed": processed,
+                            "approved": approved,
+                            "filtered": filtered,
+                            "skipped_no_data": skipped,
+                        })
+                        
                 else:
                     async def process_batch(uids: list[str]):
                         return
@@ -334,6 +364,7 @@ async def main():
 #     await seeder.run_dmigaptrend_seeder()
     await seeder.run_dmigap_seeder()
     await seeder.run_emastatus_seeder()
+    await seeder.run_emapattern_seeder()
 
     # Запускаем оба воркера под автоперезапуском
     await asyncio.gather(

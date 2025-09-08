@@ -8,7 +8,7 @@ import json
 log = logging.getLogger("LAB_SEEDER")
 
 # 🔸 Общие сетки параметров
-WINRATE_VARIANTS = [0.45, 0.50, 0.55, 0.60, 0.65]
+WINRATE_VARIANTS = [0.55]
 
 MIN_TRADE_VARIANTS = [
 #     ("absolute", 5),
@@ -17,21 +17,21 @@ MIN_TRADE_VARIANTS = [
 
 # 🔸 Компоненты (15 комбинаций без пустого множества)
 COMPONENTS = [
-#     ["m5"],
-#     ["m15"],
-#     ["h1"],
+    ["m5"],
+    ["m15"],
+    ["h1"],
     ["comp"],
-#     ["m5", "m15"],
-#     ["m5", "h1"],
-#     ["m5", "comp"],
-#     ["m15", "h1"],
-#     ["m15", "comp"],
-#     ["h1", "comp"],
-#     ["m5", "m15", "h1"],
-#     ["m5", "m15", "comp"],
-#     ["m5", "h1", "comp"],
-#     ["m15", "h1", "comp"],
-#     ["m5", "m15", "h1", "comp"],
+    ["m5", "m15"],
+    ["m5", "h1"],
+    ["m5", "comp"],
+    ["m15", "h1"],
+    ["m15", "comp"],
+    ["h1", "comp"],
+    ["m5", "m15", "h1"],
+    ["m5", "m15", "comp"],
+    ["m5", "h1", "comp"],
+    ["m15", "h1", "comp"],
+    ["m5", "m15", "h1", "comp"],
 ]
 
 # 🔸 Хелпер для форматирования trade-порогов
@@ -77,6 +77,12 @@ def make_name_emastatus(ema_len, components, min_trade_type, min_trade_value, wr
     comp_str = "+".join(components)
     trade_str = format_trade(min_trade_type, min_trade_value)
     return f"EMAstatus({ema_len}) | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
+
+# 🔸 Имя теста EMA Pattern
+def make_name_emapattern(components, min_trade_type, min_trade_value, wr):
+    comp_str = "+".join(components)
+    trade_str = format_trade(min_trade_type, min_trade_value)
+    return f"EMApattern | {comp_str} | thresh={trade_str} | wr={wr:.2f}"
     
 # 🔸 Сидер ADX
 async def run_adx_seeder():
@@ -406,3 +412,48 @@ async def run_emastatus_seeder():
         "Сидер: успешно создано %d EMAstatus-тестов",
         len(EMA_LENS) * len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS),
     )
+    
+# 🔸 Сидер EMA Pattern (solo m5/m15/h1 и comp)
+async def run_emapattern_seeder():
+    async with infra.pg_pool.acquire() as conn:
+        existing = await conn.fetchval("SELECT COUNT(*) FROM laboratory_instances_v4 WHERE name LIKE 'EMApattern | %'")
+        if existing and existing > 0:
+            log.info("Сидер: EMApattern-тесты уже есть (%s шт.), сид не нужен", existing)
+            return
+
+    log.info("Сидер: начинаем генерацию EMApattern-тестов")
+
+    async with infra.pg_pool.acquire() as conn:
+        async with conn.transaction():
+            for wr in WINRATE_VARIANTS:
+                for mt_type, mt_value in MIN_TRADE_VARIANTS:
+                    for comps in COMPONENTS:
+                        name = make_name_emapattern(comps, mt_type, mt_value, wr)
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO laboratory_instances_v4
+                              (name, active, min_trade_type, min_trade_value, min_winrate)
+                            VALUES ($1, true, $2, $3, $4)
+                            RETURNING id
+                            """,
+                            name, mt_type, Decimal(str(mt_value)), Decimal(str(wr))
+                        )
+                        lab_id = row["id"]
+
+                        for c in comps:
+                            if c in ("m5", "m15", "h1"):
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 "
+                                    "(lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'emapattern', 'solo', $2, '{}')",
+                                    lab_id, c,
+                                )
+                            elif c == "comp":
+                                await conn.execute(
+                                    "INSERT INTO laboratory_parameters_v4 "
+                                    "(lab_id, test_name, test_type, test_tf, param_spec) "
+                                    "VALUES ($1, 'emapattern', 'comp', NULL, '{}')",
+                                    lab_id,
+                                )
+
+    log.info("Сидер: успешно создано %d EMApattern-тестов", len(WINRATE_VARIANTS) * len(MIN_TRADE_VARIANTS) * len(COMPONENTS))
