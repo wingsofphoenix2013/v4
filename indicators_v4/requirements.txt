@@ -1,20 +1,20 @@
 # Асинхронный доступ к PostgreSQL
-asyncpg==0.29.0
+asyncpg>=0.29
 
 # Асинхронный Redis-клиент
-redis==5.0.1
+redis>=5.0
 
 # Работа с базой данных через ORM
-sqlalchemy>=2.0.0
-psycopg2-binary
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
 
 # Научные библиотеки для расчётов
-numpy==1.26.4
-scipy==1.13.0
+numpy>=1.26
+scipy>=1.13
 
 # Индикаторы
-ta==0.10.2
-pandas_ta
+ta>=0.10.2
+pandas-ta>=0.3.14b0   # импорт остаётся: import pandas_ta as ta
 
 # Для логирования (опционально)
-loguru==0.7.2
+loguru>=0.7
