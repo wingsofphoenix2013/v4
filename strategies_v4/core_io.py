@@ -1,12 +1,12 @@
-# core_io.py
+# core_io.py — I/O-воркеры: логи сигналов, запись позиций/таргетов/логов, обновления событий, reverse-сигналы + публикация счётчиков стратегии при закрытии
 
+# 🔸 Импорты
 import asyncio
 import logging
 from datetime import datetime
 from infra import infra
 import json
 from decimal import Decimal
-
 
 # 🔸 Логгер для I/O-операций
 log = logging.getLogger("CORE_IO")
@@ -65,7 +65,9 @@ async def run_signal_log_writer():
 
         except Exception:
             log.exception("❌ Ошибка в loop Consumer Group")
-            await asyncio.sleep(5)  
+            await asyncio.sleep(5)
+
+
 # 🔸 Преобразование данных из Redis Stream
 def _parse_signal_log_data(data: dict) -> tuple:
     return (
@@ -76,6 +78,7 @@ def _parse_signal_log_data(data: dict) -> tuple:
         data.get("position_uid"),
         datetime.fromisoformat(data["logged_at"])
     )
+
 
 # 🔸 Батч-запись логов в PostgreSQL
 async def write_log_entry_batch(batch: list[tuple]):
@@ -95,7 +98,9 @@ async def write_log_entry_batch(batch: list[tuple]):
         log.debug(f"✅ Записано логов сигналов: {len(batch)}")
     except Exception:
         log.exception("❌ Ошибка записи логов сигналов в БД")
-# 🔹 Воркер: запись открытых позиций из positions_open_stream
+
+
+# 🔸 Воркер: запись открытых позиций из positions_open_stream
 async def run_position_open_writer():
     stream_name = "positions_open_stream"
     group_name = "core_io_position_group"
@@ -144,8 +149,9 @@ async def _wrap_open_position(data, redis, record_id):
         await redis.xack("positions_open_stream", "core_io_position_group", record_id)
     except Exception:
         log.exception(f"❌ Ошибка обработки позиции (id={record_id})")
-        
-# 🔹 Обработка одной позиции из Redis Stream
+
+
+# 🔸 Обработка одной позиции из Redis Stream (открытие)
 async def _handle_open_position(data: dict):
     # 🔸 Декодирование TP/SL целей
     tp_targets = json.loads(data["tp_targets"])
@@ -230,7 +236,9 @@ async def _handle_open_position(data: dict):
     )
 
     log.debug(f"✅ Позиция {position_uid} записана в БД")
-# 🔸 Обработка события позиции
+
+
+# 🔸 Обработка события позиции (tp_hit / closed / sl_replaced)
 async def _handle_position_update_event(event: dict):
     if event.get("event_type") == "tp_hit":
         async with infra.pg_pool.acquire() as conn:
@@ -288,7 +296,7 @@ async def _handle_position_update_event(event: dict):
                      datetime.utcnow())
 
         log.debug(f"📝 Событие tp_hit обработано и записано для {event['position_uid']}")
-        
+
     elif event.get("event_type") == "closed":
         async with infra.pg_pool.acquire() as conn:
             async with conn.transaction():
@@ -367,17 +375,19 @@ async def _handle_position_update_event(event: dict):
                      event["note"],
                      datetime.utcnow())
 
-            # 🔸 Запись события closed в signal_log_queue для signal_log_entries_v4
-            await infra.redis_client.xadd("signal_log_queue", {
-                "log_uid": event["log_uid"],
-                "strategy_id": str(event["strategy_id"]),
-                "status": "closed",
-                "note": event["note"],
-                "position_uid": event["position_uid"],
-                "logged_at": datetime.utcnow().isoformat()
-            })
+        # 🔸 Запись события closed в signal_log_queue для signal_log_entries_v4
+        await infra.redis_client.xadd("signal_log_queue", {
+            "log_uid": event["log_uid"],
+            "strategy_id": str(event["strategy_id"]),
+            "status": "closed",
+            "note": event["note"],
+            "position_uid": event["position_uid"],
+            "logged_at": datetime.utcnow().isoformat()
+        })
+        log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
 
-            log.debug(f"📝 Событие закрытия позиции записано для {event['position_uid']}")
+        # 🔸 Публикация счётчиков стратегии (market_watcher=true) в Redis KV — асинхронно
+        asyncio.create_task(_publish_strategy_counters_after_close(event))
 
         # 🔁 Если причина закрытия — reverse, отправляем реверсный сигнал
         if event.get("close_reason") == "reverse-signal-stop":
@@ -385,7 +395,7 @@ async def _handle_position_update_event(event: dict):
                 await _send_reverse_signal_from_event(event)
             except Exception:
                 log.exception(f"❌ Ошибка при отправке реверсного сигнала для {event['position_uid']}")
-        
+
     elif event.get("event_type") == "sl_replaced":
         async with infra.pg_pool.acquire() as conn:
             async with conn.transaction():
@@ -442,7 +452,8 @@ async def _handle_position_update_event(event: dict):
                     datetime.utcnow())
 
         log.debug(f"📝 Событие sl_replaced записано для {event['position_uid']}")
-                
+
+
 # 🔸 Воркер: обработка событий из positions_update_stream
 async def run_position_update_writer():
     stream_name = "positions_update_stream"
@@ -499,6 +510,59 @@ async def run_position_update_writer():
         except Exception:
             log.exception("❌ Ошибка в цикле run_position_update_writer")
             await asyncio.sleep(5)
+
+
+# 🔸 Публикация счётчиков стратегии (market_watcher=true) после закрытия позиции
+async def _publish_strategy_counters_after_close(event: dict):
+    """
+    В Redis Hash strategy:stats:{strategy_id} инкрементируем:
+      closed_total / closed_long / closed_short
+      pnl_total / pnl_long / pnl_short
+    Идемпотентность на позицию: SADD strategy:closed_seen:{sid} {position_uid} → инкрементируем только при 1.
+    Условие: стратегия должна иметь market_watcher=true.
+    """
+    try:
+        sid = int(event["strategy_id"])
+        uid = event["position_uid"]
+        direction = str(event["direction"]).lower()  # 'long' | 'short'
+        pnl = Decimal(str(event["pnl"]))
+
+        # фильтр: только для стратегий с market_watcher=true
+        row = await infra.pg_pool.fetchrow(
+            "SELECT COALESCE(market_watcher, false) AS mw FROM strategies_v4 WHERE id = $1",
+            sid
+        )
+        if not row or not row["mw"]:
+            return
+
+        redis = infra.redis_client
+        seen_key = f"strategy:closed_seen:{sid}"
+        stats_key = f"strategy:stats:{sid}"
+
+        # дедупликация по position_uid
+        added = await redis.sadd(seen_key, uid)
+        if added != 1:
+            return
+
+        # атомарные инкременты (пайплайн)
+        pipe = redis.pipeline()
+        pipe.hincrby(stats_key, "closed_total", 1)
+        pipe.hincrbyfloat(stats_key, "pnl_total", float(pnl))
+
+        if direction == "long":
+            pipe.hincrby(stats_key, "closed_long", 1)
+            pipe.hincrbyfloat(stats_key, "pnl_long", float(pnl))
+        elif direction == "short":
+            pipe.hincrby(stats_key, "closed_short", 1)
+            pipe.hincrbyfloat(stats_key, "pnl_short", float(pnl))
+
+        await pipe.execute()
+        log.debug(f"📊 [STRAT_STATS] sid={sid} uid={uid} dir={direction} pnl={pnl}")
+
+    except Exception:
+        log.exception("❌ Ошибка публикации счётчиков стратегии")
+
+
 # 🔸 Формирование и отправка реверсного сигнала
 async def _send_reverse_signal_from_event(event: dict):
     try:
