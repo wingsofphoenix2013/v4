@@ -44,14 +44,14 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
     log = logging.getLogger(name)
     while True:
         try:
-            log.info("Запуск воркера")
+            log.debug("Запуск воркера")
             await coro_fn()
         except asyncio.CancelledError:
-            log.info("Воркер остановлен")
+            log.debug("Воркер остановлен")
             raise
         except Exception as e:
             log.error(f"Ошибка: {e}", exc_info=True)
-            log.info(f"Перезапуск через {retry_delay} секунд...")
+            log.debug(f"Перезапуск через {retry_delay} секунд...")
             await asyncio.sleep(retry_delay)
 
 # 🔸 Централизованное логирование

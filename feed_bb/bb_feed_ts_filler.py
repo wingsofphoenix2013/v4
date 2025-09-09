@@ -8,7 +8,7 @@ log = logging.getLogger("BB_TS_FILLER")
 
 # 🔸 Основной воркер (idle)
 async def run_feed_ts_filler_bb(pg_pool, redis):
-    log.info("BB_TS_FILLER запущен (idle): слежу за ohlcv_bb_gap")
+    log.debug("BB_TS_FILLER запущен (idle): слежу за ohlcv_bb_gap")
 
     while True:
         try:

@@ -20,7 +20,7 @@ async def run_core_io_bb(pg_pool, redis):
     last_id = "$"  # только новые сообщения
     semaphore = asyncio.Semaphore(20)  # ограничим конкуренцию
 
-    log.info("BB_CORE_IO запущен: слушаю bb:ohlcv_stream и пишу в PG")
+    log.debug("BB_CORE_IO запущен: слушаю bb:ohlcv_stream и пишу в PG")
 
     async def process_message(data):
         async with semaphore:

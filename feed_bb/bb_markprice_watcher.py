@@ -78,7 +78,7 @@ async def _watch_symbol_markprice(symbol: str, pg_pool, redis):
                 # подписка на тикер (markPrice внутри)
                 sub = {"op": "subscribe", "args": [f"tickers.{symbol}"]}
                 await ws.send(json.dumps(sub))
-                log.info(f"[{symbol}] MARKPRICE: connected & subscribed")
+                log.debug(f"[{symbol}] MARKPRICE: connected & subscribed")
 
                 ka_task = asyncio.create_task(keepalive(ws))
                 try:
@@ -120,7 +120,7 @@ async def _watch_symbol_markprice(symbol: str, pg_pool, redis):
 
 # 🔸 Менеджер: спавнит/останавливает таски по активным символам
 async def run_markprice_watcher_bb(pg_pool, redis):
-    log.info("MARKPRICE watcher (Bybit) запущен")
+    log.debug("MARKPRICE watcher (Bybit) запущен")
 
     tasks: dict[str, asyncio.Task] = {}
 
@@ -132,14 +132,14 @@ async def run_markprice_watcher_bb(pg_pool, redis):
             # старт новых
             for sym in active - known:
                 tasks[sym] = asyncio.create_task(_watch_symbol_markprice(sym, pg_pool, redis))
-                log.info(f"[{sym}] MARKPRICE: started")
+                log.debug(f"[{sym}] MARKPRICE: started")
 
             # остановка лишних
             for sym in known - active:
                 t = tasks.pop(sym, None)
                 if t:
                     t.cancel()
-                    log.info(f"[{sym}] MARKPRICE: stopped (deactivated)")
+                    log.debug(f"[{sym}] MARKPRICE: stopped (deactivated)")
 
             await asyncio.sleep(REFRESH_ACTIVE_SEC)
 

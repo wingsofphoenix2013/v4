@@ -120,12 +120,12 @@ async def _send_sub(ws, topics):
         return
     payload = {"op": "subscribe", "args": topics}
     await ws.send(json.dumps(payload))
-    log.info(f"SUB → {len(topics)} топиков")
+    log.debug(f"SUB → {len(topics)} топиков")
 
 # 🔸 Главный луп для одного таймфрейма (1 WS-подключение на ТФ, подписка на все активные символы)
 async def _run_tf_loop(pg_pool, redis, interval_m: str):
     bybit_iv = INTERVAL_MAP_SUB[interval_m]
-    log.info(f"[{interval_m}] старт воркера (Bybit interval={bybit_iv})")
+    log.debug(f"[{interval_m}] старт воркера (Bybit interval={bybit_iv})")
 
     current_symbols = set()
     ws = None
@@ -156,7 +156,7 @@ async def _run_tf_loop(pg_pool, redis, interval_m: str):
                         pass
                     ws = None
                 current_symbols.clear()
-                log.info(f"[{interval_m}] активных символов нет")
+                log.debug(f"[{interval_m}] активных символов нет")
                 await asyncio.sleep(REFRESH_ACTIVE_SEC)
                 continue
 
@@ -169,7 +169,7 @@ async def _run_tf_loop(pg_pool, redis, interval_m: str):
                         pass
                     ws = None
 
-                log.info(f"[{interval_m}] соединяюсь к {BYBIT_WS_URL}")
+                log.debug(f"[{interval_m}] соединяюсь к {BYBIT_WS_URL}")
                 async with websockets.connect(
                     BYBIT_WS_URL,
                     ping_interval=None,
@@ -254,7 +254,7 @@ async def _run_tf_loop(pg_pool, redis, interval_m: str):
                                 last_refresh = now
                                 active2 = set(await _load_active_symbols(pg_pool))
                                 if active2 != current_symbols:
-                                    log.info(f"[{interval_m}] изменения активных символов → пересабскрайб")
+                                    log.debug(f"[{interval_m}] изменения активных символов → пересабскрайб")
                                     break  # выходим из цикла чтения → переподписка
 
                     finally:
@@ -262,7 +262,7 @@ async def _run_tf_loop(pg_pool, redis, interval_m: str):
 
         except Exception as e:
             log.error(f"[{interval_m}] ошибка WS: {e}", exc_info=True)
-            log.info(f"[{interval_m}] переподключение через 5 секунд...")
+            log.debug(f"[{interval_m}] переподключение через 5 секунд...")
             await asyncio.sleep(5)
 
 # 🔸 Публичные воркеры для main (по одному на каждый ТФ)

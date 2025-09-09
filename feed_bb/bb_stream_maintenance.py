@@ -17,7 +17,7 @@ INTERVAL_SECONDS = 60  # периодичность чистки
 
 # 🔸 Воркер XTRIM по стримам bb:*
 async def run_stream_maintenance_bb(redis):
-    log.info("BB_STREAM_MAINT запущен (XTRIM bb:*)")
+    log.debug("BB_STREAM_MAINT запущен (XTRIM bb:*)")
     while True:
         try:
             for key, maxlen in STREAM_LIMITS.items():
