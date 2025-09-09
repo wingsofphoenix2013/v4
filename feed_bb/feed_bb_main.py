@@ -5,6 +5,7 @@ import asyncio
 import logging
 from bb_infra import setup_logging, init_pg_pool, init_redis_client, run_safe_loop
 from bb_stream_maintenance import run_stream_maintenance_bb
+from bb_core_io import run_core_io_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -12,7 +13,7 @@ log = logging.getLogger("FEED_BB_MAIN")
 async def heartbeat():
     while True:
         log.info("feed_bb main up (dry) — heartbeat")
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)
 
 # 🔸 Главная точка запуска
 async def main():
@@ -24,6 +25,7 @@ async def main():
     await asyncio.gather(
         run_safe_loop(heartbeat, "HEARTBEAT"),
         run_safe_loop(lambda: run_stream_maintenance_bb(redis), "BB_STREAM_MAINT"),
+        run_safe_loop(lambda: run_core_io_bb(pg_pool, redis), "BB_CORE_IO"),
     )
 
 if __name__ == "__main__":
