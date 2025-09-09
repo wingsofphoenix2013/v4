@@ -75,7 +75,7 @@ async def run_core_io_bb(pg_pool, redis):
 
     while True:
         try:
-            response = await redis.xread({stream_key: last_id}, count=10, block=5000)
+            response = await redis.xread({stream_key: last_id}, count=100, block=500)
             if not response:
                 continue
 
