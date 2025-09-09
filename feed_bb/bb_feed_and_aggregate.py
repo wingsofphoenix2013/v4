@@ -6,8 +6,11 @@ import asyncio
 import logging
 import json
 import time
+import random
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+
 import websockets
+from websockets.exceptions import ConnectionClosedError
 
 log = logging.getLogger("BB_FEED_AGGR")
 
@@ -134,10 +137,23 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         except asyncio.CancelledError:
             return
 
+    backoff = 1.0  # экспоненциальный бэкофф
+
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None, close_timeout=5) as ws:
+            # stagger start (мягкий старт соединений)
+            await asyncio.sleep(random.uniform(0.05, 0.25))
+
+            async with websockets.connect(
+                url,
+                ping_interval=None,
+                close_timeout=5,
+                max_queue=None,
+                open_timeout=10,
+            ) as ws:
                 await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
+                backoff = 1.0  # успех — сброс бэкоффа
+
                 ka = asyncio.create_task(keepalive(ws))
                 try:
                     async for raw in ws:
@@ -152,6 +168,13 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
                             await queue.put(it)
                 finally:
                     ka.cancel()
+
+        except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
+            wait = min(30.0, backoff * (1.5 + random.random() * 0.5))
+            log.info(f"[WS {bybit_iv}] {symbol} reconnect in {wait:.1f}s ({type(e).__name__})")
+            await asyncio.sleep(wait)
+            backoff = wait
+
         except Exception as e:
             log.error(f"[WS {bybit_iv}] {symbol} error: {e}", exc_info=True)
             await asyncio.sleep(3)
@@ -167,6 +190,7 @@ async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, t
             v_r = _round_down(v, pq)
             labels = {"symbol": sym, "interval": iv_m}
 
+            # троттлинг незакрытых баров
             if not is_closed:
                 key = (sym, iv_m)
                 now_s = int(time.monotonic())
@@ -175,6 +199,7 @@ async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, t
                     continue
                 throttle_map[key] = now_s
 
+            # запись в TS (как в v4: один ряд, last-перезапись)
             await asyncio.gather(
                 _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:o", ts_ms, o_r, {**labels, "field": "o"}),
                 _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:h", ts_ms, h_r, {**labels, "field": "h"}),
@@ -183,6 +208,7 @@ async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, t
                 _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:v", ts_ms, v_r, {**labels, "field": "v"}),
             )
 
+            # закрытый бар → в Stream + Pub/Sub
             if is_closed:
                 await redis.xadd("bb:ohlcv_stream", {
                     "symbol": sym, "interval": iv_m, "timestamp": str(ts_ms),
@@ -205,8 +231,10 @@ async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6)
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=20000)
     throttle_map: dict = {}
-    workers = [asyncio.create_task(_kline_worker_tf(queue, pg_pool, redis, tf_name, throttle_map))
-               for _ in range(workers_num)]
+    workers = [
+        asyncio.create_task(_kline_worker_tf(queue, pg_pool, redis, tf_name, throttle_map))
+        for _ in range(workers_num)
+    ]
 
     tasks: dict[str, asyncio.Task] = {}
 
@@ -215,10 +243,14 @@ async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6)
             active = set(await _load_active_symbols(pg_pool))
             known = set(tasks.keys())
 
+            # старт новых слушателей
             for sym in active - known:
                 tasks[sym] = asyncio.create_task(_listen_symbol_tf(sym, bybit_iv, queue))
                 log.info(f"[{tf_name}] start WS {sym}")
+                # лёгкий stagger, чтобы не лупить десятки подключений в одну миллисекунду
+                await asyncio.sleep(0.05)
 
+            # стоп лишних
             for sym in known - active:
                 t = tasks.pop(sym, None)
                 if t:
