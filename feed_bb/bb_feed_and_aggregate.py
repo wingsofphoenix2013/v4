@@ -1,11 +1,11 @@
-# bb_feed_and_aggregate.py — приём kline от Bybit (linear) и запись в Redis TS/Stream для m5/m15/h1
+# bb_feed_and_aggregate.py — per-symbol Bybit WS (linear) → Redis TS/Stream для m5/m15/h1
 
 # 🔸 Импорты и зависимости
 import os
 import asyncio
 import logging
 import json
-from datetime import datetime
+import time
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import websockets
 
@@ -14,15 +14,15 @@ log = logging.getLogger("BB_FEED_AGGR")
 # 🔸 Конфиг/ENV
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
 KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "180"))
-REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "15"))
+ACTIVE_REFRESH_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 NONCLOSED_THROTTLE_SEC = int(os.getenv("BB_NONCLOSED_THROTTLE_SEC", "10"))
 TS_RETENTION_MS = int(os.getenv("BB_TS_RETENTION_MS", str(60 * 24 * 60 * 60 * 1000)))  # ~60 дней
 
-# 🔸 Маппинг интервалов Bybit ↔ внутренние
-INTERVAL_MAP_SUB = {"m5": "5", "m15": "15", "h1": "60"}
-INTERVALS = ("m5", "m15", "h1")
+# 🔸 Маппинги интервалов
+SUB_IV = {"m5": "5", "m15": "15", "h1": "60"}
+ALL_TF = ("m5", "m15", "h1")
 
-# 🔸 Кеш точностей (precision_price/precision_qty) из tickers_bb
+# 🔸 Кеш precision из tickers_bb
 class PrecisionCache:
     def __init__(self):
         self.price = {}
@@ -33,7 +33,10 @@ class PrecisionCache:
             return self.price[symbol], self.qty[symbol]
         async with pg_pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT precision_price, precision_qty FROM tickers_bb WHERE symbol = %s", (symbol,))
+                await cur.execute(
+                    "SELECT precision_price, precision_qty FROM tickers_bb WHERE symbol = %s",
+                    (symbol,)
+                )
                 row = await cur.fetchone()
         pp = int(row[0]) if row and row[0] is not None else 0
         pq = int(row[1]) if row and row[1] is not None else 0
@@ -43,12 +46,14 @@ class PrecisionCache:
 
 prec_cache = PrecisionCache()
 
-# 🔸 Служебные утилиты
+# 🔸 Утилиты округления/чтения активных
 def _round_down(value: float, digits: int) -> float:
     if digits <= 0:
-        # округляем вниз до целого, если digits==0
         if digits == 0:
-            return float(int(Decimal(value).to_integral_value(rounding=ROUND_DOWN)))
+            try:
+                return float(Decimal(value).to_integral_value(rounding=ROUND_DOWN))
+            except Exception:
+                return float(int(value))
         return value
     try:
         return float(Decimal(value).quantize(Decimal(f"1e-{digits}"), rounding=ROUND_DOWN))
@@ -60,7 +65,7 @@ async def _load_active_symbols(pg_pool):
         async with pg_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT symbol FROM tickers_bb WHERE status = 'enabled' AND is_active = true ORDER BY symbol"
+                    "SELECT symbol FROM tickers_bb WHERE status='enabled' AND is_active=true ORDER BY symbol"
                 )
                 rows = await cur.fetchall()
         return [r[0] for r in rows] if rows else []
@@ -68,6 +73,7 @@ async def _load_active_symbols(pg_pool):
         log.error(f"Ошибка загрузки активных тикеров: {e}", exc_info=True)
         return []
 
+# 🔸 Безопасная запись одной точки в Redis TS
 async def _ts_safe_add(redis, key: str, ts_ms: int, value, labels: dict):
     try:
         try:
@@ -83,10 +89,10 @@ async def _ts_safe_add(redis, key: str, ts_ms: int, value, labels: dict):
     except Exception as e:
         log.warning(f"TS.ADD ошибка {key}: {e}")
 
+# 🔸 Парсинг Bybit kline
 def _parse_bybit_kline(msg: dict):
-    # ожидаем topic="kline.{5|15|60}.{SYMBOL}", data=[ {...}, ... ]
-    topic = msg.get("topic")
-    if not topic or not topic.startswith("kline."):
+    topic = msg.get("topic") or ""
+    if not topic.startswith("kline."):
         return []
     parts = topic.split(".")
     if len(parts) != 3:
@@ -96,18 +102,15 @@ def _parse_bybit_kline(msg: dict):
     interval_m = iv_map.get(iv_bybit)
     if not interval_m:
         return []
-
     data = msg.get("data") or []
     out = []
     for item in data:
-        start = item.get("start")  # ms
+        start = item.get("start")
         if start is None:
             continue
         try:
-            o = float(item.get("open"))
-            h = float(item.get("high"))
-            l = float(item.get("low"))
-            c = float(item.get("close"))
+            o = float(item.get("open")); h = float(item.get("high"))
+            l = float(item.get("low"));  c = float(item.get("close"))
             v = float(item.get("volume"))
         except Exception:
             continue
@@ -115,26 +118,12 @@ def _parse_bybit_kline(msg: dict):
         out.append((symbol, interval_m, int(start), o, h, l, c, v, is_closed))
     return out
 
-async def _send_sub(ws, topics):
-    if not topics:
-        return
-    payload = {"op": "subscribe", "args": topics}
-    await ws.send(json.dumps(payload))
-    log.debug(f"SUB → {len(topics)} топиков")
+# 🔸 per-symbol WS listener (кладёт kline-элементы в очередь)
+async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
+    url = BYBIT_WS_URL
+    topic = f"kline.{bybit_iv}.{symbol}"
 
-# 🔸 Главный луп для одного таймфрейма (1 WS-подключение на ТФ, подписка на все активные символы)
-async def _run_tf_loop(pg_pool, redis, interval_m: str):
-    bybit_iv = INTERVAL_MAP_SUB[interval_m]
-    log.debug(f"[{interval_m}] старт воркера (Bybit interval={bybit_iv})")
-
-    current_symbols = set()
-    ws = None
-    last_nonclosed_emit = {}  # (symbol, interval) -> last_ts_seconds
-
-    async def build_topics(symbols):
-        return [f"kline.{bybit_iv}.{s}" for s in symbols]
-
-    async def keepalive():
+    async def keepalive(ws):
         try:
             while True:
                 try:
@@ -147,130 +136,107 @@ async def _run_tf_loop(pg_pool, redis, interval_m: str):
 
     while True:
         try:
-            active = set(await _load_active_symbols(pg_pool))
-            if not active:
-                if ws:
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    ws = None
-                current_symbols.clear()
-                log.debug(f"[{interval_m}] активных символов нет")
-                await asyncio.sleep(REFRESH_ACTIVE_SEC)
-                continue
+            async with websockets.connect(url, ping_interval=None, close_timeout=5) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
+                ka = asyncio.create_task(keepalive(ws))
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        if msg.get("topic") != topic:
+                            continue
+                        items = _parse_bybit_kline(msg)
+                        for it in items:  # (sym, iv_m, ts_ms, o,h,l,c,v,is_closed)
+                            await queue.put(it)
+                finally:
+                    ka.cancel()
+        except Exception as e:
+            log.error(f"[WS {bybit_iv}] {symbol} error: {e}", exc_info=True)
+            await asyncio.sleep(3)
 
-            need_resub = active != current_symbols or ws is None
-            if need_resub:
-                if ws:
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    ws = None
+# 🔸 worker: берёт из очереди, пишет TS/Stream (троттлит незакрытые)
+async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, throttle_map: dict):
+    while True:
+        sym, iv_m, ts_ms, o, h, l, c, v, is_closed = await queue.get()
+        try:
+            pp, pq = await prec_cache.get(pg_pool, sym)
+            o_r = _round_down(o, pp); h_r = _round_down(h, pp)
+            l_r = _round_down(l, pp); c_r = _round_down(c, pp)
+            v_r = _round_down(v, pq)
+            labels = {"symbol": sym, "interval": iv_m}
 
-                log.debug(f"[{interval_m}] соединяюсь к {BYBIT_WS_URL}")
-                async with websockets.connect(
-                    BYBIT_WS_URL,
-                    ping_interval=None,
-                    close_timeout=5
-                ) as _ws:
-                    ws = _ws
-                    topics = await build_topics(sorted(active))
-                    await _send_sub(ws, topics)
-                    current_symbols = set(active)
+            if not is_closed:
+                key = (sym, iv_m)
+                now_s = int(time.monotonic())
+                last_s = throttle_map.get(key, 0)
+                if now_s - last_s < NONCLOSED_THROTTLE_SEC:
+                    queue.task_done()
+                    continue
+                throttle_map[key] = now_s
 
-                    ka_task = asyncio.create_task(keepalive())
-                    try:
-                        last_refresh = asyncio.get_event_loop().time()
+            await asyncio.gather(
+                _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:o", ts_ms, o_r, {**labels, "field": "o"}),
+                _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:h", ts_ms, h_r, {**labels, "field": "h"}),
+                _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:l", ts_ms, l_r, {**labels, "field": "l"}),
+                _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:c", ts_ms, c_r, {**labels, "field": "c"}),
+                _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:v", ts_ms, v_r, {**labels, "field": "v"}),
+            )
 
-                        async for raw in ws:
-                            try:
-                                msg = json.loads(raw)
-                            except Exception:
-                                continue
-
-                            # служебные ответы/ack
-                            if "op" in msg:
-                                log.debug(f"[{interval_m}] ctrl: {msg}")
-                                continue
-
-                            # данные по свечам
-                            items = _parse_bybit_kline(msg)
-                            if not items:
-                                continue
-
-                            for (sym, iv_m, ts_ms, o, h, l, c, v, is_closed) in items:
-                                try:
-                                    pp, pq = await prec_cache.get(pg_pool, sym)
-                                    # округление вниз по правилам биржи (если precision=0 → целые/как есть)
-                                    o_r = _round_down(o, pp) if pp is not None else o
-                                    h_r = _round_down(h, pp) if pp is not None else h
-                                    l_r = _round_down(l, pp) if pp is not None else l
-                                    c_r = _round_down(c, pp) if pp is not None else c
-                                    v_r = _round_down(v, pq) if pq is not None else v
-
-                                    labels = {"symbol": sym, "interval": iv_m}
-
-                                    # троттлинг незакрытых баров (не чаще N сек на символ/интервал)
-                                    if not is_closed:
-                                        key = (sym, iv_m)
-                                        now_s = int(asyncio.get_event_loop().time())
-                                        if now_s - last_nonclosed_emit.get(key, 0) < NONCLOSED_THROTTLE_SEC:
-                                            continue
-                                        last_nonclosed_emit[key] = now_s
-
-                                    # запись в TS
-                                    await asyncio.gather(
-                                        _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:o", ts_ms, o_r, {**labels, "field": "o"}),
-                                        _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:h", ts_ms, h_r, {**labels, "field": "h"}),
-                                        _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:l", ts_ms, l_r, {**labels, "field": "l"}),
-                                        _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:c", ts_ms, c_r, {**labels, "field": "c"}),
-                                        _ts_safe_add(redis, f"bb:ts:{sym}:{iv_m}:v", ts_ms, v_r, {**labels, "field": "v"}),
-                                    )
-
-                                    # закрытый бар → в Stream + Pub/Sub
-                                    if is_closed:
-                                        await redis.xadd("bb:ohlcv_stream", {
-                                            "symbol": sym,
-                                            "interval": iv_m,
-                                            "timestamp": str(ts_ms),
-                                            "o": str(o_r),
-                                            "h": str(h_r),
-                                            "l": str(l_r),
-                                            "c": str(c_r),
-                                            "v": str(v_r),
-                                        })
-                                        await redis.publish("bb:ohlcv_channel", json.dumps({
-                                            "symbol": sym, "interval": iv_m, "timestamp": str(ts_ms)
-                                        }))
-
-                                except Exception as e:
-                                    log.warning(f"[{interval_m}] ошибка обработки свечи {sym}: {e}", exc_info=True)
-
-                            # периодическая проверка списка активных
-                            now = asyncio.get_event_loop().time()
-                            if now - last_refresh >= REFRESH_ACTIVE_SEC:
-                                last_refresh = now
-                                active2 = set(await _load_active_symbols(pg_pool))
-                                if active2 != current_symbols:
-                                    log.debug(f"[{interval_m}] изменения активных символов → пересабскрайб")
-                                    break  # выходим из цикла чтения → переподписка
-
-                    finally:
-                        ka_task.cancel()
+            if is_closed:
+                await redis.xadd("bb:ohlcv_stream", {
+                    "symbol": sym, "interval": iv_m, "timestamp": str(ts_ms),
+                    "o": str(o_r), "h": str(h_r), "l": str(l_r), "c": str(c_r), "v": str(v_r),
+                })
+                await redis.publish("bb:ohlcv_channel", json.dumps({
+                    "symbol": sym, "interval": iv_m, "timestamp": str(ts_ms)
+                }))
 
         except Exception as e:
-            log.error(f"[{interval_m}] ошибка WS: {e}", exc_info=True)
-            log.debug(f"[{interval_m}] переподключение через 5 секунд...")
-            await asyncio.sleep(5)
+            log.warning(f"[{tf_name}] worker err {sym}: {e}", exc_info=True)
+        finally:
+            queue.task_done()
 
-# 🔸 Публичные воркеры для main (по одному на каждый ТФ)
+# 🔸 Менеджер одного таймфрейма: per-symbol WS + пул воркеров
+async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6):
+    bybit_iv = SUB_IV[interval_m]
+    tf_name = interval_m
+    log.info(f"[{tf_name}] per-symbol WS mode")
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=20000)
+    throttle_map: dict = {}
+    workers = [asyncio.create_task(_kline_worker_tf(queue, pg_pool, redis, tf_name, throttle_map))
+               for _ in range(workers_num)]
+
+    tasks: dict[str, asyncio.Task] = {}
+
+    while True:
+        try:
+            active = set(await _load_active_symbols(pg_pool))
+            known = set(tasks.keys())
+
+            for sym in active - known:
+                tasks[sym] = asyncio.create_task(_listen_symbol_tf(sym, bybit_iv, queue))
+                log.info(f"[{tf_name}] start WS {sym}")
+
+            for sym in known - active:
+                t = tasks.pop(sym, None)
+                if t:
+                    t.cancel()
+                    log.info(f"[{tf_name}] stop WS {sym}")
+
+            await asyncio.sleep(ACTIVE_REFRESH_SEC)
+        except Exception as e:
+            log.error(f"[{tf_name}] manager err: {e}", exc_info=True)
+            await asyncio.sleep(2)
+
+# 🔸 Публичные воркеры (для main)
 async def run_feed_and_aggregator_m5_bb(pg_pool, redis):
-    await _run_tf_loop(pg_pool, redis, "m5")
+    await _run_tf_manager(pg_pool, redis, "m5", workers_num=int(os.getenv("BB_M5_WORKERS", "8")))
 
 async def run_feed_and_aggregator_m15_bb(pg_pool, redis):
-    await _run_tf_loop(pg_pool, redis, "m15")
+    await _run_tf_manager(pg_pool, redis, "m15", workers_num=int(os.getenv("BB_M15_WORKERS", "6")))
 
 async def run_feed_and_aggregator_h1_bb(pg_pool, redis):
-    await _run_tf_loop(pg_pool, redis, "h1")
+    await _run_tf_manager(pg_pool, redis, "h1", workers_num=int(os.getenv("BB_H1_WORKERS", "4")))

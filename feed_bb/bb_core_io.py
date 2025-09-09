@@ -18,7 +18,7 @@ TABLE_MAP = {
 async def run_core_io_bb(pg_pool, redis):
     stream_key = "bb:ohlcv_stream"
     last_id = "$"  # только новые сообщения
-    semaphore = asyncio.Semaphore(20)  # ограничим конкуренцию
+    semaphore = asyncio.Semaphore(30)  # ограничим конкуренцию
 
     log.debug("BB_CORE_IO запущен: слушаю bb:ohlcv_stream и пишу в PG")
 
