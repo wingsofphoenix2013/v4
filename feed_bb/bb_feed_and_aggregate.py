@@ -130,11 +130,11 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         try:
             while True:
                 try:
-                    await ws.ping()                               # стандартный WS ping
-                    await ws.send(json.dumps({"op": "ping"}))     # Bybit ping
+                    ws.ping()                                   # не await — не ждём pong
+                    await ws.send(json.dumps({"op": "ping"}))   # Bybit ping
                 except Exception:
                     return
-                await asyncio.sleep(KEEPALIVE_SEC)                # рекомендов. 20 c
+                await asyncio.sleep(KEEPALIVE_SEC)              # рекомендов. 20 c
         except asyncio.CancelledError:
             return
 
@@ -186,8 +186,8 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
                     ka.cancel()
 
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
-            # ожидаемые сетевые обрывы — плавный реконнект с джиттером
-            wait = min(30.0, backoff * (1.5 + random.random() * 0.5))
+            # ожидаемые сетевые обрывы — плавный реконнект с джиттером (минимум 3с)
+            wait = max(3.0, min(30.0, backoff * (1.5 + random.random() * 0.5)))
             log.info(f"[WS {bybit_iv}] {symbol} reconnect in {wait:.1f}s ({type(e).__name__})")
             await asyncio.sleep(wait)
             backoff = wait
@@ -195,8 +195,8 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         except Exception as e:
             # неожиданные ошибки — короткий бэкофф
             log.error(f"[WS {bybit_iv}] {symbol} error: {e}", exc_info=True)
-            await asyncio.sleep(3)
-                        
+            await asyncio.sleep(3) 
+                                   
 # 🔸 worker: берёт из очереди, пишет TS/Stream (троттлит незакрытые)
 async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, throttle_map: dict):
     while True:
