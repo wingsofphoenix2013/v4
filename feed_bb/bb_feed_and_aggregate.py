@@ -172,7 +172,6 @@ async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, t
                 now_s = int(time.monotonic())
                 last_s = throttle_map.get(key, 0)
                 if now_s - last_s < NONCLOSED_THROTTLE_SEC:
-                    queue.task_done()
                     continue
                 throttle_map[key] = now_s
 
