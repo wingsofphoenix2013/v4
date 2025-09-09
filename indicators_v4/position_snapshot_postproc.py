@@ -201,7 +201,7 @@ async def _postproc_worker(redis):
                             combo_str = f"{cur['m5']}-{cur['m15']}-{cur['h1']}"
                             try:
                                 await redis.set(_kv_key_combo(strategy_id, log_uid), combo_str, ex=REDIS_KV_TTL_SEC)
-                                log.info(f"[RSI14_COMBO] sid={strategy_id} log={log_uid} combo={combo_str}")
+                                log.debug(f"[RSI14_COMBO] sid={strategy_id} log={log_uid} combo={combo_str}")
                             except Exception as e:
                                 log.warning(f"[KV_COMBO_SET] err: {e}")
 
@@ -248,7 +248,7 @@ async def _postproc_worker(redis):
                                 combo_adx = f"{cur['m5']}-{cur['m15']}-{cur['h1']}"
                                 try:
                                     await redis.set(_kv_key_combo_adx(strategy_id, log_uid), combo_adx, ex=REDIS_KV_TTL_SEC)
-                                    log.info(f"[ADXBIN_COMBO] sid={strategy_id} log={log_uid} combo={combo_adx}")
+                                    log.debug(f"[ADXBIN_COMBO] sid={strategy_id} log={log_uid} combo={combo_adx}")
                                 except Exception as e:
                                     log.warning(f"[KV_COMBO_SET_ADX] err: {e}")
 
@@ -306,7 +306,7 @@ async def _postproc_worker(redis):
                                     combo_gap = f"{cur['m5']}-{cur['m15']}-{cur['h1']}"
                                     try:
                                         await redis.set(_kv_key_combo_dmigap(strategy_id, log_uid), combo_gap, ex=REDIS_KV_TTL_SEC)
-                                        log.info(f"[DMIGAP_COMBO] sid={strategy_id} log={log_uid} combo={combo_gap}")
+                                        log.debug(f"[DMIGAP_COMBO] sid={strategy_id} log={log_uid} combo={combo_gap}")
                                     except Exception as e:
                                         log.warning(f"[KV_COMBO_SET_DMIGAP] err: {e}")
 
@@ -354,7 +354,7 @@ async def _postproc_worker(redis):
                                 combo_bb = f"{cur['m5']}-{cur['m15']}-{cur['h1']}"
                                 try:
                                     await redis.set(_kv_key_combo_bb(strategy_id, log_uid), combo_bb, ex=REDIS_KV_TTL_SEC)
-                                    log.info(f"[BBBIN_COMBO] sid={strategy_id} log={log_uid} combo={combo_bb}")
+                                    log.debug(f"[BBBIN_COMBO] sid={strategy_id} log={log_uid} combo={combo_bb}")
                                 except Exception as e:
                                     log.warning(f"[KV_COMBO_SET_BB] err: {e}")
 
@@ -409,7 +409,7 @@ async def _postproc_worker(redis):
                         combo_str = f"{cur['m5']}-{cur['m15']}-{cur['h1']}"
                         try:
                             await redis.set(_kv_key_combo_ema(strategy_id, log_uid, L), combo_str, ex=REDIS_KV_TTL_SEC)
-                            log.info(f"[EMA{L}_STATUS_COMBO] sid={strategy_id} log={log_uid} combo={combo_str}")
+                            log.debug(f"[EMA{L}_STATUS_COMBO] sid={strategy_id} log={log_uid} combo={combo_str}")
                         except Exception as e:
                             log.warning(f"[KV_COMBO_SET_EMA] err: {e}")
 
