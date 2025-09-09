@@ -4,6 +4,7 @@
 import asyncio
 import logging
 from bb_infra import setup_logging, init_pg_pool, init_redis_client, run_safe_loop
+from bb_stream_maintenance import run_stream_maintenance_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -21,7 +22,8 @@ async def main():
     log.info("PG/Redis подключены (feed_bb)")
 
     await asyncio.gather(
-        run_safe_loop(heartbeat, "HEARTBEAT")
+        run_safe_loop(heartbeat, "HEARTBEAT"),
+        run_safe_loop(lambda: run_stream_maintenance_bb(redis), "BB_STREAM_MAINT"),
     )
 
 if __name__ == "__main__":
