@@ -86,12 +86,12 @@ async def _update_symbol_row(conn, symbol: str, ticksize: str | None, qty_step: 
     sql = f"UPDATE tickers_bb SET {', '.join(sets)} WHERE symbol = %s"
     await conn.execute(sql, tuple(vals))
 
-    log.info(f"[{symbol}] updated: ticksize={ticksize} qtyStep={qty_step} minQty={min_qty} → "
+    log.debug(f"[{symbol}] updated: ticksize={ticksize} qtyStep={qty_step} minQty={min_qty} → "
              f"precision_price={pp} precision_qty={pq}")
 
 # 🔸 Основной воркер: раз в час обновляет активные тикеры
 async def run_tickers_precision_updater_bb(pg_pool):
-    log.info("BB_PRECISION_UPDATER запущен: обновляю precision из Bybit instruments-info (linear)")
+    log.debug("BB_PRECISION_UPDATER запущен: обновляю precision из Bybit instruments-info (linear)")
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT + 5)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -105,9 +105,9 @@ async def run_tickers_precision_updater_bb(pg_pool):
                     symbols = [r[0] for r in rows] if rows else []
 
                 if not symbols:
-                    log.info("BB_PRECISION_UPDATER: символов нет")
+                    log.debug("BB_PRECISION_UPDATER: символов нет")
                 else:
-                    log.info(f"BB_PRECISION_UPDATER: обновляю {len(symbols)} символов")
+                    log.debug(f"BB_PRECISION_UPDATER: обновляю {len(symbols)} символов")
                     for sym in symbols:
                         info = await _fetch_instrument_info(session, sym)
                         if not info:
