@@ -11,7 +11,12 @@ from bb_feed_auditor import run_feed_auditor_bb
 from bb_feed_ts_filler import run_feed_ts_filler_bb
 from bb_feed_healer import run_feed_healer_bb
 from bb_tickers_precision_updater import run_tickers_precision_updater_bb
-from bb_feed_and_aggregate import run_feed_and_aggregator_bb
+
+from bb_feed_and_aggregate import (
+    run_feed_and_aggregator_m5_bb,
+    run_feed_and_aggregator_m15_bb,
+    run_feed_and_aggregator_h1_bb,
+)
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -35,8 +40,10 @@ async def main():
         run_safe_loop(lambda: run_feed_auditor_bb(pg_pool, redis), "BB_FEED_AUDITOR"),
         run_safe_loop(lambda: run_feed_ts_filler_bb(pg_pool, redis), "BB_TS_FILLER"),
         run_safe_loop(lambda: run_feed_healer_bb(pg_pool, redis), "BB_FEED_HEALER"),
-        run_safe_loop(lambda: run_feed_and_aggregator_bb(pg_pool, redis), "BB_FEED_AGGR"),
         run_safe_loop(lambda: run_tickers_precision_updater_bb(pg_pool), "BB_PRECISION_UPDATER"),
+        run_safe_loop(lambda: run_feed_and_aggregator_m5_bb(pg_pool, redis), "BB_FEED_AGGR:M5"),
+        run_safe_loop(lambda: run_feed_and_aggregator_m15_bb(pg_pool, redis), "BB_FEED_AGGR:M15"),
+        run_safe_loop(lambda: run_feed_and_aggregator_h1_bb(pg_pool, redis), "BB_FEED_AGGR:H1"),
     )
 
 if __name__ == "__main__":
