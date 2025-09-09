@@ -16,13 +16,10 @@ async def heartbeat():
 # 🔸 Главная точка запуска
 async def main():
     setup_logging()
-
-    # подключение к инфраструктуре
-    pg = await init_pg_pool()
+    pg_pool = await init_pg_pool()   # <-- теперь psycopg pool
     redis = init_redis_client()
     log.info("PG/Redis подключены (feed_bb)")
 
-    # здесь позже добавим остальные воркеры через run_safe_loop(...)
     await asyncio.gather(
         run_safe_loop(heartbeat, "HEARTBEAT")
     )
