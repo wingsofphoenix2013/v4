@@ -11,6 +11,7 @@ from bb_feed_auditor import run_feed_auditor_bb
 from bb_feed_ts_filler import run_feed_ts_filler_bb
 from bb_feed_healer import run_feed_healer_bb
 from bb_tickers_precision_updater import run_tickers_precision_updater_bb
+from bb_markprice_watcher import run_markprice_watcher_bb
 
 from bb_feed_and_aggregate import (
     run_feed_and_aggregator_m5_bb,
@@ -37,6 +38,7 @@ async def main():
         run_safe_loop(lambda: run_feed_and_aggregator_m5_bb(pg_pool, redis), "BB_FEED_AGGR:M5"),
         run_safe_loop(lambda: run_feed_and_aggregator_m15_bb(pg_pool, redis), "BB_FEED_AGGR:M15"),
         run_safe_loop(lambda: run_feed_and_aggregator_h1_bb(pg_pool, redis), "BB_FEED_AGGR:H1"),
+        run_safe_loop(lambda: run_markprice_watcher_bb(pg_pool, redis), "BB_MARKPRICE"),
     )
 
 if __name__ == "__main__":
