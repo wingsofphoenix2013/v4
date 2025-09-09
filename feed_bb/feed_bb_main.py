@@ -3,10 +3,12 @@
 # 🔸 Импорты и зависимости
 import asyncio
 import logging
+
 from bb_infra import setup_logging, init_pg_pool, init_redis_client, run_safe_loop
 from bb_stream_maintenance import run_stream_maintenance_bb
 from bb_core_io import run_core_io_bb
 from bb_feed_auditor import run_feed_auditor_bb
+from bb_feed_ts_filler import run_feed_ts_filler_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -28,6 +30,7 @@ async def main():
         run_safe_loop(lambda: run_stream_maintenance_bb(redis), "BB_STREAM_MAINT"),
         run_safe_loop(lambda: run_core_io_bb(pg_pool, redis), "BB_CORE_IO"),
         run_safe_loop(lambda: run_feed_auditor_bb(pg_pool, redis), "BB_FEED_AUDITOR"),
+        run_safe_loop(lambda: run_feed_ts_filler_bb(pg_pool, redis), "BB_TS_FILLER"),
     )
 
 if __name__ == "__main__":
