@@ -20,12 +20,6 @@ from bb_feed_and_aggregate import (
 
 log = logging.getLogger("FEED_BB_MAIN")
 
-# 🔸 Heartbeat-воркер (держит процесс живым, показывает, что main работает)
-async def heartbeat():
-    while True:
-        log.info("feed_bb main up (dry) — heartbeat")
-        await asyncio.sleep(60)
-
 # 🔸 Главная точка запуска
 async def main():
     setup_logging()
@@ -34,7 +28,6 @@ async def main():
     log.info("PG/Redis подключены (feed_bb)")
 
     await asyncio.gather(
-        run_safe_loop(heartbeat, "HEARTBEAT"),
         run_safe_loop(lambda: run_stream_maintenance_bb(redis), "BB_STREAM_MAINT"),
         run_safe_loop(lambda: run_core_io_bb(pg_pool, redis), "BB_CORE_IO"),
         run_safe_loop(lambda: run_feed_auditor_bb(pg_pool, redis), "BB_FEED_AUDITOR"),
