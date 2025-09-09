@@ -18,6 +18,8 @@ from position_snapshot_worker import run_position_snapshot_worker
 from cleanup_worker import run_indicators_cleanup
 from indicators_market_watcher import run_market_watcher
 from indicators_ema_status import run_indicators_ema_status
+from position_snapshot_sharedmemory import run_sharedmemory_gc
+from position_snapshot_postproc import run_snapshot_postproc
 # from indicators_ema_status_live import run_indicators_ema_status_live
 # from positions_mw_backfill import run_positions_mw_backfill
 # from indicators_perminute_live import run_indicators_perminute_live
@@ -444,6 +446,8 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_market_watcher(pg, redis), "MR_WATCHER"),
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
+        run_safe_loop(run_sharedmemory_gc, "SHM_GC"),
+        run_safe_loop(lambda: run_snapshot_postproc(redis), "SNAP_POSTPROC"),
 #         run_safe_loop(lambda: run_indicators_ema_status_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "EMA_STATUS_LIVE"),
 #         run_safe_loop(lambda: run_indicators_perminute_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "PERMIN_LIVE"),
 #         run_safe_loop(lambda: run_indicators_dmigaptrend_live(pg, redis, get_instances_by_tf, get_precision, get_active_symbols), "DMIGAP_LIVE"),

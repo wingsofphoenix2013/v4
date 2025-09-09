@@ -11,6 +11,7 @@ import pandas as pd
 from indicators.compute_and_store import compute_snapshot_values_async
 from indicators_ema_status import _classify_with_prev, EPS0, EPS1
 from regime9_core import RegimeState, RegimeParams, decide_regime_code
+from position_snapshot_sharedmemory import put_snapshot_tf
 
 # 🔸 Логгер
 log = logging.getLogger("IND_POS_SNAPSHOT")
@@ -344,6 +345,13 @@ async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int,
 
 # 🔸 Основной воркер
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw=lambda _sid: True):
+    # локальный импорт для публикации снапшотов TF в общую память
+    try:
+        from position_snapshot_sharedmemory import put_snapshot_tf
+    except Exception:
+        put_snapshot_tf = None
+        log.warning("position_snapshot_sharedmemory.put_snapshot_tf недоступен — пост-обработка отключена")
+
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
         log.debug(f"Группа {GROUP} создана для {STREAM}")
@@ -380,12 +388,14 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                 for msg_id, data in messages:
                     to_ack.append(msg_id)
                     try:
-                        uid   = data.get("position_uid")
-                        sym   = data.get("symbol")
-                        strat = int(data.get("strategy_id"))
-                        side  = data.get("direction")
-                        created_iso = data.get("created_at")
+                        uid        = data.get("position_uid")
+                        sym        = data.get("symbol")
+                        strat      = int(data.get("strategy_id"))
+                        side       = data.get("direction")
+                        created_iso= data.get("created_at")
+                        log_uid    = data.get("log_uid")  # важен для пост-обработчика
 
+                        # фильтр по market_watcher
                         try:
                             if not get_strategy_mw(strat):
                                 log.debug(f"[SKIP] uid={uid} strategy_id={strat}: market_watcher=false")
@@ -398,8 +408,9 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                         created_dt = datetime.fromisoformat(created_iso)
                         created_ms = int(created_dt.timestamp() * 1000)
-                        precision = get_precision(sym)
+                        precision  = get_precision(sym)
 
+                        # entry_price для EMA-паттерна
                         async with pg.acquire() as conn:
                             ep_row = await conn.fetchrow(
                                 "SELECT entry_price FROM positions_v4 WHERE position_uid = $1",
@@ -422,6 +433,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             step_ms = STEP_MS[tf]
                             start_ts = bar_open_ms - (REQUIRED_BARS_DEFAULT - 1) * step_ms
 
+                            # загрузка OHLCV (как было)
                             fields = ["o", "h", "l", "c", "v"]
                             keys = {f: f"ts:{sym}:{tf}:{f}" for f in fields}
                             tasks = {f: redis.execute_command("TS.RANGE", keys[f], start_ts, bar_open_ms) for f in fields}
@@ -451,8 +463,10 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             close_t = float(pdf["c"].iloc[-1])
                             close_prev = float(pdf["c"].iloc[-2]) if len(pdf) > 1 else None
 
+                            # локальный кэш t-значений по инстансам
                             tf_cache_values: dict[int, dict[str, str]] = {}
 
+                            # пробег по инстансам
                             for inst in instances:
                                 en = inst.get("enabled_at")
                                 if en and bar_open_ms < int(en.replace(tzinfo=None).timestamp() * 1000):
@@ -490,6 +504,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         params_json
                                     ))
 
+                                # EMA-status
                                 if inst.get("indicator") == "ema":
                                     try:
                                         L = int(inst["params"].get("length"))
@@ -519,6 +534,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             except Exception:
                                                 ema_p = None
 
+                                    # scale: high-low (как раньше)
                                     scale_t = None
                                     scale_prev = None
                                     try:
@@ -539,6 +555,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             params_json
                                         ))
 
+                            # EMA-паттерн
                             if entry_price is not None:
                                 try:
                                     ema_map_for_tf: dict[str, float] = {}
@@ -579,6 +596,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 except Exception:
                                     log.exception(f"[EMA_PATTERN_ERR] uid={uid} TF={tf}")
 
+                            # MW (regime9)
                             feats = await build_mw_features(redis, sym, tf, bar_open_ms, pdf, precision, instances, tf_cache_values=tf_cache_values)
                             if feats is not None:
                                 state = RegimeState()
@@ -593,6 +611,26 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                 ))
                                 tf_param_count += 1
 
+                            # публикация снапшота TF в общую память для пост-обработки
+                            try:
+                                if put_snapshot_tf is not None and rows:
+                                    bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+                                    # компактный payload: param_name -> value_str
+                                    payload_dict = {r[5]: r[6] for r in rows if r[5] and (r[6] is not None)}
+                                    await put_snapshot_tf(
+                                        position_uid=uid,
+                                        log_uid=log_uid,
+                                        strategy_id=strat,
+                                        symbol=sym,
+                                        direction=side,
+                                        timeframe=tf,
+                                        bar_open_time=bar_iso,
+                                        payload=payload_dict
+                                    )
+                            except Exception:
+                                log.exception(f"[SHM_PUT_ERR] uid={uid} TF={tf}")
+
+                            # накопить строки TF в общий батч для PG
                             if rows:
                                 rows_all.extend(rows)
 
@@ -601,6 +639,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             total_ind += tf_inst_count
                             total_params += tf_param_count
 
+                        # запись в PG одним батчем
                         if rows_all:
                             async with pg.acquire() as conn:
                                 async with conn.transaction():
