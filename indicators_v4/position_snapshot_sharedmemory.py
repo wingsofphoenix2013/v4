@@ -48,7 +48,8 @@ async def put_snapshot_tf(
     direction: str,
     timeframe: str,                # "m5" | "m15" | "h1"
     bar_open_time: str,            # ISO UTC
-    payload: Any                   # dict[param_name -> value_str] ИЛИ list[{param_name,value_str,...}]
+    payload: Any,                  # dict[param_name -> value_str] ИЛИ list[{param_name,value_str,...}]
+    entry_price: float | None = None
 ) -> None:
     item = {
         "position_uid": position_uid,
@@ -59,6 +60,7 @@ async def put_snapshot_tf(
         "timeframe": timeframe,
         "bar_open_time": bar_open_time,
         "payload": _normalize_payload(payload),
+        "entry_price": (float(entry_price) if entry_price is not None else None),
         "ts_put": time.time(),
     }
     await SNAP_QUEUE.put(item)

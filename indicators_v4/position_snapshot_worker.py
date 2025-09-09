@@ -352,6 +352,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
         put_snapshot_tf = None
         log.warning("position_snapshot_sharedmemory.put_snapshot_tf недоступен — пост-обработка отключена")
 
+    # создание consumer-group
     try:
         await redis.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
         log.debug(f"Группа {GROUP} создана для {STREAM}")
@@ -362,6 +363,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
             log.exception("Ошибка создания consumer group")
             return
 
+    # разовая загрузка словаря EMA-паттернов
     if not _EMA_PATTERN_DICT:
         try:
             await _load_emapattern_dict(pg)
@@ -388,12 +390,12 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                 for msg_id, data in messages:
                     to_ack.append(msg_id)
                     try:
-                        uid        = data.get("position_uid")
-                        sym        = data.get("symbol")
-                        strat      = int(data.get("strategy_id"))
-                        side       = data.get("direction")
-                        created_iso= data.get("created_at")
-                        log_uid    = data.get("log_uid")  # важен для пост-обработчика
+                        uid         = data.get("position_uid")
+                        sym         = data.get("symbol")
+                        strat       = int(data.get("strategy_id"))
+                        side        = data.get("direction")
+                        created_iso = data.get("created_at")
+                        log_uid     = data.get("log_uid")  # важен для пост-обработчика
 
                         # фильтр по market_watcher
                         try:
@@ -410,13 +412,21 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         created_ms = int(created_dt.timestamp() * 1000)
                         precision  = get_precision(sym)
 
-                        # entry_price для EMA-паттерна
-                        async with pg.acquire() as conn:
-                            ep_row = await conn.fetchrow(
-                                "SELECT entry_price FROM positions_v4 WHERE position_uid = $1",
-                                uid
-                            )
-                        entry_price = float(ep_row["entry_price"]) if (ep_row and ep_row["entry_price"] is not None) else None
+                        # entry_price: сначала из сообщения, при отсутствии — фоллбэк к БД
+                        entry_price = None
+                        try:
+                            ep_raw = data.get("entry_price")
+                            if ep_raw is not None:
+                                entry_price = float(ep_raw)
+                        except Exception:
+                            entry_price = None
+                        if entry_price is None:
+                            async with pg.acquire() as conn:
+                                ep_row = await conn.fetchrow(
+                                    "SELECT entry_price FROM positions_v4 WHERE position_uid = $1",
+                                    uid
+                                )
+                            entry_price = float(ep_row["entry_price"]) if (ep_row and ep_row["entry_price"] is not None) else None
                         if entry_price is None:
                             log.debug(f"[SKIP_EMAPATTERN] uid={uid} нет entry_price")
 
@@ -433,7 +443,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             step_ms = STEP_MS[tf]
                             start_ts = bar_open_ms - (REQUIRED_BARS_DEFAULT - 1) * step_ms
 
-                            # загрузка OHLCV (как было)
+                            # загрузка OHLCV
                             fields = ["o", "h", "l", "c", "v"]
                             keys = {f: f"ts:{sym}:{tf}:{f}" for f in fields}
                             tasks = {f: redis.execute_command("TS.RANGE", keys[f], start_ts, bar_open_ms) for f in fields}
@@ -534,7 +544,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                             except Exception:
                                                 ema_p = None
 
-                                    # scale: high-low (как раньше)
+                                    # scale: high-low
                                     scale_t = None
                                     scale_prev = None
                                     try:
@@ -615,8 +625,7 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                             try:
                                 if put_snapshot_tf is not None and rows:
                                     bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
-                                    # компактный payload: param_name -> value_str
-                                    payload_dict = {r[5]: r[6] for r in rows if r[5] and (r[6] is not None)}
+                                    payload_dict = {r[5]: r[6] for r in rows if r[5] and (r[6] is not None)}  # param_name -> value_str
                                     await put_snapshot_tf(
                                         position_uid=uid,
                                         log_uid=log_uid,
@@ -625,7 +634,8 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         direction=side,
                                         timeframe=tf,
                                         bar_open_time=bar_iso,
-                                        payload=payload_dict
+                                        payload=payload_dict,
+                                        entry_price=entry_price
                                     )
                             except Exception:
                                 log.exception(f"[SHM_PUT_ERR] uid={uid} TF={tf}")
