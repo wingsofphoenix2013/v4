@@ -16,7 +16,7 @@ log = logging.getLogger("BB_FEED_AGGR")
 
 # 🔸 Конфиг/ENV
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
-KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "180"))
+KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "30"))
 ACTIVE_REFRESH_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 NONCLOSED_THROTTLE_SEC = int(os.getenv("BB_NONCLOSED_THROTTLE_SEC", "10"))
 TS_RETENTION_MS = int(os.getenv("BB_TS_RETENTION_MS", str(60 * 24 * 60 * 60 * 1000)))  # ~60 дней
@@ -130,30 +130,48 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         try:
             while True:
                 try:
-                    await ws.send(json.dumps({"op": "ping"}))
+                    await ws.ping()                               # стандартный ping-frame
+                    await ws.send(json.dumps({"op": "ping"}))     # Bybit op:ping
                 except Exception:
                     return
-                await asyncio.sleep(KEEPALIVE_SEC)
+                await asyncio.sleep(KEEPALIVE_SEC)                # рекомендуемо 20 c
         except asyncio.CancelledError:
             return
 
-    backoff = 1.0  # экспоненциальный бэкофф
+    backoff = 1.0  # экспоненциальный бэкофф (с джиттером)
 
     while True:
         try:
-            # stagger start (мягкий старт соединений)
+            # мягкий старт, чтобы не открывать десятки коннектов одномоментно
             await asyncio.sleep(random.uniform(0.05, 0.25))
 
             async with websockets.connect(
                 url,
-                ping_interval=None,
+                ping_interval=None,       # свой keepalive
                 close_timeout=5,
-                max_queue=None,
+                max_queue=None,           # не ограничиваем очередь кадров
                 open_timeout=10,
             ) as ws:
+                # подписка
                 await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
-                backoff = 1.0  # успех — сброс бэкоффа
 
+                # ждём краткий ack на подписку (если не пришёл — перезапуск)
+                ack_ok = False
+                try:
+                    ack_raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    try:
+                        ack = json.loads(ack_raw)
+                        if isinstance(ack, dict) and ack.get("op") == "subscribe" and ack.get("success", True):
+                            ack_ok = True
+                    except Exception:
+                        pass
+                except asyncio.TimeoutError:
+                    pass
+                if not ack_ok:
+                    raise ConnectionClosedError(1006, "subscribe ack timeout")
+
+                # успешное подключение → сбрасываем бэкофф и запускаем keepalive
+                backoff = 1.0
                 ka = asyncio.create_task(keepalive(ws))
                 try:
                     async for raw in ws:
@@ -163,22 +181,25 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
                             continue
                         if msg.get("topic") != topic:
                             continue
-                        items = _parse_bybit_kline(msg)
-                        for it in items:  # (sym, iv_m, ts_ms, o,h,l,c,v,is_closed)
+
+                        items = _parse_bybit_kline(msg)  # [(sym, iv_m, ts_ms, o,h,l,c,v,is_closed), ...]
+                        for it in items:
                             await queue.put(it)
                 finally:
                     ka.cancel()
 
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
+            # ожидаемые сетевые обрывы — плавный реконнект с джиттером
             wait = min(30.0, backoff * (1.5 + random.random() * 0.5))
             log.info(f"[WS {bybit_iv}] {symbol} reconnect in {wait:.1f}s ({type(e).__name__})")
             await asyncio.sleep(wait)
             backoff = wait
 
         except Exception as e:
+            # неожиданные ошибки — короткий бэкофф
             log.error(f"[WS {bybit_iv}] {symbol} error: {e}", exc_info=True)
             await asyncio.sleep(3)
-
+            
 # 🔸 worker: берёт из очереди, пишет TS/Stream (троттлит незакрытые)
 async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str, throttle_map: dict):
     while True:
