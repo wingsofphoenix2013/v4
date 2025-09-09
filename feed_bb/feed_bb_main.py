@@ -9,6 +9,7 @@ from bb_stream_maintenance import run_stream_maintenance_bb
 from bb_core_io import run_core_io_bb
 from bb_feed_auditor import run_feed_auditor_bb
 from bb_feed_ts_filler import run_feed_ts_filler_bb
+from bb_feed_healer import run_feed_healer_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -31,6 +32,7 @@ async def main():
         run_safe_loop(lambda: run_core_io_bb(pg_pool, redis), "BB_CORE_IO"),
         run_safe_loop(lambda: run_feed_auditor_bb(pg_pool, redis), "BB_FEED_AUDITOR"),
         run_safe_loop(lambda: run_feed_ts_filler_bb(pg_pool, redis), "BB_TS_FILLER"),
+        run_safe_loop(lambda: run_feed_healer_bb(pg_pool, redis), "BB_FEED_HEALER"),
     )
 
 if __name__ == "__main__":
