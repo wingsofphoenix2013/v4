@@ -4,33 +4,37 @@
 import os
 import logging
 import asyncio
-import psycopg  # psycopg3
+import psycopg
 from psycopg_pool import AsyncConnectionPool
 import redis.asyncio as aioredis
 
-# 🔸 Переменные окружения (изолированы от v4)
-BB_DATABASE_URL = os.getenv("BB_DATABASE_URL")
-BB_REDIS_URL = os.getenv("BB_REDIS_URL")
-BB_DEBUG = os.getenv("BB_DEBUG", "false").lower() == "true"
+# 🔸 Переменные окружения
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-# 🔸 Подключение к PostgreSQL (пул 10..30, async psycopg)
+# 🔸 Подключение к PostgreSQL (пул 10..30, явное open)
 async def init_pg_pool() -> AsyncConnectionPool:
-    # пример BB_DATABASE_URL: postgres://user:pass@host:5432/dbname
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
     pool = AsyncConnectionPool(
-        conninfo=BB_DATABASE_URL,
+        conninfo=DATABASE_URL,
         min_size=10,
         max_size=30,
-        kwargs={"autocommit": False}  # транзакции будем открывать вручную
+        open=False,
+        kwargs={"autocommit": False}
     )
-    # прогреть подключение
+    await pool.open()
     async with pool.connection() as _:
         pass
     return pool
 
 # 🔸 Подключение к Redis
 def init_redis_client() -> aioredis.Redis:
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL not set")
     return aioredis.from_url(
-        BB_REDIS_URL,
+        REDIS_URL,
         decode_responses=True,
         encoding="utf-8"
     )
@@ -52,7 +56,7 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
 
 # 🔸 Централизованное логирование
 def setup_logging():
-    level = logging.DEBUG if BB_DEBUG else logging.INFO
+    level = logging.DEBUG if DEBUG_MODE else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
