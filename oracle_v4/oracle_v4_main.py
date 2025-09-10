@@ -24,8 +24,6 @@ from oracle_dmigap_snapshot_aggregator import run_oracle_dmigap_snapshot_aggrega
 from oracle_dmigap_snapshot_backfill import run_oracle_dmigap_snapshot_backfill
 from oracle_emastatus_snapshot_aggregator import run_oracle_emastatus_snapshot_aggregator
 from oracle_emastatus_snapshot_backfill import run_oracle_emastatus_snapshot_backfill
-from oracle_mw_snapshot_aggregator import run_oracle_mw_snapshot_aggregator
-from oracle_mw_snapshot_backfill import run_oracle_mw_snapshot_backfill 
 from oracle_emapattern_snapshot_aggregator import run_oracle_emapattern_snapshot_aggregator
 from oracle_emapattern_snapshot_backfill import run_oracle_emapattern_snapshot_backfill
 
@@ -101,8 +99,6 @@ async def main():
         run_safe_loop(run_oracle_dmigap_snapshot_backfill, "DMI_GAP_BF"),
         run_safe_loop(run_oracle_emastatus_snapshot_aggregator, "EMA_STATUS_SNAP"),
         run_safe_loop(run_oracle_emastatus_snapshot_backfill, "EMA_STATUS_BF"),
-        run_safe_loop(run_oracle_mw_snapshot_aggregator, "MW_SNAP"),
-        run_safe_loop(run_oracle_mw_snapshot_backfill, "MW_BF"),
         run_safe_loop(run_oracle_emapattern_snapshot_aggregator, "EMAPATTERN_SNAP"),
         run_safe_loop(run_oracle_emapattern_snapshot_backfill, "EMAPATTERN_BF"),
     )
