@@ -27,6 +27,7 @@ from oracle_emastatus_snapshot_backfill import run_oracle_emastatus_snapshot_bac
 from oracle_emapattern_snapshot_aggregator import run_oracle_emapattern_snapshot_aggregator
 from oracle_emapattern_snapshot_backfill import run_oracle_emapattern_snapshot_backfill
 from oracle_mw_aggregator import run_oracle_mw_aggregator
+from oracle_mw_backfill import run_oracle_mw_backfill
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -103,6 +104,7 @@ async def main():
         run_safe_loop(run_oracle_emapattern_snapshot_aggregator, "EMAPATTERN_SNAP"),
         run_safe_loop(run_oracle_emapattern_snapshot_backfill, "EMAPATTERN_BF"),
         run_safe_loop(run_oracle_mw_aggregator, "MW_AGG"),
+        run_safe_loop(run_oracle_mw_backfill, "MW_BF"),
     )
 
 if __name__ == "__main__":
