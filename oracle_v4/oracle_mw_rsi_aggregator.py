@@ -236,7 +236,7 @@ async def _process_uid(uid: str):
         status, trades = await _upsert_sextet_with_claim(pos, mw_triplet, rsi_triplet)
         if status == "updated":
             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            log.info("[MW×RSI] uid=%s strat=%s dir=%s mw=%s rsi=%s win=%d",
+            log.debug("[MW×RSI] uid=%s strat=%s dir=%s mw=%s rsi=%s win=%d",
                      uid, pos["strategy_id"], pos["direction"], mw_triplet, rsi_triplet, win_flag)
             return ("updated", trades)
         else:
@@ -263,14 +263,14 @@ async def _count_remaining():
 async def run_oracle_mw_rsi_aggregator():
     # стартовая задержка
     if START_DELAY_SEC > 0:
-        log.info("⏳ MW×RSI: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.debug("⏳ MW×RSI: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.info("🚀 MW×RSI: старт прохода")
+            log.debug("🚀 MW×RSI: старт прохода")
             batch_idx = 0
             tot_upd = tot_part = tot_skip = tot_claim = tot_err = 0
 
@@ -307,19 +307,19 @@ async def run_oracle_mw_rsi_aggregator():
                         remaining = None
 
                 if remaining is None:
-                    log.info("[MW×RSI] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[MW×RSI] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), upd, part, claim, skip, err)
                 else:
-                    log.info("[MW×RSI] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[MW×RSI] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), upd, part, claim, skip, err, remaining)
 
-            log.info("✅ MW×RSI: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ MW×RSI: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, tot_upd, tot_part, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.info("⏹️ MW×RSI агрегатор остановлен")
+            log.debug("⏹️ MW×RSI агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ MW×RSI loop error: %s", e)

@@ -52,10 +52,10 @@ def _floor_to_bar_open(dt_utc: datetime, tf: str) -> datetime:
 async def _ensure_group():
     try:
         await infra.redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="$", mkstream=True)
-        log.info("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
+        log.debug("✅ Consumer group '%s' создана на '%s'", GROUP_NAME, STREAM_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
+            log.debug("ℹ️ Consumer group '%s' уже существует", GROUP_NAME)
         else:
             log.exception("❌ Ошибка создания consumer group: %s", e)
             raise
@@ -329,7 +329,7 @@ async def _aggregate_and_mark(pos, per_tf_codes: dict):
 # 🔸 Основной цикл
 async def run_oracle_mw_aggregator():
     await _ensure_group()
-    log.info("🚀 MW AGG: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
+    log.debug("🚀 MW AGG: слушаем '%s' (group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
 
     while True:
         try:
@@ -375,7 +375,7 @@ async def run_oracle_mw_aggregator():
                             }
                             await _aggregate_and_mark(pos, per_tf_codes)
                             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-                            log.info(
+                            log.debug(
                                 "[MW AGG] uid=%s strat=%s dir=%s PIS=%s AGG tf=3 comp=1 win=%d",
                                 pos_uid, pos["strategy_id"], pos["direction"],
                                 "/".join(sorted(per_tf_found.keys())) if per_tf_found else "-",
@@ -394,7 +394,7 @@ async def run_oracle_mw_aggregator():
                 await infra.redis_client.xack(STREAM_NAME, GROUP_NAME, *to_ack)
 
         except asyncio.CancelledError:
-            log.info("⏹️ MW агрегатор остановлен")
+            log.debug("⏹️ MW агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ XREADGROUP loop error: %s", e)

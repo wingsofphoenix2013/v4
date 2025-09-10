@@ -385,14 +385,14 @@ async def _count_remaining():
 # 🔸 Основной цикл backfill'а
 async def run_oracle_mw_backfill():
     if START_DELAY_SEC > 0:
-        log.info("⏳ MW-BF: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.debug("⏳ MW-BF: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.info("🚀 MW-BF: старт прохода")
+            log.debug("🚀 MW-BF: старт прохода")
             batch_idx = 0
             total_agg = total_partial = total_skip = total_claim = total_err = 0
 
@@ -438,21 +438,21 @@ async def run_oracle_mw_backfill():
                         remaining = None
 
                 if remaining is None:
-                    log.info("[MW-BF] batch=%d size=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[MW-BF] batch=%d size=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), agg, partial, claim, skip, err)
                 else:
-                    log.info("[MW-BF] batch=%d size=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[MW-BF] batch=%d size=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), agg, partial, claim, skip, err, remaining)
 
                 await asyncio.sleep(SHORT_SLEEP_MS / 1000)
 
-            log.info("✅ MW-BF: проход завершён batches=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ MW-BF: проход завершён batches=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, total_agg, total_partial, total_claim, total_skip, total_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.info("⏹️ MW-BF остановлен")
+            log.debug("⏹️ MW-BF остановлен")
             raise
         except Exception as e:
             log.exception("❌ MW-BF loop error: %s", e)
