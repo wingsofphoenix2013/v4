@@ -234,7 +234,7 @@ async def _process_uid(uid: str):
         status, trades = await _upsert_quartet_with_claim(pos, mw_triplet, bb_bin_m5)
         if status == "updated":
             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            log.info("[MW×BB-Q] uid=%s strat=%s dir=%s mw=%s bb_m5=%s win=%d",
+            log.debug("[MW×BB-Q] uid=%s strat=%s dir=%s mw=%s bb_m5=%s win=%d",
                      uid, pos["strategy_id"], pos["direction"], mw_triplet, bb_bin_m5, win_flag)
             return ("updated", trades)
         else:
@@ -260,14 +260,14 @@ async def _count_remaining():
 # 🔸 Основной цикл
 async def run_oracle_mw_bb_quartet_aggregator():
     if START_DELAY_SEC > 0:
-        log.info("⏳ MW×BB-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.debug("⏳ MW×BB-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.info("🚀 MW×BB-Q: старт прохода")
+            log.debug("🚀 MW×BB-Q: старт прохода")
             batch_idx = 0
             tot_upd = tot_part = tot_skip = tot_claim = tot_err = 0
 
@@ -304,19 +304,19 @@ async def run_oracle_mw_bb_quartet_aggregator():
                         remaining = None
 
                 if remaining is None:
-                    log.info("[MW×BB-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[MW×BB-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), upd, part, claim, skip, err)
                 else:
-                    log.info("[MW×BB-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[MW×BB-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), upd, part, claim, skip, err, remaining)
 
-            log.info("✅ MW×BB-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ MW×BB-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, tot_upd, tot_part, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.info("⏹️ MW×BB-Q агрегатор остановлен")
+            log.debug("⏹️ MW×BB-Q агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ MW×BB-Q loop error: %s", e)
