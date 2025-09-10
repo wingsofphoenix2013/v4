@@ -49,6 +49,12 @@ class PrecisionCache:
 
 prec_cache = PrecisionCache()
 
+# 🔸 fire-and-forget helper (поглощает исключение, чтоб не было "Future exception was never retrieved")
+def _ff(coro):
+    t = asyncio.create_task(coro)
+    t.add_done_callback(lambda fut: fut.exception())  # читаем исключение, чтобы подавить warn
+    return t
+    
 # 🔸 Утилиты округления/чтения активных
 def _round_down(value: float, digits: int) -> float:
     if digits <= 0:
@@ -130,7 +136,7 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         try:
             while True:
                 try:
-                    ws.ping()                                   # не await — не ждём pong
+                    _ff(ws.ping())                                   # не await — не ждём pong
                     await ws.send(json.dumps({"op": "ping"}))   # Bybit ping
                 except Exception:
                     return

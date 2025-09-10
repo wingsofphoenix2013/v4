@@ -36,6 +36,12 @@ class PricePrecisionCache:
 
 prec_price_cache = PricePrecisionCache()
 
+# 🔸 fire-and-forget helper (поглощает исключение, чтоб не было "Future exception was never retrieved")
+def _ff(coro):
+    t = asyncio.create_task(coro)
+    t.add_done_callback(lambda fut: fut.exception())  # читаем исключение, чтобы подавить warn
+    return t
+    
 # 🔸 Утилиты
 async def _load_active_symbols(pg_pool):
     try:
@@ -85,7 +91,7 @@ async def run_markprice_watcher_bb(pg_pool, redis):
         try:
             while True:
                 try:
-                    ws.ping()                                  # не await — не ждать pong
+                    _ff(ws.ping())                                 # не await — не ждать pong
                     await ws.send(json.dumps({"op": "ping"}))  # Bybit ping
                 except Exception:
                     return
