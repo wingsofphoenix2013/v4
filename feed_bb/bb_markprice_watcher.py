@@ -15,7 +15,7 @@ log = logging.getLogger("BB_MARKPRICE")
 
 # 🔸 Конфиг
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
-KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "60"))
+KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "20"))
 REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 
 # 🔸 Кеш точности цены
@@ -91,8 +91,7 @@ async def run_markprice_watcher_bb(pg_pool, redis):
         try:
             while True:
                 try:
-                    _ff(ws.ping())                                 # не await — не ждать pong
-                    await ws.send(json.dumps({"op": "ping"}))  # Bybit ping
+                    await ws.send(json.dumps({"op": "ping"}))  # Bybit ping раз в KEEPALIVE_SEC
                 except Exception:
                     return
                 await asyncio.sleep(KEEPALIVE_SEC)

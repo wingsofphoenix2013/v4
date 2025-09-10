@@ -16,7 +16,7 @@ log = logging.getLogger("BB_FEED_AGGR")
 
 # 🔸 Конфиг/ENV
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
-KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "60"))
+KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "20"))
 ACTIVE_REFRESH_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 NONCLOSED_THROTTLE_SEC = int(os.getenv("BB_NONCLOSED_THROTTLE_SEC", "10"))
 TS_RETENTION_MS = int(os.getenv("BB_TS_RETENTION_MS", str(60 * 24 * 60 * 60 * 1000)))  # ~60 дней
@@ -136,7 +136,6 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         try:
             while True:
                 try:
-                    _ff(ws.ping())                                   # не await — не ждём pong
                     await ws.send(json.dumps({"op": "ping"}))   # Bybit ping
                 except Exception:
                     return
