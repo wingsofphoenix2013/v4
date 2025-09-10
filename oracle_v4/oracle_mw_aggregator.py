@@ -1,9 +1,9 @@
-# 🔸 oracle_mw_aggregator.py — MarketWatcher: запись MW-срезов (PIS) на баре открытия + агрегация (per-TF и композит) при наличии всех трёх TF
+# 🔸 oracle_mw_aggregator.py — MarketWatcher: запись MW-срезов (PIS) на баре открытия + агрегация при наличии всех трёх TF (naive UTC timestamps)
 
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 import infra
@@ -19,7 +19,7 @@ XREAD_BLOCKMS = int(os.getenv("ORACLE_MW_BLOCK_MS", "1000"))
 
 # 🔸 Константы/маппинги
 TF_ORDER = ("m5", "m15", "h1")
-TF_STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
+TF_STEP_SEC = {"m5": 300, "m15": 900, "h1": 3600}
 MW_INSTANCE_BY_TF = {"m5": 1001, "m15": 1002, "h1": 1003}
 MW_CODE2STR = {
     0: "FLAT_CONS",
@@ -34,18 +34,18 @@ MW_CODE2STR = {
 }
 
 
-# 🔸 Утилита: floor к началу бара TF (UTC)
+# 🔸 Утилита: floor к началу бара TF (UTC, NAIVE)
 def _floor_to_bar_open(dt_utc: datetime, tf: str) -> datetime:
     """
-    dt_utc: datetime в UTC (naive=UTC или tz-aware=UTC)
+    Принимает datetime в UTC. Возвращает NAIVE UTC datetime (tzinfo=None).
     """
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    step = TF_STEP_MIN[tf]
-    epoch = int(dt_utc.timestamp())
-    step_sec = step * 60
-    floored = (epoch // step_sec) * step_sec
-    return datetime.fromtimestamp(floored, tz=timezone.utc)
+    # приводим к naive UTC
+    if dt_utc.tzinfo is not None:
+        dt_utc = dt_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    step = TF_STEP_SEC[tf]
+    epoch = int(dt_utc.timestamp())  # трактуется как UTC для naive datetime
+    floored = (epoch // step) * step
+    return datetime.utcfromtimestamp(floored)  # naive UTC
 
 
 # 🔸 Идемпотентно создать consumer-group
@@ -137,7 +137,7 @@ async def _write_pis_mw(position_uid: str, strategy_id: int, direction: str, sym
             "mw",
             vstr,
             float(code),
-            bar_open,       # bar_open_time
+            bar_open,       # bar_open_time (naive UTC)
             None,           # enabled_at
             None            # params_json
         ))
@@ -185,10 +185,7 @@ async def _check_all_three_present(position_uid: str, created_at_utc: datetime):
                 """,
                 position_uid, tf, int(instance_id), bar_open
             )
-        if exists:
-            per_tf_ok[tf] = True
-        else:
-            per_tf_ok[tf] = False
+        per_tf_ok[tf] = bool(exists)
     return all(per_tf_ok.values())
 
 
@@ -357,38 +354,34 @@ async def run_oracle_mw_aggregator():
                             log.debug("[MW AGG] skip msg_id=%s uid=%s reason=status=%s", msg_id, pos_uid, status)
                             continue
 
-                        # загрузить позицию/стратегию и базовые проверки
                         pos, strat, verdict = await _load_position_and_strategy(pos_uid)
                         v_code, v_reason = verdict
                         if v_code != "ok":
                             log.debug("[MW AGG] uid=%s skip: %s", pos_uid, v_reason)
                             continue
 
-                        # 1) Запись MW-срезов (PIS) по найденным TF (идемпотентно)
                         created_at = pos["created_at"]
-                        created_at_utc = created_at.replace(tzinfo=timezone.utc) if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+                        created_at_utc = created_at.astimezone(timezone.utc).replace(tzinfo=None) if created_at.tzinfo is not None else created_at
+
                         per_tf_found = await _write_pis_mw(
                             pos["position_uid"], pos["strategy_id"], pos["direction"], pos["symbol"], created_at_utc
                         )
 
-                        # 2) Если в PIS есть все 3 TF — запустить агрегацию и выставить флаги
                         all_three = await _check_all_three_present(pos["position_uid"], created_at_utc)
                         if all_three:
-                            await _aggregate_and_mark(pos, {
+                            per_tf_codes = {
                                 tf: await _load_imw_code(pos["symbol"], tf, _floor_to_bar_open(created_at_utc, tf))
                                 for tf in TF_ORDER
-                            })
+                            }
+                            await _aggregate_and_mark(pos, per_tf_codes)
                             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-                            updated_tf = 3
-                            updated_comp = 1
                             log.info(
-                                "[MW AGG] uid=%s strat=%s dir=%s PIS=%s AGG tf=%d comp=%d win=%d",
+                                "[MW AGG] uid=%s strat=%s dir=%s PIS=%s AGG tf=3 comp=1 win=%d",
                                 pos_uid, pos["strategy_id"], pos["direction"],
                                 "/".join(sorted(per_tf_found.keys())) if per_tf_found else "-",
-                                updated_tf, updated_comp, win_flag
+                                win_flag
                             )
                         else:
-                            # частичный PIS, агрегацию не делаем, флаг не ставим
                             log.debug(
                                 "[MW AGG] uid=%s partial PIS: present=%s (agg postponed)",
                                 pos_uid, "/".join(sorted(per_tf_found.keys())) if per_tf_found else "-"
