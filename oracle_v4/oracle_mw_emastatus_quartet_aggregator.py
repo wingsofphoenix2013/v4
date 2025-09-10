@@ -203,7 +203,7 @@ async def _upsert_quartets_with_claim(pos, mw_triplet: str, ems_map: dict):
                         f'{{"closed_trades": {c}, "winrate": {float(wr):.4f}}}'
                     )
                 except Exception:
-                    log.debug("Redis SET failed (quartet)")
+                    log.info("Redis SET failed (quartet)")
 
             return ("updated", total_upd)
 
@@ -224,7 +224,7 @@ async def _process_uid(uid: str):
         status, total_upd = await _upsert_quartets_with_claim(pos, mw_triplet, ems_map)
         if status == "updated":
             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            log.debug("[MW×EMAStatus-Q] uid=%s strat=%s dir=%s mw=%s ema_count=%d win=%d",
+            log.info("[MW×EMAStatus-Q] uid=%s strat=%s dir=%s mw=%s ema_count=%d win=%d",
                      uid, pos["strategy_id"], pos["direction"], mw_triplet, total_upd, win_flag)
             return ("updated", total_upd)
         else:
@@ -250,14 +250,14 @@ async def _count_remaining():
 # 🔸 Основной цикл
 async def run_oracle_mw_emastatus_quartet_aggregator():
     if START_DELAY_SEC > 0:
-        log.debug("⏳ MW×EMAStatus-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.info("⏳ MW×EMAStatus-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.debug("🚀 MW×EMAStatus-Q: старт прохода")
+            log.info("🚀 MW×EMAStatus-Q: старт прохода")
             batch_idx = 0
             tot_upd = tot_part = tot_skip = tot_claim = tot_err = 0
 
@@ -294,19 +294,19 @@ async def run_oracle_mw_emastatus_quartet_aggregator():
                         remaining = None
 
                 if remaining is None:
-                    log.debug("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                    log.info("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), upd, part, claim, skip, err)
                 else:
-                    log.debug("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.info("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), upd, part, claim, skip, err, remaining)
 
-            log.debug("✅ MW×EMAStatus-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.info("✅ MW×EMAStatus-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, tot_upd, tot_part, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.debug("⏹️ MW×EMAStatus-Q агрегатор остановлен")
+            log.info("⏹️ MW×EMAStatus-Q агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ MW×EMAStatus-Q loop error: %s", e)
