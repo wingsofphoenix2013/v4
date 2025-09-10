@@ -296,7 +296,7 @@ async def _handle_symbol_tf_now(redis, symbol: str, tf: str, bar_open_ms: int, p
 
     # лог результата
     bar_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
-    logging.getLogger("MRW_LIVE").info(
+    logging.getLogger("MRW_LIVE").debug(
         f"[LIVE] {symbol}/{tf} @ {bar_iso} → code={code} "
         f"(adx={diag['adx']:.2f}/{diag['adx_low']:.2f}-{diag['adx_high']:.2f}, "
         f"bbw={diag['bb_width']:.4f}/{diag['bb_low']:.4f}-{diag['bb_high']:.4f}, "
