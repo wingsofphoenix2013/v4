@@ -30,6 +30,7 @@ from oracle_mw_aggregator import run_oracle_mw_aggregator
 from oracle_mw_backfill import run_oracle_mw_backfill
 from oracle_mw_rsi_quartet_aggregator import run_oracle_mw_rsi_quartet_aggregator
 from oracle_mw_adx_quartet_aggregator import run_oracle_mw_adx_quartet_aggregator
+from oracle_mw_bb_quartet_aggregator import run_oracle_mw_bb_quartet_aggregator
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -109,6 +110,7 @@ async def main():
         run_safe_loop(run_oracle_mw_backfill, "MW_BF"),
         run_safe_loop(run_oracle_mw_rsi_quartet_aggregator, "MW_RSI_Q"),
         run_safe_loop(run_oracle_mw_adx_quartet_aggregator, "MW_ADX_Q"),
+        run_safe_loop(run_oracle_mw_bb_quartet_aggregator, "MW_BB_Q"),
     )
 
 if __name__ == "__main__":
