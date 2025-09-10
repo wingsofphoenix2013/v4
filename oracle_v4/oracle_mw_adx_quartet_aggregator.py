@@ -1,4 +1,4 @@
-# 🔸 oracle_mw_rsi_quartet_aggregator.py — MW×RSI(m5) квартеты: скан позиций, сбор MW-триплета и RSI m5, UPSERT агрегата, Redis, флаг
+# 🔸 oracle_mw_adx_quartet_aggregator.py — MW×ADX(m5) квартеты: скан позиций, сбор MW-триплета и ADX m5 (бин), UPSERT агрегата, Redis, флаг
 
 import os
 import asyncio
@@ -8,20 +8,20 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import infra
 
-log = logging.getLogger("ORACLE_MW_RSI_Q")
+log = logging.getLogger("ORACLE_MW_ADX_Q")
 
 # 🔸 Конфиг сканера
-BATCH_SIZE           = int(os.getenv("MW_RSI_Q_BATCH_SIZE", "500"))
-MAX_CONCURRENCY      = int(os.getenv("MW_RSI_Q_MAX_CONCURRENCY", "15"))
-START_DELAY_SEC      = int(os.getenv("MW_RSI_Q_START_DELAY_SEC", "120"))
-RECHECK_INTERVAL_SEC = int(os.getenv("MW_RSI_Q_RECHECK_INTERVAL_SEC", "300"))  # каждые 5 минут
+BATCH_SIZE           = int(os.getenv("MW_ADX_Q_BATCH_SIZE", "500"))
+MAX_CONCURRENCY      = int(os.getenv("MW_ADX_Q_MAX_CONCURRENCY", "15"))
+START_DELAY_SEC      = int(os.getenv("MW_ADX_Q_START_DELAY_SEC", "120"))
+RECHECK_INTERVAL_SEC = int(os.getenv("MW_ADX_Q_RECHECK_INTERVAL_SEC", "300"))  # каждые 5 минут
 
-TF_ORDER   = ("m5", "m15", "h1")
+TF_ORDER    = ("m5", "m15", "h1")
 TF_STEP_SEC = {"m5": 300, "m15": 900, "h1": 3600}
-MW_INST    = {"m5": 1001, "m15": 1002, "h1": 1003}
-RSI_PARAM  = "rsi14"   # мы используем RSI-14
+MW_INST     = {"m5": 1001, "m15": 1002, "h1": 1003}
+ADX_PARAM   = "adx_dmi14_adx"   # точное имя параметра ADX в PIS (using_current_bar=true)
 
-# 🔸 Кандидаты: закрытые, MW включена, есть MW-аггрегация и RSI, но квартет ещё не считан
+# 🔸 Кандидаты: закрытые, MW и ADX готовы, квартет ещё нет
 _CANDIDATES_SQL = """
 SELECT p.position_uid
 FROM positions_v4 p
@@ -29,9 +29,9 @@ JOIN strategies_v4 s ON s.id = p.strategy_id
 WHERE p.status = 'closed'
   AND s.enabled = true
   AND COALESCE(s.market_watcher, false) = true
-  AND COALESCE(p.mrk_watcher_checked, false) = true    -- MW-триплет уже собран/агрегирован
-  AND COALESCE(p.rsi_checked, false) = true            -- RSI уже собран
-  AND COALESCE(p.mw_rsi_quartet_checked, false) = false
+  AND COALESCE(p.mrk_watcher_checked, false) = true
+  AND COALESCE(p.adx_checked, false) = true
+  AND COALESCE(p.mw_adx_quartet_checked, false) = false
 ORDER BY p.closed_at NULLS LAST, p.id
 LIMIT $1
 """
@@ -44,8 +44,8 @@ WHERE p.status = 'closed'
   AND s.enabled = true
   AND COALESCE(s.market_watcher, false) = true
   AND COALESCE(p.mrk_watcher_checked, false) = true
-  AND COALESCE(p.rsi_checked, false) = true
-  AND COALESCE(p.mw_rsi_quartet_checked, false) = false
+  AND COALESCE(p.adx_checked, false) = true
+  AND COALESCE(p.mw_adx_quartet_checked, false) = false
 """
 
 # 🔸 Утилита: floor к началу бара TF (UTC, NAIVE)
@@ -65,7 +65,7 @@ async def _load_pos(position_uid: str):
             """
             SELECT p.id, p.position_uid, p.symbol, p.direction, p.strategy_id,
                    p.pnl, p.status, p.created_at,
-                   p.mrk_watcher_checked, p.rsi_checked, p.mw_rsi_quartet_checked
+                   p.mrk_watcher_checked, p.adx_checked, p.mw_adx_quartet_checked
             FROM positions_v4 p
             WHERE p.position_uid = $1
             """,
@@ -90,13 +90,14 @@ async def _load_mw_code_from_pis(uid: str, tf: str, bar_open: datetime):
         )
     return None if code is None else int(code)
 
-# 🔸 RSI m5 из PIS (using_current_bar=true) → бин 0..95, шаг 5
-def _rsi_to_bin(x: float) -> int:
+# 🔸 Биннинг 0..95, шаг 5
+def _to_bin_5(x: float) -> int:
     v = max(0.0, min(100.0, float(x)))
     b = int(v // 5) * 5
     return 95 if b == 100 else b
 
-async def _load_rsi_bin_m5(uid: str):
+# 🔸 ADX m5 из PIS (using_current_bar=true) → бин
+async def _load_adx_bin_m5(uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
         val = await conn.fetchval(
@@ -109,11 +110,11 @@ async def _load_rsi_bin_m5(uid: str):
             ORDER BY snapshot_at DESC
             LIMIT 1
             """,
-            uid, RSI_PARAM
+            uid, ADX_PARAM
         )
-    return None if val is None else _rsi_to_bin(float(val))
+    return None if val is None else _to_bin_5(float(val))
 
-# 🔸 Собрать MW-триплет и RSI m5 бин
+# 🔸 Собрать MW-триплет и ADX m5 бин
 async def _build_quartet_components(pos) -> tuple[str | None, int | None]:
     created_at = pos["created_at"]
     created_at_utc = created_at.astimezone(timezone.utc).replace(tzinfo=None) if created_at.tzinfo is not None else created_at
@@ -125,11 +126,11 @@ async def _build_quartet_components(pos) -> tuple[str | None, int | None]:
             mw_codes[tf] = int(code)
     mw_triplet = f"{mw_codes['m5']}-{mw_codes['m15']}-{mw_codes['h1']}" if all(tf in mw_codes for tf in TF_ORDER) else None
 
-    rsi_bin_m5 = await _load_rsi_bin_m5(pos["position_uid"])
-    return mw_triplet, rsi_bin_m5
+    adx_bin_m5 = await _load_adx_bin_m5(pos["position_uid"])
+    return mw_triplet, adx_bin_m5
 
 # 🔸 UPSERT квартета под claim позиции, публикация Redis, флаг
-async def _upsert_quartet_with_claim(pos, mw_triplet: str, rsi_bin_m5: int):
+async def _upsert_quartet_with_claim(pos, mw_triplet: str, adx_bin_m5: int):
     pg = infra.pg_pool
     redis = infra.redis_client
 
@@ -144,10 +145,10 @@ async def _upsert_quartet_with_claim(pos, mw_triplet: str, rsi_bin_m5: int):
             claimed = await conn.fetchrow(
                 """
                 UPDATE positions_v4
-                SET mw_rsi_quartet_checked = true
+                SET mw_adx_quartet_checked = true
                 WHERE position_uid = $1
                   AND status = 'closed'
-                  AND COALESCE(mw_rsi_quartet_checked, false) = false
+                  AND COALESCE(mw_adx_quartet_checked, false) = false
                 RETURNING position_uid
                 """,
                 pos["position_uid"]
@@ -157,23 +158,23 @@ async def _upsert_quartet_with_claim(pos, mw_triplet: str, rsi_bin_m5: int):
 
             await conn.execute(
                 """
-                INSERT INTO positions_mw_rsi_stat_quartet
-                  (strategy_id, direction, mw_triplet, rsi_bin_m5,
+                INSERT INTO positions_mw_adx_stat_quartet
+                  (strategy_id, direction, mw_triplet, adx_bin_m5,
                    closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
                 VALUES ($1,$2,$3,$4, 0,0,0,0,0,NOW())
-                ON CONFLICT (strategy_id, direction, mw_triplet, rsi_bin_m5) DO NOTHING
+                ON CONFLICT (strategy_id, direction, mw_triplet, adx_bin_m5) DO NOTHING
                 """,
-                strategy_id, direction, mw_triplet, int(rsi_bin_m5)
+                strategy_id, direction, mw_triplet, int(adx_bin_m5)
             )
 
             row = await conn.fetchrow(
                 """
                 SELECT closed_trades, won_trades, pnl_sum
-                FROM positions_mw_rsi_stat_quartet
-                WHERE strategy_id=$1 AND direction=$2 AND mw_triplet=$3 AND rsi_bin_m5=$4
+                FROM positions_mw_adx_stat_quartet
+                WHERE strategy_id=$1 AND direction=$2 AND mw_triplet=$3 AND adx_bin_m5=$4
                 FOR UPDATE
                 """,
-                strategy_id, direction, mw_triplet, int(rsi_bin_m5)
+                strategy_id, direction, mw_triplet, int(adx_bin_m5)
             )
             c0 = int(row["closed_trades"]); w0 = int(row["won_trades"]); s0 = Decimal(str(row["pnl_sum"]))
             c = c0 + 1
@@ -184,17 +185,17 @@ async def _upsert_quartet_with_claim(pos, mw_triplet: str, rsi_bin_m5: int):
 
             await conn.execute(
                 """
-                UPDATE positions_mw_rsi_stat_quartet
+                UPDATE positions_mw_adx_stat_quartet
                 SET closed_trades=$5, won_trades=$6, pnl_sum=$7, winrate=$8, avg_pnl=$9, updated_at=NOW()
-                WHERE strategy_id=$1 AND direction=$2 AND mw_triplet=$3 AND rsi_bin_m5=$4
+                WHERE strategy_id=$1 AND direction=$2 AND mw_triplet=$3 AND adx_bin_m5=$4
                 """,
-                strategy_id, direction, mw_triplet, int(rsi_bin_m5),
+                strategy_id, direction, mw_triplet, int(adx_bin_m5),
                 c, w, str(s), str(wr), str(ap)
             )
 
             try:
                 await redis.set(
-                    f"oracle:mw_rsi:quartet:{strategy_id}:{direction}:mw:{mw_triplet}:rsi:{int(rsi_bin_m5)}",
+                    f"oracle:mw_adx:quartet:{strategy_id}:{direction}:mw:{mw_triplet}:adx:{int(adx_bin_m5)}",
                     f'{{"closed_trades": {c}, "winrate": {float(wr):.4f}}}'
                 )
             except Exception:
@@ -208,24 +209,24 @@ async def _process_uid(uid: str):
         pos = await _load_pos(uid)
         if not pos or pos["status"] != "closed":
             return ("skip", "not_applicable")
-        if not (pos["mrk_watcher_checked"] and pos["rsi_checked"]) or pos["mw_rsi_quartet_checked"]:
+        if not (pos["mrk_watcher_checked"] and pos["adx_checked"]) or pos["mw_adx_quartet_checked"]:
             return ("skip", "flags")
 
-        mw_triplet, rsi_bin_m5 = await _build_quartet_components(pos)
-        if not mw_triplet or rsi_bin_m5 is None:
-            return ("partial", f"mw={bool(mw_triplet)} rsi_m5={rsi_bin_m5 is not None}")
+        mw_triplet, adx_bin_m5 = await _build_quartet_components(pos)
+        if not mw_triplet or adx_bin_m5 is None:
+            return ("partial", f"mw={bool(mw_triplet)} adx_m5={adx_bin_m5 is not None}")
 
-        status, trades = await _upsert_quartet_with_claim(pos, mw_triplet, rsi_bin_m5)
+        status, trades = await _upsert_quartet_with_claim(pos, mw_triplet, adx_bin_m5)
         if status == "updated":
             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            log.debug("[MW×RSI-Q] uid=%s strat=%s dir=%s mw=%s rsi_m5=%s win=%d",
-                     uid, pos["strategy_id"], pos["direction"], mw_triplet, rsi_bin_m5, win_flag)
+            log.debug("[MW×ADX-Q] uid=%s strat=%s dir=%s mw=%s adx_m5=%s win=%d",
+                     uid, pos["strategy_id"], pos["direction"], mw_triplet, adx_bin_m5, win_flag)
             return ("updated", trades)
         else:
             return ("claimed", "by_other")
 
     except Exception as e:
-        log.exception("❌ MW×RSI-Q uid=%s error: %s", uid, e)
+        log.exception("❌ MW×ADX-Q uid=%s error: %s", uid, e)
         return ("error", "exception")
 
 # 🔸 Пакет кандидатов / остаток
@@ -242,16 +243,16 @@ async def _count_remaining():
     return int(val or 0)
 
 # 🔸 Основной цикл
-async def run_oracle_mw_rsi_quartet_aggregator():
+async def run_oracle_mw_adx_quartet_aggregator():
     if START_DELAY_SEC > 0:
-        log.debug("⏳ MW×RSI-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.debug("⏳ MW×ADX-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.debug("🚀 MW×RSI-Q: старт прохода")
+            log.debug("🚀 MW×ADX-Q: старт прохода")
             batch_idx = 0
             tot_upd = tot_part = tot_skip = tot_claim = tot_err = 0
 
@@ -288,20 +289,20 @@ async def run_oracle_mw_rsi_quartet_aggregator():
                         remaining = None
 
                 if remaining is None:
-                    log.debug("[MW×RSI-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[MW×ADX-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), upd, part, claim, skip, err)
                 else:
-                    log.debug("[MW×RSI-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[MW×ADX-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), upd, part, claim, skip, err, remaining)
 
-            log.debug("✅ MW×RSI-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ MW×ADX-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, tot_upd, tot_part, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.debug("⏹️ MW×RSI-Q агрегатор остановлен")
+            log.debug("⏹️ MW×ADX-Q агрегатор остановлен")
             raise
         except Exception as e:
-            log.exception("❌ MW×RSI-Q loop error: %s", e)
+            log.exception("❌ MW×ADX-Q loop error: %s", e)
             await asyncio.sleep(1)
