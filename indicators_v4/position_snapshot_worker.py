@@ -1,4 +1,4 @@
-# position_snapshot_worker.py — чтение positions_open_stream и on-demand срез индикаторов + EMA-status + MW(regime9) + EMA-pattern
+# position_snapshot_worker.py — чтение positions_open_stream и on-demand срез индикаторов + EMA-status + EMA-pattern
 
 # 🔸 Импорты
 import os
@@ -10,7 +10,6 @@ from datetime import datetime
 import pandas as pd
 from indicators.compute_and_store import compute_snapshot_values_async
 from indicators_ema_status import _classify_with_prev, EPS0, EPS1
-from regime9_core import RegimeState, RegimeParams, decide_regime_code
 from position_snapshot_sharedmemory import put_snapshot_tf
 
 # 🔸 Логгер
@@ -29,16 +28,6 @@ STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 # 🔸 Параллелизм on-demand расчётов (настраивается через ENV)
 SNAPSHOT_MAX_CONCURRENCY = int(os.getenv("SNAPSHOT_MAX_CONCURRENCY", "16"))
 
-# 🔸 Market Watcher (regime9 v2): окна/пороги из ENV (как в live)
-N_PCT = int(os.getenv("MRW_N_PCT", "200"))
-N_ACC = int(os.getenv("MRW_N_ACC", "50"))
-EPS_Z = float(os.getenv("MRW_EPS_Z", "0.5"))
-HYST_TREND_BARS = int(os.getenv("MRW_R9_HYST_TREND_BARS", "2"))
-HYST_SUB_BARS   = int(os.getenv("MRW_R9_HYST_SUB_BARS", "1"))
-
-# 🔸 Захардкоженные instance_id для MW (по TF)
-MW_INSTANCE_ID = {"m5": 1001, "m15": 1002, "h1": 1003}
-
 # 🔸 EMA-паттерн: константы, фейковые instance_id и кэш словаря
 EMA_NAMES  = ("ema9", "ema21", "ema50", "ema100", "ema200")
 EMA_LEN    = {"ema9": 9, "ema21": 21, "ema50": 50, "ema100": 100, "ema200": 200}
@@ -51,23 +40,6 @@ _EMA_PATTERN_DICT: dict[str, int] = {}
 def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
     step_ms = STEP_MIN[tf] * 60_000
     return (ts_ms // step_ms) * step_ms
-
-# 🔸 TS ключи
-def ts_adx_key(sym: str, tf: str) -> str:
-    return f"ts_ind:{sym}:{tf}:adx_dmi14_adx" if tf in ("m5", "m15") else f"ts_ind:{sym}:{tf}:adx_dmi28_adx"
-
-def ts_ema21_key(sym: str, tf: str) -> str:
-    return f"ts_ind:{sym}:{tf}:ema21"
-
-def ts_macd_hist_key(sym: str, tf: str) -> str:
-    return f"ts_ind:{sym}:{tf}:macd12_macd_hist"
-
-def ts_bb_keys(sym: str, tf: str):
-    base = f"ts_ind:{sym}:{tf}:bb20_2_0_"
-    return base + "upper", base + "lower", base + "center"
-
-def ts_atr14_key(sym: str, tf: str):
-    return f"ts_ind:{sym}:{tf}:atr14" if tf in ("m5", "m15") else None
 
 # 🔸 Чтение диапазона из TS в dict
 async def ts_range_map(redis, key: str, start_ms: int, end_ms: int):
@@ -163,186 +135,6 @@ def pick_required_instances(instances_tf: list, ema_lens: list[int] = None):
             continue
     return ema_by_len, atr14, bb_20_2, macd12, adx_14_or_28
 
-# 🔸 Построение MW-фич на текущем баре (окна из TS до t-1 + on-demand t, с использованием кэша t)
-async def build_mw_features(redis, sym: str, tf: str, bar_open_ms: int,
-                            pdf: pd.DataFrame, precision: int, instances_tf: list,
-                            tf_cache_values: dict[int, dict[str, str]] | None = None):
-    step = STEP_MS[tf]
-    start_win = bar_open_ms - max((N_PCT - 1), N_ACC) * step
-
-    ema_map  = await ts_range_map(redis, ts_ema21_key(sym, tf), start_win, bar_open_ms - step)
-    macd_map = await ts_range_map(redis, ts_macd_hist_key(sym, tf), start_win, bar_open_ms - step)
-    adx_map  = await ts_range_map(redis, ts_adx_key(sym, tf), start_win, bar_open_ms - step)
-    bbu_key, bbl_key, bbc_key = ts_bb_keys(sym, tf)
-    bbu_map = await ts_range_map(redis, bbu_key, start_win, bar_open_ms - step)
-    bbl_map = await ts_range_map(redis, bbl_key, start_win, bar_open_ms - step)
-    bbc_map = await ts_range_map(redis, bbc_key, start_win, bar_open_ms - step)
-    atr_key = ts_atr14_key(sym, tf)
-    atr_map = await ts_range_map(redis, atr_key, start_win, bar_open_ms - step) if atr_key else {}
-
-    ema_by_len, atr14, bb_20_2, macd12, adx_inst = pick_required_instances(instances_tf, ema_lens=[21])
-
-    # ema21_t — из кэша или пересчёт
-    ema_t = None
-    if 21 in ema_by_len:
-        if tf_cache_values:
-            vals = tf_cache_values.get(int(ema_by_len[21]["id"]))
-            if vals and "ema21" in vals:
-                try:
-                    ema_t = float(vals["ema21"])
-                except Exception:
-                    ema_t = None
-        if ema_t is None:
-            v = await compute_snapshot_values_async(ema_by_len[21], sym, pdf, precision)
-            try:
-                ema_t = float(v.get("ema21")) if v and "ema21" in v else None
-            except Exception:
-                ema_t = None
-
-    # macd12_hist_t — из кэша или пересчёт
-    macd_t = None
-    if macd12 is not None:
-        if tf_cache_values:
-            vals = tf_cache_values.get(int(macd12["id"]))
-            if vals and "macd12_macd_hist" in vals:
-                try:
-                    macd_t = float(vals["macd12_macd_hist"])
-                except Exception:
-                    macd_t = None
-        if macd_t is None:
-            v = await compute_snapshot_values_async(macd12, sym, pdf, precision)
-            try:
-                macd_t = float(v.get("macd12_macd_hist")) if v and "macd12_macd_hist" in v else None
-            except Exception:
-                macd_t = None
-
-    # adx_t — как и раньше, пробуем оба имени параметра и берём то, что есть
-    adx_t = None
-    if adx_inst is not None:
-        if tf_cache_values:
-            vals = tf_cache_values.get(int(adx_inst["id"]))
-            for k in ("adx_dmi14_adx", "adx_dmi28_adx"):
-                if vals and k in vals:
-                    try:
-                        adx_t = float(vals[k])
-                        break
-                    except Exception:
-                        adx_t = None
-        if adx_t is None:
-            v = await compute_snapshot_values_async(adx_inst, sym, pdf, precision)
-            for k in ("adx_dmi14_adx", "adx_dmi28_adx"):
-                if v and k in v:
-                    try:
-                        adx_t = float(v[k])
-                        break
-                    except Exception:
-                        pass
-
-    # bb_t — из кэша или пересчёт
-    bbu_t = bbl_t = bbc_t = None
-    if bb_20_2 is not None:
-        if tf_cache_values:
-            vals = tf_cache_values.get(int(bb_20_2["id"]))
-            if vals:
-                for name, sval in vals.items():
-                    try:
-                        if name.endswith("_upper"):
-                            bbu_t = float(sval)
-                        elif name.endswith("_lower"):
-                            bbl_t = float(sval)
-                        elif name.endswith("_center"):
-                            bbc_t = float(sval)
-                    except Exception:
-                        pass
-        if None in (bbu_t, bbl_t, bbc_t):
-            v = await compute_snapshot_values_async(bb_20_2, sym, pdf, precision)
-            if v:
-                for k, s in v.items():
-                    try:
-                        if k.endswith("_upper"):
-                            bbu_t = float(s)
-                        elif k.endswith("_lower"):
-                            bbl_t = float(s)
-                        elif k.endswith("_center"):
-                            bbc_t = float(s)
-                    except Exception:
-                        pass
-
-    # atr_t (только m5/m15) — из кэша или пересчёт
-    atr_t = None
-    if atr14 is not None and tf in ("m5", "m15"):
-        if tf_cache_values:
-            vals = tf_cache_values.get(int(atr14["id"]))
-            if vals and "atr14" in vals:
-                try:
-                    atr_t = float(vals["atr14"])
-                except Exception:
-                    atr_t = None
-        if atr_t is None:
-            v = await compute_snapshot_values_async(atr14, sym, pdf, precision)
-            try:
-                atr_t = float(v.get("atr14")) if v and "atr14" in v else None
-            except Exception:
-                atr_t = None
-
-    if None in (ema_t, macd_t, adx_t, bbu_t, bbl_t, bbc_t) or (tf in ("m5", "m15") and atr_t is None):
-        return None
-
-    def tail_vals(series_map, n):
-        ks = sorted(series_map.keys())
-        return [series_map[k] for k in ks[-n:]] if ks else []
-
-    ema_t1 = None
-    if ema_map:
-        ks = sorted(ema_map.keys())
-        ema_t1 = ema_map.get(ks[-1], None)
-    if ema_t1 is None and 21 in ema_by_len and len(pdf) > 1:
-        prev_vals = await compute_snapshot_values_async(ema_by_len[21], sym, pdf.iloc[:-1], precision)
-        try:
-            ema_t1 = float(prev_vals.get("ema21")) if prev_vals and "ema21" in prev_vals else None
-        except Exception:
-            ema_t1 = None
-    if ema_t1 is None:
-        return None
-
-    macd_t1 = None
-    if macd_map:
-        ks = sorted(macd_map.keys())
-        macd_t1 = macd_map.get(ks[-1], None)
-    if macd_t1 is None and len(pdf) > 1 and macd12 is not None:
-        prev_vals = await compute_snapshot_values_async(macd12, sym, pdf.iloc[:-1], precision)
-        try:
-            macd_t1 = float(prev_vals.get("macd12_macd_hist")) if prev_vals and "macd12_macd_hist" in prev_vals else None
-        except Exception:
-            macd_t1 = None
-    if macd_t1 is None:
-        return None
-
-    macd_series = tail_vals(macd_map, N_ACC + 1)
-    macd_series.append(macd_t)
-    if len(macd_series) < 2:
-        return None
-    dhist = [macd_series[i+1] - macd_series[i] for i in range(len(macd_series) - 1)]
-
-    adx_win  = (tail_vals(adx_map, N_PCT)  + [adx_t])[-N_PCT:]
-    bb_u_win = (tail_vals(bbu_map, N_PCT) + [bbu_t])[-N_PCT:]
-    bb_l_win = (tail_vals(bbl_map, N_PCT) + [bbl_t])[-N_PCT:]
-    bb_c_win = (tail_vals(bbc_map, N_PCT) + [bbc_t])[-N_PCT:]
-
-    atr_win = None
-    if tf in ("m5", "m15"):
-        atr_win = (tail_vals(atr_map, N_PCT) + [atr_t])[-N_PCT:]
-
-    return {
-        "ema_t1": ema_t1, "ema_t": ema_t,
-        "macd_t1": macd_t1, "macd_t": macd_t,
-        "dhist_win": dhist[-N_ACC:],
-        "adx_win": adx_win,
-        "bb_u_win": bb_u_win, "bb_l_win": bb_l_win, "bb_c_win": bb_c_win,
-        "atr_t": atr_t if tf in ("m5", "m15") else None,
-        "atr_win": atr_win if (atr_win and tf in ("m5", "m15")) else None,
-    }
-
 # 🔸 Основной воркер
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw=lambda _sid: True):
     # локальный импорт для публикации снапшотов TF в общую память
@@ -396,15 +188,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                         side        = data.get("direction")
                         created_iso = data.get("created_at")
                         log_uid     = data.get("log_uid")  # важен для пост-обработчика
-
-                        # фильтр по market_watcher
-                        try:
-                            if not get_strategy_mw(strat):
-                                log.debug(f"[SKIP] uid={uid} strategy_id={strat}: market_watcher=false")
-                                continue
-                        except Exception:
-                            log.exception(f"[SKIP] uid={uid} strategy_id={strat}: ошибка проверки market_watcher")
-                            continue
 
                         log.debug(f"[OPENED] uid={uid} {sym} strategy={strat} dir={side} created_at={created_iso}")
 
@@ -605,21 +388,6 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
                                         log.debug(f"[EMA_PATTERN_SKIP] uid={uid} TF={tf} неполный набор EMA: {sorted(ema_map_for_tf.keys())}")
                                 except Exception:
                                     log.exception(f"[EMA_PATTERN_ERR] uid={uid} TF={tf}")
-
-                            # MW (regime9)
-                            feats = await build_mw_features(redis, sym, tf, bar_open_ms, pdf, precision, instances, tf_cache_values=tf_cache_values)
-                            if feats is not None:
-                                state = RegimeState()
-                                params = RegimeParams(hyst_trend_bars=HYST_TREND_BARS, hyst_sub_bars=HYST_SUB_BARS, eps_z=EPS_Z)
-                                code, _, diag = decide_regime_code(tf, feats, state, params)
-                                rows.append((
-                                    uid, strat, side, tf,
-                                    MW_INSTANCE_ID[tf], "mw", str(code), code,
-                                    datetime.utcfromtimestamp(bar_open_ms / 1000),
-                                    None,
-                                    None
-                                ))
-                                tf_param_count += 1
 
                             # публикация снапшота TF в общую память для пост-обработки
                             try:
