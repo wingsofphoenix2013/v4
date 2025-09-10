@@ -80,20 +80,29 @@ async def _load_mw_code_from_pis(uid: str, tf: str):
         )
     return None if code is None else int(code)
 
-# 🔸 Считать EMA-status на m5 для всех 5 длин (final) → словарь {L: status_code}
+# 🔸 Считать EMA-status на m5 для всех 5 длин (latest per param_name) → словарь {L: status_code}
 async def _load_emastatus_map_m5(uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT param_name, value_num
-            FROM positions_indicators_stat
-            WHERE position_uid=$1 AND timeframe='m5'
-              AND using_current_bar=false AND is_final=true
-              AND param_name IN ('ema9_status','ema21_status','ema50_status','ema100_status','ema200_status')
+            FROM (
+                SELECT
+                    param_name,
+                    value_num,
+                    ROW_NUMBER() OVER (PARTITION BY param_name ORDER BY snapshot_at DESC) AS rn
+                FROM positions_indicators_stat
+                WHERE position_uid = $1
+                  AND timeframe = 'm5'
+                  AND using_current_bar = true
+                  AND param_name IN ('ema9_status','ema21_status','ema50_status','ema100_status','ema200_status')
+            ) t
+            WHERE rn = 1
             """,
             uid
         )
+
     got = {}
     for r in rows:
         name = r["param_name"]
@@ -101,13 +110,12 @@ async def _load_emastatus_map_m5(uid: str):
         if v is None:
             continue
         try:
-            L = int(name.replace("ema","").replace("_status",""))
+            L = int(name.replace("ema", "").replace("_status", ""))
             if L in EMA_LENS:
                 got[L] = int(v)
         except Exception:
             continue
-    return got  # ожидаем все 5 ключей
-
+    return got  # ожидаем до 5 ключей: {9,21,50,100,200}
 # 🔸 Собрать MW-триплет и EMA-status карту
 async def _build_quartet_components(pos):
     # MW
@@ -203,7 +211,7 @@ async def _upsert_quartets_with_claim(pos, mw_triplet: str, ems_map: dict):
                         f'{{"closed_trades": {c}, "winrate": {float(wr):.4f}}}'
                     )
                 except Exception:
-                    log.info("Redis SET failed (quartet)")
+                    log.debug("Redis SET failed (quartet)")
 
             return ("updated", total_upd)
 
@@ -224,7 +232,7 @@ async def _process_uid(uid: str):
         status, total_upd = await _upsert_quartets_with_claim(pos, mw_triplet, ems_map)
         if status == "updated":
             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            log.info("[MW×EMAStatus-Q] uid=%s strat=%s dir=%s mw=%s ema_count=%d win=%d",
+            log.debug("[MW×EMAStatus-Q] uid=%s strat=%s dir=%s mw=%s ema_count=%d win=%d",
                      uid, pos["strategy_id"], pos["direction"], mw_triplet, total_upd, win_flag)
             return ("updated", total_upd)
         else:
@@ -250,14 +258,14 @@ async def _count_remaining():
 # 🔸 Основной цикл
 async def run_oracle_mw_emastatus_quartet_aggregator():
     if START_DELAY_SEC > 0:
-        log.info("⏳ MW×EMAStatus-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        log.debug("⏳ MW×EMAStatus-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
     gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            log.info("🚀 MW×EMAStatus-Q: старт прохода")
+            log.debug("🚀 MW×EMAStatus-Q: старт прохода")
             batch_idx = 0
             tot_upd = tot_part = tot_skip = tot_claim = tot_err = 0
 
@@ -294,19 +302,19 @@ async def run_oracle_mw_emastatus_quartet_aggregator():
                         remaining = None
 
                 if remaining is None:
-                    log.info("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), upd, part, claim, skip, err)
                 else:
-                    log.info("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[MW×EMAStatus-Q] batch=%d size=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), upd, part, claim, skip, err, remaining)
 
-            log.info("✅ MW×EMAStatus-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ MW×EMAStatus-Q: проход завершён batches=%d updated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, tot_upd, tot_part, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
-            log.info("⏹️ MW×EMAStatus-Q агрегатор остановлен")
+            log.debug("⏹️ MW×EMAStatus-Q агрегатор остановлен")
             raise
         except Exception as e:
             log.exception("❌ MW×EMAStatus-Q loop error: %s", e)
