@@ -20,6 +20,7 @@ from indicators_market_watcher import run_market_watcher
 from indicators_ema_status import run_indicators_ema_status
 from position_snapshot_sharedmemory import run_sharedmemory_gc
 from position_snapshot_postproc import run_snapshot_postproc
+from indicators_market_watcher_live import run_market_watcher_live
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -441,6 +442,7 @@ async def main():
         run_safe_loop(lambda: run_indicators_ema_status(pg, redis), "EMA_STATUS"),
         run_safe_loop(run_sharedmemory_gc, "SHM_GC"),
         run_safe_loop(lambda: run_snapshot_postproc(redis), "SNAP_POSTPROC"),
+        run_safe_loop(lambda: run_market_watcher_live(pg, redis, get_active_symbols, get_precision), "MR_WATCHER_LIVE"),
     )
 
 if __name__ == "__main__":
