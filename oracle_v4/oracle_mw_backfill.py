@@ -1,4 +1,4 @@
-# 🔸 oracle_mw_backfill.py — MarketWatcher backfill: дописываем PIS (mw) на баре открытия и агрегируем при полном комплекте; claim позиции против конфликтов с live (naive UTC timestamps)
+# 🔸 oracle_mw_backfill.py — MarketWatcher backfill: дописываем PIS (mw) на баре открытия, агрегируем при полном комплекте; транзакционный claim против конфликтов с live
 
 import os
 import asyncio
@@ -12,10 +12,10 @@ log = logging.getLogger("ORACLE_MW_BF")
 
 # 🔸 Конфиг backfill'а
 BATCH_SIZE           = int(os.getenv("MW_BF_BATCH_SIZE", "500"))
-MAX_CONCURRENCY      = int(os.getenv("MW_BF_MAX_CONCURRENCY", "12"))
-SHORT_SLEEP_MS       = int(os.getenv("MW_BF_SLEEP_MS", "150"))
-START_DELAY_SEC      = int(os.getenv("MW_BF_START_DELAY_SEC", "120"))
-RECHECK_INTERVAL_SEC = int(os.getenv("MW_BF_RECHECK_INTERVAL_SEC", "300"))  # каждые 5 минут
+MAX_CONCURRENCY      = int(os.getenv("MW_BF_MAX_CONCURRENCY", "12"))          # допускаем повышенную нагрузку
+SHORT_SLEEP_MS       = int(os.getenv("MW_BF_SLEEP_MS", "150"))                # пауза между батчами
+START_DELAY_SEC      = int(os.getenv("MW_BF_START_DELAY_SEC", "120"))         # стартовая задержка
+RECHECK_INTERVAL_SEC = int(os.getenv("MW_BF_RECHECK_INTERVAL_SEC", "300"))    # 🔁 каждые 5 минут
 
 # 🔸 Константы/маппинги
 TF_ORDER = ("m5", "m15", "h1")
@@ -57,19 +57,18 @@ WHERE p.status = 'closed'
   AND COALESCE(s.market_watcher, false) = true
 """
 
-
 # 🔸 Утилита: floor к началу бара TF (UTC, NAIVE)
 def _floor_to_bar_open(dt_utc: datetime, tf: str) -> datetime:
     """
-    Принимает datetime в UTC. Возвращает NAIVE UTC datetime (tzinfo=None).
+    Вход/выход: naive-UTC datetime (tzinfo=None).
+    Если пришёл aware — приводим к naive UTC.
     """
     if dt_utc.tzinfo is not None:
         dt_utc = dt_utc.astimezone(timezone.utc).replace(tzinfo=None)
-    step = TF_STEP_SEC[tf]
-    epoch = int(dt_utc.timestamp())
-    floored = (epoch // step) * step
+    step_sec = TF_STEP_SEC[tf]
+    epoch = int(dt_utc.timestamp())  # трактуем как UTC
+    floored = (epoch // step_sec) * step_sec
     return datetime.utcfromtimestamp(floored)  # naive UTC
-
 
 # 🔸 Прочитать regime_code из indicator_marketwatcher_v4
 async def _load_imw_code(symbol: str, tf: str, bar_open: datetime):
@@ -85,8 +84,7 @@ async def _load_imw_code(symbol: str, tf: str, bar_open: datetime):
         )
     return None if code is None else int(code)
 
-
-# 🔸 Загрузка позиции и стратегии (без claim, просто данные)
+# 🔸 Загрузка позиции и стратегии (предварительные проверки)
 async def _load_pos_and_strat(position_uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
@@ -116,8 +114,7 @@ async def _load_pos_and_strat(position_uid: str):
             return pos, strat, ("skip", "strategy_inactive_or_no_mw")
     return pos, strat, ("ok", "eligible")
 
-
-# 🔸 Идемпотентно записать отсутствующие PIS (mw)
+# 🔸 Идемпотентно записать отсутствующие PIS (mw) по найденным TF
 async def _write_missing_pis_mw(position_uid: str, strategy_id: int, direction: str, symbol: str, created_at_utc: datetime):
     per_tf_found = {}
     rows = []
@@ -137,7 +134,7 @@ async def _write_missing_pis_mw(position_uid: str, strategy_id: int, direction: 
             "mw",
             vstr,
             float(code),
-            bar_open,   # naive UTC
+            bar_open,
             None,
             None
         ))
@@ -165,9 +162,8 @@ async def _write_missing_pis_mw(position_uid: str, strategy_id: int, direction: 
             )
     return per_tf_found
 
-
 # 🔸 Проверить наличие всех 3 TF в PIS
-async def _three_present_in_pis(position_uid: str, created_at_utc: datetime):
+async def _three_present_in_pis(position_uid: str, created_at_utc: datetime) -> bool:
     pg = infra.pg_pool
     for tf in TF_ORDER:
         bar_open = _floor_to_bar_open(created_at_utc, tf)
@@ -187,7 +183,6 @@ async def _three_present_in_pis(position_uid: str, created_at_utc: datetime):
             return False
     return True
 
-
 # 🔸 Детерминированные ключи агрегатов
 def _ordered_agg_keys(strategy_id: int, direction: str, per_tf_codes: dict):
     per_tf_keys = []
@@ -199,7 +194,6 @@ def _ordered_agg_keys(strategy_id: int, direction: str, per_tf_codes: dict):
         triplet = f"{per_tf_codes['m5']}-{per_tf_codes['m15']}-{per_tf_codes['h1']}"
         comp_keys.append(("comp", (strategy_id, direction, triplet)))
     return per_tf_keys, comp_keys
-
 
 # 🔸 Агрегация под транзакционным claim'ом позиции (исключает конфликт с live)
 async def _aggregate_with_claim(pos, per_tf_codes: dict):
@@ -334,7 +328,6 @@ async def _aggregate_with_claim(pos, per_tf_codes: dict):
 
             return ("aggregated", updated_tf, updated_comp)
 
-
 # 🔸 Обработка одного UID
 async def _process_uid(uid: str):
     try:
@@ -345,8 +338,11 @@ async def _process_uid(uid: str):
         if v_code != "ok":
             return ("skip", v_reason)
 
-        created_at = pos["created_at"]
-        created_at_utc = created_at.astimezone(timezone.utc).replace(tzinfo=None) if created_at.tzinfo is not None else created_at
+        created_at = pos["created_at"]  # timestamp (naive UTC по схеме)
+        if created_at.tzinfo is not None:
+            created_at_utc = created_at.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            created_at_utc = created_at
 
         per_tf_now = await _write_missing_pis_mw(
             pos["position_uid"], pos["strategy_id"], pos["direction"], pos["symbol"], created_at_utc
@@ -361,10 +357,9 @@ async def _process_uid(uid: str):
             for tf in TF_ORDER
         }
 
-        agg_status = await _aggregate_with_claim(pos, per_tf_codes)
-        if agg_status and agg_status[0] == "aggregated":
+        agg_status, updated_tf, updated_comp = await _aggregate_with_claim(pos, per_tf_codes)
+        if agg_status == "aggregated":
             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            _, updated_tf, updated_comp = agg_status
             return ("aggregated", f"tf={updated_tf} comp={updated_comp} win={win_flag}")
         else:
             return ("claimed", "by_other")
@@ -373,7 +368,6 @@ async def _process_uid(uid: str):
         log.exception("❌ MW-BF uid=%s error: %s", uid, e)
         return ("error", "exception")
 
-
 # 🔸 Выборка пачки UID'ов
 async def _fetch_candidates(batch_size: int):
     pg = infra.pg_pool
@@ -381,8 +375,85 @@ async def _fetch_candidates(batch_size: int):
         rows = await conn.fetch(_CANDIDATES_SQL, batch_size)
     return [r["position_uid"] for r in rows]
 
-
 # 🔸 Подсчёт оставшихся (для периодических отчётов)
 async def _count_remaining():
     pg = infra.pg_pool
-    async
+    async with pg.acquire() as conn:
+        val = await conn.fetchval(_COUNT_SQL)
+    return int(val or 0)
+
+# 🔸 Основной цикл backfill'а
+async def run_oracle_mw_backfill():
+    if START_DELAY_SEC > 0:
+        log.info("⏳ MW-BF: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
+        await asyncio.sleep(START_DELAY_SEC)
+
+    gate = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    while True:
+        try:
+            log.info("🚀 MW-BF: старт прохода")
+            batch_idx = 0
+            total_agg = total_partial = total_skip = total_claim = total_err = 0
+
+            while True:
+                uids = await _fetch_candidates(BATCH_SIZE)
+                if not uids:
+                    break
+
+                batch_idx += 1
+                agg = partial = skip = claim = err = 0
+                results = []
+
+                async def worker(one_uid: str):
+                    async with gate:
+                        res = await _process_uid(one_uid)
+                        results.append(res)
+
+                await asyncio.gather(*[asyncio.create_task(worker(u)) for u in uids])
+
+                for status, _ in results:
+                    if status == "aggregated":
+                        agg += 1
+                    elif status == "pis_partial":
+                        partial += 1
+                    elif status == "claimed":
+                        claim += 1
+                    elif status == "skip":
+                        skip += 1
+                    else:
+                        err += 1
+
+                total_agg += agg
+                total_partial += partial
+                total_claim += claim
+                total_skip += skip
+                total_err += err
+
+                remaining = None
+                if batch_idx % 5 == 1:
+                    try:
+                        remaining = await _count_remaining()
+                    except Exception:
+                        remaining = None
+
+                if remaining is None:
+                    log.info("[MW-BF] batch=%d size=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d",
+                             batch_idx, len(uids), agg, partial, claim, skip, err)
+                else:
+                    log.info("[MW-BF] batch=%d size=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                             batch_idx, len(uids), agg, partial, claim, skip, err, remaining)
+
+                await asyncio.sleep(SHORT_SLEEP_MS / 1000)
+
+            log.info("✅ MW-BF: проход завершён batches=%d aggregated=%d partial=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+                     batch_idx, total_agg, total_partial, total_claim, total_skip, total_err, RECHECK_INTERVAL_SEC)
+
+            await asyncio.sleep(RECHECK_INTERVAL_SEC)
+
+        except asyncio.CancelledError:
+            log.info("⏹️ MW-BF остановлен")
+            raise
+        except Exception as e:
+            log.exception("❌ MW-BF loop error: %s", e)
+            await asyncio.sleep(1)
