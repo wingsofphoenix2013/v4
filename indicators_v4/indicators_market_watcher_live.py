@@ -307,7 +307,7 @@ async def _handle_symbol_tf_now(redis, symbol: str, tf: str, bar_open_ms: int, p
 # 🔸 Основной цикл воркера (раз в минуту по всем активным символам и TF)
 async def run_market_watcher_live(pg, redis, get_active_symbols, get_precision):
     log = logging.getLogger("MRW_LIVE")
-    log.info("market_watcher_live starting")
+    log.debug("market_watcher_live starting")
 
     # глобальные семафоры для контроля параллелизма
     task_gate = asyncio.Semaphore(MAX_CONCURRENCY)
