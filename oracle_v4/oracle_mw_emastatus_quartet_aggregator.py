@@ -1,22 +1,31 @@
-# 🔸 oracle_mw_emastatus_quartet_aggregator.py — MW×EMA(m5) квартеты: пока только поиск кандидатов и сводка в логах
+# 🔸 oracle_mw_emastatus_quartet_aggregator.py — MW×EMA(m5) квартеты: батчи + семафор, UPSERT агрегатов, Redis, флаги
 
 # 🔸 Импорты и базовая настройка
 import os
 import asyncio
 import logging
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 import infra
 
 log = logging.getLogger("ORACLE_MW_EMA_Q")
 
-# 🔸 Конфиг сканера/агрегатора (пока без записи)
-START_DELAY_SEC      = int(os.getenv("MW_EMA_Q_START_DELAY_SEC", "5"))
+# 🔸 Конфиг
+START_DELAY_SEC      = int(os.getenv("MW_EMA_Q_START_DELAY_SEC", "120"))
 RECHECK_INTERVAL_SEC = int(os.getenv("MW_EMA_Q_RECHECK_INTERVAL_SEC", "300"))
-LOG_TOP_STRATS       = int(os.getenv("MW_EMA_Q_LOG_TOP_STRATS", "0"))  # 0 = не логировать по стратегиям
+BATCH_SIZE           = int(os.getenv("MW_EMA_Q_BATCH_SIZE", "500"))
+MAX_CONCURRENCY      = int(os.getenv("MW_EMA_Q_MAX_CONCURRENCY", "12"))
 
-# 🔸 SQL-запросы
-_CANDIDATES_ANY_SQL = """
-SELECT 1
+# 🔸 Таймфреймы/инстансы
+TF_ORDER    = ("m5", "m15", "h1")
+TF_STEP_SEC = {"m5": 300, "m15": 900, "h1": 3600}
+MW_INST     = {"m5": 1001, "m15": 1002, "h1": 1003}
+EMA_LENS    = (9, 21, 50, 100, 200)
+
+# 🔸 SQL: кандидаты и остаток
+_CANDIDATES_SQL = """
+SELECT p.position_uid
 FROM positions_v4 p
 JOIN strategies_v4 s ON s.id = p.strategy_id
 WHERE p.status = 'closed'
@@ -25,192 +34,312 @@ WHERE p.status = 'closed'
   AND COALESCE(p.mw_emastatus_quartet_checked, false) = false
   AND s.enabled = true
   AND COALESCE(s.market_watcher, false) = true
-LIMIT 1
-"""
-
-_TOTAL_SQL = """
-WITH candidates AS (
-  SELECT p.position_uid
-  FROM positions_v4 p
-  JOIN strategies_v4 s ON s.id = p.strategy_id
-  WHERE p.status = 'closed'
-    AND COALESCE(p.mrk_watcher_checked, false) = true
-    AND COALESCE(p.emastatus_checked, false) = true
-    AND COALESCE(p.mw_emastatus_quartet_checked, false) = false
-    AND s.enabled = true
-    AND COALESCE(s.market_watcher, false) = true
-)
-SELECT COUNT(*)::bigint AS total_candidates
-FROM candidates
-"""
-
-_DIST_SQL = """
-WITH candidates AS (
-  SELECT p.position_uid
-  FROM positions_v4 p
-  JOIN strategies_v4 s ON s.id = p.strategy_id
-  WHERE p.status = 'closed'
-    AND COALESCE(p.mrk_watcher_checked, false) = true
-    AND COALESCE(p.emastatus_checked, false) = true
-    AND COALESCE(p.mw_emastatus_quartet_checked, false) = false
-    AND s.enabled = true
-    AND COALESCE(s.market_watcher, false) = true
-),
-per_pos_lens AS (
-  SELECT c.position_uid,
-         COUNT(*) AS lens_found
-  FROM candidates c
-  JOIN LATERAL (
-    SELECT DISTINCT ON (pis.param_name)
-           pis.param_name
-    FROM positions_indicators_stat pis
-    WHERE pis.position_uid = c.position_uid
-      AND pis.timeframe = 'm5'
-      AND pis.using_current_bar = true
-      AND pis.param_name IN ('ema9_status','ema21_status','ema50_status','ema100_status','ema200_status')
-    ORDER BY pis.param_name, pis.snapshot_at DESC
-  ) t ON TRUE
-  GROUP BY c.position_uid
-),
-all_pos AS (
-  SELECT c.position_uid, COALESCE(p.lens_found, 0) AS lens_found
-  FROM candidates c
-  LEFT JOIN per_pos_lens p USING (position_uid)
-),
-dist AS (
-  SELECT lens_found, COUNT(*) AS cnt
-  FROM all_pos
-  GROUP BY lens_found
-)
-SELECT lens_found, cnt, (SELECT COUNT(*) FROM all_pos) AS total
-FROM dist
-ORDER BY lens_found
-"""
-
-_PER_STRATEGY_SQL = """
-WITH candidates AS (
-  SELECT p.position_uid, p.strategy_id
-  FROM positions_v4 p
-  JOIN strategies_v4 s ON s.id = p.strategy_id
-  WHERE p.status = 'closed'
-    AND COALESCE(p.mrk_watcher_checked, false) = true
-    AND COALESCE(p.emastatus_checked, false) = true
-    AND COALESCE(p.mw_emastatus_quartet_checked, false) = false
-    AND s.enabled = true
-    AND COALESCE(s.market_watcher, false) = true
-),
-per_pos_lens AS (
-  SELECT c.position_uid,
-         c.strategy_id,
-         COUNT(*) AS lens_found
-  FROM candidates c
-  JOIN LATERAL (
-    SELECT DISTINCT ON (pis.param_name) pis.param_name
-    FROM positions_indicators_stat pis
-    WHERE pis.position_uid = c.position_uid
-      AND pis.timeframe = 'm5'
-      AND pis.using_current_bar = true
-      AND pis.param_name IN ('ema9_status','ema21_status','ema50_status','ema100_status','ema200_status')
-    ORDER BY pis.param_name, pis.snapshot_at DESC
-  ) t ON TRUE
-  GROUP BY c.position_uid, c.strategy_id
-),
-all_pos AS (
-  SELECT c.position_uid, c.strategy_id, COALESCE(p.lens_found, 0) AS lens_found
-  FROM candidates c
-  LEFT JOIN per_pos_lens p USING (position_uid, strategy_id)
-),
-sum_by_strat AS (
-  SELECT strategy_id,
-         SUM(CASE WHEN lens_found = 5 THEN 1 ELSE 0 END) AS full_5,
-         SUM(CASE WHEN lens_found BETWEEN 1 AND 4 THEN 1 ELSE 0 END) AS partial_1_4,
-         SUM(CASE WHEN lens_found = 0 THEN 1 ELSE 0 END) AS empty_0,
-         COUNT(*) AS total
-  FROM all_pos
-  GROUP BY strategy_id
-)
-SELECT strategy_id, full_5, partial_1_4, empty_0, total
-FROM sum_by_strat
-ORDER BY total DESC
+ORDER BY p.closed_at NULLS LAST, p.id
 LIMIT $1
 """
 
-# 🔸 Утилиты (поиск и логгирование сводки)
-async def _any_candidates() -> bool:
+_COUNT_SQL = """
+SELECT COUNT(*)
+FROM positions_v4 p
+JOIN strategies_v4 s ON s.id = p.strategy_id
+WHERE p.status = 'closed'
+  AND COALESCE(p.mrk_watcher_checked, false) = true
+  AND COALESCE(p.emastatus_checked, false) = true
+  AND COALESCE(p.mw_emastatus_quartet_checked, false) = false
+  AND s.enabled = true
+  AND COALESCE(s.market_watcher, false) = true
+"""
+
+# 🔸 Утилита: floor к началу бара TF (UTC, NAIVE)
+def _floor_to_bar_open(dt_utc: datetime, tf: str) -> datetime:
+    if dt_utc.tzinfo is not None:
+        dt_utc = dt_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    step_sec = TF_STEP_SEC[tf]
+    epoch = int(dt_utc.timestamp())
+    floored = (epoch // step_sec) * step_sec
+    return datetime.utcfromtimestamp(floored)  # naive UTC
+
+# 🔸 Позиция (базовая загрузка)
+async def _load_pos(position_uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
-        row = await conn.fetchrow(_CANDIDATES_ANY_SQL)
-    return row is not None
+        return await conn.fetchrow(
+            """
+            SELECT p.id, p.position_uid, p.symbol, p.direction, p.strategy_id,
+                   p.pnl, p.status, p.created_at,
+                   p.mrk_watcher_checked, p.emastatus_checked, p.mw_emastatus_quartet_checked
+            FROM positions_v4 p
+            WHERE p.position_uid = $1
+            """,
+            position_uid,
+        )
 
-async def _log_summary():
+# 🔸 MW-код из PIS (на баре открытия)
+async def _load_mw_code_from_pis(uid: str, tf: str, bar_open: datetime):
     pg = infra.pg_pool
-
-    # общий счётчик
+    inst = MW_INST[tf]
     async with pg.acquire() as conn:
-        total_row = await conn.fetchrow(_TOTAL_SQL)
-    total = int(total_row["total_candidates"] or 0)
+        code = await conn.fetchval(
+            """
+            SELECT value_num
+            FROM positions_indicators_stat
+            WHERE position_uid=$1 AND timeframe=$2
+              AND instance_id=$3 AND param_name='mw'
+              AND bar_open_time=$4
+              AND using_current_bar=false AND is_final=true
+            """,
+            uid, tf, int(inst), bar_open
+        )
+    return None if code is None else int(code)
 
-    if total == 0:
-        log.info("[MW×EMA-Q] кандидатов нет (total=0)")
-        return
-
-    # распределение по числу найденных EMA-длин (0..5)
+# 🔸 EMA-status(m5) по доступным длинам (последние значения per param)
+async def _load_ema_statuses_m5(uid: str):
+    pg = infra.pg_pool
+    pname_list = [f"ema{n}_status" for n in EMA_LENS]
     async with pg.acquire() as conn:
-        dist_rows = await conn.fetch(_DIST_SQL)
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (param_name) param_name, value_num
+            FROM positions_indicators_stat
+            WHERE position_uid=$1
+              AND timeframe='m5'
+              AND using_current_bar=true
+              AND param_name = ANY($2::text[])
+            ORDER BY param_name, snapshot_at DESC
+            """,
+            uid, pname_list
+        )
+    result = {}
+    for r in rows:
+        pname = r["param_name"]; val = r["value_num"]
+        if val is None:
+            continue
+        try:
+            ema_len = int(pname.replace("ema", "").replace("_status", ""))
+            result[ema_len] = int(val)  # 0..4
+        except Exception:
+            continue
+    return result  # {ema_len: status_code}
 
-    # подготовка компактного вывода 0..5
-    total_from_dist = int(dist_rows[0]["total"]) if dist_rows else 0
-    pct_parts = []
-    cnt_parts = []
-    for k in range(0, 6):
-        cnt = next((int(r["cnt"]) for r in dist_rows if int(r["lens_found"]) == k), 0)
-        pct = (100.0 * cnt / total_from_dist) if total_from_dist else 0.0
-        pct_parts.append(f"{k}=>{pct:.2f}%")
-        cnt_parts.append(f"{k}=>{cnt}")
+# 🔸 Построить компоненты квартета: MW-триплет + EMA(m5) статусы
+async def _build_quartet_components(pos) -> tuple[str | None, dict[int, int]]:
+    created_at = pos["created_at"]
+    created_at_utc = created_at.astimezone(timezone.utc).replace(tzinfo=None) if created_at and created_at.tzinfo is not None else created_at
 
-    log.info("[MW×EMA-Q] candidates=%d", total)
-    log.info("[MW×EMA-Q] lens_found distribution (pct): %s", " ".join(pct_parts))
-    log.info("[MW×EMA-Q] lens_found distribution (cnt): %s", " ".join(cnt_parts))
+    mw_codes = {}
+    if created_at_utc:
+        for tf in TF_ORDER:
+            code = await _load_mw_code_from_pis(pos["position_uid"], tf, _floor_to_bar_open(created_at_utc, tf))
+            if code is not None:
+                mw_codes[tf] = int(code)
+    mw_triplet = f"{mw_codes['m5']}-{mw_codes['m15']}-{mw_codes['h1']}" if all(tf in mw_codes for tf in TF_ORDER) else None
 
-    # по стратегиям — опционально топ-N
-    if LOG_TOP_STRATS > 0:
-        async with pg.acquire() as conn:
-            srows = await conn.fetch(_PER_STRATEGY_SQL, int(LOG_TOP_STRATS))
-        for r in srows:
-            # формат строки по стратегии
-            sid = int(r["strategy_id"])
-            full5 = int(r["full_5"]); part = int(r["partial_1_4"]); empty = int(r["empty_0"]); tot = int(r["total"])
-            p_full = (100.0 * full5 / tot) if tot else 0.0
-            p_part = (100.0 * part / tot) if tot else 0.0
-            p_empty = (100.0 * empty / tot) if tot else 0.0
-            log.info(
-                "[MW×EMA-Q] strat=%s total=%d full5=%d(%.2f%%) partial=%d(%.2f%%) empty=%d(%.2f%%)",
-                sid, tot, full5, p_full, part, p_part, empty, p_empty
+    ema_statuses_m5 = await _load_ema_statuses_m5(pos["position_uid"])  # {ema_len: 0..4}
+    return mw_triplet, ema_statuses_m5
+
+# 🔸 UPSERT квартетов под claim позиции, публикация Redis, флаг
+async def _upsert_quartets_with_claim(pos, mw_triplet: str, ema_statuses_m5: dict[int, int]):
+    pg = infra.pg_pool
+    redis = infra.redis_client
+
+    strategy_id = int(pos["strategy_id"])
+    direction   = str(pos["direction"])
+    pnl_raw     = pos["pnl"]
+    pnl         = Decimal(str(pnl_raw if pnl_raw is not None else "0")).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    is_win      = 1 if pnl > Decimal("0") else 0
+
+    # детерминированный порядок EMA-длин
+    ema_items = [(k, ema_statuses_m5[k]) for k in sorted(ema_statuses_m5.keys())]
+
+    async with pg.acquire() as conn:
+        async with conn.transaction():
+            # claim позиции
+            claimed = await conn.fetchrow(
+                """
+                UPDATE positions_v4
+                SET mw_emastatus_quartet_checked = true
+                WHERE position_uid = $1
+                  AND status = 'closed'
+                  AND COALESCE(mw_emastatus_quartet_checked, false) = false
+                RETURNING position_uid
+                """,
+                pos["position_uid"]
             )
+            if not claimed:
+                return ("claimed_by_other", 0)
 
-# 🔸 Основной цикл (пока только поиск и лог-сводка)
+            total_updates = 0
+
+            # вставка-обновление агрегатов по каждой длине
+            for ema_len, status_code in ema_items:
+                # предсоздание
+                await conn.execute(
+                    """
+                    INSERT INTO positions_mw_emastatus_stat_quartet
+                      (strategy_id, direction, mw_triplet, ema_len, status_code,
+                       closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
+                    VALUES ($1,$2,$3,$4,$5, 0,0,0,0,0,NOW())
+                    ON CONFLICT (strategy_id, direction, mw_triplet, ema_len, status_code) DO NOTHING
+                    """,
+                    strategy_id, direction, mw_triplet, int(ema_len), int(status_code)
+                )
+
+                # FOR UPDATE → пересчёт
+                row = await conn.fetchrow(
+                    """
+                    SELECT closed_trades, won_trades, pnl_sum
+                    FROM positions_mw_emastatus_stat_quartet
+                    WHERE strategy_id=$1 AND direction=$2 AND mw_triplet=$3 AND ema_len=$4 AND status_code=$5
+                    FOR UPDATE
+                    """,
+                    strategy_id, direction, mw_triplet, int(ema_len), int(status_code)
+                )
+                c0 = int(row["closed_trades"]); w0 = int(row["won_trades"]); s0 = Decimal(str(row["pnl_sum"]))
+                c = c0 + 1
+                w = w0 + is_win
+                s = (s0 + pnl).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                wr = (Decimal(w) / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                ap = (s / Decimal(c)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+                await conn.execute(
+                    """
+                    UPDATE positions_mw_emastatus_stat_quartet
+                    SET closed_trades=$6, won_trades=$7, pnl_sum=$8, winrate=$9, avg_pnl=$10, updated_at=NOW()
+                    WHERE strategy_id=$1 AND direction=$2 AND mw_triplet=$3 AND ema_len=$4 AND status_code=$5
+                    """,
+                    strategy_id, direction, mw_triplet, int(ema_len), int(status_code),
+                    c, w, str(s), str(wr), str(ap)
+                )
+
+                # публикация Redis (best-effort)
+                try:
+                    await redis.set(
+                        f"oracle:mw_ema:quartet:{strategy_id}:{direction}:mw:{mw_triplet}:ema{int(ema_len)}:{int(status_code)}",
+                        f'{{"closed_trades": {c}, "winrate": {float(wr):.4f}}}'
+                    )
+                except Exception:
+                    log.debug("Redis SET failed (quartet ema_len=%s)", ema_len)
+
+                total_updates += 1
+
+            return ("updated", total_updates)
+
+# 🔸 Обработка одной позиции
+async def _process_uid(uid: str):
+    try:
+        pos = await _load_pos(uid)
+        if not pos or pos["status"] != "closed":
+            return ("skip", "not_applicable")
+        if not (pos["mrk_watcher_checked"] and pos["emastatus_checked"]) or pos["mw_emastatus_quartet_checked"]:
+            return ("skip", "flags")
+
+        mw_triplet, ema_statuses_m5 = await _build_quartet_components(pos)
+
+        # если EMA нет вовсе — только флаг (с claim), ничего не пишем в квартеты
+        if not ema_statuses_m5:
+            pg = infra.pg_pool
+            async with pg.acquire() as conn:
+                async with conn.transaction():
+                    claimed = await conn.fetchrow(
+                        """
+                        UPDATE positions_v4
+                        SET mw_emastatus_quartet_checked = true
+                        WHERE position_uid = $1
+                          AND status = 'closed'
+                          AND COALESCE(mw_emastatus_quartet_checked, false) = false
+                        RETURNING position_uid
+                        """,
+                        uid
+                    )
+            return ("empty_zero", 1 if claimed else 0)
+
+        # если нет MW-триплета — отложим
+        if not mw_triplet:
+            return ("partial", "mw_triplet_missing")
+
+        # нормальный путь: claim + upserts
+        status, n = await _upsert_quartets_with_claim(pos, mw_triplet, ema_statuses_m5)
+        if status == "updated":
+            return ("updated", n)
+        else:
+            return ("claimed", "by_other")
+    except Exception as e:
+        log.exception("❌ MW×EMA-Q uid=%s error: %s", uid, e)
+        return ("error", "exception")
+
+# 🔸 Пакет кандидатов / остаток
+async def _fetch_candidates(n: int):
+    pg = infra.pg_pool
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(_CANDIDATES_SQL, n)
+    return [r["position_uid"] for r in rows]
+
+async def _count_remaining():
+    pg = infra.pg_pool
+    async with pg.acquire() as conn:
+        val = await conn.fetchval(_COUNT_SQL)
+    return int(val or 0)
+
+# 🔸 Основной цикл
 async def run_oracle_mw_emastatus_quartet_aggregator():
-    # задержка старта (как у других воркеров)
     if START_DELAY_SEC > 0:
-        log.debug("⏳ MW×EMA-Q: задержка старта %d сек", START_DELAY_SEC)
+        log.debug("⏳ MW×EMA-Q: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
         await asyncio.sleep(START_DELAY_SEC)
 
-    log.debug("🚀 MW×EMA-Q: старт цикла (режим: поиск и сводка, без записи)")
+    gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
     while True:
         try:
-            # условия достаточности
-            any_cand = await _any_candidates()
-            if not any_cand:
-                log.info("[MW×EMA-Q] кандидатов нет → следующая проверка через %ds", RECHECK_INTERVAL_SEC)
-                await asyncio.sleep(RECHECK_INTERVAL_SEC)
-                continue
+            log.debug("🚀 MW×EMA-Q: старт прохода")
+            batch_idx = 0
+            tot_upd = tot_part = tot_skip = tot_claim = tot_err = 0
+            tot_empty = 0
 
-            # разовая сводка по актуальному набору кандидатов
-            await _log_summary()
+            while True:
+                uids = await _fetch_candidates(BATCH_SIZE)
+                if not uids:
+                    break
 
-            # ожидание до следующего прохода
-            log.debug("✅ MW×EMA-Q: сводка готова — следующий запуск через %ds", RECHECK_INTERVAL_SEC)
+                batch_idx += 1
+                upd = part = skip = claim = err = empty = 0
+                results = []
+
+                async def worker(one_uid: str):
+                    async with gate:
+                        res = await _process_uid(one_uid)
+                        results.append(res)
+
+                await asyncio.gather(*[asyncio.create_task(worker(u)) for u in uids])
+
+                for status, _ in results:
+                    if status == "updated":   upd += 1
+                    elif status == "partial": part += 1
+                    elif status == "claimed": claim += 1
+                    elif status == "skip":    skip += 1
+                    elif status == "empty_zero": empty += 1
+                    else:                     err  += 1
+
+                tot_upd += upd; tot_part += part; tot_claim += claim; tot_skip += skip; tot_err += err; tot_empty += empty
+
+                remaining = None
+                if batch_idx % 5 == 1:
+                    try:
+                        remaining = await _count_remaining()
+                    except Exception:
+                        remaining = None
+
+                # лог по батчу (INFO)
+                if remaining is None:
+                    log.info("[MW×EMA-Q] batch=%d size=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d",
+                             batch_idx, len(uids), upd, part, empty, claim, skip, err)
+                else:
+                    log.info("[MW×EMA-Q] batch=%d size=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                             batch_idx, len(uids), upd, part, empty, claim, skip, err, remaining)
+
+            # итог по проходу (INFO)
+            log.info("✅ [MW×EMA-Q] pass done: batches=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d — next in %ds",
+                     batch_idx, tot_upd, tot_part, tot_empty, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
+
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
 
         except asyncio.CancelledError:
