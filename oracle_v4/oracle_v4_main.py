@@ -33,7 +33,6 @@ from oracle_mw_adx_quartet_aggregator import run_oracle_mw_adx_quartet_aggregato
 from oracle_mw_bb_quartet_aggregator import run_oracle_mw_bb_quartet_aggregator
 from oracle_mw_dmigap_quartet_aggregator import run_oracle_mw_dmigap_quartet_aggregator
 from oracle_mw_emastatus_quartet_aggregator import run_oracle_mw_emastatus_quartet_aggregator
-from oracle_mw_emapattern_quartet_aggregator import run_oracle_mw_emapattern_quartet_aggregator
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -115,8 +114,7 @@ async def main():
         run_safe_loop(run_oracle_mw_adx_quartet_aggregator, "MW_ADX_Q"),
         run_safe_loop(run_oracle_mw_bb_quartet_aggregator, "MW_BB_Q"),
         run_safe_loop(run_oracle_mw_dmigap_quartet_aggregator, "MW_DMIGAP_Q"),
-        run_safe_loop(run_oracle_mw_emastatus_quartet_aggregator, "MW_EMASTATUS_Q"),
-        run_safe_loop(run_oracle_mw_emapattern_quartet_aggregator, "MW_EMAPATTERN_Q"),
+        run_safe_loop(run_oracle_mw_emastatus_quartet_aggregator, "MW_EMA_Q"),
     )
 
 if __name__ == "__main__":
