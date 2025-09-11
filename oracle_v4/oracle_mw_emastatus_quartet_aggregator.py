@@ -330,14 +330,14 @@ async def run_oracle_mw_emastatus_quartet_aggregator():
 
                 # лог по батчу (INFO)
                 if remaining is None:
-                    log.info("[MW×EMA-Q] batch=%d size=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[MW×EMA-Q] batch=%d size=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), upd, part, empty, claim, skip, err)
                 else:
-                    log.info("[MW×EMA-Q] batch=%d size=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[MW×EMA-Q] batch=%d size=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), upd, part, empty, claim, skip, err, remaining)
 
             # итог по проходу (INFO)
-            log.info("✅ [MW×EMA-Q] pass done: batches=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d — next in %ds",
+            log.debug("✅ [MW×EMA-Q] pass done: batches=%d updated=%d partial=%d empty_zero=%d claimed=%d skipped=%d errors=%d — next in %ds",
                      batch_idx, tot_upd, tot_part, tot_empty, tot_claim, tot_skip, tot_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)

@@ -1,5 +1,6 @@
-# 🔸 oracle_mw_backfill.py — MarketWatcher backfill: дописываем PIS (mw) на баре открытия, агрегируем при полном комплекте; транзакционный claim против конфликтов с live
+# 🔸 oracle_mw_backfill.py — MarketWatcher backfill: дописываем PIS (mw) на баре открытия, агрегируем при полном комплекте; транзакционный claim + advisory-lock против конфликтов
 
+# 🔸 Импорты и базовая настройка
 import os
 import asyncio
 import logging
@@ -33,6 +34,7 @@ MW_CODE2STR = {
     8: "TREND_DN_DECEL",
 }
 
+# 🔸 SQL-кандидаты
 _CANDIDATES_SQL = """
 SELECT p.position_uid
 FROM positions_v4 p
@@ -46,6 +48,7 @@ ORDER BY p.closed_at NULLS LAST, p.id
 LIMIT $1
 """
 
+# 🔸 SQL-подсчёт остатка
 _COUNT_SQL = """
 SELECT COUNT(*)
 FROM positions_v4 p
@@ -195,7 +198,15 @@ def _ordered_agg_keys(strategy_id: int, direction: str, per_tf_codes: dict):
         comp_keys.append(("comp", (strategy_id, direction, triplet)))
     return per_tf_keys, comp_keys
 
-# 🔸 Агрегация под транзакционным claim'ом позиции (исключает конфликт с live)
+# 🔸 Advisory-lock по агрегатному ключу (в рамках текущей транзакции)
+async def _advisory_xact_lock(conn, class_id: int, key_text: str):
+    # используем детерминированный hashtext(text) → int4; двухкомпонентный ключ (class_id, hash)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1::int4, hashtext($2)::int4)",
+        int(class_id), key_text
+    )
+
+# 🔸 Агрегация под транзакционным claim'ом позиции (advisory-lock на каждый агрегатный ключ)
 async def _aggregate_with_claim(pos, per_tf_codes: dict):
     pg = infra.pg_pool
     redis = infra.redis_client
@@ -210,6 +221,7 @@ async def _aggregate_with_claim(pos, per_tf_codes: dict):
 
     async with pg.acquire() as conn:
         async with conn.transaction():
+            # claim позиции против гонок с live/другими backfill
             claimed = await conn.fetchrow(
                 """
                 UPDATE positions_v4
@@ -225,8 +237,10 @@ async def _aggregate_with_claim(pos, per_tf_codes: dict):
             if not claimed:
                 return ("claimed_by_other", 0, 0)
 
+            # предсоздание строк (DO NOTHING) — в фиксированном порядке
             for _, key in per_tf_keys:
                 s_id, dir_, tf, code = key
+                await _advisory_xact_lock(conn, 1, f"{s_id}:{dir_}:{tf}:{code}")  # класс 1 → per-TF
                 await conn.execute(
                     """
                     INSERT INTO positions_mw_stat_tf
@@ -239,6 +253,7 @@ async def _aggregate_with_claim(pos, per_tf_codes: dict):
                 )
             for _, key in comp_keys:
                 s_id, dir_, triplet = key
+                await _advisory_xact_lock(conn, 2, f"{s_id}:{dir_}:{triplet}")   # класс 2 → comp
                 await conn.execute(
                     """
                     INSERT INTO positions_mw_stat_comp
@@ -250,9 +265,11 @@ async def _aggregate_with_claim(pos, per_tf_codes: dict):
                     s_id, dir_, triplet
                 )
 
+            # апдейты (в том же порядке) с FOR UPDATE
             updated_tf = 0
             for _, key in per_tf_keys:
                 s_id, dir_, tf, code = key
+                # лок уже взят выше на этот же ключ
                 row = await conn.fetchrow(
                     """
                     SELECT closed_trades, won_trades, pnl_sum
@@ -291,6 +308,7 @@ async def _aggregate_with_claim(pos, per_tf_codes: dict):
             updated_comp = 0
             for _, key in comp_keys:
                 s_id, dir_, triplet = key
+                # лок уже взят выше на этот же ключ
                 row = await conn.fetchrow(
                     """
                     SELECT closed_trades, won_trades, pnl_sum
