@@ -1,11 +1,15 @@
-# bb_feed_auditor.py — аудит БД на целостность баров (bb_*), фиксация пропусков за 12 часов с отсечкой по created_at
+# bb_feed_auditor.py — аудит БД на целостность баров (bb_*): окно N часов, но не глубже activated_at
 
 # 🔸 Импорты и зависимости
+import os
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger("BB_FEED_AUDITOR")
+
+# 🔸 Параметры окна аудита
+WINDOW_HOURS = int(os.getenv("BB_AUDIT_WINDOW_HOURS", "12"))
 
 # 🔸 Соответствие интервалов таблицам и шагам
 TABLE_MAP = {
@@ -24,33 +28,37 @@ def align_start(ts, step_min):
         ts = ts - timedelta(minutes=rem)
     return ts
 
-# 🔸 Аудит за 12 часов по одному символу/интервалу с отсечкой по created_at
-async def audit_db_12h_bb(pg_pool, symbol, interval, end_ts):
+# 🔸 Аудит окна по одному символу/интервалу с отсечкой по activated_at
+async def audit_window_bb(pg_pool, symbol, interval, end_ts):
     table = TABLE_MAP.get(interval)
     if not table:
         return 0
 
     step_min = STEP_MIN[interval]
-    start_ts = align_start(end_ts - timedelta(hours=12), step_min)
-    end_ts = align_start(end_ts, step_min)
     step_delta = timedelta(minutes=step_min)
 
+    # базовое окно: end_ts - WINDOW_HOURS .. end_ts
+    start_ts = align_start(end_ts - timedelta(hours=WINDOW_HOURS), step_min)
+    end_ts_aligned = align_start(end_ts, step_min)
+
+    # срез «не глубже, чем activated_at»
     async with pg_pool.connection() as conn:
         async with conn.cursor() as cur:
-            # created_at для отсечки «не бежим назад»
-            await cur.execute("SELECT created_at FROM tickers_bb WHERE symbol = %s", (symbol,))
+            await cur.execute("SELECT activated_at FROM tickers_bb WHERE symbol = %s", (symbol,))
             row = await cur.fetchone()
-            created_at = row[0] if row else None
-            if created_at:
-                created_at = align_start(created_at, step_min)
-                if created_at > start_ts:
-                    start_ts = created_at
+    activated_at = row[0] if row else None
+    if activated_at:
+        a = align_start(activated_at, step_min)
+        if a > start_ts:
+            start_ts = a
 
-            # если отсечка обгоняет конец — аудита нет
-            if start_ts > end_ts:
-                return 0
+    # если окно схлопнулось — ничего не делаем
+    if start_ts > end_ts_aligned:
+        return 0
 
-            # генерируем сетку и ищем пропуски
+    # генерируем сетку ожидаемых open_time и ищем пропуски
+    async with pg_pool.connection() as conn:
+        async with conn.cursor() as cur:
             await cur.execute(
                 f"""
                 WITH gs AS (
@@ -62,13 +70,12 @@ async def audit_db_12h_bb(pg_pool, symbol, interval, end_ts):
                   ON t.symbol = %s AND t.open_time = gs.open_time
                 WHERE t.open_time IS NULL
                 """,
-                (start_ts, end_ts, step_delta, symbol)
+                (start_ts, end_ts_aligned, step_delta, symbol),
             )
-            missing_rows = await cur.fetchall()
-            missing = [r[0] for r in missing_rows] if missing_rows else []
+            rows = await cur.fetchall()
+            missing = [r[0] for r in rows] if rows else []
 
             if missing:
-                # вставляем found (игнорим конфликты)
                 vals = [(symbol, interval, ts) for ts in missing]
                 await cur.executemany(
                     """
@@ -76,7 +83,7 @@ async def audit_db_12h_bb(pg_pool, symbol, interval, end_ts):
                     VALUES (%s, %s, %s, 'found')
                     ON CONFLICT (symbol, interval, open_time) DO NOTHING
                     """,
-                    vals
+                    vals,
                 )
 
     return len(missing)
@@ -92,7 +99,7 @@ async def run_feed_auditor_bb(pg_pool, redis):
         pass
 
     consumer = "bb_auditor"
-    log.debug("BB_FEED_AUDITOR запущен: аудит 12ч по событиям вставки в PG (с отсечкой created_at)")
+    log.info(f"BB_FEED_AUDITOR запущен: аудит {WINDOW_HOURS}ч с отсечкой по activated_at")
 
     while True:
         try:
@@ -113,10 +120,8 @@ async def run_feed_auditor_bb(pg_pool, redis):
                             continue
 
                         end_ts = datetime.utcfromtimestamp(int(ts_ms) / 1000).replace(tzinfo=timezone.utc)
-                        log.debug(f"BB_AUDIT: {symbol} [{interval}] @ {end_ts.isoformat()}")
-
-                        missing_count = await audit_db_12h_bb(pg_pool, symbol, interval, end_ts)
-                        log.debug(f"BB_AUDIT done: {symbol} [{interval}] — пропусков {missing_count}")
+                        missing_count = await audit_window_bb(pg_pool, symbol, interval, end_ts)
+                        log.debug(f"AUDIT {symbol} [{interval}] @ {end_ts.isoformat()} → missing={missing_count}")
 
                     except Exception as e:
                         log.warning(f"BB_AUDIT ошибка {symbol}/{interval}/{ts_ms}: {e}", exc_info=True)
