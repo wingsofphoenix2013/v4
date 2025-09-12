@@ -1,4 +1,4 @@
-# bb_feed_healer.py — лечение пропусков (Bybit): читаем ohlcv_bb_gap, тянем REST klines и вставляем в PG
+# bb_feed_healer.py — лечение пропусков (Bybit): читаем ohlcv_bb_gap, тянем REST klines (≤2 req/s) и вставляем в PG
 
 # 🔸 Импорты и зависимости
 import os
@@ -17,8 +17,14 @@ CATEGORY = "linear"
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 TABLE_MAP = {"m5": "ohlcv_bb_m5", "m15": "ohlcv_bb_m15", "h1": "ohlcv_bb_h1"}
 STEP_MS = {"m5": 5 * 60 * 1000, "m15": 15 * 60 * 1000, "h1": 60 * 60 * 1000}
-REST_TIMEOUT = int(os.getenv("BB_HTTP_TIMEOUT_SEC", "15"))
+
+REST_TIMEOUT = float(os.getenv("BB_HTTP_TIMEOUT_SEC", "15"))
 BATCH_LIMIT = int(os.getenv("BB_HEALER_LIMIT", "20"))  # сколько (symbol, interval) обрабатываем за проход
+
+# 🔸 Ограничения и повторы REST
+GLOBAL_MIN_INTERVAL_SEC = float(os.getenv("BB_HEALER_MIN_INTERVAL_SEC", "0.5"))  # 0.5s → 2 req/s глобально
+RETRY_MAX_TRIES = int(os.getenv("BB_HEALER_RETRY_TRIES", "5"))
+RETRY_BASE_DELAY = float(os.getenv("BB_HEALER_RETRY_BASE", "0.5"))               # 0.5 → 1 → 2 → 4 → 8
 
 # 🔸 Служебные утилиты (без эмоджи)
 def group_missing_into_ranges(times, step_min: int):
@@ -37,8 +43,58 @@ def group_missing_into_ranges(times, step_min: int):
     ranges.append((start, prev))
     return ranges
 
+# 🔸 Глобальный троттлер запросов (≤2 req/s на весь воркер)
+class _RateLimiter:
+    def __init__(self, min_interval_sec: float):
+        self.min_interval = min_interval_sec
+        self._last = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait = self.min_interval - (now - self._last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = asyncio.get_event_loop().time()
+
+_rate_limiter = _RateLimiter(GLOBAL_MIN_INTERVAL_SEC)
+
+# 🔸 Обёртка для GET с троттлингом и ретраями
+async def throttled_get_json(session: aiohttp.ClientSession, url: str, *, params: dict):
+    await _RateLimiter.wait(_rate_limiter)  # глобальный лимит
+    delay = RETRY_BASE_DELAY
+    for attempt in range(1, RETRY_MAX_TRIES + 1):
+        try:
+            async with session.get(url, params=params, timeout=REST_TIMEOUT) as resp:
+                # уважить Retry-After при 429/5xx
+                if resp.status in (429, 500, 502, 503, 504):
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        try:
+                            ra_wait = float(ra)
+                            log.warning(f"REST {resp.status} retry-after={ra_wait}s ({url})")
+                            await asyncio.sleep(ra_wait)
+                        except Exception:
+                            pass
+                    else:
+                        log.warning(f"REST {resp.status} backoff={delay}s ({url})")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 8.0)
+                    continue
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            if attempt >= RETRY_MAX_TRIES:
+                raise
+            log.warning(f"REST error attempt={attempt}: {e} → backoff={delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    # сюда не дойдём
+    return None
+
+# 🔸 REST /v5/market/kline (через троттлинг/ретраи)
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, start_ms: int, end_ms: int):
-    """REST Bybit v5 /market/kline — возвращает список списков (open_ts, o,h,l,c,v,turnover, ...)"""
     url = f"{BYBIT_REST_BASE}/v5/market/kline"
     params = {
         "category": CATEGORY,
@@ -48,12 +104,10 @@ async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: st
         "end": end_ms,
         "limit": 1000,
     }
-    async with session.get(url, params=params, timeout=REST_TIMEOUT) as resp:
-        resp.raise_for_status()
-        js = await resp.json()
-        if js.get("retCode") != 0:
-            raise RuntimeError(f"Bybit error {js.get('retCode')}: {js.get('retMsg')}")
-        return (js.get("result") or {}).get("list") or []
+    js = await throttled_get_json(session, url, params=params)
+    if js is None or js.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error {js.get('retCode')}: {js.get('retMsg')}")
+    return (js.get("result") or {}).get("list") or []
 
 # 🔸 Обновления статусов в gap (через UPDATE ... ANY())
 async def mark_gaps_healed_db(conn, symbol: str, interval: str, times):
@@ -166,12 +220,13 @@ async def heal_range(pg_pool, session: aiohttp.ClientSession, symbol: str, inter
             await mark_gaps_error(conn, symbol, interval, missing, "partial heal")
             log.warning(f"[{symbol}] [{interval}] not healed {len(missing)}")
 
-# 🔸 Основной воркер хилера
+# 🔸 Основной воркер хилера (последовательная обработка; ≤2 req/s глобально)
 async def run_feed_healer_bb(pg_pool, redis):
-    log.info("BB_FEED_HEALER запущен (реально)")
+    log.info("BB_FEED_HEALER запущен (реально, ≤2 req/s)")
 
+    connector = aiohttp.TCPConnector(limit_per_host=4)
     http_timeout = aiohttp.ClientTimeout(total=REST_TIMEOUT + 5)
-    async with aiohttp.ClientSession(timeout=http_timeout) as session:
+    async with aiohttp.ClientSession(timeout=http_timeout, connector=connector) as session:
         while True:
             try:
                 # берём пачку «дыр» сгруппированных по (symbol, interval)
