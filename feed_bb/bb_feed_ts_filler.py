@@ -1,6 +1,7 @@
-# bb_feed_ts_filler.py — дозаполнение Redis TS из ohlcv_bb_* для точек healed_db → healed_ts
+# bb_feed_ts_filler.py — дозаполнение Redis TS из ohlcv_bb_* для точек healed_db → healed_ts (параллелизация по (symbol, interval))
 
 # 🔸 Импорты и зависимости
+import os
 import asyncio
 import logging
 from decimal import Decimal, ROUND_DOWN
@@ -10,6 +11,7 @@ log = logging.getLogger("BB_TS_FILLER")
 
 TABLE_MAP = {"m5": "ohlcv_bb_m5", "m15": "ohlcv_bb_m15", "h1": "ohlcv_bb_h1"}
 TS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000  # ~60 дней
+PAIR_CONCURRENCY = int(os.getenv("BB_TS_FILLER_CONCURRENCY", "5"))  # параллельных пар (symbol, interval)
 
 # 🔸 безопасная запись одной точки в TS (создать ключ при отсутствии)
 async def ts_safe_add(redis, key, ts_ms, value, labels):
@@ -122,13 +124,22 @@ async def process_symbol_interval(pg_pool, redis, symbol, interval, times):
         await mark_gaps_healed_ts(conn, symbol, interval, times)
     log.debug(f"[{symbol}] [{interval}] TS заполнен для {len(times)} точек")
 
-# 🔸 основной воркер
+# 🔸 основной воркер (параллелизация по парам через семафор)
 async def run_feed_ts_filler_bb(pg_pool, redis):
-    log.debug("BB_TS_FILLER запущен (реально)")
+    log.info(f"BB_TS_FILLER запущен (real, concurrency={PAIR_CONCURRENCY})")
+    sem = asyncio.Semaphore(PAIR_CONCURRENCY)
+
+    async def run_one(sym, iv, times):
+        async with sem:
+            try:
+                await process_symbol_interval(pg_pool, redis, sym, iv, times)
+            except Exception as e:
+                log.warning(f"TS_FILLER pair err {sym}/{iv}: {e}", exc_info=True)
+
     while True:
         try:
             async with pg_pool.connection() as conn:
-                batch = await fetch_healed_db_batch(conn, limit=500)
+                batch = await fetch_healed_db_batch(conn, limit=1000)
             if not batch:
                 await asyncio.sleep(2)
                 continue
@@ -138,9 +149,11 @@ async def run_feed_ts_filler_bb(pg_pool, redis):
             for sym, iv, ot in batch:
                 by_pair.setdefault((sym, iv), []).append(ot)
 
-            # последовательно пары, внутренняя запись параллельная
-            for (sym, iv), times in by_pair.items():
-                await process_symbol_interval(pg_pool, redis, sym, iv, times)
+            # запускаем пары параллельно с ограничением
+            tasks = [asyncio.create_task(run_one(sym, iv, times))
+                     for (sym, iv), times in by_pair.items()]
+            if tasks:
+                await asyncio.gather(*tasks)
 
             await asyncio.sleep(1)
 
