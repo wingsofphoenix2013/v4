@@ -160,7 +160,7 @@ async def heal_range(pg_pool, session: aiohttp.ClientSession, symbol: str, inter
 
         if healed:
             await mark_gaps_healed_db(conn, symbol, interval, healed)
-            log.debug(f"[{symbol}] [{interval}] healed {len(healed)}/{len(expected_times)}")
+            log.info(f"[{symbol}] [{interval}] healed {len(healed)}/{len(expected_times)}")
 
         if missing:
             await mark_gaps_error(conn, symbol, interval, missing, "partial heal")
