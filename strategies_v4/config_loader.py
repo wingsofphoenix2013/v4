@@ -179,7 +179,7 @@ class ConfigState:
             self.strategies[strategy_id] = strategy
 
             # 🔸 Лог: детали загруженной стратегии
-            log.debug(
+            log.info(
                 f"🧠 Загружена стратегия {strategy_id} | "
                 f"TP={[{'level': r['level'], 'value': r['tp_value'], 'type': r['tp_type'], 'volume': r['volume_percent']} for r in strategy['tp_levels']]}, "
                 f"SL={[{'tp_level_id': r['tp_level_id'], 'level': r['level'], 'mode': r['sl_mode']} for r in strategy['sl_rules']]}"
