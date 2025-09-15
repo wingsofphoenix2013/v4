@@ -34,6 +34,7 @@ from oracle_mw_bb_quartet_aggregator import run_oracle_mw_bb_quartet_aggregator
 from oracle_mw_dmigap_quartet_aggregator import run_oracle_mw_dmigap_quartet_aggregator
 from oracle_mw_emastatus_quartet_aggregator import run_oracle_mw_emastatus_quartet_aggregator
 from oracle_kingwatch_aggregator import run_oracle_kingwatch_aggregator
+from oracle_kingwatch_backfill import run_oracle_kingwatch_backfill
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -117,6 +118,7 @@ async def main():
         run_safe_loop(run_oracle_mw_dmigap_quartet_aggregator, "MW_DMIGAP_Q"),
         run_safe_loop(run_oracle_mw_emastatus_quartet_aggregator, "MW_EMA_Q"),
         run_safe_loop(run_oracle_kingwatch_aggregator, "KW_AGG"),
+        run_safe_loop(run_oracle_kingwatch_backfill, "KW_BF"),
     )
 
 if __name__ == "__main__":
