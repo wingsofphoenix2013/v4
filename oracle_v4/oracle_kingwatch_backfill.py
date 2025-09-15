@@ -1,4 +1,5 @@
 # 🔸 oracle_kingwatch_backfill.py — KingWatcher backfill: добираем композит по триплету MW на баре открытия (для стратегий king_watcher=true)
+#     Обновлено: при апдейте триплета пишем денормализованное "всего сделок у стратегии" в строку.
 
 import os
 import asyncio
@@ -14,9 +15,9 @@ log = logging.getLogger("ORACLE_KW_BF")
 
 # 🔸 Конфиг backfill'а
 BATCH_SIZE           = int(os.getenv("KW_BF_BATCH_SIZE", "500"))
-MAX_CONCURRENCY      = int(os.getenv("KW_BF_MAX_CONCURRENCY", "15"))
+MAX_CONCURRENCY      = int(os.getenv("KW_BF_MAX_CONCURRENCY", "12"))
 SHORT_SLEEP_MS       = int(os.getenv("KW_BF_SLEEP_MS", "150"))
-START_DELAY_SEC      = int(os.getenv("KW_BF_START_DELAY_SEC", "120"))
+START_DELAY_SEC      = int(os.getenv("KW_BF_START_DELAY_SEC", "180"))
 RECHECK_INTERVAL_SEC = int(os.getenv("KW_BF_RECHECK_INTERVAL_SEC", "300"))
 
 
@@ -135,7 +136,7 @@ async def _advisory_xact_lock(conn, key_text: str):
     )
 
 
-# 🔸 Claim позиции и апдейт агрегата (в одной транзакции) + публикация Redis KV
+# 🔸 Claim позиции и апдейт агрегата (в одной транзакции) + обновление total + Redis KV
 async def _aggregate_with_claim(pos, triplet: str):
     pg = infra.pg_pool
     redis = infra.redis_client
@@ -162,7 +163,7 @@ async def _aggregate_with_claim(pos, triplet: str):
                 pos["position_uid"]
             )
             if not claimed:
-                return ("claimed_by_other", 0)
+                return ("claimed_by_other", 0, 0)
 
             # advisory-lock на агрегатный ключ
             await _advisory_xact_lock(conn, f"{s_id}:{dir_}:{triplet}")
@@ -172,8 +173,9 @@ async def _aggregate_with_claim(pos, triplet: str):
                 """
                 INSERT INTO positions_kw_stat_comp
                   (strategy_id, direction, status_triplet,
-                   closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
-                VALUES ($1,$2,$3, 0,0,0,0,0,NOW())
+                   closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at,
+                   strategy_total_closed_trades)
+                VALUES ($1,$2,$3, 0,0,0,0,0,NOW(), 0)
                 ON CONFLICT (strategy_id, direction, status_triplet) DO NOTHING
                 """,
                 s_id, dir_, triplet
@@ -206,6 +208,24 @@ async def _aggregate_with_claim(pos, triplet: str):
                 c, w, str(s), str(wr), str(ap)
             )
 
+            # считаем "всего сделок у стратегии" по направлению (денормализация)
+            total_n = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(closed_trades), 0)
+                FROM positions_kw_stat_comp
+                WHERE strategy_id=$1 AND direction=$2
+                """,
+                s_id, dir_
+            )
+            await conn.execute(
+                """
+                UPDATE positions_kw_stat_comp
+                SET strategy_total_closed_trades = $4
+                WHERE strategy_id=$1 AND direction=$2 AND status_triplet=$3
+                """,
+                s_id, dir_, triplet, int(total_n)
+            )
+
             # Redis KV публикация
             try:
                 await redis.set(
@@ -215,128 +235,4 @@ async def _aggregate_with_claim(pos, triplet: str):
             except Exception:
                 log.debug("Redis SET failed (kw comp)")
 
-            return ("aggregated", c)
-
-
-# 🔸 Обработка одного UID
-async def _process_uid(uid: str):
-    try:
-        pos, strat, verdict = await _load_pos_and_strat(uid)
-        if not pos:
-            return ("skip", "pos_not_found")
-        v_code, v_reason = verdict
-        if v_code != "ok":
-            return ("skip", v_reason)
-
-        created_at = pos["created_at"]  # timestamp (naive UTC по схеме)
-        created_at_utc = created_at.astimezone(timezone.utc).replace(tzinfo=None) if created_at.tzinfo is not None else created_at
-
-        triplet = await _collect_mw_triplet(pos["symbol"], created_at_utc)
-        if triplet is None:
-            return ("triplet_missing", "-")
-
-        agg_status, closed_trades = await _aggregate_with_claim(pos, triplet)
-        if agg_status == "aggregated":
-            win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-            return ("aggregated", f"triplet={triplet} win={win_flag} closed_trades={closed_trades}")
-        else:
-            return ("claimed", "by_other")
-
-    except Exception as e:
-        log.exception("❌ KW-BF uid=%s error: %s", uid, e)
-        return ("error", "exception")
-
-
-# 🔸 Выборка пачки UID'ов
-async def _fetch_candidates(batch_size: int):
-    pg = infra.pg_pool
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(_CANDIDATES_SQL, batch_size)
-    return [r["position_uid"] for r in rows]
-
-
-# 🔸 Подсчёт оставшихся (для периодических отчётов)
-async def _count_remaining():
-    pg = infra.pg_pool
-    async with pg.acquire() as conn:
-        val = await conn.fetchval(_COUNT_SQL)
-    return int(val or 0)
-
-
-# 🔸 Основной цикл backfill'а
-async def run_oracle_kingwatch_backfill():
-    if START_DELAY_SEC > 0:
-        log.debug("⏳ KW-BF: задержка старта %d сек (batch=%d, conc=%d)", START_DELAY_SEC, BATCH_SIZE, MAX_CONCURRENCY)
-        await asyncio.sleep(START_DELAY_SEC)
-
-    gate = asyncio.Semaphore(MAX_CONCURRENCY)
-
-    while True:
-        try:
-            log.debug("🚀 KW-BF: старт прохода")
-            batch_idx = 0
-            total_agg = total_missing = total_skip = total_claim = total_err = 0
-
-            while True:
-                uids = await _fetch_candidates(BATCH_SIZE)
-                if not uids:
-                    break
-
-                batch_idx += 1
-                agg = missing = skip = claim = err = 0
-                results = []
-
-                # воркер на один uid
-                async def worker(one_uid: str):
-                    async with gate:
-                        res = await _process_uid(one_uid)
-                        results.append(res)
-
-                await asyncio.gather(*[asyncio.create_task(worker(u)) for u in uids])
-
-                # сводка по батчу
-                for status, _info in results:
-                    if status == "aggregated":
-                        agg += 1
-                    elif status == "triplet_missing":
-                        missing += 1
-                    elif status == "claimed":
-                        claim += 1
-                    elif status == "skip":
-                        skip += 1
-                    else:
-                        err += 1
-
-                total_agg += agg
-                total_missing += missing
-                total_claim += claim
-                total_skip += skip
-                total_err += err
-
-                remaining = None
-                if batch_idx % 5 == 1:
-                    try:
-                        remaining = await _count_remaining()
-                    except Exception:
-                        remaining = None
-
-                if remaining is None:
-                    log.info("[KW-BF] batch=%d size=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d",
-                             batch_idx, len(uids), agg, missing, claim, skip, err)
-                else:
-                    log.info("[KW-BF] batch=%d size=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d remaining≈%d",
-                             batch_idx, len(uids), agg, missing, claim, skip, err, remaining)
-
-                await asyncio.sleep(SHORT_SLEEP_MS / 1000)
-
-            log.info("✅ KW-BF: проход завершён batches=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
-                     batch_idx, total_agg, total_missing, total_claim, total_skip, total_err, RECHECK_INTERVAL_SEC)
-
-            await asyncio.sleep(RECHECK_INTERVAL_SEC)
-
-        except asyncio.CancelledError:
-            log.debug("⏹️ KW-BF остановлен")
-            raise
-        except Exception as e:
-            log.exception("❌ KW-BF loop error: %s", e)
-            await asyncio.sleep(1)
+            return ("aggregated", c, int(total_n))

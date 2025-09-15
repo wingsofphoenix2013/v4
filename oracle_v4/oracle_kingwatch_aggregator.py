@@ -1,4 +1,5 @@
 # 🔸 oracle_kingwatch_aggregator.py — KingWatcher: композитная агрегация по триплету MW на баре открытия (для стратегий king_watcher=true)
+#     Обновлено: FK-связь стратегии на уровне БД (DDL) + запись денормализованного "всего сделок у стратегии" в строку триплета.
 
 import os
 import asyncio
@@ -128,7 +129,7 @@ async def _collect_mw_triplet(symbol: str, created_at_utc: datetime):
     return f"{per_tf['m5']}-{per_tf['m15']}-{per_tf['h1']}"
 
 
-# 🔸 Claim позиции и апдейт агрегата KW (композит) + публикация Redis KV
+# 🔸 Claim позиции и апдейт агрегата KW (композит) + обновление total по стратегии + публикация Redis KV
 async def _claim_and_update_kw(pos, triplet: str):
     pg = infra.pg_pool
     redis = infra.redis_client
@@ -155,7 +156,7 @@ async def _claim_and_update_kw(pos, triplet: str):
                 pos["position_uid"]
             )
             if not claimed:
-                return ("claim_skip", 0)
+                return ("claim_skip", 0, 0)
 
             # advisory-lock по агрегатному ключу (класс 10 для KW-comp)
             await _advisory_xact_lock(conn, 10, f"{strategy_id}:{direction}:{triplet}")
@@ -165,8 +166,9 @@ async def _claim_and_update_kw(pos, triplet: str):
                 """
                 INSERT INTO positions_kw_stat_comp
                   (strategy_id, direction, status_triplet,
-                   closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at)
-                VALUES ($1,$2,$3, 0,0,0,0,0,NOW())
+                   closed_trades, won_trades, pnl_sum, winrate, avg_pnl, updated_at,
+                   strategy_total_closed_trades)
+                VALUES ($1,$2,$3, 0,0,0,0,0,NOW(), 0)
                 ON CONFLICT (strategy_id, direction, status_triplet) DO NOTHING
                 """,
                 strategy_id, direction, triplet
@@ -199,6 +201,24 @@ async def _claim_and_update_kw(pos, triplet: str):
                 c, w, str(s), str(wr), str(ap)
             )
 
+            # считаем "всего сделок у стратегии" по направлению (денормализация)
+            total_n = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(closed_trades), 0)
+                FROM positions_kw_stat_comp
+                WHERE strategy_id=$1 AND direction=$2
+                """,
+                strategy_id, direction
+            )
+            await conn.execute(
+                """
+                UPDATE positions_kw_stat_comp
+                SET strategy_total_closed_trades = $4
+                WHERE strategy_id=$1 AND direction=$2 AND status_triplet=$3
+                """,
+                strategy_id, direction, triplet, int(total_n)
+            )
+
             # KV публикация
             try:
                 await redis.set(
@@ -208,7 +228,7 @@ async def _claim_and_update_kw(pos, triplet: str):
             except Exception:
                 log.debug("Redis SET failed (kw comp)")
 
-            return ("ok", c)
+            return ("ok", c, int(total_n))
 
 
 # 🔸 Основной цикл
@@ -258,11 +278,11 @@ async def run_oracle_kingwatch_aggregator():
                             continue
 
                         # claim позиции + апдейт агрегата
-                        agg_status, closed_trades = await _claim_and_update_kw(pos, triplet)
+                        agg_status, closed_trades, total_trades = await _claim_and_update_kw(pos, triplet)
                         if agg_status == "ok":
                             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-                            log.debug("[KW AGG] uid=%s strat=%s dir=%s triplet=%s — aggregated (win=%d, closed_trades=%d)",
-                                     pos_uid, pos["strategy_id"], pos["direction"], triplet, win_flag, closed_trades)
+                            log.debug("[KW AGG] uid=%s strat=%s dir=%s triplet=%s — aggregated (win=%d, closed_trades=%d, strat_total=%d)",
+                                     pos_uid, pos["strategy_id"], pos["direction"], triplet, win_flag, closed_trades, total_trades)
                         else:
                             log.debug("[KW AGG] uid=%s — уже обработана параллельно (claim skipped)", pos_uid)
 
