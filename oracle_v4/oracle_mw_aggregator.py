@@ -1,4 +1,5 @@
-# 🔸 oracle_mw_aggregator.py — MarketWatcher: запись MW-срезов (PIS) на баре открытия + агрегация при наличии всех трёх TF (naive UTC timestamps)
+# 🔸 oracle_mw_aggregator.py — MarketWatcher: запись MW-срезов (PIS) на баре открытия + агрегация при наличии всех трёх TF
+#     Обновлено: единый порядок блокировок (сначала claim позиции, затем агрегаты) + advisory-lock как в backfill.
 
 import os
 import asyncio
@@ -61,42 +62,50 @@ async def _ensure_group():
             raise
 
 
+# 🔸 Advisory-lock по агрегатному ключу (в рамках текущей транзакции)
+async def _advisory_xact_lock(conn, class_id: int, key_text: str):
+    # используем детерминированный hashtext(text) → int4; двухкомпонентный ключ (class_id, hash)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1::int4, hashtext($2)::int4)",
+        int(class_id), key_text
+    )
+
+
 # 🔸 Загрузка позиции и стратегии (проверки флагов)
 async def _load_position_and_strategy(position_uid: str):
     pg = infra.pg_pool
     async with pg.acquire() as conn:
-        async with conn.transaction():
-            pos = await conn.fetchrow(
-                """
-                SELECT p.id, p.position_uid, p.symbol, p.direction, p.strategy_id,
-                       p.pnl, p.status, p.created_at,
-                       COALESCE(p.mrk_indwatch_checked, false) AS pis_checked,
-                       COALESCE(p.mrk_watcher_checked, false) AS agg_checked
-                FROM positions_v4 p
-                WHERE p.position_uid = $1
-                FOR UPDATE
-                """,
-                position_uid,
-            )
-            if not pos:
-                return None, None, ("skip", "position_not_found")
-            if pos["status"] != "closed":
-                return pos, None, ("skip", "position_not_closed")
-            if pos["agg_checked"]:
-                return pos, None, ("skip", "already_aggregated")
+        # ⚠️ БЕЗ FOR UPDATE — row-lock берём только в claim внутри _aggregate_and_mark
+        pos = await conn.fetchrow(
+            """
+            SELECT p.id, p.position_uid, p.symbol, p.direction, p.strategy_id,
+                   p.pnl, p.status, p.created_at,
+                   COALESCE(p.mrk_indwatch_checked, false) AS pis_checked,
+                   COALESCE(p.mrk_watcher_checked, false) AS agg_checked
+            FROM positions_v4 p
+            WHERE p.position_uid = $1
+            """,
+            position_uid,
+        )
+        if not pos:
+            return None, None, ("skip", "position_not_found")
+        if pos["status"] != "closed":
+            return pos, None, ("skip", "position_not_closed")
+        if pos["agg_checked"]:
+            return pos, None, ("skip", "already_aggregated")
 
-            strat = await conn.fetchrow(
-                """
-                SELECT id, enabled, COALESCE(archived, false) AS archived, COALESCE(market_watcher, false) AS mw
-                FROM strategies_v4
-                WHERE id = $1
-                """,
-                int(pos["strategy_id"]),
-            )
-            if (not strat) or (not strat["enabled"]) or bool(strat["archived"]) or (not strat["mw"]):
-                return pos, strat, ("skip", "strategy_inactive_or_no_mw")
+        strat = await conn.fetchrow(
+            """
+            SELECT id, enabled, COALESCE(archived, false) AS archived, COALESCE(market_watcher, false) AS mw
+            FROM strategies_v4
+            WHERE id = $1
+            """,
+            int(pos["strategy_id"]),
+        )
+        if (not strat) or (not strat["enabled"]) or bool(strat["archived"]) or (not strat["mw"]):
+            return pos, strat, ("skip", "strategy_inactive_or_no_mw")
 
-            return pos, strat, ("ok", "eligible")
+        return pos, strat, ("ok", "eligible")
 
 
 # 🔸 Прочитать regime_code из indicator_marketwatcher_v4 по (symbol, TF, bar_open_time)
@@ -114,10 +123,10 @@ async def _load_imw_code(symbol: str, tf: str, bar_open: datetime):
     return None if code is None else int(code)
 
 
-#   Сформировать строки для PIS (пишем только найденные TF)
+# 🔸 Сформировать строки для PIS (пишем только найденные TF)
 async def _write_pis_mw(position_uid: str, strategy_id: int, direction: str, symbol: str, created_at_utc: datetime):
     """
-    Возвращает: dict per_tf_found: {'m5': code?, 'm15': code?, 'h1': code?} — только найденные TF
+    Возвращает: dict per_tf_found: {'m5': code?, 'm15': code?, 'h1': code?} — только найденные TF.
     """
     per_tf_found = {}
     rows = []
@@ -202,10 +211,16 @@ def _ordered_keys_for_agg(strategy_id: int, direction: str, per_tf_codes: dict):
     return per_tf_keys, comp_keys
 
 
-# 🔸 Агрегация MW (per-TF и композит) + публикация Redis (только если есть все 3 TF) + выставление флагов
+# 🔸 Агрегация MW (per-TF и композит) под claim позиции + advisory-lockи на агрегаты
 async def _aggregate_and_mark(pos, per_tf_codes: dict):
     """
     ВАЖНО: вызывать только если в PIS найдены все 3 TF (иначе агрегацию не делаем).
+    Порядок блокировок:
+      1) транзакционный claim позиции (UPDATE ... RETURNING) → row-lock positions_v4
+      2) advisory-lock на каждый агрегатный ключ (per-TF и comp)
+      3) предсоздание строк агрегатов (DO NOTHING)
+      4) SELECT ... FOR UPDATE и UPDATE агрегатов
+      5) запись кешей в Redis
     """
     pg = infra.pg_pool
     redis = infra.redis_client
@@ -220,7 +235,32 @@ async def _aggregate_and_mark(pos, per_tf_codes: dict):
 
     async with pg.acquire() as conn:
         async with conn.transaction():
-            # предсоздание (DO NOTHING)
+            # 1) claim позиции: если уже забрана (live/bf), то выходим без ошибок
+            claimed = await conn.fetchrow(
+                """
+                UPDATE positions_v4
+                SET mrk_watcher_checked = true,
+                    mrk_indwatch_checked = true
+                WHERE position_uid = $1
+                  AND status = 'closed'
+                  AND COALESCE(mrk_watcher_checked, false) = false
+                RETURNING position_uid
+                """,
+                pos["position_uid"]
+            )
+            if not claimed:
+                # позиция уже обработана/взята параллельным потоком
+                return
+
+            # 2) advisory-lock на агрегатные ключи (детерминированный порядок)
+            for _, key in per_tf_keys:
+                s_id, dir_, tf, code = key
+                await _advisory_xact_lock(conn, 1, f"{s_id}:{dir_}:{tf}:{code}")  # класс 1 → per-TF
+            for _, key in comp_keys:
+                s_id, dir_, triplet = key
+                await _advisory_xact_lock(conn, 2, f"{s_id}:{dir_}:{triplet}")     # класс 2 → comp
+
+            # 3) предсоздание строк агрегатов (идемпотентно)
             for _, key in per_tf_keys:
                 s_id, dir_, tf, code = key
                 await conn.execute(
@@ -246,7 +286,7 @@ async def _aggregate_and_mark(pos, per_tf_codes: dict):
                     s_id, dir_, triplet
                 )
 
-            # апдейты (FOR UPDATE → UPDATE) в фиксированном порядке
+            # 4) апдейты (FOR UPDATE) в фиксированном порядке
             for _, key in per_tf_keys:
                 s_id, dir_, tf, code = key
                 row = await conn.fetchrow(
@@ -318,12 +358,6 @@ async def _aggregate_and_mark(pos, per_tf_codes: dict):
                     )
                 except Exception:
                     log.debug("Redis SET failed (comp)")
-
-            # флаги: все 3 TF есть → отмечаем PIS-флаг и итоговый флаг агрегации
-            await conn.execute(
-                "UPDATE positions_v4 SET mrk_indwatch_checked = true, mrk_watcher_checked = true WHERE position_uid = $1",
-                pos["position_uid"]
-            )
 
 
 # 🔸 Основной цикл
