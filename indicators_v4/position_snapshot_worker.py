@@ -191,6 +191,11 @@ async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_preci
 
                         log.debug(f"[OPENED] uid={uid} {sym} strategy={strat} dir={side} created_at={created_iso}")
 
+                        # 🔸 Фильтр по стратегиям: обрабатываем ТОЛЬКО если market_watcher = true
+                        if not get_strategy_mw(strat):
+                            log.debug(f"[SKIP_MW] uid={uid} strategy={strat} market_watcher=false — пропускаем обработку")
+                            continue
+                            
                         created_dt = datetime.fromisoformat(created_iso)
                         created_ms = int(created_dt.timestamp() * 1000)
                         precision  = get_precision(sym)

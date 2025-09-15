@@ -20,6 +20,9 @@ STREAM_LIMITS = {
 # 🔹 Тайм-бюджет на ретенцию TS в одном цикле, чтобы не блокировать воркер надолго
 TS_RETENTION_TIME_BUDGET_SEC = 30
 
+# 🔹 Периодичность чистки позиций не-MW стратегий
+NON_MW_CLEANUP_PERIOD_HOURS = 4
+
 # 🔸 Пройтись по ts_ind:* и выставить RETENTION=14 суток (с тайм-бюджетом)
 async def enforce_ts_retention(redis):
     """
@@ -77,10 +80,31 @@ async def trim_streams(redis):
         except Exception as e:
             log.warning(f"[STREAM] {key} XTRIM error: {e}")
 
+# 🔸 Очистка позиций индикаторов для стратегий без market_watcher
+async def cleanup_positions_indicators_non_mw(pg):
+    """
+    Удаляет все строки из positions_indicators_stat для стратегий, у которых market_watcher = false.
+    Использует join по strategy_id, чтобы захватить как старые записи, так и любые случайно записанные в будущем.
+    """
+    try:
+        async with pg.acquire() as conn:
+            res = await conn.execute(
+                """
+                DELETE FROM positions_indicators_stat pis
+                USING strategies_v4 s
+                WHERE pis.strategy_id = s.id
+                  AND s.market_watcher = false
+                """
+            )
+        log.debug(f"[DB] positions_indicators_stat (non-MW) удалено: {res}")
+    except Exception as e:
+        log.error(f"[DB] cleanup_positions_indicators_non_mw error: {e}", exc_info=True)
+
 # 🔸 Основной воркер: запускает периодические задачи
 async def run_indicators_cleanup(pg, redis):
     log.info("IND_CLEANUP started")
     last_db = datetime.min
+    last_non_mw = datetime.min
 
     while True:
         try:
@@ -88,11 +112,17 @@ async def run_indicators_cleanup(pg, redis):
             await enforce_ts_retention(redis)
             await trim_streams(redis)
 
-            # раз в сутки — очистка indicator_values_v4
             now = datetime.utcnow()
+
+            # раз в сутки — очистка indicator_values_v4
             if (now - last_db) >= timedelta(days=1):
                 await cleanup_db(pg)
                 last_db = now
+
+            # раз в 4 часа — чистка позиций индикаторов для стратегий без market_watcher
+            if (now - last_non_mw) >= timedelta(hours=NON_MW_CLEANUP_PERIOD_HOURS):
+                await cleanup_positions_indicators_non_mw(pg)
+                last_non_mw = now
 
             await asyncio.sleep(300)  # пауза 5 минут
 
