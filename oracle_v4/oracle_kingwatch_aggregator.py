@@ -128,8 +128,7 @@ async def _collect_mw_triplet(symbol: str, created_at_utc: datetime):
     # формируем строку-триплет
     return f"{per_tf['m5']}-{per_tf['m15']}-{per_tf['h1']}"
 
-
-# 🔸 Claim позиции и апдейт агрегата KW (композит) + обновление total по стратегии + публикация Redis KV
+# 🔸 Claim позиции и апдейт агрегата KW (композит) + обновление total по ВСЕМ строкам стратегии/направления + публикация Redis KV
 async def _claim_and_update_kw(pos, triplet: str):
     pg = infra.pg_pool
     redis = infra.redis_client
@@ -210,13 +209,15 @@ async def _claim_and_update_kw(pos, triplet: str):
                 """,
                 strategy_id, direction
             )
+
+            # ОБНОВЛЯЕМ TOTAL ДЛЯ ВСЕХ СТРОК ЭТОЙ СТРАТЕГИИ/НАПРАВЛЕНИЯ
             await conn.execute(
                 """
                 UPDATE positions_kw_stat_comp
-                SET strategy_total_closed_trades = $4
-                WHERE strategy_id=$1 AND direction=$2 AND status_triplet=$3
+                SET strategy_total_closed_trades = $3
+                WHERE strategy_id=$1 AND direction=$2
                 """,
-                strategy_id, direction, triplet, int(total_n)
+                strategy_id, direction, int(total_n)
             )
 
             # KV публикация
@@ -229,7 +230,6 @@ async def _claim_and_update_kw(pos, triplet: str):
                 log.debug("Redis SET failed (kw comp)")
 
             return ("ok", c, int(total_n))
-
 
 # 🔸 Основной цикл
 async def run_oracle_kingwatch_aggregator():

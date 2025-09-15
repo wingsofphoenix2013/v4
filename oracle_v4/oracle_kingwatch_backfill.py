@@ -15,9 +15,9 @@ log = logging.getLogger("ORACLE_KW_BF")
 
 # 🔸 Конфиг backfill'а
 BATCH_SIZE           = int(os.getenv("KW_BF_BATCH_SIZE", "500"))
-MAX_CONCURRENCY      = int(os.getenv("KW_BF_MAX_CONCURRENCY", "12"))
+MAX_CONCURRENCY      = int(os.getenv("KW_BF_MAX_CONCURRENCY", "15"))
 SHORT_SLEEP_MS       = int(os.getenv("KW_BF_SLEEP_MS", "150"))
-START_DELAY_SEC      = int(os.getenv("KW_BF_START_DELAY_SEC", "120"))
+START_DELAY_SEC      = int(os.getenv("KW_BF_START_DELAY_SEC", "180"))
 RECHECK_INTERVAL_SEC = int(os.getenv("KW_BF_RECHECK_INTERVAL_SEC", "300"))
 
 
@@ -135,8 +135,7 @@ async def _advisory_xact_lock(conn, key_text: str):
         10, key_text
     )
 
-
-# 🔸 Claim позиции и апдейт агрегата (в одной транзакции) + обновление total + Redis KV
+# 🔸 Claim позиции и апдейт агрегата (в одной транзакции) + обновление total по ВСЕМ строкам стратегии/направления + Redis KV
 async def _aggregate_with_claim(pos, triplet: str):
     pg = infra.pg_pool
     redis = infra.redis_client
@@ -217,13 +216,15 @@ async def _aggregate_with_claim(pos, triplet: str):
                 """,
                 s_id, dir_
             )
+
+            # ОБНОВЛЯЕМ TOTAL ДЛЯ ВСЕХ СТРОК ЭТОЙ СТРАТЕГИИ/НАПРАВЛЕНИЯ
             await conn.execute(
                 """
                 UPDATE positions_kw_stat_comp
-                SET strategy_total_closed_trades = $4
-                WHERE strategy_id=$1 AND direction=$2 AND status_triplet=$3
+                SET strategy_total_closed_trades = $3
+                WHERE strategy_id=$1 AND direction=$2
                 """,
-                s_id, dir_, triplet, int(total_n)
+                s_id, dir_, int(total_n)
             )
 
             # Redis KV публикация
@@ -236,7 +237,6 @@ async def _aggregate_with_claim(pos, triplet: str):
                 log.debug("Redis SET failed (kw comp)")
 
             return ("aggregated", c, int(total_n))
-
 
 # 🔸 Обработка одного UID
 async def _process_uid(uid: str):
