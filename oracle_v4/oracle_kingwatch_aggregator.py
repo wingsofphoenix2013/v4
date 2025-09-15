@@ -253,7 +253,7 @@ async def run_oracle_kingwatch_aggregator():
                         # собираем триплет MW; если неполный — оставляем на backfill
                         triplet = await _collect_mw_triplet(pos["symbol"], created_at_utc)
                         if triplet is None:
-                            log.info("[KW AGG] uid=%s strat=%s dir=%s — MW триплет не готов (postpone)",
+                            log.debug("[KW AGG] uid=%s strat=%s dir=%s — MW триплет не готов (postpone)",
                                      pos_uid, pos["strategy_id"], pos["direction"])
                             continue
 
@@ -261,7 +261,7 @@ async def run_oracle_kingwatch_aggregator():
                         agg_status, closed_trades = await _claim_and_update_kw(pos, triplet)
                         if agg_status == "ok":
                             win_flag = 1 if (pos["pnl"] is not None and pos["pnl"] > 0) else 0
-                            log.info("[KW AGG] uid=%s strat=%s dir=%s triplet=%s — aggregated (win=%d, closed_trades=%d)",
+                            log.debug("[KW AGG] uid=%s strat=%s dir=%s triplet=%s — aggregated (win=%d, closed_trades=%d)",
                                      pos_uid, pos["strategy_id"], pos["direction"], triplet, win_flag, closed_trades)
                         else:
                             log.debug("[KW AGG] uid=%s — уже обработана параллельно (claim skipped)", pos_uid)
