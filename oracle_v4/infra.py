@@ -10,6 +10,7 @@ pg_pool = None
 redis_client = None
 enabled_tickers: dict[str, dict] = {}
 market_watcher_strategies: set[int] = set()
+king_watcher_strategies: set[int] = set()  # NEW
 
 # 🔸 Переменные окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -79,11 +80,19 @@ def set_enabled_tickers(new_dict: dict):
     log.debug("Кэш тикеров обновлён (%d)", len(enabled_tickers))
 
 
-# 🔸 Обновление кэша стратегий (market_watcher=true)
-def set_market_watcher_strategies(id_set: set[int]):
-    global market_watcher_strategies
-    market_watcher_strategies = set(int(x) for x in (id_set or set()))
-    log.info("🧠 Кэш стратегий market_watcher обновлён (%d)", len(market_watcher_strategies))
+# 🔸 Обновление кэша стратегий (king_watcher=true)
+def set_king_watcher_strategies(id_set: set[int]):
+    global king_watcher_strategies
+    king_watcher_strategies = set(int(x) for x in (id_set or set()))
+    log.info("🧠 Кэш стратегий king_watcher обновлён (%d)", len(king_watcher_strategies))
+
+def add_king_watcher_strategy(sid: int):
+    king_watcher_strategies.add(int(sid))
+    log.debug("Добавлена стратегия в кэш king_watcher: %s (итого %d)", sid, len(king_watcher_strategies))
+
+def remove_king_watcher_strategy(sid: int):
+    king_watcher_strategies.discard(int(sid))
+    log.debug("Удалена стратегия из кэша king_watcher: %s (итого %d)", sid, len(king_watcher_strategies))
 
 
 # 🔸 Точечное добавление стратегии в кэш
@@ -96,3 +105,4 @@ def add_market_watcher_strategy(sid: int):
 def remove_market_watcher_strategy(sid: int):
     market_watcher_strategies.discard(int(sid))
     log.debug("Удалена стратегия из кэша market_watcher: %s (итого %d)", sid, len(market_watcher_strategies))
+
