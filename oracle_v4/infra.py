@@ -79,7 +79,12 @@ def set_enabled_tickers(new_dict: dict):
     enabled_tickers = new_dict or {}
     log.debug("Кэш тикеров обновлён (%d)", len(enabled_tickers))
 
-
+# 🔸 Обновление кэша стратегий (market_watcher=true)
+def set_market_watcher_strategies(id_set: set[int]):
+    global market_watcher_strategies
+    market_watcher_strategies = set(int(x) for x in (id_set or set()))
+    log.info("🧠 Кэш стратегий market_watcher обновлён (%d)", len(market_watcher_strategies))
+    
 # 🔸 Обновление кэша стратегий (king_watcher=true)
 def set_king_watcher_strategies(id_set: set[int]):
     global king_watcher_strategies
