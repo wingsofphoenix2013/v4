@@ -341,15 +341,15 @@ async def run_oracle_kingwatch_backfill():
                         remaining = None
 
                 if remaining is None:
-                    log.info("[KW-BF] batch=%d size=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d",
+                    log.debug("[KW-BF] batch=%d size=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d",
                              batch_idx, len(uids), agg, missing, claim, skip, err)
                 else:
-                    log.info("[KW-BF] batch=%d size=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d remaining≈%d",
+                    log.debug("[KW-BF] batch=%d size=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d remaining≈%d",
                              batch_idx, len(uids), agg, missing, claim, skip, err, remaining)
 
                 await asyncio.sleep(SHORT_SLEEP_MS / 1000)
 
-            log.info("✅ KW-BF: проход завершён batches=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
+            log.debug("✅ KW-BF: проход завершён batches=%d aggregated=%d missing=%d claimed=%d skipped=%d errors=%d — следующий запуск через %ds",
                      batch_idx, total_agg, total_missing, total_claim, total_skip, total_err, RECHECK_INTERVAL_SEC)
 
             await asyncio.sleep(RECHECK_INTERVAL_SEC)
