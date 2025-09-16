@@ -1,11 +1,10 @@
-# bb_feed_and_aggregate.py — per-symbol Bybit WS (linear) → Redis TS/Stream для m5/m15/h1 (троттлинг ДО очереди, ограничение очередей)
+# bb_feed_and_aggregate.py — per-symbol Bybit WS (linear) → Redis TS/Stream для m5/m15/h1 (троттлинг ДО очереди, ограничение очередей, безопасная отмена, TTL-кэш precision)
 
 # 🔸 Импорты и зависимости
 import os
 import asyncio
 import logging
 import json
-import time
 import random
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
@@ -18,28 +17,59 @@ log = logging.getLogger("BB_FEED_AGGR")
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
 KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "20"))
 ACTIVE_REFRESH_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
-NONCLOSED_THROTTLE_SEC = int(os.getenv("BB_NONCLOSED_THROTTLE_SEC", "10"))
+NONCLOSED_THROTTLE_SEC = float(os.getenv("BB_NONCLOSED_THROTTLE_SEC", "15"))
 TS_RETENTION_MS = int(os.getenv("BB_TS_RETENTION_MS", str(60 * 24 * 60 * 60 * 1000)))  # ~60 дней
 
 # ограничение размеров очередей по ТФ (чтобы не раздувать RAM)
 QUEUE_MAX_M5 = int(os.getenv("BB_QUEUE_MAXSIZE_M5", "2000"))
 QUEUE_MAX_OTH = int(os.getenv("BB_QUEUE_MAXSIZE_OTH", "500"))
+
 # таймаут при попытке положить live-апдейт в забитую очередь (дропаем по таймауту)
 QUEUE_PUT_TIMEOUT_SEC = float(os.getenv("BB_QUEUE_PUT_TIMEOUT_SEC", "0.2"))
+
+# ограничение внутренней очереди клиента websockets (чтобы не копилась память)
+WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))
+
+# TTL кэширования precision (секунды)
+PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
 
 # 🔸 Маппинги интервалов
 SUB_IV = {"m5": "5", "m15": "15", "h1": "60"}
 ALL_TF = ("m5", "m15", "h1")
 
-# 🔸 Кеш precision из tickers_bb
+# 🔸 Вспомогательные структуры: TTL-кэш
+class _TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        self._data: dict[str, tuple[object, float]] = {}
+
+    # получить значение из кэша
+    def get(self, key: str):
+        item = self._data.get(key)
+        if not item:
+            return None
+        val, ts = item
+        now = asyncio.get_event_loop().time()
+        if now - ts > self.ttl:
+            self._data.pop(key, None)
+            return None
+        return val
+
+    # записать значение в кэш
+    def set(self, key: str, value):
+        self._data[key] = (value, asyncio.get_event_loop().time())
+
+# 🔸 Кеш precision из tickers_bb (с TTL)
 class PrecisionCache:
     def __init__(self):
-        self.price = {}
-        self.qty = {}
+        self.price = _TTLCache(PRECISION_CACHE_TTL_SEC)
+        self.qty = _TTLCache(PRECISION_CACHE_TTL_SEC)
 
     async def get(self, pg_pool, symbol: str):
-        if symbol in self.price and symbol in self.qty:
-            return self.price[symbol], self.qty[symbol]
+        pp = self.price.get(symbol)
+        pq = self.qty.get(symbol)
+        if pp is not None and pq is not None:
+            return pp, pq
         async with pg_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -49,8 +79,8 @@ class PrecisionCache:
                 row = await cur.fetchone()
         pp = int(row[0]) if row and row[0] is not None else 0
         pq = int(row[1]) if row and row[1] is not None else 0
-        self.price[symbol] = pp
-        self.qty[symbol] = pq
+        self.price.set(symbol, pp)
+        self.qty.set(symbol, pq)
         return pp, pq
 
 prec_cache = PrecisionCache()
@@ -144,7 +174,7 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
             return
 
     backoff = 1.0  # экспоненциальный бэкофф с джиттером
-    last_live_emit_s = 0  # троттлинг незакрытых: не чаще, чем раз в NONCLOSED_THROTTLE_SEC
+    last_live_emit_s = 0.0  # троттлинг незакрытых: не чаще, чем раз в NONCLOSED_THROTTLE_SEC
 
     while True:
         try:
@@ -155,7 +185,7 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
                 url,
                 ping_interval=None,       # свой keepalive
                 close_timeout=5,
-                max_queue=None,           # не ограничиваем очередь кадров на клиенте WS
+                max_queue=WS_MAX_QUEUE,   # ограничиваем внутреннюю очередь кадров клиента WS
                 open_timeout=10,
             ) as ws:
                 # подписка
@@ -187,15 +217,15 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
 
                         items = _parse_bybit_kline(msg)  # [(sym, iv_m, ts_ms, o,h,l,c,v,is_closed), ...]
                         for (sym, iv_m, ts_ms, o, h, l, c, v, is_closed) in items:
-                            # 🔹 ТРОТТЛИНГ ДО ОЧЕРЕДИ: live-апдейты пропускаем, если прошло < NONCLOSED_THROTTLE_SEC
+                            # троттлинг ДО очереди для незакрытых баров
                             if not is_closed:
-                                now_s = int(asyncio.get_event_loop().time())
+                                now_s = asyncio.get_event_loop().time()
                                 if now_s - last_live_emit_s < NONCLOSED_THROTTLE_SEC:
                                     continue
                                 last_live_emit_s = now_s
 
                             item = (sym, iv_m, ts_ms, o, h, l, c, v, is_closed)
-                            # 🔹 Пытаемся положить в очередь. Закрытый бар — никогда не дропаем.
+                            # Пытаемся положить в очередь. Закрытый бар — никогда не дропаем.
                             try:
                                 if is_closed:
                                     await queue.put(item)  # блокируемся при необходимости
@@ -206,7 +236,12 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
                                 pass
 
                 finally:
+                    # корректно завершаем keepalive
                     ka.cancel()
+                    try:
+                        await ka
+                    except Exception:
+                        pass
 
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
             # ожидаемые сетевые обрывы — плавный реконнект с джиттером (минимум 3с)
@@ -259,7 +294,7 @@ async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str):
 async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6):
     bybit_iv = SUB_IV[interval_m]
     tf_name = interval_m
-    log.info(f"[{tf_name}] per-symbol WS mode")
+    log.info(f"[{tf_name}] per-symbol WS mode (WS_MAX_QUEUE={WS_MAX_QUEUE}, throttle={NONCLOSED_THROTTLE_SEC}s)")
 
     maxsize = QUEUE_MAX_M5 if interval_m == "m5" else QUEUE_MAX_OTH
     queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
@@ -287,7 +322,11 @@ async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6)
                 t = tasks.pop(sym, None)
                 if t:
                     t.cancel()
-                    log.info(f"[{tf_name}] stop WS {sym}")
+                    try:
+                        await asyncio.wait_for(t, timeout=2.0)
+                        log.info(f"[{tf_name}] stop WS {sym} — cancelled")
+                    except asyncio.TimeoutError:
+                        log.info(f"[{tf_name}] stop WS {sym} — cancel timeout")
 
             # мониторим размер очереди (опционально)
             log.debug(f"[{tf_name}] qsize={queue.qsize()} max={maxsize}")

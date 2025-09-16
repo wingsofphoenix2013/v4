@@ -1,4 +1,4 @@
-# bb_feed_ts_filler.py — дозаполнение Redis TS из ohlcv_bb_* для точек healed_db → healed_ts (параллелизация по (symbol, interval))
+# bb_feed_ts_filler.py — дозаполнение Redis TS из ohlcv_bb_* для точек healed_db → healed_ts (параллелизация по (symbol, interval), TTL-кэш precision_qty)
 
 # 🔸 Импорты и зависимости
 import os
@@ -9,9 +9,11 @@ from datetime import datetime
 
 log = logging.getLogger("BB_TS_FILLER")
 
+# 🔸 Конфиг/ENV
 TABLE_MAP = {"m5": "ohlcv_bb_m5", "m15": "ohlcv_bb_m15", "h1": "ohlcv_bb_h1"}
 TS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000  # ~60 дней
 PAIR_CONCURRENCY = int(os.getenv("BB_TS_FILLER_CONCURRENCY", "5"))  # параллельных пар (symbol, interval)
+PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
 
 # 🔸 безопасная запись одной точки в TS (создать ключ при отсутствии)
 async def ts_safe_add(redis, key, ts_ms, value, labels):
@@ -29,20 +31,43 @@ async def ts_safe_add(redis, key, ts_ms, value, labels):
     except Exception as e:
         log.warning(f"TS.ADD ошибка {key}: {e}")
 
-# 🔸 кеш точности объёма (precision_qty)
+# 🔸 TTL-кэш (общая вспомогательная структура)
+class _TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        self._data: dict[str, tuple[object, float]] = {}
+
+    # получить значение из кэша
+    def get(self, key: str):
+        item = self._data.get(key)
+        if not item:
+            return None
+        val, ts = item
+        now = asyncio.get_event_loop().time()
+        if now - ts > self.ttl:
+            self._data.pop(key, None)
+            return None
+        return val
+
+    # записать значение в кэш
+    def set(self, key: str, value):
+        self._data[key] = (value, asyncio.get_event_loop().time())
+
+# 🔸 кеш точности объёма (precision_qty) с TTL
 class PrecisionCache:
     def __init__(self):
-        self.pq = {}
+        self.pq = _TTLCache(PRECISION_CACHE_TTL_SEC)
 
     async def get_precision_qty(self, pg_pool, symbol):
-        if symbol in self.pq:
-            return self.pq[symbol]
+        cached = self.pq.get(symbol)
+        if cached is not None:
+            return cached
         async with pg_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT precision_qty FROM tickers_bb WHERE symbol=%s", (symbol,))
                 row = await cur.fetchone()
         val = int(row[0]) if row and row[0] is not None else 0
-        self.pq[symbol] = val
+        self.pq.set(symbol, val)
         return val
 
 prec_cache = PrecisionCache()
@@ -94,14 +119,18 @@ async def process_symbol_interval(pg_pool, redis, symbol, interval, times):
     table = TABLE_MAP.get(interval)
     if not table or not times:
         return
+
+    # получить строки OHLCV из БД
     async with pg_pool.connection() as conn:
         rows = await fetch_ohlcv_rows(conn, table, symbol, times)
     if not rows:
         log.warning(f"[{symbol}] [{interval}] нет строк OHLCV в БД для {len(times)} open_time")
         return
 
+    # получить precision_qty с TTL-кэшем
     pq = await prec_cache.get_precision_qty(pg_pool, symbol)
 
+    # прогнать и записать в Redis TS
     for r in rows:
         sym, open_time, o, h, l, c, v = r
         ts_ms = int(open_time.timestamp() * 1000)
@@ -120,9 +149,11 @@ async def process_symbol_interval(pg_pool, redis, symbol, interval, times):
             ts_safe_add(redis, f"bb:ts:{sym}:{interval}:v", ts_ms, v, {**labels, "field": "v"}),
         )
 
+    # отметить healed_ts для обработанных времён
     async with pg_pool.connection() as conn:
         await mark_gaps_healed_ts(conn, symbol, interval, times)
-    log.debug(f"[{symbol}] [{interval}] TS заполнен для {len(times)} точек")
+
+    log.info(f"[{symbol}] [{interval}] TS заполнен для {len(times)} точек (precision_qty={pq})")
 
 # 🔸 основной воркер (параллелизация по парам через семафор)
 async def run_feed_ts_filler_bb(pg_pool, redis):
@@ -138,14 +169,16 @@ async def run_feed_ts_filler_bb(pg_pool, redis):
 
     while True:
         try:
+            # выбрать пачку задач
             async with pg_pool.connection() as conn:
                 batch = await fetch_healed_db_batch(conn, limit=1000)
+
             if not batch:
                 await asyncio.sleep(2)
                 continue
 
             # группируем по (symbol, interval)
-            by_pair = {}
+            by_pair: dict[tuple[str, str], list[datetime]] = {}
             for sym, iv, ot in batch:
                 by_pair.setdefault((sym, iv), []).append(ot)
 

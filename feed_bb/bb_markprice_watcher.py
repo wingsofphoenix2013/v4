@@ -1,4 +1,4 @@
-# bb_markprice_watcher.py — общий WS для всех tickers.{symbol} (Bybit v5 linear) → bb:price:{symbol}
+# bb_markprice_watcher.py — общий WS для всех tickers.{symbol} (Bybit v5 linear) → bb:price:{symbol} (ограничение очереди WS, TTL-кэш precision, корректная отмена keepalive)
 
 # 🔸 Импорты и зависимости
 import os
@@ -18,20 +18,49 @@ BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/pu
 KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "20"))
 REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 
-# 🔸 Кеш точности цены
+# ограничение внутренней очереди клиента websockets (для контроля роста памяти)
+WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))
+
+# TTL кэширования precision (секунды)
+PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
+
+# 🔸 TTL-кэш (для precision)
+class _TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        self._data: dict[str, tuple[object, float]] = {}
+
+    # получить значение из кэша
+    def get(self, key: str):
+        item = self._data.get(key)
+        if not item:
+            return None
+        val, ts = item
+        now = asyncio.get_event_loop().time()
+        if now - ts > self.ttl:
+            self._data.pop(key, None)
+            return None
+        return val
+
+    # записать значение в кэш
+    def set(self, key: str, value):
+        self._data[key] = (value, asyncio.get_event_loop().time())
+
+# 🔸 Кеш точности цены (TTL)
 class PricePrecisionCache:
     def __init__(self):
-        self.pp = {}
+        self.pp = _TTLCache(PRECISION_CACHE_TTL_SEC)
 
     async def get(self, pg_pool, symbol: str) -> int:
-        if symbol in self.pp:
-            return self.pp[symbol]
+        cached = self.pp.get(symbol)
+        if cached is not None:
+            return cached
         async with pg_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT precision_price FROM tickers_bb WHERE symbol=%s", (symbol,))
                 row = await cur.fetchone()
         val = int(row[0]) if row and row[0] is not None else 0
-        self.pp[symbol] = val
+        self.pp.set(symbol, val)
         return val
 
 prec_price_cache = PricePrecisionCache()
@@ -41,7 +70,7 @@ def _ff(coro):
     t = asyncio.create_task(coro)
     t.add_done_callback(lambda fut: fut.exception())  # читаем исключение, чтобы подавить warn
     return t
-    
+
 # 🔸 Утилиты
 async def _load_active_symbols(pg_pool):
     try:
@@ -82,7 +111,7 @@ async def _send_unsub(ws, syms):
 
 # 🔸 Менеджер одного общего WS: подписка на все активные tickers.{symbol}
 async def run_markprice_watcher_bb(pg_pool, redis):
-    log.info("MARKPRICE watcher (Bybit) запущен — общий WS для всех символов")
+    log.info(f"MARKPRICE watcher (Bybit) запущен — общий WS для всех символов (WS_MAX_QUEUE={WS_MAX_QUEUE})")
 
     current = set()
     backoff = 1.0
@@ -114,7 +143,7 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                 BYBIT_WS_URL,
                 ping_interval=None,
                 close_timeout=5,
-                max_queue=None,
+                max_queue=WS_MAX_QUEUE,  # ограничиваем внутреннюю очередь клиента WS
                 open_timeout=10,
             ) as ws:
                 # первичная подписка на все активные
@@ -142,7 +171,8 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                             to_sub   = sorted(active2 - current)
                             if to_unsub:
                                 await _send_unsub(ws, to_unsub)
-                                for s in to_unsub: current.discard(s)
+                                for s in to_unsub:
+                                    current.discard(s)
                             if to_sub:
                                 await _send_sub(ws, to_sub)
                                 current.update(to_sub)
@@ -173,7 +203,12 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                         await redis.set(f"bb:price:{sym}", _round_down_price(price, pp))
 
                 finally:
+                    # корректно завершаем keepalive
                     ka.cancel()
+                    try:
+                        await ka
+                    except Exception:
+                        pass
 
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
             # ожидаемые сетевые обрывы — плавный реконнект с джиттером и полным ресабскрайбом

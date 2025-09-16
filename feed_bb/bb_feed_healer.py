@@ -1,4 +1,4 @@
-# bb_feed_healer.py — лечение пропусков (Bybit): читаем ohlcv_bb_gap, тянем REST klines (≤2 req/s) и вставляем в PG
+# bb_feed_healer.py — лечение пропусков (Bybit): читаем ohlcv_bb_gap, тянем REST klines (≤2 req/s) и вставляем в PG (исправлен вызов rate-limiter)
 
 # 🔸 Импорты и зависимости
 import os
@@ -62,7 +62,8 @@ _rate_limiter = _RateLimiter(GLOBAL_MIN_INTERVAL_SEC)
 
 # 🔸 Обёртка для GET с троттлингом и ретраями
 async def throttled_get_json(session: aiohttp.ClientSession, url: str, *, params: dict):
-    await _RateLimiter.wait(_rate_limiter)  # глобальный лимит
+    # исправлено: вызываем метод инстанса, а не класса
+    await _rate_limiter.wait()
     delay = RETRY_BASE_DELAY
     for attempt in range(1, RETRY_MAX_TRIES + 1):
         try:
