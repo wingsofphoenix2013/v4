@@ -1,16 +1,23 @@
-# indicator_healer.py — лечение пропусков индикаторов: пересчёт и дозапись в БД
+# indicator_healer.py — лечение пропусков индикаторов: пересчёт и дозапись в БД (Bybit / bb:ts:*)
 
 import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime
 
+# 🔸 Импорт вычислений снимков индикаторов
 from indicators.compute_and_store import compute_snapshot_values_async
 
+# 🔸 Логгер модуля
 log = logging.getLogger("IND_HEALER")
 
+# 🔸 Константы TF и глубины
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 REQUIRED_BARS_DEFAULT = 800
+
+# 🔸 Префикс временных рядов OHLCV в Redis (Bybit/feed_bb)
+BB_TS_PREFIX = "bb:ts"  # bb:ts:{symbol}:{interval}:{field}
+
 
 # 🔸 Выборка «дыр» со статусом found и группировка по (instance_id, symbol, timeframe)
 async def fetch_found_gaps_grouped(pg, limit_pairs: int = 1000):
@@ -41,6 +48,7 @@ async def fetch_found_gaps_grouped(pg, limit_pairs: int = 1000):
         result.append((iid, sym, tf, dict(by_time)))
     return result
 
+
 # 🔸 Данные инстанса: indicator, params, enabled_at, timeframe
 async def fetch_instance(pg, instance_id: int):
     async with pg.acquire() as conn:
@@ -63,14 +71,16 @@ async def fetch_instance(pg, instance_id: int):
         "params": params,
     }
 
-# 🔸 Точность тикера
+
+# 🔸 Точность тикера (Bybit)
 async def fetch_precision(pg, symbol: str) -> int:
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT precision_price FROM tickers_v4 WHERE symbol = $1",
+            "SELECT precision_price FROM tickers_bb WHERE symbol = $1",
             symbol,
         )
     return int(row["precision_price"]) if row and row["precision_price"] is not None else 8
+
 
 # 🔸 Оценка нужной глубины истории (в барах)
 def estimate_depth_bars(indicator: str, params: dict) -> int:
@@ -85,12 +95,13 @@ def estimate_depth_bars(indicator: str, params: dict) -> int:
     except Exception:
         return 200
 
-# 🔸 Загрузка OHLCV из Redis TS [start..end] по количеству баров
+
+# 🔸 Загрузка OHLCV из Redis TS [start..end] по количеству баров (Bybit префикс)
 async def load_ts_window(redis, symbol: str, interval: str, end_ts_ms: int, count: int):
     step_ms = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}[interval]
     start_ts = end_ts_ms - (count - 1) * step_ms
     fields = ["o", "h", "l", "c", "v"]
-    keys = {f: f"ts:{symbol}:{interval}:{f}" for f in fields}
+    keys = {f: f"{BB_TS_PREFIX}:{symbol}:{interval}:{f}" for f in fields}
     tasks = {f: redis.execute_command("TS.RANGE", keys[f], start_ts, end_ts_ms) for f in fields}
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
@@ -116,6 +127,7 @@ async def load_ts_window(redis, symbol: str, interval: str, end_ts_ms: int, coun
 
     return {"index": idx, "data": df}
 
+
 # 🔸 Вырезать срез по точному open_time
 def slice_until(df, end_ts_ms: int):
     idx = df["index"]
@@ -129,6 +141,7 @@ def slice_until(df, end_ts_ms: int):
     new_data = {k: v[: pos + 1] for k, v in df["data"].items()}
     return {"index": new_idx, "data": new_data}
 
+
 # 🔸 Преобразовать псевдо-DF в pandas.DataFrame
 def to_pandas(df_like):
     import pandas as pd
@@ -138,6 +151,7 @@ def to_pandas(df_like):
     out = pd.DataFrame(df_like["data"], index=ts_index)
     out.index.name = "open_time"
     return out
+
 
 # 🔸 Записать вылеченные параметры в БД и обновить статус gap
 async def write_healed(pg, instance_id: int, symbol: str, open_time: datetime, values: dict, missing_params: set):
@@ -183,9 +197,10 @@ async def write_healed(pg, instance_id: int, symbol: str, open_time: datetime, v
             )
     return len(to_insert)
 
+
 # 🔸 Основной воркер healer: пересчёт и дозапись в БД
 async def run_indicator_healer(pg, redis, pause_sec: int = 2):
-    log.info("HEALER индикаторов запущен")
+    log.info("IND_HEALER: лечение индикаторных пропусков запущено")
     sema = asyncio.Semaphore(4)
 
     while True:
@@ -194,6 +209,9 @@ async def run_indicator_healer(pg, redis, pause_sec: int = 2):
             if not groups:
                 await asyncio.sleep(pause_sec)
                 continue
+
+            total_groups = 0
+            total_inserted = 0
 
             for iid, sym, tf, by_time in groups:
                 try:
@@ -228,10 +246,18 @@ async def run_indicator_healer(pg, redis, pause_sec: int = 2):
                             values = await compute_snapshot_values_async(instance, sym, pdf, precision)
 
                         inserted = await write_healed(pg, iid, sym, ot, values, missing)
-                        log.info(f"[{sym}] [{tf}] inst={iid} {ot} — вылечено {inserted}/{len(missing)}")
+                        total_inserted += inserted
+                        # итог по конкретному бару
+                        log.info(f"IND_HEALER: [{sym}] [{tf}] inst={iid} {ot} — вылечено {inserted}/{len(missing)}")
+
+                    total_groups += 1
 
                 except Exception as e:
                     log.error(f"[{sym}] [{tf}] inst={iid} ошибка лечения: {e}", exc_info=True)
+
+            # агрегированный итог прохода
+            if total_groups:
+                log.info(f"IND_HEALER: обработано групп={total_groups}, вставлено значений={total_inserted}")
 
             await asyncio.sleep(pause_sec)
 
