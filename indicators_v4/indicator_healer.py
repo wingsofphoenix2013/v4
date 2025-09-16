@@ -200,7 +200,7 @@ async def write_healed(pg, instance_id: int, symbol: str, open_time: datetime, v
 
 # 🔸 Основной воркер healer: пересчёт и дозапись в БД
 async def run_indicator_healer(pg, redis, pause_sec: int = 2):
-    log.info("IND_HEALER: лечение индикаторных пропусков запущено")
+    log.debug("IND_HEALER: лечение индикаторных пропусков запущено")
     sema = asyncio.Semaphore(4)
 
     while True:
@@ -248,7 +248,7 @@ async def run_indicator_healer(pg, redis, pause_sec: int = 2):
                         inserted = await write_healed(pg, iid, sym, ot, values, missing)
                         total_inserted += inserted
                         # итог по конкретному бару
-                        log.info(f"IND_HEALER: [{sym}] [{tf}] inst={iid} {ot} — вылечено {inserted}/{len(missing)}")
+                        log.debug(f"IND_HEALER: [{sym}] [{tf}] inst={iid} {ot} — вылечено {inserted}/{len(missing)}")
 
                     total_groups += 1
 
@@ -257,7 +257,7 @@ async def run_indicator_healer(pg, redis, pause_sec: int = 2):
 
             # агрегированный итог прохода
             if total_groups:
-                log.info(f"IND_HEALER: обработано групп={total_groups}, вставлено значений={total_inserted}")
+                log.debug(f"IND_HEALER: обработано групп={total_groups}, вставлено значений={total_inserted}")
 
             await asyncio.sleep(pause_sec)
 

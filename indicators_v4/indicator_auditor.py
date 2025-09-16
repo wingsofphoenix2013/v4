@@ -90,7 +90,7 @@ async def insert_gaps(pg, gaps):
 
 # 🔸 Основной воркер аудитора
 async def run_indicator_auditor(pg, redis, window_hours: int = 12):
-    log.info("Аудитор индикаторов запущен (iv4_inserted)")
+    log.debug("Аудитор индикаторов запущен (iv4_inserted)")
 
     stream = "iv4_inserted"
     group = "ind_audit_group"

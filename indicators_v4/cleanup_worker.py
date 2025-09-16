@@ -104,7 +104,7 @@ async def trim_streams(redis):
 
 # 🔸 Основной воркер: запускает периодические задачи
 async def run_indicators_cleanup(pg, redis):
-    log.info("IND_CLEANUP: воркер запущен")
+    log.debug("IND_CLEANUP: воркер запущен")
     last_db = datetime.min
 
     while True:
@@ -115,7 +115,7 @@ async def run_indicators_cleanup(pg, redis):
 
             # итоговая инфо-метрика по проходу ретенции/стримам
             total_trimmed = sum(trim_stats.values())
-            log.info(
+            log.debug(
                 f"IND_CLEANUP: TS_RETENTION changed={changed}, full_pass={finished}; "
                 f"Streams trimmed total={total_trimmed} ({', '.join(f'{k}:{v}' for k,v in trim_stats.items())})"
             )
@@ -126,9 +126,9 @@ async def run_indicators_cleanup(pg, redis):
             if (now - last_db) >= timedelta(days=1):
                 deleted = await cleanup_db(pg)
                 if deleted is not None:
-                    log.info(f"IND_CLEANUP: DB purge indicator_values_v4 — deleted={deleted} rows (older than {DB_KEEP_DAYS}d)")
+                    log.debug(f"IND_CLEANUP: DB purge indicator_values_v4 — deleted={deleted} rows (older than {DB_KEEP_DAYS}d)")
                 else:
-                    log.info(f"IND_CLEANUP: DB purge indicator_values_v4 — completed (older than {DB_KEEP_DAYS}d)")
+                    log.debug(f"IND_CLEANUP: DB purge indicator_values_v4 — completed (older than {DB_KEEP_DAYS}d)")
                 last_db = now
 
             await asyncio.sleep(300)  # пауза 5 минут

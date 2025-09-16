@@ -88,7 +88,7 @@ async def write_ts_and_mark(pg, redis, instance_id: int, symbol: str, timeframe:
 
 # 🔸 Основной воркер TS-филлера
 async def run_indicator_ts_filler(pg, redis, pause_sec: int = 2):
-    log.info("TS_FILLER индикаторов запущен")
+    log.debug("TS_FILLER индикаторов запущен")
     while True:
         try:
             groups = await fetch_healed_db_gaps(pg)
@@ -106,7 +106,7 @@ async def run_indicator_ts_filler(pg, redis, pause_sec: int = 2):
                     rows_need = [r for r in rows if (r["open_time"], r["param_name"]) in need]
 
                     n = await write_ts_and_mark(pg, redis, iid, sym, tf, rows_need)
-                    log.info(f"[{sym}] [{tf}] inst={iid} TS заполнен для {n} точек")
+                    log.debug(f"[{sym}] [{tf}] inst={iid} TS заполнен для {n} точек")
 
                 except Exception as e:
                     log.error(f"[{sym}] [{tf}] inst={iid} ошибка TS_FILLER: {e}", exc_info=True)

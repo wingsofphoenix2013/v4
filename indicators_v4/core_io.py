@@ -15,7 +15,7 @@ async def run_core_io(pg, redis):
     # Попытка создать группу (если уже существует — игнорировать)
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
-        log.info(f"Consumer group '{group}' создана")
+        log.debug(f"Consumer group '{group}' создана")
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             log.error(f"Ошибка при создании группы: {e}")
