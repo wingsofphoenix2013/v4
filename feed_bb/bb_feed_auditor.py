@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 log = logging.getLogger("BB_FEED_AUDITOR")
 
 # 🔸 Параметры окна аудита
-WINDOW_HOURS = int(os.getenv("BB_AUDIT_WINDOW_HOURS", "720"))
+WINDOW_HOURS = int(os.getenv("BB_AUDIT_WINDOW_HOURS", "800"))
 
 # 🔸 Соответствие интервалов таблицам и шагам
 TABLE_MAP = {

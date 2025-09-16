@@ -12,7 +12,7 @@ log = logging.getLogger("BB_TS_FILLER")
 # 🔸 Конфиг/ENV
 TABLE_MAP = {"m5": "ohlcv_bb_m5", "m15": "ohlcv_bb_m15", "h1": "ohlcv_bb_h1"}
 TS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000  # ~60 дней
-PAIR_CONCURRENCY = int(os.getenv("BB_TS_FILLER_CONCURRENCY", "5"))  # параллельных пар (symbol, interval)
+PAIR_CONCURRENCY = int(os.getenv("BB_TS_FILLER_CONCURRENCY", "10"))  # параллельных пар (symbol, interval)
 PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
 
 # 🔸 безопасная запись одной точки в TS (создать ключ при отсутствии)
