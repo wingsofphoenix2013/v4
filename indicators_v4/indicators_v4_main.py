@@ -18,6 +18,7 @@ from indicators.compute_and_store import compute_and_store, compute_snapshot_val
 from cleanup_worker import run_indicators_cleanup
 from indicator_livestream import run_indicator_livestream
 from indicator_rsipostproc import run_indicator_rsipostproc
+from indicator_mfipostproc import run_indicator_mfipostproc
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -219,7 +220,7 @@ async def watch_ticker_updates(pg, redis):
                         removed_by_refresh += 1
 
                     # лог результата рефреша
-                    log.info(
+                    log.debug(
                         f"PRECISIONS_REFRESH: updated={refresh_updates}, new={new_symbols}, "
                         f"removed={removed_by_refresh}, active={len(active_tickers)}"
                     )
@@ -555,6 +556,7 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision, get_active_symbols),"IND_LIVESTREAM"),
         run_safe_loop(lambda: run_indicator_rsipostproc(pg, redis), "IND_RSI_POST"),
+        run_safe_loop(lambda: run_indicator_mfipostproc(pg, redis), "IND_MFI_POST"),
     )
 
 
