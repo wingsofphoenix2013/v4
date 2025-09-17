@@ -81,7 +81,6 @@ async def load_ohlcv_df(redis, symbol: str, tf: str, end_ts_ms: int, bars: int):
     df.index.name = "open_time"
     return df.sort_index()
 
-
 # 🔸 Менеджер циклов по (symbol, timeframe)
 class TFManager:
     def __init__(self, pg, redis, get_instances_by_tf, get_precision, get_active_symbols):
@@ -112,6 +111,9 @@ class TFManager:
             prev.cancel()
             try:
                 await prev
+            except asyncio.CancelledError:
+                # ожидаемая отмена — не считаем ошибкой
+                pass
             except Exception:
                 pass
 
@@ -128,6 +130,9 @@ class TFManager:
                 t.cancel()
                 try:
                     await t
+                except asyncio.CancelledError:
+                    # ожидаемая отмена — не считаем ошибкой
+                    pass
                 except Exception:
                     pass
                 log.info(f"[STOP] {key[0]}/{key[1]}: live-цикл остановлен")
@@ -224,7 +229,6 @@ class TFManager:
         except asyncio.CancelledError:
             log.info(f"[CANCEL:init] {symbol}/{tf}: live-цикл не запущен/остановлен на старте")
             return
-
 
 # 🔸 Основной воркер: слушает iv4_inserted и управляет циклами по (symbol, TF)
 async def run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision, get_active_symbols):
