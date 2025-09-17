@@ -17,6 +17,7 @@ from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
 from cleanup_worker import run_indicators_cleanup
 from indicator_livestream import run_indicator_livestream
+from indicator_rsipostproc import run_indicator_rsipostproc
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -553,6 +554,7 @@ async def main():
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision, get_active_symbols),"IND_LIVESTREAM"),
+        run_safe_loop(lambda: run_indicator_rsipostproc(pg, redis), "IND_RSI_POST"),
     )
 
 

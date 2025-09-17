@@ -1,4 +1,4 @@
-# indicator_livestream.py — воркер «живых» значений индикаторов (ind_live:*) по (symbol, TF), тик раз в 60с, TTL=90с
+# indicator_livestream.py — воркер «живых» значений индикаторов: вычисляет по (symbol, TF) раз в 60с, публикует батч в Stream и (опционально) пишет KV
 
 import asyncio
 import json
@@ -17,17 +17,21 @@ log = logging.getLogger("IND_LIVESTREAM")
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 STEP_MS  = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 
-LIVE_TICK_SEC   = 60        # период live-обновления
-LIVE_TTL_SEC    = 90        # TTL ind_live:* (с запасом > периода)
-LIVE_DEPTH_BARS = 800       # запас истории для расчёта «живых» индикаторов
+LIVE_TICK_SEC    = 60       # период live-обновления
+LIVE_TTL_SEC     = 90       # TTL ind_live:* (если включено KV)
+LIVE_DEPTH_BARS  = 800      # глубина истории для live-расчётов
 LIVE_CONCURRENCY = 10       # семафор параллельных вычислений по инстансам TF
 
-# 🔸 Префиксы хранилищ
-BB_TS_PREFIX     = "bb:ts"       # bb:ts:{symbol}:{interval}:{field}
-IND_LIVE_PREFIX  = "ind_live"    # ind_live:{symbol}:{tf}:{param}
+# 🔸 Публикация live в Stream и/или в KV
+LIVE_PUBLISH_STREAM = True                # XADD в indicator_live_stream (для всех последующих постпроцессоров)
+LIVE_WRITE_KV       = False               # писать ind_live:* (обычно False, чтобы не дублировать хранение)
 
+# 🔸 Имена и префиксы хранилищ
+BB_TS_PREFIX      = "bb:ts"               # bb:ts:{symbol}:{interval}:{field}
+IND_LIVE_PREFIX   = "ind_live"            # ind_live:{symbol}:{tf}:{param}
+LIVE_STREAM_NAME  = "indicator_live_stream"  # Stream с батч-событиями по (symbol, TF)
 
-# 🔸 Вспомогательные: вычисление начала бара и текущее время в мс (UTC)
+# 🔸 Вспомогательные: вычисление начала бара (UTC, мс)
 def floor_to_bar(ts_ms: int, tf: str) -> int:
     step = STEP_MS[tf]
     return (ts_ms // step) * step
@@ -45,10 +49,7 @@ async def load_ohlcv_df(redis, symbol: str, tf: str, end_ts_ms: int, bars: int):
     keys = {f: f"{BB_TS_PREFIX}:{symbol}:{tf}:{f}" for f in fields}
 
     # один батч на 5 TS.RANGE
-    tasks = {
-        f: redis.execute_command("TS.RANGE", keys[f], start_ts, end_ts_ms)
-        for f in fields
-    }
+    tasks = {f: redis.execute_command("TS.RANGE", keys[f], start_ts, end_ts_ms) for f in fields}
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
     series = {}
@@ -80,6 +81,7 @@ async def load_ohlcv_df(redis, symbol: str, tf: str, end_ts_ms: int, bars: int):
 
     df.index.name = "open_time"
     return df.sort_index()
+
 
 # 🔸 Менеджер циклов по (symbol, timeframe)
 class TFManager:
@@ -131,23 +133,21 @@ class TFManager:
                 try:
                     await t
                 except asyncio.CancelledError:
-                    # ожидаемая отмена — не считаем ошибкой
                     pass
                 except Exception:
                     pass
                 log.debug(f"[STOP] {key[0]}/{key[1]}: live-цикл остановлен")
 
     async def _tf_loop(self, symbol: str, tf: str):
-        # начальная задержка: 60с после «закрытого» (привязка фазы к событию)
+        # без начальной задержки: первый live-тик выполняем сразу после перезапуска по iv4_inserted
         try:
-            await asyncio.sleep(LIVE_TICK_SEC)
             sem = asyncio.Semaphore(LIVE_CONCURRENCY)
 
             while True:
                 t0 = time.monotonic()
 
                 try:
-                    # проверка активности символа (если у нас есть такой список)
+                    # проверка активности символа
                     if symbol not in set(self.get_active_symbols()):
                         log.debug(f"[SKIP] {symbol}/{tf}: символ неактивен")
                         await asyncio.sleep(LIVE_TICK_SEC)
@@ -179,42 +179,70 @@ class TFManager:
                     async def run_one(inst):
                         # вычисление снапшота индикатора по текущему df
                         async with sem:
-                            return inst["id"], await compute_snapshot_values_async(inst, symbol, df, precision)
+                            return inst["id"], inst["indicator"], inst["params"], await compute_snapshot_values_async(inst, symbol, df, precision)
 
                     t_comp0 = time.monotonic()
                     results = await asyncio.gather(*[run_one(inst) for inst in instances], return_exceptions=True)
                     t_comp1 = time.monotonic()
 
-                    # 4) запись ind_live:* (одним pipeline)
-                    pipe = self.redis.pipeline()
-                    params_written = 0
+                    # собрать батч для Stream: только валидные результаты
+                    instances_payload = []
+                    params_written = 0  # будет >0 только если включим KV
 
-                    for item in results:
-                        if isinstance(item, Exception):
+                    for res in results:
+                        if isinstance(res, Exception):
                             continue
-                        iid, values = item
+                        iid, indicator, params, values = res
                         if not values:
                             continue
-                        for pname, sval in values.items():
-                            rkey = f"{IND_LIVE_PREFIX}:{symbol}:{tf}:{pname}"
-                            # запись значения с TTL=90с
-                            pipe.set(rkey, sval, ex=LIVE_TTL_SEC)
-                            params_written += 1
+                        instances_payload.append({
+                            "instance_id": iid,
+                            "indicator": indicator,
+                            "params": params,
+                            "values": values,  # dict param_name -> строковое значение
+                        })
 
-                    t_write0 = time.monotonic()
-                    if params_written > 0:
-                        await pipe.execute()
-                    t_write1 = time.monotonic()
+                    # 4a) публикация в Stream (один XADD на тик по (symbol, TF))
+                    t_pub0 = time.monotonic()
+                    if LIVE_PUBLISH_STREAM and instances_payload:
+                        try:
+                            await self.redis.xadd(LIVE_STREAM_NAME, {
+                                "symbol": symbol,
+                                "timeframe": tf,
+                                "tick_open_time": datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat(),
+                                "instances": json.dumps(instances_payload),
+                                "precision": str(precision),
+                            })
+                        except Exception as e:
+                            log.warning(f"[STREAM] XADD {LIVE_STREAM_NAME} error for {symbol}/{tf}: {e}")
+                    t_pub1 = time.monotonic()
+
+                    # 4b) (опционально) запись ind_live:* (одним pipeline), если включено LIVE_WRITE_KV
+                    t_write0 = t_write1 = time.monotonic()
+                    if LIVE_WRITE_KV and instances_payload:
+                        pipe = self.redis.pipeline()
+                        for item in instances_payload:
+                            values = item.get("values") or {}
+                            for pname, sval in values.items():
+                                rkey = f"{IND_LIVE_PREFIX}:{symbol}:{tf}:{pname}"
+                                pipe.set(rkey, sval, ex=LIVE_TTL_SEC)
+                                params_written += 1
+                        t_write0 = time.monotonic()
+                        if params_written > 0:
+                            await pipe.execute()
+                        t_write1 = time.monotonic()
 
                     # 5) лог итога тика
                     fetch_ms  = int((t_fetch1 - t_fetch0) * 1000)
                     comp_ms   = int((t_comp1  - t_comp0) * 1000)
+                    pub_ms    = int((t_pub1   - t_pub0) * 1000) if LIVE_PUBLISH_STREAM and instances_payload else 0
                     write_ms  = int((t_write1 - t_write0) * 1000) if params_written > 0 else 0
                     total_ms  = int((time.monotonic() - t0) * 1000)
 
                     log.debug(
-                        f"[LIVE] {symbol}/{tf}: instances={len(instances)}, params_written={params_written}, "
-                        f"fetch_ms={fetch_ms}, compute_ms={comp_ms}, write_ms={write_ms}, total_ms={total_ms}"
+                        f"[LIVE] {symbol}/{tf}: instances={len(instances_payload)}/{len(instances)}, "
+                        f"stream_ms={pub_ms}, kv_params={params_written}, fetch_ms={fetch_ms}, "
+                        f"compute_ms={comp_ms}, write_ms={write_ms}, total_ms={total_ms}"
                     )
 
                 except asyncio.CancelledError:
@@ -229,6 +257,7 @@ class TFManager:
         except asyncio.CancelledError:
             log.debug(f"[CANCEL:init] {symbol}/{tf}: live-цикл не запущен/остановлен на старте")
             return
+
 
 # 🔸 Основной воркер: слушает iv4_inserted и управляет циклами по (symbol, TF)
 async def run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision, get_active_symbols):
@@ -319,7 +348,6 @@ async def run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision
                     try:
                         await mgr.start_or_restart(symbol, interval)
                     except asyncio.CancelledError:
-                        # ожидаемая отмена предыдущей задачи при перезапуске
                         pass
 
                 except Exception as e:
