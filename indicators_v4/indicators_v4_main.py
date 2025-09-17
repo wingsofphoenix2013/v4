@@ -20,6 +20,7 @@ from indicator_livestream import run_indicator_livestream
 from indicator_rsipostproc import run_indicator_rsipostproc
 from indicator_mfipostproc import run_indicator_mfipostproc
 from indicator_bbpostproc import run_indicator_bbpostproc
+from indicator_lrpostproc import run_indicator_lrpostproc
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -559,6 +560,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_rsipostproc(pg, redis), "IND_RSI_POST"),
         run_safe_loop(lambda: run_indicator_mfipostproc(pg, redis), "IND_MFI_POST"),
         run_safe_loop(lambda: run_indicator_bbpostproc(pg, redis), "IND_BB_POST"),
+        run_safe_loop(lambda: run_indicator_lrpostproc(pg, redis), "IND_LR_POST"),
     )
 
 

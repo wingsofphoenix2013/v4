@@ -14,7 +14,7 @@ GROUP_NAME       = "rsi_post_group"            # consumer-group для этог�
 CONSUMER_NAME    = "rsi_post_1"
 
 # 🔸 TTL для композитного live-ключа (сек)
-LIVE_TTL_SEC = 90
+LIVE_TTL_SEC = 30
 
 # 🔸 Порог «мертвого коридора» (эпсилон) на шкале RSI (в пунктах RSI)
 EPSILON_BY_TF = {
