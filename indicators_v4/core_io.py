@@ -26,8 +26,8 @@ async def run_core_io(pg, redis):
                 groupname=group,
                 consumername=consumer,
                 streams={stream: ">"},
-                count=50,
-                block=1000
+                count=1000,
+                block=500
             )
             if not response:
                 continue
