@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 
 # 🔸 Логгер модуля
@@ -157,8 +158,8 @@ async def run_indicator_lrpostproc(pg, redis):
                 groupname=GROUP_NAME,
                 consumername=CONSUMER_NAME,
                 streams={LIVE_STREAM_NAME: ">"},
-                count=100,
-                block=2000
+                count=1000,
+                block=200
             )
             if not resp:
                 continue
@@ -169,23 +170,48 @@ async def run_indicator_lrpostproc(pg, redis):
 
             for _, messages in resp:
                 for msg_id, data in messages:
+                    # таймер обработки одного сообщения (одного tОpen по конкретному symbol/tf)
+                    t_msg0 = time.monotonic()
+
                     to_ack.append(msg_id)
+                    p_processed = 0
+                    p_written = 0
+
                     try:
                         symbol = data.get("symbol")
                         tf = data.get("timeframe")
                         tick_open_iso = data.get("tick_open_time")
                         instances_raw = data.get("instances")
                         if not symbol or tf not in STEP_MS or not instances_raw:
+                            # финальный лог по сообщению
+                            t_msg1 = time.monotonic()
+                            log.info(
+                                f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
+                                f"processed={p_processed} written={p_written} "
+                                f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
+                            )
                             continue
 
                         try:
                             instances = json.loads(instances_raw) if isinstance(instances_raw, str) else instances_raw
                         except Exception:
+                            t_msg1 = time.monotonic()
+                            log.info(
+                                f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
+                                f"processed={p_processed} written={p_written} "
+                                f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
+                            )
                             continue
 
                         # берём только LR-инстансы
                         lr_items = [x for x in instances if str(x.get("indicator")) == "lr"]
                         if not lr_items:
+                            t_msg1 = time.monotonic()
+                            log.info(
+                                f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
+                                f"processed={p_processed} written={p_written} "
+                                f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
+                            )
                             continue
 
                         # время последнего закрытого бара
@@ -264,21 +290,31 @@ async def run_indicator_lrpostproc(pg, redis):
 
                             pipe.set(lr_pack_key(symbol, tf, base), json.dumps(pack), ex=LIVE_TTL_SEC)
                             writes += 1
-                            total_processed += 1
+                            p_processed += 1
 
                         if writes:
                             await pipe.execute()
-                            total_written += writes
+                            p_written += writes
 
-                    # условия достаточности и защита цикла
+                        total_processed += p_processed
+                        total_written += p_written
+
                     except Exception as e:
                         log.warning(f"[LR_POST] обработка записи ошиблась: {e}", exc_info=True)
+
+                    # финальный лог по одному сообщению
+                    t_msg1 = time.monotonic()
+                    log.info(
+                        f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
+                        f"processed={p_processed} written={p_written} "
+                        f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
+                    )
 
             if to_ack:
                 await redis.xack(LIVE_STREAM_NAME, GROUP_NAME, *to_ack)
 
             if total_processed or total_written:
-                log.info(f"IND_LR_POST: processed={total_processed}, written={total_written}")
+                log.debug(f"IND_LR_POST: processed_total={total_processed}, written_total={total_written}")
 
         except Exception as e:
             log.error(f"IND_LR_POST loop error: {e}", exc_info=True)
