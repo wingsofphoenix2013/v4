@@ -18,7 +18,7 @@ CONSUMER_NAME    = "lr_post_1"
 STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 
 # 🔸 TTL композитного live-ключа (сек)
-LIVE_TTL_SEC = 30
+LIVE_TTL_SEC = 90
 
 # 🔸 Порог «такой же угол»: относительное изменение <= 5%
 ANGLE_FLAT_REL = 0.05
@@ -185,7 +185,7 @@ async def run_indicator_lrpostproc(pg, redis):
                         if not symbol or tf not in STEP_MS or not instances_raw:
                             # финальный лог по сообщению
                             t_msg1 = time.monotonic()
-                            log.info(
+                            log.debug(
                                 f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
                                 f"processed={p_processed} written={p_written} "
                                 f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
@@ -196,7 +196,7 @@ async def run_indicator_lrpostproc(pg, redis):
                             instances = json.loads(instances_raw) if isinstance(instances_raw, str) else instances_raw
                         except Exception:
                             t_msg1 = time.monotonic()
-                            log.info(
+                            log.debug(
                                 f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
                                 f"processed={p_processed} written={p_written} "
                                 f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
@@ -207,7 +207,7 @@ async def run_indicator_lrpostproc(pg, redis):
                         lr_items = [x for x in instances if str(x.get("indicator")) == "lr"]
                         if not lr_items:
                             t_msg1 = time.monotonic()
-                            log.info(
+                            log.debug(
                                 f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
                                 f"processed={p_processed} written={p_written} "
                                 f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"
@@ -304,7 +304,7 @@ async def run_indicator_lrpostproc(pg, redis):
 
                     # финальный лог по одному сообщению
                     t_msg1 = time.monotonic()
-                    log.info(
+                    log.debug(
                         f"[DONE] IND_LR_POST {symbol}/{tf} tick={tick_open_iso} "
                         f"processed={p_processed} written={p_written} "
                         f"elapsed_ms={int((t_msg1 - t_msg0)*1000)}"

@@ -17,8 +17,8 @@ log = logging.getLogger("IND_LIVESTREAM")
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 STEP_MS  = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 
-LIVE_TICK_SEC    = 15       # период live-обновления
-LIVE_TTL_SEC     = 30       # TTL ind_live:* (если включено KV)
+LIVE_TICK_SEC    = 30       # период live-обновления
+LIVE_TTL_SEC     = 90       # TTL ind_live:* (если включено KV)
 LIVE_DEPTH_BARS  = 800      # глубина истории для live-расчётов
 LIVE_CONCURRENCY = 30       # семафор параллельных вычислений по инстансам TF
 
