@@ -119,7 +119,7 @@ class TFManager:
 
         task = asyncio.create_task(self._tf_loop(symbol, tf))
         self.tasks[key] = task
-        log.info(f"[START] {symbol}/{tf}: live-цикл запущен (первый тик через {LIVE_TICK_SEC}s)")
+        log.debug(f"[START] {symbol}/{tf}: live-цикл запущен (первый тик через {LIVE_TICK_SEC}s)")
 
     async def stop_symbol(self, symbol: str):
         # остановить все TF по символу
@@ -135,7 +135,7 @@ class TFManager:
                     pass
                 except Exception:
                     pass
-                log.info(f"[STOP] {key[0]}/{key[1]}: live-цикл остановлен")
+                log.debug(f"[STOP] {key[0]}/{key[1]}: live-цикл остановлен")
 
     async def _tf_loop(self, symbol: str, tf: str):
         # начальная задержка: 60с после «закрытого» (привязка фазы к событию)
@@ -149,7 +149,7 @@ class TFManager:
                 try:
                     # проверка активности символа (если у нас есть такой список)
                     if symbol not in set(self.get_active_symbols()):
-                        log.info(f"[SKIP] {symbol}/{tf}: символ неактивен")
+                        log.debug(f"[SKIP] {symbol}/{tf}: символ неактивен")
                         await asyncio.sleep(LIVE_TICK_SEC)
                         continue
 
@@ -162,14 +162,14 @@ class TFManager:
                     t_fetch1 = time.monotonic()
 
                     if df is None or df.empty:
-                        log.info(f"[SKIP] {symbol}/{tf}: нет данных OHLCV для live-тика")
+                        log.debug(f"[SKIP] {symbol}/{tf}: нет данных OHLCV для live-тика")
                         await asyncio.sleep(LIVE_TICK_SEC)
                         continue
 
                     # 2) список инстансов TF (из in-memory кэша)
                     instances = self.get_instances_by_tf(tf)
                     if not instances:
-                        log.info(f"[SKIP] {symbol}/{tf}: нет активных инстансов TF")
+                        log.debug(f"[SKIP] {symbol}/{tf}: нет активных инстансов TF")
                         await asyncio.sleep(LIVE_TICK_SEC)
                         continue
 
@@ -212,13 +212,13 @@ class TFManager:
                     write_ms  = int((t_write1 - t_write0) * 1000) if params_written > 0 else 0
                     total_ms  = int((time.monotonic() - t0) * 1000)
 
-                    log.info(
+                    log.debug(
                         f"[LIVE] {symbol}/{tf}: instances={len(instances)}, params_written={params_written}, "
                         f"fetch_ms={fetch_ms}, compute_ms={comp_ms}, write_ms={write_ms}, total_ms={total_ms}"
                     )
 
                 except asyncio.CancelledError:
-                    log.info(f"[CANCEL] {symbol}/{tf}: live-цикл остановлен")
+                    log.debug(f"[CANCEL] {symbol}/{tf}: live-цикл остановлен")
                     return
                 except Exception as e:
                     log.warning(f"[ERR] {symbol}/{tf}: ошибка live-обновления: {e}", exc_info=True)
@@ -227,7 +227,7 @@ class TFManager:
                 await asyncio.sleep(LIVE_TICK_SEC)
 
         except asyncio.CancelledError:
-            log.info(f"[CANCEL:init] {symbol}/{tf}: live-цикл не запущен/остановлен на старте")
+            log.debug(f"[CANCEL:init] {symbol}/{tf}: live-цикл не запущен/остановлен на старте")
             return
 
 # 🔸 Основной воркер: слушает iv4_inserted и управляет циклами по (symbol, TF)
@@ -247,6 +247,26 @@ async def run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision
         if "BUSYGROUP" not in str(e):
             log.warning(f"xgroup_create error: {e}")
 
+    # 🔸 БУТСТРАП: стартуем live-циклы для всех активных символов и TF с инстансами (первый тик через 60с)
+    try:
+        symbols = get_active_symbols()
+        tfs_with_instances = [tf for tf in ("m5", "m15", "h1") if get_instances_by_tf(tf)]
+        started = 0
+        for tf in tfs_with_instances:
+            for sym in symbols:
+                try:
+                    await mgr.start_or_restart(sym, tf)  # _tf_loop сам ждёт 60с перед первым тиком
+                    started += 1
+                except asyncio.CancelledError:
+                    # ожидаемая отмена при перезапуске — игнорируем
+                    pass
+        log.debug(f"[BOOT] live-циклы запущены: symbols={len(symbols)}, tfs={tfs_with_instances}, tasks={started}")
+    except Exception as e:
+        log.warning(f"[BOOT] ошибка инициализации live-циклов: {e}", exc_info=True)
+
+    # 🔸 Антидребезг: запоминаем последний open_time по (symbol, TF), чтобы не перезапускать цикл на тот же бар
+    last_open_time: dict[tuple[str, str], datetime] = {}
+
     while True:
         try:
             resp = await redis.xreadgroup(group, consumer, streams={stream: ">"}, count=200, block=2000)
@@ -254,6 +274,7 @@ async def run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision
                 continue
 
             to_ack = []
+            latest: dict[tuple[str, str], datetime | None] = {}  # (symbol, interval) -> max(open_time) или None
 
             for _, messages in resp:
                 for msg_id, data in messages:
@@ -261,16 +282,48 @@ async def run_indicator_livestream(pg, redis, get_instances_by_tf, get_precision
                     try:
                         symbol = data.get("symbol")
                         interval = data.get("interval")  # m5/m15/h1
+                        open_time_iso = data.get("open_time")
 
                         # минимальная валидация
                         if not symbol or interval not in STEP_MIN:
                             continue
 
-                        # запуск/перезапуск цикла по (symbol, TF)
-                        await mgr.start_or_restart(symbol, interval)
+                        # берём самый свежий open_time в батче для каждой пары (symbol, TF)
+                        key = (symbol, interval)
+                        ot = None
+                        if open_time_iso:
+                            try:
+                                ot = datetime.fromisoformat(open_time_iso)
+                            except Exception:
+                                ot = None
+
+                        if key not in latest:
+                            latest[key] = ot
+                        else:
+                            if ot is not None:
+                                if latest[key] is None or ot > latest[key]:
+                                    latest[key] = ot
 
                     except Exception as e:
                         log.warning(f"[STREAM] parse iv4_inserted error: {e}")
+
+            # запуск/перезапуск не чаще одного раза на бар и одну пару (symbol, TF)
+            for (symbol, interval), ot in latest.items():
+                try:
+                    # если это тот же бар, который уже перезапускали — пропускаем
+                    if ot is not None and last_open_time.get((symbol, interval)) == ot:
+                        continue
+                    if ot is not None:
+                        last_open_time[(symbol, interval)] = ot
+
+                    try:
+                        await mgr.start_or_restart(symbol, interval)
+                    except asyncio.CancelledError:
+                        # ожидаемая отмена предыдущей задачи при перезапуске
+                        pass
+
+                except Exception as e:
+                    log.warning(f"[STREAM] start_or_restart error for {symbol}/{interval}: {e}")
 
             if to_ack:
                 await redis.xack(stream, group, *to_ack)
