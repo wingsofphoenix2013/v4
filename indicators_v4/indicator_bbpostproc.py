@@ -82,28 +82,35 @@ def classify_bw_trend(rel_diff: float, eps: float) -> str:
     return "stable"
 
 def compute_bucket_12(price: float, lower: float, upper: float) -> int | None:
-    # 12 корзин: 0..11 (2 над, 8 внутри, 2 под); крайние при экстремумах
     width = upper - lower
     if width <= 0:
         return None
+
     seg = width / 8.0
     top1 = upper + seg
     top2 = upper + 2 * seg
     bot1 = lower - seg
     bot2 = lower - 2 * seg
 
+    # над полосой: 0 (крайняя), 1 (обычная)
     if price >= top2:
         return 0
     if price >= upper:  # [upper, top2)
         return 1
-    if price >= lower:  # внутри полосы
-        k = int((price - lower) // seg)  # 0..7
-        # на случай граничного попадания в upper из-за численной ошибки
-        k = clamp(k, 0, 7)
-        return 2 + int(k)
+
+    # внутри полосы: 8 сегментов сверху вниз → 2..9
+    if price >= lower:  # [lower, upper)
+        # 0..7: 0 — самый верхний внутренний сегмент (непосредственно под upper)
+        k = int((upper - price) // seg)
+        if k < 0:
+            k = 0
+        if k > 7:
+            k = 7
+        return 2 + k  # 2..9
+
+    # под полосой: 10 (обычная), 11 (крайняя)
     if price >= bot1:  # [bot1, lower)
         return 10
-    # ниже bot2 → 11
     return 11
 
 async def fetch_mark_or_last_close(redis, symbol: str, tf: str) -> float | None:
