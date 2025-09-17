@@ -162,7 +162,7 @@ async def run_indicator_rsipostproc(pg, redis):
                 await redis.xack(LIVE_STREAM_NAME, GROUP_NAME, *to_ack)
 
             if total_processed or total_written:
-                log.info(f"IND_RSI_POST: processed={total_processed}, written={total_written}")
+                log.debug(f"IND_RSI_POST: processed={total_processed}, written={total_written}")
 
         except Exception as e:
             log.error(f"IND_RSI_POST loop error: {e}", exc_info=True)
