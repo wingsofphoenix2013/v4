@@ -1,4 +1,4 @@
-# indicator_gateway.py — on-demand координатор (RSI + MFI + BB + LR) c параллельной обработкой сообщений
+# indicator_gateway.py — on-demand координатор (RSI + MFI + BB + LR + ATR) c параллельной обработкой сообщений
 
 import asyncio
 import json
@@ -10,6 +10,7 @@ from packs.rsi_pack import build_rsi_pack
 from packs.mfi_pack import build_mfi_pack
 from packs.bb_pack  import build_bb_pack
 from packs.lr_pack  import build_lr_pack
+from packs.atr_pack import build_atr_pack
 from packs.pack_utils import floor_to_bar
 
 log = logging.getLogger("IND_GATEWAY")
@@ -34,16 +35,17 @@ def public_key(indicator: str, symbol: str, tf: str, base: str) -> str:
         return f"bbpos_pack:{symbol}:{tf}:{base}"
     if indicator == "lr":
         return f"lrpos_pack:{symbol}:{tf}:{base}"
+    if indicator == "atr":
+        return f"atr_pack:{symbol}:{tf}:{base}"
     return f"{indicator}_pack:{symbol}:{tf}:{base}"
 
-# 🔸 Разбор std из строки запроса (2 знака точности)
 def parse_std(std_raw) -> float | None:
     try:
         return round(float(std_raw), 2)
     except Exception:
         return None
 
-# 🔸 Основной воркер gateway (RSI + MFI + BB + LR)
+# 🔸 Основной воркер gateway (RSI + MFI + BB + LR + ATR)
 async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, compute_snapshot_values_async):
     log.debug("IND_GATEWAY: воркер запущен")
 
@@ -60,7 +62,6 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
     sem = asyncio.Semaphore(GATEWAY_CONCURRENCY)
 
     async def process_one(msg_id: str, data: dict) -> str | None:
-        """Обработка одного сообщения; возвращает msg_id для ACK или None при фатальной ошибке парсинга."""
         async with sem:
             t0 = time.monotonic()
             try:
@@ -71,15 +72,14 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 std_s    = data.get("std")
                 ts_raw   = data.get("timestamp_ms")
 
-                # валидация запроса
-                if not symbol or tf not in ("m5","m15","h1") or ind not in ("rsi","mfi","bb","lr"):
+                # валидация
+                if not symbol or tf not in ("m5","m15","h1") or ind not in ("rsi","mfi","bb","lr","atr"):
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "bad_request"})
                     return msg_id
 
                 now_ms = int(ts_raw) if ts_raw else int(datetime.utcnow().timestamp() * 1000)
                 bar_open_ms = floor_to_bar(now_ms, tf)
 
-                # активные инстансы по TF/типу
                 instances = [i for i in get_instances_by_tf(tf) if i["indicator"] == ind]
                 if not instances:
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"instance_not_found"})
@@ -88,7 +88,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 precision = get_precision(symbol) or 8
                 results = []
 
-                # ── RSI / MFI ───────────────────────────────────────────────────────
+                # 🔸 RSI / MFI
                 if ind in ("rsi", "mfi"):
                     if length_s:
                         try:
@@ -126,7 +126,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                             await redis.set(pkey, js, ex=LIVE_TTL_SEC)
                             results.append(pack)
 
-                # ── BB ──────────────────────────────────────────────────────────────
+                # 🔸 BB
                 elif ind == "bb":
                     # собрать активные (length,std)
                     active_pairs = []
@@ -189,20 +189,14 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                             await redis.set(pkey, js, ex=LIVE_TTL_SEC)
                             results.append(pack)
 
-                # ── LR ──────────────────────────────────────────────────────────────
-                else:  # ind == "lr"
+                # 🔸 LR
+                elif ind == "lr":
                     if length_s:
                         try:
                             L = int(length_s)
                         except Exception:
                             await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_length"})
                             return msg_id
-                    else:
-                        # все активные длины
-                        L = None
-
-                    # определить список длин
-                    if L is not None:
                         if not any(int(i["params"]["length"]) == L for i in instances):
                             await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"instance_not_found"})
                             return msg_id
@@ -230,7 +224,42 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                             await redis.set(pkey, js, ex=LIVE_TTL_SEC)
                             results.append(pack)
 
-                # ── Ответ по сообщению ─────────────────────────────────────────────
+                # 🔸 ATR
+                else:  # ind == "atr"
+                    if length_s:
+                        try:
+                            L = int(length_s)
+                        except Exception:
+                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_length"})
+                            return msg_id
+                        if not any(int(i["params"]["length"]) == L for i in instances):
+                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"instance_not_found"})
+                            return msg_id
+                        lengths = [L]
+                    else:
+                        lengths = sorted({int(i["params"]["length"]) for i in instances})
+
+                    for L in lengths:
+                        base = f"atr{L}"
+                        ckey = cache_key(ind, symbol, tf, base, bar_open_ms)
+                        pkey = public_key(ind, symbol, tf, base)
+
+                        cached = await redis.get(ckey)
+                        if cached:
+                            try:
+                                results.append(json.loads(cached))
+                                continue
+                            except Exception:
+                                pass
+
+                        pack = await build_atr_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
+                        if pack:
+                            js = json.dumps(pack)
+                            await redis.set(ckey, js, ex=LIVE_TTL_SEC)
+                            await redis.set(pkey, js, ex=LIVE_TTL_SEC)
+                            results.append(pack)
+
+                # 🔸 Ответ
                 if results:
                     await redis.xadd(RESP_STREAM, {
                         "req_id": msg_id,
@@ -253,9 +282,9 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "exception"})
                 except Exception:
                     pass
-                return msg_id  # всё равно ACK, чтобы не клинило очередь
+                return msg_id
 
-    # 🔸 Основной цикл чтения стрима: читаем пачку, обрабатываем параллельно, ACK батчем
+    # 🔸 Основной цикл чтения стрима
     while True:
         try:
             resp = await redis.xreadgroup(
