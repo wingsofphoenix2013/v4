@@ -1,4 +1,4 @@
-# packs/ema_pack.py — on-demand построитель пакета EMA (позиция цены vs EMA и динамика удаляется/стабильна/приближается)
+# packs/ema_pack.py — on-demand построитель пакета EMA (позиция цены vs EMA и динамики: strict + smooth)
 
 import logging
 from .pack_utils import (
@@ -18,8 +18,12 @@ MOVE_EPS_PCT = {   # антидребезг по изменению дистан
     "h1":  0.10,
 }
 
+# 🔸 Smooth: сколько закрытых баров учитывать в среднем |d|
+SMOOTH_N = {"m5": 10, "m15": 6, "h1": 4}
+
 # 🔸 KV/TS префиксы
 IND_KV_PREFIX = "ind"     # ind:{symbol}:{tf}:{param_name}
+TS_IND_PREFIX = "ts_ind"  # ts_ind:{symbol}:{tf}:{param_name}
 BB_TS_PREFIX  = "bb:ts"   # bb:ts:{symbol}:{tf}:c
 MARK_PRICE    = "bb:price:{symbol}"
 
@@ -59,14 +63,53 @@ async def fetch_closed_ema(redis, symbol: str, tf: str, length: int) -> float | 
     except Exception:
         return None
 
-# 🔸 Классификация динамики EMA (7 состояний)
+# 🔸 История закрытых EMA и CLOSE за N баров → среднее |d| (в %)
+async def fetch_mean_abs_d(redis, symbol: str, tf: str, length: int, last_closed_ms: int, n: int) -> float | None:
+    """
+    mean(|d|), d = (Close - EMA)/EMA * 100, по N закрытым барам [last-N+1 .. last]
+    """
+    if n <= 0:
+        return None
+    step = STEP_MS[tf]
+    start = last_closed_ms - (n - 1) * step
+    try:
+        ema_series = await redis.execute_command(
+            "TS.RANGE", f"{TS_IND_PREFIX}:{symbol}:{tf}:ema{length}", start, last_closed_ms
+        )
+        close_series = await redis.execute_command(
+            "TS.RANGE", f"{BB_TS_PREFIX}:{symbol}:{tf}:c", start, last_closed_ms
+        )
+        if not ema_series or not close_series:
+            return None
+        ema_map = {int(ts): float(v) for ts, v in ema_series}
+        close_map = {int(ts): float(v) for ts, v in close_series}
+        xs = sorted(set(ema_map.keys()) & set(close_map.keys()))
+        if not xs:
+            return None
+        vals = []
+        for t in xs:
+            ema_v = ema_map.get(t)
+            c_v = close_map.get(t)
+            if ema_v is None or c_v is None or ema_v == 0:
+                continue
+            d = (c_v - ema_v) / ema_v * 100.0
+            vals.append(abs(d))
+        if not vals:
+            return None
+        # усечём до последних N точек на всякий случай
+        vals = vals[-n:]
+        return sum(vals) / len(vals)
+    except Exception:
+        return None
+
+# 🔸 Классификация динамики EMA (strict и smooth)
 def classify_ema_dynamic(d_t: float, d_c: float, tf: str) -> tuple[str, str, float]:
     """
     d_t, d_c — нормированные дистанции в процентах:
       d = (Price - EMA)/EMA * 100
-    Возвращает (side, dynamic, delta_abs),
+    Возвращает (side, dynamic_strict, delta_abs),
       side ∈ {"above","equal","below"},
-      dynamic ∈ {"equal","above_away","above_stable","above_approaching","below_away","below_stable","below_approaching"}
+      dynamic_strict ∈ {"equal","above_away","above_stable","above_approaching","below_away","below_stable","below_approaching"}
     """
     eq_eps = EQ_EPS_PCT
     move_eps = MOVE_EPS_PCT.get(tf, 0.05)
@@ -141,28 +184,38 @@ async def build_ema_pack(symbol: str, tf: str, length: int, now_ms: int,
     ema_closed = await fetch_closed_ema(redis, symbol, tf, length)
     price_closed = await fetch_closed_close(redis, symbol, tf, last_closed_ms) if last_closed_ms is not None else None
 
-    # если нет закрытого — считаем, что динамика неизвестна, но side и dist есть
+    # если нет закрытого значения — прерываем
     if ema_closed is None or price_closed is None or ema_closed == 0:
-        side = "above" if d_t > EQ_EPS_PCT else ("below" if d_t < -EQ_EPS_PCT else "equal")
-        dynamic = "equal" if side == "equal" else f"{side}_stable"
-        pack = {
-            "base": base,
-            "pack": {
-                "value": f"{ema_live:.{precision}f}",
-                "price": f"{price_live:.{precision}f}",
-                "dist_pct": f"{d_t:.2f}",
-                "delta_dist_pct": None,
-                "side": side,
-                "dynamic": dynamic,
-                "ref": "closed_missing",
-                "open_time": bar_open_iso(bar_open_ms),
-            },
-        }
-        return pack
+        return None
 
-    # полная классификация
-    d_c = (price_closed - ema_closed) / ema_closed * 100.0
-    side, dynamic, delta_abs = classify_ema_dynamic(d_t, d_c, tf)
+    # strict
+    if ema_closed is None or price_closed is None or ema_closed == 0:
+        # нет референса — отдаём только side/eq
+        side = "above" if d_t > EQ_EPS_PCT else ("below" if d_t < -EQ_EPS_PCT else "equal")
+        dynamic_strict = "equal" if side == "equal" else f"{side}_stable"
+        dynamic_smooth = dynamic_strict
+        delta_abs = None
+        delta_smooth = None
+    else:
+        d_c = (price_closed - ema_closed) / ema_closed * 100.0
+        side, dynamic_strict, delta_abs = classify_ema_dynamic(d_t, d_c, tf)
+
+        # smooth: сравниваем |d_t| с SMA_N(|d|) по последним закрытым барам
+        n = SMOOTH_N.get(tf, 6)
+        mean_abs_d = await fetch_mean_abs_d(redis, symbol, tf, length, last_closed_ms, n)
+        if mean_abs_d is None:
+            dynamic_smooth = dynamic_strict
+            delta_smooth = None
+        else:
+            move_eps = MOVE_EPS_PCT.get(tf, 0.05)
+            delta_smooth_val = abs(d_t) - mean_abs_d
+            if abs(delta_smooth_val) <= move_eps:
+                dynamic_smooth = f"{side}_stable"
+            elif delta_smooth_val > 0:
+                dynamic_smooth = f"{side}_away"
+            else:
+                dynamic_smooth = f"{side}_approaching"
+            delta_smooth = delta_smooth_val
 
     pack = {
         "base": base,
@@ -170,10 +223,13 @@ async def build_ema_pack(symbol: str, tf: str, length: int, now_ms: int,
             "value": f"{ema_live:.{precision}f}",
             "price": f"{price_live:.{precision}f}",
             "dist_pct": f"{d_t:.2f}",
-            "delta_dist_pct": f"{delta_abs:.2f}",
-            "side": side,            # above / equal / below
-            "dynamic": dynamic,      # above_away / above_stable / above_approaching / equal / below_...
-            "ref": "closed",
+            "delta_dist_pct": (f"{delta_abs:.2f}" if delta_abs is not None else None),
+            "side": side,                    # above / equal / below
+            "dynamic": dynamic_strict,       # alias на strict для совместимости
+            "dynamic_strict": dynamic_strict,
+            "dynamic_smooth": dynamic_smooth,
+            "delta_smooth_pct": (f"{delta_smooth:.2f}" if delta_smooth is not None else None),
+            "ref": "closed" if (ema_closed is not None and price_closed is not None) else "closed_missing",
             "open_time": bar_open_iso(bar_open_ms),
         },
     }
