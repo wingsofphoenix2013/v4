@@ -96,7 +96,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 bar_open_ms = floor_to_bar(now_ms, tf)
 
                 # активные инстансы
-                if ind != "trend":
+                if ind not in ("trend", "volatility"):
                     instances = [i for i in get_instances_by_tf(tf) if i["indicator"] == ind]
                     if not instances:
                         await redis.xadd(RESP_STREAM, {
@@ -106,7 +106,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                         })
                         return msg_id
                 else:
-                    # trend не имеет собственного инстанса — агрегирует EMA/LR/ADX сам через compute_fn
+                    # trend/volatility не имеют собственных инстансов — агрегируем из нескольких индикаторов
                     instances = []
 
                 precision = get_precision(symbol) or 8
