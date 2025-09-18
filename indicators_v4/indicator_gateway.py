@@ -1,4 +1,4 @@
-# indicator_gateway.py — on-demand координатор (RSI + MFI + BB + LR + ATR) c параллельной обработкой сообщений
+# indicator_gateway.py — on-demand координатор (RSI + MFI + BB + LR + ATR + EMA) c параллельной обработкой сообщений
 
 import asyncio
 import json
@@ -11,6 +11,7 @@ from packs.mfi_pack import build_mfi_pack
 from packs.bb_pack  import build_bb_pack
 from packs.lr_pack  import build_lr_pack
 from packs.atr_pack import build_atr_pack
+from packs.ema_pack import build_ema_pack
 from packs.pack_utils import floor_to_bar
 
 log = logging.getLogger("IND_GATEWAY")
@@ -37,15 +38,17 @@ def public_key(indicator: str, symbol: str, tf: str, base: str) -> str:
         return f"lrpos_pack:{symbol}:{tf}:{base}"
     if indicator == "atr":
         return f"atr_pack:{symbol}:{tf}:{base}"
+    # ema/rsi/mfi идут по умолчанию: {indicator}_pack:{symbol}:{tf}:{base}
     return f"{indicator}_pack:{symbol}:{tf}:{base}"
 
+# 🔸 Разбор std из строки запроса (2 знака точности)
 def parse_std(std_raw) -> float | None:
     try:
         return round(float(std_raw), 2)
     except Exception:
         return None
 
-# 🔸 Основной воркер gateway (RSI + MFI + BB + LR + ATR)
+# 🔸 Основной воркер gateway (RSI + MFI + BB + LR + ATR + EMA)
 async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, compute_snapshot_values_async):
     log.debug("IND_GATEWAY: воркер запущен")
 
@@ -73,7 +76,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 ts_raw   = data.get("timestamp_ms")
 
                 # валидация
-                if not symbol or tf not in ("m5","m15","h1") or ind not in ("rsi","mfi","bb","lr","atr"):
+                if not symbol or tf not in ("m5","m15","h1") or ind not in ("rsi","mfi","bb","lr","atr","ema"):
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "bad_request"})
                     return msg_id
 
@@ -88,8 +91,8 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 precision = get_precision(symbol) or 8
                 results = []
 
-                # 🔸 RSI / MFI
-                if ind in ("rsi", "mfi"):
+                # 🔸 RSI / MFI / EMA (одинаковая схема по длинам)
+                if ind in ("rsi", "mfi", "ema"):
                     if length_s:
                         try:
                             L = int(length_s)
@@ -104,8 +107,9 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                         lengths = sorted({int(i["params"]["length"]) for i in instances})
 
                     for L in lengths:
-                        ckey = cache_key(ind, symbol, tf, str(L), bar_open_ms)
-                        pkey = public_key(ind, symbol, tf, f"{ind}{L}")
+                        base = f"{ind}{L}"
+                        ckey = cache_key(ind, symbol, tf, (str(L) if ind in ("rsi","mfi") else base), bar_open_ms)
+                        pkey = public_key(ind, symbol, tf, base)
 
                         cached = await redis.get(ckey)
                         if cached:
@@ -117,8 +121,10 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
 
                         if ind == "rsi":
                             pack = await build_rsi_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
-                        else:
+                        elif ind == "mfi":
                             pack = await build_mfi_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
+                        else:  # ema
+                            pack = await build_ema_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
 
                         if pack:
                             js = json.dumps(pack)
