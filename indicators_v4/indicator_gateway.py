@@ -14,6 +14,7 @@ from packs.lr_pack  import build_lr_pack
 from packs.atr_pack import build_atr_pack
 from packs.ema_pack import build_ema_pack
 from packs.adx_dmi_pack import build_adx_dmi_pack
+from packs.macd_pack import build_macd_pack
 from packs.pack_utils import floor_to_bar
 
 # 🔸 Логгер
@@ -43,6 +44,8 @@ def public_key(indicator: str, symbol: str, tf: str, base: str) -> str:
         return f"atr_pack:{symbol}:{tf}:{base}"
     if indicator == "adx_dmi":
         return f"adx_dmi_pack:{symbol}:{tf}:{base}"
+    if indicator == "macd":
+        return f"macd_pack:{symbol}:{tf}:{base}"
     # ema/rsi/mfi → общий шаблон
     return f"{indicator}_pack:{symbol}:{tf}:{base}"
 
@@ -82,7 +85,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 ts_raw   = data.get("timestamp_ms")
 
                 # валидация
-                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi")
+                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd")
                 if not symbol or tf not in ("m5","m15","h1") or ind not in valid_inds:
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_request"})
                     return msg_id
@@ -100,15 +103,15 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 results = []
 
                 # 🔸 RSI / MFI / EMA
-                if ind in ("rsi","mfi","ema"):
+                if ind in ("rsi", "mfi", "ema"):
                     if length_s:
                         try:
                             L = int(length_s)
                         except Exception:
-                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_length"})
+                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "bad_length"})
                             return msg_id
                         if not any(int(i["params"]["length"]) == L for i in instances):
-                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"instance_not_found"})
+                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "instance_not_found"})
                             return msg_id
                         lengths = [L]
                     else:
@@ -116,7 +119,8 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
 
                     for L in lengths:
                         base = f"{ind}{L}"
-                        ckey = cache_key(ind, symbol, tf, (str(L) if ind in ("rsi","mfi") else base), bar_open_ms)
+                        # для rsi/mfi кэш-ключ строим по длине, для ema — по base (единый стиль с публичным ключом)
+                        ckey = cache_key(ind, symbol, tf, (str(L) if ind in ("rsi", "mfi") else base), bar_open_ms)
                         pkey = public_key(ind, symbol, tf, base)
 
                         cached = await redis.get(ckey)
@@ -133,6 +137,44 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                             pack = await build_mfi_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
                         else:  # ema
                             pack = await build_ema_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
+
+                        if pack:
+                            js = json.dumps(pack)
+                            await redis.set(ckey, js, ex=LIVE_TTL_SEC)
+                            await redis.set(pkey, js, ex=LIVE_TTL_SEC)
+                            results.append(pack)
+
+                # 🔸 MACD (base по fast)
+                elif ind == "macd":
+                    # длина в запросе трактуем как fast
+                    if length_s:
+                        try:
+                            F = int(length_s)
+                        except Exception:
+                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "bad_length"})
+                            return msg_id
+                        # в инстансах MACD fast лежит в params["fast"]
+                        if not any(int(i["params"]["fast"]) == F for i in instances):
+                            await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status": "error", "error": "instance_not_found"})
+                            return msg_id
+                        fasts = [F]
+                    else:
+                        fasts = sorted({int(i["params"]["fast"]) for i in instances})
+
+                    for F in fasts:
+                        base = f"macd{F}"
+                        ckey = cache_key(ind, symbol, tf, base, bar_open_ms)
+                        pkey = public_key(ind, symbol, tf, base)
+
+                        cached = await redis.get(ckey)
+                        if cached:
+                            try:
+                                results.append(json.loads(cached))
+                                continue
+                            except Exception:
+                                pass
+
+                        pack = await build_macd_pack(symbol, tf, F, now_ms, precision, redis, compute_snapshot_values_async)
 
                         if pack:
                             js = json.dumps(pack)
