@@ -186,7 +186,7 @@ async def compute_vol_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     # ждём полный комплект точек в TS
     ready = await wait_for_ts_barrier(redis, symbol, tf, open_ms)
     if not ready:
-        log.info(f"MW_VOL GAP {symbol}/{tf}@{open_iso} (TS not ready)")
+        log.debug(f"MW_VOL GAP {symbol}/{tf}@{open_iso} (TS not ready)")
         return
 
     # читаем cur/prev
@@ -249,7 +249,7 @@ async def compute_vol_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     }
 
     await persist_result(pg, redis, symbol, tf, open_iso, state, "ok", details)
-    log.info(
+    log.debug(
         f"MW_VOL OK {symbol}/{tf}@{open_iso} state={state} "
         f"atr_pct={details['atr_pct']} atr_b={details['atr_bucket']} Δatr_b={details['atr_bucket_delta']} "
         f"bw_phase={bw_phase} bw_rel={details['bw']['rel_diff']}"
