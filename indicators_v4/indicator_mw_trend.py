@@ -1,4 +1,4 @@
-# indicator_mw_trend.py — воркер расчёта рыночного условия Trend (up/down/sideways + strong/weak)
+# indicator_mw_trend.py — воркер расчёта рыночного условия Trend (up/down/sideways + strong/weak) с учётом дельт последнего бара
 
 import asyncio
 import json
@@ -10,12 +10,12 @@ STREAM_READY = "indicator_stream"          # вход: готовность ин
 GROUP       = "mw_trend_group"
 CONSUMER    = "mw_trend_1"
 
-GRACE_SEC   = 60                           # окно ожидания всех баз для бара
+GRACE_SEC   = 60                           # ожидание всех баз для бара
 CHECK_TICK  = 1.0                          # период внутреннего таймера (сек)
 ANGLE_EPS   = 0.0                          # порог для LR angle (>=0 — up, <=0 — down)
 ADX_STRONG  = 25.0                         # порог силы тренда по ADX (max из adx14/21)
 
-# 🔸 Шаги TF в миллисекундах (для выравнивания и удобства)
+# 🔸 Таймшаги TF (мс)
 STEP_MS = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 
 # 🔸 Ожидаемые базы для Trend (без суффиксов)
@@ -26,17 +26,25 @@ TS_IND_PREFIX = "ts_ind"   # ts_ind:{symbol}:{tf}:{param}
 BB_TS_PREFIX  = "bb:ts"    # bb:ts:{symbol}:{tf}:c
 KV_MW_PREFIX  = "ind_mw"   # ind_mw:{symbol}:{tf}:{kind}
 
+# 🔸 Пороговые дельты (по TF) — «острота» силы
+ADX_DROP_EPS        = {"m5": 0.5, "m15": 0.7, "h1": 1.0}    # если max(ADX) уменьшается больше eps → ослабляем
+EMA_DIST_DROP_EPS   = {"m5": 0.15, "m15": 0.20, "h1": 0.30} # уменьшение |(Close-EMA50)/EMA50| в п.п. → ослабляем
+LR_FLATTEN_ALLOW    = {"m5": 0.0, "m15": 0.0, "h1": 0.0}    # если Δугла <= 0 (не растёт) → ослабляем
+
 # 🔸 Логгер
 log = logging.getLogger("MW_TREND")
 
 
-# 🔸 Вспомогательное: ms с ISO open_time
+# 🔸 Утилиты времени/форматов
 def iso_to_ms(iso: str) -> int:
     dt = datetime.fromisoformat(iso)
     return int(dt.timestamp() * 1000)
 
+def prev_bar_ms(open_ms: int, tf: str) -> int:
+    return open_ms - STEP_MS[tf]
 
-# 🔸 Вспомогательное: чтение единственной точки TS по exact open_time (from=to)
+
+# 🔸 Чтение одной точки TS по exact open_time (from=to)
 async def ts_get_at(redis, key: str, ts_ms: int):
     try:
         res = await redis.execute_command("TS.RANGE", key, ts_ms, ts_ms)
@@ -47,11 +55,45 @@ async def ts_get_at(redis, key: str, ts_ms: int):
     return None
 
 
-# 🔸 Определение направления по EMA и LR
-def infer_direction(price: float | None,
-                    ema21: float | None, ema50: float | None, ema200: float | None,
-                    ang50: float | None, ang100: float | None) -> str:
-    # голоса EMA: price vs EMA (если цена неизвестна — голос игнорируем)
+# 🔸 Сбор значений из Redis TS на два бара: текущий open_time и предыдущий
+async def load_trend_inputs(redis, symbol: str, tf: str, open_ms: int) -> dict:
+    # ключи TS (EMA/LR/ADX/Close)
+    keys = {
+        "ema21":       f"{TS_IND_PREFIX}:{symbol}:{tf}:ema21",
+        "ema50":       f"{TS_IND_PREFIX}:{symbol}:{tf}:ema50",
+        "ema200":      f"{TS_IND_PREFIX}:{symbol}:{tf}:ema200",
+        "lr50_angle":  f"{TS_IND_PREFIX}:{symbol}:{tf}:lr50_angle",
+        "lr100_angle": f"{TS_IND_PREFIX}:{symbol}:{tf}:lr100_angle",
+        "adx14":       f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi14_adx",
+        "adx21":       f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi21_adx",
+        "close":       f"{BB_TS_PREFIX}:{symbol}:{tf}:c",
+    }
+
+    prev_ms = prev_bar_ms(open_ms, tf)
+
+    # внутренняя помощь: прочитать два значения
+    async def read_pair(key: str):
+        # условия достаточности
+        cur = await ts_get_at(redis, key, open_ms)
+        prev = await ts_get_at(redis, key, prev_ms)
+        return cur, prev
+
+    # параллельный батч чтений
+    tasks = {k: read_pair(key) for k, key in keys.items()}
+    results = await asyncio.gather(*tasks.values(), return_exceptions=False)
+
+    out = {}
+    for (name, _), (cur, prev) in zip(tasks.items(), results):
+        out[name] = {"cur": cur, "prev": prev}
+    out["open_ms"] = open_ms
+    out["prev_ms"] = prev_ms
+    return out
+
+
+# 🔸 Направление: EMA vs цена + LR углы (по текущему бару)
+def infer_direction_now(price: float | None,
+                        ema21: float | None, ema50: float | None, ema200: float | None,
+                        ang50: float | None, ang100: float | None) -> str:
     up_votes = 0
     down_votes = 0
 
@@ -66,7 +108,6 @@ def infer_direction(price: float | None,
         if price > ema200: up_votes += 1
         elif price < ema200: down_votes += 1
 
-    # голоса LR по углам
     if ang50 is not None:
         if ang50 > ANGLE_EPS: up_votes += 1
         elif ang50 < -ANGLE_EPS: down_votes += 1
@@ -82,38 +123,88 @@ def infer_direction(price: float | None,
     return "sideways"
 
 
-# 🔸 Определение силы по ADX
-def infer_strength(adx14: float | None, adx21: float | None) -> bool:
+# 🔸 Сила: базово по уровню ADX на текущем баре
+def base_strength_now(adx14: float | None, adx21: float | None) -> bool:
     vals = [v for v in (adx14, adx21) if v is not None]
     if not vals:
         return False
     return max(vals) >= ADX_STRONG
 
 
-# 🔸 Сбор значений из Redis TS на конкретный бар
-async def load_trend_inputs(redis, symbol: str, tf: str, open_ms: int) -> dict:
-    # ключи TS (EMA/LR/ADX/Close)
-    keys = {
-        "ema21":       f"{TS_IND_PREFIX}:{symbol}:{tf}:ema21",
-        "ema50":       f"{TS_IND_PREFIX}:{symbol}:{tf}:ema50",
-        "ema200":      f"{TS_IND_PREFIX}:{symbol}:{tf}:ema200",
-        "lr50_angle":  f"{TS_IND_PREFIX}:{symbol}:{tf}:lr50_angle",
-        "lr100_angle": f"{TS_IND_PREFIX}:{symbol}:{tf}:lr100_angle",
-        "adx14":       f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi14_adx",
-        "adx21":       f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi21_adx",
-        "close":       f"{BB_TS_PREFIX}:{symbol}:{tf}:c",
+# 🔸 Коррекция силы по «динамике» (ослабление strong → weak)
+def weaken_by_deltas(tf: str,
+                     adx14_cur: float | None, adx14_prev: float | None,
+                     adx21_cur: float | None, adx21_prev: float | None,
+                     ema50_cur: float | None, ema50_prev: float | None,
+                     close_cur: float | None, close_prev: float | None,
+                     ang50_cur: float | None, ang50_prev: float | None,
+                     ang100_cur: float | None, ang100_prev: float | None) -> dict:
+    # условия достаточности
+    adx_drop_eps = ADX_DROP_EPS.get(tf, 0.7)
+    ema_drop_eps = EMA_DIST_DROP_EPS.get(tf, 0.2)
+    lr_flat_allow = LR_FLATTEN_ALLOW.get(tf, 0.0)
+
+    # ΔADX (берём максимум из двух длин)
+    adx_cur_vals = [v for v in (adx14_cur, adx21_cur) if v is not None]
+    adx_prev_vals = [v for v in (adx14_prev, adx21_prev) if v is not None]
+    max_adx_cur = max(adx_cur_vals) if adx_cur_vals else None
+    max_adx_prev = max(adx_prev_vals) if adx_prev_vals else None
+    d_adx = None
+    adx_is_falling = False
+    if max_adx_cur is not None and max_adx_prev is not None:
+        d_adx = max_adx_cur - max_adx_prev
+        adx_is_falling = (d_adx <= -adx_drop_eps)
+
+    # Δ|dist to EMA50| (% пункты)
+    d_abs_dist = None
+    abs_dist_is_shrinking = False
+    if (ema50_cur is not None and ema50_cur != 0 and close_cur is not None and
+        ema50_prev is not None and ema50_prev != 0 and close_prev is not None):
+        dist_cur = abs((close_cur - ema50_cur) / ema50_cur) * 100.0
+        dist_prev = abs((close_prev - ema50_prev) / ema50_prev) * 100.0
+        d_abs_dist = dist_cur - dist_prev
+        abs_dist_is_shrinking = (d_abs_dist <= -ema_drop_eps)
+
+    # Δуглов LR (если не растут → считаем «сглаживание/флэт»)
+    d_ang50 = None
+    d_ang100 = None
+    lr_is_flatten = False
+    if ang50_cur is not None and ang50_prev is not None:
+        d_ang50 = ang50_cur - ang50_prev
+    if ang100_cur is not None and ang100_prev is not None:
+        d_ang100 = ang100_cur - ang100_prev
+    # если оба определены — используем «и», если один — по одному
+    conds = []
+    if d_ang50 is not None:
+        conds.append(d_ang50 <= lr_flat_allow)
+    if d_ang100 is not None:
+        conds.append(d_ang100 <= lr_flat_allow)
+    if conds:
+        lr_is_flatten = all(conds)
+
+    # итоговый флаг «ослабить strong»
+    weaken = adx_is_falling or abs_dist_is_shrinking or lr_is_flatten
+
+    # отдадим детали для логирования/деталей
+    return {
+        "weaken": weaken,
+        "d_adx": d_adx,
+        "d_abs_dist_pct": d_abs_dist,
+        "d_lr50_angle": d_ang50,
+        "d_lr100_angle": d_ang100,
+        "flags": {
+            "adx_is_falling": adx_is_falling,
+            "abs_dist_is_shrinking": abs_dist_is_shrinking,
+            "lr_is_flatten": lr_is_flatten,
+        }
     }
 
-    # параллельный батч чтений
-    tasks = {k: ts_get_at(redis, key, open_ms) for k, key in keys.items()}
-    results = await asyncio.gather(*tasks.values(), return_exceptions=False)
-    return dict(zip(tasks.keys(), results))
 
-
-# 🔸 Запись результата в Redis KV (последнее состояние) и в PostgreSQL (история)
+# 🔸 Запись результата в Redis KV и в PostgreSQL
 async def persist_result(pg, redis, symbol: str, tf: str, open_time_iso: str,
                          state: str, direction: str, strong: bool,
                          status: str, used_bases: list[str], missing_bases: list[str],
+                         extras: dict | None = None,
                          source: str = "live", version: int = 1):
     # KV
     kv_key = f"{KV_MW_PREFIX}:{symbol}:{tf}:trend"
@@ -125,7 +216,7 @@ async def persist_result(pg, redis, symbol: str, tf: str, open_time_iso: str,
         "version": version,
         "open_time": open_time_iso,
         "computed_at": datetime.utcnow().isoformat(),
-        "details": {"used_bases": used_bases, "missing_bases": missing_bases},
+        "details": {"used_bases": used_bases, "missing_bases": missing_bases, **(extras or {})},
     }
     try:
         await redis.set(kv_key, json.dumps(payload))
@@ -139,6 +230,7 @@ async def persist_result(pg, redis, symbol: str, tf: str, open_time_iso: str,
         "used_bases": used_bases,
         "missing_bases": missing_bases,
         "open_time_iso": open_time_iso,
+        **(extras or {}),
     }
     try:
         async with pg.acquire() as conn:
@@ -200,7 +292,7 @@ async def run_indicator_mw_trend(pg, redis):
 
     # внутренний таймер для таймаутов
     async def check_timeouts():
-        # сканируем дедлайны и закрываем просроченные ключи
+        # ищем просроченные ключи и закрываем их как partial
         now = datetime.utcnow()
         expired = []
         for k, obj in pending.items():
@@ -209,30 +301,57 @@ async def run_indicator_mw_trend(pg, redis):
         for (k, obj) in expired:
             symbol, tf, open_time_iso = k
             missing = sorted(list(obj["expected"] - obj["arrived"]))
-            # частичный расчёт (или фиксация как partial без расчёта, если данных явно нет)
+
             open_ms = iso_to_ms(open_time_iso)
             inputs = await load_trend_inputs(redis, symbol, tf, open_ms)
 
-            # направление/сила (что есть)
-            direction = infer_direction(
-                inputs.get("close"),
-                inputs.get("ema21"), inputs.get("ema50"), inputs.get("ema200"),
-                inputs.get("lr50_angle"), inputs.get("lr100_angle")
+            # направление по текущему бару
+            direction = infer_direction_now(
+                inputs["close"]["cur"],
+                inputs["ema21"]["cur"], inputs["ema50"]["cur"], inputs["ema200"]["cur"],
+                inputs["lr50_angle"]["cur"], inputs["lr100_angle"]["cur"]
             )
-            strong = infer_strength(inputs.get("adx14"), inputs.get("adx21"))
+            strong = base_strength_now(inputs["adx14"]["cur"], inputs["adx21"]["cur"])
+
+            # коррекция силы по дельтам
+            deltas = weaken_by_deltas(
+                tf,
+                inputs["adx14"]["cur"], inputs["adx14"]["prev"],
+                inputs["adx21"]["cur"], inputs["adx21"]["prev"],
+                inputs["ema50"]["cur"], inputs["ema50"]["prev"],
+                inputs["close"]["cur"], inputs["close"]["prev"],
+                inputs["lr50_angle"]["cur"], inputs["lr50_angle"]["prev"],
+                inputs["lr100_angle"]["cur"], inputs["lr100_angle"]["prev"],
+            )
+            if strong and deltas["weaken"]:
+                strong = False
+
             state = (
                 "sideways" if direction == "sideways"
                 else f"{direction}_{'strong' if strong else 'weak'}"
             )
 
+            extras = {
+                "deltas": {
+                    "d_adx": deltas["d_adx"],
+                    "d_abs_dist_pct": deltas["d_abs_dist_pct"],
+                    "d_lr50_angle": deltas["d_lr50_angle"],
+                    "d_lr100_angle": deltas["d_lr100_angle"],
+                    **deltas["flags"],
+                }
+            }
+
             await persist_result(
                 pg, redis, symbol, tf, open_time_iso,
                 state=state, direction=direction, strong=strong,
                 status="partial", used_bases=sorted(list(obj["arrived"])), missing_bases=missing,
-                source="live", version=1
+                extras=extras, source="live", version=1
             )
             await mark_gap(pg, symbol, tf, open_time_iso, missing)
-            log.debug(f"MW_TREND PARTIAL {symbol}/{tf}@{open_time_iso} arrived={len(obj['arrived'])}/{len(obj['expected'])} state={state}")
+            log.info(
+                f"MW_TREND PARTIAL {symbol}/{tf}@{open_time_iso} "
+                f"arrived={len(obj['arrived'])}/{len(obj['expected'])} state={state}"
+            )
             pending.pop(k, None)
 
     # основной цикл
@@ -263,8 +382,8 @@ async def run_indicator_mw_trend(pg, redis):
                             continue
 
                         symbol = data["symbol"]
-                        tf     = data["timeframe"]
-                        base   = data["indicator"]  # например: 'ema21', 'lr50', 'adx_dmi14', ...
+                        tf     = data.get("timeframe") or data.get("interval")
+                        base   = data["indicator"]              # 'ema21', 'lr50', 'adx_dmi14', ...
                         open_iso = data["open_time"]
 
                         # интересуют только нужные базы
@@ -290,24 +409,55 @@ async def run_indicator_mw_trend(pg, redis):
                             open_ms = iso_to_ms(open_iso)
                             inputs = await load_trend_inputs(redis, symbol, tf, open_ms)
 
-                            direction = infer_direction(
-                                inputs.get("close"),
-                                inputs.get("ema21"), inputs.get("ema50"), inputs.get("ema200"),
-                                inputs.get("lr50_angle"), inputs.get("lr100_angle")
+                            # направление по текущему бару
+                            direction = infer_direction_now(
+                                inputs["close"]["cur"],
+                                inputs["ema21"]["cur"], inputs["ema50"]["cur"], inputs["ema200"]["cur"],
+                                inputs["lr50_angle"]["cur"], inputs["lr100_angle"]["cur"]
                             )
-                            strong = infer_strength(inputs.get("adx14"), inputs.get("adx21"))
+                            strong = base_strength_now(inputs["adx14"]["cur"], inputs["adx21"]["cur"])
+
+                            # коррекция силы по дельтам
+                            deltas = weaken_by_deltas(
+                                tf,
+                                inputs["adx14"]["cur"], inputs["adx14"]["prev"],
+                                inputs["adx21"]["cur"], inputs["adx21"]["prev"],
+                                inputs["ema50"]["cur"], inputs["ema50"]["prev"],
+                                inputs["close"]["cur"], inputs["close"]["prev"],
+                                inputs["lr50_angle"]["cur"], inputs["lr50_angle"]["prev"],
+                                inputs["lr100_angle"]["cur"], inputs["lr100_angle"]["prev"],
+                            )
+                            if strong and deltas["weaken"]:
+                                strong = False
+
                             state = (
                                 "sideways" if direction == "sideways"
                                 else f"{direction}_{'strong' if strong else 'weak'}"
                             )
 
+                            extras = {
+                                "deltas": {
+                                    "d_adx": deltas["d_adx"],
+                                    "d_abs_dist_pct": deltas["d_abs_dist_pct"],
+                                    "d_lr50_angle": deltas["d_lr50_angle"],
+                                    "d_lr100_angle": deltas["d_lr100_angle"],
+                                    **deltas["flags"],
+                                }
+                            }
+
                             await persist_result(
                                 pg, redis, symbol, tf, open_iso,
                                 state=state, direction=direction, strong=strong,
                                 status="ok", used_bases=sorted(list(rec["arrived"])), missing_bases=[],
-                                source="live", version=1
+                                extras=extras, source="live", version=1
                             )
-                            log.debug(f"MW_TREND OK {symbol}/{tf}@{open_iso} state={state}")
+                            log.info(
+                                f"MW_TREND OK {symbol}/{tf}@{open_iso} state={state} "
+                                f"d_adx={deltas['d_adx']:.2f if deltas['d_adx'] is not None else 'n/a'} "
+                                f"d_abs_dist={deltas['d_abs_dist_pct']:.2f if deltas['d_abs_dist_pct'] is not None else 'n/a'} "
+                                f"d_ang50={deltas['d_lr50_angle']:.5f if deltas['d_lr50_angle'] is not None else 'n/a'} "
+                                f"d_ang100={deltas['d_lr100_angle']:.5f if deltas['d_lr100_angle'] is not None else 'n/a'}"
+                            )
                             pending.pop(key, None)
 
                     except Exception as e:
