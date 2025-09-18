@@ -10,7 +10,7 @@ STREAM_READY = "indicator_stream"          # вход: готовность ин
 GROUP       = "mw_trend_group"
 CONSUMER    = "mw_trend_1"
 
-GRACE_SEC   = 60                           # ожидание всех баз для бара
+GRACE_SEC   = 90                           # ожидание всех баз для бара
 CHECK_TICK  = 1.0                          # период внутреннего таймера (сек)
 ANGLE_EPS   = 0.0                          # порог для LR angle (>=0 — up, <=0 — down)
 ADX_STRONG  = 25.0                         # порог силы тренда по ADX (max из adx14/21)
@@ -451,13 +451,19 @@ async def run_indicator_mw_trend(pg, redis):
                                 status="ok", used_bases=sorted(list(rec["arrived"])), missing_bases=[],
                                 extras=extras, source="live", version=1
                             )
+
+                            # подготовка строк для логов
+                            d_adx_str    = f"{deltas['d_adx']:.2f}" if deltas["d_adx"] is not None else "n/a"
+                            d_abs_str    = f"{deltas['d_abs_dist_pct']:.2f}" if deltas["d_abs_dist_pct"] is not None else "n/a"
+                            d_ang50_str  = f"{deltas['d_lr50_angle']:.5f}" if deltas["d_lr50_angle"] is not None else "n/a"
+                            d_ang100_str = f"{deltas['d_lr100_angle']:.5f}" if deltas["d_lr100_angle"] is not None else "n/a"
+
                             log.info(
                                 f"MW_TREND OK {symbol}/{tf}@{open_iso} state={state} "
-                                f"d_adx={deltas['d_adx']:.2f if deltas['d_adx'] is not None else 'n/a'} "
-                                f"d_abs_dist={deltas['d_abs_dist_pct']:.2f if deltas['d_abs_dist_pct'] is not None else 'n/a'} "
-                                f"d_ang50={deltas['d_lr50_angle']:.5f if deltas['d_lr50_angle'] is not None else 'n/a'} "
-                                f"d_ang100={deltas['d_lr100_angle']:.5f if deltas['d_lr100_angle'] is not None else 'n/a'}"
+                                f"d_adx={d_adx_str} d_abs_dist={d_abs_str} "
+                                f"d_ang50={d_ang50_str} d_ang100={d_ang100_str}"
                             )
+
                             pending.pop(key, None)
 
                     except Exception as e:
