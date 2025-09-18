@@ -12,7 +12,7 @@ CONSUMER    = "mw_trend_1"
 
 # без «partial»: считаем только когда все точки есть в TS; если долго нет — фиксируем gap и выходим
 BARRIER_FAST_POLL_MS = 300                 # быстрый поллинг TS (первые N секунд)
-BARRIER_FAST_SECONDS = 5
+BARRIER_FAST_SECONDS = 15
 BARRIER_SLOW_POLL_MS = 1200                # медленный поллинг TS после FAST-окна
 BARRIER_MAX_WAIT_SEC = 90                  # максимум ожидания полного комплекта (≈ один бар m5)
 
