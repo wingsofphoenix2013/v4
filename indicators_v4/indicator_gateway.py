@@ -15,6 +15,7 @@ from packs.atr_pack import build_atr_pack
 from packs.ema_pack import build_ema_pack
 from packs.adx_dmi_pack import build_adx_dmi_pack
 from packs.macd_pack import build_macd_pack
+from packs.trend_pack import build_trend_pack
 from packs.pack_utils import floor_to_bar
 
 # 🔸 Логгер
@@ -85,7 +86,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 ts_raw   = data.get("timestamp_ms")
 
                 # валидация
-                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd")
+                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd","trend")
                 if not symbol or tf not in ("m5","m15","h1") or ind not in valid_inds:
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_request"})
                     return msg_id
@@ -308,6 +309,26 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                                 pass
 
                         pack = await build_atr_pack(symbol, tf, L, now_ms, precision, redis, compute_snapshot_values_async)
+                        if pack:
+                            js = json.dumps(pack)
+                            await redis.set(ckey, js, ex=LIVE_TTL_SEC)
+                            await redis.set(pkey, js, ex=LIVE_TTL_SEC)
+                            results.append(pack)
+
+                # 🔸 TREND (live на текущем баре)
+                elif ind == "trend":
+                    base = "trend"
+                    ckey = cache_key(ind, symbol, tf, base, bar_open_ms)
+                    pkey = public_key(ind, symbol, tf, base)
+
+                    cached = await redis.get(ckey)
+                    if cached:
+                        try:
+                            results.append(json.loads(cached))
+                        except Exception:
+                            pass
+                    else:
+                        pack = await build_trend_pack(symbol, tf, now_ms, precision, redis, compute_snapshot_values_async)
                         if pack:
                             js = json.dumps(pack)
                             await redis.set(ckey, js, ex=LIVE_TTL_SEC)

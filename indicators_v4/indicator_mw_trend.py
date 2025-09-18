@@ -232,7 +232,7 @@ async def run_indicator_mw_trend(pg, redis):
                 source="live", version=1
             )
             await mark_gap(pg, symbol, tf, open_time_iso, missing)
-            log.info(f"MW_TREND PARTIAL {symbol}/{tf}@{open_time_iso} arrived={len(obj['arrived'])}/{len(obj['expected'])} state={state}")
+            log.debug(f"MW_TREND PARTIAL {symbol}/{tf}@{open_time_iso} arrived={len(obj['arrived'])}/{len(obj['expected'])} state={state}")
             pending.pop(k, None)
 
     # основной цикл
@@ -307,7 +307,7 @@ async def run_indicator_mw_trend(pg, redis):
                                 status="ok", used_bases=sorted(list(rec["arrived"])), missing_bases=[],
                                 source="live", version=1
                             )
-                            log.info(f"MW_TREND OK {symbol}/{tf}@{open_iso} state={state}")
+                            log.debug(f"MW_TREND OK {symbol}/{tf}@{open_iso} state={state}")
                             pending.pop(key, None)
 
                     except Exception as e:
