@@ -389,7 +389,7 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
         d_abs_str    = "n/a" if deltas["d_abs_dist_pct"] is None else f"{deltas['d_abs_dist_pct']:.2f}"
         d_ang50_str  = "n/a" if deltas["d_lr50_angle"] is None else f"{deltas['d_lr50_angle']:.5f}"
         d_ang100_str = "n/a" if deltas["d_lr100_angle"] is None else f"{deltas['d_lr100_angle']:.5f}"
-        log.info(
+        log.debug(
             f"MW_TREND OK {symbol}/{tf}@{open_iso} state=sideways (max_adx={max_adx:.2f}) "
             f"d_adx={d_adx_str} d_abs_dist={d_abs_str} d_ang50={d_ang50_str} d_ang100={d_ang100_str}"
         )
