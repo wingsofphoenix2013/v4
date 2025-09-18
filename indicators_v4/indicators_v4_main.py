@@ -20,6 +20,7 @@ from indicator_gateway import run_indicator_gateway
 
 # 🔸 Воркеры MarketWatch (Trend)
 from indicator_mw_trend import run_indicator_mw_trend
+from indicator_mw_volatility import run_indicator_mw_volatility
 
 
 # 🔸 Глобальные переменные
@@ -558,6 +559,8 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, compute_snapshot_values_async), "IND_GATEWAY"),
         run_safe_loop(lambda: run_indicator_mw_trend(pg, redis), "MW_TREND"),
+        run_safe_loop(lambda: run_indicator_mw_trend(pg, redis), "MW_TREND"),
+run_safe_loop(lambda: run_indicator_mw_volatility(pg, redis), "MW_VOL"),
     )
 
 
