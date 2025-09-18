@@ -29,7 +29,7 @@ KV_MW_PREFIX  = "ind_mw"   # ind_mw:{symbol}:{tf}:{kind}
 
 # «сила тренда»
 ADX_STRONG_LEVEL    = 25.0                  # базовый порог strong
-ADX_SIDEWAYS_LEVEL  = 15.0                  # если ниже — считаем sideways независимо от голосов
+ADX_SIDEWAYS_LEVEL  = 12.0                  # если ниже — считаем sideways независимо от голосов
 
 # «острота» силы (дельты последнего бара)
 ADX_DROP_EPS        = {"m5": 0.5, "m15": 0.7, "h1": 1.0}
@@ -333,14 +333,14 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     if not ready:
         # выясним, чего не хватает — пробежимся по ключам
         req = {
-            "ema21":       f"{TS_IND_PREFIX}:{symbol}:{tf}:ema21",
-            "ema50":       f"{TS_IND_PREFIX}:{symbol}:{tf}:ema50",
-            "ema200":      f"{TS_IND_PREFIX}:{symbol}:{tf}:ema200",
-            "lr50":        f"{TS_IND_PREFIX}:{symbol}:{tf}:lr50_angle",
-            "lr100":       f"{TS_IND_PREFIX}:{symbol}:{tf}:lr100_angle",
-            "adx_dmi14":   f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi14_adx",
-            "adx_dmi21":   f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi21_adx",
-            "close":       f"{BB_TS_PREFIX}:{symbol}:{tf}:c",
+            "ema21":     f"{TS_IND_PREFIX}:{symbol}:{tf}:ema21",
+            "ema50":     f"{TS_IND_PREFIX}:{symbol}:{tf}:ema50",
+            "ema200":    f"{TS_IND_PREFIX}:{symbol}:{tf}:ema200",
+            "lr50":      f"{TS_IND_PREFIX}:{symbol}:{tf}:lr50_angle",
+            "lr100":     f"{TS_IND_PREFIX}:{symbol}:{tf}:lr100_angle",
+            "adx_dmi14": f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi14_adx",
+            "adx_dmi21": f"{TS_IND_PREFIX}:{symbol}:{tf}:adx_dmi21_adx",
+            "close":     f"{BB_TS_PREFIX}:{symbol}:{tf}:c",
         }
         missing = []
         for base, key in req.items():
@@ -354,16 +354,45 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     # все точки есть — грузим пары cur/prev
     inputs = await load_trend_inputs(redis, symbol, tf, open_ms)
 
-    # ADX guard на флэт
+    # считаем дельты всегда (до ADX-гарда)
+    deltas = weaken_by_deltas(
+        tf,
+        inputs["adx14"]["cur"], inputs["adx14"]["prev"],
+        inputs["adx21"]["cur"], inputs["adx21"]["prev"],
+        inputs["ema50"]["cur"], inputs["ema50"]["prev"],
+        inputs["close"]["cur"], inputs["close"]["prev"],
+        inputs["lr50_angle"]["cur"], inputs["lr50_angle"]["prev"],
+        inputs["lr100_angle"]["cur"], inputs["lr100_angle"]["prev"],
+    )
+
+    # проверяем ADX guard → если слабый тренд, сразу sideways, но дельты логируем
     _, max_adx = base_strength_now(inputs["adx14"]["cur"], inputs["adx21"]["cur"])
     if max_adx < ADX_SIDEWAYS_LEVEL:
         state = "sideways"
-        extras = {"deltas": {"d_adx": None, "d_abs_dist_pct": None, "d_lr50_angle": None, "d_lr100_angle": None},
-                  "max_adx": round(max_adx, 2)}
-        await persist_result(pg, redis, symbol, tf, open_iso, state, "sideways", False,
-                             status="ok", used_bases=sorted(EXPECTED_BASES), missing_bases=[],
-                             extras=extras, source="live", version=1)
-        log.debug(f"MW_TREND OK {symbol}/{tf}@{open_iso} state=sideways (max_adx={max_adx:.2f})")
+        extras = {
+            "deltas": {
+                "d_adx": deltas["d_adx"],
+                "d_abs_dist_pct": deltas["d_abs_dist_pct"],
+                "d_lr50_angle": deltas["d_lr50_angle"],
+                "d_lr100_angle": deltas["d_lr100_angle"],
+                **deltas["flags"],
+            },
+            "max_adx": round(max_adx, 2),
+        }
+        await persist_result(
+            pg, redis, symbol, tf, open_iso,
+            state=state, direction="sideways", strong=False,
+            status="ok", used_bases=sorted(EXPECTED_BASES), missing_bases=[],
+            extras=extras, source="live", version=1
+        )
+        d_adx_str    = "n/a" if deltas["d_adx"] is None else f"{deltas['d_adx']:.2f}"
+        d_abs_str    = "n/a" if deltas["d_abs_dist_pct"] is None else f"{deltas['d_abs_dist_pct']:.2f}"
+        d_ang50_str  = "n/a" if deltas["d_lr50_angle"] is None else f"{deltas['d_lr50_angle']:.5f}"
+        d_ang100_str = "n/a" if deltas["d_lr100_angle"] is None else f"{deltas['d_lr100_angle']:.5f}"
+        log.info(
+            f"MW_TREND OK {symbol}/{tf}@{open_iso} state=sideways (max_adx={max_adx:.2f}) "
+            f"d_adx={d_adx_str} d_abs_dist={d_abs_str} d_ang50={d_ang50_str} d_ang100={d_ang100_str}"
+        )
         return
 
     # направление по «мягкому» голосованию
