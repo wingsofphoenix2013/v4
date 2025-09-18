@@ -18,6 +18,9 @@ from indicators.compute_and_store import compute_and_store, compute_snapshot_val
 from cleanup_worker import run_indicators_cleanup
 from indicator_gateway import run_indicator_gateway
 
+# 🔸 Воркеры MarketWatch (Trend)
+from indicator_mw_trend import run_indicator_mw_trend
+
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -554,6 +557,7 @@ async def main():
         run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, compute_snapshot_values_async), "IND_GATEWAY"),
+        run_safe_loop(lambda: run_indicator_mw_trend(pg, redis), "MW_TREND"),
     )
 
 
