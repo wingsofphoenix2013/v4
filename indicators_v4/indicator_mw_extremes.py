@@ -5,6 +5,13 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+# 🔸 Общие правила MarketWatch (Extremes)
+from indicator_mw_shared import (
+    load_prev_state,
+    ext_thresholds,
+    apply_ext_hysteresis_and_dwell,
+)
+
 # 🔸 Константы и настройки (в стиле MW_TREND / MW_VOL / MW_MOM)
 STREAM_READY = "indicator_stream"          # вход: готовность инстансов (rsi/mfi/bb/lr)
 GROUP       = "mw_ext_group"
@@ -187,8 +194,7 @@ async def persist_result(pg, redis, symbol: str, tf: str, open_time_iso: str,
     except Exception as e:
         log.error(f"[PG] upsert error extremes {symbol}/{tf}@{open_time_iso}: {e}")
 
-
-# 🔸 Расчёт Extremes по ключу (symbol, tf, open_time) — TS-барьер + cur/prev
+# 🔸 Расчёт Extremes по ключу (symbol, tf, open_time) — TS-барьер + cur/prev + hysteresis/dwell
 async def compute_ext_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     open_ms = iso_to_ms(open_iso)
 
@@ -205,9 +211,24 @@ async def compute_ext_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     rsi14, rsi21 = x["rsi14"]["cur"], x["rsi21"]["cur"]
     mfi14, mfi21 = x["mfi14"]["cur"], x["mfi21"]["cur"]
 
-    # BB и цена → корзины 12-сегментов (cur/prev)
+    # BB корзины
     up_cur, lo_cur, pr_cur = x["bb_up"]["cur"], x["bb_lo"]["cur"], x["close"]["cur"]
     up_prev, lo_prev, pr_prev = x["bb_up"]["prev"], x["bb_lo"]["prev"], x["close"]["prev"]
+
+    def bb_bucket_12(price: float, lower: float, upper: float) -> int | None:
+        width = upper - lower
+        if width <= 0: return None
+        seg = width / 8.0
+        top2 = upper + 2 * seg
+        if price >= top2: return 0
+        if price >= upper: return 1
+        if price >= lower:
+            k = int((upper - price) // seg)
+            if k < 0: k = 0
+            if k > 7: k = 7
+            return 2 + k
+        if price >= (lower - seg): return 10
+        return 11
 
     bb_bucket_cur = None
     bb_bucket_prev = None
@@ -220,14 +241,15 @@ async def compute_ext_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     if bb_bucket_cur is not None and bb_bucket_prev is not None:
         bb_bucket_delta = bb_bucket_cur - bb_bucket_prev
 
-    # LR-тренд (по углам)
+    # LR-тренд (нейтрализуем конфликт знаков)
     ang50, ang100 = x["lr50_ang"]["cur"], x["lr100_ang"]["cur"]
-    up_eps  = LR_UP_ANGLE_EPS.get(tf, 1e-4)
-    dn_eps  = LR_DOWN_ANGLE_EPS.get(tf, -1e-4)
-    uptrend   = (ang50 is not None and ang50 > up_eps) or (ang100 is not None and ang100 > up_eps)
-    downtrend = (ang50 is not None and ang50 < dn_eps) or (ang100 is not None and ang100 < dn_eps)
+    uptrend_raw   = (ang50 is not None and ang50 > 0) or (ang100 is not None and ang100 > 0)
+    downtrend_raw = (ang50 is not None and ang50 < 0) or (ang100 is not None and ang100 < 0)
+    lr_conflict = (ang50 is not None and ang100 is not None and ((ang50 > 0 and ang100 < 0) or (ang50 < 0 and ang100 > 0)))
+    uptrend   = False if lr_conflict else uptrend_raw
+    downtrend = False if lr_conflict else downtrend_raw
 
-    # Флаги зон
+    # флаги OB/OS
     ob = ((rsi14 is not None and rsi14 >= RSI_OVERBOUGHT[tf]) or
           (rsi21 is not None and rsi21 >= RSI_OVERBOUGHT[tf]) or
           (mfi14 is not None and mfi14 >= MFI_OVERBOUGHT[tf]) or
@@ -237,28 +259,33 @@ async def compute_ext_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
           (mfi14 is not None and mfi14 <= MFI_OVERSOLD[tf]) or
           (mfi21 is not None and mfi21 <= MFI_OVERSOLD[tf]))
 
-    # 🔸 Классификация (приоритет)
-    state = "none"
-
-    # overbought_extension: зона overbought + верхние корзины BB (0..3) и/или рост корзины
+    # raw-состояние (приоритет)
+    raw_state = "none"
     if ob and bb_bucket_cur is not None and bb_bucket_cur <= 3:
-        state = "overbought_extension"
+        raw_state = "overbought_extension"
     elif ob and (bb_bucket_delta is not None and bb_bucket_delta >= 1):
-        state = "overbought_extension"
-
-    # oversold_extension: зона oversold + нижние корзины BB (8..11) и/или падение корзины
+        raw_state = "overbought_extension"
     elif os and bb_bucket_cur is not None and bb_bucket_cur >= 8:
-        state = "oversold_extension"
+        raw_state = "oversold_extension"
     elif os and (bb_bucket_delta is not None and bb_bucket_delta <= -1):
-        state = "oversold_extension"
-
-    # pullback в ап/даун-тренде (по LR): движение корзины BB против тренда
+        raw_state = "oversold_extension"
     elif uptrend and (bb_bucket_delta is not None and bb_bucket_delta <= -1):
-        state = "pullback_in_uptrend"
-    elif downtrend and (bb_bucket_delta is not None and bb_bucket_delta >= 1):
-        state = "pullback_in_downtrend"
+        raw_state = "pullback_in_uptrend"
+    elif downtrend and (bb_bucket_delta is not None and bb_bucket_delta >= +1):
+        raw_state = "pullback_in_downtrend"
 
-    # Детали (округление для красоты)
+    # hysteresis + dwell
+    prev_state, prev_streak = await load_prev_state(redis, kind="extremes", symbol=symbol, tf=tf)
+    thr = ext_thresholds(tf)
+    final_state, new_streak = apply_ext_hysteresis_and_dwell(
+        prev_state=prev_state,
+        raw_state=raw_state,
+        features={"bb_delta": bb_bucket_delta},
+        thr=thr,
+        prev_streak=prev_streak,
+    )
+
+    # детали
     def r2(x): return None if x is None else round(float(x), 2)
     def r5(x): return None if x is None else round(float(x), 5)
 
@@ -271,21 +298,26 @@ async def compute_ext_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
             "bucket_delta": bb_bucket_delta,
             "upper": r5(up_cur), "lower": r5(lo_cur)
         },
-        "lr": {"ang50": r5(ang50), "ang100": r5(ang100), "uptrend": bool(uptrend), "downtrend": bool(downtrend)},
+        "lr": {"ang50": r5(ang50), "ang100": r5(ang100), "uptrend": bool(uptrend), "downtrend": bool(downtrend), "conflict": bool(lr_conflict)},
         "flags": {"overbought": bool(ob), "oversold": bool(os)},
         "used_bases": ["rsi14","rsi21","mfi14","mfi21","bb20_2_0_upper","bb20_2_0_lower","lr50_angle","lr100_angle","close"],
         "missing_bases": [],
         "open_time_iso": open_iso,
+
+        # синхронизация с on-demand
+        "raw_state": raw_state,
+        "prev_state": prev_state,
+        "streak": new_streak,
     }
 
-    await persist_result(pg, redis, symbol, tf, open_iso, state, details)
+    await persist_result(pg, redis, symbol, tf, open_iso, final_state, details)
     log.debug(
-        f"MW_EXT OK {symbol}/{tf}@{open_iso} state={state} "
+        f"MW_EXT OK {symbol}/{tf}@{open_iso} state={final_state} "
+        f"(raw={raw_state}, prev={prev_state}, streak={new_streak}) "
         f"bb_bkt={bb_bucket_cur} Δbkt={bb_bucket_delta} "
         f"OB={details['flags']['overbought']} OS={details['flags']['oversold']} "
-        f"LR(up={uptrend},down={downtrend})"
+        f"LR(up={uptrend},down={downtrend},conflict={lr_conflict})"
     )
-
 
 # 🔸 Основной воркер: слушает indicator_stream, запускает расчёт с TS-барьером
 async def run_indicator_mw_extremes(pg, redis):

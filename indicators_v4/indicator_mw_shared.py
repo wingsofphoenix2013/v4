@@ -228,5 +228,71 @@ def apply_mom_hysteresis_and_dwell(
 
     return candidate, 1
 
-# 🔸 ------------------ TODO: Extremes thresholds + hysteresis/dwell ------------------
-# Зарезервировано под будущие обновления (MW_EXT).
+# 🔸 ------------------ Extremes: thresholds + hysteresis/dwell ------------------
+
+# Порог смещения BB-корзины для входа/выхода pullback (в «корзинах»)
+EXT_PULL_IN_DELTA  = 1   # вход: |Δbucket| ≥ 1
+EXT_PULL_OUT_DELTA = 0   # выход: допускаем 0 (ослабление отката)
+
+# Минимальная длительность эпизода
+EXT_MIN_STREAK     = {"m5": 2, "m15": 1, "h1": 1}
+
+def ext_thresholds(tf: str) -> dict:
+    return {
+        "pull_in":  EXT_PULL_IN_DELTA,
+        "pull_out": EXT_PULL_OUT_DELTA,
+        "min_streak": EXT_MIN_STREAK.get(tf, 2),
+    }
+
+def apply_ext_hysteresis_and_dwell(
+    prev_state: str | None,
+    raw_state: str,              # "overbought_extension" | "oversold_extension" | "pullback_in_uptrend" | "pullback_in_downtrend" | "none"
+    features: dict,              # {"bb_delta": int | None}
+    thr: dict,                   # из ext_thresholds(tf)
+    prev_streak: int,
+) -> tuple[str, int]:
+    """
+    Правила:
+      - extension (overbought/oversold) — override: переключаемся сразу, без dwell.
+      - pullback_* — гистерезис: вход при |Δbucket| ≥ pull_in, выход при |Δbucket| ≤ pull_out.
+      - dwell-time: удерживаем prev_state минимум N баров при смене на/с 'none' и между pullback-вариантами.
+    """
+    if prev_state is None:
+        return raw_state, 1
+
+    # overrides для extensions
+    if raw_state in ("overbought_extension", "oversold_extension"):
+        return (raw_state, prev_streak + 1) if raw_state == prev_state else (raw_state, 1)
+
+    bb_delta = features.get("bb_delta")
+    min_streak = thr["min_streak"]
+    pull_in  = thr["pull_in"]
+    pull_out = thr["pull_out"]
+
+    candidate = raw_state
+
+    # удержание/выход для pullback'ов
+    if prev_state == "pullback_in_uptrend":
+        keep = (bb_delta is not None and bb_delta <= -pull_out)
+        candidate = "pullback_in_uptrend" if keep else raw_state
+    elif prev_state == "pullback_in_downtrend":
+        keep = (bb_delta is not None and bb_delta >= +pull_out)
+        candidate = "pullback_in_downtrend" if keep else raw_state
+
+    # вход в pullback при недостаточной амплитуде не разрешаем
+    if raw_state == "pullback_in_uptrend":
+        if not (bb_delta is not None and bb_delta <= -pull_in):
+            candidate = "none"
+    if raw_state == "pullback_in_downtrend":
+        if not (bb_delta is not None and bb_delta >= +pull_in):
+            candidate = "none"
+
+    # если кандидат совпал — растим streak
+    if candidate == prev_state:
+        return prev_state, prev_streak + 1
+
+    # dwell для переключений (кроме extension override)
+    if prev_streak + 1 < min_streak and raw_state not in ("overbought_extension","oversold_extension"):
+        return prev_state, prev_streak + 1
+
+    return candidate, 1
