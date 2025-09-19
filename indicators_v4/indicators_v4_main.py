@@ -22,6 +22,7 @@ from indicator_gateway import run_indicator_gateway
 from indicator_mw_trend import run_indicator_mw_trend
 from indicator_mw_volatility import run_indicator_mw_volatility
 from indicator_mw_momentum import run_indicator_mw_momentum
+from indicator_mw_extremes import run_indicator_mw_extremes
 
 
 # 🔸 Глобальные переменные
@@ -562,6 +563,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_trend(pg, redis), "MW_TREND"),
         run_safe_loop(lambda: run_indicator_mw_volatility(pg, redis), "MW_VOL"),
         run_safe_loop(lambda: run_indicator_mw_momentum(pg, redis), "MW_MOM"),
+        run_safe_loop(lambda: run_indicator_mw_extremes(pg, redis), "MW_EXT"),
     )
 
 
