@@ -147,42 +147,17 @@ from routers import routers
 for router in routers:
     app.include_router(router)
 
-# 🔸 Получение всех тикеров + последних флагов из oracle_flags_v4
+# 🔸 Получение всех тикеров (без рыночных флагов/метрик)
 async def get_all_tickers():
     async with pg_pool.acquire() as conn:
-        # 1. Загружаем тикеры
-        tickers = await conn.fetch("""
+        rows = await conn.fetch("""
             SELECT id, symbol, status, tradepermission,
                    precision_price, precision_qty, min_qty
             FROM tickers_bb
             ORDER BY id
         """)
-        tickers = [dict(row) for row in tickers]
-
-        # 2. Загружаем последние флаги по каждому symbol и flag_type
-        flags = await conn.fetch("""
-            SELECT DISTINCT ON (symbol, flag_type)
-                   symbol, flag_type, flag_value
-            FROM oracle_flags_v4
-            ORDER BY symbol, flag_type, created_at DESC
-        """)
-
-        # 3. Преобразуем флаги в словарь вида: flags_by_symbol[symbol][flag_type] = flag_value
-        from collections import defaultdict
-
-        flags_by_symbol = defaultdict(dict)
-        for row in flags:
-            flags_by_symbol[row["symbol"]][row["flag_type"]] = row["flag_value"]
-
-        # 4. Встраиваем флаги в каждый тикер
-        for t in tickers:
-            symbol = t["symbol"]
-            t["trend_state"] = flags_by_symbol[symbol].get("trend_state")
-            t["volatility_state"] = flags_by_symbol[symbol].get("volatility_state")
-            t["volume_state"] = flags_by_symbol[symbol].get("volume_state")
-
-        return tickers
-
+        return [dict(row) for row in rows]
+        
 # 🔸 Добавление нового тикера в базу
 async def add_new_ticker(data: dict):
     async with pg_pool.acquire() as conn:
