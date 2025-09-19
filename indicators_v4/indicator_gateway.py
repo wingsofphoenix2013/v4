@@ -18,6 +18,7 @@ from packs.macd_pack import build_macd_pack
 from packs.trend_pack import build_trend_pack
 from packs.volatility_pack import build_volatility_pack
 from packs.momentum_pack import build_momentum_pack
+from packs.extremes_pack import build_extremes_pack
 from packs.pack_utils import floor_to_bar
 
 # 🔸 Логгер
@@ -88,7 +89,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 ts_raw   = data.get("timestamp_ms")
 
                 # валидация
-                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd","trend","volatility","momentum")
+                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd","trend","volatility","momentum","extremes")
                 if not symbol or tf not in ("m5","m15","h1") or ind not in valid_inds:
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_request"})
                     return msg_id
@@ -97,7 +98,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 bar_open_ms = floor_to_bar(now_ms, tf)
 
                 # активные инстансы
-                if ind not in ("trend", "volatility", "momentum"):
+                if ind not in ("trend", "volatility", "momentum", "extremes"):
                     instances = [i for i in get_instances_by_tf(tf) if i["indicator"] == ind]
                     if not instances:
                         await redis.xadd(RESP_STREAM, {
@@ -384,7 +385,27 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                             await redis.set(ckey, js, ex=LIVE_TTL_SEC)
                             await redis.set(pkey, js, ex=LIVE_TTL_SEC)
                             results.append(pack)
-                              
+
+                # 🔸 EXTREMES (live на текущем баре)
+                elif ind == "extremes":
+                    base = "extremes"
+                    ckey = cache_key(ind, symbol, tf, base, bar_open_ms)
+                    pkey = public_key(ind, symbol, tf, base)
+
+                    cached = await redis.get(ckey)
+                    if cached:
+                        try:
+                            results.append(json.loads(cached))
+                        except Exception:
+                            pass
+                    else:
+                        pack = await build_extremes_pack(symbol, tf, now_ms, precision, redis, compute_snapshot_values_async)
+                        if pack:
+                            js = json.dumps(pack)
+                            await redis.set(ckey, js, ex=LIVE_TTL_SEC)
+                            await redis.set(pkey, js, ex=LIVE_TTL_SEC)
+                            results.append(pack)
+                                      
                 # 🔸 ADX/DMI
                 else:  # ind == "adx_dmi"
                     if length_s:
