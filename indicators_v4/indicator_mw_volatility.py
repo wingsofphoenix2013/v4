@@ -5,6 +5,13 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+# 🔸 Общие правила MarketWatch (Volatility)
+from indicator_mw_shared import (
+    load_prev_state,
+    vol_thresholds,
+    apply_vol_hysteresis_and_dwell,
+)
+
 # 🔸 Константы и настройки (синхронизированы по стилю с MW_TREND)
 STREAM_READY = "indicator_stream"          # вход: готовность инстансов (atr14, bb20_2_0)
 GROUP       = "mw_vol_group"
@@ -178,8 +185,7 @@ async def persist_result(pg, redis, symbol: str, tf: str, open_time_iso: str,
     except Exception as e:
         log.error(f"[PG] upsert error volatility {symbol}/{tf}@{open_time_iso}: {e}")
 
-
-# 🔸 Расчёт Volatility по ключу (symbol, tf, open_time) — TS-барьер + дельты
+# 🔸 Расчёт Volatility по ключу (symbol, tf, open_time) — TS-барьер + дельты + hysteresis/dwell
 async def compute_vol_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     open_ms = iso_to_ms(open_iso)
 
@@ -206,22 +212,34 @@ async def compute_vol_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     if data["bb_upper"]["prev"] is not None and data["bb_lower"]["prev"] is not None:
         bw_prev = data["bb_upper"]["prev"] - data["bb_lower"]["prev"]
 
+    # классификация фазы ширины (expanding/contracting/stable) и относительная динамика
     bw_phase, bw_rel = classify_bw_phase(tf, bw_cur, bw_prev)
 
-    # классификация состояния (приоритеты)
-    low_th  = ATR_LOW_PCT.get(tf, 0.3)
-    high_th = ATR_HIGH_PCT.get(tf, 0.8)
-    is_low  = (atr_pct_cur is not None and atr_pct_cur < low_th)
-    is_high = (atr_pct_cur is not None and atr_pct_cur > high_th)
+    # 🔸 пороги и прошлое состояние
+    thr = vol_thresholds(tf)
+    prev_state, prev_streak = await load_prev_state(redis, kind="volatility", symbol=symbol, tf=tf)
+
+    # 🔸 raw_state по приоритетам (используем включающее сравнение для low)
+    is_low  = (atr_pct_cur is not None and atr_pct_cur <= thr["atr_low"])
+    is_high = (atr_pct_cur is not None and atr_pct_cur >  thr["atr_high"])
 
     if is_low and bw_phase == "contracting":
-        state = "low_squeeze"
+        raw_state = "low_squeeze"
     elif is_high:
-        state = "high"
-    elif bw_phase == "expanding":
-        state = "expanding"
+        raw_state = "high"
+    elif bw_rel is not None and bw_rel >= thr["bw_exp_in"]:
+        raw_state = "expanding"
     else:
-        state = "normal"
+        raw_state = "normal"
+
+    # 🔸 hysteresis + dwell (единые правила)
+    final_state, new_streak = apply_vol_hysteresis_and_dwell(
+        prev_state=prev_state,
+        raw_state=raw_state,
+        features={"rel_diff": bw_rel, "atr_pct": atr_pct_cur},
+        thr=thr,
+        prev_streak=prev_streak,
+    )
 
     # детали (округлим для красоты)
     def r2(x): return None if x is None else round(float(x), 2)
@@ -246,15 +264,23 @@ async def compute_vol_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
         "used_bases": ["atr14", "bb20_2_0_upper", "bb20_2_0_lower", "close"],
         "missing_bases": [],
         "open_time_iso": open_iso,
+
+        # 🔸 синхронизация с on-demand: память состояния
+        "raw_state": raw_state,
+        "prev_state": prev_state,
+        "streak": new_streak,
     }
 
-    await persist_result(pg, redis, symbol, tf, open_iso, state, "ok", details)
+    # запись
+    await persist_result(pg, redis, symbol, tf, open_iso, final_state, "ok", details)
+
+    # лог
     log.debug(
-        f"MW_VOL OK {symbol}/{tf}@{open_iso} state={state} "
+        f"MW_VOL OK {symbol}/{tf}@{open_iso} state={final_state} "
+        f"(raw={raw_state}, prev={prev_state}, streak={new_streak}) "
         f"atr_pct={details['atr_pct']} atr_b={details['atr_bucket']} Δatr_b={details['atr_bucket_delta']} "
         f"bw_phase={bw_phase} bw_rel={details['bw']['rel_diff']}"
     )
-
 
 # 🔸 Основной воркер: слушает indicator_stream, запускает расчёт с TS-барьером
 async def run_indicator_mw_volatility(pg, redis):
