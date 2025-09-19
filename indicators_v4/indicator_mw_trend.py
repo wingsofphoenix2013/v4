@@ -5,6 +5,13 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+# 🔸 Общие правила MarketWatch (гистерезис + dwell)
+from indicator_mw_shared import (
+    load_prev_state,
+    trend_thresholds,
+    apply_trend_hysteresis_and_dwell,
+)
+
 # 🔸 Константы и настройки
 STREAM_READY = "indicator_stream"          # вход: готовность инстансов (из compute_and_store)
 GROUP       = "mw_trend_group"
@@ -323,8 +330,7 @@ async def mark_gap(pg, symbol: str, tf: str, open_time_iso: str, missing_bases: 
     except Exception as e:
         log.warning(f"[GAP] insert error {symbol}/{tf}@{open_time_iso}: {e}")
 
-
-# 🔸 Расчёт Trend по ключу (symbol, tf, open_time) — с учётом TS-барьера и дельт
+# 🔸 Расчёт Trend по ключу (symbol, tf, open_time) — с учётом TS-барьера, дельт и единого hysteresis+dwell
 async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     open_ms = iso_to_ms(open_iso)
 
@@ -354,7 +360,7 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     # все точки есть — грузим пары cur/prev
     inputs = await load_trend_inputs(redis, symbol, tf, open_ms)
 
-    # считаем дельты всегда (до ADX-гарда)
+    # считаем дельты всегда (до финальной классификации)
     deltas = weaken_by_deltas(
         tf,
         inputs["adx14"]["cur"], inputs["adx14"]["prev"],
@@ -365,37 +371,10 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
         inputs["lr100_angle"]["cur"], inputs["lr100_angle"]["prev"],
     )
 
-    # проверяем ADX guard → если слабый тренд, сразу sideways, но дельты логируем
+    # текущая сила по ADX (для guard/гистерезиса)
     _, max_adx = base_strength_now(inputs["adx14"]["cur"], inputs["adx21"]["cur"])
-    if max_adx < ADX_SIDEWAYS_LEVEL:
-        state = "sideways"
-        extras = {
-            "deltas": {
-                "d_adx": deltas["d_adx"],
-                "d_abs_dist_pct": deltas["d_abs_dist_pct"],
-                "d_lr50_angle": deltas["d_lr50_angle"],
-                "d_lr100_angle": deltas["d_lr100_angle"],
-                **deltas["flags"],
-            },
-            "max_adx": round(max_adx, 2),
-        }
-        await persist_result(
-            pg, redis, symbol, tf, open_iso,
-            state=state, direction="sideways", strong=False,
-            status="ok", used_bases=sorted(EXPECTED_BASES), missing_bases=[],
-            extras=extras, source="live", version=1
-        )
-        d_adx_str    = "n/a" if deltas["d_adx"] is None else f"{deltas['d_adx']:.2f}"
-        d_abs_str    = "n/a" if deltas["d_abs_dist_pct"] is None else f"{deltas['d_abs_dist_pct']:.2f}"
-        d_ang50_str  = "n/a" if deltas["d_lr50_angle"] is None else f"{deltas['d_lr50_angle']:.5f}"
-        d_ang100_str = "n/a" if deltas["d_lr100_angle"] is None else f"{deltas['d_lr100_angle']:.5f}"
-        log.debug(
-            f"MW_TREND OK {symbol}/{tf}@{open_iso} state=sideways (max_adx={max_adx:.2f}) "
-            f"d_adx={d_adx_str} d_abs_dist={d_abs_str} d_ang50={d_ang50_str} d_ang100={d_ang100_str}"
-        )
-        return
 
-    # направление по «мягкому» голосованию
+    # направление по «мягкому» голосованию (deadband + согласованность)
     direction = infer_direction_soft(
         tf,
         inputs["close"]["cur"],
@@ -405,20 +384,29 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
 
     # сила: базово strong по уровню, затем ослабляем по дельтам
     strong, _ = base_strength_now(inputs["adx14"]["cur"], inputs["adx21"]["cur"])
-    deltas = weaken_by_deltas(
-        tf,
-        inputs["adx14"]["cur"], inputs["adx14"]["prev"],
-        inputs["adx21"]["cur"], inputs["adx21"]["prev"],
-        inputs["ema50"]["cur"], inputs["ema50"]["prev"],
-        inputs["close"]["cur"], inputs["close"]["prev"],
-        inputs["lr50_angle"]["cur"], inputs["lr50_angle"]["prev"],
-        inputs["lr100_angle"]["cur"], inputs["lr100_angle"]["prev"],
-    )
     if strong and deltas["weaken"]:
         strong = False
 
-    state = "sideways" if direction == "sideways" else f"{direction}_{'strong' if strong else 'weak'}"
+    # пороги/память (единые правила)
+    prev_state, prev_streak = await load_prev_state(redis, kind="trend", symbol=symbol, tf=tf)
+    thresholds = trend_thresholds(tf)
 
+    # RAW state: если ADX ниже входного порога во флет — raw = sideways; иначе — по direction/strong
+    if max_adx is not None and max_adx < thresholds["adx_in"]:
+        raw_state = "sideways"
+    else:
+        raw_state = "sideways" if direction == "sideways" else f"{direction}_{'strong' if strong else 'weak'}"
+
+    # финальный state с учётом гистерезиса и минимальной длительности
+    final_state, new_streak = apply_trend_hysteresis_and_dwell(
+        prev_state=prev_state,
+        raw_state=raw_state,
+        features={"max_adx": max_adx},
+        thresholds=thresholds,
+        prev_streak=prev_streak,
+    )
+
+    # детали для записи
     extras = {
         "deltas": {
             "d_adx": deltas["d_adx"],
@@ -426,26 +414,35 @@ async def compute_trend_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
             "d_lr50_angle": deltas["d_lr50_angle"],
             "d_lr100_angle": deltas["d_lr100_angle"],
             **deltas["flags"],
-        }
+        },
+        "max_adx": round(max_adx, 2) if max_adx is not None else None,
+        "raw_state": raw_state,
+        "prev_state": prev_state,
+        "streak": new_streak,
     }
 
     await persist_result(
         pg, redis, symbol, tf, open_iso,
-        state=state, direction=direction, strong=strong,
-        status="ok", used_bases=sorted(EXPECTED_BASES), missing_bases=[],
-        extras=extras, source="live", version=1
+        state=final_state,
+        direction=direction,
+        strong=final_state.endswith("_strong"),
+        status="ok",
+        used_bases=sorted(EXPECTED_BASES),
+        missing_bases=[],
+        extras=extras,
+        source="live",
+        version=1
     )
 
-    # лог красиво
+    # лог: итог + краткие дельты
     d_adx_str    = "n/a" if deltas["d_adx"] is None else f"{deltas['d_adx']:.2f}"
     d_abs_str    = "n/a" if deltas["d_abs_dist_pct"] is None else f"{deltas['d_abs_dist_pct']:.2f}"
     d_ang50_str  = "n/a" if deltas["d_lr50_angle"] is None else f"{deltas['d_lr50_angle']:.5f}"
     d_ang100_str = "n/a" if deltas["d_lr100_angle"] is None else f"{deltas['d_lr100_angle']:.5f}"
-    log.debug(
-        f"MW_TREND OK {symbol}/{tf}@{open_iso} state={state} "
-        f"d_adx={d_adx_str} d_abs_dist={d_abs_str} d_ang50={d_ang50_str} d_ang100={d_ang100_str}"
+    log.info(
+        f"MW_TREND OK {symbol}/{tf}@{open_iso} state={final_state} (raw={raw_state}, prev={prev_state}, streak={new_streak}) "
+        f"(max_adx={extras['max_adx']}) d_adx={d_adx_str} d_abs_dist={d_abs_str} d_ang50={d_ang50_str} d_ang100={d_ang100_str}"
     )
-
 
 # 🔸 Основной воркер: слушает indicator_stream, запускает расчёт с TS-барьером
 async def run_indicator_mw_trend(pg, redis):

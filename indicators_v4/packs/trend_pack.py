@@ -1,6 +1,14 @@
 # packs/trend_pack.py — on-demand TREND (live на текущем баре: up/down/sideways + strong/weak) с дельтами и «смягчённым» голосованием
 
 import logging
+
+# 🔸 Общие правила MarketWatch (гистерезис + dwell)
+from indicator_mw_shared import (
+    load_prev_state,
+    trend_thresholds,
+    apply_trend_hysteresis_and_dwell,
+)
+
 from .pack_utils import (
     STEP_MS,
     floor_to_bar,
@@ -166,8 +174,7 @@ def weaken_by_deltas(tf: str,
         }
     }
 
-
-# 🔸 Построить live TREND-пакет (в стиле MW_TREND)
+# 🔸 Построить live TREND-пакет (в стиле MW_TREND) с единым hysteresis+dwell
 async def build_trend_pack(symbol: str, tf: str, now_ms: int,
                            precision: int, redis, compute_fn) -> dict | None:
     """
@@ -251,29 +258,8 @@ async def build_trend_pack(symbol: str, tf: str, now_ms: int,
         ang100, ang100_prev,
     )
 
-    # guard на флэт по ADX
+    # сила по ADX (для guard/гистерезиса)
     _, max_adx = base_strength_now(adx14, adx21)
-    if max_adx < ADX_SIDEWAYS_LEVEL:
-        pack = {
-            "base": "trend",
-            "pack": {
-                "state": "sideways",
-                "direction": "sideways",
-                "strong": False,
-                "ref": "live",
-                "open_time": bar_open_iso(bar_open_ms),
-                "used_bases": ["ema21", "ema50", "ema200", "lr50", "lr100", "adx_dmi14", "adx_dmi21"],
-                "max_adx": round(max_adx, 2),
-                "deltas": {
-                    "d_adx": deltas["d_adx"],
-                    "d_abs_dist_pct": deltas["d_abs_dist_pct"],
-                    "d_lr50_angle": deltas["d_lr50_angle"],
-                    "d_lr100_angle": deltas["d_lr100_angle"],
-                    **deltas["flags"],
-                },
-            },
-        }
-        return pack
 
     # направление по «мягкому» голосованию (deadband + согласованность)
     direction = infer_direction_soft(tf, price_live, ema21, ema50, ema200, ang50, ang100)
@@ -283,19 +269,39 @@ async def build_trend_pack(symbol: str, tf: str, now_ms: int,
     if strong and deltas["weaken"]:
         strong = False
 
-    state = "sideways" if direction == "sideways" else f"{direction}_{'strong' if strong else 'weak'}"
+    # единые пороги/гистерезис + чтение прошлого состояния из KV
+    prev_state, prev_streak = await load_prev_state(redis, kind="trend", symbol=symbol, tf=tf)
+    thresholds = trend_thresholds(tf)
 
-    # сборка пакета (диагностика включена)
+    # RAW state: если ADX ниже входного порога во флет — raw = sideways; иначе — по direction/strong
+    if max_adx is not None and max_adx < thresholds["adx_in"]:
+        raw_state = "sideways"
+    else:
+        raw_state = "sideways" if direction == "sideways" else f"{direction}_{'strong' if strong else 'weak'}"
+
+    # финальный state с учётом hysteresis+dwell
+    final_state, new_streak = apply_trend_hysteresis_and_dwell(
+        prev_state=prev_state,
+        raw_state=raw_state,
+        features={"max_adx": max_adx},
+        thresholds=thresholds,
+        prev_streak=prev_streak,
+    )
+
+    # сборка пакета (диагностика совпадает с воркером)
     pack = {
         "base": "trend",
         "pack": {
-            "state": state,
+            "state": final_state,
             "direction": direction,
-            "strong": bool(strong),
+            "strong": final_state.endswith("_strong"),
             "ref": "live",
             "open_time": bar_open_iso(bar_open_ms),
             "used_bases": ["ema21", "ema50", "ema200", "lr50", "lr100", "adx_dmi14", "adx_dmi21"],
-            "max_adx": round(max_adx, 2),
+            "max_adx": round(max_adx, 2) if max_adx is not None else None,
+            "prev_state": prev_state,
+            "raw_state": raw_state,
+            "streak_preview": new_streak,  # сколько будет после фиксации на закрытии
             "deltas": {
                 "d_adx": deltas["d_adx"],
                 "d_abs_dist_pct": deltas["d_abs_dist_pct"],
