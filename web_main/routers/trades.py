@@ -34,6 +34,8 @@ async def trades_page(request: Request, filter: str = "24h", series: str = None)
         "filter": filter,
         "series": series,
     })
+
+
 # 🔸 Расчёт статистики стратегий под /trades
 async def get_trading_summary(filter: str) -> list[dict]:
     async with pg_pool.acquire() as conn:
@@ -45,15 +47,8 @@ async def get_trading_summary(filter: str) -> list[dict]:
             ORDER BY id
         """)
 
-        # 👑 Получаем последнюю запись из strategies_active_v4
-        active_row = await conn.fetchrow("""
-            SELECT * FROM strategies_active_v4
-            ORDER BY ts DESC
-            LIMIT 1
-        """)
-        current_king_id = active_row["strategy_id"] if active_row else None
-        previous_king_id = active_row["previous_strategy_id"] if active_row else None
-        current_ts = active_row["ts"] if active_row else None
+        # 🕒 Таймштампы метрик: текущий и «предыдущий» (4–6 минут назад)
+        current_ts = await conn.fetchval("SELECT MAX(ts) FROM strategies_metrics_v4")
 
         # 🔁 Диапазон по фильтру
         if filter == "3h":
@@ -72,34 +67,36 @@ async def get_trading_summary(filter: str) -> list[dict]:
         if start and end:
             start = start.replace(tzinfo=None)
             end = end.replace(tzinfo=None)
-            
-        # ⏳ Предыдущее ts из диапазона 4–6 минут
-        previous_ts = await conn.fetchval("""
-            SELECT ts FROM strategies_metrics_v4
-            WHERE ts < $1
-              AND ts >= $1 - interval '6 minutes'
-              AND ts <= $1 - interval '4 minutes'
-            ORDER BY ts DESC
-            LIMIT 1
-        """, current_ts)
 
-        # 📊 Метрики по current_ts
-        rows_current = await conn.fetch("""
-            SELECT strategy_id, final_rating
-            FROM strategies_metrics_v4
-            WHERE ts = $1
-        """, current_ts)
-        metrics_current = {r["strategy_id"]: r["final_rating"] for r in rows_current}
+        # Если нет ни одной метрики — продолжим без тренд-иконок
+        metrics_current = {}
+        metrics_prev = {}
+        if current_ts is not None:
+            previous_ts = await conn.fetchval("""
+                SELECT ts FROM strategies_metrics_v4
+                WHERE ts < $1
+                  AND ts >= $1 - interval '6 minutes'
+                  AND ts <= $1 - interval '4 minutes'
+                ORDER BY ts DESC
+                LIMIT 1
+            """, current_ts)
 
-        # 📉 Метрики по previous_ts
-        rows_prev = await conn.fetch("""
-            SELECT strategy_id, final_rating
-            FROM strategies_metrics_v4
-            WHERE ts = $1
-        """, previous_ts)
-        metrics_prev = {r["strategy_id"]: r["final_rating"] for r in rows_prev}
+            rows_current = await conn.fetch("""
+                SELECT strategy_id, final_rating
+                FROM strategies_metrics_v4
+                WHERE ts = $1
+            """, current_ts)
+            metrics_current = {r["strategy_id"]: r["final_rating"] for r in rows_current}
 
-        # 🧠 Строим словарь динамики
+            if previous_ts is not None:
+                rows_prev = await conn.fetch("""
+                    SELECT strategy_id, final_rating
+                    FROM strategies_metrics_v4
+                    WHERE ts = $1
+                """, previous_ts)
+                metrics_prev = {r["strategy_id"]: r["final_rating"] for r in rows_prev}
+
+        # 🧠 Словарь динамики
         trend_map = {}
         all_ids = {s["id"] for s in strategies}
         for sid in all_ids:
@@ -122,60 +119,8 @@ async def get_trading_summary(filter: str) -> list[dict]:
             else:
                 trend_map[sid] = "⛔"
 
-        # 🔥 Добавляем "Королевские торги" — псевдо-стратегию
-        if start and end:
-            rows_king = await conn.fetch("""
-                SELECT p.status, p.pnl, p.notional_value, p.strategy_id, s.leverage
-                FROM positions_v4 p
-                JOIN strategies_v4 s ON p.strategy_id = s.id
-                WHERE p.opened_by_king = true
-                  AND p.created_at BETWEEN $1 AND $2
-            """, start, end)
-        else:
-            rows_king = await conn.fetch("""
-                SELECT p.status, p.pnl, p.notional_value, p.strategy_id, s.leverage
-                FROM positions_v4 p
-                JOIN strategies_v4 s ON p.strategy_id = s.id
-                WHERE p.opened_by_king = true
-            """)
+        result = []
 
-        open_count = sum(1 for r in rows_king if r["status"] == "open")
-
-        closed_positions = [
-            r for r in rows_king
-            if r["status"] == "closed"
-            and r["pnl"] is not None
-            and r["notional_value"] is not None
-            and r["leverage"]
-        ]
-
-        closed_count = len(closed_positions)
-        win_count = sum(1 for r in closed_positions if r["pnl"] >= 0)
-        pnl_sum = sum((r["pnl"] for r in closed_positions), Decimal("0"))
-
-        total_invested = sum(
-            (r["notional_value"] / r["leverage"])
-            for r in closed_positions
-            if r["leverage"] > 0
-        )
-
-        winrate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
-        roi = round(pnl_sum / total_invested * 100, 2) if total_invested > 0 else None
-
-        result = [{
-            "id": -1,
-            "name": "kings_bounty",
-            "human_name": "Королевские торги",
-            "open": open_count,
-            "closed": closed_count,
-            "winrate": winrate,
-            "roi": roi,
-            "profit": pnl_sum,
-            "is_king": False,
-            "was_king": False,
-            "trend_icon": "👑"
-        }]
-        
         # 📦 Основные стратегии
         for strat in strategies:
             sid = strat["id"]
@@ -215,9 +160,6 @@ async def get_trading_summary(filter: str) -> list[dict]:
                     WHERE strategy_id = $1 AND status = 'open'
                 """, sid)
 
-            is_king = sid == current_king_id
-            was_king = sid == previous_king_id
-
             result.append({
                 "id": sid,
                 "name": strat["name"],
@@ -227,13 +169,13 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 "winrate": winrate,
                 "roi": roi,
                 "profit": pnl_sum,
-                "is_king": is_king,
-                "was_king": was_king,
                 "trend_icon": trend_map.get(sid, "⛔"),
             })
 
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
         return result
+
+
 @router.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_detail_page(
     request: Request,
@@ -396,6 +338,8 @@ async def strategy_detail_page(
         "roi": roi,
         "today_key": today_key,
     })
+
+
 # 🔸 Страница статистики по стратегиям
 @router.get("/trades/details/{strategy_name}/stats", response_class=HTMLResponse)
 async def strategy_stats_overview(
@@ -542,6 +486,8 @@ async def strategy_stats_overview(
         "summary_row": summary_row,
         "ema_distribution": ema_distribution
     })
+
+
 # 🔸 Статистика стратегии по индикатору RSI
 RSI_BINS = [(0, 20), (20, 30), (30, 40), (40, 50),
             (50, 60), (60, 70), (70, 80), (80, float("inf"))]
@@ -641,6 +587,8 @@ async def strategy_rsi_stats(
         "rsi_bins": RSI_BINS,
         "rsi_inf": RSI_INF,
     })
+
+
 # 🔸 Статистика стратегии по индикатору ADX
 ADX_BINS = [(0, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 35), (35, 40), (40, float("inf"))]
 ADX_INF = float("inf")  # для шаблона
@@ -785,6 +733,8 @@ async def strategy_adx_stats(
         "signed_gap_fail": signed_gap_fail,
         "gap_labels": GAP_LABELS
     })
+
+
 # 🔸 Статистика стратегии по Bollinger Bands
 BB_ZONES = 6
 BB_SETS = ["2_5", "2_0"]
@@ -909,6 +859,7 @@ async def strategy_bb_stats(
         "bb_pnl_distribution": bb_pnl_distribution,
     })
 
+
 # 🔸 Статистика стратегии по MFI
 MFI_BINS = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50),
             (50, 60), (60, 70), (70, 80), (80, 90), (90, float("inf"))]
@@ -943,7 +894,7 @@ async def strategy_mfi_stats(
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
             FROM positions_v4
-            WHERE strategy_id = $1 AND status = 'closed'
+            WHERE strategy_id = $1 AND статус = 'closed'
         """, strategy["id"])
 
         position_map = {
@@ -1009,6 +960,8 @@ async def strategy_mfi_stats(
         "mfi_summary": summary,
         "mfi_bins": MFI_BINS
     })
+
+
 # 🔸 Статистика стратегии по LR (угол наклона)
 LR_BINS = [
     (-float("inf"), -0.02),
@@ -1136,6 +1089,8 @@ async def strategy_lr_stats(
         "lr_summary": summary,
         "lr_labels": LR_LABELS
     })
+
+
 # 🔸 Статистика стратегии по MACD (включая направление тренда)
 MACD_CATEGORIES_EXT = [
     "↓↓ hist←", "↓↓ hist→",

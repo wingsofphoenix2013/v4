@@ -154,7 +154,7 @@ async def get_all_tickers():
         tickers = await conn.fetch("""
             SELECT id, symbol, status, tradepermission,
                    precision_price, precision_qty, min_qty
-            FROM tickers_v4
+            FROM tickers_bb
             ORDER BY id
         """)
         tickers = [dict(row) for row in tickers]
@@ -187,7 +187,7 @@ async def get_all_tickers():
 async def add_new_ticker(data: dict):
     async with pg_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO tickers_v4 (symbol, status, tradepermission,
+            INSERT INTO tickers_bb (symbol, status, tradepermission,
               precision_price, precision_qty, min_qty, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, NOW())
         """, data['symbol'], data['status'], data['tradepermission'],
@@ -197,7 +197,7 @@ async def add_new_ticker(data: dict):
 async def ticker_exists(symbol: str) -> bool:
     async with pg_pool.acquire() as conn:
         result = await conn.fetchval("""
-            SELECT EXISTS(SELECT 1 FROM tickers_v4 WHERE symbol = $1)
+            SELECT EXISTS(SELECT 1 FROM tickers_bb WHERE symbol = $1)
         """, symbol)
         return result
 
@@ -272,7 +272,7 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
     async with pg_pool.acquire() as conn:
         # 🔹 Обновление основного поля
         await conn.execute(
-            f"UPDATE tickers_v4 SET {field} = $1 WHERE id = $2",
+            f"UPDATE tickers_bb SET {field} = $1 WHERE id = $2",
             new_value, ticker_id
         )
 
@@ -280,17 +280,17 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
         if field == "status":
             if new_value == "enabled":
                 await conn.execute(
-                    "UPDATE tickers_v4 SET activated_at = NOW() WHERE id = $1",
+                    "UPDATE tickers_bb SET activated_at = NOW() WHERE id = $1",
                     ticker_id
                 )
             elif new_value == "disabled":
                 await conn.execute(
-                    "UPDATE tickers_v4 SET activated_at = NULL WHERE id = $1",
+                    "UPDATE tickers_bb SET activated_at = NULL WHERE id = $1",
                     ticker_id
                 )
 
         # 🔹 Получение символа тикера
-        symbol = await conn.fetchval("SELECT symbol FROM tickers_v4 WHERE id = $1", ticker_id)
+        symbol = await conn.fetchval("SELECT symbol FROM tickers_bb WHERE id = $1", ticker_id)
 
     # 🔹 Публикация события
     event = {
@@ -300,7 +300,7 @@ async def update_ticker_and_notify(ticker_id: int, field: str, new_value: str):
         "source": "web_ui"
     }
 
-    await redis_client.publish("tickers_v4_events", json.dumps(event))
+    await redis_client.publish("bb:tickers_events", json.dumps(event))
     log.info(f"[PubSub] {event}")
 # 🔸 Страница со списком всех расчётов индикаторов и их параметрами
 @app.get("/indicators", response_class=HTMLResponse)
@@ -473,13 +473,13 @@ async def testsignals_page(request: Request):
     async with pg_pool.acquire() as conn:
         # Все тикеры с включённым статусом
         tickers_all = await conn.fetch("""
-            SELECT symbol FROM tickers_v4
+            SELECT symbol FROM tickers_bb
             WHERE status = 'enabled'
         """)
 
         # Только активные тикеры (status=enabled и tradepermission=enabled)
         tickers_active = await conn.fetch("""
-            SELECT symbol FROM tickers_v4
+            SELECT symbol FROM tickers_bb
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
 

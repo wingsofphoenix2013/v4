@@ -86,22 +86,6 @@
      class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded font-medium">
     Торги
   </a>
-
-  <!-- Кнопка фискализации -->
-  <form method="post" action="/strategies/{{ strategy.name }}/toggle-auditor">
-    <button type="submit"
-            class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded font-medium">
-      {{ "Выключить фискализацию" if strategy.auditor_enabled else "Включить фискализацию" }}
-    </button>
-  </form>
-  <!-- Кнопка Binance -->
-  <form method="post" action="/strategies/{{ strategy.name }}/toggle-binance">
-    <button type="submit"
-          class="px-4 py-1.5 bg-black text-sm rounded font-medium
-                 {% if strategy.binance_enabled %}text-red-500{% else %}text-green-500{% endif %}">
-    {{ "Выключить торговлю" if strategy.binance_enabled else "Включить торговлю" }}
-    </button>
-  </form>
 </div>
 
     <!-- Правая группа кнопок -->

@@ -23,6 +23,7 @@ pg_pool = None
 redis_client = None
 templates = None  # будет присвоено в main.py
 
+
 # 🔸 Страница со списком стратегий
 @router.get("/strategies", response_class=HTMLResponse)
 async def strategies_page(request: Request, filter: str = "all"):
@@ -55,17 +56,21 @@ async def strategies_page(request: Request, filter: str = "all"):
         "disabled_strategies": disabled_list,
         "filter": filter
     })
+
+
 # 🔸 POST: включение стратегии
 @router.post("/strategies/{strategy_id}/enable")
 async def enable_strategy(strategy_id: int, filter: str = Form("all")):
     await update_strategy_status(strategy_id, True)
     return RedirectResponse(url=f"/strategies?filter={filter}", status_code=status.HTTP_303_SEE_OTHER)
 
+
 # 🔸 POST: отключение стратегии
 @router.post("/strategies/{strategy_id}/disable")
 async def disable_strategy(strategy_id: int, filter: str = Form("all")):
     await update_strategy_status(strategy_id, False)
     return RedirectResponse(url=f"/strategies?filter={filter}", status_code=status.HTTP_303_SEE_OTHER)
+
 
 # 🔸 Обновление статуса стратегии и публикация события
 async def update_strategy_status(strategy_id: int, new_value: bool):
@@ -85,6 +90,7 @@ async def update_strategy_status(strategy_id: int, new_value: bool):
     await redis_client.publish("strategies_v4_events", json.dumps(event))
     log.info(f"[PubSub] {event}")
 
+
 # 🔸 Форма создания стратегии
 @router.get("/strategies/create", response_class=HTMLResponse)
 async def strategies_create_form(request: Request):
@@ -98,6 +104,7 @@ async def strategies_create_form(request: Request):
         "error": None
     })
 
+
 # 🔸 Сигналы по таймфрейму (AJAX)
 @router.get("/strategies/signals_by_timeframe")
 async def get_signals_by_tf(tf: str):
@@ -108,6 +115,8 @@ async def get_signals_by_tf(tf: str):
             ORDER BY name
         """, tf)
         return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
 # 🔸 POST: создание стратегии (без TP/SL/тикеров)
 @router.post("/strategies/create", response_class=HTMLResponse)
 async def create_strategy(
@@ -171,6 +180,7 @@ async def create_strategy(
              deposit, position_limit, leverage, max_risk,
              timeframe.lower(), enabled_bool, reverse, sl_protection,
              use_all_tickers, sl_type, Decimal(sl_value))
+
         # Получаем ID вставленной стратегии
         result = await conn.fetchrow("SELECT id FROM strategies_v4 WHERE name = $1", name)
         strategy_id = result["id"]
@@ -217,6 +227,8 @@ async def create_strategy(
                 """, strategy_id, int(tid))
                 
     return RedirectResponse(url="/strategies", status_code=status.HTTP_303_SEE_OTHER)
+
+
 # 🔸 GET: список тикеров со статусом 'enabled' (для стратегии)
 @router.get("/tickers/enabled")
 async def get_enabled_tickers():
@@ -229,6 +241,7 @@ async def get_enabled_tickers():
         """)
         return [{"id": r["id"], "symbol": r["symbol"]} for r in rows]
 
+
 # 🔸 GET: проверка уникальности имени стратегии (AJAX от UI)
 @router.get("/strategies/check_name")
 async def check_strategy_name(name: str):
@@ -238,6 +251,8 @@ async def check_strategy_name(name: str):
             name
         )
     return {"exists": row is not None}
+
+
 # 🔸 Детали стратегии по name
 @router.get("/strategies/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_details(
@@ -337,8 +352,9 @@ async def strategy_details(
         "trade_total": trade_total,
         "trade_limit": trade_limit,
     })
-# 🔸 POST: Снятие средств из кассы
 
+
+# 🔸 POST: Снятие средств из кассы
 class WithdrawRequest(BaseModel):
     amount: float
 
@@ -385,6 +401,8 @@ async def withdraw_from_cash(strategy_name: str, payload: WithdrawRequest):
                 f"Снято из кассы ${float(amount):.2f}. Остаток в кассе ${float(new_cash):.2f}")
 
     return {"status": "ok"}
+
+
 # 🔸 POST: Перевод между кассой и депозитом
 class TransferRequest(BaseModel):
     amount: condecimal(gt=Decimal("-100000000"), lt=Decimal("100000000"))  # строго Decimal, безопасный диапазон
@@ -488,8 +506,9 @@ async def transfer_cash_to_deposit(strategy_name: str, payload: TransferRequest)
             })
 
     return {"status": "ok"}
-# 🔸 POST: Изменение депозита вручную
 
+
+# 🔸 POST: Изменение депозита вручную
 class AdjustDepositRequest(BaseModel):
     amount: condecimal(gt=Decimal("-100000000"), lt=Decimal("100000000"))
 
@@ -571,59 +590,8 @@ async def adjust_deposit(strategy_name: str, payload: AdjustDepositRequest):
             })
 
     return {"status": "ok"}
-@router.post("/strategies/{strategy_name}/toggle-auditor")
-async def toggle_auditor(strategy_name: str):
-    async with pg_pool.acquire() as conn:
-        # Получаем текущее значение
-        row = await conn.fetchrow("""
-            SELECT id, auditor_enabled
-            FROM strategies_v4
-            WHERE name = $1
-        """, strategy_name)
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Стратегия не найдена")
 
-        new_value = not row["auditor_enabled"]
-
-        await conn.execute("""
-            UPDATE strategies_v4
-            SET auditor_enabled = $1
-            WHERE id = $2
-        """, new_value, row["id"])
-
-    return RedirectResponse(url=f"/strategies/details/{strategy_name}", status_code=303)
-# 🔸 Переключение флага Binance-торговли
-@router.post("/strategies/{strategy_name}/toggle-binance")
-async def toggle_binance(strategy_name: str):
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, binance_enabled
-            FROM strategies_v4
-            WHERE name = $1
-        """, strategy_name)
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Стратегия не найдена")
-
-        strategy_id = row["id"]
-        new_value = not row["binance_enabled"]
-
-        await conn.execute("""
-            UPDATE strategies_v4
-            SET binance_enabled = $1
-            WHERE id = $2
-        """, new_value, strategy_id)
-
-        # Публикация в Redis Pub/Sub
-        payload = json.dumps({
-            "strategy_id": strategy_id,
-            "binance_enabled": new_value
-        })
-
-        await redis_client.publish("binance_strategy_updates", payload)
-
-    return RedirectResponse(url=f"/strategies/details/{strategy_name}", status_code=303)
 @router.post("/strategies/bulk-create", response_class=HTMLResponse)
 async def bulk_create_strategies(request: Request):
     form = await request.form()
@@ -756,7 +724,7 @@ async def bulk_create_strategies(request: Request):
                         timeframe, enabled, reverse, sl_protection,
                         archived, use_all_tickers, allow_open,
                         use_stoploss, sl_type, sl_value,
-                        auditor_enabled, binance_enabled, created_at
+                        created_at
                     )
                     VALUES (
                         $1, $2, $3, $4,
@@ -764,7 +732,7 @@ async def bulk_create_strategies(request: Request):
                         $9, false, $10, $11,
                         false, $12, true,
                         true, $13, $14,
-                        false, false, NOW()
+                        NOW()
                     )
                     RETURNING id
                 """, s["name"], s["human_name"], s["description"], signal_id,
@@ -803,6 +771,8 @@ async def bulk_create_strategies(request: Request):
                         """, strategy_id, tid)
 
     return RedirectResponse(url="/strategies", status_code=303)
+
+
 @router.get("/strategies/bulk-create", response_class=HTMLResponse)
 async def strategies_bulk_create_form(request: Request):
     return templates.TemplateResponse("strategies_bulk_create.html", {

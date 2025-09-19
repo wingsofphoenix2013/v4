@@ -6,13 +6,10 @@
     <title>Стратегии</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-      body {
-        background: linear-gradient(to bottom right, #e0f2ff, #fde2e4);
-      }
+      body { background: linear-gradient(to bottom right, #e0f2ff, #fde2e4); }
     </style>
   </head>
   <body class="min-h-screen font-sans text-slate-800">
-    <!-- Верхнее меню навигации -->
     <header class="w-full bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
       <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
         <h1 class="text-2xl font-semibold text-blue-900 tracking-wide">Торговый Движок v4</h1>
@@ -27,142 +24,86 @@
         </nav>
       </div>
     </header>
-<!-- Контейнер кнопок и таблицы -->
-<main class="max-w-7xl mx-auto px-4 py-10">
-<!-- Панель кнопок фильтрации по дате и серии -->
-<div class="flex justify-between items-center mb-6">
-<!-- Фильтр по дате -->
-<div class="flex space-x-3">
-  {% for f in ['3h', '24h', 'yesterday', '7days', 'all'] %}
-  <a href="/trades?filter={{ f }}{% if series %}&series={{ series }}{% endif %}"
-     class="px-4 py-2 rounded-lg font-semibold transition
-     {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == f else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-    {% if f == '3h' %}3 часа{% elif f == '24h' %}24 часа{% elif f == 'yesterday' %}Вчера{% elif f == '7days' %}7 дней{% else %}Всего{% endif %}
-  </a>
-  {% endfor %}
-</div>
-<!-- Фильтр по серии -->
-<div class="flex space-x-3">
-  <!-- Кнопка "Все серии" -->
-  <a href="/trades{% if filter %}?filter={{ filter }}{% endif %}"
-     class="px-3 py-2 rounded-lg font-semibold transition
-     {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if not series else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-    Все серии
-  </a>
 
-  {% for s in ['0', '1', '2', '3', '4', '5', '6', '7', '8'] %}
-  <a href="/trades?series={{ s }}{% if filter %}&filter={{ filter }}{% endif %}"
-     class="px-3 py-2 rounded-lg font-semibold transition
-     {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if series == s else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
-    {{ s }}
-  </a>
-  {% endfor %}
-</div>
-</div>
-{% set special_strategy = strategies | selectattr("name", "equalto", "kings_bounty") | list %}
-{% set main_strategies = strategies | rejectattr("name", "equalto", "kings_bounty") | list %}
+    <main class="max-w-7xl mx-auto px-4 py-10">
+      <!-- Панель кнопок фильтрации по дате и серии -->
+      <div class="flex justify-between items-center mb-6">
+        <!-- Фильтр по дате -->
+        <div class="flex space-x-3">
+          {% for f in ['3h', '24h', 'yesterday', '7days', 'all'] %}
+          <a href="/trades?filter={{ f }}{% if series %}&series={{ series }}{% endif %}"
+             class="px-4 py-2 rounded-lg font-semibold transition
+             {{ 'bg-blue-600 text-white shadow hover:bg-blue-700' if filter == f else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+            {% if f == '3h' %}3 часа{% elif f == '24h' %}24 часа{% elif f == 'yesterday' %}Вчера{% elif f == '7days' %}7 дней{% else %}Всего{% endif %}
+          </a>
+          {% endfor %}
+        </div>
+        <!-- Фильтр по серии -->
+        <div class="flex space-x-3">
+          <a href="/trades{% if filter %}?filter={{ filter }}{% endif %}"
+             class="px-3 py-2 rounded-lg font-semibold transition
+             {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if not series else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+            Все серии
+          </a>
+          {% for s in ['0','1','2','3','4','5','6','7','8'] %}
+          <a href="/trades?series={{ s }}{% if filter %}&filter={{ filter }}{% endif %}"
+             class="px-3 py-2 rounded-lg font-semibold transition
+             {{ 'bg-purple-600 text-white shadow hover:bg-purple-700' if series == s else 'bg-slate-200 text-slate-800 hover:bg-slate-300' }}">
+            {{ s }}
+          </a>
+          {% endfor %}
+        </div>
+      </div>
 
-<!-- 🔥 Первая таблица: Королевские торги -->
-{% if special_strategy %}
-<table class="w-full table-auto bg-yellow-50 rounded-xl shadow overflow-hidden mb-8">
-  <thead class="bg-yellow-100 text-slate-700 text-left text-sm uppercase">
-    <tr>
-      <th class="px-4 py-3">№</th>
-      <th class="px-4 py-3">Код</th>
-      <th class="px-4 py-3">Название стратегии</th>
-      <th class="px-4 py-3">Сделки</th>
-      <th class="px-4 py-3">Winrate</th>
-      <th class="px-4 py-3">Прибыль</th>
-    </tr>
-  </thead>
-  <tbody class="text-slate-800 text-sm divide-y divide-yellow-200">
-    {% for s in special_strategy %}
-    <tr>
-      <td class="px-4 py-3">👑</td>
-      <td class="px-4 py-3 font-mono">{{ s.name }}</td>
-      <td class="px-4 py-3">
-        <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-yellow-800 underline hover:text-yellow-600">
-          {{ s.human_name }}
-        </a>
-      </td>
-      <td class="px-4 py-3">{{ s.open }}/{{ s.closed }}</td>
-      <td class="px-4 py-3">
-        {% if s.winrate is not none %}
-          <span class="font-bold {{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
-            {{ "%.2f" | format(s.winrate) }}%
-          </span>
-        {% else %}
-          N/A
-        {% endif %}
-      </td>
-      <td class="px-4 py-3">
-        {% if "profit" in s %}
-          <span class="font-bold {{ 'text-green-600' if s.profit >= 0 else 'text-red-600' }}">
-            ${{ "{:,.2f}".format(s.profit) }}
-          </span>
-        {% else %}
-          N/A
-        {% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% endif %}
-<!-- 🧩 Основная таблица стратегий -->
-<table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
-  <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
-    <tr>
-      <th class="px-4 py-3">№</th>
-      <th class="px-4 py-3">Код</th>
-      <th class="px-4 py-3">Название стратегии</th>
-      <th class="px-4 py-3">Сделки</th>
-      <th class="px-4 py-3">Winrate</th>
-      <th class="px-4 py-3">ROI</th>
-    </tr>
-  </thead>
-  <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
-    {% for s in main_strategies %}
-    <tr>
-      <td class="px-4 py-3">
-        {{ loop.index }}
-        {% if s.is_king %}<span title="Текущий лидер">👑</span>{% endif %}
-        {% if s.was_king %}<span title="Бывший лидер">🤡</span>{% endif %}
-        {% if s.trend_icon %}<span title="Динамика рейтинга">{{ s.trend_icon }}</span>{% endif %}
-      </td>
-      <td class="px-4 py-3 font-mono">{{ s.name }}</td>
-      <td class="px-4 py-3">
-        <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-blue-600 underline hover:text-blue-800">{{ s.human_name }}</a>
-      </td>
-      <td class="px-4 py-3">
-        {% if filter == "today" %}
-          {{ s.open }}/{{ s.closed }}
-        {% else %}
-          {{ s.closed }}
-        {% endif %}
-      </td>
-      <td class="px-4 py-3">
-        {% if s.winrate is not none %}
-          <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
-            {{ "%.2f" | format(s.winrate) }}%
-          </span>
-        {% else %}
-          N/A
-        {% endif %}
-      </td>
-      <td class="px-4 py-3">
-        {% if s.roi is not none %}
-          <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
-            {{ "%.2f" | format(s.roi) }}%
-          </span>
-        {% else %}
-          N/A
-        {% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-</main>
-	</body>
+      <!-- 🧩 Основная таблица стратегий -->
+      <table class="w-full table-auto bg-white/80 rounded-xl shadow overflow-hidden">
+        <thead class="bg-slate-100 text-slate-700 text-left text-sm uppercase">
+          <tr>
+            <th class="px-4 py-3">№</th>
+            <th class="px-4 py-3">Код</th>
+            <th class="px-4 py-3">Название стратегии</th>
+            <th class="px-4 py-3">Сделки</th>
+            <th class="px-4 py-3">Winrate</th>
+            <th class="px-4 py-3">ROI</th>
+          </tr>
+        </thead>
+        <tbody class="text-slate-800 text-sm divide-y divide-slate-200">
+          {% for s in strategies %}
+          <tr>
+            <td class="px-4 py-3">
+              {{ loop.index }}
+            </td>
+            <td class="px-4 py-3 font-mono">{{ s.name }}</td>
+            <td class="px-4 py-3">
+              <a href="/trades/details/{{ s.name }}?filter={{ filter }}{% if series %}&series={{ series }}{% endif %}" class="text-blue-600 underline hover:text-blue-800">
+                {{ s.human_name }}
+              </a>
+            </td>
+            <td class="px-4 py-3">
+              {% if filter == "today" %}
+                {{ s.open }}/{{ s.closed }}
+              {% else %}
+                {{ s.closed }}
+              {% endif %}
+            </td>
+            <td class="px-4 py-3">
+              {% if s.winrate is not none %}
+                <span class="{{ 'text-green-600' if s.winrate >= 50 else 'text-red-600' }}">
+                  {{ "%.2f" | format(s.winrate) }}%
+                </span>
+              {% else %}N/A{% endif %}
+            </td>
+            <td class="px-4 py-3">
+              {% if s.roi is not none %}
+                <span class="{{ 'text-green-600' if s.roi >= 0 else 'text-red-600' }}">
+                  {{ "%.2f" | format(s.roi) }}%
+                </span>
+              {% else %}N/A{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </main>
+  </body>
 </html>
