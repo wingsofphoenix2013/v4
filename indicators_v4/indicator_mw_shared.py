@@ -137,9 +137,96 @@ def apply_vol_hysteresis_and_dwell(
 
     return candidate, 1
 
+# 🔸 ------------------ Momentum: thresholds + hysteresis/dwell ------------------
 
-# 🔸 ------------------ TODO: Momentum thresholds + hysteresis/dwell ------------------
-# Зарезервировано под будущие обновления (MW_MOM).
+# near-zero для MACD12 (в % от цены)
+MOM_ZERO_EPS_PCT_IN  = {"m5": 0.04, "m15": 0.05, "h1": 0.10}   # вход/подтверждение near-zero
+MOM_ZERO_EPS_PCT_OUT = {"m5": 0.03, "m15": 0.04, "h1": 0.08}   # выход из near-zero
+
+# пороги импульса по Δhist (в п.п. = percentage points)
+MOM_HIST_IN_PCT  = {"m5": 0.03, "m15": 0.04, "h1": 0.05}       # вход в импульс (строже)
+MOM_HIST_OUT_PCT = {"m5": 0.015,"m15": 0.020,"h1": 0.025}      # выход из импульса (мягче)
+
+# минимальная длительность
+MOM_MIN_STREAK   = {"m5": 2, "m15": 1, "h1": 1}
+
+def mom_thresholds(tf: str) -> dict:
+    return {
+        "zero_in":  MOM_ZERO_EPS_PCT_IN[tf],
+        "zero_out": MOM_ZERO_EPS_PCT_OUT[tf],
+        "hist_in":  MOM_HIST_IN_PCT[tf],
+        "hist_out": MOM_HIST_OUT_PCT[tf],
+        "min_streak": MOM_MIN_STREAK.get(tf, 2),
+    }
+
+def apply_mom_hysteresis_and_dwell(
+    prev_state: str | None,
+    raw_state: str,              # "bull_impulse" | "bear_impulse" | "overbought" | "oversold" | "divergence_flat"
+    features: dict,              # {"d12": float|None, "d5": float|None, "near_zero": bool}
+    thr: dict,                   # из mom_thresholds(tf)
+    prev_streak: int,
+) -> tuple[str, int]:
+    """
+    Гистерезис по импульсу: вход Δhist > hist_in, удержание пока Δhist > hist_out.
+    near-zero контролируется через raw_state (в решателе); здесь только устойчивость.
+    Dwell-time: удерживаем prev_state минимум N баров, кроме overbought/oversold (override).
+    """
+    if prev_state is None:
+        return raw_state, 1
+
+    # overrides — меняем без задержек
+    if raw_state in ("overbought", "oversold"):
+        return (raw_state, prev_streak + 1) if raw_state == prev_state else (raw_state, 1)
+
+    d12 = features.get("d12")
+    d5  = features.get("d5")
+    hist_in  = thr["hist_in"]
+    hist_out = thr["hist_out"]
+    min_streak = thr["min_streak"]
+
+    candidate = raw_state
+
+    # удержание импульса с более мягким порогом «out»
+    if prev_state == "bull_impulse":
+        keep = False
+        for d in (d12, d5):
+            if d is not None and d > hist_out:
+                keep = True
+        candidate = "bull_impulse" if keep else raw_state
+
+    elif prev_state == "bear_impulse":
+        keep = False
+        for d in (d12, d5):
+            if d is not None and d < -hist_out:
+                keep = True
+        candidate = "bear_impulse" if keep else raw_state
+
+    # предотвращаем вход в импульс, если дельты ещё не дотянули до «in»
+    if raw_state == "bull_impulse":
+        ok = False
+        for d in (d12, d5):
+            if d is not None and d > hist_in:
+                ok = True
+        if not ok:
+            candidate = "divergence_flat"
+
+    if raw_state == "bear_impulse":
+        ok = False
+        for d in (d12, d5):
+            if d is not None and d < -hist_in:
+                ok = True
+        if not ok:
+            candidate = "divergence_flat"
+
+    # если кандидат совпал — растим streak
+    if candidate == prev_state:
+        return prev_state, prev_streak + 1
+
+    # dwell-time для переключений (кроме overrides)
+    if prev_streak + 1 < min_streak and raw_state not in ("overbought", "oversold"):
+        return prev_state, prev_streak + 1
+
+    return candidate, 1
 
 # 🔸 ------------------ TODO: Extremes thresholds + hysteresis/dwell ------------------
 # Зарезервировано под будущие обновления (MW_EXT).

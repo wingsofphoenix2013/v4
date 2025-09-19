@@ -5,6 +5,13 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+# 🔸 Общие правила MarketWatch (Momentum)
+from indicator_mw_shared import (
+    load_prev_state,
+    mom_thresholds,
+    apply_mom_hysteresis_and_dwell,
+)
+
 # 🔸 Константы и настройки (в стиле MW_TREND / MW_VOL)
 STREAM_READY = "indicator_stream"          # вход: готовность инстансов (macd12/macd5, rsi14/21, mfi14/21)
 GROUP       = "mw_mom_group"
@@ -191,8 +198,7 @@ async def persist_result(pg, redis, symbol: str, tf: str, open_time_iso: str,
     except Exception as e:
         log.error(f"[PG] upsert error momentum {symbol}/{tf}@{open_time_iso}: {e}")
 
-
-# 🔸 Расчёт Momentum по ключу (symbol, tf, open_time)
+# 🔸 Расчёт Momentum по ключу (symbol, tf, open_time) — TS-барьер + dpp + hysteresis/dwell
 async def compute_momentum_for_bar(pg, redis, symbol: str, tf: str, open_iso: str):
     open_ms = iso_to_ms(open_iso)
 
@@ -205,25 +211,29 @@ async def compute_momentum_for_bar(pg, redis, symbol: str, tf: str, open_iso: st
     # читаем cur/prev
     x = await load_mom_inputs(redis, symbol, tf, open_ms)
 
-    # цена и MACD в процентах от цены
     price_cur  = x["close"]["cur"]
     price_prev = x["close"]["prev"]
+
+    # MACD hist в % (cur/prev)
+    def hist_pct(v_hist, price):
+        if v_hist is None or price is None or price == 0:
+            return None
+        return (v_hist / price) * 100.0
 
     m12_hist_pct_cur  = hist_pct(x["m12_hist"]["cur"], price_cur)
     m12_hist_pct_prev = hist_pct(x["m12_hist"]["prev"], price_prev)
     m5_hist_pct_cur   = hist_pct(x["m5_hist"]["cur"],  price_cur)
     m5_hist_pct_prev  = hist_pct(x["m5_hist"]["prev"], price_prev)
 
-    # Δгистограммы (в п.п.)
+    # Δгистограммы (п.п.)
     def dpp(cur, prev):
-        if cur is None or prev is None:
-            return None
+        if cur is None or prev is None: return None
         return cur - prev
 
     d_m12_hist_pp = dpp(m12_hist_pct_cur, m12_hist_pct_prev)
     d_m5_hist_pp  = dpp(m5_hist_pct_cur,  m5_hist_pct_prev)
 
-    # MACD режим (по спреду macd - signal)
+    # режимы MACD (спред macd-signal)
     m12_mode = None
     if x["m12_macd"]["cur"] is not None and x["m12_sig"]["cur"] is not None:
         m12_mode = "bull" if (x["m12_macd"]["cur"] - x["m12_sig"]["cur"]) >= 0 else "bear"
@@ -231,11 +241,10 @@ async def compute_momentum_for_bar(pg, redis, symbol: str, tf: str, open_iso: st
     if x["m5_macd"]["cur"] is not None and x["m5_sig"]["cur"] is not None:
         m5_mode = "bull" if (x["m5_macd"]["cur"] - x["m5_sig"]["cur"]) >= 0 else "bear"
 
-    # near-zero MACD (по самому MACD12)
+    # near-zero по MACD12 (в %)
     macd12_zero_pct = None
     if x["m12_macd"]["cur"] is not None and price_cur is not None and price_cur != 0:
         macd12_zero_pct = (x["m12_macd"]["cur"] / price_cur) * 100.0
-    near_zero = (macd12_zero_pct is not None and abs(macd12_zero_pct) <= MACD_ZERO_EPS_PCT.get(tf, 0.05))
 
     # RSI/MFI уровни и дельты
     rsi14, rsi21 = x["rsi14"]["cur"], x["rsi21"]["cur"]
@@ -243,70 +252,84 @@ async def compute_momentum_for_bar(pg, redis, symbol: str, tf: str, open_iso: st
     drsi14 = None if (x["rsi14"]["prev"] is None or rsi14 is None) else (rsi14 - x["rsi14"]["prev"])
     dmfi14 = None if (x["mfi14"]["prev"] is None or mfi14 is None) else (mfi14 - x["mfi14"]["prev"])
 
-    # Флаги зон
-    overbought = is_overbought(tf, rsi14, mfi14) or is_overbought(tf, rsi21, mfi21)
-    oversold   = is_oversold(tf, rsi14, mfi14)   or is_oversold(tf, rsi21, mfi21)
+    # флаги зон
+    def is_overbought(rsi, mfi):
+        return (rsi is not None and rsi >= RSI_OVERBOUGHT.get(tf,70.0)) or \
+               (mfi is not None and mfi >= MFI_OVERBOUGHT.get(tf,80.0))
+    def is_oversold(rsi, mfi):
+        return (rsi is not None and rsi <= RSI_OVERSOLD.get(tf,30.0)) or \
+               (mfi is not None and mfi <= MFI_OVERSOLD.get(tf,20.0))
 
-    # Антидребезг для импульса (по гистограмме)
-    hist_eps = HIST_MOVE_EPS_PCT.get(tf, 0.03)
-    m12_up   = (d_m12_hist_pp is not None and d_m12_hist_pp >  hist_eps)
-    m12_down = (d_m12_hist_pp is not None and d_m12_hist_pp < -hist_eps)
-    m5_up    = (d_m5_hist_pp  is not None and d_m5_hist_pp  >  hist_eps)
-    m5_down  = (d_m5_hist_pp  is not None and d_m5_hist_pp  < -hist_eps)
+    overbought = is_overbought(rsi14, mfi14) or is_overbought(rsi21, mfi21)
+    oversold   = is_oversold(rsi14, mfi14)   or is_oversold(rsi21, mfi21)
 
-    # 🔸 Правила приоритета состояний
+    # импульсные признаки (антидребезг в решателе raw_state, а hysteresis — в shared)
+    thr = mom_thresholds(tf)
+    hist_in  = thr["hist_in"]
+    # raw-решение
     if overbought:
-        state = "overbought"
+        raw_state = "overbought"
     elif oversold:
-        state = "oversold"
-    elif (m12_mode == "bull" and m5_mode == "bull" and (m12_up or m5_up) and (drsi14 is None or drsi14 >= 0) and (dmfi14 is None or dmfi14 >= 0)):
-        state = "bull_impulse"
-    elif (m12_mode == "bear" and m5_mode == "bear" and (m12_down or m5_down) and (drsi14 is None or drsi14 <= 0) and (dmfi14 is None or dmfi14 <= 0)):
-        state = "bear_impulse"
+        raw_state = "oversold"
     else:
-        # около нуля и без явной синхронизации импульса
-        state = "divergence_flat" if near_zero else "divergence_flat"
+        # импульс, если режимы согласованы и есть достаточная Δhist
+        bull_ok = (m12_mode == "bull" and m5_mode == "bull") and \
+                  ((d_m12_hist_pp is not None and d_m12_hist_pp > hist_in) or
+                   (d_m5_hist_pp  is not None and d_m5_hist_pp  > hist_in))
+        bear_ok = (m12_mode == "bear" and m5_mode == "bear") and \
+                  ((d_m12_hist_pp is not None and d_m12_hist_pp < -hist_in) or
+                   (d_m5_hist_pp  is not None and d_m5_hist_pp  < -hist_in))
 
-    # Детали (округлим для красоты)
+        if bull_ok:
+            raw_state = "bull_impulse"
+        elif bear_ok:
+            raw_state = "bear_impulse"
+        else:
+            raw_state = "divergence_flat"
+
+    # hysteresis + dwell на основе прошлого state/streak
+    prev_state, prev_streak = await load_prev_state(redis, kind="momentum", symbol=symbol, tf=tf)
+    final_state, new_streak = apply_mom_hysteresis_and_dwell(
+        prev_state=prev_state,
+        raw_state=raw_state,
+        features={"d12": d_m12_hist_pp, "d5": d_m5_hist_pp, "near_zero": None},
+        thr=thr,
+        prev_streak=prev_streak,
+    )
+
+    # детали (округление)
     def r2(x): return None if x is None else round(float(x), 2)
-    def r5(x): return None if x is None else round(float(x), 5)
 
     details = {
         "macd": {
             "mode12": m12_mode,
-            "mode5": m5_mode,
+            "mode5":  m5_mode,
             "hist12_pct": r2(m12_hist_pct_cur),
             "hist12_delta_pp": r2(d_m12_hist_pp),
-            "hist5_pct": r2(m5_hist_pct_cur),
-            "hist5_delta_pp": r2(d_m5_hist_pp),
+            "hist5_pct":  r2(m5_hist_pct_cur),
+            "hist5_delta_pp":  r2(d_m5_hist_pp),
             "near_zero_pct": r2(macd12_zero_pct),
         },
-        "rsi": {
-            "rsi14": r2(rsi14), "drsi14": r2(drsi14),
-            "rsi21": r2(rsi21)
-        },
-        "mfi": {
-            "mfi14": r2(mfi14), "dmfi14": r2(dmfi14),
-            "mfi21": r2(mfi21)
-        },
-        "flags": {
-            "overbought": bool(overbought),
-            "oversold": bool(oversold),
-            "m12_up": m12_up, "m12_down": m12_down,
-            "m5_up": m5_up,   "m5_down":  m5_down,
-        },
+        "rsi": {"rsi14": r2(rsi14), "drsi14": r2(drsi14), "rsi21": r2(rsi21)},
+        "mfi": {"mfi14": r2(mfi14), "dmfi14": r2(dmfi14), "mfi21": r2(mfi21)},
+        "flags": {"overbought": bool(overbought), "oversold": bool(oversold)},
         "used_bases": ["macd12","macd5","rsi14","rsi21","mfi14","mfi21","close"],
         "missing_bases": [],
         "open_time_iso": open_iso,
+
+        # синхронизация с on-demand
+        "raw_state": raw_state,
+        "prev_state": prev_state,
+        "streak": new_streak,
     }
 
-    await persist_result(pg, redis, symbol, tf, open_iso, state, details)
+    await persist_result(pg, redis, symbol, tf, open_iso, final_state, details)
     log.debug(
-        f"MW_MOM OK {symbol}/{tf}@{open_iso} state={state} "
+        f"MW_MOM OK {symbol}/{tf}@{open_iso} state={final_state} "
+        f"(raw={raw_state}, prev={prev_state}, streak={new_streak}) "
         f"m12_hist={details['macd']['hist12_pct']}pp Δ={details['macd']['hist12_delta_pp']}pp "
         f"RSI14={details['rsi']['rsi14']} Δ={details['rsi']['drsi14']} MFI14={details['mfi']['mfi14']} Δ={details['mfi']['dmfi14']}"
     )
-
 
 # 🔸 Основной воркер: слушает indicator_stream, запускает расчёт с TS-барьером
 async def run_indicator_mw_momentum(pg, redis):
