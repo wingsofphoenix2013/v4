@@ -17,6 +17,7 @@ from packs.adx_dmi_pack import build_adx_dmi_pack
 from packs.macd_pack import build_macd_pack
 from packs.trend_pack import build_trend_pack
 from packs.volatility_pack import build_volatility_pack
+from packs.momentum_pack import build_momentum_pack
 from packs.pack_utils import floor_to_bar
 
 # 🔸 Логгер
@@ -87,7 +88,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 ts_raw   = data.get("timestamp_ms")
 
                 # валидация
-                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd","trend","volatility")
+                valid_inds = ("rsi","mfi","bb","lr","atr","ema","adx_dmi","macd","trend","volatility","momentum")
                 if not symbol or tf not in ("m5","m15","h1") or ind not in valid_inds:
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"bad_request"})
                     return msg_id
@@ -96,7 +97,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 bar_open_ms = floor_to_bar(now_ms, tf)
 
                 # активные инстансы
-                if ind not in ("trend", "volatility"):
+                if ind not in ("trend", "volatility", "momentum"):
                     instances = [i for i in get_instances_by_tf(tf) if i["indicator"] == ind]
                     if not instances:
                         await redis.xadd(RESP_STREAM, {
@@ -363,7 +364,27 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                             await redis.set(ckey, js, ex=LIVE_TTL_SEC)
                             await redis.set(pkey, js, ex=LIVE_TTL_SEC)
                             results.append(pack)
-                            
+
+                # 🔸 MOMENTUM (live на текущем баре)
+                elif ind == "momentum":
+                    base = "momentum"
+                    ckey = cache_key(ind, symbol, tf, base, bar_open_ms)
+                    pkey = public_key(ind, symbol, tf, base)
+
+                    cached = await redis.get(ckey)
+                    if cached:
+                        try:
+                            results.append(json.loads(cached))
+                        except Exception:
+                            pass
+                    else:
+                        pack = await build_momentum_pack(symbol, tf, now_ms, precision, redis, compute_snapshot_values_async)
+                        if pack:
+                            js = json.dumps(pack)
+                            await redis.set(ckey, js, ex=LIVE_TTL_SEC)
+                            await redis.set(pkey, js, ex=LIVE_TTL_SEC)
+                            results.append(pack)
+                              
                 # 🔸 ADX/DMI
                 else:  # ind == "adx_dmi"
                     if length_s:
