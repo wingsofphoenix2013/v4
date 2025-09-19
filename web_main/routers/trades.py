@@ -35,11 +35,10 @@ async def trades_page(request: Request, filter: str = "24h", series: str = None)
         "series": series,
     })
 
-
-# 🔸 Расчёт статистики стратегий под /trades
+# 🔸 Расчёт статистики стратегий под /trades (без метрик и king)
 async def get_trading_summary(filter: str) -> list[dict]:
     async with pg_pool.acquire() as conn:
-        # Все стратегии
+        # Все включённые стратегии
         strategies = await conn.fetch("""
             SELECT id, name, human_name, deposit, leverage
             FROM strategies_v4
@@ -47,10 +46,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             ORDER BY id
         """)
 
-        # 🕒 Таймштампы метрик: текущий и «предыдущий» (4–6 минут назад)
-        current_ts = await conn.fetchval("SELECT MAX(ts) FROM strategies_metrics_v4")
-
-        # 🔁 Диапазон по фильтру
+        # Диапазон по фильтру
         if filter == "3h":
             end = datetime.utcnow()
             start = end - timedelta(hours=3)
@@ -68,60 +64,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             start = start.replace(tzinfo=None)
             end = end.replace(tzinfo=None)
 
-        # Если нет ни одной метрики — продолжим без тренд-иконок
-        metrics_current = {}
-        metrics_prev = {}
-        if current_ts is not None:
-            previous_ts = await conn.fetchval("""
-                SELECT ts FROM strategies_metrics_v4
-                WHERE ts < $1
-                  AND ts >= $1 - interval '6 minutes'
-                  AND ts <= $1 - interval '4 minutes'
-                ORDER BY ts DESC
-                LIMIT 1
-            """, current_ts)
-
-            rows_current = await conn.fetch("""
-                SELECT strategy_id, final_rating
-                FROM strategies_metrics_v4
-                WHERE ts = $1
-            """, current_ts)
-            metrics_current = {r["strategy_id"]: r["final_rating"] for r in rows_current}
-
-            if previous_ts is not None:
-                rows_prev = await conn.fetch("""
-                    SELECT strategy_id, final_rating
-                    FROM strategies_metrics_v4
-                    WHERE ts = $1
-                """, previous_ts)
-                metrics_prev = {r["strategy_id"]: r["final_rating"] for r in rows_prev}
-
-        # 🧠 Словарь динамики
-        trend_map = {}
-        all_ids = {s["id"] for s in strategies}
-        for sid in all_ids:
-            in_current = sid in metrics_current
-            in_prev = sid in metrics_prev
-
-            if in_current and in_prev:
-                curr = metrics_current[sid]
-                prev = metrics_prev[sid]
-                if curr > prev:
-                    trend_map[sid] = "📈"
-                elif curr < prev:
-                    trend_map[sid] = "📉"
-                else:
-                    trend_map[sid] = "➖"
-            elif in_current and not in_prev:
-                trend_map[sid] = "🔥"
-            elif not in_current and in_prev:
-                trend_map[sid] = "❌"
-            else:
-                trend_map[sid] = "⛔"
-
         result = []
-
-        # 📦 Основные стратегии
         for strat in strategies:
             sid = strat["id"]
             deposit = strat["deposit"]
@@ -142,7 +85,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             pnl_list = [r["pnl"] for r in closed_rows if r["pnl"] is not None]
             closed_count = len(pnl_list)
             win_count = sum(1 for pnl in pnl_list if pnl >= 0)
-            pnl_sum = sum(pnl_list)
+            pnl_sum = sum(pnl_list) if pnl_list else 0
 
             winrate = round(win_count / closed_count * 100, 2) if closed_count > 0 else None
             roi = round(pnl_sum / deposit * 100, 2) if deposit else None
@@ -169,13 +112,13 @@ async def get_trading_summary(filter: str) -> list[dict]:
                 "winrate": winrate,
                 "roi": roi,
                 "profit": pnl_sum,
-                "trend_icon": trend_map.get(sid, "⛔"),
+                "trend_icon": None,   # метрики отключили
             })
 
+        # сортируем по ROI (если есть)
         result.sort(key=lambda r: (r["roi"] is not None, r["roi"]), reverse=True)
         return result
-
-
+        
 @router.get("/trades/details/{strategy_name}", response_class=HTMLResponse)
 async def strategy_detail_page(
     request: Request,
