@@ -36,7 +36,7 @@ async def load_enabled_tickers():
     async with infra.PG_POOL.acquire() as conn:
         rows = await conn.fetch("""
             SELECT symbol
-            FROM tickers_v4
+            FROM tickers_bb
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
         for row in rows:
@@ -100,7 +100,7 @@ async def handle_ticker_event(data: dict):
         async with infra.PG_POOL.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT symbol
-                FROM tickers_v4
+                FROM tickers_bb
                 WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
             """, symbol)
             if row:
@@ -175,7 +175,7 @@ async def handle_strategy_event(data: dict):
 async def subscribe_and_watch_pubsub():
     log = logging.getLogger("PUBSUB_WATCHER")
     pubsub = infra.REDIS.pubsub()
-    await pubsub.subscribe("tickers_v4_events", "signals_v4_events", "strategies_v4_events")
+    await pubsub.subscribe("tickers_bb_events", "signals_v4_events", "strategies_v4_events")
     log.info("Подписка на каналы Pub/Sub активна")
 
     async for message in pubsub.listen():
@@ -186,7 +186,7 @@ async def subscribe_and_watch_pubsub():
             data = json.loads(message["data"])
             channel = message["channel"]
 
-            if channel == "tickers_v4_events":
+            if channel == "tickers_bb_events":
                 await handle_ticker_event(data)
             elif channel == "signals_v4_events":
                 await handle_signal_event(data)
