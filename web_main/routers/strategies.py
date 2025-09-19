@@ -223,7 +223,7 @@ async def get_enabled_tickers():
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, symbol
-            FROM tickers_v4
+            FROM tickers_bb
             WHERE status = 'enabled'
             ORDER BY symbol
         """)
