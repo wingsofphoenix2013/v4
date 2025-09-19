@@ -31,7 +31,6 @@ MAX_CONCURRENCY = 8
 # 🔸 Логгер
 log = logging.getLogger("POS_SNAPSHOT")
 
-
 # 🔸 Вспомогательные: кэшируемый вычислитель compute_fn на один TF/символ
 def _make_compute_cached(
     compute_snapshot_values_async,
@@ -43,8 +42,8 @@ def _make_compute_cached(
 ):
     memo: Dict[Any, Dict[str, str]] = {}
 
-    async def _compute(inst: dict) -> Dict[str, str]:
-        # кэш-ключ по контракту инстанса
+    # совместимая сигнатура: (inst, symbol_arg, df_arg, precision_arg)
+    async def _compute(inst: dict, _symbol_arg=None, _df_arg=None, _precision_arg=None) -> Dict[str, str]:
         key = (
             inst.get("indicator"),
             tuple(sorted((inst.get("params") or {}).items())),
@@ -60,7 +59,6 @@ def _make_compute_cached(
         return memo[key]
 
     return _compute
-
 
 # 🔸 Собрать packs для одного TF
 async def _build_packs_for_tf(
