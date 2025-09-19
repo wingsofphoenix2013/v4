@@ -26,7 +26,7 @@ STREAM_POSITIONS_OPEN = "positions_open_stream"
 GROUP_SNAPSHOT = "pos_snap_group"
 CONSUMER_SNAPSHOT = "pos_snap_1"
 TF_LIST = ("m5", "m15", "h1")
-MAX_CONCURRENCY = 8
+MAX_CONCURRENCY = 30
 
 # 🔸 Логгер
 log = logging.getLogger("POS_SNAPSHOT")
@@ -169,7 +169,7 @@ async def _handle_snapshot_for_position(
 
     # фильтр по стратегиям с market_watcher
     if not get_strategy_mw(strategy_id):
-        log.info(f"⏭️  Пропуск снимка: strategy_id={strategy_id} (market_watcher=false) pos={position_uid}")
+        log.debug(f"⏭️  Пропуск снимка: strategy_id={strategy_id} (market_watcher=false) pos={position_uid}")
         return
 
     precision = get_precision(symbol) or 8
@@ -181,7 +181,7 @@ async def _handle_snapshot_for_position(
             bar_open_ms = floor_to_bar(now_ms, tf)
             df = await load_ohlcv_df(redis, symbol, tf, bar_open_ms, 800)
             if df is None or df.empty:
-                log.info(f"⚠️  DF пустой: {symbol}/{tf} pos={position_uid}")
+                log.debug(f"⚠️  DF пустой: {symbol}/{tf} pos={position_uid}")
                 # продолжаем, всё равно зафиксируем «пустой» values/packs/mw
             compute_cached = _make_compute_cached(
                 compute_snapshot_values_async, symbol, tf, bar_open_ms, df, precision
@@ -218,34 +218,21 @@ async def _handle_snapshot_for_position(
                 },
                 "indicators": {
                     "values": values,
+                    # компактный паспорт активных инстансов TF (без enabled_at и лишних полей)
                     "instances": [
                         {
-                            "id": iid,
+                            "id": inst.get("id"),
                             "indicator": inst["indicator"],
                             "timeframe": inst["timeframe"],
-                            "enabled_at": inst.get("enabled_at").isoformat() if inst.get("enabled_at") else None,
                             "params": inst.get("params", {}),
                         }
-                        for iid, inst in getattr(instances, "items", lambda: [])()
-                    ] if isinstance(instances, dict) else [
-                        {
-                            "id": inst_id if isinstance(inst, tuple) else inst.get("id"),
-                            "indicator": (inst[1]["indicator"] if isinstance(inst, tuple) else inst["indicator"]),
-                            "timeframe": (inst[1]["timeframe"] if isinstance(inst, tuple) else inst["timeframe"]),
-                            "enabled_at": (
-                                inst[1].get("enabled_at").isoformat()
-                                if isinstance(inst, tuple) and inst[1].get("enabled_at")
-                                else (inst.get("enabled_at").isoformat() if inst.get("enabled_at") else None)
-                            ),
-                            "params": (inst[1].get("params", {}) if isinstance(inst, tuple) else inst.get("params", {})),
-                        }
-                        for (inst_id, inst) in enumerate(instances)  # instances из indicators_v4_main.py — list[dict]
+                        for inst in instances  # instances из indicators_v4_main.py — list[dict]
                     ],
                 },
                 "packs": {k: [p for p in v if p] for k, v in packs.items()},
                 "mw": mw,
             }
-
+            
             # вставка в PG (одна строка на TF)
             await pg.execute(
                 """
@@ -268,7 +255,7 @@ async def _handle_snapshot_for_position(
             # лог результата по TF
             packs_count = {k: len(v) for k, v in payload["packs"].items()}
             values_count = len(values)
-            log.info(
+            log.debug(
                 f"✅ SNAPSHOT pos={position_uid} {symbol}/{tf} "
                 f"values={values_count} packs={packs_count} mw="
                 f"{','.join([k for k,v in mw.items() if v]) or 'none'}"
