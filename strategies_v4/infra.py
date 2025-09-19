@@ -87,7 +87,7 @@ async def get_price(symbol: str) -> float | None:
     if symbol in _price_cache and now - _price_ts[symbol] < 1.0:
         return _price_cache[symbol]
 
-    raw = await infra.redis_client.get(f"price:{symbol}")
+    raw = await infra.redis_client.get(f"bb:price:{symbol}")  # ← новый ключ Bybit
     if raw:
         try:
             price = float(raw)

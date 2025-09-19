@@ -40,7 +40,7 @@ class ConfigState:
     async def reload_ticker(self, symbol: str):
         async with self._lock:
             row = await infra.pg_pool.fetchrow(
-                "SELECT * FROM tickers_v4 WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'",
+                "SELECT * FROM tickers_bb WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'",
                 symbol
             )
             if row:
@@ -106,7 +106,7 @@ class ConfigState:
                 '''
                 SELECT t.symbol
                 FROM strategy_tickers_v4 st
-                JOIN tickers_v4 t ON st.ticker_id = t.id
+                JOIN tickers_bb t ON st.ticker_id = t.id
                 WHERE st.strategy_id = $1 AND st.enabled = true AND t.status = 'enabled' AND t.tradepermission = 'enabled'
                 ''',
                 strategy_id
@@ -132,7 +132,7 @@ class ConfigState:
     # 🔸 Загрузка всех тикеров (только активных с разрешением)
     async def _load_tickers(self):
         rows = await infra.pg_pool.fetch(
-            "SELECT * FROM tickers_v4 WHERE status = 'enabled' AND tradepermission = 'enabled'"
+            "SELECT * FROM tickers_bb WHERE status = 'enabled' AND tradepermission = 'enabled'"
         )
         self.tickers = {r["symbol"]: dict(r) for r in rows}
 
@@ -191,7 +191,7 @@ class ConfigState:
             '''
             SELECT s.strategy_id, t.symbol
             FROM strategy_tickers_v4 s
-            JOIN tickers_v4 t ON s.ticker_id = t.id
+            JOIN tickers_bb t ON s.ticker_id = t.id
             WHERE s.enabled = true AND t.status = 'enabled' AND t.tradepermission = 'enabled'
             '''
         )
@@ -213,7 +213,7 @@ async def init_config_state():
 async def config_event_listener():
     redis = infra.redis_client
     pubsub = redis.pubsub()
-    await pubsub.subscribe("tickers_v4_events", "strategies_v4_events")
+    await pubsub.subscribe("bb:tickers_events", "strategies_v4_events")
 
     log.info("📡 Подписка на каналы Redis запущена")
 
@@ -222,7 +222,7 @@ async def config_event_listener():
             continue
         try:
             data = json.loads(msg["data"])
-            if msg["channel"] == "tickers_v4_events":
+            if msg["channel"] == "bb:tickers_events":
                 symbol = data["symbol"]
                 if data["action"] == "enabled":
                     await config.reload_ticker(symbol)
@@ -236,6 +236,7 @@ async def config_event_listener():
                     await config.remove_strategy(strategy_id)
         except Exception:
             log.exception("❌ Ошибка обработки события из Redis")
+
 # 🔸 Подписка на обновления стратегий из Redis Stream
 async def listen_strategy_update_stream():
     stream = "strategy_update_stream"
