@@ -74,117 +74,94 @@ def indicator_base_from_instance(inst: Dict[str, Any]) -> str:
     ind = str(inst.get("indicator", "indicator"))
     return "adx_dmi" if ind.startswith("adx_dmi") else ind
 
-
-# 🔸 Отправка on-demand запроса индикатора и ожидание ответа (XREAD от «хвоста»)
+# 🔸 Отправка on-demand запроса индикатора и ожидание ответа (бездедлайново)
 async def request_indicator_snapshot(redis, *, symbol: str, timeframe: str, instance_id: int, timestamp_ms: int) -> Tuple[str, Dict[str, Any]]:
-    async def one_try(wait_ms: int) -> Tuple[str, Dict[str, Any]]:
-        start_id = "$"
-        fields = {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "instance_id": str(instance_id),
-            "timestamp_ms": str(timestamp_ms),
-        }
+    # читаем только новые ответы (снимок хвоста до запроса)
+    start_id = "$"
+    fields = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "instance_id": str(instance_id),
+        "timestamp_ms": str(timestamp_ms),
+    }
+    try:
+        req_id = await redis.xadd(IND_REQ_STREAM, fields)
+    except Exception:
+        log.warning("stream_error: XADD indicator_request failed", exc_info=True)
+        return "stream_error", {}
+
+    last_id = start_id
+    while True:
         try:
-            req_id = await redis.xadd(IND_REQ_STREAM, fields)
+            resp = await redis.xread({IND_RESP_STREAM: last_id}, block=READ_BLOCK_MS, count=200)
         except Exception:
-            log.warning("stream_error: XADD indicator_request failed", exc_info=True)
-            return "stream_error", {}
+            log.warning("stream_error: XREAD indicator_response failed", exc_info=True)
+            continue  # просто продолжаем ждать
 
-        deadline = time.monotonic() + (wait_ms / 1000.0)
-        last_id = start_id
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return "timeout", {}
-            try:
-                resp = await redis.xread({IND_RESP_STREAM: last_id}, block=min(int(remaining * 1000), READ_BLOCK_MS), count=200)
-            except Exception:
-                log.warning("stream_error: XREAD indicator_response failed", exc_info=True)
-                return "stream_error", {}
-            if not resp:
-                continue
-            for _, messages in resp:
-                for msg_id, data in messages:
-                    last_id = msg_id
-                    if data.get("req_id") != req_id:
-                        continue
-                    status = data.get("status", "error")
-                    if status != "ok":
-                        return data.get("error", "exception"), {}
-                    try:
-                        open_time = data.get("open_time") or ""
-                        results_raw = data.get("results") or "{}"
-                        results = json.loads(results_raw)
-                        return "ok", {"open_time": open_time, "results": results}
-                    except Exception:
-                        return "exception", {}
-    st, pl = await one_try(REQ_RESPONSE_TIMEOUT_MS)
-    if st != "timeout":
-        return st, pl
-    log.info("IND_POSSTAT: retry on timeout (indicator) instance_id=%s symbol=%s tf=%s", instance_id, symbol, timeframe)
-    return await one_try(SECOND_TRY_TIMEOUT_MS)
+        if not resp:
+            continue
 
+        for _, messages in resp:
+            for msg_id, data in messages:
+                last_id = msg_id
+                if data.get("req_id") != req_id:
+                    continue
+                status = data.get("status", "error")
+                if status != "ok":
+                    return data.get("error", "exception"), {}
+                try:
+                    open_time = data.get("open_time") or ""
+                    results_raw = data.get("results") or "{}"
+                    results = json.loads(results_raw)
+                    return "ok", {"open_time": open_time, "results": results}
+                except Exception:
+                    return "exception", {}
 
-# 🔸 Отправка on-demand запроса pack (gateway) и ожидание ответа (XREAD от «хвоста»)
+# 🔸 Отправка on-demand запроса pack (gateway) и ожидание ответа (бездедлайново)
 async def request_pack(redis, *, symbol: str, timeframe: str, indicator: str, timestamp_ms: int, length: Optional[int] = None, std: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Возвращает (status, results), где:
-      - status: "ok" или узкий код ошибки ("timeout","instance_not_found","bad_length","bad_request","no_results","exception","stream_error")
-      - results: список паков [{"base": <base>, "pack": {...}}, ...]
-    """
-    async def one_try(wait_ms: int) -> Tuple[str, List[Dict[str, Any]]]:
-        start_id = "$"
-        fields = {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "indicator": indicator,
-            "timestamp_ms": str(timestamp_ms),
-        }
-        if length is not None:
-            fields["length"] = str(length)
-        if std is not None:
-            fields["std"] = std
+    start_id = "$"
+    fields = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "indicator": indicator,
+        "timestamp_ms": str(timestamp_ms),
+    }
+    if length is not None:
+        fields["length"] = str(length)
+    if std is not None:
+        fields["std"] = std
 
+    try:
+        req_id = await redis.xadd(GW_REQ_STREAM, fields)
+    except Exception:
+        log.warning("stream_error: XADD indicator_gateway_request failed", exc_info=True)
+        return "stream_error", []
+
+    last_id = start_id
+    while True:
         try:
-            req_id = await redis.xadd(GW_REQ_STREAM, fields)
+            resp = await redis.xread({GW_RESP_STREAM: last_id}, block=READ_BLOCK_MS, count=200)
         except Exception:
-            log.warning("stream_error: XADD indicator_gateway_request failed", exc_info=True)
-            return "stream_error", []
+            log.warning("stream_error: XREAD indicator_gateway_response failed", exc_info=True)
+            continue  # просто ждём дальше
 
-        deadline = time.monotonic() + (wait_ms / 1000.0)
-        last_id = start_id
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return "timeout", []
-            try:
-                resp = await redis.xread({GW_RESP_STREAM: last_id}, block=min(int(remaining * 1000), READ_BLOCK_MS), count=200)
-            except Exception:
-                log.warning("stream_error: XREAD indicator_gateway_response failed", exc_info=True)
-                return "stream_error", []
-            if not resp:
-                continue
-            for _, messages in resp:
-                for msg_id, data in messages:
-                    last_id = msg_id
-                    if data.get("req_id") != req_id:
-                        continue
-                    status = data.get("status", "error")
-                    if status != "ok":
-                        return data.get("error", "exception"), []
-                    try:
-                        results_raw = data.get("results") or "[]"
-                        results = json.loads(results_raw)
-                        return "ok", results if isinstance(results, list) else []
-                    except Exception:
-                        return "exception", []
-    st, packs = await one_try(REQ_RESPONSE_TIMEOUT_MS)
-    if st != "timeout":
-        return st, packs
-    log.info("IND_POSSTAT: retry on timeout (pack) kind=%s symbol=%s tf=%s", indicator, symbol, timeframe)
-    return await one_try(SECOND_TRY_TIMEOUT_MS)
+        if not resp:
+            continue
 
+        for _, messages in resp:
+            for msg_id, data in messages:
+                last_id = msg_id
+                if data.get("req_id") != req_id:
+                    continue
+                status = data.get("status", "error")
+                if status != "ok":
+                    return data.get("error", "exception"), []
+                try:
+                    results_raw = data.get("results") or "[]"
+                    results = json.loads(results_raw)
+                    return "ok", results if isinstance(results, list) else []
+                except Exception:
+                    return "exception", []
 
 # 🔸 Словарь result-полей для packs (только результат, без служебного)
 PACK_FIELDS: Dict[str, List[str]] = {
