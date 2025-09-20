@@ -1,4 +1,4 @@
-# indicator_position_snapshot.py — воркер снимка индикаторов на момент открытия позиции (шаг 1: m5, param_type=indicator)
+# indicator_position_snapshot.py — воркер снимка индикаторов на момент открытия позиции (этап 1: m5, param_type=indicator)
 
 import asyncio
 import json
@@ -7,23 +7,24 @@ from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
 # 🔸 Импорты инфраструктуры
-from infra import run_safe_loop
+# (воркер встраивается в общий оркестратор через oracle_v4_main.py / indicators_v4_main.py)
+# from infra import run_safe_loop  # не требуется в этом модуле напрямую
 
 # 🔸 Константы стримов и настроек
-POSITIONS_OPEN_STREAM = "positions_open_stream"       # входной стрим внешнего модуля
-IND_REQ_STREAM        = "indicator_request"           # on-demand запросы индикаторов
-IND_RESP_STREAM       = "indicator_response"          # on-demand ответы индикаторов
+POSITIONS_OPEN_STREAM = "positions_open_stream"   # входной стрим внешнего модуля
+IND_REQ_STREAM        = "indicator_request"       # on-demand запросы индикаторов
+IND_RESP_STREAM       = "indicator_response"      # on-demand ответы индикаторов
 
-IPS_GROUP   = "ips_group"                             # consumer-group для позиций
-IPS_CONSUMER= "ips_consumer_1"
+IPS_GROUP    = "ips_group"                        # consumer-group для позиций
+IPS_CONSUMER = "ips_consumer_1"
 
 # 🔸 Тайминги/ограничения
-READ_BLOCK_MS              = 1500                     # ожидание в XREAD (мс)
-REQ_RESPONSE_TIMEOUT_MS    = 2000                     # общий таймаут ожидания ответа (мс) на один запрос индикатора
-PARALLEL_REQUESTS_LIMIT    = 20                       # одновременные запросы on-demand
-BATCH_INSERT_MAX           = 500                      # макс. размер пачки для INSERT
+READ_BLOCK_MS            = 1500                   # ожидание в XREAD (мс)
+REQ_RESPONSE_TIMEOUT_MS  = 2000                   # общий таймаут ожидания ответа (мс) на один запрос индикатора
+PARALLEL_REQUESTS_LIMIT  = 20                     # одновременные запросы on-demand
+BATCH_INSERT_MAX         = 500                    # макс. размер пачки для INSERT
 
-# 🔸 Таймшаги TF
+# 🔸 Таймшаги TF (этап 1 — только m5)
 STEP_MIN = {"m5": 5}
 STEP_MS  = {k: v * 60_000 for k, v in STEP_MIN.items()}
 
@@ -45,7 +46,7 @@ def parse_iso_to_ms(iso_str: str) -> Optional[int]:
         return None
 
 def derive_base_from_param_name(param_name: str) -> str:
-    # правила: если есть '_' → base = всё до последнего '_', иначе base = param_name
+    # если есть '_' → base = всё до последнего '_', иначе base = param_name
     # подходит для bb20_2_0_{center,upper,lower}, macd12_{macd,macd_signal,macd_hist},
     # adx_dmi14_{adx,plus_di,minus_di}, lr50_{angle,center,upper,lower}
     if "_" in param_name:
@@ -60,10 +61,11 @@ def to_float_safe(s: str) -> Optional[float]:
 
 
 # 🔸 Отправка on-demand запроса и ожидание ответа по req_id
-async def request_indicator_snapshot(redis, *, symbol: str, timeframe: str, instance_id: int, timestamp_ms: int) -> Tuple[str, Dict[str, str]]:
+async def request_indicator_snapshot(redis, *, symbol: str, timeframe: str, instance_id: int, timestamp_ms: int) -> Tuple[str, Dict[str, Any]]:
     """
     Возвращает (status, payload), где:
-      - status: "ok" или код ошибки ("timeout","no_ohlcv","instance_not_active","symbol_not_active","before_enabled_at","no_values","bad_request","exception")
+      - status: "ok" или код ошибки ("timeout","no_ohlcv","instance_not_active",
+                "symbol_not_active","before_enabled_at","no_values","bad_request","exception","stream_error")
       - payload: при ok → {"open_time": <iso>, "results": {param_name: str_value, ...}}
     """
     # подготовка и отправка запроса
@@ -82,6 +84,7 @@ async def request_indicator_snapshot(redis, *, symbol: str, timeframe: str, inst
     # ожидание ответа по req_id
     deadline = asyncio.get_event_loop().time() + (REQ_RESPONSE_TIMEOUT_MS / 1000.0)
     last_id = "0-0"
+
     while True:
         timeout = max(0.0, deadline - asyncio.get_event_loop().time())
         if timeout == 0.0:
@@ -118,8 +121,17 @@ async def request_indicator_snapshot(redis, *, symbol: str, timeframe: str, inst
         # если своя запись не найдена — продолжаем до дедлайна
 
 
-# 🔸 Сбор строк для одного инстанса индикатора
-async def build_rows_for_instance(redis, *, symbol: str, tf: str, instance: Dict[str, Any], bar_open_ms: int, strategy_id: int, position_uid: str) -> List[Tuple]:
+# 🔸 Сбор строк для одного инстанса индикатора (этап 1: только m5)
+async def build_rows_for_instance(
+    redis,
+    *,
+    symbol: str,
+    tf: str,
+    instance: Dict[str, Any],
+    bar_open_ms: int,
+    strategy_id: int,
+    position_uid: str
+) -> List[Tuple]:
     """
     Возвращает список кортежей для вставки в indicator_position_stat.
     Структура кортежа соответствует INSERT в run_insert_batch().
@@ -134,11 +146,10 @@ async def build_rows_for_instance(redis, *, symbol: str, tf: str, instance: Dict
     )
 
     rows: List[Tuple] = []
+
     if status != "ok":
-        # одна строка об ошибке по базовому имени (используем param_base из instance/params правил)
-        # здесь нет прямого base; возьмём из имени первого ожидаемого ключа в ответе (эвристика):
-        # безопаснее — реконструировать base по типу индикатора и params.length/fast/std
-        # но на этапе m5/indicator нам достаточно зафиксировать "общую" базу из id-инстанса.
+        # одна строка об ошибке по базовому имени
+        # базу восстанавливаем из типа индикатора и его params
         try:
             indicator = instance["indicator"]
             params = instance.get("params", {})
@@ -154,7 +165,9 @@ async def build_rows_for_instance(redis, *, symbol: str, tf: str, instance: Dict
         except Exception:
             base = "unknown"
 
-        open_time_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+        # открытие бара — передаём в БД именно datetime, а не ISO-строку
+        open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
+
         rows.append((
             position_uid,                # position_uid
             strategy_id,                 # strategy_id
@@ -164,15 +177,20 @@ async def build_rows_for_instance(redis, *, symbol: str, tf: str, instance: Dict
             base,                        # param_base
             base,                        # param_name (унифицируем на base при ошибке)
             None,                        # value_num
-            status,                      # value_text (пишем код ошибки как текстовое значение)
-            open_time_iso,               # open_time
+            status,                      # value_text (код ошибки как значение)
+            open_time_dt,                # open_time (datetime)
             "error",                     # status
             status                       # error_code
         ))
         return rows
 
     # успех: разложить все пары {param_name: str_value} в строки
-    open_time_iso = payload.get("open_time") or datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+    ot_raw = payload.get("open_time")
+    try:
+        open_time_dt = datetime.fromisoformat(ot_raw) if ot_raw else datetime.utcfromtimestamp(bar_open_ms / 1000)
+    except Exception:
+        open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
+
     results: Dict[str, str] = payload.get("results", {})
 
     for param_name, str_value in results.items():
@@ -180,18 +198,18 @@ async def build_rows_for_instance(redis, *, symbol: str, tf: str, instance: Dict
         fval = to_float_safe(str_value)
 
         rows.append((
-            position_uid,                # position_uid
-            strategy_id,                 # strategy_id
-            symbol,                      # symbol
-            tf,                          # timeframe
-            "indicator",                 # param_type
-            base,                        # param_base
-            param_name,                  # param_name
-            fval if fval is not None else None,     # value_num
-            None if fval is not None else str_value, # value_text (на всякий случай, если пришёл нечисловой)
-            open_time_iso,               # open_time
-            "ok",                        # status
-            None                         # error_code
+            position_uid,                                  # position_uid
+            strategy_id,                                   # strategy_id
+            symbol,                                        # symbol
+            tf,                                            # timeframe
+            "indicator",                                   # param_type
+            base,                                          # param_base
+            param_name,                                    # param_name
+            fval if fval is not None else None,            # value_num
+            None if fval is not None else str_value,       # value_text (на случай нечисловых)
+            open_time_dt,                                  # open_time (datetime)
+            "ok",                                          # status
+            None                                           # error_code
         ))
 
     return rows
@@ -201,7 +219,7 @@ async def build_rows_for_instance(redis, *, symbol: str, tf: str, instance: Dict
 async def run_insert_batch(pg, rows: List[Tuple]) -> None:
     if not rows:
         return
-    # порядок параметров должен соответствовать VALUES ($1..$11)
+    # порядок параметров должен соответствовать VALUES ($1..$12)
     sql = """
         INSERT INTO indicator_position_stat
         (position_uid, strategy_id, symbol, timeframe, param_type, param_base, param_name, value_num, value_text, open_time, status, error_code)
@@ -269,6 +287,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         rows_all: List[Tuple] = []
 
         async def run_one(inst):
+            # обработка одного инстанса под семафором
             async with sem:
                 try:
                     r = await build_rows_for_instance(
@@ -289,17 +308,28 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
                     if indicator == "macd":
                         base = f"macd{params.get('fast')}"
                     elif indicator == "bb":
-                        std_raw = str(round(float(params.get("std", 2.0)), 2)).replace(".", "_")
-                        base = f"bb{int(params.get('length', 20))}_{std_raw}"
+                        try:
+                            std_raw = str(round(float(params.get("std", 2.0)), 2)).replace(".", "_")
+                        except Exception:
+                            std_raw = "2_0"
+                        try:
+                            length_i = int(params.get("length", 20))
+                        except Exception:
+                            length_i = 20
+                        base = f"bb{length_i}_{std_raw}"
                     elif "length" in params:
-                        base = f"{indicator}{int(params['length'])}"
+                        try:
+                            base = f"{indicator}{int(params['length'])}"
+                        except Exception:
+                            base = indicator
                     else:
                         base = indicator
-                    open_time_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+                    open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
                     return [(
                         position_uid, strategy_id, symbol, tf,
                         "indicator", base, base,
-                        None, "exception", open_time_iso, "error", "exception"
+                        None, "exception",
+                        open_time_dt, "error", "exception"
                     )]
 
         tasks = [asyncio.create_task(run_one(inst)) for inst in instances]
@@ -312,7 +342,10 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
             await run_insert_batch(pg, rows_all[i:i + BATCH_INSERT_MAX])
 
         t1 = asyncio.get_event_loop().time()
-        log.info(f"IND_POSSTAT: m5 indicators done position_uid={position_uid} symbol={symbol} rows={len(rows_all)} elapsed_ms={int((t1-t0)*1000)}")
+        log.info(
+            f"IND_POSSTAT: m5 indicators done position_uid={position_uid} "
+            f"symbol={symbol} rows={len(rows_all)} elapsed_ms={int((t1 - t0) * 1000)}"
+        )
 
         return msg_id
 
