@@ -1,4 +1,4 @@
-# indicator_position_snapshot.py — воркер снимка признаков при открытии позиции (этап 3: m5+m15+h1; param_type=indicator + pack)
+# indicator_position_snapshot.py — воркер снимка признаков при открытии позиции (этап 4: m5+m15+h1; param_type=indicator + pack + marketwatch)
 
 import asyncio
 import json
@@ -25,7 +25,7 @@ IPS_CONSUMER     = "ips_consumer_1"
 READ_BLOCK_MS             = 1500       # блокирующее чтение XREAD (мс)
 REQ_RESPONSE_TIMEOUT_MS   = 5000       # таймаут ожидания ответа (мс)
 SECOND_TRY_TIMEOUT_MS     = 3000       # таймаут второй попытки (мс) при первичном timeout
-PARALLEL_REQUESTS_LIMIT   = 24         # одновременные запросы on-demand (индикаторы/пакеты суммарно)
+PARALLEL_REQUESTS_LIMIT   = 30         # одновременные запросы on-demand (индикаторы/пакеты суммарно)
 BATCH_INSERT_MAX          = 500        # макс. размер пачки для INSERT
 
 # 🔸 Таймфреймы и шаги
@@ -196,8 +196,10 @@ PACK_FIELDS: Dict[str, List[str]] = {
     "atr":       ["value_pct", "bucket", "bucket_delta"],
     "adx_dmi":   ["adx_bucket_low", "adx_dynamic_smooth", "gap_bucket_low", "gap_dynamic_smooth"],
     "macd":      ["mode", "cross", "zero_side", "hist_bucket_low_pct", "hist_trend_smooth"],
-    # агрегаты MW будут добавлены на этапе 4
 }
+
+# 🔸 MarketWatch виды (пишем только итоговое состояние state)
+MARKETWATCH_KINDS = ["trend", "volatility", "momentum", "extremes"]
 
 
 # 🔸 Сбор строк для одного инстанса индикатора (indicator)
@@ -263,7 +265,7 @@ async def build_rows_for_pack_kind(
     bar_open_ms: int,
     strategy_id: int,
     position_uid: str
-) -> List[Tuple]:
+) -> List[Tuple]]:
     status, results = await request_pack(
         redis,
         symbol=symbol,
@@ -276,7 +278,6 @@ async def build_rows_for_pack_kind(
     fields = PACK_FIELDS.get(kind, [])
 
     if status != "ok":
-        # при ошибке: одна строка с базой = сам kind (pack не зависит от instance_id)
         open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
         rows.append((
             position_uid, strategy_id, symbol, tf,
@@ -286,10 +287,9 @@ async def build_rows_for_pack_kind(
         ))
         return rows
 
-    # успех: results — список {"base": "...", "pack": {...}}
     open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
     for item in results:
-        base = str(item.get("base") or kind)   # для packs сохраняем полный base (ema21, bb20_2_0, macd12, ...)
+        base = str(item.get("base") or kind)   # packs: полный base (ema21, bb20_2_0, macd12, ...)
         pack = item.get("pack") or {}
         if not isinstance(pack, dict):
             continue
@@ -306,11 +306,66 @@ async def build_rows_for_pack_kind(
                 open_time_dt, "ok", None
             ))
 
-    # если ничего не собрали — считаем это "no_results"
     if not rows:
         rows.append((
             position_uid, strategy_id, symbol, tf,
             "pack", kind, kind,
+            None, "no_results",
+            open_time_dt, "error", "no_results"
+        ))
+    return rows
+
+
+# 🔸 Сбор строк для одного вида MarketWatch (gateway; пишем только state)
+async def build_rows_for_mw_kind(
+    redis,
+    *,
+    symbol: str,
+    tf: str,
+    kind: str,                # trend|volatility|momentum|extremes
+    bar_open_ms: int,
+    strategy_id: int,
+    position_uid: str
+) -> List[Tuple]]:
+    status, results = await request_pack(
+        redis,
+        symbol=symbol,
+        timeframe=tf,
+        indicator=kind,
+        timestamp_ms=bar_open_ms
+    )
+
+    rows: List[Tuple] = []
+    open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
+
+    if status != "ok":
+        rows.append((
+            position_uid, strategy_id, symbol, tf,
+            "marketwatch", kind, "state",
+            None, status,
+            open_time_dt, "error", status
+        ))
+        return rows
+
+    # ожидаем results как список из одного элемента {"base": kind, "pack": {"state": "...", ...}}
+    wrote = False
+    for item in results:
+        base = str(item.get("base") or kind)
+        pack = item.get("pack") or {}
+        if isinstance(pack, dict) and "state" in pack:
+            state_val = str(pack["state"])
+            rows.append((
+                position_uid, strategy_id, symbol, tf,
+                "marketwatch", base, "state",
+                None, state_val,
+                open_time_dt, "ok", None
+            ))
+            wrote = True
+
+    if not wrote:
+        rows.append((
+            position_uid, strategy_id, symbol, tf,
+            "marketwatch", kind, "state",
             None, "no_results",
             open_time_dt, "error", "no_results"
         ))
@@ -339,9 +394,9 @@ async def run_insert_batch(pg, rows: List[Tuple]) -> None:
             await conn.executemany(sql, rows)
 
 
-# 🔸 Основной воркер снимка (этап 3: indicators + packs по всем TF; m5 приоритет)
+# 🔸 Основной воркер снимка (этап 4: indicators + packs + marketwatch по всем TF; m5 приоритет)
 async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
-    log.info("IND_POSSTAT: воркер запущен (phase=3 indicators+packs m5+m15+h1)")
+    log.info("IND_POSSTAT: воркер запущен (phase=4 indicators+packs+marketwatch m5+m15+h1)")
 
     # создать consumer-group для позиций (идемпотентно)
     try:
@@ -363,14 +418,13 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         async def run_one(inst):
             async with sem:
                 try:
-                    r = await build_rows_for_indicator_instance(
+                    return await build_rows_for_indicator_instance(
                         redis,
                         symbol=symbol, tf=tf, instance=inst,
                         bar_open_ms=bar_open_ms,
                         strategy_id=strategy_id,
                         position_uid=position_uid
                     )
-                    return r
                 except Exception:
                     log.warning(f"IND_POSSTAT: exception in build_rows_for_indicator_instance tf={tf}", exc_info=True)
                     base_short = indicator_base_from_instance(inst)
@@ -386,7 +440,6 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         for batch in await asyncio.gather(*tasks, return_exceptions=False):
             rows_all.extend(batch)
 
-        # запись пачками
         for i in range(0, len(rows_all), BATCH_INSERT_MAX):
             await run_insert_batch(pg, rows_all[i:i + BATCH_INSERT_MAX])
 
@@ -399,20 +452,52 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         async def run_one(kind: str):
             async with sem:
                 try:
-                    r = await build_rows_for_pack_kind(
+                    return await build_rows_for_pack_kind(
                         redis,
                         symbol=symbol, tf=tf, kind=kind,
                         bar_open_ms=bar_open_ms,
                         strategy_id=strategy_id,
                         position_uid=position_uid
                     )
-                    return r
                 except Exception:
                     log.warning(f"IND_POSSTAT: exception in build_rows_for_pack_kind tf={tf} kind={kind}", exc_info=True)
                     open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
                     return [(
                         position_uid, strategy_id, symbol, tf,
                         "pack", kind, kind,
+                        None, "exception",
+                        open_time_dt, "error", "exception"
+                    )]
+
+        tasks = [asyncio.create_task(run_one(k)) for k in kinds]
+        for batch in await asyncio.gather(*tasks, return_exceptions=False):
+            rows_all.extend(batch)
+
+        for i in range(0, len(rows_all), BATCH_INSERT_MAX):
+            await run_insert_batch(pg, rows_all[i:i + BATCH_INSERT_MAX])
+
+        return len(rows_all)
+
+    async def process_mw_tf(tf: str, position_uid: str, strategy_id: int, symbol: str, bar_open_ms: int) -> int:
+        kinds = MARKETWATCH_KINDS
+        rows_all: List[Tuple] = []
+
+        async def run_one(kind: str):
+            async with sem:
+                try:
+                    return await build_rows_for_mw_kind(
+                        redis,
+                        symbol=symbol, tf=tf, kind=kind,
+                        bar_open_ms=bar_open_ms,
+                        strategy_id=strategy_id,
+                        position_uid=position_uid
+                    )
+                except Exception:
+                    log.warning(f"IND_POSSTAT: exception in build_rows_for_mw_kind tf={tf} kind={kind}", exc_info=True)
+                    open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
+                    return [(
+                        position_uid, strategy_id, symbol, tf,
+                        "marketwatch", kind, "state",
                         None, "exception",
                         open_time_dt, "error", "exception"
                     )]
@@ -449,28 +534,33 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
 
         total_rows = 0
 
-        # m5 — сначала (индикаторы + пакеты)
+        # m5 — приоритет: indicators + packs + marketwatch
         tf = "m5"
         t0 = asyncio.get_event_loop().time()
-        rows_m5_ind = await process_indicators_tf(tf, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf))
-        rows_m5_pack = await process_packs_tf(tf, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf))
-        total_rows += rows_m5_ind + rows_m5_pack
+        b_m5 = floor_to_bar(ts_ms, tf)
+        rows_m5_ind = await process_indicators_tf(tf, position_uid, strategy_id, symbol, b_m5)
+        rows_m5_pack = await process_packs_tf(tf, position_uid, strategy_id, symbol, b_m5)
+        rows_m5_mw  = await process_mw_tf(tf, position_uid, strategy_id, symbol, b_m5)
+        total_rows += rows_m5_ind + rows_m5_pack + rows_m5_mw
         t1 = asyncio.get_event_loop().time()
-        log.info(f"IND_POSSTAT: {tf} indicators+packs done position_uid={position_uid} symbol={symbol} rows={rows_m5_ind + rows_m5_pack} elapsed_ms={int((t1-t0)*1000)}")
+        log.info(f"IND_POSSTAT: {tf} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_m5_ind + rows_m5_pack + rows_m5_mw} elapsed_ms={int((t1-t0)*1000)}")
 
-        # m15 и h1 — затем (параллельно; для каждого TF считаем индикаторы + пакеты)
+        # m15 и h1 — затем (параллельно; для каждого TF считаем indicators + packs + mw)
         async def run_tf(tf2: str):
             t_start = asyncio.get_event_loop().time()
-            rows_ind = await process_indicators_tf(tf2, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf2))
-            rows_pack = await process_packs_tf(tf2, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf2))
+            b_tf = floor_to_bar(ts_ms, tf2)
+            rows_ind = await process_indicators_tf(tf2, position_uid, strategy_id, symbol, b_tf)
+            rows_pack = await process_packs_tf(tf2, position_uid, strategy_id, symbol, b_tf)
+            rows_mw  = await process_mw_tf(tf2, position_uid, strategy_id, symbol, b_tf)
             t_end = asyncio.get_event_loop().time()
-            log.info(f"IND_POSSTAT: {tf2} indicators+packs done position_uid={position_uid} symbol={symbol} rows={rows_ind + rows_pack} elapsed_ms={int((t_end-t_start)*1000)}")
-            return rows_ind + rows_pack
+            rows_sum = rows_ind + rows_pack + rows_mw
+            log.info(f"IND_POSSTAT: {tf2} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_sum} elapsed_ms={int((t_end-t_start)*1000)}")
+            return rows_sum
 
         rows_m15, rows_h1 = await asyncio.gather(run_tf("m15"), run_tf("h1"))
         total_rows += rows_m15 + rows_h1
 
-        log.info(f"IND_POSSTAT: all TF indicators+packs done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
+        log.info(f"IND_POSSTAT: all TF indicators+packs+mw done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
         return msg_id
 
     # 🔸 Основной цикл чтения позиций: пачкой + параллельная обработка + батч-ACK
@@ -481,7 +571,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
                 consumername=IPS_CONSUMER,
                 streams={POSITIONS_OPEN_STREAM: ">"},
                 count=100,
-                block=2000
+                block=1000
             )
         except Exception as e:
             log.error(f"IND_POSSTAT: read error: {e}", exc_info=True)
