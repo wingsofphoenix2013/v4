@@ -373,7 +373,7 @@ async def run_insert_batch(pg, rows: List[Tuple]) -> None:
 
 # 🔸 Основной воркер снимка (этап 4: indicators + packs + marketwatch по всем TF; m5 приоритет)
 async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
-    log.info("IND_POSSTAT: воркер запущен (phase=4 indicators+packs+marketwatch m5+m15+h1)")
+    log.debug("IND_POSSTAT: воркер запущен (phase=4 indicators+packs+marketwatch m5+m15+h1)")
 
     # создать consumer-group для позиций (идемпотентно)
     try:
@@ -387,7 +387,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
     async def process_indicators_tf(tf: str, position_uid: str, strategy_id: int, symbol: str, bar_open_ms: int) -> int:
         instances = [i for i in get_instances_by_tf(tf)]
         if not instances:
-            log.info(f"IND_POSSTAT: no_instances_{tf} symbol={symbol}")
+            log.debug(f"IND_POSSTAT: no_instances_{tf} symbol={symbol}")
             return 0
 
         rows_all: List[Tuple] = []
@@ -496,7 +496,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         created_at_iso = data.get("created_at")
 
         if not position_uid or not strategy_id_s or not symbol or not created_at_iso:
-            log.info(f"IND_POSSTAT: bad_event msg_id={msg_id} data_keys={list(data.keys())}")
+            log.debug(f"IND_POSSTAT: bad_event msg_id={msg_id} data_keys={list(data.keys())}")
             return msg_id
 
         try:
@@ -506,7 +506,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
 
         ts_ms = parse_iso_to_ms(created_at_iso)
         if ts_ms is None:
-            log.info(f"IND_POSSTAT: bad_event_time position_uid={position_uid}")
+            log.debug(f"IND_POSSTAT: bad_event_time position_uid={position_uid}")
             return msg_id
 
         total_rows = 0
@@ -520,7 +520,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         rows_m5_mw  = await process_mw_tf(tf, position_uid, strategy_id, symbol, b_m5)
         total_rows += rows_m5_ind + rows_m5_pack + rows_m5_mw
         t1 = asyncio.get_event_loop().time()
-        log.info(f"IND_POSSTAT: {tf} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_m5_ind + rows_m5_pack + rows_m5_mw} elapsed_ms={int((t1-t0)*1000)}")
+        log.debug(f"IND_POSSTAT: {tf} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_m5_ind + rows_m5_pack + rows_m5_mw} elapsed_ms={int((t1-t0)*1000)}")
 
         # m15 и h1 — затем (параллельно; для каждого TF считаем indicators + packs + mw)
         async def run_tf(tf2: str):
@@ -531,13 +531,13 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
             rows_mw  = await process_mw_tf(tf2, position_uid, strategy_id, symbol, b_tf)
             t_end = asyncio.get_event_loop().time()
             rows_sum = rows_ind + rows_pack + rows_mw
-            log.info(f"IND_POSSTAT: {tf2} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_sum} elapsed_ms={int((t_end-t_start)*1000)}")
+            log.debug(f"IND_POSSTAT: {tf2} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_sum} elapsed_ms={int((t_end-t_start)*1000)}")
             return rows_sum
 
         rows_m15, rows_h1 = await asyncio.gather(run_tf("m15"), run_tf("h1"))
         total_rows += rows_m15 + rows_h1
 
-        log.info(f"IND_POSSTAT: all TF indicators+packs+mw done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
+        log.debug(f"IND_POSSTAT: all TF indicators+packs+mw done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
         return msg_id
 
     # 🔸 Основной цикл чтения позиций: пачкой + параллельная обработка + батч-ACK
