@@ -17,13 +17,15 @@ from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
 from cleanup_worker import run_indicators_cleanup
 from indicator_gateway import run_indicator_gateway
-from indicator_positions_snapshot import run_indicator_positions_snapshot
 
 # 🔸 Воркеры MarketWatch (Trend)
 from indicator_mw_trend import run_indicator_mw_trend
 from indicator_mw_volatility import run_indicator_mw_volatility
 from indicator_mw_momentum import run_indicator_mw_momentum
 from indicator_mw_extremes import run_indicator_mw_extremes
+
+# 🔸 Воркер Snapshot
+from indicator_position_snapshot import run_indicator_position_snapshot
 
 
 # 🔸 Глобальные переменные
@@ -565,7 +567,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_volatility(pg, redis), "MW_VOL"),
         run_safe_loop(lambda: run_indicator_mw_momentum(pg, redis), "MW_MOM"),
         run_safe_loop(lambda: run_indicator_mw_extremes(pg, redis), "MW_EXT"),
-        run_safe_loop(lambda: run_indicator_positions_snapshot(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw, compute_snapshot_values_async), "POS_SNAPSHOT"),
+        run_safe_loop(lambda: run_indicator_position_snapshot(pg, redis, get_instances_by_tf), "IND_POSSTAT"),
     )
 
 
