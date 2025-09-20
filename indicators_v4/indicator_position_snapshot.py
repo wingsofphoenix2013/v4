@@ -1,8 +1,9 @@
-# indicator_position_snapshot.py — воркер снимка индикаторов на момент открытия позиции (этап 2: m5+m15+h1, param_type=indicator)
+# indicator_position_snapshot.py — воркер снимка индикаторов на момент открытия позиции (этап 2: m5+m15+h1, param_type=indicator; без истории, без pending)
 
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -11,29 +12,21 @@ POSITIONS_OPEN_STREAM = "positions_open_stream"      # входной стрим
 
 IND_REQ_STREAM   = "indicator_request"               # on-demand запросы индикаторов
 IND_RESP_STREAM  = "indicator_response"              # on-demand ответы индикаторов (общий стрим системы)
-RESP_GROUP       = "ips_resp_group"                  # наша consumer-group на ответах (только этот воркер)
-RESP_CONSUMER    = "ips_resp_consumer_1"
 
 IPS_GROUP        = "ips_group"                       # consumer-group для позиций
 IPS_CONSUMER     = "ips_consumer_1"
 
 # 🔸 Тайминги/ограничения
-READ_BLOCK_MS             = 1500                     # блокирующее чтение из стримов (мс)
-REQ_RESPONSE_TIMEOUT_MS   = 5000                     # общий таймаут ожидания ответа (мс) на один запрос индикатора
+READ_BLOCK_MS             = 1500                     # блокирующее чтение из XREAD (мс)
+REQ_RESPONSE_TIMEOUT_MS   = 5000                     # таймаут ожидания ответа (мс)
 SECOND_TRY_TIMEOUT_MS     = 3000                     # таймаут второй попытки (мс) при первичном timeout
 PARALLEL_REQUESTS_LIMIT   = 24                       # одновременные запросы on-demand
 BATCH_INSERT_MAX          = 500                      # макс. размер пачки для INSERT
 
-# 🔸 Таймфреймы и таймшаги (этап 2 — m5, m15, h1)
+# 🔸 Таймфреймы и шаги (этап 2 — m5, m15, h1)
 TF_ORDER = ["m5", "m15", "h1"]
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 STEP_MS  = {k: v * 60_000 for k, v in STEP_MIN.items()}
-
-# 🔸 Параметры роутера ответов
-PENDING_TTL_SEC           = 15                       # TTL для «ожидающих» сообщений (в памяти)
-XAUTOCLAIM_MIN_IDLE_MS    = 2000                     # сообщения старше этого idle считаем «протухшими» и забираем
-XAUTOCLAIM_BATCH          = 200                      # за раз подбирать не больше N сообщений
-PENDING_MAX_IN_MEMORY     = 20000                    # мягкий лимит на буфер pending
 
 # 🔸 Логгер
 log = logging.getLogger("IND_POSSTAT")
@@ -76,156 +69,24 @@ def indicator_base_from_instance(inst: Dict[str, Any]) -> str:
     return "adx_dmi" if ind.startswith("adx_dmi") else ind
 
 
-# 🔸 Роутер ответов indicator_response (гарантированная доставка без потерь)
-class IndicatorResponseRouter:
-    """
-    Один фоновой читатель XREADGROUP по IND_RESP_STREAM/RESP_GROUP.
-    Диспетчеризует сообщения по req_id в asyncio.Queue.
-    «Неизвестные» req_id не ACK-аем; складываем в pending и отдаём при register(req_id), после чего ACK.
-    Периодически забираем «протухшие» сообщения через XAUTOCLAIM.
-    """
-    def __init__(self, redis):
-        self.redis = redis
-        self._queues: Dict[str, asyncio.Queue] = {}                 # req_id -> Queue
-        self._pending: Dict[str, Tuple[str, Dict[str, Any], float]] = {}  # req_id -> (msg_id, data, put_ts)
-        self._reader_task: Optional[asyncio.Task] = None
-        self._reclaimer_task: Optional[asyncio.Task] = None
-        self._janitor_task: Optional[asyncio.Task] = None
-        self._started = False
-        self._lock = asyncio.Lock()
-
-    async def start(self):
-        if self._started:
-            return
-        # создать группу (идемпотентно)
-        try:
-            await self.redis.xgroup_create(IND_RESP_STREAM, RESP_GROUP, id="$", mkstream=True)
-        except Exception as e:
-            if "BUSYGROUP" not in str(e):
-                log.warning(f"xgroup_create (resp) error: {e}")
-        self._reader_task   = asyncio.create_task(self._reader_loop())
-        self._reclaimer_task= asyncio.create_task(self._reclaim_loop())
-        self._janitor_task  = asyncio.create_task(self._janitor_loop())
-        self._started = True
-        log.debug("IND_POSSTAT: response router started")
-
-    async def _reader_loop(self):
-        while True:
-            try:
-                resp = await self.redis.xreadgroup(
-                    groupname=RESP_GROUP,
-                    consumername=RESP_CONSUMER,
-                    streams={IND_RESP_STREAM: ">"},
-                    count=200,
-                    block=READ_BLOCK_MS
-                )
-                if not resp:
-                    continue
-
-                ack_ids: List[str] = []
-                now_mono = asyncio.get_event_loop().time()
-
-                for _, messages in resp:
-                    for msg_id, data in messages:
-                        req_id = data.get("req_id")
-                        if not req_id:
-                            ack_ids.append(msg_id)
-                            continue
-
-                        q = self._queues.get(req_id)
-                        if q is not None:
-                            try:
-                                q.put_nowait((msg_id, data))
-                                ack_ids.append(msg_id)
-                            except Exception:
-                                self._pending[req_id] = (msg_id, data, now_mono)
-                        else:
-                            if len(self._pending) < PENDING_MAX_IN_MEMORY:
-                                self._pending[req_id] = (msg_id, data, now_mono)
-                            else:
-                                log.warning("IND_POSSTAT: pending buffer full, buffered without ACK; size=%d", len(self._pending))
-                                self._pending[req_id] = (msg_id, data, now_mono)
-
-                if ack_ids:
-                    await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, *ack_ids)
-
-            except Exception as e:
-                log.error(f"IND_POSSTAT: resp router read error: {e}", exc_info=True)
-                await asyncio.sleep(0.3)
-
-    async def _reclaim_loop(self):
-        last_id = "0-0"
-        while True:
-            try:
-                claimed = await self.redis.execute_command(
-                    "XAUTOCLAIM", IND_RESP_STREAM, RESP_GROUP, RESP_CONSUMER,
-                    XAUTOCLAIM_MIN_IDLE_MS, last_id, "COUNT", XAUTOCLAIM_BATCH
-                )
-                next_id, entries = claimed[0], claimed[1]
-                now_mono = asyncio.get_event_loop().time()
-                for msg_id, data in entries:
-                    req_id = data.get("req_id")
-                    if not req_id:
-                        await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, msg_id)
-                        continue
-                    if req_id in self._queues:
-                        try:
-                            self._queues[req_id].put_nowait((msg_id, data))
-                            await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, msg_id)
-                        except Exception:
-                            self._pending[req_id] = (msg_id, data, now_mono)
-                    else:
-                        self._pending[req_id] = (msg_id, data, now_mono)
-
-                last_id = next_id or last_id
-            except Exception as e:
-                log.warning(f"IND_POSSTAT: resp router reclaim error: {e}", exc_info=True)
-            finally:
-                await asyncio.sleep(1.0)
-
-    async def _janitor_loop(self):
-        while True:
-            try:
-                now_mono = asyncio.get_event_loop().time()
-                stale = [rid for rid, (_, _, put_ts) in self._pending.items()
-                         if now_mono - put_ts > PENDING_TTL_SEC]
-                if stale:
-                    log.warning("IND_POSSTAT: pending entries stale=%d (kept unacked, waiting for register)", len(stale))
-            except Exception:
-                pass
-            finally:
-                await asyncio.sleep(5.0)
-
-    async def register(self, req_id: str) -> asyncio.Queue:
-        async with self._lock:
-            q = asyncio.Queue(maxsize=1)
-            self._queues[req_id] = q
-            pending = self._pending.pop(req_id, None)
-            if pending:
-                msg_id, data, _ = pending
-                try:
-                    q.put_nowait((msg_id, data))
-                    await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, msg_id)
-                except Exception:
-                    self._pending[req_id] = (msg_id, data, asyncio.get_event_loop().time())
-            return q
-
-    async def unregister(self, req_id: str):
-        async with self._lock:
-            self._queues.pop(req_id, None)
-
-
-# 🔸 Отправка on-demand запроса и получение ответа через общий роутер (с 1 ретраем)
+# 🔸 Отправка on-demand запроса и ожидание ответа (простая схема XREAD после снимка хвоста)
 async def request_indicator_snapshot(
     redis,
-    router: IndicatorResponseRouter,
     *,
     symbol: str,
     timeframe: str,
     instance_id: int,
     timestamp_ms: int
 ) -> Tuple[str, Dict[str, Any]]:
+    """
+    Возвращает (status, payload), где:
+      - status: "ok" или узкий код ошибки ("timeout","no_ohlcv","instance_not_active",
+                "symbol_not_active","before_enabled_at","no_values","bad_request","exception","stream_error")
+      - payload: при ok → {"open_time": <iso>, "results": {param_name: str_value, ...}}
+    """
     async def one_try(wait_ms: int) -> Tuple[str, Dict[str, Any]]:
+        # снимок хвоста до запроса → будем читать только новые сообщения
+        start_id = "$"
         fields = {
             "symbol": symbol,
             "timeframe": timeframe,
@@ -238,30 +99,45 @@ async def request_indicator_snapshot(
             log.warning("stream_error: XADD indicator_request failed", exc_info=True)
             return "stream_error", {}
 
-        q = await router.register(req_id)
-        try:
-            try:
-                msg_id, data = await asyncio.wait_for(q.get(), timeout=wait_ms / 1000.0)
-            except asyncio.TimeoutError:
+        deadline = time.monotonic() + (wait_ms / 1000.0)
+        last_id = start_id
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return "timeout", {}
 
-            status = data.get("status", "error")
-            if status != "ok":
-                return data.get("error", "exception"), {}
-
             try:
-                open_time = data.get("open_time") or ""
-                results_raw = data.get("results") or "{}"
-                results = json.loads(results_raw)
-                return "ok", {"open_time": open_time, "results": results}
+                resp = await redis.xread({IND_RESP_STREAM: last_id}, block=min(int(remaining * 1000), READ_BLOCK_MS), count=200)
             except Exception:
-                return "exception", {}
-        finally:
-            await router.unregister(req_id)
+                log.warning("stream_error: XREAD indicator_response failed", exc_info=True)
+                return "stream_error", {}
 
+            if not resp:
+                continue
+
+            for _, messages in resp:
+                for msg_id, data in messages:
+                    last_id = msg_id
+                    if data.get("req_id") != req_id:
+                        # чужое — пропускаем
+                        continue
+                    status = data.get("status", "error")
+                    if status != "ok":
+                        return data.get("error", "exception"), {}
+                    try:
+                        open_time = data.get("open_time") or ""
+                        results_raw = data.get("results") or "{}"
+                        results = json.loads(results_raw)
+                        return "ok", {"open_time": open_time, "results": results}
+                    except Exception:
+                        return "exception", {}
+
+    # первая попытка
     st, pl = await one_try(REQ_RESPONSE_TIMEOUT_MS)
     if st != "timeout":
         return st, pl
+    # вторая попытка на случай редкой задержки
     log.info("IND_POSSTAT: retry on timeout for instance_id=%s symbol=%s tf=%s", instance_id, symbol, timeframe)
     return await one_try(SECOND_TRY_TIMEOUT_MS)
 
@@ -269,7 +145,6 @@ async def request_indicator_snapshot(
 # 🔸 Сбор строк для одного инстанса индикатора (общая логика для всех TF)
 async def build_rows_for_instance(
     redis,
-    router: IndicatorResponseRouter,
     *,
     symbol: str,
     tf: str,
@@ -281,7 +156,6 @@ async def build_rows_for_instance(
     instance_id = int(instance["id"])
     status, payload = await request_indicator_snapshot(
         redis,
-        router,
         symbol=symbol,
         timeframe=tf,
         instance_id=instance_id,
@@ -354,27 +228,21 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         if "BUSYGROUP" not in str(e):
             log.warning(f"xgroup_create (positions) error: {e}")
 
-    # поднять роутер ответов и его consumer-group
-    router = IndicatorResponseRouter(redis)
-    await router.start()
-
     sem = asyncio.Semaphore(PARALLEL_REQUESTS_LIMIT)
 
     async def process_tf(tf: str, position_uid: str, strategy_id: int, symbol: str, bar_open_ms: int) -> int:
-        # собрать инстансы по TF
         instances = [i for i in get_instances_by_tf(tf)]
         if not instances:
             log.info(f"IND_POSSTAT: no_instances_{tf} symbol={symbol}")
             return 0
 
-        # параллельная обработка инстансов с лимитом
         rows_all: List[Tuple] = []
 
         async def run_one(inst):
             async with sem:
                 try:
                     r = await build_rows_for_instance(
-                        redis, router,
+                        redis,
                         symbol=symbol, tf=tf, instance=inst,
                         bar_open_ms=bar_open_ms,
                         strategy_id=strategy_id,
@@ -397,7 +265,6 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         for batch in results_batches:
             rows_all.extend(batch)
 
-        # запись пачками
         for i in range(0, len(rows_all), BATCH_INSERT_MAX):
             await run_insert_batch(pg, rows_all[i:i + BATCH_INSERT_MAX])
 
@@ -434,7 +301,7 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         t1 = asyncio.get_event_loop().time()
         log.info(f"IND_POSSTAT: {tf} indicators done position_uid={position_uid} symbol={symbol} rows={rows_m5} elapsed_ms={int((t1-t0)*1000)}")
 
-        # m15 и h1 — потом (параллельно)
+        # m15 и h1 — затем (параллельно)
         async def run_tf(tf2: str):
             t_start = asyncio.get_event_loop().time()
             rows = await process_tf(tf2, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf2))
