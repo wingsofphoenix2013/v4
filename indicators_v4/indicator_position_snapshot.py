@@ -1,9 +1,9 @@
-# indicator_position_snapshot.py — воркер снимка индикаторов на момент открытия позиции (этап 1: m5, param_type=indicator)
+# indicator_position_snapshot.py — воркер снимка индикаторов на момент открытия позиции (этап 2: m5+m15+h1, param_type=indicator)
 
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
 # 🔸 Константы стримов и настроек
@@ -21,11 +21,12 @@ IPS_CONSUMER     = "ips_consumer_1"
 READ_BLOCK_MS             = 1500                     # блокирующее чтение из стримов (мс)
 REQ_RESPONSE_TIMEOUT_MS   = 5000                     # общий таймаут ожидания ответа (мс) на один запрос индикатора
 SECOND_TRY_TIMEOUT_MS     = 3000                     # таймаут второй попытки (мс) при первичном timeout
-PARALLEL_REQUESTS_LIMIT   = 20                       # одновременные запросы on-demand
+PARALLEL_REQUESTS_LIMIT   = 24                       # одновременные запросы on-demand
 BATCH_INSERT_MAX          = 500                      # макс. размер пачки для INSERT
 
-# 🔸 Таймшаги TF (этап 1 — только m5)
-STEP_MIN = {"m5": 5}
+# 🔸 Таймфреймы и таймшаги (этап 2 — m5, m15, h1)
+TF_ORDER = ["m5", "m15", "h1"]
+STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 STEP_MS  = {k: v * 60_000 for k, v in STEP_MIN.items()}
 
 # 🔸 Параметры роутера ответов
@@ -59,7 +60,7 @@ def to_float_safe(s: str) -> Optional[float]:
 # 🔸 Нормализация базового имени для param_type='indicator'
 def indicator_base_from_param_name(param_name: str) -> str:
     """
-    Правило: в param_base для indicators пишем укороченный тип без длины:
+    В param_base для indicators пишем укороченный тип без длины:
       ema21 -> ema, rsi14 -> rsi, atr14 -> atr, kama30 -> kama,
       bb20_2_0_upper -> bb, macd12_macd -> macd, adx_dmi21_plus_di -> adx_dmi, lr50_angle -> lr.
     """
@@ -80,14 +81,13 @@ class IndicatorResponseRouter:
     """
     Один фоновой читатель XREADGROUP по IND_RESP_STREAM/RESP_GROUP.
     Диспетчеризует сообщения по req_id в asyncio.Queue.
-    ВАЖНО: «неизвестные» req_id не ACK-аем; складываем в pending и
-    отдаём потребителю при register(req_id), после чего ACK.
-    Также периодически забираем «протухшие» сообщения через XAUTOCLAIM.
+    «Неизвестные» req_id не ACK-аем; складываем в pending и отдаём при register(req_id), после чего ACK.
+    Периодически забираем «протухшие» сообщения через XAUTOCLAIM.
     """
     def __init__(self, redis):
         self.redis = redis
         self._queues: Dict[str, asyncio.Queue] = {}                 # req_id -> Queue
-        self._pending: Dict[str, Tuple[str, Dict[str, Any], float]] = {}  # req_id -> (msg_id, data, put_time_monotonic)
+        self._pending: Dict[str, Tuple[str, Dict[str, Any], float]] = {}  # req_id -> (msg_id, data, put_ts)
         self._reader_task: Optional[asyncio.Task] = None
         self._reclaimer_task: Optional[asyncio.Task] = None
         self._janitor_task: Optional[asyncio.Task] = None
@@ -129,26 +129,21 @@ class IndicatorResponseRouter:
                     for msg_id, data in messages:
                         req_id = data.get("req_id")
                         if not req_id:
-                            # нет корреляции — ACK сразу
                             ack_ids.append(msg_id)
                             continue
 
                         q = self._queues.get(req_id)
                         if q is not None:
-                            # потребитель уже ждёт — доставляем и ACK
                             try:
                                 q.put_nowait((msg_id, data))
                                 ack_ids.append(msg_id)
                             except Exception:
-                                # очередь закрыта/переполнена — буферизуем без ACK
                                 self._pending[req_id] = (msg_id, data, now_mono)
                         else:
-                            # потребитель ещё не зарегистрировался — буферизуем без ACK
                             if len(self._pending) < PENDING_MAX_IN_MEMORY:
                                 self._pending[req_id] = (msg_id, data, now_mono)
                             else:
-                                # мягкий напоминатель в логах; не ACK-аем, чтобы не потерять
-                                log.warning("IND_POSSTAT: pending buffer full, message buffered without ACK; size=%d", len(self._pending))
+                                log.warning("IND_POSSTAT: pending buffer full, buffered without ACK; size=%d", len(self._pending))
                                 self._pending[req_id] = (msg_id, data, now_mono)
 
                 if ack_ids:
@@ -159,35 +154,27 @@ class IndicatorResponseRouter:
                 await asyncio.sleep(0.3)
 
     async def _reclaim_loop(self):
-        """
-        Периодически подбираем «протухшие» сообщения из PEL (после рестартов/сбоев).
-        """
         last_id = "0-0"
         while True:
             try:
-                # XAUTOCLAIM с min-idle — вернёт нам сообщения, которые давно лежат в PEL
                 claimed = await self.redis.execute_command(
                     "XAUTOCLAIM", IND_RESP_STREAM, RESP_GROUP, RESP_CONSUMER,
                     XAUTOCLAIM_MIN_IDLE_MS, last_id, "COUNT", XAUTOCLAIM_BATCH
                 )
-                # Формат ответа: [<next-id>, [[msg_id, {field:val...}], ...]]
                 next_id, entries = claimed[0], claimed[1]
                 now_mono = asyncio.get_event_loop().time()
                 for msg_id, data in entries:
                     req_id = data.get("req_id")
                     if not req_id:
-                        # некоррелируемые — сразу ACK
                         await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, msg_id)
                         continue
                     if req_id in self._queues:
-                        # потребитель уже ждёт — дропаем в очередь и ACK
                         try:
                             self._queues[req_id].put_nowait((msg_id, data))
                             await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, msg_id)
                         except Exception:
                             self._pending[req_id] = (msg_id, data, now_mono)
                     else:
-                        # буферизуем без ACK (доставим и ACK-нем при register)
                         self._pending[req_id] = (msg_id, data, now_mono)
 
                 last_id = next_id or last_id
@@ -197,10 +184,6 @@ class IndicatorResponseRouter:
                 await asyncio.sleep(1.0)
 
     async def _janitor_loop(self):
-        """
-        Уборщик сильно протухших pending: логируем и продлеваем жизнь.
-        Не ACK-аем до регистрации, чтобы не терять сообщения.
-        """
         while True:
             try:
                 now_mono = asyncio.get_event_loop().time()
@@ -208,7 +191,6 @@ class IndicatorResponseRouter:
                          if now_mono - put_ts > PENDING_TTL_SEC]
                 if stale:
                     log.warning("IND_POSSTAT: pending entries stale=%d (kept unacked, waiting for register)", len(stale))
-                # Ничего не удаляем и не ACK-аем — ждём регистраций
             except Exception:
                 pass
             finally:
@@ -218,7 +200,6 @@ class IndicatorResponseRouter:
         async with self._lock:
             q = asyncio.Queue(maxsize=1)
             self._queues[req_id] = q
-            # если ответ уже пришёл и лежит в pending — отдаём немедленно и ACK
             pending = self._pending.pop(req_id, None)
             if pending:
                 msg_id, data, _ = pending
@@ -226,7 +207,6 @@ class IndicatorResponseRouter:
                     q.put_nowait((msg_id, data))
                     await self.redis.xack(IND_RESP_STREAM, RESP_GROUP, msg_id)
                 except Exception:
-                    # если очередь не приняла — вернём обратно в pending без ACK
                     self._pending[req_id] = (msg_id, data, asyncio.get_event_loop().time())
             return q
 
@@ -245,12 +225,6 @@ async def request_indicator_snapshot(
     instance_id: int,
     timestamp_ms: int
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Возвращает (status, payload), где:
-      - status: "ok" или узкий код ошибки ("timeout","no_ohlcv","instance_not_active",
-                "symbol_not_active","before_enabled_at","no_values","bad_request","exception","stream_error")
-      - payload: при ok → {"open_time": <iso>, "results": {param_name: str_value, ...}}
-    """
     async def one_try(wait_ms: int) -> Tuple[str, Dict[str, Any]]:
         fields = {
             "symbol": symbol,
@@ -285,16 +259,14 @@ async def request_indicator_snapshot(
         finally:
             await router.unregister(req_id)
 
-    # первая попытка
     st, pl = await one_try(REQ_RESPONSE_TIMEOUT_MS)
     if st != "timeout":
         return st, pl
-    # вторая попытка на случай редкой задержки
     log.info("IND_POSSTAT: retry on timeout for instance_id=%s symbol=%s tf=%s", instance_id, symbol, timeframe)
     return await one_try(SECOND_TRY_TIMEOUT_MS)
 
 
-# 🔸 Сбор строк для одного инстанса индикатора (этап 1: только m5)
+# 🔸 Сбор строк для одного инстанса индикатора (общая логика для всех TF)
 async def build_rows_for_instance(
     redis,
     router: IndicatorResponseRouter,
@@ -306,10 +278,6 @@ async def build_rows_for_instance(
     strategy_id: int,
     position_uid: str
 ) -> List[Tuple]:
-    """
-    Возвращает список кортежей для вставки в indicator_position_stat.
-    Порядок полей кортежа соответствует VALUES ($1..$12) в run_insert_batch().
-    """
     instance_id = int(instance["id"])
     status, payload = await request_indicator_snapshot(
         redis,
@@ -323,26 +291,16 @@ async def build_rows_for_instance(
     rows: List[Tuple] = []
 
     if status != "ok":
-        # при ошибке пишем одну строку с укороченной базой (без длины)
         base_short = indicator_base_from_instance(instance)
         open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
         rows.append((
-            position_uid,                 # position_uid
-            strategy_id,                  # strategy_id
-            symbol,                       # symbol
-            tf,                           # timeframe
-            "indicator",                  # param_type
-            base_short,                   # param_base (без длины)
-            base_short,                   # param_name (на ошибке можно дублировать базу)
-            None,                         # value_num
-            status,                       # value_text (код ошибки)
-            open_time_dt,                 # open_time (datetime)
-            "error",                      # status
-            status                        # error_code
+            position_uid, strategy_id, symbol, tf,
+            "indicator", base_short, base_short,
+            None, status,
+            open_time_dt, "error", status
         ))
         return rows
 
-    # успех: open_time → datetime, разложить все пары {param_name: str_value}
     ot_raw = payload.get("open_time")
     try:
         open_time_dt = datetime.fromisoformat(ot_raw) if ot_raw else datetime.utcfromtimestamp(bar_open_ms / 1000)
@@ -353,22 +311,13 @@ async def build_rows_for_instance(
     for param_name, str_value in results.items():
         base_short = indicator_base_from_param_name(param_name)
         fval = to_float_safe(str_value)
-
         rows.append((
-            position_uid,                                  # position_uid
-            strategy_id,                                   # strategy_id
-            symbol,                                        # symbol
-            tf,                                            # timeframe
-            "indicator",                                   # param_type
-            base_short,                                    # param_base (без длины)
-            param_name,                                    # param_name (полный канон, с длиной)
-            fval if fval is not None else None,            # value_num
-            None if fval is not None else str_value,       # value_text
-            open_time_dt,                                  # open_time (datetime)
-            "ok",                                          # status
-            None                                           # error_code
+            position_uid, strategy_id, symbol, tf,
+            "indicator", base_short, param_name,
+            fval if fval is not None else None,
+            None if fval is not None else str_value,
+            open_time_dt, "ok", None
         ))
-
     return rows
 
 
@@ -394,9 +343,9 @@ async def run_insert_batch(pg, rows: List[Tuple]) -> None:
             await conn.executemany(sql, rows)
 
 
-# 🔸 Основной воркер снимка (этап 1: только m5 + indicators, без таймаутов на ответах)
+# 🔸 Основной воркер снимка (этап 2: m5 → m15/h1, все param_type=indicator)
 async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
-    log.info("IND_POSSTAT: воркер запущен (phase=1 m5/indicator)")
+    log.info("IND_POSSTAT: воркер запущен (phase=2 indicators m5+m15+h1)")
 
     # создать consumer-group для позиций (идемпотентно)
     try:
@@ -411,57 +360,29 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
 
     sem = asyncio.Semaphore(PARALLEL_REQUESTS_LIMIT)
 
-    async def process_position(msg_id: str, data: Dict[str, Any]) -> Optional[str]:
-        # условия достаточности
-        position_uid = data.get("position_uid")
-        strategy_id_s = data.get("strategy_id")
-        symbol = data.get("symbol")
-        created_at_iso = data.get("created_at")
-
-        if not position_uid or not strategy_id_s or not symbol or not created_at_iso:
-            log.info(f"IND_POSSTAT: bad_event msg_id={msg_id} data_keys={list(data.keys())}")
-            return msg_id  # ACK мусора
-
-        try:
-            strategy_id = int(strategy_id_s)
-        except Exception:
-            strategy_id = 0
-
-        ts_ms = parse_iso_to_ms(created_at_iso)
-        if ts_ms is None:
-            log.info(f"IND_POSSTAT: bad_event_time position_uid={position_uid}")
-            return msg_id
-
-        # bar-open для m5
-        tf = "m5"
-        bar_open_ms = floor_to_bar(ts_ms, tf)
-
-        # собрать инстансы для m5
+    async def process_tf(tf: str, position_uid: str, strategy_id: int, symbol: str, bar_open_ms: int) -> int:
+        # собрать инстансы по TF
         instances = [i for i in get_instances_by_tf(tf)]
         if not instances:
-            log.info(f"IND_POSSTAT: no_instances_m5 symbol={symbol}")
-            return msg_id
+            log.info(f"IND_POSSTAT: no_instances_{tf} symbol={symbol}")
+            return 0
 
         # параллельная обработка инстансов с лимитом
-        t0 = asyncio.get_event_loop().time()
         rows_all: List[Tuple] = []
 
         async def run_one(inst):
             async with sem:
                 try:
                     r = await build_rows_for_instance(
-                        redis,
-                        router,
-                        symbol=symbol,
-                        tf=tf,
-                        instance=inst,
+                        redis, router,
+                        symbol=symbol, tf=tf, instance=inst,
                         bar_open_ms=bar_open_ms,
                         strategy_id=strategy_id,
                         position_uid=position_uid
                     )
                     return r
                 except Exception:
-                    log.warning("IND_POSSTAT: exception in build_rows_for_instance", exc_info=True)
+                    log.warning(f"IND_POSSTAT: exception in build_rows_for_instance tf={tf}", exc_info=True)
                     base_short = indicator_base_from_instance(inst)
                     open_time_dt = datetime.utcfromtimestamp(bar_open_ms / 1000)
                     return [(
@@ -476,15 +397,56 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         for batch in results_batches:
             rows_all.extend(batch)
 
-        # запись пачкой (частями, если очень много)
+        # запись пачками
         for i in range(0, len(rows_all), BATCH_INSERT_MAX):
             await run_insert_batch(pg, rows_all[i:i + BATCH_INSERT_MAX])
 
+        return len(rows_all)
+
+    async def process_position(msg_id: str, data: Dict[str, Any]) -> Optional[str]:
+        # условия достаточности
+        position_uid = data.get("position_uid")
+        strategy_id_s = data.get("strategy_id")
+        symbol = data.get("symbol")
+        created_at_iso = data.get("created_at")
+
+        if not position_uid or not strategy_id_s or not symbol or not created_at_iso:
+            log.info(f"IND_POSSTAT: bad_event msg_id={msg_id} data_keys={list(data.keys())}")
+            return msg_id
+
+        try:
+            strategy_id = int(strategy_id_s)
+        except Exception:
+            strategy_id = 0
+
+        ts_ms = parse_iso_to_ms(created_at_iso)
+        if ts_ms is None:
+            log.info(f"IND_POSSTAT: bad_event_time position_uid={position_uid}")
+            return msg_id
+
+        total_rows = 0
+
+        # m5 — сначала (приоритет)
+        tf = "m5"
+        t0 = asyncio.get_event_loop().time()
+        rows_m5 = await process_tf(tf, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf))
+        total_rows += rows_m5
         t1 = asyncio.get_event_loop().time()
-        log.info(
-            f"IND_POSSTAT: m5 indicators done position_uid={position_uid} "
-            f"symbol={symbol} rows={len(rows_all)} elapsed_ms={int((t1 - t0) * 1000)}"
-        )
+        log.info(f"IND_POSSTAT: {tf} indicators done position_uid={position_uid} symbol={symbol} rows={rows_m5} elapsed_ms={int((t1-t0)*1000)}")
+
+        # m15 и h1 — потом (параллельно)
+        async def run_tf(tf2: str):
+            t_start = asyncio.get_event_loop().time()
+            rows = await process_tf(tf2, position_uid, strategy_id, symbol, floor_to_bar(ts_ms, tf2))
+            t_end = asyncio.get_event_loop().time()
+            log.info(f"IND_POSSTAT: {tf2} indicators done position_uid={position_uid} symbol={symbol} rows={rows} elapsed_ms={int((t_end-t_start)*1000)}")
+            return rows
+
+        rows_m15, rows_h1 = await asyncio.gather(run_tf("m15"), run_tf("h1"))
+        total_rows += rows_m15 + rows_h1
+
+        # итог по позиции
+        log.info(f"IND_POSSTAT: indicators all TF done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
 
         return msg_id
 
