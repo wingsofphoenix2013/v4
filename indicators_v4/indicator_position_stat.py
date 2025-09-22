@@ -1,4 +1,4 @@
-# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (этап 2+3+4: m5+m15+h1; индикаторы + packs + marketwatch; параллельные позиции; пер-TF лог)
+# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (m5 only; consumer-groups для ответов, watchdog утерянных req)
 
 import asyncio
 import json
@@ -9,28 +9,29 @@ from datetime import datetime, timedelta
 from packs.pack_utils import floor_to_bar
 
 # 🔸 Константы стримов и таблиц
-POSITIONS_OPEN_STREAM = "positions_open_stream"
-INDICATOR_REQ_STREAM  = "indicator_request"
-INDICATOR_RESP_STREAM = "indicator_response"
-GW_REQ_STREAM         = "indicator_gateway_request"
-GW_RESP_STREAM        = "indicator_gateway_response"
-TARGET_TABLE          = "indicator_position_stat"
+POSITIONS_OPEN_STREAM   = "positions_open_stream"
+INDICATOR_REQ_STREAM    = "indicator_request"
+INDICATOR_RESP_STREAM   = "indicator_response"
+GW_REQ_STREAM           = "indicator_gateway_request"
+GW_RESP_STREAM          = "indicator_gateway_response"
+TARGET_TABLE            = "indicator_position_stat"
 
 # 🔸 Параметры воркера / параллелизм
-REQUIRED_TFS           = ("m5", "m15", "h1")  # теперь все 3 ТФ
-POLL_INTERVAL_SEC      = 1                    # частота ретраев
-RESP_BLOCK_MS          = 300                  # короткий блок на чтение ответов
-GLOBAL_TIMEOUT_SEC     = 600                  # 10 минут на позицию
-BATCH_SIZE_POS_OPEN    = 20                   # чтение позиций
-BATCH_SIZE_RESP        = 200                  # чтение ответов (indicator/gateway)
-CONCURRENCY_PER_TF     = {"m5": 80, "m15": 40, "h1": 30}  # лимиты on-demand per TF (m5 приоритетнее)
-POSITIONS_CONCURRENCY  = 16                   # одновременно обрабатываемых позиций
+REQUIRED_TFS            = ("m5",)          # только m5
+POLL_INTERVAL_SEC       = 1               # частота ретраев
+RESP_BLOCK_MS           = 300             # короткий блок на чтение ответов
+GLOBAL_TIMEOUT_SEC      = 600             # 10 минут на позицию
+BATCH_SIZE_POS_OPEN     = 20              # чтение позиций
+BATCH_SIZE_RESP         = 200             # чтение ответов (indicator/gateway)
+CONCURRENCY_PER_M5      = 100             # лимит on-demand запросов по m5
+POSITIONS_CONCURRENCY   = 16              # одновременно обрабатываемых позиций
+LOST_REQ_SEC            = 5               # watchdog: через сколько секунд считаем req потерянным
 
-# 🔸 Пакеты и MW
+# 🔸 Пакеты и MW (m5)
 PACK_INDS = ("ema", "rsi", "mfi", "bb", "lr", "atr", "adx_dmi", "macd")
 MW_KINDS  = ("trend", "volatility", "momentum", "extremes")
 
-# 🔸 Белые списки полей паков (строго как задано)
+# 🔸 Белые списки полей паков (строго как согласовано)
 PACK_FIELD_WHITELIST = {
     "rsi":     ["bucket_low", "trend"],
     "mfi":     ["bucket_low", "trend"],
@@ -43,6 +44,12 @@ PACK_FIELD_WHITELIST = {
     "macd":    ["mode", "cross", "zero_side", "hist_bucket_low_pct",
                 "hist_trend_strict", "hist_trend_smooth"],
 }
+
+# 🔸 Consumer-groups для ответов (гарантированная доставка)
+IND_RESP_GROUP = "iv4_possnap_indresp"
+GW_RESP_GROUP  = "iv4_possnap_gwresp"
+IND_RESP_CONSUMER = "iv4_possnap_router_ind_1"
+GW_RESP_CONSUMER  = "iv4_possnap_router_gw_1"
 
 # 🔸 Логгер
 log = logging.getLogger("IND_POS_STAT")
@@ -113,22 +120,17 @@ async def insert_rows_pg(pg, rows: list[tuple]) -> int:
     return len(rows)
 
 
-# 🔸 Подсчёт уникальных строк по позиции и/или ТФ
-async def count_unique_rows(pg, position_uid: str, tf: str | None = None) -> int:
+# 🔸 Подсчёт уникальных строк по позиции и TF
+async def count_unique_rows(pg, position_uid: str, tf: str) -> int:
     async with pg.acquire() as conn:
-        if tf is None:
-            rec = await conn.fetchrow(
-                f"SELECT COUNT(*) AS cnt FROM {TARGET_TABLE} WHERE position_uid = $1", position_uid
-            )
-        else:
-            rec = await conn.fetchrow(
-                f"SELECT COUNT(*) AS cnt FROM {TARGET_TABLE} WHERE position_uid = $1 AND timeframe = $2",
-                position_uid, tf
-            )
+        rec = await conn.fetchrow(
+            f"SELECT COUNT(*) AS cnt FROM {TARGET_TABLE} WHERE position_uid = $1 AND timeframe = $2",
+            position_uid, tf
+        )
         return int(rec["cnt"]) if rec else 0
 
 
-# 🔸 Антидубли: локальная дедупликация кортежей по уникальному ключу
+# 🔸 Антидубли: локальная дедупликация по ключу таблицы
 def dedup_rows(rows: list[tuple]) -> list[tuple]:
     seen = set()
     out = []
@@ -141,7 +143,7 @@ def dedup_rows(rows: list[tuple]) -> list[tuple]:
     return out
 
 
-# 🔸 Определить тип базы по префиксу (ema50 → ema, bb20_2_0 → bb, ...)
+# 🔸 Тип базы по префиксу (ema50 → ema, bb20_2_0 → bb, ...)
 def base_kind(base: str) -> str | None:
     for k in PACK_FIELD_WHITELIST.keys():
         if base.startswith(k):
@@ -149,7 +151,7 @@ def base_kind(base: str) -> str | None:
     return None
 
 
-# 🔸 Утилита: плоский обход pack['pack'] (фильтр мета-полей)
+# 🔸 Плоский обход pack['pack'] (фильтр мета-полей)
 def flatten_pack_dict(d: dict):
     for k, v in d.items():
         if k in ("open_time", "ref", "used_bases", "prev_state", "raw_state",
@@ -158,7 +160,7 @@ def flatten_pack_dict(d: dict):
         yield (k, v)
 
 
-# 🔸 Подготовка строк для паков (param_type='pack') по whitelist
+# 🔸 Строки для паков (param_type='pack') по whitelist
 def build_rows_for_pack_response(position_uid: str,
                                  strategy_id: int,
                                  symbol: str,
@@ -201,7 +203,7 @@ def build_rows_for_pack_response(position_uid: str,
     return rows
 
 
-# 🔸 Построить ожидаемые базы паков из списка инстансов (по TF)
+# 🔸 Ожидаемые базы паков из активных инстансов (по m5)
 def build_expected_pack_bases(instances: list[dict]) -> dict[str, set[str]]:
     expected: dict[str, set[str]] = {ind: set() for ind in PACK_INDS}
     for inst in instances:
@@ -232,182 +234,191 @@ def build_expected_pack_bases(instances: list[dict]) -> dict[str, set[str]]:
     return expected
 
 
-# 🔸 Роутер ответов: читает indicator_response и gateway_response, доставляет по req_id
+# 🔸 Роутер ответов (consumer-groups): гарантированная доставка в очередь позиции
 async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
                               stop_event: asyncio.Event):
-    last_ind_id = "0-0"
-    last_gw_id  = "0-0"
 
-    async def drain(stream_key: str, last_id: str):
-        try:
-            got = await redis.xread(streams={stream_key: last_id},
-                                    count=BATCH_SIZE_RESP, block=RESP_BLOCK_MS)
-        except Exception:
-            return last_id, []
-        if not got:
-            return last_id, []
-        out = []
-        for _, msgs in got:
-            for rid, payload in msgs:
-                out.append((rid, payload))
-                last_id = rid
-        return last_id, out
+    # создать consumer-groups для ответных стримов
+    try:
+        await redis.xgroup_create(INDICATOR_RESP_STREAM, IND_RESP_GROUP, id="$", mkstream=True)
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            log.warning(f"xgroup_create ind_resp error: {e}")
+    try:
+        await redis.xgroup_create(GW_RESP_STREAM, GW_RESP_GROUP, id="$", mkstream=True)
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            log.warning(f"xgroup_create gw_resp error: {e}")
 
     while not stop_event.is_set():
-        last_ind_id, ind_items = await drain(INDICATOR_RESP_STREAM, last_ind_id)
-        for rid, payload in ind_items:
-            req_id = payload.get("req_id")
-            if not req_id:
-                continue
-            queue = None
-            async with req_lock:
-                queue = req_routes.get(req_id)
-            if queue:
-                try:
-                    await queue.put(("indicator", payload))
-                except Exception:
-                    pass
+        try:
+            # читаем из обоих стримов малыми блоками
+            tasks = [
+                redis.xreadgroup(IND_RESP_GROUP, IND_RESP_CONSUMER, streams={INDICATOR_RESP_STREAM: ">"}, count=BATCH_SIZE_RESP, block=RESP_BLOCK_MS),
+                redis.xreadgroup(GW_RESP_GROUP,  GW_RESP_CONSUMER,  streams={GW_RESP_STREAM: ">"},         count=BATCH_SIZE_RESP, block=RESP_BLOCK_MS),
+            ]
+            res_ind, res_gw = await asyncio.gather(*tasks, return_exceptions=True)
 
-        last_gw_id, gw_items = await drain(GW_RESP_STREAM, last_gw_id)
-        for rid, payload in gw_items:
-            req_id = payload.get("req_id")
-            if not req_id:
-                continue
-            queue = None
-            async with req_lock:
-                queue = req_routes.get(req_id)
-            if queue:
-                try:
-                    await queue.put(("gateway", payload))
-                except Exception:
-                    pass
+            # обработка INDICATOR_RESP_STREAM
+            if isinstance(res_ind, list) and res_ind:
+                to_ack = []
+                for _, msgs in res_ind:
+                    for msg_id, payload in msgs:
+                        req_id = payload.get("req_id")
+                        if not req_id:
+                            to_ack.append(msg_id)
+                            continue
+                        queue = None
+                        async with req_lock:
+                            queue = req_routes.get(req_id)
+                        if queue:
+                            try:
+                                await queue.put(("indicator", payload))
+                                to_ack.append(msg_id)
+                            except Exception:
+                                # не ack — пусть переизвлечётся
+                                pass
+                        else:
+                            # нет получателя — ack, чтобы не зависало
+                            to_ack.append(msg_id)
+                if to_ack:
+                    await redis.xack(INDICATOR_RESP_STREAM, IND_RESP_GROUP, *to_ack)
 
-        await asyncio.sleep(0.01)
+            # обработка GW_RESP_STREAM
+            if isinstance(res_gw, list) and res_gw:
+                to_ack = []
+                for _, msgs in res_gw:
+                    for msg_id, payload in msgs:
+                        req_id = payload.get("req_id")
+                        if not req_id:
+                            to_ack.append(msg_id)
+                            continue
+                        queue = None
+                        async with req_lock:
+                            queue = req_routes.get(req_id)
+                        if queue:
+                            try:
+                                await queue.put(("gateway", payload))
+                                to_ack.append(msg_id)
+                            except Exception:
+                                pass
+                        else:
+                            to_ack.append(msg_id)
+                if to_ack:
+                    await redis.xack(GW_RESP_STREAM, GW_RESP_GROUP, *to_ack)
+
+        except Exception as e:
+            log.error(f"router loop error: {e}", exc_info=True)
+            await asyncio.sleep(0.2)
 
 
-# 🔸 Обработчик одной позиции (отдельная задача; m5 приоритет, m15/h1 параллельно)
-async def handle_position(pg, redis, get_instances_by_tf,
-                          position_uid: str, strategy_id: int, symbol: str, created_at_iso: str,
-                          req_routes: dict, req_lock: asyncio.Lock,
-                          tf_semaphores: dict[str, asyncio.Semaphore]):
+# 🔸 Обработчик одной позиции (только m5; watchdog утерянных req)
+async def handle_position_m5(pg, redis, get_instances_by_tf,
+                             position_uid: str, strategy_id: int, symbol: str, created_at_iso: str,
+                             req_routes: dict, req_lock: asyncio.Lock,
+                             m5_semaphore: asyncio.Semaphore):
 
-    instances_by_tf = {tf: [i for i in get_instances_by_tf(tf)] for tf in REQUIRED_TFS}
-    expected_bases_by_tf = {tf: build_expected_pack_bases(instances_by_tf[tf]) for tf in REQUIRED_TFS}
-    bar_open_ms_by_tf = {tf: to_bar_open_ms(created_at_iso, tf) for tf in REQUIRED_TFS}
+    instances = [i for i in get_instances_by_tf("m5")]
+    expected_bases = build_expected_pack_bases(instances)
+    bar_open_ms = to_bar_open_ms(created_at_iso, "m5")
 
-    # состояния по TF
-    start_ts_global = datetime.utcnow()
-    tf_start_ts = {tf: None for tf in REQUIRED_TFS}
-    tf_done = {tf: False for tf in REQUIRED_TFS}
-    deadline = start_ts_global + timedelta(seconds=GLOBAL_TIMEOUT_SEC)
+    start_ts = datetime.utcnow()
+    deadline = start_ts + timedelta(seconds=GLOBAL_TIMEOUT_SEC)
 
-    # индикаторы
+    # индикаторы per instance_id
     ind_ctx = {
-        tf: {
-            inst["id"]: {"inflight": False, "state": "pending", "last_err": None, "req_ids": set(), "indicator": inst["indicator"]}
-            for inst in instances_by_tf[tf]
-        } for tf in REQUIRED_TFS
+        inst["id"]: {"inflight": False, "state": "pending", "last_err": None,
+                     "req_ids": set(), "indicator": inst["indicator"], "sent_at": None}
+        for inst in instances
     }
-    # паки
+
+    # паки per indicator type
     pack_ctx = {
-        tf: {
-            ind: {"inflight": False, "state": "pending", "last_err": None,
-                  "req_ids": set(), "done_bases": set(), "expected_bases": set(expected_bases_by_tf[tf].get(ind, set()))}
-            for ind in PACK_INDS if expected_bases_by_tf[tf].get(ind)
-        } for tf in REQUIRED_TFS
+        ind: {"inflight": False, "state": "pending", "last_err": None,
+              "req_ids": set(), "done_bases": set(),
+              "expected_bases": set(expected_bases.get(ind, set())), "sent_at": None}
+        for ind in PACK_INDS if expected_bases.get(ind)
     }
+
     # marketwatch
     mw_ctx = {
-        tf: {kind: {"inflight": False, "state": "pending", "last_err": None, "req_ids": set()}
-             for kind in MW_KINDS} for tf in REQUIRED_TFS
+        kind: {"inflight": False, "state": "pending", "last_err": None,
+               "req_ids": set(), "sent_at": None}
+        for kind in MW_KINDS
     }
 
-    # очередь ответов для этой позиции
+    # очередь ответов для этой позиции и набор req_id для быстрой очистки
     resp_queue: asyncio.Queue = asyncio.Queue()
+    all_req_ids: set[str] = set()
 
-    # ретраибельная ошибка?
+    # ретраибельность
     def is_retriable(err: str) -> bool:
         return err not in ("instance_not_active", "exception")
 
     # отправка indicator_request
-    async def send_indicator(tf: str, inst_id: int):
-        s = ind_ctx[tf][inst_id]
+    async def send_indicator(inst_id: int):
+        s = ind_ctx[inst_id]
         if s["inflight"] or s["state"] != "pending":
             return
-        if tf_start_ts[tf] is None:
-            tf_start_ts[tf] = datetime.utcnow()
-        async with tf_semaphores[tf]:
+        async with m5_semaphore:
             rid = await redis.xadd(INDICATOR_REQ_STREAM, {
                 "symbol": symbol,
-                "timeframe": tf,
+                "timeframe": "m5",
                 "instance_id": str(inst_id),
-                "timestamp_ms": str(bar_open_ms_by_tf[tf])
+                "timestamp_ms": str(bar_open_ms)
             })
         async with req_lock:
             req_routes[rid] = resp_queue
         s["inflight"] = True
+        s["sent_at"] = datetime.utcnow()
         s["req_ids"].add(rid)
+        all_req_ids.add(rid)
 
     # отправка gateway_request (pack или mw)
-    async def send_gateway(tf: str, indicator_or_kind: str):
-        if indicator_or_kind in pack_ctx[tf]:
-            s = pack_ctx[tf][indicator_or_kind]
-            ok_states = ("pending", "ok_part")
-        else:
-            s = mw_ctx[tf][indicator_or_kind]
-            ok_states = ("pending",)
+    async def send_gateway(kind_or_pack: str, is_pack: bool):
+        s = pack_ctx[kind_or_pack] if is_pack else mw_ctx[kind_or_pack]
+        ok_states = ("pending", "ok_part") if is_pack else ("pending",)
         if s["inflight"] or s["state"] not in ok_states:
             return
-        if tf_start_ts[tf] is None:
-            tf_start_ts[tf] = datetime.utcnow()
-        async with tf_semaphores[tf]:
+        async with m5_semaphore:
             rid = await redis.xadd(GW_REQ_STREAM, {
                 "symbol": symbol,
-                "timeframe": tf,
-                "indicator": indicator_or_kind,
-                "timestamp_ms": str(bar_open_ms_by_tf[tf])
+                "timeframe": "m5",
+                "indicator": kind_or_pack,          # имя пака или kind MW
+                "timestamp_ms": str(bar_open_ms)
             })
         async with req_lock:
             req_routes[rid] = resp_queue
         s["inflight"] = True
+        s["sent_at"] = datetime.utcnow()
         s["req_ids"].add(rid)
+        all_req_ids.add(rid)
 
-    # первая волна: m5 сначала, затем m15+h1 (почти сразу, но после m5)
-    if "m5" in REQUIRED_TFS:
-        await asyncio.gather(*[send_indicator("m5", inst["id"]) for inst in instances_by_tf["m5"]])
-        await asyncio.gather(*[send_gateway("m5", ind) for ind in pack_ctx["m5"].keys()])
-        await asyncio.gather(*[send_gateway("m5", kind) for kind in MW_KINDS])
-
-    for tf in ("m15", "h1"):
-        if tf in REQUIRED_TFS:
-            await asyncio.gather(*[send_indicator(tf, inst["id"]) for inst in instances_by_tf[tf]])
-            await asyncio.gather(*[send_gateway(tf, ind) for ind in pack_ctx[tf].keys()])
-            await asyncio.gather(*[send_gateway(tf, kind) for kind in MW_KINDS])
+    # первая волна: все индикаторы, все паки, все MW
+    await asyncio.gather(*[send_indicator(inst["id"]) for inst in instances])
+    await asyncio.gather(*[send_gateway(ind, True) for ind in pack_ctx.keys()])
+    await asyncio.gather(*[send_gateway(kind, False) for kind in MW_KINDS])
 
     total_upserts = 0
-    upserts_by_tf = {tf: 0 for tf in REQUIRED_TFS}
 
-    # главный цикл до готовности всех TF или таймаута
+    # главный цикл
     while True:
         now = datetime.utcnow()
         if now >= deadline:
-            # лог по таймауту
-            for tf in REQUIRED_TFS:
-                if tf_done[tf]:
-                    continue
-                for inst_id, s in ind_ctx[tf].items():
-                    if s["state"] == "pending":
-                        log.debug(f"[TIMEOUT] IND {symbol}/{tf} inst_id={inst_id} {s['indicator']} last_err={s['last_err']}")
-                for ind, s in pack_ctx[tf].items():
-                    if s["state"] in ("pending", "ok_part"):
-                        missing = sorted(list(s["expected_bases"] - s["done_bases"]))
-                        log.debug(f"[TIMEOUT] PACK {symbol}/{tf} {ind} missing_bases={missing} last_err={s['last_err']}")
-                for kind, s in mw_ctx[tf].items():
-                    if s["state"] == "pending":
-                        log.debug(f"[TIMEOUT] MW {symbol}/{tf} {kind} last_err={s['last_err']}")
+            # лог незакрытых
+            for inst_id, s in ind_ctx.items():
+                if s["state"] == "pending":
+                    log.info(f"[TIMEOUT] IND {symbol}/m5 inst_id={inst_id} {s['indicator']} last_err={s['last_err']}")
+            for ind, s in pack_ctx.items():
+                if s["state"] in ("pending", "ok_part"):
+                    missing = sorted(list(s["expected_bases"] - s["done_bases"]))
+                    log.info(f"[TIMEOUT] PACK {symbol}/m5 {ind} missing_bases={missing} last_err={s['last_err']}")
+            for kind, s in mw_ctx.items():
+                if s["state"] == "pending":
+                    log.info(f"[TIMEOUT] MW {symbol}/m5 {kind} last_err={s['last_err']}")
             break
 
-        # окно POLL_INTERVAL_SEC: собираем ответы, пишем в БД порциями
+        # окно сбора ответов
         end_wait = now + timedelta(seconds=POLL_INTERVAL_SEC)
         collected_rows: list[tuple] = []
 
@@ -421,33 +432,32 @@ async def handle_position(pg, redis, get_instances_by_tf,
             req_id = payload.get("req_id")
             r_symbol = payload.get("symbol")
             tf = payload.get("timeframe")
+            if r_symbol != symbol or tf != "m5":
+                continue
 
+            # убрать req_id из маршрутов (больше не нужен)
             if req_id:
                 async with req_lock:
                     req_routes.pop(req_id, None)
-
-            if r_symbol != symbol or tf not in REQUIRED_TFS:
-                continue
 
             if src == "indicator":
                 instance_id_raw = payload.get("instance_id")
                 if not instance_id_raw:
                     continue
                 iid = int(instance_id_raw)
-                s = ind_ctx[tf].get(iid)
+                s = ind_ctx.get(iid)
                 if not s or req_id not in s["req_ids"]:
                     continue
                 s["req_ids"].discard(req_id)
                 s["inflight"] = False
 
                 if status == "ok":
-                    indicator_name = s["indicator"]
                     rows = build_rows_for_indicator_response(
                         position_uid=position_uid,
                         strategy_id=strategy_id,
                         symbol=symbol,
-                        tf=tf,
-                        indicator_name=indicator_name,
+                        tf="m5",
+                        indicator_name=s["indicator"],
                         open_time_iso=payload.get("open_time"),
                         results_json=payload.get("results", "{}"),
                     )
@@ -460,18 +470,18 @@ async def handle_position(pg, redis, get_instances_by_tf,
                     if not is_retriable(err):
                         s["state"] = "error"
 
-            else:  # gateway (packs/MW)
-                ind = payload.get("indicator")
-                ctx_slot = None
-                ctx_type = None
-                if ind in pack_ctx[tf]:
-                    ctx_slot = pack_ctx[tf][ind]
-                    ctx_type = "pack"
-                elif ind in mw_ctx[tf]:
-                    ctx_slot = mw_ctx[tf][ind]
-                    ctx_type = "mw"
+            else:  # gateway
+                kind = payload.get("indicator")
+                # это pack или MW?
+                if kind in pack_ctx:
+                    ctx_slot = pack_ctx[kind]
+                    is_pack = True
+                elif kind in mw_ctx:
+                    ctx_slot = mw_ctx[kind]
+                    is_pack = False
                 else:
                     continue
+
                 if req_id not in ctx_slot["req_ids"]:
                     continue
                 ctx_slot["req_ids"].discard(req_id)
@@ -483,7 +493,7 @@ async def handle_position(pg, redis, get_instances_by_tf,
                     except Exception:
                         results = []
 
-                    if ctx_type == "pack":
+                    if is_pack:
                         if not isinstance(results, list):
                             ctx_slot["last_err"] = "bad_results"
                         else:
@@ -492,8 +502,8 @@ async def handle_position(pg, redis, get_instances_by_tf,
                                 p = item.get("pack", {})
                                 if not base or not isinstance(p, dict):
                                     continue
-                                open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms_by_tf[tf] / 1000).isoformat()
-                                rows = build_rows_for_pack_response(position_uid, strategy_id, symbol, tf, base, open_time_iso, p)
+                                open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+                                rows = build_rows_for_pack_response(position_uid, strategy_id, symbol, "m5", base, open_time_iso, p)
                                 if rows:
                                     collected_rows.extend(rows)
                                     ctx_slot["done_bases"].add(base)
@@ -504,13 +514,13 @@ async def handle_position(pg, redis, get_instances_by_tf,
                             ctx_slot["last_err"] = "bad_results"
                         else:
                             item = results[0]
-                            base = item.get("base", ind)  # trend|volatility|momentum|extremes
+                            base = item.get("base", kind)  # trend|volatility|momentum|extremes
                             p = item.get("pack", {})
                             state_val = p.get("state")
                             if state_val is not None:
-                                open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms_by_tf[tf] / 1000).isoformat()
+                                open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
                                 rows = [(
-                                    position_uid, strategy_id, symbol, tf,
+                                    position_uid, strategy_id, symbol, "m5",
                                     "marketwatch", base, "state",
                                     None, str(state_val),
                                     parse_iso(open_time_iso),
@@ -527,98 +537,104 @@ async def handle_position(pg, redis, get_instances_by_tf,
                     if not is_retriable(err):
                         ctx_slot["state"] = "error"
 
-        # запись в БД (локальная дедупликация)
+        # запись в БД
         if collected_rows:
             deduped = dedup_rows(collected_rows)
-            # разделим по TF, чтобы аккумулировать per-TF upserts
-            by_tf = {}
-            for r in deduped:
-                by_tf.setdefault(r[3], []).append(r)  # r[3] = timeframe
-            for tf, chunk in by_tf.items():
-                n = await insert_rows_pg(pg, chunk)
-                total_upserts += n
-                upserts_by_tf[tf] += n
+            n = await insert_rows_pg(pg, deduped)
+            total_upserts += n
 
-        # ретраи «раз в секунду»: отправляем тем, кто pending и не inflight (с учётом retriable)
-        for tf in REQUIRED_TFS:
-            # m5 приоритетнее: просто идём в порядке m5→m15→h1 (лимиты различаются в семафорах)
-            for inst_id, s in ind_ctx[tf].items():
-                if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
-                    await send_indicator(tf, inst_id)
-            for ind, s in pack_ctx[tf].items():
-                if s["state"] in ("pending", "ok_part") and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
-                    await send_gateway(tf, ind)
-            for kind, s in mw_ctx[tf].items():
-                if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
-                    await send_gateway(tf, kind)
+        # 🔸 watchdog утерянных запросов (через LOST_REQ_SEC снимаем inflight и перезапрашиваем)
+        now = datetime.utcnow()
+        for iid, s in ind_ctx.items():
+            if s["state"] == "pending" and s["inflight"] and s["sent_at"] and (now - s["sent_at"]).total_seconds() > LOST_REQ_SEC:
+                # снимаем старые req_id из маршрутов (если ещё там)
+                async with req_lock:
+                    for rid in list(s["req_ids"]):
+                        req_routes.pop(rid, None)
+                s["req_ids"].clear()
+                s["inflight"] = False
+                s["sent_at"] = None
+        for name, s in pack_ctx.items():
+            if s["state"] in ("pending", "ok_part") and s["inflight"] and s["sent_at"] and (now - s["sent_at"]).total_seconds() > LOST_REQ_SEC:
+                async with req_lock:
+                    for rid in list(s["req_ids"]):
+                        req_routes.pop(rid, None)
+                s["req_ids"].clear()
+                s["inflight"] = False
+                s["sent_at"] = None
+        for kind, s in mw_ctx.items():
+            if s["state"] == "pending" and s["inflight"] and s["sent_at"] and (now - s["sent_at"]).total_seconds() > LOST_REQ_SEC:
+                async with req_lock:
+                    for rid in list(s["req_ids"]):
+                        req_routes.pop(rid, None)
+                s["req_ids"].clear()
+                s["inflight"] = False
+                s["sent_at"] = None
 
-        # проверка готовности по каждому TF → логируем пер-TF и отмечаем done
-        def all_done_tf(tf: str) -> bool:
-            if any(s["state"] in ("pending", "error") for s in ind_ctx[tf].values()):
+        # ретраи «раз в секунду»
+        for iid, s in ind_ctx.items():
+            if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
+                await send_indicator(iid)
+        for ind, s in pack_ctx.items():
+            if s["state"] in ("pending", "ok_part") and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
+                await send_gateway(ind, True)
+        for kind, s in mw_ctx.items():
+            if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
+                await send_gateway(kind, False)
+
+        # готовность m5?
+        def all_done_m5() -> bool:
+            if any(s["state"] in ("pending", "error") for s in ind_ctx.values()):
                 return False
-            for ind, s in pack_ctx[tf].items():
+            for s in pack_ctx.values():
                 if s["state"] == "error":
                     return False
                 if not (s["expected_bases"] <= s["done_bases"]):
                     return False
-            if any(s["state"] in ("pending", "error") for s in mw_ctx[tf].values()):
+            if any(s["state"] in ("pending", "error") for s in mw_ctx.values()):
                 return False
             return True
 
-        for tf in REQUIRED_TFS:
-            if not tf_done[tf] and all_done_tf(tf):
-                tf_done[tf] = True
-                elapsed_ms_tf = int((datetime.utcnow() - (tf_start_ts[tf] or start_ts_global)).total_seconds() * 1000)
-                ok_inst_tf = sum(1 for s in ind_ctx[tf].values() if s["state"] == "ok")
-                ok_packs_tf = sum(len(s["done_bases"]) for s in pack_ctx[tf].values())
-                ok_mw_tf = sum(1 for s in mw_ctx[tf].values() if s["state"] == "ok")
-                unique_rows_tf = await count_unique_rows(pg, position_uid, tf)
-                log.debug(
-                    f"IND_POS_STAT: position={position_uid} {symbol} {tf} snapshot complete: "
-                    f"ok_instances={ok_inst_tf}, ok_packs={ok_packs_tf}, ok_mw={ok_mw_tf}, "
-                    f"rows_upserted_tf={upserts_by_tf[tf]}, unique_rows_tf={unique_rows_tf}, elapsed_ms={elapsed_ms_tf}"
-                )
-
-        # если все TF завершены — финальный лог и выход
-        if all(tf_done.values()):
-            elapsed_ms = int((datetime.utcnow() - start_ts_global).total_seconds() * 1000)
-            unique_all = await count_unique_rows(pg, position_uid, None)
-            total_ok_inst = sum(1 for tf in REQUIRED_TFS for s in ind_ctx[tf].values() if s["state"] == "ok")
-            total_ok_packs = sum(len(s["done_bases"]) for tf in REQUIRED_TFS for s in pack_ctx[tf].values())
-            total_ok_mw = sum(1 for tf in REQUIRED_TFS for s in mw_ctx[tf].values() if s["state"] == "ok")
-            log.debug(
-                f"IND_POS_STAT: position={position_uid} {symbol} ALL TF done: "
-                f"ok_instances={total_ok_inst}, ok_packs={total_ok_packs}, ok_mw={total_ok_mw}, "
-                f"rows_upserted_total={total_upserts}, unique_rows_total={unique_all}, elapsed_ms={elapsed_ms}"
+        if all_done_m5():
+            elapsed_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+            ok_inst = sum(1 for s in ind_ctx.values() if s["state"] == "ok")
+            ok_packs = sum(len(s["done_bases"]) for s in pack_ctx.values())
+            ok_mw = sum(1 for s in mw_ctx.values() if s["state"] == "ok")
+            unique_rows_tf = await count_unique_rows(pg, position_uid, "m5")
+            log.info(
+                f"IND_POS_STAT: position={position_uid} {symbol} m5 snapshot complete: "
+                f"ok_instances={ok_inst}, ok_packs={ok_packs}, ok_mw={ok_mw}, "
+                f"rows_upserted_tf={total_upserts}, unique_rows_tf={unique_rows_tf}, elapsed_ms={elapsed_ms}"
             )
             break
 
+    # очистка всех req_id этой позиции из маршрутов (на всякий случай)
+    async with req_lock:
+        for rid in list(all_req_ids):
+            req_routes.pop(rid, None)
 
-# 🔸 Основной воркер: диспетчер позиций + глобальный роутер ответов
+
+# 🔸 Основной воркер: диспетчер позиций + глобальный роутер ответов (m5 only)
 async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precision):
     group = "iv4_possnap_group"
     consumer = "iv4_possnap_1"
 
-    # создать consumer-group для входного стрима
+    # создать consumer-group для входного стрима позиций
     try:
         await redis.xgroup_create(POSITIONS_OPEN_STREAM, group, id="$", mkstream=True)
     except Exception as e:
         if "BUSYGROUP" not in str(e):
-            log.warning(f"xgroup_create error: {e}")
+            log.warning(f"xgroup_create pos_open error: {e}")
 
     # роутинг req_id → очередь позиции
     req_routes: dict[str, asyncio.Queue] = {}
     req_lock = asyncio.Lock()
 
-    # лимитер параллельных позиций
+    # лимитер параллельных позиций и запросов m5
     pos_sema = asyncio.Semaphore(POSITIONS_CONCURRENCY)
+    m5_semaphore = asyncio.Semaphore(CONCURRENCY_PER_M5)
 
-    # семафоры TF для on-demand запросов
-    tf_semaphores = {
-        tf: asyncio.Semaphore(CONCURRENCY_PER_TF.get(tf, 30)) for tf in REQUIRED_TFS
-    }
-
-    # останов роутера при завершении процесса
+    # глобальный роутер ответов (consumer-groups)
     stop_event = asyncio.Event()
     router_task = asyncio.create_task(run_response_router(redis, req_routes, req_lock, stop_event))
 
@@ -655,15 +671,15 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                         symbol = data["symbol"]
                         created_at_iso = data.get("created_at") or data.get("received_at")
                         if not created_at_iso:
-                            log.debug(f"[SKIP] position {position_uid}: no created_at/received_at")
+                            log.info(f"[SKIP] position {position_uid}: no created_at/received_at")
                             to_ack.append(msg_id)
                             continue
 
                         async def run_one():
                             async with pos_sema:
-                                await handle_position(pg, redis, get_instances_by_tf,
-                                                      position_uid, strategy_id, symbol, created_at_iso,
-                                                      req_routes, req_lock, tf_semaphores)
+                                await handle_position_m5(pg, redis, get_instances_by_tf,
+                                                         position_uid, strategy_id, symbol, created_at_iso,
+                                                         req_routes, req_lock, m5_semaphore)
 
                         task = asyncio.create_task(run_one())
                         pos_tasks.append((msg_id, task))
@@ -671,7 +687,7 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                     except Exception as e:
                         log.error(f"position spawn error: {e}", exc_info=True)
 
-            # ждём завершения всех задач этой пачки и ACK-аем соответствующие сообщения
+            # ждём завершения всех задач пачки и ACK-аем соответствующие сообщения
             for msg_id, task in pos_tasks:
                 try:
                     await task
