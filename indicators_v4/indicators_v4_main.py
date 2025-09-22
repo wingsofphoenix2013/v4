@@ -532,7 +532,7 @@ async def watch_indicator_requests(pg, redis):
 
             # итог логирования
             if ok_count or err_count:
-                log.info(f"IND_ONDEMAND: ok={ok_count}, errors={err_count}")
+                log.debug(f"IND_ONDEMAND: ok={ok_count}, errors={err_count}")
 
         except Exception as e:
             logging.getLogger("IND_ONDEMAND").error(f"loop error: {e}", exc_info=True)
