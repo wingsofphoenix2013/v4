@@ -397,14 +397,14 @@ async def handle_position(pg, redis, get_instances_by_tf,
                     continue
                 for inst_id, s in ind_ctx[tf].items():
                     if s["state"] == "pending":
-                        log.info(f"[TIMEOUT] IND {symbol}/{tf} inst_id={inst_id} {s['indicator']} last_err={s['last_err']}")
+                        log.debug(f"[TIMEOUT] IND {symbol}/{tf} inst_id={inst_id} {s['indicator']} last_err={s['last_err']}")
                 for ind, s in pack_ctx[tf].items():
                     if s["state"] in ("pending", "ok_part"):
                         missing = sorted(list(s["expected_bases"] - s["done_bases"]))
-                        log.info(f"[TIMEOUT] PACK {symbol}/{tf} {ind} missing_bases={missing} last_err={s['last_err']}")
+                        log.debug(f"[TIMEOUT] PACK {symbol}/{tf} {ind} missing_bases={missing} last_err={s['last_err']}")
                 for kind, s in mw_ctx[tf].items():
                     if s["state"] == "pending":
-                        log.info(f"[TIMEOUT] MW {symbol}/{tf} {kind} last_err={s['last_err']}")
+                        log.debug(f"[TIMEOUT] MW {symbol}/{tf} {kind} last_err={s['last_err']}")
             break
 
         # окно POLL_INTERVAL_SEC: собираем ответы, пишем в БД порциями
@@ -573,7 +573,7 @@ async def handle_position(pg, redis, get_instances_by_tf,
                 ok_packs_tf = sum(len(s["done_bases"]) for s in pack_ctx[tf].values())
                 ok_mw_tf = sum(1 for s in mw_ctx[tf].values() if s["state"] == "ok")
                 unique_rows_tf = await count_unique_rows(pg, position_uid, tf)
-                log.info(
+                log.debug(
                     f"IND_POS_STAT: position={position_uid} {symbol} {tf} snapshot complete: "
                     f"ok_instances={ok_inst_tf}, ok_packs={ok_packs_tf}, ok_mw={ok_mw_tf}, "
                     f"rows_upserted_tf={upserts_by_tf[tf]}, unique_rows_tf={unique_rows_tf}, elapsed_ms={elapsed_ms_tf}"
@@ -586,7 +586,7 @@ async def handle_position(pg, redis, get_instances_by_tf,
             total_ok_inst = sum(1 for tf in REQUIRED_TFS for s in ind_ctx[tf].values() if s["state"] == "ok")
             total_ok_packs = sum(len(s["done_bases"]) for tf in REQUIRED_TFS for s in pack_ctx[tf].values())
             total_ok_mw = sum(1 for tf in REQUIRED_TFS for s in mw_ctx[tf].values() if s["state"] == "ok")
-            log.info(
+            log.debug(
                 f"IND_POS_STAT: position={position_uid} {symbol} ALL TF done: "
                 f"ok_instances={total_ok_inst}, ok_packs={total_ok_packs}, ok_mw={total_ok_mw}, "
                 f"rows_upserted_total={total_upserts}, unique_rows_total={unique_all}, elapsed_ms={elapsed_ms}"
@@ -655,7 +655,7 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                         symbol = data["symbol"]
                         created_at_iso = data.get("created_at") or data.get("received_at")
                         if not created_at_iso:
-                            log.info(f"[SKIP] position {position_uid}: no created_at/received_at")
+                            log.debug(f"[SKIP] position {position_uid}: no created_at/received_at")
                             to_ack.append(msg_id)
                             continue
 
