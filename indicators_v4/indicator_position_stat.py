@@ -1,4 +1,4 @@
-# indicator_position_stat.py — воркер on-demand снимка индикаторов при открытии позиции (этап 1: только «сырые» индикаторы по m5)
+# indicator_position_stat.py — воркер on-demand снимка индикаторов при открытии позиции (этап 1: только «сырые» индикаторы по m5; антидубли, привязка ответов по req_id)
 
 import asyncio
 import json
@@ -66,7 +66,7 @@ def build_rows_for_indicator_response(position_uid: str,
         try:
             value_num = float(str_val)
         except Exception:
-            # если внезапно пришло ненаumeric значение — пропустим на этапе 1
+            # на этапе 1 храним только числовые значения
             continue
 
         rows.append((
@@ -87,9 +87,15 @@ def build_rows_for_indicator_response(position_uid: str,
 
 
 # 🔸 Вспомогательное: INSERT пачки строк в PG (UPSERT по уникальному ключу)
-async def insert_rows_pg(pg, rows: list[tuple]):
+async def insert_rows_pg(pg, rows: list[tuple]) -> tuple[int, int]:
+    """
+    Возвращает (upsert_count, unique_count).
+    upsert_count — сколько строк отправили в executemany (после локальной дедупликации),
+    unique_count — сколько уникальных (по ключу) строк реально хранится после операции.
+    """
     if not rows:
-        return 0
+        return 0, 0
+
     async with pg.acquire() as conn:
         async with conn.transaction():
             await conn.executemany(f"""
@@ -106,17 +112,30 @@ async def insert_rows_pg(pg, rows: list[tuple]):
                     error_code = EXCLUDED.error_code,
                     captured_at = NOW()
             """, rows)
-    return len(rows)
+
+            # считаем реальное число уникальных строк по позиции
+            # (это недорого: одна агрегация по нужной позиции; используем DISTINCT ON ключе)
+            sample = rows[0]
+            position_uid = sample[0]
+            rec = await conn.fetchrow(f"""
+                SELECT COUNT(*) AS cnt
+                FROM {TARGET_TABLE}
+                WHERE position_uid = $1
+            """, position_uid)
+            unique_count = int(rec["cnt"]) if rec else 0
+
+    return len(rows), unique_count
 
 
-# 🔸 Основной воркер: читаем открытия позиций и снимаем «сырые» индикаторы по m5
+# 🔸 Основной воркер: читаем открытия позиций и снимаем «сырые» индикаторы по m5 (с антидублированием запросов/ответов)
 async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precision):
     """
     Этап 1:
     - Подписываемся на positions_open_stream своей consumer-group.
     - На событие «opened»: для каждого TF из REQUIRED_TFS (пока только m5)
       отправляем indicator_request по всем активным инстансам TF.
-    - Ретраим ответы каждую 1с до полной готовности либо до глобального таймаута 10 минут.
+    - Избегаем дублей: один активный запрос на instance; обрабатываем только ответы с нашими req_id.
+    - Ретраим ответы каждые 1с до полной готовности либо до глобального таймаута 10 минут.
     - Пишем только param_type='indicator' строки в indicator_position_stat.
     - Логи по итогам — log.info.
     """
@@ -130,7 +149,7 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
         if "BUSYGROUP" not in str(e):
             log.warning(f"xgroup_create error: {e}")
 
-    # локальный оффсет для чтения ответов indicator_response
+    # локальный оффсет для чтения ответов indicator_response (XREAD без группы — не держим PEL и не мешаем другим)
     last_resp_id = "0-0"
 
     # 🔸 Пул семафоров по TF для ограничения параллелизма
@@ -150,7 +169,7 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
 
             to_ack: list[str] = []
 
-            # вложенная обработка каждой позиции по очереди (m5 приоритет внутри позиции)
+            # обработка позиций последовательно (m5 приоритет внутри позиции)
             for _, messages in resp:
                 for msg_id, data in messages:
                     try:
@@ -163,49 +182,72 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                         symbol = data["symbol"]
                         created_at_iso = data.get("created_at") or data.get("received_at")
                         if not created_at_iso:
-                            # нет валидного времени — ACK, но логируем
                             log.info(f"[SKIP] position {position_uid}: no created_at/received_at")
                             to_ack.append(msg_id)
                             continue
 
-                        # соберём активные инстансы per TF (только m5 на этапе 1)
+                        # активные инстансы per TF (только m5 на этапе 1)
                         instances_by_tf = {tf: [i for i in get_instances_by_tf(tf)] for tf in REQUIRED_TFS}
 
-                        # построим задания на indicator_request для всех инстансов m5
+                        # контекст ожидания: по каждому instance — inflight, req_ids, state, last_err, last_req_at
+                        ctx = {
+                            tf: {
+                                inst["id"]: {
+                                    "inflight": False,
+                                    "req_ids": set(),
+                                    "state": "pending",    # pending|ok|error
+                                    "last_err": None,
+                                    "last_req_at": None,
+                                } for inst in instances
+                            } for tf, instances in instances_by_tf.items()
+                        }
+
                         start_ts = datetime.utcnow()
                         deadline = start_ts + timedelta(seconds=GLOBAL_TIMEOUT_SEC)
-
-                        # прогресс слежения: по каждому TF — map instance_id -> state ('pending'|'ok'|'error'), last_error
-                        progress = {tf: {inst["id"]: {"state": "pending", "err": None} for inst in instances}
-                                    for tf, instances in instances_by_tf.items()}
-
-                        # предвычислим bar_open_ms на основе created_at
                         bar_open_ms_by_tf = {tf: to_bar_open_ms(created_at_iso, tf) for tf in REQUIRED_TFS}
 
-                        # helper: отправить запрос для одного инстанса
+                        # helper: ретраибельна ли ошибка
+                        def is_retriable(err: str) -> bool:
+                            return err not in ("instance_not_active", "exception")
+
+                        # helper: отправить запрос для одного инстанса (если нет активного)
                         async def request_one(tf: str, inst: dict):
+                            s = ctx[tf][inst["id"]]
+                            if s["inflight"]:
+                                return
                             async with tf_semaphores[tf]:
-                                await redis.xadd(INDICATOR_REQ_STREAM, {
+                                rid = await redis.xadd(INDICATOR_REQ_STREAM, {
                                     "symbol": symbol,
                                     "timeframe": tf,
                                     "instance_id": str(inst["id"]),
                                     "timestamp_ms": str(bar_open_ms_by_tf[tf])
                                 })
+                            s["inflight"] = True
+                            s["req_ids"].add(rid)
+                            s["last_req_at"] = datetime.utcnow()
 
                         # helper: отправить запросы для всех pending по TF
-                        async def request_all_pending(tf: str):
+                        async def request_all_pending(tf: str, first_round: bool):
                             tasks = []
                             for inst in instances_by_tf[tf]:
-                                if progress[tf][inst["id"]]["state"] == "pending":
+                                s = ctx[tf][inst["id"]]
+                                if s["state"] != "pending":
+                                    continue
+                                # на первой волне отправляем всем; далее — только если предыдущая попытка дала retriable ошибку и запрос не в полёте
+                                if first_round or ((s["last_err"] is not None) and is_retriable(s["last_err"]) and not s["inflight"]):
                                     tasks.append(asyncio.create_task(request_one(tf, inst)))
                             if tasks:
                                 await asyncio.gather(*tasks, return_exceptions=True)
 
-                        # helper: обработать пакет ответов indicator_response
+                        # helper: чтение ответов indicator_response (только наши req_id), без захвата чужих
                         async def drain_indicator_responses():
                             nonlocal last_resp_id
                             try:
-                                got = await redis.xread(streams={INDICATOR_RESP_STREAM: last_resp_id}, count=BATCH_SIZE_RESP_READ, block=1000)
+                                got = await redis.xread(
+                                    streams={INDICATOR_RESP_STREAM: last_resp_id},
+                                    count=BATCH_SIZE_RESP_READ,
+                                    block=1000
+                                )
                             except Exception:
                                 return []
                             if not got:
@@ -217,47 +259,43 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                     last_resp_id = rid
                             return out
 
-                        # helper: записать в PG ответы по одному TF
-                        async def persist_ok_rows(tf: str, collected: list[tuple]):
-                            if not collected:
-                                return 0
-                            n = await insert_rows_pg(pg, collected)
-                            return n
+                        # helper: собрать уникальные строки для PG (локальная дедупликация по ключу)
+                        def dedup_rows(rows: list[tuple]) -> list[tuple]:
+                            seen = set()
+                            out = []
+                            for r in rows:
+                                key = (r[0], r[3], r[4], r[5], r[6])  # (position_uid, timeframe, param_type, param_base, param_name)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                out.append(r)
+                            return out
 
-                        # главный цикл ретраев — до полной готовности m5 (и остальных TF в этой фазе) или таймаута
-                        total_inserted = 0
+                        # главный цикл ретраев — до полной готовности m5 или таймаута
+                        total_upserts = 0
+                        unique_after = 0
                         first_round = True
                         while True:
                             now = datetime.utcnow()
                             if now >= deadline:
-                                # пишем ошибки для всех оставшихся pending как 'error' c последним кодом (без значения)
-                                err_rows = []
+                                # таймаут — логируем незакрытые
                                 for tf in REQUIRED_TFS:
                                     for inst in instances_by_tf[tf]:
-                                        st = progress[tf][inst["id"]]
-                                        if st["state"] == "pending":
-                                            # финализируем как error по каждому ожидаемому param (не знаем конкретный список param_name на этапе ожидания) — на этапе 1 фиксируем агрегированно по instance (пустой results не пишем)
-                                            # Для наглядности — лог:
-                                            log.info(f"[TIMEOUT] position {position_uid} {symbol}/{tf} inst_id={inst['id']} indicator={inst['indicator']} last_err={st['err']}")
-                                # завершаем обработку позиции с таймаутом (без доп. вставок)
+                                        s = ctx[tf][inst["id"]]
+                                        if s["state"] == "pending":
+                                            log.info(f"[TIMEOUT] position {position_uid} {symbol}/{tf} inst_id={inst['id']} indicator={inst['indicator']} last_err={s['last_err']}")
                                 break
 
-                            # 1) первая волна запросов (или перезапрос только pending)
-                            if first_round:
-                                # m5 приоритет — сначала m5
-                                await request_all_pending("m5") if "m5" in REQUIRED_TFS else None
-                                # остальные TF (на этапе 1 их нет) можно было бы запустить параллельно
-                                first_round = False
-                            else:
-                                # повторные запросы только по тем, кто pending и давал ретраибельные ошибки
-                                for tf in REQUIRED_TFS:
-                                    await request_all_pending(tf)
+                            # 1) отправка запросов: m5 сначала
+                            if "m5" in REQUIRED_TFS:
+                                await request_all_pending("m5", first_round)
+                            # другие TF отсутствуют на этапе 1
+                            first_round = False
 
-                            # 2) собираем ответы из indicator_response до следующего тика
+                            # 2) собираем ответы в течение POLL_INTERVAL_SEC
                             end_wait = now + timedelta(seconds=POLL_INTERVAL_SEC)
-                            collected_rows_by_tf = {tf: [] for tf in REQUIRED_TFS}
+                            collected_rows: list[tuple] = []
 
-                            # ждём внутри окна POLL_INTERVAL_SEC, чтобы собрать пачку ответов
                             while datetime.utcnow() < end_wait:
                                 batch = await drain_indicator_responses()
                                 if not batch:
@@ -265,75 +303,81 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                     continue
 
                                 for resp_id, payload in batch:
-                                    req_id = payload.get("req_id")
                                     status = payload.get("status")
+                                    req_id = payload.get("req_id")
                                     r_symbol = payload.get("symbol")
                                     tf = payload.get("timeframe")
                                     instance_id_raw = payload.get("instance_id")
-                                    if not tf or tf not in progress or r_symbol != symbol or not instance_id_raw:
+
+                                    # фильтрация по символу/TF/instance и strict по нашему req_id
+                                    if tf not in ctx or r_symbol != symbol or not instance_id_raw or not req_id:
+                                        continue
+                                    iid = int(instance_id_raw)
+                                    if iid not in ctx[tf]:
+                                        continue
+                                    s = ctx[tf][iid]
+                                    if req_id not in s["req_ids"]:
+                                        # это не ответ на наш запрос — игнорируем
                                         continue
 
-                                    iid = int(instance_id_raw)
-                                    if iid not in progress[tf]:
-                                        continue
+                                    # этот req_id обработан — снимаем inflight-флаг
+                                    s["req_ids"].discard(req_id)
+                                    s["inflight"] = False
 
                                     if status == "ok":
                                         inst = next((i for i in instances_by_tf[tf] if i["id"] == iid), None)
                                         if not inst:
                                             continue
-                                        open_time_iso = payload.get("open_time")
-                                        results_json = payload.get("results", "{}")
                                         rows = build_rows_for_indicator_response(
                                             position_uid=position_uid,
                                             strategy_id=strategy_id,
                                             symbol=symbol,
                                             tf=tf,
                                             indicator_name=inst["indicator"],
-                                            open_time_iso=open_time_iso,
-                                            results_json=results_json
+                                            open_time_iso=payload.get("open_time"),
+                                            results_json=payload.get("results", "{}"),
                                         )
-                                        if rows:
-                                            collected_rows_by_tf[tf].extend(rows)
-                                        progress[tf][iid]["state"] = "ok"
-                                        progress[tf][iid]["err"] = None
-
+                                        collected_rows.extend(rows)
+                                        s["state"] = "ok"
+                                        s["last_err"] = None
                                     elif status == "error":
                                         err = payload.get("error") or "unknown"
-                                        progress[tf][iid]["err"] = err
-                                        # финальные ошибки — помечаем как error (на этапе 1 не пишем отдельные строки, только меняем статус ожидания)
+                                        s["last_err"] = err
                                         if err in ("instance_not_active", "exception"):
-                                            progress[tf][iid]["state"] = "error"
-                                        # иначе оставляем pending — перезапросим на следующем тике
+                                            s["state"] = "error"
+                                        # иначе остаётся pending — перезапросим на следующем тике
 
                                 await asyncio.sleep(0.01)
 
-                            # 3) сохраняем собранные ok-значения в PG пачками по TF
-                            for tf in REQUIRED_TFS:
-                                if collected_rows_by_tf[tf]:
-                                    added = await persist_ok_rows(tf, collected_rows_by_tf[tf])
-                                    total_inserted += added
+                            # 3) локальная дедупликация и запись в PG
+                            if collected_rows:
+                                deduped = dedup_rows(collected_rows)
+                                upserts, unique_cnt = await insert_rows_pg(pg, deduped)
+                                total_upserts += upserts
+                                unique_after = unique_cnt  # реальное уникальное кол-во строк по позиции после этой итерации
 
-                            # 4) проверка «готовности» всех TF (этап 1 — только m5)
+                            # 4) проверка готовности m5
                             all_done = True
                             for tf in REQUIRED_TFS:
-                                # m5 готов тогда, когда все инстансы tf в состоянии ok/или финальная ошибка (но по правилам — ожидаем все, поэтому error тоже оставит all_done=True, если их нет; на этапе 1 следуем правилу "нужно получить все" → считаем done только если нет pending и нет error)
-                                states = [v["state"] for v in progress[tf].values()]
-                                if any(s == "pending" for s in states):
-                                    all_done = False
-                                if any(s == "error" for s in states):
+                                states = [ctx[tf][inst["id"]]["state"] for inst in instances_by_tf[tf]]
+                                # «нужно получить все»: нет pending и нет error
+                                if any(s in ("pending", "error") for s in states):
                                     all_done = False
                             if all_done:
                                 elapsed_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
-                                ok_cnt = sum(1 for tf in REQUIRED_TFS for v in progress[tf].values() if v["state"] == "ok")
-                                log.info(f"IND_POS_STAT: position={position_uid} {symbol} m5 snapshot complete: ok_instances={ok_cnt}, rows_inserted={total_inserted}, elapsed_ms={elapsed_ms}")
+                                ok_cnt = sum(1 for tf in REQUIRED_TFS for inst in instances_by_tf[tf] if ctx[tf][inst["id"]]["state"] == "ok")
+                                log.info(
+                                    f"IND_POS_STAT: position={position_uid} {symbol} m5 snapshot complete: "
+                                    f"ok_instances={ok_cnt}, rows_upserted={total_upserts}, unique_rows={unique_after}, elapsed_ms={elapsed_ms}"
+                                )
                                 break
 
-                        # на этапе 1 — считаем позицию обработанной полностью после готовности m5
+                        # позиция обработана на этапе 1 после готовности m5 или таймаута
                         to_ack.append(msg_id)
 
                     except Exception as e:
                         log.error(f"position handling error: {e}", exc_info=True)
-                        # в случае исключения — не ACK, чтобы можно было повторить обработку
+                        # не ACK — чтобы можно было повторить обработку
 
             # батчевый ACK для обработанных
             if to_ack:
