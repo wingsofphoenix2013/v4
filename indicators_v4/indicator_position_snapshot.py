@@ -392,7 +392,7 @@ async def build_rows_for_mw_kind(
     bar_open_ms: int,
     strategy_id: int,
     position_uid: str
-) -> List[Tuple]]:
+) -> List[Tuple]:
     status, results = await request_pack(
         redis, gw_router,
         symbol=symbol,
