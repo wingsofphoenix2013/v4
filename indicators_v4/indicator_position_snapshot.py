@@ -593,7 +593,7 @@ async def _process_mw_tf(
 _process_mw_tf.sem = asyncio.Semaphore(PARALLEL_REQUESTS_LIMIT)
 
 
-# 🔸 Основной воркер: неблокирующее чтение стрима, отдельная задача на каждую позицию, ACK по готовности
+# 🔸 Основной воркер: неблокирующее чтение стрима, отдельная задача на каждую позицию, ACK по готовности + глобальный предохранитель по времени
 async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
     log.info("IND_POSSTAT: воркер запущен (phase=4 indicators+packs+marketwatch m5+m15+h1)")
 
@@ -606,10 +606,11 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         if "BUSYGROUP" not in str(e):
             log.warning(f"xgroup_create (positions) error: {e}")
 
-    # локальный семафор по числу одновременно обрабатываемых позиций
-    inflight_sem = asyncio.Semaphore(INFLIGHT_POSITIONS_LIMIT)
+    # локальные лимиты
+    inflight_sem = asyncio.Semaphore(INFLIGHT_POSITIONS_LIMIT)  # одновременно обрабатываемых позиций
+    POSITION_MAX_RUNTIME_SEC = 600  # глобальный предохранитель: максимальное время обработки одной позиции (10 минут)
 
-    # вложенный ACK-хелпер, чтобы передавать в задачу позиции
+    # вложенный ACK-хелпер
     async def ack_msg(msg_id: str):
         try:
             await redis.xack(POSITIONS_OPEN_STREAM, group, msg_id)
@@ -634,17 +635,38 @@ async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
         if not resp:
             continue
 
-        # создаём независимые задачи по каждой записи; ACK будет внутри задачи по завершении
+        # создаём независимые задачи по каждой записи; ACK будет внутри задачи по завершении/ошибке
         for _, messages in resp:
             for msg_id, data in messages:
-                # ограничиваем число одновременных позиций
                 async def one_position(msg_id=msg_id, data=data):
                     async with inflight_sem:
-                        await _process_position_message(
-                            pg, redis, get_instances_by_tf,
-                            msg_id=msg_id, message=data,
-                            positions_ack_cb=ack_msg
-                        )
+                        try:
+                            # глобальный предохранитель: если задача зависла навсегда — не блокируем конвейер
+                            await asyncio.wait_for(
+                                _process_position_message(
+                                    pg, redis, get_instances_by_tf,
+                                    msg_id=msg_id, message=data,
+                                    positions_ack_cb=ack_msg
+                                ),
+                                timeout=POSITION_MAX_RUNTIME_SEC
+                            )
+                        except asyncio.TimeoutError:
+                            # позиция зависла дольше лимита — лог, DLQ (опционально), ACK
+                            pos_uid = data.get("position_uid")
+                            sym = data.get("symbol")
+                            log.error(
+                                f"IND_POSSTAT: position timeout (global) "
+                                f"position_uid={pos_uid} symbol={sym} limit_sec={POSITION_MAX_RUNTIME_SEC}"
+                            )
+                            try:
+                                await redis.xadd("positions_open_timeout", {"data": json.dumps(data)})
+                            except Exception:
+                                log.warning("IND_POSSTAT: failed to push DLQ for timeout", exc_info=True)
+                            await ack_msg(msg_id)
+                        except Exception:
+                            log.error("IND_POSSTAT: position task exception (global)", exc_info=True)
+                            await ack_msg(msg_id)
+
                 try:
                     asyncio.create_task(one_position())
                 except Exception:
