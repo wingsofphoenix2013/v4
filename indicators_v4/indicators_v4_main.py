@@ -26,6 +26,8 @@ from indicator_mw_extremes import run_indicator_mw_extremes
 
 # 🔸 Воркер Snapshot
 from indicator_position_stat import run_indicator_position_stat
+from indicator_position_statm15 import run_indicator_position_stat_m15
+from indicator_position_stath1 import run_indicator_position_stat_h1
 
 
 # 🔸 Глобальные переменные
@@ -568,6 +570,8 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_momentum(pg, redis), "MW_MOM"),
         run_safe_loop(lambda: run_indicator_mw_extremes(pg, redis), "MW_EXT"),
         run_safe_loop(lambda: run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precision), "IND_POS_STAT"),
+        run_safe_loop(lambda: run_indicator_position_stat_m15(pg, redis, get_instances_by_tf, get_precision), "IND_POS_STAT_M15"),
+        run_safe_loop(lambda: run_indicator_position_stat_h1(pg, redis, get_instances_by_tf, get_precision), "IND_POS_STAT_H1"),
     )
 
 
