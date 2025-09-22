@@ -407,7 +407,7 @@ async def _process_position_message(
         created_at_iso = message.get("created_at")
 
         if not position_uid or not strategy_id_s or not symbol or not created_at_iso:
-            log.info(f"IND_POSSTAT: bad_event msg_id={msg_id} data_keys={list(message.keys())}")
+            log.debug(f"IND_POSSTAT: bad_event msg_id={msg_id} data_keys={list(message.keys())}")
             await positions_ack_cb(msg_id)
             return
 
@@ -418,7 +418,7 @@ async def _process_position_message(
 
         ts_ms = parse_iso_to_ms(created_at_iso)
         if ts_ms is None:
-            log.info(f"IND_POSSTAT: bad_event_time position_uid={position_uid}")
+            log.debug(f"IND_POSSTAT: bad_event_time position_uid={position_uid}")
             await positions_ack_cb(msg_id)
             return
 
@@ -433,7 +433,7 @@ async def _process_position_message(
         rows_m5_mw  = await _process_mw_tf(pg, redis, tf, position_uid, strategy_id, symbol, b_m5)
         total_rows += rows_m5_ind + rows_m5_pack + rows_m5_mw
         t1 = asyncio.get_event_loop().time()
-        log.info(f"IND_POSSTAT: {tf} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_m5_ind + rows_m5_pack + rows_m5_mw} elapsed_ms={int((t1-t0)*1000)}")
+        log.debug(f"IND_POSSTAT: {tf} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_m5_ind + rows_m5_pack + rows_m5_mw} elapsed_ms={int((t1-t0)*1000)}")
 
         # 🔸 m15 и h1 — затем (параллельно)
         async def run_tf(tf2: str):
@@ -444,13 +444,13 @@ async def _process_position_message(
             rows_mw  = await _process_mw_tf(pg, redis, tf2, position_uid, strategy_id, symbol, b_tf)
             t_end = asyncio.get_event_loop().time()
             rows_sum = rows_ind + rows_pack + rows_mw
-            log.info(f"IND_POSSTAT: {tf2} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_sum} elapsed_ms={int((t_end-t_start)*1000)}")
+            log.debug(f"IND_POSSTAT: {tf2} indicators+packs+mw done position_uid={position_uid} symbol={symbol} rows={rows_sum} elapsed_ms={int((t_end-t_start)*1000)}")
             return rows_sum
 
         rows_m15, rows_h1 = await asyncio.gather(run_tf("m15"), run_tf("h1"))
         total_rows += rows_m15 + rows_h1
 
-        log.info(f"IND_POSSTAT: all TF indicators+packs+mw done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
+        log.debug(f"IND_POSSTAT: all TF indicators+packs+mw done position_uid={position_uid} symbol={symbol} total_rows={total_rows}")
 
     except Exception:
         log.error("IND_POSSTAT: position processing exception", exc_info=True)
@@ -469,7 +469,7 @@ async def _process_indicators_tf(
 ) -> int:
     instances = [i for i in get_instances_by_tf(tf)]
     if not instances:
-        log.info(f"IND_POSSTAT: no_instances_{tf} symbol={symbol}")
+        log.debug(f"IND_POSSTAT: no_instances_{tf} symbol={symbol}")
         return 0
 
     rows_all: List[Tuple] = []
@@ -595,7 +595,7 @@ _process_mw_tf.sem = asyncio.Semaphore(PARALLEL_REQUESTS_LIMIT)
 
 # 🔸 Основной воркер: неблокирующее чтение стрима, отдельная задача на каждую позицию, ACK по готовности + глобальный предохранитель по времени
 async def run_indicator_position_snapshot(pg, redis, get_instances_by_tf):
-    log.info("IND_POSSTAT: воркер запущен (phase=4 indicators+packs+marketwatch m5+m15+h1)")
+    log.debug("IND_POSSTAT: воркер запущен (phase=4 indicators+packs+marketwatch m5+m15+h1)")
 
     # создать consumer-group (идемпотентно)
     group = "ips_group"
