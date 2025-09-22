@@ -217,7 +217,6 @@ async def _handle_tp_hit(position, tp, price: Decimal):
             event_data["new_sl_quantity"] = str(position.quantity_left)
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-        await infra.redis_client.xadd("binance_update_stream", {"data": json.dumps(event_data)})
         log.debug(f"📤 Событие TP-{tp.level} отправлено в positions_update_stream для {position.uid}")
 
         # 🔸 Финализация позиции, если она полностью закрыта
@@ -261,7 +260,6 @@ async def _finalize_position_close(position, exit_price: Decimal, reason: str):
         )
 
     await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-    await infra.redis_client.xadd("binance_update_stream", {"data": json.dumps(event_data)})
     log.debug(f"📤 Событие closed отправлено в positions_update_stream для {position.uid}")
 # 🔸 Закрытие позиции по SL-защите (protect)
 async def full_protect_stop(position):
@@ -325,7 +323,6 @@ async def full_protect_stop(position):
         }
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-        await infra.redis_client.xadd("binance_update_stream", {"data": json.dumps(event_data)})
 
         log.debug(f"🔒 PROTECT: позиция {position.uid} закрыта через SL-protect")
 
@@ -407,7 +404,6 @@ async def apply_sl_replacement(position, log_uid, strategy_id, symbol):
         }
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-        await infra.redis_client.xadd("binance_update_stream", {"data": json.dumps(event_data)})
         
 # 🔸 Закрытие позиции по механизму reverse
 async def full_reverse_stop(position, signal_id, direction, time, log_uid):
@@ -471,7 +467,6 @@ async def full_reverse_stop(position, signal_id, direction, time, log_uid):
         }
 
         await infra.redis_client.xadd("positions_update_stream", {"data": json.dumps(event_data)})
-        await infra.redis_client.xadd("binance_update_stream", {"data": json.dumps(event_data)})
 
         log.debug(f"🔁 REVERSE: позиция {position.uid} закрыта по сигналу reverse")
 
