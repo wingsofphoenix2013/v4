@@ -1,4 +1,4 @@
-# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (этап 2, m5: индикаторы + packs + marketwatch; ПАРАЛЛЕЛЬНЫЕ ПОЗИЦИИ, роутер ответов по req_id)
+# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (этап 2+3+4: m5+m15+h1; индикаторы + packs + marketwatch; параллельные позиции; пер-TF лог)
 
 import asyncio
 import json
@@ -17,14 +17,14 @@ GW_RESP_STREAM        = "indicator_gateway_response"
 TARGET_TABLE          = "indicator_position_stat"
 
 # 🔸 Параметры воркера / параллелизм
-REQUIRED_TFS        = ("m5",)   # этап 2 — только m5
-POLL_INTERVAL_SEC   = 1         # частота ретраев
-RESP_BLOCK_MS       = 300       # короткий блок на чтение ответов
-GLOBAL_TIMEOUT_SEC  = 600       # 10 минут на позицию
-BATCH_SIZE_POS_OPEN = 20        # чтение позиций
-BATCH_SIZE_RESP     = 200       # чтение ответов (indicator/gateway)
-CONCURRENCY_PER_TF  = 50        # лимит параллельных on-demand запросов по TF
-POSITIONS_CONCURRENCY = 12      # одновременных позиций (горячий пул)
+REQUIRED_TFS           = ("m5", "m15", "h1")  # теперь все 3 ТФ
+POLL_INTERVAL_SEC      = 1                    # частота ретраев
+RESP_BLOCK_MS          = 300                  # короткий блок на чтение ответов
+GLOBAL_TIMEOUT_SEC     = 600                  # 10 минут на позицию
+BATCH_SIZE_POS_OPEN    = 20                   # чтение позиций
+BATCH_SIZE_RESP        = 200                  # чтение ответов (indicator/gateway)
+CONCURRENCY_PER_TF     = {"m5": 80, "m15": 40, "h1": 30}  # лимиты on-demand per TF (m5 приоритетнее)
+POSITIONS_CONCURRENCY  = 16                   # одновременно обрабатываемых позиций
 
 # 🔸 Пакеты и MW
 PACK_INDS = ("ema", "rsi", "mfi", "bb", "lr", "atr", "adx_dmi", "macd")
@@ -90,10 +90,10 @@ def build_rows_for_indicator_response(position_uid: str,
     return rows
 
 
-# 🔸 Вставка пачки строк в PG (UPSERT); возвращает (upsert_count, unique_count)
-async def insert_rows_pg(pg, rows: list[tuple]) -> tuple[int, int]:
+# 🔸 Вставка пачки строк в PG (UPSERT); возвращает upsert_count
+async def insert_rows_pg(pg, rows: list[tuple]) -> int:
     if not rows:
-        return 0, 0
+        return 0
     async with pg.acquire() as conn:
         async with conn.transaction():
             await conn.executemany(f"""
@@ -110,10 +110,22 @@ async def insert_rows_pg(pg, rows: list[tuple]) -> tuple[int, int]:
                     error_code = EXCLUDED.error_code,
                     captured_at = NOW()
             """, rows)
-            position_uid = rows[0][0]
-            rec = await conn.fetchrow(f"SELECT COUNT(*) AS cnt FROM {TARGET_TABLE} WHERE position_uid = $1", position_uid)
-            unique_count = int(rec["cnt"]) if rec else 0
-    return len(rows), unique_count
+    return len(rows)
+
+
+# 🔸 Подсчёт уникальных строк по позиции и/или ТФ
+async def count_unique_rows(pg, position_uid: str, tf: str | None = None) -> int:
+    async with pg.acquire() as conn:
+        if tf is None:
+            rec = await conn.fetchrow(
+                f"SELECT COUNT(*) AS cnt FROM {TARGET_TABLE} WHERE position_uid = $1", position_uid
+            )
+        else:
+            rec = await conn.fetchrow(
+                f"SELECT COUNT(*) AS cnt FROM {TARGET_TABLE} WHERE position_uid = $1 AND timeframe = $2",
+                position_uid, tf
+            )
+        return int(rec["cnt"]) if rec else 0
 
 
 # 🔸 Антидубли: локальная дедупликация кортежей по уникальному ключу
@@ -242,7 +254,6 @@ async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
         return last_id, out
 
     while not stop_event.is_set():
-        # читаем оба стрима по очереди маленькими блоками
         last_ind_id, ind_items = await drain(INDICATOR_RESP_STREAM, last_ind_id)
         for rid, payload in ind_items:
             req_id = payload.get("req_id")
@@ -274,19 +285,21 @@ async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
         await asyncio.sleep(0.01)
 
 
-# 🔸 Обработчик одной позиции (отдельная задача)
+# 🔸 Обработчик одной позиции (отдельная задача; m5 приоритет, m15/h1 параллельно)
 async def handle_position(pg, redis, get_instances_by_tf,
                           position_uid: str, strategy_id: int, symbol: str, created_at_iso: str,
                           req_routes: dict, req_lock: asyncio.Lock,
                           tf_semaphores: dict[str, asyncio.Semaphore]):
-    # подготовка по TF (этап 2 — только m5)
+
     instances_by_tf = {tf: [i for i in get_instances_by_tf(tf)] for tf in REQUIRED_TFS}
     expected_bases_by_tf = {tf: build_expected_pack_bases(instances_by_tf[tf]) for tf in REQUIRED_TFS}
     bar_open_ms_by_tf = {tf: to_bar_open_ms(created_at_iso, tf) for tf in REQUIRED_TFS}
 
-    # состояния
-    start_ts = datetime.utcnow()
-    deadline = start_ts + timedelta(seconds=GLOBAL_TIMEOUT_SEC)
+    # состояния по TF
+    start_ts_global = datetime.utcnow()
+    tf_start_ts = {tf: None for tf in REQUIRED_TFS}
+    tf_done = {tf: False for tf in REQUIRED_TFS}
+    deadline = start_ts_global + timedelta(seconds=GLOBAL_TIMEOUT_SEC)
 
     # индикаторы
     ind_ctx = {
@@ -312,15 +325,17 @@ async def handle_position(pg, redis, get_instances_by_tf,
     # очередь ответов для этой позиции
     resp_queue: asyncio.Queue = asyncio.Queue()
 
-    # helper: ретраибельна ли ошибка
+    # ретраибельная ошибка?
     def is_retriable(err: str) -> bool:
         return err not in ("instance_not_active", "exception")
 
-    # helper: отправка indicator_request
+    # отправка indicator_request
     async def send_indicator(tf: str, inst_id: int):
         s = ind_ctx[tf][inst_id]
         if s["inflight"] or s["state"] != "pending":
             return
+        if tf_start_ts[tf] is None:
+            tf_start_ts[tf] = datetime.utcnow()
         async with tf_semaphores[tf]:
             rid = await redis.xadd(INDICATOR_REQ_STREAM, {
                 "symbol": symbol,
@@ -333,10 +348,8 @@ async def handle_position(pg, redis, get_instances_by_tf,
         s["inflight"] = True
         s["req_ids"].add(rid)
 
-    # helper: отправка gateway_request (pack или mw)
+    # отправка gateway_request (pack или mw)
     async def send_gateway(tf: str, indicator_or_kind: str):
-        # может быть pack (ema/rsi/...) или mw (trend/...)
-        s = None
         if indicator_or_kind in pack_ctx[tf]:
             s = pack_ctx[tf][indicator_or_kind]
             ok_states = ("pending", "ok_part")
@@ -345,6 +358,8 @@ async def handle_position(pg, redis, get_instances_by_tf,
             ok_states = ("pending",)
         if s["inflight"] or s["state"] not in ok_states:
             return
+        if tf_start_ts[tf] is None:
+            tf_start_ts[tf] = datetime.utcnow()
         async with tf_semaphores[tf]:
             rid = await redis.xadd(GW_REQ_STREAM, {
                 "symbol": symbol,
@@ -357,21 +372,29 @@ async def handle_position(pg, redis, get_instances_by_tf,
         s["inflight"] = True
         s["req_ids"].add(rid)
 
-    # первая волна запросов: m5 индикаторы + все паки + все MW
+    # первая волна: m5 сначала, затем m15+h1 (почти сразу, но после m5)
     if "m5" in REQUIRED_TFS:
         await asyncio.gather(*[send_indicator("m5", inst["id"]) for inst in instances_by_tf["m5"]])
         await asyncio.gather(*[send_gateway("m5", ind) for ind in pack_ctx["m5"].keys()])
         await asyncio.gather(*[send_gateway("m5", kind) for kind in MW_KINDS])
 
-    total_upserts = 0
-    unique_after = 0
+    for tf in ("m15", "h1"):
+        if tf in REQUIRED_TFS:
+            await asyncio.gather(*[send_indicator(tf, inst["id"]) for inst in instances_by_tf[tf]])
+            await asyncio.gather(*[send_gateway(tf, ind) for ind in pack_ctx[tf].keys()])
+            await asyncio.gather(*[send_gateway(tf, kind) for kind in MW_KINDS])
 
-    # главный цикл до готовности или таймаута
+    total_upserts = 0
+    upserts_by_tf = {tf: 0 for tf in REQUIRED_TFS}
+
+    # главный цикл до готовности всех TF или таймаута
     while True:
         now = datetime.utcnow()
         if now >= deadline:
             # лог по таймауту
             for tf in REQUIRED_TFS:
+                if tf_done[tf]:
+                    continue
                 for inst_id, s in ind_ctx[tf].items():
                     if s["state"] == "pending":
                         log.info(f"[TIMEOUT] IND {symbol}/{tf} inst_id={inst_id} {s['indicator']} last_err={s['last_err']}")
@@ -392,7 +415,6 @@ async def handle_position(pg, redis, get_instances_by_tf,
             try:
                 src, payload = await asyncio.wait_for(resp_queue.get(), timeout=RESP_BLOCK_MS / 1000.0)
             except asyncio.TimeoutError:
-                # отправим ретраи для тех, кто в pending и не inflight
                 break
 
             status = payload.get("status")
@@ -400,7 +422,6 @@ async def handle_position(pg, redis, get_instances_by_tf,
             r_symbol = payload.get("symbol")
             tf = payload.get("timeframe")
 
-            # детач req_id из маршрутов
             if req_id:
                 async with req_lock:
                     req_routes.pop(req_id, None)
@@ -439,7 +460,7 @@ async def handle_position(pg, redis, get_instances_by_tf,
                     if not is_retriable(err):
                         s["state"] = "error"
 
-            else:  # gateway
+            else:  # gateway (packs/MW)
                 ind = payload.get("indicator")
                 ctx_slot = None
                 ctx_type = None
@@ -476,7 +497,6 @@ async def handle_position(pg, redis, get_instances_by_tf,
                                 if rows:
                                     collected_rows.extend(rows)
                                     ctx_slot["done_bases"].add(base)
-                            # ok, если закрыли все базы
                             ctx_slot["state"] = "ok" if (ctx_slot["expected_bases"] <= ctx_slot["done_bases"]) else "ok_part"
                             ctx_slot["last_err"] = None
                     else:
@@ -501,7 +521,6 @@ async def handle_position(pg, redis, get_instances_by_tf,
                                 ctx_slot["last_err"] = None
                             else:
                                 ctx_slot["last_err"] = "no_state"
-
                 else:
                     err = payload.get("error") or "unknown"
                     ctx_slot["last_err"] = err
@@ -511,12 +530,18 @@ async def handle_position(pg, redis, get_instances_by_tf,
         # запись в БД (локальная дедупликация)
         if collected_rows:
             deduped = dedup_rows(collected_rows)
-            upserts, unique_cnt = await insert_rows_pg(pg, deduped)
-            total_upserts += upserts
-            unique_after = unique_cnt
+            # разделим по TF, чтобы аккумулировать per-TF upserts
+            by_tf = {}
+            for r in deduped:
+                by_tf.setdefault(r[3], []).append(r)  # r[3] = timeframe
+            for tf, chunk in by_tf.items():
+                n = await insert_rows_pg(pg, chunk)
+                total_upserts += n
+                upserts_by_tf[tf] += n
 
-        # ретраи «раз в секунду»: отправляем только тем, кто pending и не inflight, и у кого ошибка — ретраибельная
+        # ретраи «раз в секунду»: отправляем тем, кто pending и не inflight (с учётом retriable)
         for tf in REQUIRED_TFS:
+            # m5 приоритетнее: просто идём в порядке m5→m15→h1 (лимиты различаются в семафорах)
             for inst_id, s in ind_ctx[tf].items():
                 if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
                     await send_indicator(tf, inst_id)
@@ -527,7 +552,7 @@ async def handle_position(pg, redis, get_instances_by_tf,
                 if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
                     await send_gateway(tf, kind)
 
-        # проверка готовности m5
+        # проверка готовности по каждому TF → логируем пер-TF и отмечаем done
         def all_done_tf(tf: str) -> bool:
             if any(s["state"] in ("pending", "error") for s in ind_ctx[tf].values()):
                 return False
@@ -540,22 +565,33 @@ async def handle_position(pg, redis, get_instances_by_tf,
                 return False
             return True
 
-        if all(all_done_tf(tf) for tf in REQUIRED_TFS):
-            elapsed_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
-            ok_inst = sum(1 for tf in REQUIRED_TFS for s in ind_ctx[tf].values() if s["state"] == "ok")
-            ok_packs = sum(len(s["done_bases"]) for tf in REQUIRED_TFS for s in pack_ctx[tf].values())
-            ok_mw = sum(1 for tf in REQUIRED_TFS for s in mw_ctx[tf].values() if s["state"] == "ok")
+        for tf in REQUIRED_TFS:
+            if not tf_done[tf] and all_done_tf(tf):
+                tf_done[tf] = True
+                elapsed_ms_tf = int((datetime.utcnow() - (tf_start_ts[tf] or start_ts_global)).total_seconds() * 1000)
+                ok_inst_tf = sum(1 for s in ind_ctx[tf].values() if s["state"] == "ok")
+                ok_packs_tf = sum(len(s["done_bases"]) for s in pack_ctx[tf].values())
+                ok_mw_tf = sum(1 for s in mw_ctx[tf].values() if s["state"] == "ok")
+                unique_rows_tf = await count_unique_rows(pg, position_uid, tf)
+                log.info(
+                    f"IND_POS_STAT: position={position_uid} {symbol} {tf} snapshot complete: "
+                    f"ok_instances={ok_inst_tf}, ok_packs={ok_packs_tf}, ok_mw={ok_mw_tf}, "
+                    f"rows_upserted_tf={upserts_by_tf[tf]}, unique_rows_tf={unique_rows_tf}, elapsed_ms={elapsed_ms_tf}"
+                )
+
+        # если все TF завершены — финальный лог и выход
+        if all(tf_done.values()):
+            elapsed_ms = int((datetime.utcnow() - start_ts_global).total_seconds() * 1000)
+            unique_all = await count_unique_rows(pg, position_uid, None)
+            total_ok_inst = sum(1 for tf in REQUIRED_TFS for s in ind_ctx[tf].values() if s["state"] == "ok")
+            total_ok_packs = sum(len(s["done_bases"]) for tf in REQUIRED_TFS for s in pack_ctx[tf].values())
+            total_ok_mw = sum(1 for tf in REQUIRED_TFS for s in mw_ctx[tf].values() if s["state"] == "ok")
             log.info(
-                f"IND_POS_STAT: position={position_uid} {symbol} m5 snapshot complete: "
-                f"ok_instances={ok_inst}, ok_packs={ok_packs}, ok_mw={ok_mw}, "
-                f"rows_upserted={total_upserts}, unique_rows={unique_after}, elapsed_ms={elapsed_ms}"
+                f"IND_POS_STAT: position={position_uid} {symbol} ALL TF done: "
+                f"ok_instances={total_ok_inst}, ok_packs={total_ok_packs}, ok_mw={total_ok_mw}, "
+                f"rows_upserted_total={total_upserts}, unique_rows_total={unique_all}, elapsed_ms={elapsed_ms}"
             )
             break
-
-    # финальная очистка маршрутов req_id этой позиции (на случай незавершённых)
-    async with req_lock:
-        # быстрый проход по ключам (дорого искать все) — пропускаем; мы снимали req_id из map при получении
-        pass
 
 
 # 🔸 Основной воркер: диспетчер позиций + глобальный роутер ответов
@@ -578,7 +614,9 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
     pos_sema = asyncio.Semaphore(POSITIONS_CONCURRENCY)
 
     # семафоры TF для on-demand запросов
-    tf_semaphores = {tf: asyncio.Semaphore(CONCURRENCY_PER_TF) for tf in REQUIRED_TFS}
+    tf_semaphores = {
+        tf: asyncio.Semaphore(CONCURRENCY_PER_TF.get(tf, 30)) for tf in REQUIRED_TFS
+    }
 
     # останов роутера при завершении процесса
     stop_event = asyncio.Event()
@@ -621,7 +659,6 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                             to_ack.append(msg_id)
                             continue
 
-                        # запускаем обработку позиции как отдельную задачу с лимитом позиций
                         async def run_one():
                             async with pos_sema:
                                 await handle_position(pg, redis, get_instances_by_tf,
@@ -633,22 +670,19 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
 
                     except Exception as e:
                         log.error(f"position spawn error: {e}", exc_info=True)
-                        # не ACK — повторим позже
 
-            # ждём завершения всех запущенных задач этой пачки и ACK-аем соответствующие сообщения
+            # ждём завершения всех задач этой пачки и ACK-аем соответствующие сообщения
             for msg_id, task in pos_tasks:
                 try:
                     await task
                     to_ack.append(msg_id)
                 except Exception as e:
                     log.error(f"position task error: {e}", exc_info=True)
-                    # не ACK — повтор
 
             if to_ack:
                 await redis.xack(POSITIONS_OPEN_STREAM, group, *to_ack)
 
     finally:
-        # останов роутера ответов
         stop_event.set()
         try:
             await router_task
