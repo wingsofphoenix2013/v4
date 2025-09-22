@@ -1,4 +1,4 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (переключён на Bybit/feed_bb)
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4
 
 import asyncio
 import json
@@ -25,7 +25,7 @@ from indicator_mw_momentum import run_indicator_mw_momentum
 from indicator_mw_extremes import run_indicator_mw_extremes
 
 # 🔸 Воркер Snapshot
-from indicator_position_snapshot import run_indicator_position_snapshot
+# зарезервированное место
 
 
 # 🔸 Глобальные переменные
@@ -567,7 +567,6 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_volatility(pg, redis), "MW_VOL"),
         run_safe_loop(lambda: run_indicator_mw_momentum(pg, redis), "MW_MOM"),
         run_safe_loop(lambda: run_indicator_mw_extremes(pg, redis), "MW_EXT"),
-        run_safe_loop(lambda: run_indicator_position_snapshot(pg, redis, get_instances_by_tf), "IND_POSSTAT"),
     )
 
 
