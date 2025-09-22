@@ -1,4 +1,4 @@
-# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (этап 2: m5 индикаторы + packs + marketwatch, антидубли, быстрый сбор ответов)
+# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (этап 2: m5 индикаторы + packs + marketwatch; строгие поля паков, MW только state)
 
 import asyncio
 import json
@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 
 # 🔸 Время бара и шаги TF
-from packs.pack_utils import floor_to_bar, STEP_MS
+from packs.pack_utils import floor_to_bar
 
 # 🔸 Константы стримов и таблиц
 POSITIONS_OPEN_STREAM = "positions_open_stream"
@@ -19,15 +19,29 @@ TARGET_TABLE = "indicator_position_stat"
 # 🔸 Параметры воркера
 REQUIRED_TFS = ("m5",)             # этап 2 — только m5
 POLL_INTERVAL_SEC = 1              # частота ретраев недостающих сущностей
-RESP_BLOCK_MS = 300                # внутренний короткий блок на чтение ответов (~0.3с)
+RESP_BLOCK_MS = 300                # внутренний блок чтения ответов (~0.3s)
 GLOBAL_TIMEOUT_SEC = 600           # 10 минут на позицию
 BATCH_SIZE_POS_OPEN = 20           # чтение событий позиций
 BATCH_SIZE_RESP_READ = 200         # чтение ответов (indicator/gateway)
 CONCURRENCY_PER_TF = 50            # лимит параллельных on-demand запросов по TF
 
 # 🔸 Наборы паков и MW
-PACK_INDS = ("ema", "rsi", "mfi", "lr", "atr", "adx_dmi", "macd", "bb")
+PACK_INDS = ("ema", "rsi", "mfi", "bb", "lr", "atr", "adx_dmi", "macd")
 MW_KINDS = ("trend", "volatility", "momentum", "extremes")
+
+# 🔸 Белые списки полей паков по типу базы (ТОЧНО как требуется)
+PACK_FIELD_WHITELIST = {
+    "rsi":      ["bucket_low", "trend"],
+    "mfi":      ["bucket_low", "trend"],
+    "bb":       ["bucket", "bucket_delta", "bw_trend_strict", "bw_trend_smooth"],
+    "lr":       ["bucket", "bucket_delta", "angle_trend"],
+    "atr":      ["bucket", "bucket_delta"],
+    "adx_dmi":  ["adx_bucket_low", "adx_dynamic_strict", "adx_dynamic_smooth",
+                 "gap_bucket_low", "gap_dynamic_strict", "gap_dynamic_smooth"],
+    "ema":      ["side", "dynamic", "dynamic_strict", "dynamic_smooth"],
+    "macd":     ["mode", "cross", "zero_side",
+                 "hist_bucket_low_pct", "hist_trend_strict", "hist_trend_smooth"],
+}
 
 # 🔸 Логгер
 log = logging.getLogger("IND_POS_STAT")
@@ -80,67 +94,6 @@ def build_rows_for_indicator_response(position_uid: str,
     return rows
 
 
-# 🔸 Утилита: «плоский» обход словаря pack['pack']
-def flatten_pack_dict(d: dict, prefix=""):
-    for k, v in d.items():
-        if k in ("open_time", "ref"):  # метаданные паков не пишем как параметры
-            continue
-        name = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-        if isinstance(v, dict):
-            # вложенные (например, deltas.*)
-            yield from flatten_pack_dict(v, name)
-        else:
-            yield (name, v)
-
-
-# 🔸 Подготовка строк для паков (param_type='pack')
-def build_rows_for_pack_response(position_uid: str,
-                                 strategy_id: int,
-                                 symbol: str,
-                                 tf: str,
-                                 base: str,
-                                 open_time_iso: str,
-                                 pack_payload: dict) -> list[tuple]:
-    rows = []
-    open_time = parse_iso(open_time_iso)
-    for pname, pval in flatten_pack_dict(pack_payload):
-        # числа → value_num, строки/булевы → value_text
-        val_num = None
-        val_text = None
-        if isinstance(pval, (int, float)):
-            val_num = float(pval)
-        else:
-            # строки вида "0.04" тоже считаем числами
-            try:
-                val_num = float(pval)
-            except Exception:
-                if isinstance(pval, bool):
-                    val_text = "true" if pval else "false"
-                else:
-                    # если список/None — сериализуем кратко в текст
-                    if pval is None:
-                        val_text = None  # пропустим такие
-                        continue
-                    if isinstance(pval, (list, tuple)):
-                        try:
-                            val_text = json.dumps(pval)
-                        except Exception:
-                            continue
-                    else:
-                        val_text = str(pval)
-
-        rows.append((
-            position_uid, strategy_id, symbol, tf,
-            "pack",          # param_type
-            base,            # param_base (например: ema50, bb20_2_0, macd12, trend ...)
-            pname,           # param_name (например: dist_pct, dynamic_smooth, deltas.d_adx)
-            val_num, val_text,
-            open_time,
-            "ok", None
-        ))
-    return rows
-
-
 # 🔸 Вставка пачки строк в PG (UPSERT); возвращает (upsert_count, unique_count)
 async def insert_rows_pg(pg, rows: list[tuple]) -> tuple[int, int]:
     if not rows:
@@ -161,7 +114,6 @@ async def insert_rows_pg(pg, rows: list[tuple]) -> tuple[int, int]:
                     error_code = EXCLUDED.error_code,
                     captured_at = NOW()
             """, rows)
-            # реальное число уникальных строк по позиции
             sample = rows[0]
             position_uid = sample[0]
             rec = await conn.fetchrow(f"""
@@ -184,6 +136,72 @@ def dedup_rows(rows: list[tuple]) -> list[tuple]:
         seen.add(key)
         out.append(r)
     return out
+
+
+# 🔸 Определить тип базы по префиксу (ema50 → ema, bb20_2_0 → bb, ...)
+def base_kind(base: str) -> str | None:
+    for k in PACK_FIELD_WHITELIST.keys():
+        if base.startswith(k):
+            return k
+    return None
+
+
+# 🔸 Утилита: «плоский» обход словаря pack['pack'] (игнорируя meta)
+def flatten_pack_dict(d: dict):
+    for k, v in d.items():
+        if k in ("open_time", "ref", "used_bases", "prev_state", "raw_state", "streak_preview", "strong", "direction", "max_adx", "deltas"):
+            # эти поля не пишем как параметры (MW мета и диагностика, лишнее для паков)
+            continue
+        yield (k, v)
+
+
+# 🔸 Подготовка строк для паков (param_type='pack') по whitelist
+def build_rows_for_pack_response(position_uid: str,
+                                 strategy_id: int,
+                                 symbol: str,
+                                 tf: str,
+                                 base: str,
+                                 open_time_iso: str,
+                                 pack_payload: dict) -> list[tuple]:
+    rows = []
+    kind = base_kind(base)
+    if not kind:
+        return rows
+    allowed = set(PACK_FIELD_WHITELIST.get(kind, []))
+    if not allowed:
+        return rows
+
+    open_time = parse_iso(open_time_iso)
+    for pname, pval in flatten_pack_dict(pack_payload):
+        if pname not in allowed:
+            continue
+
+        val_num = None
+        val_text = None
+        if isinstance(pval, (int, float)):
+            val_num = float(pval)
+        else:
+            try:
+                val_num = float(pval)
+            except Exception:
+                if pval is None:
+                    continue
+                if isinstance(pval, bool):
+                    val_text = "true" if pval else "false"
+                else:
+                    val_text = str(pval)
+
+        rows.append((
+            position_uid, strategy_id, symbol, tf,
+            "pack",    # param_type
+            base,      # param_base (например: ema50, bb20_2_0, lr50, ...)
+            pname,     # param_name (например: dist_pct, side, angle_trend, ...)
+            val_num, val_text,
+            open_time,
+            "ok", None
+        ))
+
+    return rows
 
 
 # 🔸 Построить ожидаемые базы паков из списка инстансов (по TF)
@@ -323,21 +341,21 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                             } for tf in REQUIRED_TFS
                         }
 
-                        # паки (per indicator base) — строим ожидаемые базы из активных инстансов
+                        # паки (per indicator) — ожидаемые базы из активных инстансов
                         pack_ctx = {
                             tf: {
                                 ind: {
                                     "inflight": False,
                                     "req_ids": set(),
                                     "state": "pending",      # pending|ok_part|ok|error
-                                    "done_bases": set(),     # какие базы уже получили и записали
+                                    "done_bases": set(),     # закрытые базы (base из ответа)
                                     "expected_bases": set(expected_bases_by_tf[tf].get(ind, set())),
                                     "last_err": None
                                 } for ind in PACK_INDS if expected_bases_by_tf[tf].get(ind)
                             } for tf in REQUIRED_TFS
                         }
 
-                        # marketwatch (four kinds)
+                        # marketwatch (четыре вида)
                         mw_ctx = {
                             tf: {
                                 kind: {
@@ -372,8 +390,7 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                 rid = await redis.xadd(GW_REQ_STREAM, {
                                     "symbol": symbol,
                                     "timeframe": tf,
-                                    "indicator": ind,
-                                    # не указываем length/std/fast → gateway вернёт все активные базы
+                                    "indicator": ind,  # без length/std/fast — вернёт все активные базы
                                     "timestamp_ms": str(bar_open_ms_by_tf[tf])
                                 })
                             s["inflight"] = True
@@ -424,45 +441,33 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                             # 1) первая волна — отправляем сразу всё по m5
                             if first_round:
                                 if "m5" in REQUIRED_TFS:
-                                    # индикаторы
-                                    await asyncio.gather(*[
-                                        request_indicator("m5", inst) for inst in instances_by_tf["m5"]
-                                    ])
-                                    # паки (только те индикаторы, для которых есть ожидаемые базы)
-                                    await asyncio.gather(*[
-                                        request_pack("m5", ind) for ind in pack_ctx["m5"].keys()
-                                    ])
-                                    # MW
-                                    await asyncio.gather(*[
-                                        request_mw("m5", kind) for kind in MW_KINDS
-                                    ])
+                                    await asyncio.gather(*[request_indicator("m5", inst) for inst in instances_by_tf["m5"]])
+                                    await asyncio.gather(*[request_pack("m5", ind) for ind in pack_ctx["m5"].keys()])
+                                    await asyncio.gather(*[request_mw("m5", kind) for kind in MW_KINDS])
                                 first_round = False
                             else:
-                                # 2) ретраи: только те, кто retriable и не inflight
+                                # 2) ретраи: только retriable, не inflight
                                 for tf in REQUIRED_TFS:
-                                    # индикаторы
                                     for inst in instances_by_tf[tf]:
                                         s = ind_ctx[tf][inst["id"]]
                                         if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
                                             await request_indicator(tf, inst)
-                                    # паки
                                     for ind in pack_ctx[tf]:
                                         s = pack_ctx[tf][ind]
                                         if s["state"] in ("pending", "ok_part") and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
                                             await request_pack(tf, ind)
-                                    # MW
                                     for kind in mw_ctx[tf]:
                                         s = mw_ctx[tf][kind]
                                         if s["state"] == "pending" and not s["inflight"] and (s["last_err"] is None or is_retriable(s["last_err"])):
                                             await request_mw(tf, kind)
 
-                            # 3) собираем ответы ~RESP_BLOCK_MS, повторяем внутри окна POLL_INTERVAL_SEC
+                            # 3) собираем ответы ~RESP_BLOCK_MS, повторяя внутри окна POLL_INTERVAL_SEC
                             end_wait = now + timedelta(seconds=POLL_INTERVAL_SEC)
                             collected_rows = []
 
                             while datetime.utcnow() < end_wait:
                                 # индикаторы
-                                for rid, payload in await drain_indicator_responses():
+                                for _, payload in await drain_indicator_responses():
                                     status = payload.get("status")
                                     req_id = payload.get("req_id")
                                     r_symbol = payload.get("symbol")
@@ -476,7 +481,6 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                     s = ind_ctx[tf][iid]
                                     if req_id not in s["req_ids"]:
                                         continue
-                                    # снять inflight
                                     s["req_ids"].discard(req_id)
                                     s["inflight"] = False
                                     if status == "ok":
@@ -502,23 +506,24 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                             s["state"] = "error"
 
                                 # gateway (packs + MW)
-                                for rid, payload in await drain_gateway_responses():
+                                for _, payload in await drain_gateway_responses():
                                     status = payload.get("status")
                                     req_id = payload.get("req_id")
                                     r_symbol = payload.get("symbol")
                                     tf = payload.get("timeframe")
                                     ind = payload.get("indicator")
-                                    if tf not in pack_ctx or r_symbol != symbol or not ind or not req_id:
+                                    if tf not in pack_ctx and tf not in ("m5",):  # этап 2 только m5
+                                        continue
+                                    if r_symbol != symbol or not ind or not req_id:
                                         continue
 
-                                    # это может быть pack или mw
-                                    # пробуем pack
+                                    # это pack или MW
                                     ctx_slot = None
                                     ctx_type = None
-                                    if ind in pack_ctx[tf]:
+                                    if tf in pack_ctx and ind in pack_ctx[tf]:
                                         ctx_slot = pack_ctx[tf][ind]
                                         ctx_type = "pack"
-                                    elif ind in MW_KINDS:
+                                    elif tf in mw_ctx and ind in mw_ctx[tf]:
                                         ctx_slot = mw_ctx[tf][ind]
                                         ctx_type = "mw"
                                     else:
@@ -526,7 +531,6 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
 
                                     if req_id not in ctx_slot["req_ids"]:
                                         continue
-                                    # снять inflight
                                     ctx_slot["req_ids"].discard(req_id)
                                     ctx_slot["inflight"] = False
 
@@ -536,7 +540,6 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                         except Exception:
                                             results = []
 
-                                        # packs: results — список {base, pack}
                                         if ctx_type == "pack":
                                             if not isinstance(results, list):
                                                 ctx_slot["last_err"] = "bad_results"
@@ -547,38 +550,45 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                                         p = item.get("pack", {})
                                                         if not base or not isinstance(p, dict):
                                                             continue
-                                                        # open_time берём из самого пакета (ISO)
-                                                        open_time_iso = p.get("open_time") or payload.get("open_time") \
-                                                            or datetime.utcfromtimestamp(bar_open_ms_by_tf[tf] / 1000).isoformat()
+                                                        open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms_by_tf[tf] / 1000).isoformat()
                                                         rows = build_rows_for_pack_response(
                                                             position_uid, strategy_id, symbol, tf, base, open_time_iso, p
                                                         )
-                                                        collected_rows.extend(rows)
-                                                        ctx_slot["done_bases"].add(base)
+                                                        if rows:
+                                                            collected_rows.extend(rows)
+                                                            ctx_slot["done_bases"].add(base)
                                                     except Exception:
                                                         continue
-                                            # состояние: ok, если закрыли все ожидаемые базы
                                             if ctx_slot["expected_bases"] <= ctx_slot["done_bases"]:
                                                 ctx_slot["state"] = "ok"
                                             else:
                                                 ctx_slot["state"] = "ok_part"
                                             ctx_slot["last_err"] = None
 
-                                        # mw: results — список из одного {base="trend", pack={...}}
                                         else:
                                             if not isinstance(results, list) or not results:
                                                 ctx_slot["last_err"] = "bad_results"
                                             else:
                                                 item = results[0]
-                                                base = item.get("base", ind)
+                                                base = item.get("base", ind)  # trend|volatility|momentum|extremes
                                                 p = item.get("pack", {})
-                                                open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms_by_tf[tf] / 1000).isoformat()
-                                                rows = build_rows_for_pack_response(
-                                                    position_uid, strategy_id, symbol, tf, base, open_time_iso, p
-                                                )
-                                                collected_rows.extend(rows)
-                                                ctx_slot["state"] = "ok"
-                                                ctx_slot["last_err"] = None
+                                                state_val = p.get("state")
+                                                if state_val is None:
+                                                    ctx_slot["last_err"] = "no_state"
+                                                else:
+                                                    open_time_iso = p.get("open_time") or datetime.utcfromtimestamp(bar_open_ms_by_tf[tf] / 1000).isoformat()
+                                                    rows = [(
+                                                        position_uid, strategy_id, symbol, tf,
+                                                        "marketwatch",   # param_type (ОТДЕЛЬНЫЙ ТИП!)
+                                                        base,            # param_base: trend|volatility|momentum|extremes
+                                                        "state",         # param_name
+                                                        None, str(state_val),    # value_num=None, value_text='...'
+                                                        parse_iso(open_time_iso),
+                                                        "ok", None
+                                                    )]
+                                                    collected_rows.extend(rows)
+                                                    ctx_slot["state"] = "ok"
+                                                    ctx_slot["last_err"] = None
                                     else:
                                         err = payload.get("error") or "unknown"
                                         ctx_slot["last_err"] = err
@@ -596,26 +606,18 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
 
                             # 5) критерий готовности m5: все индикаторы, все базы паков, все 4 MW — без pending/error
                             def all_done_tf(tf: str) -> bool:
-                                # индикаторы
                                 if any(s["state"] in ("pending", "error") for s in ind_ctx[tf].values()):
                                     return False
-                                # паки
                                 for ind, s in pack_ctx[tf].items():
                                     if s["state"] == "error":
                                         return False
-                                    # должны закрыть все ожидаемые базы
                                     if not (s["expected_bases"] <= s["done_bases"]):
                                         return False
-                                # MW
                                 if any(s["state"] in ("pending", "error") for s in mw_ctx[tf].values()):
                                     return False
                                 return True
 
-                            all_done = True
-                            for tf in REQUIRED_TFS:
-                                if not all_done_tf(tf):
-                                    all_done = False
-
+                            all_done = all(all_done_tf(tf) for tf in REQUIRED_TFS)
                             if all_done:
                                 elapsed_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
                                 ok_inst = sum(1 for tf in REQUIRED_TFS for s in ind_ctx[tf].values() if s["state"] == "ok")
