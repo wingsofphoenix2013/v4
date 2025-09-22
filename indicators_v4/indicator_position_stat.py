@@ -1,4 +1,4 @@
-# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (m5 only; consumer-groups для ответов, watchdog утерянных req)
+# indicator_position_stat.py — воркер on-demand снимка при открытии позиции (m5 only; consumer-groups, watchdog, неблокирующий диспетчер)
 
 import asyncio
 import json
@@ -17,15 +17,15 @@ GW_RESP_STREAM          = "indicator_gateway_response"
 TARGET_TABLE            = "indicator_position_stat"
 
 # 🔸 Параметры воркера / параллелизм
-REQUIRED_TFS            = ("m5",)          # только m5
+REQUIRED_TFS            = ("m5",)         # только m5
 POLL_INTERVAL_SEC       = 1               # частота ретраев
 RESP_BLOCK_MS           = 300             # короткий блок на чтение ответов
 GLOBAL_TIMEOUT_SEC      = 600             # 10 минут на позицию
 BATCH_SIZE_POS_OPEN     = 20              # чтение позиций
 BATCH_SIZE_RESP         = 200             # чтение ответов (indicator/gateway)
-CONCURRENCY_PER_M5      = 100             # лимит on-demand запросов по m5
+CONCURRENCY_PER_M5      = 150             # лимит on-demand запросов по m5
 POSITIONS_CONCURRENCY   = 16              # одновременно обрабатываемых позиций
-LOST_REQ_SEC            = 5               # watchdog: через сколько секунд считаем req потерянным
+LOST_REQ_SEC            = 12              # watchdog: через сколько секунд считаем req потерянным
 
 # 🔸 Пакеты и MW (m5)
 PACK_INDS = ("ema", "rsi", "mfi", "bb", "lr", "atr", "adx_dmi", "macd")
@@ -46,10 +46,10 @@ PACK_FIELD_WHITELIST = {
 }
 
 # 🔸 Consumer-groups для ответов (гарантированная доставка)
-IND_RESP_GROUP = "iv4_possnap_indresp"
-GW_RESP_GROUP  = "iv4_possnap_gwresp"
-IND_RESP_CONSUMER = "iv4_possnap_router_ind_1"
-GW_RESP_CONSUMER  = "iv4_possnap_router_gw_1"
+IND_RESP_GROUP      = "iv4_possnap_indresp"
+GW_RESP_GROUP       = "iv4_possnap_gwresp"
+IND_RESP_CONSUMER   = "iv4_possnap_router_ind_1"
+GW_RESP_CONSUMER    = "iv4_possnap_router_gw_1"
 
 # 🔸 Логгер
 log = logging.getLogger("IND_POS_STAT")
@@ -60,11 +60,9 @@ def to_bar_open_ms(created_at_iso: str, tf: str) -> int:
     dt = datetime.fromisoformat(created_at_iso)
     return floor_to_bar(int(dt.timestamp() * 1000), tf)
 
-
 # 🔸 Парс ISO → datetime
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s)
-
 
 # 🔸 Подготовка строк для индикаторов (param_type='indicator')
 def build_rows_for_indicator_response(position_uid: str,
@@ -96,7 +94,6 @@ def build_rows_for_indicator_response(position_uid: str,
         ))
     return rows
 
-
 # 🔸 Вставка пачки строк в PG (UPSERT); возвращает upsert_count
 async def insert_rows_pg(pg, rows: list[tuple]) -> int:
     if not rows:
@@ -119,7 +116,6 @@ async def insert_rows_pg(pg, rows: list[tuple]) -> int:
             """, rows)
     return len(rows)
 
-
 # 🔸 Подсчёт уникальных строк по позиции и TF
 async def count_unique_rows(pg, position_uid: str, tf: str) -> int:
     async with pg.acquire() as conn:
@@ -128,7 +124,6 @@ async def count_unique_rows(pg, position_uid: str, tf: str) -> int:
             position_uid, tf
         )
         return int(rec["cnt"]) if rec else 0
-
 
 # 🔸 Антидубли: локальная дедупликация по ключу таблицы
 def dedup_rows(rows: list[tuple]) -> list[tuple]:
@@ -142,14 +137,12 @@ def dedup_rows(rows: list[tuple]) -> list[tuple]:
         out.append(r)
     return out
 
-
 # 🔸 Тип базы по префиксу (ema50 → ema, bb20_2_0 → bb, ...)
 def base_kind(base: str) -> str | None:
     for k in PACK_FIELD_WHITELIST.keys():
         if base.startswith(k):
             return k
     return None
-
 
 # 🔸 Плоский обход pack['pack'] (фильтр мета-полей)
 def flatten_pack_dict(d: dict):
@@ -158,7 +151,6 @@ def flatten_pack_dict(d: dict):
                  "streak_preview", "strong", "direction", "max_adx", "deltas"):
             continue
         yield (k, v)
-
 
 # 🔸 Строки для паков (param_type='pack') по whitelist
 def build_rows_for_pack_response(position_uid: str,
@@ -202,7 +194,6 @@ def build_rows_for_pack_response(position_uid: str,
         ))
     return rows
 
-
 # 🔸 Ожидаемые базы паков из активных инстансов (по m5)
 def build_expected_pack_bases(instances: list[dict]) -> dict[str, set[str]]:
     expected: dict[str, set[str]] = {ind: set() for ind in PACK_INDS}
@@ -233,7 +224,6 @@ def build_expected_pack_bases(instances: list[dict]) -> dict[str, set[str]]:
                 pass
     return expected
 
-
 # 🔸 Роутер ответов (consumer-groups): гарантированная доставка в очередь позиции
 async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
                               stop_event: asyncio.Event):
@@ -252,7 +242,6 @@ async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
 
     while not stop_event.is_set():
         try:
-            # читаем из обоих стримов малыми блоками
             tasks = [
                 redis.xreadgroup(IND_RESP_GROUP, IND_RESP_CONSUMER, streams={INDICATOR_RESP_STREAM: ">"}, count=BATCH_SIZE_RESP, block=RESP_BLOCK_MS),
                 redis.xreadgroup(GW_RESP_GROUP,  GW_RESP_CONSUMER,  streams={GW_RESP_STREAM: ">"},         count=BATCH_SIZE_RESP, block=RESP_BLOCK_MS),
@@ -276,10 +265,8 @@ async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
                                 await queue.put(("indicator", payload))
                                 to_ack.append(msg_id)
                             except Exception:
-                                # не ack — пусть переизвлечётся
                                 pass
                         else:
-                            # нет получателя — ack, чтобы не зависало
                             to_ack.append(msg_id)
                 if to_ack:
                     await redis.xack(INDICATOR_RESP_STREAM, IND_RESP_GROUP, *to_ack)
@@ -310,7 +297,6 @@ async def run_response_router(redis, req_routes: dict, req_lock: asyncio.Lock,
         except Exception as e:
             log.error(f"router loop error: {e}", exc_info=True)
             await asyncio.sleep(0.2)
-
 
 # 🔸 Обработчик одной позиции (только m5; watchdog утерянных req)
 async def handle_position_m5(pg, redis, get_instances_by_tf,
@@ -547,7 +533,6 @@ async def handle_position_m5(pg, redis, get_instances_by_tf,
         now = datetime.utcnow()
         for iid, s in ind_ctx.items():
             if s["state"] == "pending" and s["inflight"] and s["sent_at"] and (now - s["sent_at"]).total_seconds() > LOST_REQ_SEC:
-                # снимаем старые req_id из маршрутов (если ещё там)
                 async with req_lock:
                     for rid in list(s["req_ids"]):
                         req_routes.pop(rid, None)
@@ -613,8 +598,7 @@ async def handle_position_m5(pg, redis, get_instances_by_tf,
         for rid in list(all_req_ids):
             req_routes.pop(rid, None)
 
-
-# 🔸 Основной воркер: диспетчер позиций + глобальный роутер ответов (m5 only)
+# 🔸 Основной воркер: диспетчер позиций + глобальный роутер ответов (m5 only; неблокирующий)
 async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precision):
     group = "iv4_possnap_group"
     consumer = "iv4_possnap_1"
@@ -638,6 +622,9 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
     stop_event = asyncio.Event()
     router_task = asyncio.create_task(run_response_router(redis, req_routes, req_lock, stop_event))
 
+    # пул активных задач позиций (для уборки завершённых)
+    active_tasks: set[asyncio.Task] = set()
+
     try:
         while True:
             try:
@@ -654,10 +641,13 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                 continue
 
             if not resp:
+                # уборка завершённых задач, чтобы пул не рос
+                for t in list(active_tasks):
+                    if t.done():
+                        active_tasks.discard(t)
                 continue
 
             to_ack = []
-            pos_tasks = []
 
             for _, messages in resp:
                 for msg_id, data in messages:
@@ -675,6 +665,7 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                             to_ack.append(msg_id)
                             continue
 
+                        # запускаем обработку позиции как отдельную задачу (не ждём завершения в диспетчере)
                         async def run_one():
                             async with pos_sema:
                                 await handle_position_m5(pg, redis, get_instances_by_tf,
@@ -682,21 +673,21 @@ async def run_indicator_position_stat(pg, redis, get_instances_by_tf, get_precis
                                                          req_routes, req_lock, m5_semaphore)
 
                         task = asyncio.create_task(run_one())
-                        pos_tasks.append((msg_id, task))
+                        active_tasks.add(task)
+                        # неблокирующий диспетчер: ACK СРАЗУ после успешного спауна задачи
+                        to_ack.append(msg_id)
 
                     except Exception as e:
                         log.error(f"position spawn error: {e}", exc_info=True)
-
-            # ждём завершения всех задач пачки и ACK-аем соответствующие сообщения
-            for msg_id, task in pos_tasks:
-                try:
-                    await task
-                    to_ack.append(msg_id)
-                except Exception as e:
-                    log.error(f"position task error: {e}", exc_info=True)
+                        # не ACK — повторим позже
 
             if to_ack:
                 await redis.xack(POSITIONS_OPEN_STREAM, group, *to_ack)
+
+            # уборка завершённых задач
+            for t in list(active_tasks):
+                if t.done():
+                    active_tasks.discard(t)
 
     finally:
         stop_event.set()
