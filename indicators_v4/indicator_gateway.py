@@ -455,7 +455,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"no_results"})
 
                 t1 = time.monotonic()
-                log.info(f"[DONE] IND_GATEWAY {ind.upper()} {symbol}/{tf} elapsed_ms={int((t1-t0)*1000)} results={len(results)}")
+                log.debug(f"[DONE] IND_GATEWAY {ind.upper()} {symbol}/{tf} elapsed_ms={int((t1-t0)*1000)} results={len(results)}")
                 return msg_id
 
             except Exception as e:
