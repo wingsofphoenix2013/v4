@@ -14,28 +14,6 @@ from config_loader import (
     config_event_listener,
 )
 
-from oracle_rsibins_snapshot_aggregator import run_oracle_rsibins_snapshot_aggregator
-from oracle_rsibins_snapshot_backfill import run_oracle_rsibins_snapshot_backfill
-from oracle_bbbins_snapshot_aggregator import run_oracle_bbbins_snapshot_aggregator
-from oracle_bbbins_snapshot_backfill import run_oracle_bbbins_snapshot_backfill
-from oracle_adxbins_snapshot_aggregator import run_oracle_adxbins_snapshot_aggregator
-from oracle_adxbins_snapshot_backfill import run_oracle_adxbins_snapshot_backfill
-from oracle_dmigap_snapshot_aggregator import run_oracle_dmigap_snapshot_aggregator
-from oracle_dmigap_snapshot_backfill import run_oracle_dmigap_snapshot_backfill
-from oracle_emastatus_snapshot_aggregator import run_oracle_emastatus_snapshot_aggregator
-from oracle_emastatus_snapshot_backfill import run_oracle_emastatus_snapshot_backfill
-from oracle_emapattern_snapshot_aggregator import run_oracle_emapattern_snapshot_aggregator
-from oracle_emapattern_snapshot_backfill import run_oracle_emapattern_snapshot_backfill
-from oracle_mw_aggregator import run_oracle_mw_aggregator
-from oracle_mw_backfill import run_oracle_mw_backfill
-from oracle_mw_rsi_quartet_aggregator import run_oracle_mw_rsi_quartet_aggregator
-from oracle_mw_adx_quartet_aggregator import run_oracle_mw_adx_quartet_aggregator
-from oracle_mw_bb_quartet_aggregator import run_oracle_mw_bb_quartet_aggregator
-from oracle_mw_dmigap_quartet_aggregator import run_oracle_mw_dmigap_quartet_aggregator
-from oracle_mw_emastatus_quartet_aggregator import run_oracle_mw_emastatus_quartet_aggregator
-from oracle_kingwatch_aggregator import run_oracle_kingwatch_aggregator
-from oracle_kingwatch_backfill import run_oracle_kingwatch_backfill
-
 log = logging.getLogger("ORACLE_MAIN")
 
 
@@ -98,27 +76,6 @@ async def main():
     # Слушатель конфигурационных событий (тикеры + стратегии)
     await asyncio.gather(
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
-        run_safe_loop(run_oracle_rsibins_snapshot_aggregator, "RSIBINS_SNAP"),
-        run_safe_loop(run_oracle_rsibins_snapshot_backfill, "RSI_BINS_BF"),
-        run_safe_loop(run_oracle_bbbins_snapshot_aggregator, "BB_BINS_SNAP"),
-        run_safe_loop(run_oracle_bbbins_snapshot_backfill, "BB_BINS_BF"),
-        run_safe_loop(run_oracle_adxbins_snapshot_aggregator, "ADX_BINS_SNAP"),
-        run_safe_loop(run_oracle_adxbins_snapshot_backfill, "ADX_BINS_BF"),
-        run_safe_loop(run_oracle_dmigap_snapshot_aggregator, "DMI_GAP_SNAP"),
-        run_safe_loop(run_oracle_dmigap_snapshot_backfill, "DMI_GAP_BF"),
-        run_safe_loop(run_oracle_emastatus_snapshot_aggregator, "EMA_STATUS_SNAP"),
-        run_safe_loop(run_oracle_emastatus_snapshot_backfill, "EMA_STATUS_BF"),
-        run_safe_loop(run_oracle_emapattern_snapshot_aggregator, "EMAPATTERN_SNAP"),
-        run_safe_loop(run_oracle_emapattern_snapshot_backfill, "EMAPATTERN_BF"),
-        run_safe_loop(run_oracle_mw_aggregator, "MW_AGG"),
-        run_safe_loop(run_oracle_mw_backfill, "MW_BF"),
-        run_safe_loop(run_oracle_mw_rsi_quartet_aggregator, "MW_RSI_Q"),
-        run_safe_loop(run_oracle_mw_adx_quartet_aggregator, "MW_ADX_Q"),
-        run_safe_loop(run_oracle_mw_bb_quartet_aggregator, "MW_BB_Q"),
-        run_safe_loop(run_oracle_mw_dmigap_quartet_aggregator, "MW_DMIGAP_Q"),
-        run_safe_loop(run_oracle_mw_emastatus_quartet_aggregator, "MW_EMA_Q"),
-        run_safe_loop(run_oracle_kingwatch_aggregator, "KW_AGG"),
-        run_safe_loop(run_oracle_kingwatch_backfill, "KW_BF"),
     )
 
 if __name__ == "__main__":
