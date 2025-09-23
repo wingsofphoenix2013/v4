@@ -209,7 +209,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 ready = await wait_current_bar(redis, symbol, tf, bar_open_ms)
                 if not ready and mode == "pack":
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"not_ready"})
-                    log.info(f"IND_GATEWAY PACK not_ready {ind} {symbol}/{tf} open={open_iso}")
+                    log.debug(f"IND_GATEWAY PACK not_ready {ind} {symbol}/{tf} open={open_iso}")
                     return msg_id
 
                 results: list[dict] = []
@@ -569,7 +569,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                         "results": json.dumps(results),
                     })
                     t1 = time.monotonic()
-                    log.info(
+                    log.debug(
                         f"IND_GATEWAY OK mode={mode} ind={ind} {symbol}/{tf} "
                         f"open={open_iso} count={len(results)} cache_hits={cache_hits} "
                         f"elapsed_ms={int((t1-t0)*1000)}"
@@ -577,7 +577,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 else:
                     await redis.xadd(RESP_STREAM, {"req_id": msg_id, "status":"error", "error":"no_results"})
                     t1 = time.monotonic()
-                    log.info(
+                    log.debug(
                         f"IND_GATEWAY EMPTY mode={mode} ind={ind} {symbol}/{tf} "
                         f"open={open_iso} cache_hits={cache_hits} elapsed_ms={int((t1-t0)*1000)}"
                     )

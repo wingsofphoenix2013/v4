@@ -14,9 +14,9 @@ REQ_STREAM_POSITIONS = "positions_open_stream"
 GW_REQ_STREAM        = "indicator_gateway_request"
 GW_RESP_STREAM       = "indicator_gateway_response"
 
-POS_CONCURRENCY     = 6           # сколько позиций одновременно обрабатываем
+POS_CONCURRENCY     = 5           # сколько позиций одновременно обрабатываем
 BATCH_INSERT_SIZE   = 400         # батч вставки в PG
-POS_TFS_ORDER       = ["m5"]  # порядок TF (m5 всегда первым)
+POS_TFS_ORDER       = ["m5", "m15", "h1"]  # порядок TF (m5 всегда первым)
 POS_DRY_RUN         = True       # True = не пишем в PG, только логи
 POS_REQ_TIMEOUT_SEC = 15.0        # таймаут ожидания ответов за один TF (секунды)
 
