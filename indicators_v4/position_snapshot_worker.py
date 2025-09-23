@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+import uuid
+
 
 # 🔸 Логгер
 log = logging.getLogger("POS_SNAPSHOT")
@@ -90,12 +92,12 @@ def build_tf_requests(symbol: str, tf: str, created_at_ms: int) -> tuple[list[di
         tags.append((ind, "pack"))
     return reqs, tags
 
-# 🔸 Отправить ВСЕ запросы TF в gateway и собирать ответы до истечения time_left
+# 🔸 Отправить ВСЕ запросы TF в gateway и собирать ответы до истечения time_left (уникальный consumer; ACK только своих)
 async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> tuple[list[dict], set[str]]:
     group = "possnap_gw_group"
-    consumer = "possnap_gw_1"
+    # уникальное имя consumer'а на каждый вызов (TF)
+    consumer = f"possnap_gw_{uuid.uuid4().hex[:10]}"
 
-    # создать consumer-group для ответа (идемпотентно)
     try:
         await redis.xgroup_create(GW_RESP_STREAM, group, id="$", mkstream=True)
     except Exception as e:
@@ -111,7 +113,6 @@ async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> 
         except Exception as e:
             log.warning(f"[GW] xadd req error: {e}")
 
-    # сбор ответов по req_id
     collected: dict[str, dict] = {}
     deadline = asyncio.get_event_loop().time() + max(0.0, time_left_sec)
 
@@ -132,22 +133,22 @@ async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> 
         if not resp:
             continue
 
-        to_ack = []
+        to_ack_ours = []   # ACK только наши
         for _, messages in resp:
             for msg_id, data in messages:
-                to_ack.append(msg_id)
                 rid = data.get("req_id")
                 if rid in req_ids:
                     collected[rid] = data
                     req_ids.remove(rid)
+                    to_ack_ours.append(msg_id)
+                # иначе это ответ для другого consumer'а/TF — НЕ ACK'аем!
 
-        if to_ack:
+        if to_ack_ours:
             try:
-                await redis.xack(GW_RESP_STREAM, group, *to_ack)
+                await redis.xack(GW_RESP_STREAM, group, *to_ack_ours)
             except Exception:
                 pass
 
-    # вернём ответы и набор неотвеченных req_ids (на них можно ретраиться — если понадобится)
     return list(collected.values()), req_ids
 
 # 🔸 Преобразование ответа gateway (OK) → строки indicator_position_stat
