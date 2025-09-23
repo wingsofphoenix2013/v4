@@ -92,9 +92,18 @@ def build_tf_requests(symbol: str, tf: str, created_at_ms: int) -> tuple[list[di
         tags.append((ind, "pack"))
     return reqs, tags
 
-# 🔸 Отправить все запросы и собрать ответы через XREAD (без consumer-group, без ACK)
+# 🔸 Отправить ВСЕ запросы TF и собрать ответы через XREAD с baseline id (без consumer-group, без ACK)
 async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> tuple[list[dict], set[str]]:
-    # отправляем все запросы, запоминаем их req_id (msg_id из request-стрима)
+    # 1) взять базовую метку ДО отправки (последний id в стриме или "0-0")
+    since_id = "0-0"
+    try:
+        tail = await redis.execute_command("XREVRANGE", GW_RESP_STREAM, "+", "-", "COUNT", 1)
+        if tail and len(tail) > 0:
+            since_id = tail[0][0]  # например "1716484845123-0"
+    except Exception:
+        pass
+
+    # 2) отправка всех запросов, запомнить их req_id (msg_id запроса)
     req_ids = set()
     for payload in reqs:
         try:
@@ -104,10 +113,10 @@ async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> 
             log.warning(f"[GW] xadd req error: {e}")
 
     collected: dict[str, dict] = {}
-    # читаем только НОВЫЕ сообщения, пришедшие ПОСЛЕ этой точки
-    last_id = ">"
     deadline = asyncio.get_event_loop().time() + max(0.0, time_left_sec)
+    last_id = since_id  # курсор XREAD: читать сообщения с ID > last_id
 
+    # 3) читать ответы до дедлайна, фильтровать по req_id
     while req_ids and asyncio.get_event_loop().time() < deadline:
         try:
             resp = await redis.xread(streams={GW_RESP_STREAM: last_id}, count=200, block=1000)
@@ -119,10 +128,12 @@ async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> 
         if not resp:
             continue
 
-        # формат resp: [(stream, [(msg_id, fields), ...])]
+        # resp: [(stream, [(msg_id, fields), ...])]
         for _, messages in resp:
+            if messages:
+                # продвигаем курсор на ПОСЛЕДНИЙ ID из пакета
+                last_id = messages[-1][0]
             for msg_id, data in messages:
-                last_id = msg_id  # продвигаем курсор
                 rid = data.get("req_id")
                 if rid in req_ids:
                     collected[rid] = data
