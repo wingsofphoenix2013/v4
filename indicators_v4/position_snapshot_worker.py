@@ -393,7 +393,7 @@ async def process_tf(pg, redis, position_uid: str, strategy_id: int, symbol: str
 
     tf_t1 = asyncio.get_event_loop().time()
     received = len(resps)
-    log.info(f"[TF] {symbol}/{tf} ok={len(ok_rows_all)} err={len(err_rows_all)} expected={expected} received={received} missing={missing} elapsed_ms={int((tf_t1-tf_t0)*1000)}")
+    log.debug(f"[TF] {symbol}/{tf} ok={len(ok_rows_all)} err={len(err_rows_all)} expected={expected} received={received} missing={missing} elapsed_ms={int((tf_t1-tf_t0)*1000)}")
 
     return ok_rows_all, err_rows_all
 
@@ -408,16 +408,16 @@ async def process_position(pg, redis, get_strategy_mw, pos_payload: dict) -> Non
     created_at_iso = pos_payload.get("created_at")
 
     if not position_uid or not symbol or strategy_id is None or not created_at_iso:
-        log.info(f"[SKIP] bad position payload: {pos_payload}")
+        log.debug(f"[SKIP] bad position payload: {pos_payload}")
         return
 
     # фильтр по стратегиям: только те, где market_watcher=true
     try:
         if not get_strategy_mw(int(strategy_id)):
-            log.info(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
+            log.debug(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
             return
     except Exception:
-        log.info(f"[SKIP] strategy_id={strategy_id} (mw flag check failed)")
+        log.debug(f"[SKIP] strategy_id={strategy_id} (mw flag check failed)")
         return
 
     created_at_ms = iso_to_ms(created_at_iso)
@@ -440,7 +440,7 @@ async def process_position(pg, redis, get_strategy_mw, pos_payload: dict) -> Non
                 log.warning(f"[POS] db_timeout uid={position_uid} sym={symbol} tf={tf}")
 
     pos_t1 = asyncio.get_event_loop().time()
-    log.info(f"POS_SNAPSHOT OK uid={position_uid} sym={symbol} ok_rows={total_ok} err_rows={total_err} elapsed_ms={int((pos_t1-pos_t0)*1000)}")
+    log.debug(f"POS_SNAPSHOT OK uid={position_uid} sym={symbol} ok_rows={total_ok} err_rows={total_err} elapsed_ms={int((pos_t1-pos_t0)*1000)}")
 
 # 🔸 Основной воркер: подписка на positions_open_stream, TF последовательно, приоритет m5; общий таймаут на позицию
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw):

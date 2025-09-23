@@ -30,7 +30,7 @@ RESP_STREAM = "indicator_gateway_response"
 
 # 🔸 Параметры параллелизма/батчинга и ожиданий
 GATEWAY_CONCURRENCY   = 30
-GATEWAY_BATCH_SIZE    = 100
+GATEWAY_BATCH_SIZE    = 200
 GW_WAIT_FIRST_MS      = 5000   # первые 5 секунд ждём активно
 GW_WAIT_RETRIES       = 10      # потом 5 попыток по 1 секунде
 GW_WAIT_RETRY_GAP_MS  = 1000
@@ -598,7 +598,7 @@ async def run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, c
                 group, consumer,
                 streams={REQ_STREAM: ">"},
                 count=GATEWAY_BATCH_SIZE,
-                block=2000
+                block=1000
             )
         except Exception as e:
             log.error(f"IND_GATEWAY read error: {e}", exc_info=True)
