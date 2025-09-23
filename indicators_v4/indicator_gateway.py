@@ -29,10 +29,10 @@ REQ_STREAM  = "indicator_gateway_request"
 RESP_STREAM = "indicator_gateway_response"
 
 # 🔸 Параметры параллелизма/батчинга и ожиданий
-GATEWAY_CONCURRENCY   = 20
+GATEWAY_CONCURRENCY   = 30
 GATEWAY_BATCH_SIZE    = 100
 GW_WAIT_FIRST_MS      = 5000   # первые 5 секунд ждём активно
-GW_WAIT_RETRIES       = 5      # потом 5 попыток по 1 секунде
+GW_WAIT_RETRIES       = 10      # потом 5 попыток по 1 секунде
 GW_WAIT_RETRY_GAP_MS  = 1000
 GW_CACHE_TTL_SEC      = 30
 GW_LOCK_TTL_SEC       = 15     # должен покрывать все ожидания
