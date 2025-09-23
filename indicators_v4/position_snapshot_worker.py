@@ -92,19 +92,9 @@ def build_tf_requests(symbol: str, tf: str, created_at_ms: int) -> tuple[list[di
         tags.append((ind, "pack"))
     return reqs, tags
 
-# 🔸 Отправить ВСЕ запросы TF в gateway и собирать ответы до истечения time_left (уникальный consumer; ACK только своих)
+# 🔸 Отправить все запросы и собрать ответы через XREAD (без consumer-group, без ACK)
 async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> tuple[list[dict], set[str]]:
-    group = "possnap_gw_group"
-    # уникальное имя consumer'а на каждый вызов (TF)
-    consumer = f"possnap_gw_{uuid.uuid4().hex[:10]}"
-
-    try:
-        await redis.xgroup_create(GW_RESP_STREAM, group, id="$", mkstream=True)
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            log.warning(f"[GW] xgroup_create resp error: {e}")
-
-    # отправка всех запросов
+    # отправляем все запросы, запоминаем их req_id (msg_id из request-стрима)
     req_ids = set()
     for payload in reqs:
         try:
@@ -114,43 +104,32 @@ async def gw_send_and_collect(redis, reqs: list[dict], time_left_sec: float) -> 
             log.warning(f"[GW] xadd req error: {e}")
 
     collected: dict[str, dict] = {}
+    # читаем только НОВЫЕ сообщения, пришедшие ПОСЛЕ этой точки
+    last_id = ">"
     deadline = asyncio.get_event_loop().time() + max(0.0, time_left_sec)
 
     while req_ids and asyncio.get_event_loop().time() < deadline:
         try:
-            resp = await redis.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={GW_RESP_STREAM: ">"},
-                count=200,
-                block=1000
-            )
+            resp = await redis.xread(streams={GW_RESP_STREAM: last_id}, count=200, block=1000)
         except Exception as e:
-            log.warning(f"[GW] read resp error: {e}")
+            log.warning(f"[GW] xread resp error: {e}")
             await asyncio.sleep(0.2)
             continue
 
         if not resp:
             continue
 
-        to_ack_ours = []   # ACK только наши
+        # формат resp: [(stream, [(msg_id, fields), ...])]
         for _, messages in resp:
             for msg_id, data in messages:
+                last_id = msg_id  # продвигаем курсор
                 rid = data.get("req_id")
                 if rid in req_ids:
                     collected[rid] = data
                     req_ids.remove(rid)
-                    to_ack_ours.append(msg_id)
-                # иначе это ответ для другого consumer'а/TF — НЕ ACK'аем!
-
-        if to_ack_ours:
-            try:
-                await redis.xack(GW_RESP_STREAM, group, *to_ack_ours)
-            except Exception:
-                pass
 
     return list(collected.values()), req_ids
-
+        
 # 🔸 Преобразование ответа gateway (OK) → строки indicator_position_stat
 def map_gateway_ok_to_rows(position_uid: str,
                            strategy_id: int,
