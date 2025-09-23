@@ -1,11 +1,9 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (единый on-demand через indicator_gateway)
 
 import asyncio
 import json
 import logging
 import pandas as pd
-from collections import defaultdict
-import math
 from datetime import datetime, timedelta
 
 # 🔸 Инфраструктура и воркеры
@@ -18,26 +16,22 @@ from indicators.compute_and_store import compute_and_store, compute_snapshot_val
 from cleanup_worker import run_indicators_cleanup
 from indicator_gateway import run_indicator_gateway
 
-# 🔸 Воркеры MarketWatch (Trend)
+# 🔸 Воркеры MarketWatch
 from indicator_mw_trend import run_indicator_mw_trend
 from indicator_mw_volatility import run_indicator_mw_volatility
 from indicator_mw_momentum import run_indicator_mw_momentum
 from indicator_mw_extremes import run_indicator_mw_extremes
 
-# 🔸 Воркер Snapshot
-# зарезервировано под воркеров снапшотов
-
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
-indicator_instances = {}    # instance_id -> dict(indicator, timeframe, stream_publish, params, enabled_at)
+indicator_instances = {}    # instance_id -> {indicator, timeframe, stream_publish, params, enabled_at}
 required_candles = {
     "m5": 800,
     "m15": 800,
     "h1": 800,
 }
-# 🔸 Кэш стратегий (id -> market_watcher)
-active_strategies = {}
+active_strategies = {}      # стратегия id -> market_watcher: bool
 
 AUDIT_WINDOW_HOURS = 12
 
@@ -62,13 +56,15 @@ def get_instances_by_tf(tf: str):
         if inst["timeframe"] == tf
     ]
 
+
 def get_precision(symbol: str) -> int:
     return active_tickers.get(symbol, 8)
+
 
 def get_active_symbols():
     return list(active_tickers.keys())
 
-# 🔸 Признак market_watcher по стратегии
+
 def get_strategy_mw(strategy_id: int) -> bool:
     return bool(active_strategies.get(int(strategy_id), False))
 
@@ -130,6 +126,7 @@ async def load_initial_strategies(pg):
             active_strategies[int(row["id"])] = bool(row["market_watcher"])
             log.debug(f"Loaded strategy: id={row['id']} → market_watcher={row['market_watcher']}")
     log.info(f"INIT: стратегий (enabled & not archived) загружено: {len(active_strategies)}")
+
 
 # 🔸 Подписка на обновления тикеров (Bybit stream) + периодический рефреш precision из tickers_bb
 async def watch_ticker_updates(pg, redis):
@@ -241,6 +238,7 @@ async def watch_ticker_updates(pg, redis):
             log.error(f"TICKER_UPDATES loop error: {e}", exc_info=True)
             await asyncio.sleep(2)
 
+
 # 🔸 Подписка на обновления расчётов индикаторов (pub/sub; фикс: не теряем enabled_at)
 async def watch_indicator_updates(pg, redis):
     log = logging.getLogger("INDICATOR_UPDATES")
@@ -274,7 +272,7 @@ async def watch_indicator_updates(pg, redis):
                             log.info(f"Индикатор m1 проигнорирован: id={iid}")
                             continue
 
-                        # фиксируем момент активации и сразу получаем фактический enabled_at
+                        # фиксируем момент активации и получаем фактический enabled_at
                         upd = await conn.fetchrow(
                             "UPDATE indicator_instances_v4 SET enabled_at = NOW() WHERE id = $1 RETURNING enabled_at",
                             iid
@@ -289,7 +287,7 @@ async def watch_indicator_updates(pg, redis):
                         """, iid)
                         param_map = {p["param"]: p["value"] for p in params}
 
-                    # обновляем карту инстансов в памяти с реальным enabled_at
+                    # обновляем карту инстансов в памяти
                     indicator_instances[iid] = {
                         "indicator": row["indicator"],
                         "timeframe": row["timeframe"],
@@ -297,7 +295,6 @@ async def watch_indicator_updates(pg, redis):
                         "params": param_map,
                         "enabled_at": enabled_at,
                     }
-                    # лог результата
                     log.info(f"Индикатор включён: id={iid} {row['indicator']} {param_map}, enabled_at={enabled_at}")
 
                 else:
@@ -310,6 +307,7 @@ async def watch_indicator_updates(pg, redis):
 
         except Exception as e:
             log.warning(f"Ошибка в indicator event: {e}")
+
 
 # 🔸 Загрузка свечей из Redis TimeSeries (Bybit TS префикс)
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
@@ -412,133 +410,6 @@ async def watch_ohlcv_events(pg, redis):
             log.warning(f"Ошибка в {BB_OHLCV_CHANNEL}: {e}")
 
 
-# 🔸 On-demand расчёт индикаторов: indicator_request → indicator_response
-async def watch_indicator_requests(pg, redis):
-    log = logging.getLogger("IND_ONDEMAND")
-
-    step_min = {"m5": 5, "m15": 15, "h1": 60}
-    stream = "indicator_request"
-    group = "ind_req_group"
-    consumer = "ind_req_1"
-
-    # helper: floor к началу бара
-    def floor_to_bar(ts_ms: int, tf: str) -> int:
-        step = step_min[tf] * 60_000
-        return (ts_ms // step) * step
-
-    # создать consumer-group
-    try:
-        await redis.xgroup_create(stream, group, id="$", mkstream=True)
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            log.warning(f"xgroup_create error: {e}")
-
-    while True:
-        try:
-            resp = await redis.xreadgroup(group, consumer, streams={stream: ">"}, count=50, block=2000)
-            if not resp:
-                continue
-
-            to_ack = []
-            ok_count = 0
-            err_count = 0
-
-            for _, messages in resp:
-                for msg_id, data in messages:
-                    to_ack.append(msg_id)
-                    try:
-                        symbol = data.get("symbol")
-                        interval = data.get("timeframe") or data.get("interval")
-                        iid_raw = data.get("instance_id")
-                        ts_raw = data.get("timestamp_ms")
-
-                        if not symbol or interval not in step_min or not iid_raw or not ts_raw:
-                            await redis.xadd("indicator_response", {
-                                "req_id": msg_id, "status": "error", "error": "bad_request"
-                            })
-                            err_count += 1
-                            continue
-
-                        instance_id = int(iid_raw)
-                        ts_ms = int(ts_raw)
-
-                        inst = indicator_instances.get(instance_id)
-                        if not inst or inst.get("timeframe") != interval:
-                            await redis.xadd("indicator_response", {
-                                "req_id": msg_id, "status": "error", "error": "instance_not_active"
-                            })
-                            err_count += 1
-                            continue
-
-                        enabled_at = inst.get("enabled_at")
-                        bar_open_ms = floor_to_bar(ts_ms, interval)
-
-                        if enabled_at:
-                            enabled_ms = int(enabled_at.replace(tzinfo=None).timestamp() * 1000)
-                            if bar_open_ms < enabled_ms:
-                                await redis.xadd("indicator_response", {
-                                    "req_id": msg_id, "status": "error", "error": "before_enabled_at"
-                                })
-                                err_count += 1
-                                continue
-
-                        precision = active_tickers.get(symbol)
-                        if precision is None:
-                            await redis.xadd("indicator_response", {
-                                "req_id": msg_id, "status": "error", "error": "symbol_not_active"
-                            })
-                            err_count += 1
-                            continue
-
-                        depth = required_candles.get(interval, 800)
-                        df = await load_ohlcv_from_redis(redis, symbol, interval, bar_open_ms, depth)
-                        if df is None or df.empty:
-                            await redis.xadd("indicator_response", {
-                                "req_id": msg_id, "status": "error", "error": "no_ohlcv"
-                            })
-                            err_count += 1
-                            continue
-
-                        values = await compute_snapshot_values_async(inst, symbol, df, precision)
-                        if not values:
-                            await redis.xadd("indicator_response", {
-                                "req_id": msg_id, "status": "error", "error": "no_values"
-                            })
-                            err_count += 1
-                            continue
-
-                        await redis.xadd("indicator_response", {
-                            "req_id": msg_id,
-                            "status": "ok",
-                            "symbol": symbol,
-                            "timeframe": interval,
-                            "instance_id": str(instance_id),
-                            "open_time": datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat(),
-                            "using_current_bar": "true",
-                            "is_final": "false",
-                            "results": json.dumps(values),
-                        })
-                        ok_count += 1
-
-                    except Exception as e:
-                        log.warning(f"request error: {e}", exc_info=True)
-                        await redis.xadd("indicator_response", {
-                            "req_id": msg_id, "status": "error", "error": "exception"
-                        })
-                        err_count += 1
-
-            if to_ack:
-                await redis.xack(stream, group, *to_ack)
-
-            # итог логирования
-            if ok_count or err_count:
-                log.debug(f"IND_ONDEMAND: ok={ok_count}, errors={err_count}")
-
-        except Exception as e:
-            logging.getLogger("IND_ONDEMAND").error(f"loop error: {e}", exc_info=True)
-            await asyncio.sleep(2)
-
-
 # 🔸 Точка входа
 async def main():
     setup_logging()
@@ -550,7 +421,7 @@ async def main():
     await load_initial_strategies(pg)
 
     # инструкции по включению в общий оркестратор:
-    # - этот модуль запускается как часть общего процесса (через run_safe_loop в oracle_v4_main.py / indicators_v4_main.py)
+    # - модуль запускается как часть общего процесса (через run_safe_loop)
     # - все воркеры ниже самостоятельны и перезапускаются при ошибках
     await asyncio.gather(
         run_safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
@@ -560,7 +431,6 @@ async def main():
         run_safe_loop(lambda: run_indicator_auditor(pg, redis, window_hours=AUDIT_WINDOW_HOURS), "IND_AUDITOR"),
         run_safe_loop(lambda: run_indicator_healer(pg, redis), "IND_HEALER"),
         run_safe_loop(lambda: run_indicator_ts_filler(pg, redis), "IND_TS_FILLER"),
-        run_safe_loop(lambda: watch_indicator_requests(pg, redis), "IND_ONDEMAND"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, compute_snapshot_values_async), "IND_GATEWAY"),
         run_safe_loop(lambda: run_indicator_mw_trend(pg, redis), "MW_TREND"),
