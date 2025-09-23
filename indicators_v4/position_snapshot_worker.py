@@ -1,10 +1,9 @@
-# position_snapshot_worker.py — воркер снапшотов индикаторов/паков/MW по открытым позициям (m5 приоритет, затем m15/h1; запросы в indicator_gateway; UPSERT в indicator_position_stat)
+# position_snapshot_worker.py — воркер снапшотов индикаторов/паков/MW по открытым позициям (m5 приоритет; m15→h1 последовательно; запросы через indicator_gateway; UPSERT в indicator_position_stat)
 
-import os
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # 🔸 Логгер
 log = logging.getLogger("POS_SNAPSHOT")
@@ -14,11 +13,13 @@ REQ_STREAM_POSITIONS = "positions_open_stream"
 GW_REQ_STREAM        = "indicator_gateway_request"
 GW_RESP_STREAM       = "indicator_gateway_response"
 
-POS_CONCURRENCY     = 5           # сколько позиций одновременно обрабатываем
-BATCH_INSERT_SIZE   = 400         # батч вставки в PG
+POS_CONCURRENCY     = 6            # сколько позиций одновременно обрабатываем
+BATCH_INSERT_SIZE   = 400          # батч вставки в PG
 POS_TFS_ORDER       = ["m5", "m15", "h1"]  # порядок TF (m5 всегда первым)
-POS_DRY_RUN         = True       # True = не пишем в PG, только логи
-POS_REQ_TIMEOUT_SEC = 15.0        # таймаут ожидания ответов за один TF (секунды)
+POS_DRY_RUN         = False        # True = не пишем в PG, только логи
+POS_REQ_TIMEOUT_SEC = 35.0         # общий таймаут ожидания ответов за один TF (секунды)
+TF_WAVE_SIZE        = 10           # отправляем запросы в gateway «волнами» по N штук, чтобы не забивать очередь
+
 
 # 🔸 Пакеты: какие поля писать в indicator_position_stat (param_type='pack')
 PACK_WHITELIST = {
@@ -34,10 +35,11 @@ PACK_WHITELIST = {
                 "hist_trend_strict", "hist_trend_smooth"],
 }
 
-# 🔸 Список типов на TF (RAW/ PACK / MW)
-RAW_TYPES = ["rsi","mfi","ema","atr","lr","adx_dmi","macd","bb"]
+# 🔸 Список типов на TF (RAW / PACK / MW)
+RAW_TYPES  = ["rsi","mfi","ema","atr","lr","adx_dmi","macd","bb"]
 PACK_TYPES = ["rsi","mfi","ema","atr","lr","adx_dmi","macd","bb"]
 MW_TYPES   = ["trend","volatility","momentum","extremes"]
+
 
 # 🔸 Вспомогательные: floor к началу бара по TF (ms → ms)
 def floor_to_bar_ms(ts_ms: int, tf: str) -> int:
@@ -57,7 +59,6 @@ def iso_to_ms(iso_str: str) -> int:
 
 # 🔸 Построить один запрос в gateway (mode=raw|pack)
 def make_gw_request(symbol: str, tf: str, indicator: str, now_ms: int, mode: str) -> dict:
-    # без length/std: gateway вернёт все активные инстансы этого индикатора на TF
     return {
         "symbol": symbol,
         "timeframe": tf,
@@ -66,8 +67,8 @@ def make_gw_request(symbol: str, tf: str, indicator: str, now_ms: int, mode: str
         "mode": mode,
     }
 
-# 🔸 Отправить пачку запросов в gateway и дождаться всех ответов (в своей consumer-group)
-async def gw_send_and_collect(redis, reqs: list[dict], timeout_sec: float) -> list[dict]:
+# 🔸 Отправка «волны» запросов в gateway и сбор ответов в пределах оставшегося таймаута
+async def gw_send_wave_and_collect(redis, reqs: list[dict], time_left_sec: float) -> list[dict]:
     group = "possnap_gw_group"
     consumer = "possnap_gw_1"
 
@@ -89,9 +90,8 @@ async def gw_send_and_collect(redis, reqs: list[dict], timeout_sec: float) -> li
 
     # сбор ответов по req_id
     collected: dict[str, dict] = {}
-    deadline = asyncio.get_event_loop().time() + timeout_sec
+    deadline = asyncio.get_event_loop().time() + max(0.0, time_left_sec)
 
-    # читаем циклом, пока не соберём все req_id или не истечёт таймаут
     while req_ids and asyncio.get_event_loop().time() < deadline:
         try:
             resp = await redis.xreadgroup(
@@ -115,7 +115,6 @@ async def gw_send_and_collect(redis, reqs: list[dict], timeout_sec: float) -> li
                 to_ack.append(msg_id)
                 rid = data.get("req_id")
                 if rid in req_ids:
-                    # сохраняем ответ целиком (включая ошибки)
                     collected[rid] = data
                     req_ids.remove(rid)
 
@@ -125,7 +124,6 @@ async def gw_send_and_collect(redis, reqs: list[dict], timeout_sec: float) -> li
             except Exception:
                 pass
 
-    # вернём список ответов (те, что не пришли к дедлайну — пропадут; обработаем как timeout на уровне TF)
     return list(collected.values())
 
 # 🔸 Преобразование ответа gateway (OK) → список строк для indicator_position_stat
@@ -135,10 +133,6 @@ def map_gateway_ok_to_rows(position_uid: str,
                            tf: str,
                            open_time_iso: str,
                            gw_resp: dict) -> tuple[list[tuple], list[tuple]]:
-    """
-    Возвращает (ok_rows, error_rows).
-    Строка ok_row: (position_uid, strategy_id, symbol, timeframe, param_type, param_base, param_name, value_num, value_text, open_time, status, error_code)
-    """
     ok_rows: list[tuple] = []
     err_rows: list[tuple] = []
 
@@ -148,17 +142,15 @@ def map_gateway_ok_to_rows(position_uid: str,
         results_json = gw_resp.get("results")
         items = json.loads(results_json) if results_json else []
     except Exception:
-        # парсинг результатов не удался
         err_rows.append((
             position_uid, strategy_id, symbol, tf,
             ("pack" if indicator in MW_TYPES or indicator in PACK_TYPES else "indicator"),
             indicator, "results_parse",
-            None, "error",
+            None, None,
             datetime.fromisoformat(open_time_iso), "error", "results_parse_error"
         ))
         return ok_rows, err_rows
 
-    # helper: пуш строки
     def push_row(param_type: str, pbase: str, pname: str, vnum, vtext, status: str = "ok", ecode: str | None = None):
         ok_rows.append((
             position_uid, strategy_id, symbol, tf,
@@ -168,15 +160,13 @@ def map_gateway_ok_to_rows(position_uid: str,
             status, ecode
         ))
 
-    # режим PACK (включая MW)
     if mode == "pack":
         if indicator in MW_TYPES:
-            # marketwatch: только state
             for it in items:
-                base = it.get("base") or indicator
                 pack = it.get("pack", {})
                 state = pack.get("state")
                 if state is not None:
+                    # marketwatch: только state
                     push_row("marketwatch", indicator, "state", None, str(state))
                 else:
                     err_rows.append((
@@ -191,39 +181,27 @@ def map_gateway_ok_to_rows(position_uid: str,
         for it in items:
             base = it.get("base")
             pack = it.get("pack", {})
-            # тип пакета по base: первые буквы до цифр/подчёркиваний
-            kind = indicator  # gateway уже прислал indicator
+            kind = indicator
             fields = PACK_WHITELIST.get(kind, [])
             for pname in fields:
                 val = pack.get(pname)
                 if val is None:
-                    # отсутствие поля не считаем ошибкой — просто пропускаем
                     continue
-                # числовое/категориальное
                 vnum, vtext = None, None
                 try:
-                    # buckets/проценты/числа → как float; категории → строкой
-                    if isinstance(val, (int, float)):
-                        vnum = float(val)
-                    else:
-                        # может быть строковый числовой вид
-                        vnum = float(val)
+                    vnum = float(val)
                 except Exception:
                     vtext = str(val)
                 push_row("pack", str(base), pname, vnum, vtext)
         return ok_rows, err_rows
 
-    # режим RAW (indicator)
-    # items — массив элементов {"base": "...", "pack": {"results": {<k>:<v>, ...}, ...}, "mode":"raw"}
+    # RAW (indicator)
     for it in items:
-        base = it.get("base")  # например ema21, rsi14, bb20_2_0
         pack = it.get("pack", {})
         results = pack.get("results", {})
-        # param_base = тип индикатора без длины
-        pbase = indicator
+        pbase = indicator  # тип без длины
         for k, v in results.items():
-            # param_name = канонический ключ (как в системе), например "ema21" или "bb20_2_0_upper"
-            pname = str(k)
+            pname = str(k)  # каноническое имя со строкой длины/суффиксом
             vnum, vtext = None, None
             try:
                 vnum = float(v)
@@ -248,14 +226,11 @@ def map_gateway_error_to_rows(position_uid: str,
     indicator = gw_resp.get("indicator")
     mode = gw_resp.get("mode") or ("pack" if indicator in PACK_TYPES or indicator in MW_TYPES else "indicator")
     error = gw_resp.get("error") or "unknown"
-    # подберём базу/имя для ошибки
     if mode == "pack":
-        # для MW/pack положим одну "техническую" строку ошибки на индикатор
         return [(
             position_uid, strategy_id, symbol, tf,
             ("marketwatch" if indicator in MW_TYPES else "pack"),
-            (indicator if indicator in MW_TYPES else indicator),  # param_base
-            "error",  # param_name
+            indicator, "error",
             None, None,
             datetime.fromisoformat(open_time_iso),
             "error", error
@@ -269,113 +244,55 @@ def map_gateway_error_to_rows(position_uid: str,
             "error", error
         )]
 
-# 🔸 Формируем список gateway-запросов для TF (m5 first policy вне этой функции)
-def build_tf_requests(symbol: str, tf: str, created_at_ms: int) -> list[dict]:
+# 🔸 Формирование пачки gateway-запросов для TF
+def build_tf_requests(symbol: str, tf: str, created_at_ms: int) -> tuple[list[dict], list[tuple[str,str]]]:
     reqs: list[dict] = []
-    # RAW
+    tags: list[tuple[str,str]] = []  # (indicator, mode)
+    # RAW сначала (они быстрее за счёт возможного фолбэка)
     for ind in RAW_TYPES:
         reqs.append(make_gw_request(symbol, tf, ind, created_at_ms, mode="raw"))
-    # PACK
+        tags.append((ind, "raw"))
+    # затем PACK
     for ind in PACK_TYPES:
         reqs.append(make_gw_request(symbol, tf, ind, created_at_ms, mode="pack"))
+        tags.append((ind, "pack"))
     # MW (как pack)
     for ind in MW_TYPES:
         reqs.append(make_gw_request(symbol, tf, ind, created_at_ms, mode="pack"))
-    return reqs
+        tags.append((ind, "pack"))
+    return reqs, tags
 
-# 🔸 Обработка одной позиции: m5 → (m15,h1) с приоритетом m5
-async def process_position(pg, redis, get_strategy_mw, pos_payload: dict) -> None:
+# 🔸 Обработка одного TF (последовательные волны; маппинг ответов; генерация timeout-ошибок)
+async def process_tf(pg, redis, position_uid: str, strategy_id: int, symbol: str, tf: str, created_at_ms: int):
     t0 = asyncio.get_event_loop().time()
 
-    # извлекаем базовые поля
-    position_uid = pos_payload.get("position_uid")
-    symbol = pos_payload.get("symbol")
-    strategy_id = int(pos_payload.get("strategy_id")) if pos_payload.get("strategy_id") is not None else None
-    created_at_iso = pos_payload.get("created_at")
-
-    if not position_uid or not symbol or strategy_id is None or not created_at_iso:
-        log.info(f"[SKIP] bad position payload: {pos_payload}")
-        return
-
-    # фильтр по стратегиям: только те, где market_watcher=true
-    try:
-        if not get_strategy_mw(int(strategy_id)):
-            log.info(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
-            return
-    except Exception:
-        log.info(f"[SKIP] strategy_id={strategy_id} (mw flag check failed)")
-        return
-
-    created_at_ms = iso_to_ms(created_at_iso)
-
-    # порядок TF: m5 обязательно первым
-    tfs = POS_TFS_ORDER[:] if POS_TFS_ORDER else ["m5","m15","h1"]
-    if "m5" not in tfs:
-        tfs.insert(0, "m5")
-
-    total_ok = total_err = 0
-
-    # Stage A: m5
-    if "m5" in tfs:
-        ok_rows, err_rows = await process_tf(pg, redis, position_uid, strategy_id, symbol, "m5", created_at_ms)
-        total_ok += len(ok_rows)
-        total_err += len(err_rows)
-        # запись в PG (батч)
-        if not POS_DRY_RUN:
-            await upsert_rows(pg, ok_rows + err_rows)
-
-    # Stage B: остальные TF параллельно
-    tasks = []
-    for tf in tfs:
-        if tf == "m5":
-            continue
-        tasks.append(process_tf(pg, redis, position_uid, strategy_id, symbol, tf, created_at_ms))
-
-    if tasks:
-        tf_results = await asyncio.gather(*tasks, return_exceptions=True)
-        batch_rows = []
-        for res in tf_results:
-            if isinstance(res, Exception):
-                log.info(f"[TF] error {res}")
-                continue
-            ok_rows, err_rows = res
-            total_ok += len(ok_rows)
-            total_err += len(err_rows)
-            batch_rows.extend(ok_rows)
-            batch_rows.extend(err_rows)
-        if batch_rows and not POS_DRY_RUN:
-            await upsert_rows(pg, batch_rows)
-
-    t1 = asyncio.get_event_loop().time()
-    log.info(f"POS_SNAPSHOT OK uid={position_uid} sym={symbol} "
-             f"ok_rows={total_ok} err_rows={total_err} elapsed_ms={int((t1-t0)*1000)}")
-
-# 🔸 Обработка одного TF (формирование запросов → ожидание ответов → маппинг строк)
-async def process_tf(pg, redis, position_uid: str, strategy_id: int, symbol: str, tf: str, created_at_ms: int):
-    # фиксируем open_time TF по created_at
     bar_open_ms = floor_to_bar_ms(created_at_ms, tf)
     open_time_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
 
-    # собираем и отправляем пачку запросов
-    reqs = build_tf_requests(symbol, tf, created_at_ms)
-    gw_resps = await gw_send_and_collect(redis, reqs, timeout_sec=POS_REQ_TIMEOUT_SEC)
+    reqs, tags_expected = build_tf_requests(symbol, tf, created_at_ms)
+    total_expected = len(reqs)
+
+    # волнами отправляем и собираем
+    waves = 0
+    collected_resps: list[dict] = []
+    deadline = t0 + POS_REQ_TIMEOUT_SEC
+    i = 0
+    while i < total_expected:
+        time_left = max(0.0, deadline - asyncio.get_event_loop().time())
+        if time_left <= 0:
+            break
+        wave = reqs[i:i+TF_WAVE_SIZE]
+        resps = await gw_send_wave_and_collect(redis, wave, time_left)
+        collected_resps.extend(resps)
+        i += len(wave)
+        waves += 1
 
     ok_rows_all: list[tuple] = []
     err_rows_all: list[tuple] = []
 
-    # ожидаем по числу запросов; если что-то не пришло — считаем таймаутом
-    received = len(gw_resps)
-    expected = len(reqs)
-    if received < expected:
-        # создадим ошибки на «пропавшие» запросы — обобщённо (мы не знаем конкретные req_id, но знаем виды)
-        missing = expected - received
-        log.info(f"[GW] TF {symbol}/{tf} missing={missing} expected={expected} received={received}")
-
-    # разбор пришедших ответов
-    for resp in gw_resps:
+    # разобрать пришедшие ответы
+    for resp in collected_resps:
         status = resp.get("status")
-        ind = resp.get("indicator")
-        mode = resp.get("mode") or ("pack" if ind in PACK_TYPES or ind in MW_TYPES else "indicator")
         if status == "ok":
             oks, errs = map_gateway_ok_to_rows(position_uid, strategy_id, symbol, tf, open_time_iso, resp)
             ok_rows_all.extend(oks)
@@ -383,15 +300,50 @@ async def process_tf(pg, redis, position_uid: str, strategy_id: int, symbol: str
         else:
             err_rows_all.extend(map_gateway_error_to_rows(position_uid, strategy_id, symbol, tf, open_time_iso, resp))
 
+    # посчитать «каких ещё не пришло» — по (indicator,mode)
+    # соберём полученные теги
+    from collections import Counter
+    got = Counter()
+    for resp in collected_resps:
+        ind = resp.get("indicator")
+        mode = resp.get("mode") or ("pack" if ind in PACK_TYPES or ind in MW_TYPES else "indicator")
+        got[(ind, mode)] += 1
+    exp = Counter(tags_expected)
+    missing_counter = exp - got
+    missing = sum(missing_counter.values())
+
+    # сгенерировать timeout-строки для недошедших
+    if missing:
+        for (ind, mode), cnt in missing_counter.items():
+            for _ in range(cnt):
+                if mode == "pack":
+                    err_rows_all.append((
+                        position_uid, strategy_id, symbol, tf,
+                        ("marketwatch" if ind in MW_TYPES else "pack"),
+                        ind, "error",
+                        None, None,
+                        datetime.fromisoformat(open_time_iso),
+                        "error", "timeout"
+                    ))
+                else:
+                    err_rows_all.append((
+                        position_uid, strategy_id, symbol, tf,
+                        "indicator", ind, "error",
+                        None, None,
+                        datetime.fromisoformat(open_time_iso),
+                        "error", "timeout"
+                    ))
+
+    t1 = asyncio.get_event_loop().time()
+    log.info(f"[TF] {symbol}/{tf} ok={len(ok_rows_all)} err={len(err_rows_all)} "
+             f"waves={waves} expected={total_expected} missing={missing} elapsed_ms={int((t1-t0)*1000)}")
+
     return ok_rows_all, err_rows_all
 
 # 🔸 UPSERT строк в indicator_position_stat (батчами)
 async def upsert_rows(pg, rows: list[tuple]):
     if not rows:
         return
-    # вставляем батчами
-    # порядок полей:
-    # (position_uid, strategy_id, symbol, timeframe, param_type, param_base, param_name, value_num, value_text, open_time, status, error_code)
     sql = """
     INSERT INTO indicator_position_stat
       (position_uid, strategy_id, symbol, timeframe, param_type, param_base, param_name, value_num, value_text, open_time, status, error_code)
@@ -414,14 +366,54 @@ async def upsert_rows(pg, rows: list[tuple]):
                 await conn.executemany(sql, chunk)
             i += len(chunk)
 
-# 🔸 Основной воркер: подписка на positions_open_stream, приоритет m5, затем m15/h1
+# 🔸 Обработка одной позиции: m5 → затем m15 → затем h1 (последовательно после m5)
+async def process_position(pg, redis, get_strategy_mw, pos_payload: dict) -> None:
+    t0 = asyncio.get_event_loop().time()
+
+    position_uid = pos_payload.get("position_uid")
+    symbol = pos_payload.get("symbol")
+    strategy_id = int(pos_payload.get("strategy_id")) if pos_payload.get("strategy_id") is not None else None
+    created_at_iso = pos_payload.get("created_at")
+
+    if not position_uid or not symbol or strategy_id is None or not created_at_iso:
+        log.info(f"[SKIP] bad position payload: {pos_payload}")
+        return
+
+    try:
+        if not get_strategy_mw(int(strategy_id)):
+            log.info(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
+            return
+    except Exception:
+        log.info(f"[SKIP] strategy_id={strategy_id} (mw flag check failed)")
+        return
+
+    created_at_ms = iso_to_ms(created_at_iso)
+
+    # порядок TF: m5 → m15 → h1 (stricly), чтобы не перегружать gateway
+    tfs = POS_TFS_ORDER[:] if POS_TFS_ORDER else ["m5","m15","h1"]
+    if "m5" not in tfs:
+        tfs.insert(0, "m5")
+
+    total_ok = total_err = 0
+
+    for tf in tfs:
+        ok_rows, err_rows = await process_tf(pg, redis, position_uid, strategy_id, symbol, tf, created_at_ms)
+        total_ok += len(ok_rows)
+        total_err += len(err_rows)
+        if not POS_DRY_RUN and (ok_rows or err_rows):
+            await upsert_rows(pg, ok_rows + err_rows)
+
+    t1 = asyncio.get_event_loop().time()
+    log.info(f"POS_SNAPSHOT OK uid={position_uid} sym={symbol} ok_rows={total_ok} err_rows={total_err} elapsed_ms={int((t1-t0)*1000)}")
+
+# 🔸 Основной воркер: подписка на positions_open_stream, приоритет m5, затем m15→h1
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw):
     log.debug("POS_SNAPSHOT: воркер запущен")
 
     group = "possnap_group"
     consumer = "possnap_1"
 
-    # создать consumer-group для позиций (идемпотентно)
+    # создать consumer-group (идемпотентно)
     try:
         await redis.xgroup_create(REQ_STREAM_POSITIONS, group, id="$", mkstream=True)
     except Exception as e:
