@@ -14,6 +14,9 @@ from config_loader import (
     config_event_listener,
 )
 
+# 🔸 импорт воркера MW-отчётов
+from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
+
 log = logging.getLogger("ORACLE_MAIN")
 
 
@@ -76,6 +79,7 @@ async def main():
     # Слушатель конфигурационных событий (тикеры + стратегии)
     await asyncio.gather(
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
+        run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
     )
 
 if __name__ == "__main__":
