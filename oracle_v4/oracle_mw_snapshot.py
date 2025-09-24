@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
+import json
 
 import infra
 
@@ -171,7 +172,6 @@ async def _finalize_report_header(
         round(float(avg_trades_per_day), 4),
     )
 
-
 # 🔸 Обработка одного TF: выбор позиций окна → батч-агрегация MW-STATE → upsert агрегатов
 async def _process_timeframe(
     conn,
@@ -210,9 +210,10 @@ async def _process_timeframe(
         uid_meta = {p["position_uid"]: (p["direction"], float(p["pnl"] or 0.0)) for p in batch}
 
         # читаем MW (включая ошибки) → агрегируем только status='ok' на текущем TF
+        # states_tf приводим к ТЕКСТУ, чтобы предсказуемо парсить JSON далее
         rows_mw = await conn.fetch(
             """
-            WITH mw_ok AS (
+            WITH mw AS (
               SELECT position_uid, timeframe, param_base, value_text, status
                 FROM indicator_position_stat
                WHERE position_uid = ANY($1::text[])
@@ -220,10 +221,10 @@ async def _process_timeframe(
             )
             SELECT
               m.position_uid,
-              bool_or(m.status = 'error')                           AS has_error,
-              jsonb_object_agg(m.param_base, m.value_text)
-                 FILTER (WHERE m.timeframe = $2 AND m.status = 'ok' AND m.param_base = ANY($3::text[])) AS states_tf
-            FROM mw_ok m
+              bool_or(m.status = 'error') AS has_error,
+              (jsonb_object_agg(m.param_base, m.value_text)
+                 FILTER (WHERE m.timeframe = $2 AND m.status = 'ok' AND m.param_base = ANY($3::text[])))::text AS states_tf
+            FROM mw m
             GROUP BY m.position_uid
             """,
             uid_list, timeframe, list(MW_BASES),
@@ -255,9 +256,28 @@ async def _process_timeframe(
         for r in rows_mw:
             uid = r["position_uid"]
             has_error = bool(r["has_error"])
-            states_tf = dict(r["states_tf"] or {})  # {'trend': 'down_weak', ...}
+            raw_states = r["states_tf"]
 
-            if has_error or not states_tf:
+            # парсим JSON надёжно
+            if not raw_states or has_error:
+                continue
+            if isinstance(raw_states, dict):
+                states_tf = raw_states
+            else:
+                try:
+                    # raw_states — строка вида '{"trend":"down_weak", ...}'
+                    states_tf = json.loads(raw_states)
+                except Exception:
+                    log.info("[TF] skip uid=%s: states_tf JSON parse error: %r", uid, raw_states)
+                    continue
+
+            if not isinstance(states_tf, dict) or not states_tf:
+                continue
+
+            # нормализуем только допустимые базы
+            states_tf = {k: v for k, v in states_tf.items() if k in MW_BASES and isinstance(v, str) and v}
+
+            if not states_tf:
                 continue
 
             direction, pnl = uid_meta.get(uid, ("long", 0.0))
@@ -271,27 +291,33 @@ async def _process_timeframe(
                 k = (report_id, strategy_id, time_frame, direction, timeframe, "solo", base, state)
                 inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
                 inc["t"] += 1
-                inc["w"] += (1 if is_win else 0)
-                inc["pt"] = round(inc["pt"] + pnl, 4)
                 if is_win:
+                    inc["w"] += 1
                     inc["pw"] = round(inc["pw"] + pnl, 4)
+                inc["pt"] = round(inc["pt"] + pnl, 4)
 
             # combos: формируем в фиксированном порядке с join состояния
             def _touch_combo(combo: Tuple[str, ...]):
-                if all(b in states_tf for b in combo):
-                    agg_base = "_".join(combo)
-                    agg_state = "|".join(f"{b}:{states_tf[b]}" for b in combo)  # 'trend:down_weak|volatility:expanding|...'
-                    k = (report_id, strategy_id, time_frame, direction, timeframe, "combo", agg_base, agg_state)
-                    inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
-                    inc["t"] += 1
-                    inc["w"] += (1 if is_win else 0)
-                    inc["pt"] = round(inc["pt"] + pnl, 4)
-                    if is_win:
-                        inc["pw"] = round(inc["pw"] + pnl, 4)
+                # условия достаточности
+                for b in combo:
+                    if b not in states_tf:
+                        return
+                agg_base = "_".join(combo)
+                agg_state = "|".join(f"{b}:{states_tf[b]}" for b in combo)  # 'trend:down_weak|volatility:expanding|...'
+                k = (report_id, strategy_id, time_frame, direction, timeframe, "combo", agg_base, agg_state)
+                inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
+                inc["t"] += 1
+                if is_win:
+                    inc["w"] += 1
+                    inc["pw"] = round(inc["pw"] + pnl, 4)
+                inc["pt"] = round(inc["pt"] + pnl, 4)
 
-            for c in combos_2: _touch_combo(c)
-            for c in combos_3: _touch_combo(c)
-            for c in combos_4: _touch_combo(c)
+            for c in combos_2:
+                _touch_combo(c)
+            for c in combos_3:
+                _touch_combo(c)
+            for c in combos_4:
+                _touch_combo(c)
 
         # батчевый UPSERT
         if inc_map:
@@ -299,7 +325,6 @@ async def _process_timeframe(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.info("[TF] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
-
 
 # 🔸 Батчевый UPSERT агрегатов (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):
