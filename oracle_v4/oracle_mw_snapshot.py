@@ -1,9 +1,9 @@
-# 🔸 oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по закрытым позициям, публикация KV
+# 🔸 oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по СОСТОЯНИЯМ (solo/combos), публикация KV
 
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Iterable
+from typing import Dict, List, Tuple
 
 import infra
 
@@ -59,13 +59,11 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
         # шапка отчёта: создаём черновик
         report_id = await _create_report_header(conn, strategy_id, tag, win_start, win_end)
 
-        # агрегаты по позициям считаются по каждому TF отдельно (последовательно)
-        # но шапку удобнее заполнить сразу — одним SQL-агрегатом
+        # агрегаты для шапки — одним SQL
         closed_total, closed_wins, pnl_sum_total, pnl_sum_wins = await _calc_report_head_metrics(
             conn, strategy_id, win_start, win_end
         )
 
-        # производные метрики шапки
         days_in_window = WINDOW_SIZES[tag].total_seconds() / 86400.0
         winrate = round((closed_wins / closed_total) if closed_total else 0.0, 4)
         avg_pnl_per_trade = round((pnl_sum_total / closed_total) if closed_total else 0.0, 4)
@@ -174,7 +172,7 @@ async def _finalize_report_header(
     )
 
 
-# 🔸 Обработка одного TF: выбор позиций окна → батч-агрегация MW → upsert агрегатов
+# 🔸 Обработка одного TF: выбор позиций окна → батч-агрегация MW-STATE → upsert агрегатов
 async def _process_timeframe(
     conn,
     report_id: int,
@@ -202,7 +200,6 @@ async def _process_timeframe(
         log.info("[TF] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
         return
 
-    # батчи по позициям
     total = len(positions)
     ok_rows = 0
     batch_count = (total + BATCH_SIZE - 1) // BATCH_SIZE
@@ -212,33 +209,32 @@ async def _process_timeframe(
         uid_list = [p["position_uid"] for p in batch]
         uid_meta = {p["position_uid"]: (p["direction"], float(p["pnl"] or 0.0)) for p in batch}
 
-        # читаем MW по всем TF, но базовые значения будем брать для текущего TF
-        # если есть любой error по позиции — позиция исключается из всех агрегатов
+        # читаем MW (включая ошибки) → агрегируем только status='ok' на текущем TF
         rows_mw = await conn.fetch(
             """
+            WITH mw_ok AS (
+              SELECT position_uid, timeframe, param_base, value_text, status
+                FROM indicator_position_stat
+               WHERE position_uid = ANY($1::text[])
+                 AND param_type = 'marketwatch'
+            )
             SELECT
-                position_uid,
-                bool_or(status = 'error') AS has_error,
-                array_agg(DISTINCT param_base)
-                    FILTER (WHERE timeframe = $2 AND status = 'ok' AND param_base = ANY($3::text[])) AS bases_tf
-            FROM indicator_position_stat
-            WHERE position_uid = ANY($1::text[])
-              AND param_type = 'marketwatch'
-            GROUP BY position_uid
+              m.position_uid,
+              bool_or(m.status = 'error')                           AS has_error,
+              jsonb_object_agg(m.param_base, m.value_text)
+                 FILTER (WHERE m.timeframe = $2 AND m.status = 'ok' AND m.param_base = ANY($3::text[])) AS states_tf
+            FROM mw_ok m
+            GROUP BY m.position_uid
             """,
-            uid_list,
-            timeframe,
-            list(MW_BASES),
+            uid_list, timeframe, list(MW_BASES),
         )
 
         # подготовим агрегаты батча в памяти
         inc_map: Dict[Tuple, Dict[str, float]] = {}
-
-        # условия достаточности
         if not rows_mw:
             continue
 
-        # combos в фиксированном порядке
+        # заготовки комбо (фиксированный порядок)
         combos_2 = (
             ("trend", "volatility"),
             ("trend", "extremes"),
@@ -255,24 +251,24 @@ async def _process_timeframe(
         )
         combos_4 = (tuple(MW_BASES),)
 
-        # обходим результаты MW
+        # обходим MW-строки
         for r in rows_mw:
             uid = r["position_uid"]
             has_error = bool(r["has_error"])
-            bases_tf = [b for b in (r["bases_tf"] or []) if b in MW_BASES]
+            states_tf = dict(r["states_tf"] or {})  # {'trend': 'down_weak', ...}
 
-            if has_error:
-                continue  # исключаем позицию полностью
-
-            if not bases_tf:
-                continue  # нечего агрегировать для этого TF
+            if has_error or not states_tf:
+                continue
 
             direction, pnl = uid_meta.get(uid, ("long", 0.0))
             is_win = pnl > 0.0
 
-            # solo
-            for base in bases_tf:
-                k = (report_id, strategy_id, time_frame, direction, timeframe, "solo", base)
+            # solo: по каждой доступной базе фиксируем её state
+            for base in MW_BASES:
+                state = states_tf.get(base)
+                if not state:
+                    continue
+                k = (report_id, strategy_id, time_frame, direction, timeframe, "solo", base, state)
                 inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
                 inc["t"] += 1
                 inc["w"] += (1 if is_win else 0)
@@ -280,12 +276,12 @@ async def _process_timeframe(
                 if is_win:
                     inc["pw"] = round(inc["pw"] + pnl, 4)
 
-            # combos
-            present = set(bases_tf)
+            # combos: формируем в фиксированном порядке с join состояния
             def _touch_combo(combo: Tuple[str, ...]):
-                if all(b in present for b in combo):
-                    base = "_".join(combo)
-                    k = (report_id, strategy_id, time_frame, direction, timeframe, "combo", base)
+                if all(b in states_tf for b in combo):
+                    agg_base = "_".join(combo)
+                    agg_state = "|".join(f"{b}:{states_tf[b]}" for b in combo)  # 'trend:down_weak|volatility:expanding|...'
+                    k = (report_id, strategy_id, time_frame, direction, timeframe, "combo", agg_base, agg_state)
                     inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
                     inc["t"] += 1
                     inc["w"] += (1 if is_win else 0)
@@ -293,14 +289,11 @@ async def _process_timeframe(
                     if is_win:
                         inc["pw"] = round(inc["pw"] + pnl, 4)
 
-            for c in combos_2:
-                _touch_combo(c)
-            for c in combos_3:
-                _touch_combo(c)
-            for c in combos_4:
-                _touch_combo(c)
+            for c in combos_2: _touch_combo(c)
+            for c in combos_3: _touch_combo(c)
+            for c in combos_4: _touch_combo(c)
 
-        # если есть накопления — upsert батчом (UNNEST)
+        # батчевый UPSERT
         if inc_map:
             await _upsert_aggregates_batch(conn, inc_map, days_in_window)
             ok_rows += sum(v["t"] for v in inc_map.values())
@@ -310,20 +303,12 @@ async def _process_timeframe(
 
 # 🔸 Батчевый UPSERT агрегатов (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):
-    # готовим массивы полей в одном порядке (соответствует uq_mwas_key)
-    report_ids = []
-    strategy_ids = []
-    time_frames = []
-    directions = []
-    timeframes = []
-    agg_types = []
-    agg_bases = []
-    trades_inc = []
-    wins_inc = []
-    pnl_total_inc = []
-    pnl_wins_inc = []
+    # готовим массивы полей (соответствует новому uq-ключу с agg_state)
+    report_ids, strategy_ids, time_frames, directions = [], [], [], []
+    timeframes, agg_types, agg_bases, agg_states = [], [], [], []
+    trades_inc, wins_inc, pnl_total_inc, pnl_wins_inc = [], [], [], []
 
-    for (report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base), v in inc_map.items():
+    for (report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base, agg_state), v in inc_map.items():
         report_ids.append(report_id)
         strategy_ids.append(strategy_id)
         time_frames.append(time_frame)
@@ -331,12 +316,12 @@ async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]],
         timeframes.append(timeframe)
         agg_types.append(agg_type)
         agg_bases.append(agg_base)
+        agg_states.append(agg_state)
         trades_inc.append(int(v["t"]))
         wins_inc.append(int(v["w"]))
         pnl_total_inc.append(round(float(v["pt"]), 4))
         pnl_wins_inc.append(round(float(v["pw"]), 4))
 
-    # выполняем вставку-обновление одним запросом
     await conn.execute(
         """
         WITH data AS (
@@ -348,26 +333,27 @@ async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]],
             unnest($5::text[])     AS timeframe,
             unnest($6::text[])     AS agg_type,
             unnest($7::text[])     AS agg_base,
-            unnest($8::int[])      AS t_inc,
-            unnest($9::int[])      AS w_inc,
-            unnest($10::numeric[]) AS pt_inc,
-            unnest($11::numeric[]) AS pw_inc
+            unnest($8::text[])     AS agg_state,
+            unnest($9::int[])      AS t_inc,
+            unnest($10::int[])     AS w_inc,
+            unnest($11::numeric[]) AS pt_inc,
+            unnest($12::numeric[]) AS pw_inc
         )
         INSERT INTO oracle_mw_aggregated_stat (
-            report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base,
+            report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base, agg_state,
             trades_total, trades_wins, winrate,
             pnl_sum_total, pnl_sum_wins,
             avg_pnl_per_trade, avg_trades_per_day
         )
         SELECT
-            report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base,
+            report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base, agg_state,
             t_inc, w_inc,
             ROUND(CASE WHEN t_inc > 0 THEN w_inc::numeric / t_inc::numeric ELSE 0 END, 4),
             pt_inc, pw_inc,
             ROUND(CASE WHEN t_inc > 0 THEN pt_inc::numeric / t_inc::numeric ELSE 0 END, 4),
-            ROUND(t_inc::numeric / $12::numeric, 4)
+            ROUND(t_inc::numeric / $13::numeric, 4)
         FROM data
-        ON CONFLICT (report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base)
+        ON CONFLICT (report_id, strategy_id, time_frame, direction, timeframe, agg_type, agg_base, agg_state)
         DO UPDATE SET
             trades_total       = oracle_mw_aggregated_stat.trades_total + EXCLUDED.trades_total,
             trades_wins        = oracle_mw_aggregated_stat.trades_wins  + EXCLUDED.trades_wins,
@@ -388,19 +374,18 @@ async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]],
                                      ELSE 0
                                    END, 4),
             avg_trades_per_day = ROUND(
-                                   ( (oracle_mw_aggregated_stat.trades_total + EXCLUDED.trades_total)::numeric / $12::numeric ),
+                                   ( (oracle_mw_aggregated_stat.trades_total + EXCLUDED.trades_total)::numeric / $13::numeric ),
                                    4),
             updated_at         = now()
         """,
-        report_ids, strategy_ids, time_frames, directions, timeframes, agg_types, agg_bases,
+        report_ids, strategy_ids, time_frames, directions, timeframes, agg_types, agg_bases, agg_states,
         trades_inc, wins_inc, pnl_total_inc, pnl_wins_inc,
         days_in_window,
     )
 
 
-# 🔸 Публикация KV сводок для отчёта (по последним обновлённым строкам на agg_base/направление)
+# 🔸 Публикация KV сводок для отчёта (по последним строкам на direction+base+state)
 async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_frame: str):
-    # читаем шапку (total закрытых), затем берём последние значения по (direction, agg_base)
     row_rep = await conn.fetchrow("SELECT closed_total FROM oracle_report_stat WHERE id = $1", report_id)
     if not row_rep:
         return
@@ -408,15 +393,14 @@ async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_f
 
     rows = await conn.fetch(
         """
-        SELECT DISTINCT ON (direction, agg_base)
-               direction, agg_base, trades_total, winrate
+        SELECT DISTINCT ON (direction, agg_base, agg_state)
+               direction, agg_base, agg_state, trades_total, winrate
           FROM oracle_mw_aggregated_stat
          WHERE report_id = $1
-         ORDER BY direction, agg_base, updated_at DESC
+         ORDER BY direction, agg_base, agg_state, updated_at DESC
         """,
         report_id,
     )
-
     if not rows:
         return
 
@@ -424,14 +408,16 @@ async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_f
     for r in rows:
         direction = r["direction"]
         agg_base = r["agg_base"]
+        agg_state = r["agg_state"]
         trades_total = int(r["trades_total"] or 0)
         winrate = float(r["winrate"] or 0.0)
 
-        key = f"oracle:mw:{strategy_id}:{direction}:{agg_base}:{time_frame}"
+        key = f"oracle:mw:{strategy_id}:{direction}:{agg_base}:{agg_state}:{time_frame}"
         payload = {
             "strategy_id": strategy_id,
             "direction": direction,
             "agg_base": agg_base,
+            "agg_state": agg_state,
             "time_frame": time_frame,
             "report_id": report_id,
             "closed_total": closed_total,
