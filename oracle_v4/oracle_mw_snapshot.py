@@ -29,16 +29,16 @@ MW_BASES = ("trend", "volatility", "extremes", "momentum")  # фиксирова
 async def run_oracle_mw_snapshot():
     # условия достаточности окружения
     if infra.pg_pool is None or infra.redis_client is None:
-        log.info("❌ Пропуск: PG/Redis не инициализированы")
+        log.debug("❌ Пропуск: PG/Redis не инициализированы")
         return
 
     strategies = sorted(infra.market_watcher_strategies or [])
     if not strategies:
-        log.info("ℹ️ Стратегий с market_watcher=true нет — нечего обрабатывать")
+        log.debug("ℹ️ Стратегий с market_watcher=true нет — нечего обрабатывать")
         return
 
     t_ref = datetime.utcnow().replace(tzinfo=None)  # UTC-naive по инвариантам системы
-    log.info("🚀 Старт MW-отчёта t0=%s, стратегий=%d", t_ref.isoformat(), len(strategies))
+    log.debug("🚀 Старт MW-отчёта t0=%s, стратегий=%d", t_ref.isoformat(), len(strategies))
 
     # последовательная обработка стратегий
     async with infra.pg_pool.acquire() as conn:
@@ -48,7 +48,7 @@ async def run_oracle_mw_snapshot():
             except Exception:
                 log.exception("❌ Ошибка обработки strategy_id=%s", sid)
 
-    log.info("✅ Завершено формирование MW-отчётов (стратегий=%d)", len(strategies))
+    log.debug("✅ Завершено формирование MW-отчётов (стратегий=%d)", len(strategies))
 
 
 # 🔸 Полный проход по стратегии: все окна → по каждому окну все TF последовательно
@@ -83,7 +83,7 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
         )
 
         if closed_total == 0:
-            log.info("[REPORT] sid=%s win=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
+            log.debug("[REPORT] sid=%s win=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
             continue
 
         # последовательный проход по TF
@@ -99,7 +99,7 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
         except Exception:
             log.exception("❌ Ошибка публикации KV sid=%s win=%s", strategy_id, tag)
 
-        log.info(
+        log.debug(
             "[REPORT] sid=%s win=%s report_id=%s total=%d wins=%d wr=%.4f pnl_sum=%.4f avg_pnl=%.4f avg_tpd=%.4f",
             strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
         )
@@ -197,7 +197,7 @@ async def _process_timeframe(
     )
     positions = [dict(r) for r in rows]
     if not positions:
-        log.info("[TF] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
+        log.debug("[TF] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
         return
 
     total = len(positions)
@@ -268,7 +268,7 @@ async def _process_timeframe(
                     # raw_states — строка вида '{"trend":"down_weak", ...}'
                     states_tf = json.loads(raw_states)
                 except Exception:
-                    log.info("[TF] skip uid=%s: states_tf JSON parse error: %r", uid, raw_states)
+                    log.debug("[TF] skip uid=%s: states_tf JSON parse error: %r", uid, raw_states)
                     continue
 
             if not isinstance(states_tf, dict) or not states_tf:
@@ -324,7 +324,7 @@ async def _process_timeframe(
             await _upsert_aggregates_batch(conn, inc_map, days_in_window)
             ok_rows += sum(v["t"] for v in inc_map.values())
 
-    log.info("[TF] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+    log.debug("[TF] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
 
 # 🔸 Батчевый UPSERT агрегатов (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):

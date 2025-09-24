@@ -26,7 +26,7 @@ TF_ORDER = ("m5", "m15", "h1")
 # 🔸 Белые списки полей по PACK (ориентир для агрегации)
 PACK_FIELDS = {
     "rsi":     ["bucket_low", "trend"],  # <— реализовано
-    "mfi":     ["bucket_low", "trend"],  # TODO
+    "mfi":     ["bucket_low", "trend"],  # <— реализовано
     "bb":      ["bucket", "bucket_delta", "bw_trend_strict", "bw_trend_smooth"],  # TODO
     "lr":      ["bucket", "bucket_delta", "angle_trend"],  # TODO
     "atr":     ["bucket", "bucket_delta"],  # TODO
@@ -35,13 +35,12 @@ PACK_FIELDS = {
     "macd":    ["mode", "cross", "zero_side", "hist_bucket_low_pct", "hist_trend_strict", "hist_trend_smooth"],  # TODO
 }
 
-# 🔸 Комбинации полей внутри PACK (пока реализуем только для rsi)
+# 🔸 Комбинации полей внутри PACK
 PACK_COMBOS = {
-    "rsi": [
-        ("bucket_low", "trend"),
-    ],
-    # "mfi": [...],
+    "rsi": [("bucket_low", "trend")],
+    "mfi": [("bucket_low", "trend")],  # ← добавлено
     # "bb": [...],
+    # "lr": [...],
     # ...
 }
 
@@ -105,12 +104,11 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
             log.info("[PACK REPORT] sid=%s win=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
             continue
 
-        # последовательный проход по TF — считаем ПАКИ (сейчас только RSI)
+        # последовательный проход по TF — считаем ПАКИ (RSI + MFI)
         for tf in TF_ORDER:
             try:
                 await _process_timeframe_rsi(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                # 🔸 Заглушки под остальные паки (реализовать позже)
-                # await _process_timeframe_mfi(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_mfi(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
                 # await _process_timeframe_bb(conn,   report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
                 # await _process_timeframe_lr(conn,   report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
                 # await _process_timeframe_atr(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
@@ -131,19 +129,19 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
             strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
         )
 
-
-# 🔸 Создание черновика шапки отчёта
+# 🔸 Создание (или возврат id) шапки отчёта
 async def _create_report_header(conn, strategy_id: int, time_frame: str, win_start: datetime, win_end: datetime) -> int:
     row = await conn.fetchrow(
         """
         INSERT INTO oracle_report_stat (strategy_id, time_frame, window_start, window_end)
         VALUES ($1, $2, $3, $4)
+        ON CONFLICT (strategy_id, time_frame, window_start, window_end)
+        DO UPDATE SET created_at = oracle_report_stat.created_at
         RETURNING id
         """,
         strategy_id, time_frame, win_start, win_end
     )
     return int(row["id"])
-
 
 # 🔸 Расчёт агрегатов для шапки (одним SQL)
 async def _calc_report_head_metrics(conn, strategy_id: int, win_start: datetime, win_end: datetime):
@@ -225,7 +223,7 @@ async def _process_timeframe_rsi(
     )
     positions = [dict(r) for r in rows]
     if not positions:
-        log.info("[PACK-RSI] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
+        log.debug("[PACK-RSI] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
         return
 
     total = len(positions)
@@ -249,7 +247,7 @@ async def _process_timeframe_rsi(
              WHERE position_uid = ANY($1::text[])
                AND param_type = 'pack'
                AND timeframe = $2
-               AND param_base LIKE 'rsi%%'
+               AND param_base LIKE 'rsi%'
                AND param_name = ANY($3::text[])
             """,
             uid_list, timeframe, rsi_fields,
@@ -323,9 +321,128 @@ async def _process_timeframe_rsi(
             await _upsert_aggregates_batch(conn, inc_map, days_in_window)
             ok_rows += sum(v["t"] for v in inc_map.values())
 
-    log.info("[PACK-RSI] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+    log.debug("[PACK-RSI] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
 
+# 🔸 Обработка TF: PACK=MFI (solo + combo внутри MFI)
+async def _process_timeframe_mfi(
+    conn,
+    report_id: int,
+    strategy_id: int,
+    time_frame: str,
+    timeframe: str,
+    win_start: datetime,
+    win_end: datetime,
+    days_in_window: float,
+):
+    # выбираем закрытые позиции этого окна (direction, pnl)
+    rows = await conn.fetch(
+        """
+        SELECT position_uid, direction, pnl
+          FROM positions_v4
+         WHERE strategy_id = $1
+           AND status = 'closed'
+           AND closed_at >= $2
+           AND closed_at <  $3
+        """,
+        strategy_id, win_start, win_end
+    )
+    positions = [dict(r) for r in rows]
+    if not positions:
+        log.info("[PACK-MFI] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
+        return
 
+    total = len(positions)
+    ok_rows = 0
+    batch_count = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+    mfi_fields = PACK_FIELDS["mfi"]
+    mfi_combos = PACK_COMBOS["mfi"]
+
+    for bi in range(batch_count):
+        batch = positions[bi * BATCH_SIZE : (bi + 1) * BATCH_SIZE]
+        uid_list = [p["position_uid"] for p in batch]
+        uid_meta = {p["position_uid"]: (p["direction"], float(p["pnl"] or 0.0)) for p in batch}
+
+        # читаем PACK только для MFI (на текущем TF), по whitelisted полям
+        rows_pack = await conn.fetch(
+            """
+            SELECT position_uid, timeframe, param_base, param_name, value_num, value_text, status
+              FROM indicator_position_stat
+             WHERE position_uid = ANY($1::text[])
+               AND param_type = 'pack'
+               AND timeframe = $2
+               AND param_base LIKE 'mfi%'
+               AND param_name = ANY($3::text[])
+            """,
+            uid_list, timeframe, mfi_fields,
+        )
+
+        by_uid: Dict[str, Dict[str, Dict[str, str]]] = {}
+        has_error: Dict[str, set] = {}
+
+        for r in rows_pack:
+            uid = r["position_uid"]
+            base = r["param_base"]      # mfi14, mfi21, ...
+            status = r["status"]
+
+            if status != "ok":
+                has_error.setdefault(uid, set()).add(base)
+                continue
+
+            name = r["param_name"]      # bucket_low | trend
+
+            # нормализуем значение в строку
+            if r["value_text"] is not None:
+                val = str(r["value_text"])
+            else:
+                num = float(r["value_num"] or 0.0)
+                val = f"{num:.8f}".rstrip('0').rstrip('.') if '.' in f"{num:.8f}" else f"{int(num)}"
+
+            by_uid.setdefault(uid, {}).setdefault(base, {})[name] = val
+
+        inc_map: Dict[Tuple, Dict[str, float]] = {}
+
+        for uid, base_map in by_uid.items():
+            direction, pnl = uid_meta.get(uid, ("long", 0.0))
+            is_win = pnl > 0.0
+
+            for base, fields in base_map.items():
+                if base in has_error.get(uid, set()):
+                    continue
+
+                # SOLO по каждому доступному полю
+                for fname in mfi_fields:
+                    if fname not in fields:
+                        continue
+                    fval = fields[fname]
+                    k = (report_id, strategy_id, time_frame, direction, timeframe, base, "solo", fname, fval)
+                    inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
+                    inc["t"] += 1
+                    if is_win:
+                        inc["w"] += 1
+                        inc["pw"] = round(inc["pw"] + pnl, 4)
+                    inc["pt"] = round(inc["pt"] + pnl, 4)
+
+                # COMBO внутри MFI
+                for combo in mfi_combos:
+                    if not all(f in fields for f in combo):
+                        continue
+                    agg_key = "|".join(combo)  # 'bucket_low|trend'
+                    agg_value = "|".join(f"{f}:{fields[f]}" for f in combo)
+                    k = (report_id, strategy_id, time_frame, direction, timeframe, base, "combo", agg_key, agg_value)
+                    inc = inc_map.setdefault(k, {"t": 0, "w": 0, "pt": 0.0, "pw": 0.0})
+                    inc["t"] += 1
+                    if is_win:
+                        inc["w"] += 1
+                        inc["pw"] = round(inc["pw"] + pnl, 4)
+                    inc["pt"] = round(inc["pt"] + pnl, 4)
+
+        if inc_map:
+            await _upsert_aggregates_batch(conn, inc_map, days_in_window)
+            ok_rows += sum(v["t"] for v in inc_map.values())
+
+    log.info("[PACK-MFI] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+    
 # 🔸 Батчевый UPSERT (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):
     # ключ: (report_id, strategy_id, time_frame, direction, timeframe, pack_base, agg_type, agg_key, agg_value)
