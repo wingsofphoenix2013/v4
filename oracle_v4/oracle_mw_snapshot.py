@@ -409,7 +409,7 @@ async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]],
     )
 
 
-# 🔸 Публикация KV сводок для отчёта (по последним строкам на direction+base+state)
+# 🔸 Публикация KV сводок для отчёта (пер-TF: direction+timeframe+base+state)
 async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_frame: str):
     row_rep = await conn.fetchrow("SELECT closed_total FROM oracle_report_stat WHERE id = $1", report_id)
     if not row_rep:
@@ -418,11 +418,11 @@ async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_f
 
     rows = await conn.fetch(
         """
-        SELECT DISTINCT ON (direction, agg_base, agg_state)
-               direction, agg_base, agg_state, trades_total, winrate
+        SELECT DISTINCT ON (direction, timeframe, agg_base, agg_state)
+               direction, timeframe, agg_base, agg_state, trades_total, winrate
           FROM oracle_mw_aggregated_stat
          WHERE report_id = $1
-         ORDER BY direction, agg_base, agg_state, updated_at DESC
+         ORDER BY direction, timeframe, agg_base, agg_state, updated_at DESC
         """,
         report_id,
     )
@@ -432,15 +432,18 @@ async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_f
     pipe = redis.pipeline()
     for r in rows:
         direction = r["direction"]
+        timeframe = r["timeframe"]
         agg_base = r["agg_base"]
         agg_state = r["agg_state"]
         trades_total = int(r["trades_total"] or 0)
         winrate = float(r["winrate"] or 0.0)
 
-        key = f"oracle:mw:{strategy_id}:{direction}:{agg_base}:{agg_state}:{time_frame}"
+        # ключ теперь включает TF (m5/m15/h1)
+        key = f"oracle:mw:{strategy_id}:{direction}:{timeframe}:{agg_base}:{agg_state}:{time_frame}"
         payload = {
             "strategy_id": strategy_id,
             "direction": direction,
+            "timeframe": timeframe,
             "agg_base": agg_base,
             "agg_state": agg_state,
             "time_frame": time_frame,
