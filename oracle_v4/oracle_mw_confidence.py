@@ -14,7 +14,7 @@ log = logging.getLogger("ORACLE_MW_CONF")
 
 # 🔸 Константы
 REPORT_READY_STREAM = "oracle:mw:reports_ready"
-STREAM_BLOCK_MS = 30_000
+STREAM_BLOCK_MS = 10_000
 HISTORY_LOOKBACK_HOURS = 48
 HISTORY_MAX_REPORTS = 12
 CONFIDENCE_DECIMALS = 4
@@ -67,7 +67,6 @@ def _compute_confidence(
     }
     return conf, inputs
 
-
 # 🔸 Основная корутина-слушатель
 async def run_oracle_mw_confidence():
     if infra.pg_pool is None or infra.redis_client is None:
@@ -80,17 +79,21 @@ async def run_oracle_mw_confidence():
 
     while True:
         try:
-            result = await redis.xread({REPORT_READY_STREAM: last_id}, timeout=STREAM_BLOCK_MS)
+            # читаем только новые сообщения; в этой версии redis.asyncio используем аргумент block
+            result = await redis.xread({REPORT_READY_STREAM: last_id}, block=STREAM_BLOCK_MS)
             if not result:
                 continue
 
             for stream_name, messages in result:
                 for msg_id, fields in messages:
                     last_id = msg_id
+                    # поле data может быть str или bytes
                     data_raw = fields.get("data") or fields.get(b"data")
                     if not data_raw:
+                        log.debug("[CONF] пропущено сообщение без поля data (id=%s)", msg_id)
                         continue
 
+                    # парсим JSON
                     try:
                         payload = json.loads(data_raw)
                     except Exception:
@@ -99,8 +102,10 @@ async def run_oracle_mw_confidence():
 
                     report_id = payload.get("report_id")
                     if not report_id:
+                        log.debug("[CONF] сообщение без report_id (id=%s)", msg_id)
                         continue
 
+                    # обработка отчёта
                     try:
                         updated, avg_conf = await _process_report_id(int(report_id))
                         log.info("[CONF] report_id=%s updated=%d avg_conf=%.4f", report_id, updated, avg_conf)
@@ -113,7 +118,6 @@ async def run_oracle_mw_confidence():
         except Exception:
             log.exception("❌ Общая ошибка слушателя, пауза 5с")
             await asyncio.sleep(5)
-
 
 # 🔸 Обработка одного report_id
 async def _process_report_id(report_id: int) -> Tuple[int, float]:
