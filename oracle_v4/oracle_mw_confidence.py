@@ -1,4 +1,4 @@
-# 🔸 oracle_mw_confidence.py — воркер: частоты MW (solo+combo), расчёт confidence_score, финальная публикация KV (TTL 8h)
+# 🔸 oracle_mw_confidence.py — воркер: частоты MW (solo+combo, канонический порядок), расчёт confidence_score (с патчем q_window), финальная публикация KV (TTL 8h)
 
 import asyncio
 import logging
@@ -16,18 +16,21 @@ log = logging.getLogger("ORACLE_MW_CONFIDENCE")
 # 🔸 Константы воркера / параметры исполнения
 REPORT_READY_STREAM = "oracle:mw:reports_ready"   # входной стрим событий «отчёт готов»
 CONF_GROUP = "mwconf_group"                       # consumer-group воркера
-CONF_CONSUMER = "mwconf_1"                        # имя consumer-а (при необходимости можно брать из ENV)
+CONF_CONSUMER = "mwconf_1"                        # имя consumer-а (можно переопределить ENV)
 FETCH_BLOCK_MS = 5000                             # блокировка XREADGROUP (мс)
 BATCH_SIZE_UPDATE = 1000                          # размер батча для апдейтов в БД
 FINAL_KV_TTL_SEC = 8 * 60 * 60                    # TTL финальных KV — 8 часов
 
-# 🔸 Домены и базовые множества
+# 🔸 Канонический порядок компонент MW (совпадает с oracle_mw_snapshot.py)
+CANONICAL_ORDER: Tuple[str, ...] = ("trend", "volatility", "extremes", "momentum")
+
+# 🔸 Домены и базовые множества (в каноническом порядке)
 TF_ORDER = ("m5", "m15", "h1")
 DIRECTIONS = ("long", "short")
-MW_COMPONENTS = ("trend", "volatility", "momentum", "extremes")
+MW_COMPONENTS = CANONICAL_ORDER
 
-# 🔸 Комбо-наборы (фиксированный порядок — как в oracle_mw_snapshot)
-COMBOS_2 = (
+# 🔸 Наборы комбо (в точном порядке как в oracle_mw_snapshot.py)
+COMBOS_2: Tuple[Tuple[str, ...], ...] = (
     ("trend", "volatility"),
     ("trend", "extremes"),
     ("trend", "momentum"),
@@ -35,13 +38,13 @@ COMBOS_2 = (
     ("volatility", "momentum"),
     ("extremes", "momentum"),
 )
-COMBOS_3 = (
+COMBOS_3: Tuple[Tuple[str, ...], ...] = (
     ("trend", "volatility", "extremes"),
     ("trend", "volatility", "momentum"),
     ("trend", "extremes", "momentum"),
     ("volatility", "extremes", "momentum"),
 )
-COMBOS_4 = (tuple(MW_COMPONENTS),)
+COMBOS_4: Tuple[Tuple[str, ...], ...] = (CANONICAL_ORDER,)
 
 
 # 🔸 Типы и ключи
@@ -170,7 +173,7 @@ async def _handle_report_ready(msg_id: str, payload: dict) -> bool:
                 log.info("[CONF] report_id=%s: агрегатов нет — нечего считать", report_id)
                 return True
 
-            # шаг 2: построение частот (solo+combo) и маргиналей компонентов
+            # шаг 2: построение частот (solo+combo) и маргиналей компонентов (по каноническому порядку)
             occ_solo, occ_combo, comp_map, denom_map = await _build_occurrence_and_components(
                 conn=conn,
                 strategy_id=strategy_id,
@@ -201,6 +204,7 @@ async def _handle_report_ready(msg_id: str, payload: dict) -> bool:
                 comp_map=comp_map,
                 cache_map=cache_map,
                 sd_refs=sd_refs,
+                dist_map=dist_map,
             )
             if upd_items:
                 await _persist_confidence_items(conn, upd_items)
@@ -257,7 +261,27 @@ async def _fetch_mwas_rows(conn, report_id: int) -> List[MwasRow]:
     return out
 
 
-# 🔸 Построение частот по окну: SOLO, COMBO и маргинали компонентов
+# 🔸 Нормализация combo-ключа в каноническую форму
+def _normalize_combo_key(agg_base: str, agg_state: str) -> Tuple[str, str]:
+    # парсим состояние в dict {comp: state}
+    state_map: Dict[str, str] = {}
+    if agg_state:
+        for part in agg_state.split("|"):
+            if ":" not in part:
+                continue
+            comp, st = part.split(":", 1)
+            comp = comp.strip()
+            st = st.strip()
+            if comp in CANONICAL_ORDER and st:
+                state_map[comp] = st
+    # оставляем только присутствующие компоненты в каноническом порядке
+    comps = tuple(c for c in CANONICAL_ORDER if c in state_map)
+    base_norm = "_".join(comps)
+    state_norm = "|".join(f"{c}:{state_map[c]}" for c in comps)
+    return base_norm, state_norm
+
+
+# 🔸 Построение частот по окну: SOLO, COMBO и маргинали компонентов (канонический порядок)
 async def _build_occurrence_and_components(
     conn,
     strategy_id: int,
@@ -317,7 +341,7 @@ async def _build_occurrence_and_components(
 
     # SOLO occurrence: (direction, timeframe, base, state) -> count
     occ_solo: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
-    # COMBO occurrence: (direction, timeframe, agg_base, agg_state) -> count
+    # COMBO occurrence (канонический ключ): (direction, timeframe, agg_base, agg_state) -> count
     occ_combo: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
     # Component marginals: (direction, timeframe, component, comp_state) -> count
     comp_map: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
@@ -334,60 +358,40 @@ async def _build_occurrence_and_components(
                 occ_solo[(key[0], key[1], base, state)] += 1
                 comp_map[(key[0], key[1], base, state)] += 1
 
-        # COMBO: формируем пересечение uid по каждой предопределённой комбинации
-        # собираем для удобства по базе множество uid, где база присутствует
-        inv_index: Dict[str, Dict[str, set]] = defaultdict(lambda: defaultdict(set))  # base -> state -> {uid}
+        # COMBO: инвертированный индекс base->state->uids
+        inv_index: Dict[str, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         for uid, bases in uid_states.items():
             for base, state in bases.items():
                 inv_index[base][state].add(uid)
 
-        # пары
-        for combo in COMBOS_2:
-            # условия достаточности — все базы должны быть представлены хотя бы где-то
-            if not all(b in inv_index for b in combo):
-                continue
-            # строим полные пары (state на каждую базу), затем их пересечение
-            # перечисляем все комбинации состояний, реально встречавшихся в uid_states
-            states_lists: List[List[Tuple[str, str]]] = []
+        # подсчёт по фиксированным наборам (строгий порядок)
+        def _emit_combo_counts(combo: Tuple[str, ...]):
+            # условия достаточности — все базы должны встречаться
             for b in combo:
-                states_lists.append([(b, s) for s in inv_index[b].keys()])
+                if b not in inv_index:
+                    return
+            # список состояний для каждой базы в порядке combo
+            states_lists: List[List[Tuple[str, str]]] = [[(b, s) for s in inv_index[b].keys()] for b in combo]
+            # декартово произведение
             for states_tuple in _cartesian_product(states_lists):
-                # пересечение по uid
+                # пересечение uid, у которых есть все состояния
                 uids_sets = [inv_index[b][s] for b, s in states_tuple]
                 inter = set.intersection(*uids_sets) if uids_sets else set()
                 if not inter:
                     continue
-                agg_base = "_".join(combo)
-                agg_state = "|".join(f"{b}:{s}" for b, s in states_tuple)
+                # каноническая нормализация (на случай, если combo не полное CANONICAL_ORDER)
+                states_dict = {b: s for b, s in states_tuple}
+                comps = tuple(c for c in CANONICAL_ORDER if c in states_dict)  # упорядочиваем по канону
+                agg_base = "_".join(comps)
+                agg_state = "|".join(f"{c}:{states_dict[c]}" for c in comps)
                 occ_combo[(key[0], key[1], agg_base, agg_state)] += len(inter)
 
-        # тройки
+        for combo in COMBOS_2:
+            _emit_combo_counts(combo)
         for combo in COMBOS_3:
-            if not all(b in inv_index for b in combo):
-                continue
-            states_lists = [[(b, s) for s in inv_index[b].keys()] for b in combo]
-            for states_tuple in _cartesian_product(states_lists):
-                uids_sets = [inv_index[b][s] for b, s in states_tuple]
-                inter = set.intersection(*uids_sets) if uids_sets else set()
-                if not inter:
-                    continue
-                agg_base = "_".join(combo)
-                agg_state = "|".join(f"{b}:{s}" for b, s in states_tuple)
-                occ_combo[(key[0], key[1], agg_base, agg_state)] += len(inter)
-
-        # четвёрки
+            _emit_combo_counts(combo)
         for combo in COMBOS_4:
-            if not all(b in inv_index for b in combo):
-                continue
-            states_lists = [[(b, s) for s in inv_index[b].keys()] for b in combo]
-            for states_tuple in _cartesian_product(states_lists):
-                uids_sets = [inv_index[b][s] for b, s in states_tuple]
-                inter = set.intersection(*uids_sets) if uids_sets else set()
-                if not inter:
-                    continue
-                agg_base = "_".join(combo)
-                agg_state = "|".join(f"{b}:{s}" for b, s in states_tuple)
-                occ_combo[(key[0], key[1], agg_base, agg_state)] += len(inter)
+            _emit_combo_counts(combo)
 
     return occ_solo, occ_combo, comp_map, denom_map
 
@@ -415,13 +419,12 @@ async def _upsert_occurrence(
     occ_combo: Dict[Tuple[str, str, str, str], int],
     denom_map: Dict[Tuple[str, str], set],
 ):
-    # соберём все строки (solo + combo)
+    # собираем записи (solo + combo) в каноническом виде
     records = []
 
     # solo
     for (direction, timeframe), uids in denom_map.items():
         total_all = len(uids)
-        # для данного (dir, tf) выгружаем только соответствующие ключи
         for (d, tf, base, state), count in occ_solo.items():
             if d == direction and tf == timeframe:
                 records.append((
@@ -430,7 +433,7 @@ async def _upsert_occurrence(
                     int(count), int(total_all),
                 ))
 
-    # combo
+    # combo (уже в каноническом порядке)
     for (direction, timeframe), uids in denom_map.items():
         total_all = len(uids)
         for (d, tf, agg_base, agg_state), count in occ_combo.items():
@@ -444,7 +447,6 @@ async def _upsert_occurrence(
     if not records:
         return
 
-    # раскладываем по колонкам
     cols = list(zip(*records))
     await conn.execute(
         """
@@ -601,12 +603,7 @@ async def _fetch_window_cache_map(conn, mwas_rows: List[MwasRow]) -> Dict[Tuple[
     if not mwas_rows:
         return {}
 
-    # соберём уникальные ключи
     keys = {(r.strategy_id, r.direction, r.timeframe, r.agg_type, r.agg_base, r.agg_state) for r in mwas_rows}
-    if not keys:
-        return {}
-
-    # раскладываем по массивам для UNNEST JOIN
     sid, d, tf, at, ab, as_ = zip(*keys)
 
     rows = await conn.fetch(
@@ -643,23 +640,18 @@ async def _fetch_window_cache_map(conn, mwas_rows: List[MwasRow]) -> Dict[Tuple[
     return out
 
 
-# 🔸 SD-референсы для q_window (по когортам) из кэша окон
+# 🔸 SD-референсы для q_window (по когортам) из кэша окон (используем только ключи с windows_available ≥ 2)
 def _build_sd_references_from_cache(
     mwas_rows: List[MwasRow],
     cache_map: Dict[Tuple[int, str, str, str, str, str], Tuple[Optional[float], Optional[float], Optional[float], int]],
 ) -> Dict[Tuple[int, str, str], List[float]]:
-    # cohort_key = (strategy_id, direction, timeframe)
     sd_refs: Dict[Tuple[int, str, str], List[float]] = defaultdict(list)
 
-    # сгруппируем по когорте и посчитаем sd по доступным p7/p14/p28 каждого ключа
     for r in mwas_rows:
         k = (r.strategy_id, r.direction, r.timeframe)
-        t = cache_map.get((r.strategy_id, r.direction, r.timeframe, r.agg_type, r.agg_base, r.agg_state))
-        if not t:
-            continue
-        p7, p14, p28, _ = t
+        p7, p14, p28, wa = cache_map.get((r.strategy_id, r.direction, r.timeframe, r.agg_type, r.agg_base, r.agg_state), (None, None, None, 0))
         vals = [x for x in (p7, p14, p28) if isinstance(x, (int, float))]
-        if len(vals) < 2:
+        if wa < 2 or len(vals) < 2:
             continue
         mean = sum(vals) / len(vals)
         sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
@@ -684,7 +676,9 @@ def _build_cohort_distributions(
         if r.agg_type == "solo":
             N_s = int(occ_solo.get((r.direction, r.timeframe, r.agg_base, r.agg_state), 0))
         else:
-            N_s = int(occ_combo.get((r.direction, r.timeframe, r.agg_base, r.agg_state), 0))
+            # нормализуем ключ на всякий случай (если бы где-то ключ пришёл не в каноне)
+            base_n, state_n = _normalize_combo_key(r.agg_base, r.agg_state)
+            N_s = int(occ_combo.get((r.direction, r.timeframe, base_n, state_n), 0))
         s = (N_s / N_all) if N_all > 0 else 0.0
         dist_map[kpos].append(s)
     return dist_map
@@ -699,22 +693,24 @@ def _compute_confidence_items(
     comp_map: Dict[Tuple[str, str, str, str], int],
     cache_map: Dict[Tuple[int, str, str, str, str, str], Tuple[Optional[float], Optional[float], Optional[float], int]],
     sd_refs: Dict[Tuple[int, str, str], List[float]],
+    dist_map: Dict[Tuple[int, str, str, str], List[float]],
 ) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
 
     for r in mwas_rows:
         N_all = len(denom_map.get((r.direction, r.timeframe), set()))
+
         if r.agg_type == "solo":
             N_s = int(occ_solo.get((r.direction, r.timeframe, r.agg_base, r.agg_state), 0))
-            p_joint = (N_s / N_all) if N_all > 0 else 0.0
-            p_marginals: List[float] = []  # не используется для solo
+            p_marginals: List[float] = []
         else:
-            N_s = int(occ_combo.get((r.direction, r.timeframe, r.agg_base, r.agg_state), 0))
-            p_joint = (N_s / N_all) if N_all > 0 else 0.0
-            # маргинали по компонентам из comp_map
-            pairs = parse_combo(r.agg_state)
+            # нормализуем combo-ключ перед поиском
+            base_n, state_n = _normalize_combo_key(r.agg_base, r.agg_state)
+            N_s = int(occ_combo.get((r.direction, r.timeframe, base_n, state_n), 0))
+            # маргинали по компонентам (используем нормализованные пары в канон-порядке)
+            comp_pairs = parse_combo(state_n)
             p_marginals = []
-            for c, s in pairs:
+            for c, s in comp_pairs:
                 positions_comp = int(comp_map.get((r.direction, r.timeframe, c, s), 0))
                 p_marginals.append((positions_comp / N_all) if N_all > 0 else 0.0)
 
@@ -722,63 +718,7 @@ def _compute_confidence_items(
         q1 = compute_q_ci_result(r.trades_wins, r.trades_total)
         q2 = compute_q_ci_occurrence(N_s, N_all)
 
-        p7, p14, p28, _wa = cache_map.get((r.strategy_id, r.direction, r.timeframe, r.agg_type, r.agg_base, r.agg_state), (None, None, None, 0))
-        q3 = compute_q_window(
-            p7, p14, p28,
-            cohort_key=(r.strategy_id, r.direction, r.timeframe),
-            sd_reference=sd_refs.get((r.strategy_id, r.direction, r.timeframe)),
-        )
-
-        # для q_scale возьмём распределение по когорте — оно строится отдельно и не передаётся сюда по памяти,
-        # поскольку для расчёта индивидуального s мы уже использовали N_s/N_all и процентиль посчитаем локально:
-        # однако, чтобы не тянуть dist_map ещё раз, воспользуемся эвристикой: percentile по (solo+combo) считается отдельной функцией ниже
-        # здесь оставим нейтральное значение; реальный перцентиль посчитаем через compute_q_scale_percentile(...)
-        # но чтобы соблюсти наш договор, пересчитаем percentile для текущего s на лету из всей когорты:
-        # → соберём s_list когорты один раз вне цикла (это уже сделано в _build_cohort_distributions) и передадим сюда! (см. выше)
-        # Исправление: q_scale вычислим здесь через вспомогательный киец:
-        #   — чтобы не городить ещё один параметр, пересчёт делаем локально ниже, вызывающий код уже подготовил dist_map.
-        # (см. правку ниже)
-        pass
-
-    # этот блок заменён более корректной версией ниже; оставлен как пояснение
-    return _compute_confidence_items_with_scale(
-        mwas_rows, occ_solo, occ_combo, denom_map, comp_map, cache_map, sd_refs
-    )
-
-
-# комментарий: финальная версия расчёта с корректным q_scale по предсобранному распределению
-def _compute_confidence_items_with_scale(
-    mwas_rows: List[MwasRow],
-    occ_solo: Dict[Tuple[str, str, str, str], int],
-    occ_combo: Dict[Tuple[str, str, str, str], int],
-    denom_map: Dict[Tuple[str, str], set],
-    comp_map: Dict[Tuple[str, str, str, str], int],
-    cache_map: Dict[Tuple[int, str, str, str, str, str], Tuple[Optional[float], Optional[float], Optional[float], int]],
-    sd_refs: Dict[Tuple[int, str, str], List[float]],
-) -> List[Dict[str, Any]]:
-    # соберём распределения s по когортам для q_scale
-    dist_map = _build_cohort_distributions(mwas_rows, occ_solo, occ_combo, denom_map)
-
-    items: List[Dict[str, Any]] = []
-    for r in mwas_rows:
-        N_all = len(denom_map.get((r.direction, r.timeframe), set()))
-        if r.agg_type == "solo":
-            N_s = int(occ_solo.get((r.direction, r.timeframe, r.agg_base, r.agg_state), 0))
-            p_joint = (N_s / N_all) if N_all > 0 else 0.0
-            p_marginals: List[float] = []
-        else:
-            N_s = int(occ_combo.get((r.direction, r.timeframe, r.agg_base, r.agg_state), 0))
-            p_joint = (N_s / N_all) if N_all > 0 else 0.0
-            pairs = parse_combo(r.agg_state)
-            p_marginals = []
-            for c, s in pairs:
-                positions_comp = int(comp_map.get((r.direction, r.timeframe, c, s), 0))
-                p_marginals.append((positions_comp / N_all) if N_all > 0 else 0.0)
-
-        q1 = compute_q_ci_result(r.trades_wins, r.trades_total)
-        q2 = compute_q_ci_occurrence(N_s, N_all)
-
-        p7, p14, p28, _wa = cache_map.get((r.strategy_id, r.direction, r.timeframe, r.agg_type, r.agg_base, r.agg_state), (None, None, None, 0))
+        p7, p14, p28, wa = cache_map.get((r.strategy_id, r.direction, r.timeframe, r.agg_type, r.agg_base, r.agg_state), (None, None, None, 0))
         q3 = compute_q_window(
             p7, p14, p28,
             cohort_key=(r.strategy_id, r.direction, r.timeframe),
@@ -794,6 +734,7 @@ def _compute_confidence_items_with_scale(
         q_list: List[Optional[float]] = [q1, q2, q3, q4]
         q5 = None
         if r.agg_type == "combo":
+            p_joint = (N_s / N_all) if N_all > 0 else 0.0
             q5 = compute_q_npmi(p_joint, p_marginals)
             q_list.append(q5)
 
@@ -913,21 +854,21 @@ async def _publish_final_kv(conn, redis, report_id: int, strategy_id: int, time_
     return published
 
 
-# 🔸 Парсинг combo-строки состояния
+# 🔸 Парсинг combo-строки состояния (возвращает пары в каноническом порядке)
 def parse_combo(agg_state: str) -> List[Tuple[str, str]]:
     if not agg_state:
         return []
-    pairs: List[Tuple[str, str]] = []
-    parts = agg_state.split("|")
-    for part in parts:
+    # парсим и нормализуем порядок
+    m: Dict[str, str] = {}
+    for part in agg_state.split("|"):
         if ":" not in part:
             continue
         comp, state = part.split(":", 1)
         comp = comp.strip()
         state = state.strip()
-        if comp in MW_COMPONENTS and state:
-            pairs.append((comp, state))
-    return pairs
+        if comp in CANONICAL_ORDER and state:
+            m[comp] = state
+    return [(c, m[c]) for c in CANONICAL_ORDER if c in m]
 
 
 # 🔸 Вычисление complexity_level
@@ -955,7 +896,8 @@ def compute_q_ci_occurrence(positions_state: int, positions_all: int, conf_level
         return 0.0
     return compute_q_ci_result(positions_state, positions_all, conf_level)
 
-# 🔸 Компонента q_window — согласованность winrate между окнами (data-driven через CUME_DIST, strict-rank)
+
+# 🔸 Компонента q_window — согласованность winrate между окнами (патч: strict-rank + константный sd_ref)
 def compute_q_window(
     p7: Optional[float],
     p14: Optional[float],
@@ -991,6 +933,7 @@ def compute_q_window(
 
     # кламп в [0,1]
     return max(0.0, min(1.0, q))
+
 
 # 🔸 Компонента q_npmi — когерентность combo
 def compute_q_npmi(p_joint: float, p_marginals: List[float], eps: float = 1e-12) -> float:
