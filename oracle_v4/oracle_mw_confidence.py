@@ -21,6 +21,9 @@ WINDOW_STEPS = {"7d": 7 * 6, "14d": 14 * 6, "28d": 28 * 6}
 # 🔸 Параметры статистики
 Z = 1.96  # Wilson 95%
 
+# 🔸 Базовый «нейтральный» winrate (RR 1:1). Тут без денег: чисто порог 0.5
+BASELINE_WR = 0.5
+
 
 # 🔸 Точка входа воркера (вызывается из oracle_v4_main через run_safe_loop)
 async def run_oracle_confidence():
@@ -271,12 +274,11 @@ async def _persistence_metrics(conn, row: dict, L: int) -> Tuple[float, float, L
 
     return presence_rate, growth_hist, hist_n
 
-
-# 🔸 Cross-window coherence: взвешенное согласие окон (веса = R окна)
+# 🔸 Cross-window coherence: согласованность знака winrate относительно BASELINE_WR (без PnL)
 async def _cross_window_coherence(conn, row: dict) -> float:
     rows = await conn.fetch(
         """
-        SELECT time_frame, trades_total, trades_wins, winrate, avg_pnl_per_trade
+        SELECT time_frame, trades_total, trades_wins, winrate
         FROM v_mw_aggregated_with_time
         WHERE strategy_id = $1
           AND direction   = $2
@@ -293,21 +295,54 @@ async def _cross_window_coherence(conn, row: dict) -> float:
     if not rows:
         return 0.0
 
-    num = 0.0
-    den = 0.0
+    # собираем «уверенные» окна и их знаки: +1 (выше baseline), -1 (ниже baseline)
+    signs = []   # элементы: (+1|-1)
+    weights = [] # элементы: R_win (Wilson LB как вес надёжности)
+
     for r in rows:
         n = int(r["trades_total"] or 0)
         w = int(r["trades_wins"] or 0)
-        pnl = float(r["avg_pnl_per_trade"] or 0.0)
         if n <= 0:
             continue
-        Rw = _wilson_lower_bound(w, n, Z)
-        den += Rw
-        aligned = 1.0 if (Rw > 0.5 and pnl > 0.0) else 0.0
-        num += Rw * aligned
 
-    return (num / den) if den > 0 else 0.0
+        lb, ub = _wilson_bounds(w, n, Z)
+        R_win = lb  # вес = надёжность окна (нижняя граница)
 
+        # уверенно «выше baseline»
+        if lb > BASELINE_WR:
+            signs.append(+1)
+            weights.append(R_win)
+        # уверенно «ниже baseline»
+        elif ub < BASELINE_WR:
+            signs.append(-1)
+            weights.append(R_win)
+        # иначе окно неопределённое — в согласованность не включаем
+
+    # если нет ни одного уверенного окна — согласованность = 0
+    if not weights:
+        return 0.0
+
+    # взвешенная согласованность: |сумма знаков| / сумма весов
+    # если все окна «в одну сторону» (все +1 или все -1) → C=1
+    # если окна пополам и по весам компенсируют друг друга → C≈0
+    signed_weight = sum(s * w for s, w in zip(signs, weights))
+    total_weight = sum(weights)
+    C = abs(signed_weight) / total_weight
+    return float(max(0.0, min(1.0, C)))
+
+
+# 🔸 Wilson bounds: нижняя и верхняя границы доверительного интервала Вильсона
+def _wilson_bounds(wins: int, n: int, z: float) -> tuple[float, float]:
+    if n <= 0:
+        return 0.0, 0.0
+    p = wins / n
+    denom = 1.0 + (z * z) / n
+    center = p + (z * z) / (2.0 * n)
+    adj = z * math.sqrt((p * (1.0 - p) / n) + (z * z) / (4.0 * n * n))
+    lb = (center - adj) / denom
+    ub = (center + adj) / denom
+    # обрезаем на [0,1] на всякий случай
+    return max(0.0, min(1.0, lb)), max(0.0, min(1.0, ub))
 
 # 🔸 Стабильность ключа: робастный z на истории ключа (median/MAD)
 async def _stability_key(conn, row: dict, L: int) -> Tuple[float, int]:
