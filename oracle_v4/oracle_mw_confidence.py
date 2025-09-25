@@ -199,7 +199,7 @@ async def _fetch_cohort(conn, row: dict) -> List[dict]:
     return [dict(x) for x in rows]
 
 
-# 🔸 Загрузка активных весов из БД (с простым кэшем)
+# 🔸 Загрузка активных весов из БД (с простым кэшем и безопасным парсингом JSON)
 async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[Dict[str, float], Dict]:
     now = time.time()
 
@@ -242,22 +242,62 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
         strategy_id, time_frame
     )
 
+    # дефолты на все случаи
+    defaults_w = {"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}
+    defaults_o = {"baseline_mode": "neutral"}
+
+    def _parse_json_like(x, default):
+        # если это уже dict — ок
+        if isinstance(x, dict):
+            return x
+        # asyncpg иногда может вернуть memoryview/bytes/str
+        if isinstance(x, (bytes, bytearray, memoryview)):
+            try:
+                return json.loads(bytes(x).decode("utf-8"))
+            except Exception:
+                log.exception("⚠️ Не удалось распарсить JSON из bytes/memoryview")
+                return default
+        if isinstance(x, str):
+            try:
+                return json.loads(x)
+            except Exception:
+                log.exception("⚠️ Не удалось распарсить JSON из строки")
+                return default
+        # неожиданный тип
+        return default
+
     if row:
-        weights = dict(row["weights"])
-        opts = dict(row["opts"])
+        raw_w = row["weights"]
+        raw_o = row["opts"]
+        weights = _parse_json_like(raw_w, defaults_w)
+        opts = _parse_json_like(raw_o, defaults_o)
     else:
-        # дефолтные веса
-        weights = {"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}
-        opts = {"baseline_mode": "neutral"}
+        weights = defaults_w
+        opts = defaults_o
+
+    # приведение и валидация весов
+    wR = float(weights.get("wR", defaults_w["wR"]))
+    wP = float(weights.get("wP", defaults_w["wP"]))
+    wC = float(weights.get("wC", defaults_w["wC"]))
+    wS = float(weights.get("wS", defaults_w["wS"]))
+
+    # если все веса нулевые/некорректные — падём на дефолт
+    total = wR + wP + wC + wS
+    if not math.isfinite(total) or total <= 0:
+        wR, wP, wC, wS = defaults_w["wR"], defaults_w["wP"], defaults_w["wC"], defaults_w["wS"]
+        total = wR + wP + wC + wS
+
+    # нормализация до суммы 1 (без изменения относительных долей)
+    wR, wP, wC, wS = (wR / total, wP / total, wC / total, wS / total)
+    weights_norm = {"wR": wR, "wP": wP, "wC": wC, "wS": wS}
 
     # запись в кэш для всех трёх ключей, чтобы реже дёргать БД
     ts = time.time()
-    _weights_cache[(strategy_id, time_frame)] = (weights, opts, ts)
-    _weights_cache[(strategy_id, None)] = (weights, opts, ts)
-    _weights_cache[(None, None)] = (weights, opts, ts)
+    _weights_cache[(strategy_id, time_frame)] = (weights_norm, opts, ts)
+    _weights_cache[(strategy_id, None)] = (weights_norm, opts, ts)
+    _weights_cache[(None, None)] = (weights_norm, opts, ts)
 
-    return weights, opts
-
+    return weights_norm, opts
 
 # 🔸 Расчёт confidence (динамическая модель)
 async def _calc_confidence(
