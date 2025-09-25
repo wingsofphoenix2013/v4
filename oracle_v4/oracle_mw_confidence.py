@@ -955,8 +955,7 @@ def compute_q_ci_occurrence(positions_state: int, positions_all: int, conf_level
         return 0.0
     return compute_q_ci_result(positions_state, positions_all, conf_level)
 
-
-# 🔸 Компонента q_window — согласованность winrate между окнами (data-driven через CUME_DIST)
+# 🔸 Компонента q_window — согласованность winrate между окнами (data-driven через CUME_DIST, strict-rank)
 def compute_q_window(
     p7: Optional[float],
     p14: Optional[float],
@@ -964,25 +963,34 @@ def compute_q_window(
     cohort_key: Tuple[int, str, str],
     sd_reference: Optional[List[float]] = None,
 ) -> float:
+    # базовые значения по окнам
     vals = [x for x in (p7, p14, p28) if isinstance(x, (int, float))]
     if len(vals) < 2:
-        return 0.5  # информационно нейтрально
+        return 0.5  # информационно нейтрально при <2 окон
+
     mean = sum(vals) / len(vals)
     sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
-    if not sd_reference:
-        # без референса — вернём нейтральное значение, не магический порог
-        return 0.5
-    # CUME_DIST по sd среди когорты
-    sorted_ref = sorted(sd_reference)
-    rank = 0
-    for x in sorted_ref:
-        if x <= sd:
-            rank += 1
-        else:
-            break
-    perc = rank / max(1, len(sorted_ref))
-    return max(0.0, min(1.0, 1.0 - perc))
 
+    # референсное распределение sd в когорте
+    if not sd_reference:
+        return 0.5  # нет референса — нейтрально
+
+    ref = [float(x) for x in sd_reference if isinstance(x, (int, float))]
+    if not ref:
+        return 0.5
+
+    # если распределение практически константно — идеальная согласованность
+    eps = 1e-12
+    if (max(ref) - min(ref)) <= eps:
+        return 1.0
+
+    # strict-rank: чем меньше sd, тем выше q_window
+    rank_strict = sum(1 for x in ref if x < sd)
+    perc_strict = rank_strict / len(ref)
+    q = 1.0 - perc_strict
+
+    # кламп в [0,1]
+    return max(0.0, min(1.0, q))
 
 # 🔸 Компонента q_npmi — когерентность combo
 def compute_q_npmi(p_joint: float, p_marginals: List[float], eps: float = 1e-12) -> float:
