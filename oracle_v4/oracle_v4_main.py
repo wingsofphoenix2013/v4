@@ -16,9 +16,10 @@ from config_loader import (
 
 # 🔸 импорт воркера MW-отчётов
 from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
-
 # 🔸 импорт воркера PACK-отчётов
 from oracle_pack_snapshot import run_oracle_pack_snapshot as run_pack, INITIAL_DELAY_SEC as PACK_INIT_DELAY, INTERVAL_SEC as PACK_INTERVAL
+# 🔸 импорт воркера confidence
+from oracle_mw_confidence import run_oracle_mw_confidence
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -84,6 +85,7 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
         run_periodic(run_pack, PACK_INTERVAL, "ORACLE_PACK_SNAPSHOT", initial_delay=PACK_INIT_DELAY),
+        run_safe_loop(run_oracle_mw_confidence, "ORACLE_MW_CONFIDENCE"),
     )
 
 if __name__ == "__main__":

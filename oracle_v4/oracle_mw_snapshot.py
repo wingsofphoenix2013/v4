@@ -1,4 +1,4 @@
-# 🔸 oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по СОСТОЯНИЯМ (solo/combos), публикация KV
+# 🔸 oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по СОСТОЯНИЯМ (solo/combos), публикация события "отчёт готов" в Redis Stream
 
 import asyncio
 import logging
@@ -13,7 +13,6 @@ log = logging.getLogger("ORACLE_MW_SNAPSHOT")
 # 🔸 Константы воркера / параметры исполнения
 INITIAL_DELAY_SEC = 90                    # первый запуск через 90 секунд
 INTERVAL_SEC = 4 * 60 * 60                # периодичность — каждые 4 часа
-REDIS_TTL_SEC = 8 * 60 * 60               # TTL KV публикаций — 8 часов
 BATCH_SIZE = 500                          # размер батча по позициям
 WINDOW_TAGS = ("7d", "14d", "28d")        # метки окон
 WINDOW_SIZES = {
@@ -23,6 +22,10 @@ WINDOW_SIZES = {
 }
 TF_ORDER = ("m5", "m15", "h1")            # последовательная обработка TF
 MW_BASES = ("trend", "volatility", "extremes", "momentum")  # фиксированный порядок для combo
+
+# 🔸 Настройки Redis Stream для сигнала «отчёт готов»
+REPORT_READY_STREAM = "oracle:mw:reports_ready"   # имя стрима с уведомлениями о готовности отчёта
+REPORT_READY_MAXLEN = 10000                       # мягкое ограничение длины стрима (XADD ... MAXLEN ~)
 
 
 # 🔸 Публичная точка запуска воркера (вызывается из oracle_v4_main.py → run_periodic)
@@ -84,20 +87,52 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
 
         if closed_total == 0:
             log.debug("[REPORT] sid=%s win=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
+            # отправим событие о готовности отчёта даже при total=0 (пусть downstream решит, что с этим делать)
+            try:
+                await _emit_report_ready(
+                    redis=infra.redis_client,
+                    report_id=report_id,
+                    strategy_id=strategy_id,
+                    time_frame=tag,
+                    window_start=win_start,
+                    window_end=win_end,
+                    aggregate_rows=0,
+                    tf_done=[],
+                    generated_at=datetime.utcnow().replace(tzinfo=None),
+                )
+            except Exception:
+                log.exception("❌ Ошибка публикации события REPORT_READY sid=%s win=%s (total=0)", strategy_id, tag)
             continue
 
         # последовательный проход по TF
+        tf_done: List[str] = []
         for tf in TF_ORDER:
             try:
                 await _process_timeframe(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                tf_done.append(tf)
             except Exception:
                 log.exception("❌ Ошибка агрегации sid=%s win=%s tf=%s", strategy_id, tag, tf)
 
-        # публикация KV сводок по этому report
+        # после завершения TF — отправляем событие «отчёт готов» в Redis Stream
         try:
-            await _publish_kv_bulk(conn, infra.redis_client, report_id, strategy_id, tag)
+            # считаем число агрегатных строк для телеметрии
+            row_count = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM oracle_mw_aggregated_stat WHERE report_id = $1",
+                report_id,
+            )
+            await _emit_report_ready(
+                redis=infra.redis_client,
+                report_id=report_id,
+                strategy_id=strategy_id,
+                time_frame=tag,
+                window_start=win_start,
+                window_end=win_end,
+                aggregate_rows=int(row_count or 0),
+                tf_done=tf_done,
+                generated_at=datetime.utcnow().replace(tzinfo=None),
+            )
         except Exception:
-            log.exception("❌ Ошибка публикации KV sid=%s win=%s", strategy_id, tag)
+            log.exception("❌ Ошибка публикации события REPORT_READY sid=%s win=%s", strategy_id, tag)
 
         log.debug(
             "[REPORT] sid=%s win=%s report_id=%s total=%d wins=%d wr=%.4f pnl_sum=%.4f avg_pnl=%.4f avg_tpd=%.4f",
@@ -171,6 +206,7 @@ async def _finalize_report_header(
         round(float(avg_pnl_per_trade), 4),
         round(float(avg_trades_per_day), 4),
     )
+
 
 # 🔸 Обработка одного TF: выбор позиций окна → батч-агрегация MW-STATE → upsert агрегатов
 async def _process_timeframe(
@@ -302,6 +338,7 @@ async def _process_timeframe(
                 for b in combo:
                     if b not in states_tf:
                         return
+                agg_base = "_join".replace("_join", "_").join(combo)  # аккуратный join (равносильно "_".join)
                 agg_base = "_".join(combo)
                 agg_state = "|".join(f"{b}:{states_tf[b]}" for b in combo)  # 'trend:down_weak|volatility:expanding|...'
                 k = (report_id, strategy_id, time_frame, direction, timeframe, "combo", agg_base, agg_state)
@@ -325,6 +362,7 @@ async def _process_timeframe(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.debug("[TF] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+
 
 # 🔸 Батчевый UPSERT агрегатов (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):
@@ -403,55 +441,47 @@ async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]],
                                    4),
             updated_at         = now()
         """,
-        report_ids, strategy_ids, time_frames, directions, timeframes, agg_types, agg_bases, agg_states,
-        trades_inc, wins_inc, pnl_total_inc, pnl_wins_inc,
-        days_in_window,
+        *[
+            report_ids, strategy_ids, time_frames, directions,
+            timeframes, agg_types, agg_bases, agg_states,
+            trades_inc, wins_inc, pnl_total_inc, pnl_wins_inc,
+            days_in_window,
+        ],
     )
 
 
-# 🔸 Публикация KV сводок для отчёта (пер-TF: direction+timeframe+base+state)
-async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_frame: str):
-    row_rep = await conn.fetchrow("SELECT closed_total FROM oracle_report_stat WHERE id = $1", report_id)
-    if not row_rep:
-        return
-    closed_total = int(row_rep["closed_total"] or 0)
+# 🔸 Публикация события «отчёт готов» в Redis Stream
+async def _emit_report_ready(
+    redis,
+    *,
+    report_id: int,
+    strategy_id: int,
+    time_frame: str,
+    window_start: datetime,
+    window_end: datetime,
+    aggregate_rows: int,
+    tf_done: List[str],
+    generated_at: datetime,
+):
+    # собираем пейлоад
+    payload = {
+        "report_id": int(report_id),
+        "strategy_id": int(strategy_id),
+        "time_frame": str(time_frame),
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "generated_at": generated_at.isoformat(),
+        "aggregate_rows": int(aggregate_rows),
+        "tf_done": list(tf_done or []),
+    }
 
-    rows = await conn.fetch(
-        """
-        SELECT DISTINCT ON (direction, timeframe, agg_base, agg_state)
-               direction, timeframe, agg_base, agg_state, trades_total, winrate
-          FROM oracle_mw_aggregated_stat
-         WHERE report_id = $1
-         ORDER BY direction, timeframe, agg_base, agg_state, updated_at DESC
-        """,
-        report_id,
+    # отправка в Redis Stream (мягкое ограничение длины)
+    # используем одно поле 'data' со строкой JSON — унифицировано с остальными стримами проекта
+    fields = {"data": json.dumps(payload, separators=(",", ":"))}
+    await redis.xadd(name=REPORT_READY_STREAM, fields=fields, maxlen=REPORT_READY_MAXLEN, approximate=True)
+
+    # лог на результат
+    log.info(
+        "[REPORT_READY] sid=%s win=%s report_id=%s rows=%d tf_done=%s",
+        strategy_id, time_frame, report_id, aggregate_rows, ",".join(tf_done) if tf_done else "-",
     )
-    if not rows:
-        return
-
-    pipe = redis.pipeline()
-    for r in rows:
-        direction = r["direction"]
-        timeframe = r["timeframe"]
-        agg_base = r["agg_base"]
-        agg_state = r["agg_state"]
-        trades_total = int(r["trades_total"] or 0)
-        winrate = float(r["winrate"] or 0.0)
-
-        # ключ теперь включает TF (m5/m15/h1)
-        key = f"oracle:mw:{strategy_id}:{direction}:{timeframe}:{agg_base}:{agg_state}:{time_frame}"
-        payload = {
-            "strategy_id": strategy_id,
-            "direction": direction,
-            "timeframe": timeframe,
-            "agg_base": agg_base,
-            "agg_state": agg_state,
-            "time_frame": time_frame,
-            "report_id": report_id,
-            "closed_total": closed_total,
-            "agg_trades_total": trades_total,
-            "winrate": f"{winrate:.4f}",
-        }
-        pipe.set(key, str(payload), ex=REDIS_TTL_SEC)
-
-    await pipe.execute()
