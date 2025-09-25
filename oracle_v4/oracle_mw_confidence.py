@@ -1,224 +1,292 @@
-# oracle_mw_confidence.py — воркер расчёта доверия к строкам MW-отчётов
+# 🔸 oracle_mw_confidence.py — воркер confidence: расчёт доверия к строкам MW-отчётов и обновление в БД
 
-# 🔸 Импорты
 import asyncio
-import json
 import logging
+import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+import math
 
 import infra
 
-# 🔸 Логгер
-log = logging.getLogger("ORACLE_MW_CONF")
+log = logging.getLogger("ORACLE_CONFIDENCE")
 
-# 🔸 Константы
-REPORT_READY_STREAM = "oracle:mw:reports_ready"
-STREAM_BLOCK_MS = 10_000
-HISTORY_LOOKBACK_HOURS = 48
-HISTORY_MAX_REPORTS = 12
-CONFIDENCE_DECIMALS = 4
+# 🔸 Константы воркера
+REPORT_STREAM = "oracle:mw:reports_ready"   # Redis Stream, из которого берём сигналы
+REPORT_CONSUMER_GROUP = "oracle_confidence_group"
+REPORT_CONSUMER_NAME = "oracle_confidence_worker"
 
-
-# 🔸 Вспомогательные функции
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+# 🔸 Параметры расчёта
+Z = 1.96               # уровень доверия для Wilson (95%)
+EMA_ALPHA = 0.3        # сглаживание для EMA по winrate
+STABILITY_WINDOW = 7   # количество прогонов для оценки стабильности
+PERSIST_K = 12         # количество прогонов для presence_rate (≈2 суток при шаге 4ч)
 
 
-def _round_conf(x: float) -> float:
-    return round(_clamp01(x), CONFIDENCE_DECIMALS)
-
-
-def _compute_confidence(
-    trades_total: int,
-    closed_total: int,
-    presence_count: int,
-    streak: int,
-    avg_inc_per_report: float,
-    cross_confirmations: int,
-) -> Tuple[float, Dict]:
-    closed_total = max(1, closed_total)
-
-    # trade_score: доля сделок
-    share = trades_total / closed_total
-    trade_score = min(1.0, share * 5.0)
-
-    # temporal_score: регулярность появления и накопления
-    presence_rate = presence_count / HISTORY_MAX_REPORTS
-    growth_factor = 1.0 if avg_inc_per_report >= 1.0 else avg_inc_per_report
-    temporal_score = min(1.0, 0.7 * presence_rate + 0.2 * (streak / HISTORY_MAX_REPORTS) + 0.1 * growth_factor)
-
-    # cross_bonus: подтверждение в других окнах
-    cross_bonus = min(1.0, cross_confirmations / 3.0)
-
-    # финальная агрегация
-    raw = 0.5 * trade_score + 0.35 * temporal_score + 0.15 * cross_bonus
-    conf = _round_conf(raw)
-
-    inputs = {
-        "trades_total": trades_total,
-        "closed_total": closed_total,
-        "share": round(share, 4),
-        "presence_count": presence_count,
-        "streak": streak,
-        "avg_inc_per_report": round(avg_inc_per_report, 4),
-        "cross_confirmations": cross_confirmations,
-        "raw": round(raw, 4),
-    }
-    return conf, inputs
-
-# 🔸 Основная корутина-слушатель
-async def run_oracle_mw_confidence():
+# 🔸 Точка входа воркера
+async def run_oracle_confidence():
     if infra.pg_pool is None or infra.redis_client is None:
-        log.debug("❌ PG/Redis не инициализированы")
+        log.debug("❌ Пропуск: PG/Redis не инициализированы")
         return
 
-    redis = infra.redis_client
-    last_id = "$"
-    log.info("🚀 ORACLE_MW_CONF слушает %s", REPORT_READY_STREAM)
+    # инициализация группы в Redis Stream (если ещё не создана)
+    try:
+        await infra.redis_client.xgroup_create(
+            name=REPORT_STREAM,
+            groupname=REPORT_CONSUMER_GROUP,
+            id="$",
+            mkstream=True
+        )
+        log.info("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            pass  # группа уже существует
+        else:
+            log.exception("❌ Ошибка инициализации группы Redis Stream")
+            return
+
+    log.info("🚀 Старт воркера confidence")
 
     while True:
         try:
-            # читаем только новые сообщения; в этой версии redis.asyncio используем аргумент block
-            result = await redis.xread({REPORT_READY_STREAM: last_id}, block=STREAM_BLOCK_MS)
-            if not result:
+            resp = await infra.redis_client.xreadgroup(
+                groupname=REPORT_CONSUMER_GROUP,
+                consumername=REPORT_CONSUMER_NAME,
+                streams={REPORT_STREAM: ">"},
+                count=10,
+                block=30_000,
+            )
+            if not resp:
                 continue
 
-            for stream_name, messages in result:
-                for msg_id, fields in messages:
-                    last_id = msg_id
-                    # поле data может быть str или bytes
-                    data_raw = fields.get("data") or fields.get(b"data")
-                    if not data_raw:
-                        log.debug("[CONF] пропущено сообщение без поля data (id=%s)", msg_id)
-                        continue
-
-                    # парсим JSON
+            for stream_name, msgs in resp:
+                for msg_id, fields in msgs:
                     try:
-                        payload = json.loads(data_raw)
+                        payload = json.loads(fields.get("data", "{}"))
+                        report_id = int(payload.get("report_id", 0))
+                        strategy_id = int(payload.get("strategy_id", 0))
+                        time_frame = payload.get("time_frame")
+                        await _process_report(report_id, strategy_id, time_frame)
+                        await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, msg_id)
                     except Exception:
-                        log.exception("❌ Ошибка парсинга JSON (id=%s)", msg_id)
-                        continue
-
-                    report_id = payload.get("report_id")
-                    if not report_id:
-                        log.debug("[CONF] сообщение без report_id (id=%s)", msg_id)
-                        continue
-
-                    # обработка отчёта
-                    try:
-                        updated, avg_conf = await _process_report_id(int(report_id))
-                        log.info("[CONF] report_id=%s updated=%d avg_conf=%.4f", report_id, updated, avg_conf)
-                    except Exception:
-                        log.exception("❌ Ошибка обработки report_id=%s", report_id)
+                        log.exception("❌ Ошибка обработки сообщения из Redis Stream")
 
         except asyncio.CancelledError:
-            log.info("⏹️ ORACLE_MW_CONF остановлен")
+            log.info("⏹️ Воркер confidence остановлен по сигналу")
             raise
         except Exception:
-            log.exception("❌ Общая ошибка слушателя, пауза 5с")
+            log.exception("❌ Ошибка в основном цикле confidence — пауза 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Обработка одного report_id
-async def _process_report_id(report_id: int) -> Tuple[int, float]:
-    now = datetime.utcnow()
-    lookback_cut = now - timedelta(hours=HISTORY_LOOKBACK_HOURS)
 
+# 🔸 Обработка одного отчёта (report_id)
+async def _process_report(report_id: int, strategy_id: int, time_frame: str):
     async with infra.pg_pool.acquire() as conn:
-        header = await conn.fetchrow(
-            "SELECT strategy_id, time_frame, created_at, closed_total FROM oracle_report_stat WHERE id = $1",
-            report_id,
-        )
-        if not header:
-            return 0, 0.0
-
-        strategy_id = int(header["strategy_id"])
-        report_time_frame = header["time_frame"]
-        report_created_at = header["created_at"]
-        closed_total = int(header["closed_total"] or 0)
-
         rows = await conn.fetch(
             """
-            SELECT id, direction, timeframe, agg_type, agg_base, agg_state, trades_total
-              FROM oracle_mw_aggregated_stat
-             WHERE report_id = $1
+            SELECT
+              id,
+              report_id,
+              strategy_id,
+              time_frame,
+              direction,
+              timeframe,
+              agg_type,
+              agg_base,
+              agg_state,
+              trades_total,
+              trades_wins,
+              winrate,
+              avg_pnl_per_trade,
+              report_created_at
+            FROM v_mw_aggregated_with_time
+            WHERE report_id = $1
             """,
             report_id,
         )
+
         if not rows:
-            return 0, 0.0
-
-        updates = []
-        for r in rows:
-            row_id = int(r["id"])
-            trades_total = int(r["trades_total"] or 0)
-
-            # история за 2 суток
-            history = await conn.fetch(
-                """
-                SELECT a.trades_total
-                  FROM oracle_mw_aggregated_stat a
-                  JOIN oracle_report_stat r ON a.report_id = r.id
-                 WHERE a.strategy_id = $1
-                   AND a.time_frame = $2
-                   AND a.direction = $3
-                   AND a.timeframe = $4
-                   AND a.agg_type = $5
-                   AND a.agg_base = $6
-                   AND a.agg_state = $7
-                   AND r.created_at >= $8
-                 ORDER BY r.created_at DESC
-                 LIMIT $9
-                """,
-                strategy_id, report_time_frame, r["direction"], r["timeframe"],
-                r["agg_type"], r["agg_base"], r["agg_state"],
-                lookback_cut, HISTORY_MAX_REPORTS,
-            )
-
-            presence_count = len(history)
-            streak = presence_count  # упрощённо: все подряд
-            avg_inc = 0.0
-            if presence_count >= 2:
-                delta = int(history[0]["trades_total"]) - int(history[-1]["trades_total"])
-                avg_inc = delta / max(1, presence_count - 1)
-
-            conf, inputs = _compute_confidence(
-                trades_total=trades_total,
-                closed_total=closed_total,
-                presence_count=presence_count,
-                streak=streak,
-                avg_inc_per_report=avg_inc,
-                cross_confirmations=0,  # упрощено, можно добавить позже
-            )
-            updates.append((conf, inputs, row_id))
+            log.info("ℹ️ Для report_id=%s нет агрегатов", report_id)
+            return
 
         updated = 0
-        avg_conf = 0.0
-        async with conn.transaction():
-            for conf, inputs, row_id in updates:
+        for r in rows:
+            try:
+                confidence, inputs = await _calc_confidence(conn, dict(r))
                 await conn.execute(
                     """
                     UPDATE oracle_mw_aggregated_stat
-                       SET confidence = $1,
-                           confidence_inputs = $2,
+                       SET confidence = $2,
+                           confidence_inputs = $3,
                            confidence_updated_at = now()
-                     WHERE id = $3
+                     WHERE id = $1
                     """,
-                    conf, json.dumps(inputs, separators=(",", ":"), ensure_ascii=False), row_id,
+                    int(r["id"]),
+                    float(confidence),
+                    json.dumps(inputs, separators=(",", ":")),
                 )
                 updated += 1
-                avg_conf += conf
+            except Exception:
+                log.exception("❌ Ошибка обновления confidence для aggregated_id=%s", r["id"])
 
-        return updated, (avg_conf / updated if updated else 0.0)
+        log.info("✅ Обновлён confidence для report_id=%s (strategy_id=%s, time_frame=%s): %d строк",
+                 report_id, strategy_id, time_frame, updated)
 
 
-# 🔸 Обёртка для main
-async def run_safe_oracle_confidence():
-    while True:
-        try:
-            await run_oracle_mw_confidence()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("❌ ORACLE_MW_CONF упал, перезапуск через 5с")
-            await asyncio.sleep(5)
+# 🔸 Расчёт confidence для одной строки
+async def _calc_confidence(conn, row: dict):
+    n = int(row["trades_total"] or 0)
+    wins = int(row["trades_wins"] or 0)
+    wr = float(row["winrate"] or 0.0)
+    pnl = float(row["avg_pnl_per_trade"] or 0.0)
+
+    # Reliability (R) — Wilson lower bound для winrate
+    R = _wilson_lower_bound(wins, n, Z) if n > 0 else 0.0
+
+    # Persistence (P) — наличие строки в последних K отчётах
+    presence_rate, volume_growth = await _calc_persistence(conn, row)
+    P = 0.6 * presence_rate + 0.4 * volume_growth
+
+    # Cross-window coherence (C) — согласованность между окнами
+    C = await _calc_cross_window(conn, row)
+
+    # Stability (S) — устойчивость winrate
+    S = await _calc_stability(conn, row)
+
+    # Итоговое confidence
+    confidence = round(
+        0.4 * R + 0.25 * P + 0.2 * C + 0.15 * S, 4
+    )
+
+    inputs = {
+        "R": R, "P": P, "C": C, "S": S,
+        "n": n, "wr": wr, "wins": wins,
+        "avg_pnl_per_trade": pnl,
+        "presence_rate": presence_rate,
+        "volume_growth": volume_growth,
+        "formula": "0.4*R + 0.25*P + 0.2*C + 0.15*S"
+    }
+
+    return confidence, inputs
+
+
+# 🔸 Wilson lower bound для биномиальной пропорции
+def _wilson_lower_bound(wins: int, n: int, z: float) -> float:
+    if n == 0:
+        return 0.0
+    p = wins / n
+    denom = 1 + z**2 / n
+    center = p + z**2 / (2 * n)
+    adj = z * math.sqrt((p * (1 - p) / n) + (z**2 / (4 * n**2)))
+    return max(0.0, (center - adj) / denom)
+
+
+# 🔸 Persistence: presence_rate и volume_growth
+async def _calc_persistence(conn, row: dict):
+    # ключ строки
+    k = {
+        "strategy_id": row["strategy_id"],
+        "time_frame": row["time_frame"],
+        "direction": row["direction"],
+        "timeframe": row["timeframe"],
+        "agg_type": row["agg_type"],
+        "agg_base": row["agg_base"],
+        "agg_state": row["agg_state"],
+    }
+
+    rows = await conn.fetch(
+        """
+        SELECT trades_total
+        FROM v_mw_aggregated_with_time
+        WHERE strategy_id = $1
+          AND time_frame = $2
+          AND direction = $3
+          AND timeframe = $4
+          AND agg_type = $5
+          AND agg_base = $6
+          AND agg_state = $7
+        ORDER BY report_created_at DESC
+        LIMIT $8
+        """,
+        k["strategy_id"], k["time_frame"], k["direction"], k["timeframe"],
+        k["agg_type"], k["agg_base"], k["agg_state"], PERSIST_K
+    )
+
+    if not rows:
+        return 0.0, 0.0
+
+    presence_rate = len(rows) / PERSIST_K
+    trades_now = int(row["trades_total"] or 0)
+    avg_trades = sum(int(r["trades_total"]) for r in rows) / len(rows)
+    volume_growth = min(1.0, trades_now / avg_trades) if avg_trades > 0 else 0.0
+
+    return presence_rate, volume_growth
+
+
+# 🔸 Cross-window coherence
+async def _calc_cross_window(conn, row: dict):
+    rows = await conn.fetch(
+        """
+        SELECT time_frame, trades_total, trades_wins, winrate, avg_pnl_per_trade
+        FROM v_mw_aggregated_with_time
+        WHERE strategy_id = $1
+          AND direction = $2
+          AND timeframe = $3
+          AND agg_type = $4
+          AND agg_base = $5
+          AND agg_state = $6
+          AND report_created_at = $7
+        """,
+        row["strategy_id"], row["direction"], row["timeframe"],
+        row["agg_type"], row["agg_base"], row["agg_state"],
+        row["report_created_at"],
+    )
+
+    if not rows:
+        return 0.0
+
+    aligned = 0
+    total = 0
+    for r in rows:
+        n = int(r["trades_total"] or 0)
+        wins = int(r["trades_wins"] or 0)
+        wr = float(r["winrate"] or 0.0)
+        pnl = float(r["avg_pnl_per_trade"] or 0.0)
+        if n == 0:
+            continue
+        total += 1
+        R = _wilson_lower_bound(wins, n, Z)
+        if R > 0.5 and pnl >= 0:
+            aligned += 1
+    return aligned / total if total > 0 else 0.0
+
+
+# 🔸 Stability: проверка отклонений winrate
+async def _calc_stability(conn, row: dict):
+    rows = await conn.fetch(
+        """
+        SELECT winrate
+        FROM v_mw_aggregated_with_time
+        WHERE strategy_id = $1
+          AND time_frame = $2
+          AND direction = $3
+          AND timeframe = $4
+          AND agg_type = $5
+          AND agg_base = $6
+          AND agg_state = $7
+        ORDER BY report_created_at DESC
+        LIMIT $8
+        """,
+        row["strategy_id"], row["time_frame"], row["direction"], row["timeframe"],
+        row["agg_type"], row["agg_base"], row["agg_state"], STABILITY_WINDOW
+    )
+
+    if not rows or len(rows) < 2:
+        return 1.0
+
+    wr_hist = [float(r["winrate"] or 0.0) for r in rows]
+    wr_now = float(row["winrate"] or 0.0)
+    mean_wr = sum(wr_hist) / len(wr_hist)
+    std_wr = math.sqrt(sum((w - mean_wr)**2 for w in wr_hist) / (len(wr_hist) - 1)) or 1e-6
+
+    z = abs(wr_now - mean_wr) / std_wr
+    return math.exp(-z)
