@@ -295,9 +295,9 @@ async def _cross_window_coherence(conn, row: dict) -> float:
     if not rows:
         return 0.0
 
-    # собираем «уверенные» окна и их знаки: +1 (выше baseline), -1 (ниже baseline)
-    signs = []   # элементы: (+1|-1)
-    weights = [] # элементы: R_win (Wilson LB как вес надёжности)
+    # собираем уверенные окна и их знаки: +1 (выше baseline), -1 (ниже baseline)
+    signs = []    # (+1 | -1)
+    weights = []  # положительные веса, отражающие силу уверенности (дистанция от baseline)
 
     for r in rows:
         n = int(r["trades_total"] or 0)
@@ -306,30 +306,24 @@ async def _cross_window_coherence(conn, row: dict) -> float:
             continue
 
         lb, ub = _wilson_bounds(w, n, Z)
-        R_win = lb  # вес = надёжность окна (нижняя граница)
 
-        # уверенно «выше baseline»
+        # уверенно выше baseline → знак +1, вес = насколько lb превышает baseline
         if lb > BASELINE_WR:
             signs.append(+1)
-            weights.append(R_win)
-        # уверенно «ниже baseline»
+            weights.append(max(ub - BASELINE_WR, lb - BASELINE_WR, 1e-9))
+        # уверенно ниже baseline → знак -1, вес = насколько ub ниже baseline
         elif ub < BASELINE_WR:
             signs.append(-1)
-            weights.append(R_win)
-        # иначе окно неопределённое — в согласованность не включаем
+            weights.append(max(BASELINE_WR - lb, BASELINE_WR - ub, 1e-9))
+        # иначе — окно неопределённое, не учитываем
 
-    # если нет ни одного уверенного окна — согласованность = 0
-    if not weights:
+    total_weight = sum(weights)
+    if total_weight <= 0.0:
         return 0.0
 
-    # взвешенная согласованность: |сумма знаков| / сумма весов
-    # если все окна «в одну сторону» (все +1 или все -1) → C=1
-    # если окна пополам и по весам компенсируют друг друга → C≈0
     signed_weight = sum(s * w for s, w in zip(signs, weights))
-    total_weight = sum(weights)
     C = abs(signed_weight) / total_weight
     return float(max(0.0, min(1.0, C)))
-
 
 # 🔸 Wilson bounds: нижняя и верхняя границы доверительного интервала Вильсона
 def _wilson_bounds(wins: int, n: int, z: float) -> tuple[float, float]:
