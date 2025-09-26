@@ -22,6 +22,8 @@ from oracle_pack_snapshot import run_oracle_pack_snapshot as run_pack, INITIAL_D
 from oracle_mw_confidence import run_oracle_confidence
 # 🔸 импорт воркера ночной автокалибровки confidence
 from oracle_mw_confidence_night import run_oracle_confidence_night, INITIAL_DELAY_H, INTERVAL_H
+# 🔸 импорт воркера sense
+from oracle_mw_sense import run_oracle_mw_sense
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -89,6 +91,7 @@ async def main():
         run_periodic(run_pack, PACK_INTERVAL, "ORACLE_PACK_SNAPSHOT", initial_delay=PACK_INIT_DELAY),
         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
         run_periodic(run_oracle_confidence_night, INTERVAL_H * 60 * 60, "ORACLE_CONFIDENCE_NIGHT", initial_delay=INITIAL_DELAY_H * 60 * 60),
+        run_safe_loop(run_oracle_mw_sense, "ORACLE_MW_SENSE"),
     )
 
 if __name__ == "__main__":
