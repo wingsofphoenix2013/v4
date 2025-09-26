@@ -6,21 +6,22 @@ import json
 import math
 import logging
 from collections import defaultdict
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
+from datetime import datetime
 
 import infra
 
 log = logging.getLogger("ORACLE_MW_SENSE")
 
 # 🔸 Константы воркера / параметры исполнения
-STREAM = "oracle:mw:reports_ready"     # источник событий о готовых MW-отчётах
-GROUP = "oracle_mw_sense_v1"           # своя consumer group, чтобы не мешать другим
-CONSUMER = "sense_worker_1"            # имя потребителя
-BLOCK_MS = 5000                        # таймаут ожидания XREADGROUP (мс)
-BATCH_COUNT = 64                       # сколько сообщений за раз читаем
+STREAM = "oracle:mw:reports_ready"      # источник событий о готовых MW-отчётах
+GROUP = "oracle_mw_sense_v1"            # своя consumer group, чтобы не мешать другим
+CONSUMER = "sense_worker_1"             # имя потребителя
+BLOCK_MS = 5000                         # таймаут ожидания XREADGROUP (мс)
+BATCH_COUNT = 64                        # сколько сообщений за раз читаем
 
-SMOOTH_WINDOW_N = 7                    # сглаживание по 7 последним значениям (включая текущее)
-METHOD_VERSION = "sense_v1_online_w7"  # версия методики (для трассировки)
+SMOOTH_WINDOW_N = 7                     # сглаживание по 7 последним значениям (включая текущее)
+METHOD_VERSION = "sense_v1_online_w7"   # версия методики (для трассировки)
 
 # 🔸 Вспомогательные математические функции
 def _safe_div(a: float, b: float) -> float:
@@ -37,7 +38,6 @@ def _geom_mean(values: List[float]) -> float:
     # геометрическое среднее по [0..1]; если список пуст — 0
     if not values:
         return 0.0
-    # если есть нули — результат 0
     prod = 1.0
     n = 0
     for v in values:
@@ -47,6 +47,31 @@ def _geom_mean(values: List[float]) -> float:
         if prod == 0.0:
             return 0.0
     return prod ** (1.0 / n)
+
+# 🔸 Парсер ISO-времени из события → datetime (UTC-naive под схему timestamp)
+def _to_dt(x: Optional[str]) -> Optional[datetime]:
+    # условия достаточности
+    if not x:
+        return None
+    s = str(x)
+    # поддержка суффикса 'Z' (UTC)
+    if s.endswith("Z"):
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            pass
+    # стандартный ISO (с или без микросекунд, с таймзоной или без)
+    try:
+        dt = datetime.fromisoformat(s)
+        # если aware — делаем naive (UTC по инвариантам системы)
+        return dt.replace(tzinfo=None)
+    except Exception:
+        # запасной вариант: откусываем смещение/суффиксы
+        base = s.split("+")[0].split("Z")[0]
+        try:
+            return datetime.fromisoformat(base).replace(tzinfo=None)
+        except Exception:
+            return None
 
 # 🔸 Инициализация consumer group
 async def _ensure_group(redis):
@@ -88,9 +113,12 @@ async def run_oracle_mw_sense():
                         data = json.loads(fields.get("data", "{}"))
                         await _process_report_event(data)
                         await infra.redis_client.xack(STREAM, GROUP, msg_id)
+                    except asyncio.CancelledError:
+                        log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу (msg_id=%s)", msg_id)
+                        raise
                     except Exception:
                         log.exception("❌ Ошибка обработки сообщения sense, msg_id=%s", msg_id)
-                        # не ack — останется в pending для ручного/планового ретрая
+                        # не ack — останется в pending для ретрая
         except asyncio.CancelledError:
             log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу")
             raise
@@ -107,8 +135,8 @@ async def _process_report_event(evt: Dict):
     report_id = int(evt["report_id"])
     strategy_id = int(evt.get("strategy_id", 0))
     time_frame = str(evt.get("time_frame", ""))  # '7d'|'14d'|'28d'
-    window_start = evt.get("window_start")
-    window_end = evt.get("window_end")
+    window_start = _to_dt(evt.get("window_start"))
+    window_end = _to_dt(evt.get("window_end"))
 
     # логируем заголовок
     log.info("[SENSE] обработка report_id=%s strategy_id=%s time_frame=%s", report_id, strategy_id, time_frame)
@@ -128,8 +156,7 @@ async def _process_report_event(evt: Dict):
             log.info("[SENSE] report_id=%s — агрегатов нет, пропуск", report_id)
             return
 
-        # группируем по (direction, timeframe, agg_base)
-        # значения внутри группы собираем по agg_state
+        # группируем по (direction, timeframe, agg_base) → внутри по agg_state
         group_map: Dict[Tuple[str, str, str], List[dict]] = defaultdict(list)
         for r in rows:
             key = (r["direction"], r["timeframe"], r["agg_base"])
@@ -143,9 +170,7 @@ async def _process_report_event(evt: Dict):
                 }
             )
 
-        # заранее получим число закрытых сделок по направлению (для coverage)
-        # coverage считаем как T / T_all_dir, где T_all_dir — общее число закрытых позиций в окне по направлению
-        # используем границы окна из события (они передаются воркером MW в ISO8601)
+        # получим число закрытых сделок по направлению (для coverage)
         t_all_by_dir: Dict[str, int] = {"long": 0, "short": 0}
         if window_start and window_end and strategy_id:
             t_all_rows = await conn.fetch(
@@ -154,8 +179,8 @@ async def _process_report_event(evt: Dict):
                   FROM positions_v4
                  WHERE strategy_id = $1
                    AND status = 'closed'
-                   AND closed_at >= $2::timestamp
-                   AND closed_at <  $3::timestamp
+                   AND closed_at >= $2
+                   AND closed_at <  $3
                  GROUP BY direction
                 """,
                 strategy_id, window_start, window_end,
@@ -163,14 +188,14 @@ async def _process_report_event(evt: Dict):
             for rr in t_all_rows:
                 t_all_by_dir[str(rr["direction"])] = int(rr["cnt"])
 
-        # обрабатываем каждую группу → считаем компоненты и итоговый sense
+        # обработка каждой группы → компоненты и итоговый sense
         for (direction, timeframe, agg_base), items in group_map.items():
             # суммарные t и w
             T = sum(x["t"] for x in items)
             W = sum(x["w"] for x in items)
             wr_overall = _safe_div(W, T)
 
-            # coverage
+            # coverage: доля сделок по направлению, покрытых данной базой
             T_all_dir = t_all_by_dir.get(direction, 0)
             coverage = max(0.0, min(1.0, _safe_div(T, T_all_dir))) if T_all_dir else 0.0
 
@@ -208,8 +233,6 @@ async def _process_report_event(evt: Dict):
             sense_raw = _geom_mean([coverage, entropy_norm, ig_norm, confidence_avg])
 
             # сглаживание по последним N=7 значений (включая текущее): простое скользящее среднее
-            # достаём до 6 предыдущих raw по этому же ключу (strategy_id, time_frame, timeframe, direction, agg_base),
-            # отсортированных по computed_at DESC
             prev_rows = await conn.fetch(
                 """
                 SELECT sense_score_raw
@@ -278,8 +301,8 @@ async def _process_report_event(evt: Dict):
                 SMOOTH_WINDOW_N,
                 json.dumps(
                     {
-                        "window_start": window_start,
-                        "window_end": window_end,
+                        "window_start": window_start.isoformat() if window_start else None,
+                        "window_end": window_end.isoformat() if window_end else None,
                         "components": {
                             "coverage": coverage,
                             "entropy_norm": entropy_norm,
@@ -307,8 +330,8 @@ async def _process_report_event(evt: Dict):
 
             # лог на результат по ключу
             log.info(
-                "[SENSE] sid=%s tf=%s dir=%s base=%s | raw=%.4f smooth=%.4f | cov=%.4f ent=%.4f ig=%.4f conf=%.4f | T=%d K=%d",
-                strategy_id, timeframe, direction, agg_base,
+                "[SENSE] sid=%s win=%s tf=%s dir=%s base=%s | raw=%.4f smooth=%.4f | cov=%.4f ent=%.4f ig=%.4f conf=%.4f | T=%d K=%d",
+                strategy_id, time_frame, timeframe, direction, agg_base,
                 round(sense_raw, 4), round(sense_smooth, 4),
                 round(coverage, 4), round(entropy_norm, 4), round(ig_norm, 4), round(confidence_avg, 4),
                 int(T), int(K_obs),
