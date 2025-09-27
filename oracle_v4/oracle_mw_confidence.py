@@ -1,4 +1,4 @@
-# 🔸 oracle_mw_confidence.py — воркер confidence: пакетный расчёт по комплекту окон (7d+14d+28d) для одного window_end + идемпотентность
+# 🔸 oracle_mw_confidence.py — воркер confidence: пакетный расчёт по комплекту окон (7d+14d+28d) для одного window_end + идемпотентность + события по каждому отчёту
 
 import asyncio
 import logging
@@ -17,7 +17,7 @@ REPORT_STREAM = "oracle:mw:reports_ready"
 REPORT_CONSUMER_GROUP = "oracle_confidence_group"
 REPORT_CONSUMER_NAME = "oracle_confidence_worker"
 
-# 🔸 Стрим «готово для sense»
+# 🔸 Стрим «готово для sense» (по ОДНОМУ отчёту)
 SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
 SENSE_REPORT_READY_MAXLEN = 10000
 
@@ -94,21 +94,23 @@ async def run_oracle_confidence():
             await asyncio.sleep(5)
 
 
-# 🔸 Публикация события «отчёт готов для sense» в Redis Stream
-async def _emit_sense_report_ready(
+# 🔸 Публикация события «отчёт готов для sense» (ОДИН отчёт = ОДНО событие)
+async def _emit_sense_report_ready_for_report(
     *,
-    report_ids: Dict[str, int],
+    report_id: int,
     strategy_id: int,
+    time_frame: str,
     window_end: str,
     aggregate_rows: int,
 ):
     # собираем пейлоад
     payload = {
+        "report_id": int(report_id),
         "strategy_id": int(strategy_id),
-        "time_frames": {"7d": report_ids.get("7d"), "14d": report_ids.get("14d"), "28d": report_ids.get("28d")},
-        "window_end": window_end,
+        "time_frame": str(time_frame),          # '7d' | '14d' | '28d'
+        "window_end": window_end,               # ISO-строка
         "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
-        "aggregate_rows": int(aggregate_rows),
+        "aggregate_rows": int(aggregate_rows),  # обновлённые строки для ЭТОГО report_id
     }
     fields = {"data": json.dumps(payload, separators=(",", ":"))}
     await infra.redis_client.xadd(
@@ -117,12 +119,12 @@ async def _emit_sense_report_ready(
         maxlen=SENSE_REPORT_READY_MAXLEN,
         approximate=True,
     )
-    log.info("[SENSE_REPORT_READY] sid=%s window_end=%s rows=%d", strategy_id, window_end, aggregate_rows)
+    log.info("[SENSE_REPORT_READY] report_id=%s sid=%s tf=%s rows=%d", report_id, strategy_id, time_frame, aggregate_rows)
 
 
 # 🔸 Пакетная обработка одного комплекта окон (ключ = strategy_id + window_end)
 async def _process_window_batch(strategy_id: int, window_end_iso: str):
-    # приводим ISO-строку к datetime для корректной подстановки в запросы asyncpg
+    # привести ISO-строку к datetime (UTC-naive) для корректной подстановки в запросы asyncpg
     try:
         window_end_dt = datetime.fromisoformat(window_end_iso.replace("Z", ""))
     except Exception:
@@ -145,7 +147,7 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
             log.debug("⌛ Комплект не готов: sid=%s window_end=%s (нашли %d из 3)", strategy_id, window_end_iso, len(rows))
             return
 
-        # вставка-маркер: если уже есть запись — выходим (идемпотентность)
+        # идемпотентность: если уже обрабатывали этот комплект — выходим
         inserted = await conn.fetchrow(
             """
             INSERT INTO oracle_conf_processed (strategy_id, window_end)
@@ -159,7 +161,7 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
             log.info("⏭️ Пропуск: комплект уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
             return
 
-        report_ids = {str(r["time_frame"]): int(r["id"]) for r in rows}
+        report_ids = {str(r["time_frame"]): int(r["id"]) for r in rows}  # {'7d': id7, '14d': id14, '28d': id28}
 
         # локальный «снэпшот» весов на время батча (стабильность в пределах комплекта)
         batch_weights: Dict[str, Tuple[Dict[str, float], Dict]] = {}
@@ -195,10 +197,13 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
             log.debug("ℹ️ Нет агрегатов для комплекта: sid=%s window_end=%s", strategy_id, window_end_iso)
             return
 
-        # кэши когорты на один отчёт (срез) — ключ без agg_state
+        # кэш когорты на один отчёт (срез) — ключ без agg_state
         cohort_cache: Dict[Tuple, List[dict]] = {}
 
-        updated = 0
+        # считаем обновлённые строки ПО КАЖДОМУ report_id
+        updated_per_report: Dict[int, int] = {rid: 0 for rid in report_ids.values()}
+
+        updated_total = 0
         for r in agg_rows:
             row = dict(r)
 
@@ -238,38 +243,37 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
                     float(confidence),
                     json.dumps(inputs, separators=(",", ":")),
                 )
-                # аудит (best-effort)
-                try:
-                    await conn.execute(
-                        """
-                        INSERT INTO oracle_mw_confidence_audit (
-                          aggregated_id, report_id, strategy_id, time_frame, direction, timeframe,
-                          agg_type, agg_base, agg_state, confidence, components
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                        """,
-                        int(row["id"]), int(row["report_id"]), int(row["strategy_id"]), str(row["time_frame"]),
-                        str(row["direction"]), str(row["timeframe"]), str(row["agg_type"]), str(row["agg_base"]),
-                        str(row["agg_state"]), float(confidence), json.dumps(inputs, separators=(",", ":"))
-                    )
-                except Exception:
-                    log.debug("Аудит недоступен или пропущен (aggregated_id=%s)", row["id"])
 
-                updated += 1
+                updated_total += 1
+                updated_per_report[int(row["report_id"])] = updated_per_report.get(int(row["report_id"]), 0) + 1
+
             except Exception:
                 log.exception("❌ Ошибка обновления confidence для aggregated_id=%s", row["id"])
 
-        log.info("✅ Обновлён confidence (пакет): sid=%s window_end=%s rows=%d", strategy_id, window_end_iso, updated)
-
-    # публикация «готово для sense» — только если мы реально обработали комплект (и дошли сюда)
-    try:
-        await _emit_sense_report_ready(
-            report_ids=report_ids,
-            strategy_id=strategy_id,
-            window_end=window_end_iso,
-            aggregate_rows=updated,
+        log.info(
+            "✅ Обновлён confidence (пакет): sid=%s window_end=%s rows_total=%d rows_7d=%d rows_14d=%d rows_28d=%d",
+            strategy_id,
+            window_end_iso,
+            updated_total,
+            updated_per_report.get(report_ids.get("7d", -1), 0),
+            updated_per_report.get(report_ids.get("14d", -1), 0),
+            updated_per_report.get(report_ids.get("28d", -1), 0),
         )
+
+    # публикуем ТРИ события — по одному на каждый отчёт (если дошли сюда, комплект точно обработан впервые)
+    try:
+        for tf in ("7d", "14d", "28d"):
+            rid = report_ids[tf]
+            _rows = updated_per_report.get(rid, 0)
+            await _emit_sense_report_ready_for_report(
+                report_id=rid,
+                strategy_id=strategy_id,
+                time_frame=tf,
+                window_end=window_end_iso,
+                aggregate_rows=_rows,
+            )
     except Exception:
-        log.exception("❌ Ошибка публикации события в %s (sid=%s window_end=%s)", SENSE_REPORT_READY_STREAM, strategy_id, window_end_iso)
+        log.exception("❌ Ошибка публикации событий в %s (sid=%s window_end=%s)", SENSE_REPORT_READY_STREAM, strategy_id, window_end_iso)
 
 
 # 🔸 Выборка когорты (все состояния agg_state внутри одного среза и времени отчёта)
@@ -345,8 +349,10 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
     defaults_o = {"baseline_mode": "neutral"}
 
     def _parse_json_like(x, default):
+        # если это уже dict — ок
         if isinstance(x, dict):
             return x
+        # asyncpg может вернуть bytes/memoryview/str
         if isinstance(x, (bytes, bytearray, memoryview)):
             try:
                 return json.loads(bytes(x).decode("utf-8"))
