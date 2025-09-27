@@ -1,4 +1,4 @@
-# 🔸 oracle_mw_confidence.py — воркер confidence: динамическая модель доверия (R, P, C, S, ECDF) + загрузка весов из БД
+# 🔸 oracle_mw_confidence.py — воркер confidence: пакетный расчёт по комплекту окон (7d+14d+28d) для одного window_end + идемпотентность
 
 import asyncio
 import logging
@@ -6,7 +6,7 @@ import json
 import math
 import time
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime  # для generated_at
+from datetime import datetime
 
 import infra
 
@@ -17,16 +17,16 @@ REPORT_STREAM = "oracle:mw:reports_ready"
 REPORT_CONSUMER_GROUP = "oracle_confidence_group"
 REPORT_CONSUMER_NAME = "oracle_confidence_worker"
 
-# 🔸 Новый стрим: сигнал для sense-воркера «отчёт полностью готов по confidence»
+# 🔸 Стрим «готово для sense»
 SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
-SENSE_REPORT_READY_MAXLEN = 10000  # мягкий предел длины
+SENSE_REPORT_READY_MAXLEN = 10000
 
 # 🔸 Геометрия окна (шаг 4 часа → 6 прогонов в сутки)
 WINDOW_STEPS = {"7d": 7 * 6, "14d": 14 * 6, "28d": 28 * 6}
 
 # 🔸 Параметры статистики
-Z = 1.96            # уровень доверия для Wilson (95%)
-BASELINE_WR = 0.5   # нейтральная доля успехов (RR 1:1), без учёта pnl
+Z = 1.96
+BASELINE_WR = 0.5
 
 # 🔸 Кэш весов модели (strategy_id,time_frame) → (weights, opts, ts)
 _weights_cache: Dict[Tuple[Optional[int], Optional[str]], Tuple[Dict[str, float], Dict, float]] = {}
@@ -45,7 +45,7 @@ async def run_oracle_confidence():
         await infra.redis_client.xgroup_create(
             name=REPORT_STREAM, groupname=REPORT_CONSUMER_GROUP, id="$", mkstream=True
         )
-        log.debug("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
+        log.info("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
     except Exception as e:
         if "BUSYGROUP" in str(e):
             pass
@@ -53,7 +53,7 @@ async def run_oracle_confidence():
             log.exception("❌ Ошибка инициализации группы Redis Stream")
             return
 
-    log.debug("🚀 Старт воркера confidence (динамическая модель)")
+    log.info("🚀 Старт воркера confidence (пакет по window_end)")
 
     # основной цикл чтения стрима
     while True:
@@ -62,7 +62,7 @@ async def run_oracle_confidence():
                 groupname=REPORT_CONSUMER_GROUP,
                 consumername=REPORT_CONSUMER_NAME,
                 streams={REPORT_STREAM: ">"},
-                count=32,
+                count=64,
                 block=30_000,
             )
             if not resp:
@@ -73,16 +73,21 @@ async def run_oracle_confidence():
                 for msg_id, fields in msgs:
                     try:
                         payload = json.loads(fields.get("data", "{}"))
-                        report_id = int(payload.get("report_id", 0))
+                        # из сообщения берём strategy_id и window_end — это наш ключ комплекта
                         strategy_id = int(payload.get("strategy_id", 0))
-                        time_frame = payload.get("time_frame")
-                        await _process_report(report_id, strategy_id, time_frame)
+                        window_end = payload.get("window_end")
+                        if not (strategy_id and window_end):
+                            log.debug("ℹ️ Пропуск сообщения: нет strategy_id/window_end: %s", payload)
+                            await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, msg_id)
+                            continue
+
+                        await _process_window_batch(strategy_id, window_end)
                         await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, msg_id)
                     except Exception:
                         log.exception("❌ Ошибка обработки сообщения из Redis Stream")
 
         except asyncio.CancelledError:
-            log.debug("⏹️ Воркер confidence остановлен по сигналу")
+            log.info("⏹️ Воркер confidence остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ Ошибка цикла confidence — пауза 5 секунд")
@@ -92,19 +97,15 @@ async def run_oracle_confidence():
 # 🔸 Публикация события «отчёт готов для sense» в Redis Stream
 async def _emit_sense_report_ready(
     *,
-    report_id: int,
+    report_ids: Dict[str, int],
     strategy_id: int,
-    time_frame: str,
-    window_start: Optional[str],
-    window_end: Optional[str],
+    window_end: str,
     aggregate_rows: int,
 ):
-    # собираем пейлоад в едином стиле проекта: одно поле 'data' со строкой JSON
+    # собираем пейлоад
     payload = {
-        "report_id": int(report_id),
         "strategy_id": int(strategy_id),
-        "time_frame": str(time_frame),
-        "window_start": window_start,
+        "time_frames": {"7d": report_ids.get("7d"), "14d": report_ids.get("14d"), "28d": report_ids.get("28d")},
         "window_end": window_end,
         "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
         "aggregate_rows": int(aggregate_rows),
@@ -116,51 +117,86 @@ async def _emit_sense_report_ready(
         maxlen=SENSE_REPORT_READY_MAXLEN,
         approximate=True,
     )
-    # исправлено: латинское 'o' в log.debug
-    log.debug(
-        "[SENSE_REPORT_READY] sid=%s win=%s report_id=%s rows=%d",
-        strategy_id, time_frame, report_id, aggregate_rows,
-    )
+    log.info("[SENSE_REPORT_READY] sid=%s window_end=%s rows=%d", strategy_id, window_end, aggregate_rows)
 
 
-# 🔸 Обработка всего отчёта (по report_id)
-async def _process_report(report_id: int, strategy_id: int, time_frame: str):
+# 🔸 Пакетная обработка одного комплекта окон (ключ = strategy_id + window_end)
+async def _process_window_batch(strategy_id: int, window_end_iso: str):
+    # идемпотентность: отметим комплект как «обрабатывается впервые»
     async with infra.pg_pool.acquire() as conn:
-        # выборка всех строк отчёта
+        # сначала проверим, что комплект (7d/14d/28d) вообще собран
         rows = await conn.fetch(
             """
-            SELECT
-              id,
-              report_id,
-              strategy_id,
-              time_frame,
-              direction,
-              timeframe,
-              agg_type,
-              agg_base,
-              agg_state,
-              trades_total,
-              trades_wins,
-              winrate,
-              avg_pnl_per_trade,
-              report_created_at
-            FROM v_mw_aggregated_with_time
-            WHERE report_id = $1
+            SELECT id, time_frame, created_at
+            FROM oracle_report_stat
+            WHERE strategy_id = $1
+              AND window_end = $2::timestamp
+              AND time_frame IN ('7d','14d','28d')
             """,
-            report_id,
+            int(strategy_id), str(window_end_iso)
         )
-        if not rows:
-            log.debug("ℹ️ Для report_id=%s нет агрегатов", report_id)
+        if len(rows) < 3:
+            log.debug("⌛ Комплект не готов: sid=%s window_end=%s (нашли %d из 3)", strategy_id, window_end_iso, len(rows))
             return
 
-        # когорты для адаптивных нормировок считаем один раз на отчёт и срез
+        # вставка-маркер: если уже есть запись — выходим (идемпотентность)
+        inserted = await conn.fetchrow(
+            """
+            INSERT INTO oracle_conf_processed (strategy_id, window_end)
+            VALUES ($1, $2::timestamp)
+            ON CONFLICT DO NOTHING
+            RETURNING 1
+            """,
+            int(strategy_id), str(window_end_iso)
+        )
+        if not inserted:
+            log.info("⏭️ Пропуск: комплект уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
+            return
+
+        report_ids = {str(r["time_frame"]): int(r["id"]) for r in rows}
+
+        # локальный «снэпшот» весов на время батча (стабильность в пределах комплекта)
+        batch_weights: Dict[str, Tuple[Dict[str, float], Dict]] = {}
+        for tf in ("7d", "14d", "28d"):
+            w, o = await _get_active_weights(conn, strategy_id, tf)
+            batch_weights[tf] = (w, o)
+
+        # берём все строки агрегатов по трём отчётам
+        agg_rows = await conn.fetch(
+            """
+            SELECT
+              a.id,
+              a.report_id,
+              a.strategy_id,
+              a.time_frame,
+              a.direction,
+              a.timeframe,
+              a.agg_type,
+              a.agg_base,
+              a.agg_state,
+              a.trades_total,
+              a.trades_wins,
+              a.winrate,
+              a.avg_pnl_per_trade,
+              r.created_at AS report_created_at
+            FROM oracle_mw_aggregated_stat a
+            JOIN oracle_report_stat r ON r.id = a.report_id
+            WHERE a.report_id = ANY($1::bigint[])
+            """,
+            list(report_ids.values())
+        )
+        if not agg_rows:
+            log.debug("ℹ️ Нет агрегатов для комплекта: sid=%s window_end=%s", strategy_id, window_end_iso)
+            return
+
+        # кэши когорты на один отчёт (срез) — ключ без agg_state
         cohort_cache: Dict[Tuple, List[dict]] = {}
 
         updated = 0
-        for r in rows:
+        for r in agg_rows:
             row = dict(r)
 
-            # ключ когорты: внутри неё сравниваем n (для N_effect)
+            # ключ когорты для ECDF(n)/S (на уровне одного отчёта)
             cohort_key = (
                 row["strategy_id"], row["time_frame"], row["direction"],
                 row["timeframe"], row["agg_type"], row["agg_base"], row["report_created_at"]
@@ -168,11 +204,19 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str):
             if cohort_key not in cohort_cache:
                 cohort_cache[cohort_key] = await _fetch_cohort(conn, row)
 
-            # загружаем активные веса для данной стратегии/окна (с кэшем)
-            weights, opts = await _get_active_weights(conn, row["strategy_id"], row["time_frame"])
+            # берём веса из локального снэпшота для конкретного окна строки
+            weights, opts = batch_weights.get(row["time_frame"], ({"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}, {"baseline_mode": "neutral"}))
 
             try:
-                confidence, inputs = await _calc_confidence(conn, row, cohort_cache[cohort_key], weights, opts)
+                confidence, inputs = await _calc_confidence_by_window_end(
+                    conn=conn,
+                    row=row,
+                    cohort_rows=cohort_cache[cohort_key],
+                    weights=weights,
+                    opts=opts,
+                    window_end_iso=window_end_iso,
+                    report_ids=report_ids,
+                )
                 await conn.execute(
                     """
                     UPDATE oracle_mw_aggregated_stat
@@ -185,8 +229,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str):
                     float(confidence),
                     json.dumps(inputs, separators=(",", ":")),
                 )
-
-                # аудит (если таблица есть — вставка успешна; если нет — проигнорируется исключением)
+                # аудит (best-effort)
                 try:
                     await conn.execute(
                         """
@@ -200,42 +243,24 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str):
                         str(row["agg_state"]), float(confidence), json.dumps(inputs, separators=(",", ":"))
                     )
                 except Exception:
-                    # не валим основной процесс, просто лог на debug
-                    log.debug("Аудит недоступен или вставка пропущена (aggregated_id=%s)", row["id"])
+                    log.debug("Аудит недоступен или пропущен (aggregated_id=%s)", row["id"])
 
                 updated += 1
             except Exception:
                 log.exception("❌ Ошибка обновления confidence для aggregated_id=%s", row["id"])
 
-        log.debug(
-            "✅ Обновлён confidence для report_id=%s (strategy_id=%s, time_frame=%s): %d строк",
-            report_id, strategy_id, time_frame, updated
-        )
+        log.info("✅ Обновлён confidence (пакет): sid=%s window_end=%s rows=%d", strategy_id, window_end_iso, updated)
 
-        # шапка отчёта — чтобы отдать окно (window_start/window_end)
-        hdr = await conn.fetchrow(
-            """
-            SELECT window_start, window_end
-            FROM oracle_report_stat
-            WHERE id = $1
-            """,
-            report_id,
-        )
-        window_start = hdr["window_start"].isoformat() if hdr and hdr["window_start"] else None
-        window_end = hdr["window_end"].isoformat() if hdr and hdr["window_end"] else None
-
-    # вне транзакции/коннекта — публикация события для sense-воркера
+    # публикация «готово для sense» — только если мы реально обработали комплект (и дошли сюда)
     try:
         await _emit_sense_report_ready(
-            report_id=report_id,
+            report_ids=report_ids,
             strategy_id=strategy_id,
-            time_frame=time_frame,
-            window_start=window_start,
-            window_end=window_end,
+            window_end=window_end_iso,
             aggregate_rows=updated,
         )
     except Exception:
-        log.exception("❌ Ошибка публикации события в %s (report_id=%s)", SENSE_REPORT_READY_STREAM, report_id)
+        log.exception("❌ Ошибка публикации события в %s (sid=%s window_end=%s)", SENSE_REPORT_READY_STREAM, strategy_id, window_end_iso)
 
 
 # 🔸 Выборка когорты (все состояния agg_state внутри одного среза и времени отчёта)
@@ -306,15 +331,13 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
         strategy_id, time_frame
     )
 
-    # дефолты на все случаи
+    # дефолты
     defaults_w = {"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}
     defaults_o = {"baseline_mode": "neutral"}
 
     def _parse_json_like(x, default):
-        # если это уже dict — ок
         if isinstance(x, dict):
             return x
-        # asyncpg иногда может вернуть memoryview/bytes/str
         if isinstance(x, (bytes, bytearray, memoryview)):
             try:
                 return json.loads(bytes(x).decode("utf-8"))
@@ -327,7 +350,6 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
             except Exception:
                 log.exception("⚠️ Не удалось распарсить JSON из строки")
                 return default
-        # неожиданный тип
         return default
 
     if row:
@@ -339,27 +361,24 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
         weights = defaults_w
         opts = defaults_o
 
-    # приведение и валидация весов
+    # приведение и валидация весов + мягкие ограничения
     wR = float(weights.get("wR", defaults_w["wR"]))
     wP = float(weights.get("wP", defaults_w["wP"]))
     wC = float(weights.get("wC", defaults_w["wC"]))
     wS = float(weights.get("wS", defaults_w["wS"]))
 
-    # 🔸 мягкие ограничения на веса (защита от доминирования C и деградации R)
+    # клиппинг, чтобы C не доминировал, а R не деградировал
     wC = min(wC, 0.35)
     wR = max(wR, 0.25)
 
-    # если все веса нулевые/некорректные — падём на дефолт
     total = wR + wP + wC + wS
     if not math.isfinite(total) or total <= 0:
         wR, wP, wC, wS = defaults_w["wR"], defaults_w["wP"], defaults_w["wC"], defaults_w["wS"]
         total = wR + wP + wC + wS
 
-    # нормализация до суммы 1 (без изменения относительных долей после клиппинга)
     wR, wP, wC, wS = (wR / total, wP / total, wC / total, wS / total)
     weights_norm = {"wR": wR, "wP": wP, "wC": wC, "wS": wS}
 
-    # запись в кэш для всех трёх ключей, чтобы реже дёргать БД
     ts = time.time()
     _weights_cache[(strategy_id, time_frame)] = (weights_norm, opts, ts)
     _weights_cache[(strategy_id, None)] = (weights_norm, opts, ts)
@@ -368,59 +387,57 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
     return weights_norm, opts
 
 
-# 🔸 Расчёт confidence (динамическая модель)
-async def _calc_confidence(
+# 🔸 Расчёт confidence для строки (по комплекту окон с общим window_end)
+async def _calc_confidence_by_window_end(
+    *,
     conn,
     row: dict,
     cohort_rows: List[dict],
     weights: Dict[str, float],
     opts: Dict,
+    window_end_iso: str,
+    report_ids: Dict[str, int],
 ) -> Tuple[float, dict]:
     n = int(row["trades_total"] or 0)
     wins = int(row["trades_wins"] or 0)
     wr = float(row["winrate"] or 0.0)
 
-    # Reliability (R): нижняя граница Wilson
+    # Reliability (R)
     R = _wilson_lower_bound(wins, n, Z) if n > 0 else 0.0
 
-    # Persistence (P): presence_rate по последним L отчётов и growth_hist через ECDF по историческим n
+    # Persistence (P): по текущему окну строки
     L = WINDOW_STEPS.get(str(row["time_frame"]), 42)
     presence_rate, growth_hist, hist_n = await _persistence_metrics(conn, row, L)
     P = 0.6 * presence_rate + 0.4 * growth_hist
 
-    # Cross-window coherence (C): согласованность знака wr относительно baseline (без PnL)
-    C = await _cross_window_coherence(conn, row)
+    # Cross-window coherence (C) по трём отчётам из одного window_end
+    C = await _cross_window_coherence_by_ids(conn, row, report_ids)
 
-    # Stability (S): робастная устойчивость wr с динамической шкалой
-    S_key, len_hist, dyn_scale_used = await _stability_key_dynamic(conn, row, L, cohort_rows)
+    # Stability (S): робастная устойчивость wr (динамическая шкала)
+    S_key, _len_hist, dyn_scale_used = await _stability_key_dynamic(conn, row, L, cohort_rows)
 
-    # Адаптивная нормировка по «массе» внутри когорты: ECDF по n
+    # Масса / N_effect: ECDF по когорте + абсолютная масса относительно медианы
     cohort_n = [int(x["trades_total"] or 0) for x in cohort_rows]
     ecdf_cohort = _ecdf_rank(n, cohort_n)
-    # если когорта маленькая, смешиваем с исторической ECDF по ключу
     ecdf_hist = _ecdf_rank(n, hist_n) if hist_n else 0.0
     if len(cohort_n) < 5:
         N_effect = 0.5 * ecdf_cohort + 0.5 * ecdf_hist
     else:
         N_effect = ecdf_cohort
-    # динамический нижний порог: 1/(size+1), чтобы полностью не занулить
     floor = 1.0 / float(max(2, len(cohort_n)) + 1)
     N_effect = max(N_effect, floor)
     N_effect = float(max(0.0, min(1.0, N_effect)))
-
-    # 🔸 дополнительная «абсолютная масса»: сглаживание малых n относительно медианы по когорте
     n_pos = [v for v in cohort_n if v > 0]
     n_med = _median([float(v) for v in n_pos]) if n_pos else 1.0
     abs_mass = math.sqrt(n / (n + n_med)) if (n_med > 0 and n >= 0) else 0.0
     N_effect = float(max(0.0, min(1.0, N_effect * abs_mass)))
 
-    # Загруженные (и уже откорректированные) веса
+    # Веса
     wR = float(weights.get("wR", 0.4))
     wP = float(weights.get("wP", 0.25))
     wC = float(weights.get("wC", 0.2))
     wS = float(weights.get("wS", 0.15))
 
-    # Итоговый скор (клиппинг на всякий случай)
     raw = wR * R + wP * P + wC * C + wS * S_key
     confidence = round(max(0.0, min(1.0, raw * N_effect)), 4)
 
@@ -439,14 +456,68 @@ async def _calc_confidence(
         "hist_points": len(hist_n),
         "dyn_scale_used": dyn_scale_used,
         "baseline_wr": BASELINE_WR,
+        "window_end": window_end_iso,
         "formula": "(wR*R + wP*P + wC*C + wS*S) * N_effect",
     }
     return confidence, inputs
 
 
+# 🔸 C по конкретному комплекту report_id (7d/14d/28d) для ключа строки
+async def _cross_window_coherence_by_ids(conn, row: dict, report_ids: Dict[str, int]) -> float:
+    # собираем для текущего ключа строки (direction/timeframe/agg_type/base/state) показатели по каждому report_id
+    rows = await conn.fetch(
+        """
+        SELECT a.time_frame, a.trades_total, a.trades_wins
+        FROM oracle_mw_aggregated_stat a
+        WHERE a.report_id = ANY($1::bigint[])
+          AND a.strategy_id = $2
+          AND a.direction   = $3
+          AND a.timeframe   = $4
+          AND a.agg_type    = $5
+          AND a.agg_base    = $6
+          AND a.agg_state   = $7
+        """,
+        list(report_ids.values()),
+        row["strategy_id"], row["direction"], row["timeframe"],
+        row["agg_type"], row["agg_base"], row["agg_state"]
+    )
+    if not rows:
+        return 0.0
+
+    signs: List[int] = []
+    weights: List[float] = []
+
+    for r in rows:
+        n = int(r["trades_total"] or 0)
+        w = int(r["trades_wins"] or 0)
+        if n <= 0:
+            continue
+        lb, ub = _wilson_bounds(w, n, Z)
+        # уверенно выше baseline → +1
+        if lb > BASELINE_WR:
+            dist = max(lb - BASELINE_WR, ub - BASELINE_WR)
+            if dist > 0:
+                signs.append(+1); weights.append(dist)
+        # уверенно ниже baseline → -1
+        elif ub < BASELINE_WR:
+            dist = max(BASELINE_WR - lb, BASELINE_WR - ub)
+            if dist > 0:
+                signs.append(-1); weights.append(dist)
+        # иначе окно неопределённое — пропускаем
+
+    total_weight = sum(weights)
+    # требуем минимум 2 уверенных окна
+    if total_weight <= 0.0 or len(weights) < 2:
+        return 0.0
+
+    signed_weight = sum(s * w for s, w in zip(signs, weights))
+    C = abs(signed_weight) / total_weight
+    return float(max(0.0, min(1.0, C)))
+
+
 # 🔸 Persistence-метрики: presence_rate и growth_hist (ECDF по историческим n)
 async def _persistence_metrics(conn, row: dict, L: int) -> Tuple[float, float, List[int]]:
-    # получаем последние L отчётов (created_at) по стратегии/окну до и включая текущий отчёт
+    # последние L отчётов (created_at) по стратегии/окну до и включая текущий отчёт
     last_rows = await conn.fetch(
         """
         WITH last_reports AS (
@@ -483,72 +554,14 @@ async def _persistence_metrics(conn, row: dict, L: int) -> Tuple[float, float, L
         row["agg_state"],
     )
 
-    # presence_rate: доля отчётов, где ключ присутствовал
     present_flags = [1 if r["trades_total"] is not None else 0 for r in last_rows]
     L_eff = len(present_flags) if present_flags else 0
     presence_rate = (sum(present_flags) / L_eff) if L_eff > 0 else 0.0
 
-    # growth_hist: ECDF текущего n относительно истории n (где ключ присутствовал)
     hist_n = [int(r["trades_total"]) for r in last_rows if r["trades_total"] is not None]
     growth_hist = _ecdf_rank(int(row["trades_total"] or 0), hist_n) if hist_n else 0.0
 
     return presence_rate, growth_hist, hist_n
-
-
-# 🔸 Cross-window coherence: согласованность знака wr относительно BASELINE_WR (без PnL)
-async def _cross_window_coherence(conn, row: dict) -> float:
-    rows = await conn.fetch(
-        """
-        SELECT time_frame, trades_total, trades_wins, winrate
-        FROM v_mw_aggregated_with_time
-        WHERE strategy_id = $1
-          AND direction   = $2
-          AND timeframe   = $3
-          AND agg_type    = $4
-          AND agg_base    = $5
-          AND agg_state   = $6
-          AND report_created_at = $7
-        """,
-        row["strategy_id"], row["direction"], row["timeframe"],
-        row["agg_type"], row["agg_base"], row["agg_state"],
-        row["report_created_at"],
-    )
-    if not rows:
-        return 0.0
-
-    signs: List[int] = []
-    weights: List[float] = []
-
-    for r in rows:
-        n = int(r["trades_total"] or 0)
-        w = int(r["trades_wins"] or 0)
-        if n <= 0:
-            continue
-
-        lb, ub = _wilson_bounds(w, n, Z)
-
-        # уверенно выше baseline → +1, вес = дистанция CI от baseline
-        if lb > BASELINE_WR:
-            dist = max(lb - BASELINE_WR, ub - BASELINE_WR)
-            if dist > 0:
-                signs.append(+1)
-                weights.append(dist)
-        # уверенно ниже baseline → -1, вес = дистанция CI от baseline
-        elif ub < BASELINE_WR:
-            dist = max(BASELINE_WR - lb, BASELINE_WR - ub)
-            if dist > 0:
-                signs.append(-1)
-                weights.append(dist)
-        # иначе — окно неопределённое, не учитываем
-
-    total_weight = sum(weights)
-    # 🔸 требуем минимум 2 уверенных окна, иначе согласованности нет
-    if total_weight <= 0.0 or len(weights) < 2:
-        return 0.0
-
-    signed_weight = sum(s * w for s, w in zip(signs, weights))
-    C = abs(signed_weight) / total_weight
-    return float(max(0.0, min(1.0, C)))
 
 
 # 🔸 Стабильность ключа: робастный z по истории wr с динамической шкалой
@@ -586,11 +599,9 @@ async def _stability_key_dynamic(
     mad = _mad(wr_hist, med)
     iqr = _iqr(wr_hist)
 
-    # когортная шкала по текущему отчёту (для подстраховки)
     wr_cohort = [float(x["winrate"] or 0.0) for x in cohort_rows] if cohort_rows else []
     cohort_mad = _mad(wr_cohort, _median(wr_cohort)) if len(wr_cohort) >= 3 else 0.0
 
-    # базовые кандидаты шкалы
     cand = []
     if mad > 0:
         cand.append(mad / 0.6745)
@@ -599,11 +610,9 @@ async def _stability_key_dynamic(
     if cohort_mad > 0:
         cand.append(cohort_mad / 0.6745)
 
-    # статистический минимум с учётом длины истории
     n_hist = len(wr_hist)
     cand.append(1.0 / math.sqrt(max(1.0, float(n_hist))))
 
-    # если история идеально ровная: S=1.0
     if all(c <= 0 for c in cand[:-1]) and abs(wr_now - med) < 1e-12:
         return 1.0, n_hist, {"mode": "flat_hist", "scale": 0.0}
 
@@ -614,7 +623,7 @@ async def _stability_key_dynamic(
     return S_key, n_hist, {"mode": "dynamic", "scale": round(scale, 6), "median": round(med, 6)}
 
 
-# 🔸 Wilson lower bound (биномиальная пропорция)
+# 🔸 Wilson lower bound / bounds
 def _wilson_lower_bound(wins: int, n: int, z: float) -> float:
     if n <= 0:
         return 0.0
@@ -626,7 +635,6 @@ def _wilson_lower_bound(wins: int, n: int, z: float) -> float:
     return max(0.0, min(1.0, lb))
 
 
-# 🔸 Wilson bounds: нижняя и верхняя границы
 def _wilson_bounds(wins: int, n: int, z: float) -> tuple[float, float]:
     if n <= 0:
         return 0.0, 0.0
@@ -639,7 +647,7 @@ def _wilson_bounds(wins: int, n: int, z: float) -> tuple[float, float]:
     return max(0.0, min(1.0, lb)), max(0.0, min(1.0, ub))
 
 
-# 🔸 ECDF-ранг: доля значений ≤ x (если список пуст, 0.0)
+# 🔸 ECDF-ранг / базовые статистики
 def _ecdf_rank(x: int, values: List[int]) -> float:
     if not values:
         return 0.0
@@ -647,7 +655,6 @@ def _ecdf_rank(x: int, values: List[int]) -> float:
     return cnt / len(values)
 
 
-# 🔸 Медиана
 def _median(arr: List[float]) -> float:
     n = len(arr)
     if n == 0:
@@ -659,7 +666,6 @@ def _median(arr: List[float]) -> float:
     return 0.5 * (s[mid - 1] + s[mid])
 
 
-# 🔸 MAD (median absolute deviation)
 def _mad(arr: List[float], med: float) -> float:
     if not arr:
         return 0.0
@@ -667,7 +673,6 @@ def _mad(arr: List[float], med: float) -> float:
     return _median(dev)
 
 
-# 🔸 IQR (межквартильный размах)
 def _iqr(arr: List[float]) -> float:
     n = len(arr)
     if n < 4:
@@ -678,7 +683,6 @@ def _iqr(arr: List[float]) -> float:
     return max(0.0, q3 - q1)
 
 
-# 🔸 Персентиль (линейная интерполяция)
 def _percentile(sorted_arr: List[float], p: float) -> float:
     if not sorted_arr:
         return 0.0
