@@ -5,13 +5,14 @@ import logging
 from typing import Dict, List, Tuple, Optional
 import math
 import time
+import json
 
 import infra
-# используем готовые утилиты/константы из основного воркера confidence
+# 🔸 используем готовые утилиты/константы из основного воркера confidence
 from oracle_mw_confidence import (
     WINDOW_STEPS, Z, BASELINE_WR,
     _wilson_lower_bound, _wilson_bounds,
-    _persistence_metrics, _cross_window_coherence, _stability_key_dynamic,
+    _persistence_metrics, _cross_window_coherence_by_ids, _stability_key_dynamic,
     _ecdf_rank, _median, _mad, _iqr,
 )
 
@@ -74,7 +75,7 @@ async def _load_target_strategies() -> List[int]:
 # 🔸 Обучение и активация весов для одной пары (strategy_id, time_frame)
 async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool:
     async with infra.pg_pool.acquire() as conn:
-        # собираем список отчётов по стратегии/окну по времени (ASC), берём запас: длина окна + ещё окно
+        # выбираем отчёты по стратегии/окну в порядке времени (ASC)
         limit_reports = int(WINDOW_STEPS.get(time_frame, 42) * 2)
         reports = await conn.fetch(
             """
@@ -90,7 +91,7 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
             log.info("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
             return False
 
-        # формируем пары (t, t+1) по времени; для каждой пары — дата t и t+1
+        # пары (t, t+1) по времени
         pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]] = []
         for i in range(len(reports) - 1):
             pairs.append(
@@ -98,16 +99,15 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
                  (int(reports[i+1]["id"]), str(reports[i+1]["created_at"])))
             )
 
-        # собираем датасет: для всех ключей, присутствующих в t,
-        # считаем признаки на t (R,P,C,S) и целевую метку y по t+1 (персистентность знака wr относительно baseline)
+        # датасет признаков и меток
         X: List[Tuple[float, float, float, float]] = []
         Y: List[int] = []
 
-        # Для ускорения кэшируем когорты (по (report_id, direction, timeframe, agg_type, agg_base))
+        # кэш когорт для ускорения
         cohort_cache: Dict[Tuple, List[dict]] = {}
 
         for (rep_id_t, created_t), (rep_id_n, created_n) in pairs:
-            # выбираем все строки T (признаки на момент t)
+            # строки T
             rows_t = await conn.fetch(
                 """
                 SELECT
@@ -121,7 +121,7 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
             if not rows_t:
                 continue
 
-            # мапа для быстрого доступа ко второй точке (t+1) по ключу
+            # строки T+1 (для целевой метки)
             rows_n = await conn.fetch(
                 """
                 SELECT
@@ -134,21 +134,35 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
             )
             key2row_n: Dict[Tuple, dict] = {}
             for rn in rows_n:
-                kn = (
-                    rn["direction"], rn["timeframe"], rn["agg_type"], rn["agg_base"], rn["agg_state"]
-                )
+                kn = (rn["direction"], rn["timeframe"], rn["agg_type"], rn["agg_base"], rn["agg_state"])
                 key2row_n[kn] = dict(rn)
 
-            # считаем признаки/цель
+            # window_end текущего репорта T для подбора трёх окон
+            hdr_t = await conn.fetchrow(
+                "SELECT strategy_id, window_end FROM oracle_report_stat WHERE id = $1",
+                rep_id_t
+            )
+            # три report_id с тем же window_end
+            trio_rows = await conn.fetch(
+                """
+                SELECT id, time_frame
+                FROM oracle_report_stat
+                WHERE strategy_id = $1
+                  AND window_end  = $2
+                  AND time_frame  IN ('7d','14d','28d')
+                """,
+                int(hdr_t["strategy_id"]), hdr_t["window_end"]
+            )
+            trio_ids = {str(r["time_frame"]): int(r["id"]) for r in trio_rows}
+
             for rt in rows_t:
                 row_t = dict(rt)
                 key = (row_t["direction"], row_t["timeframe"], row_t["agg_type"], row_t["agg_base"], row_t["agg_state"])
                 row_next = key2row_n.get(key)
-                # цель определяем только если в t+1 ключ присутствует
                 if not row_next:
                     continue
 
-                # кэш когорты для t
+                # кэш когорты для T
                 cohort_key = (
                     row_t["strategy_id"], row_t["time_frame"], row_t["direction"],
                     row_t["timeframe"], row_t["agg_type"], row_t["agg_base"], row_t["report_created_at"]
@@ -166,13 +180,16 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
                 presence_rate_t, growth_hist_t, _hist_n_t = await _persistence_metrics(conn, row_t, L)
                 P_t = 0.6 * presence_rate_t + 0.4 * growth_hist_t
 
-                # C (на t) — использует текущую реализацию с требованием ≥ 2 уверенных окон
-                C_t = await _cross_window_coherence(conn, row_t)
+                # C (на t) — пакетный расчёт по трём report_id с тем же window_end; если найдено <2 окон — C=0.0
+                if len(trio_ids) >= 2:
+                    C_t = await _cross_window_coherence_by_ids(conn, row_t, trio_ids)
+                else:
+                    C_t = 0.0
 
                 # S (на t)
                 S_t, _len_hist, _meta = await _stability_key_dynamic(conn, row_t, L, cohort_cache[cohort_key])
 
-                # цель y: знак wr относительно baseline на t и t+1 должны совпадать, и t+1 должен быть «уверенным» (интервал Вильсона не пересекает baseline)
+                # цель y: знак wr относительно baseline на t и t+1 должны совпадать, и t+1 должен быть «уверенным»
                 y = _target_same_sign_next(row_t, row_next)
 
                 X.append((R_t, P_t, C_t, S_t))
@@ -184,20 +201,19 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
                      strategy_id, time_frame, samples, MIN_SAMPLES_PER_STRATEGY)
             return False
 
-        # делим на train/holdout по времени пар (просто последние HOLDOUT_FRACTION доли — holdout)
+        # разбиение на train/holdout
         holdout = max(1, int(samples * HOLDOUT_FRACTION))
         train = samples - holdout
         X_train, Y_train = X[:train], Y[:train]
         X_hold, Y_hold = X[train:], Y[train:]
 
-        # оцениваем «важность» признаков на train: берём абсолютную point-biserial корреляцию (упрощённая корреляция Пирсона с бинарной меткой)
-        imp = _feature_importance_corr(X_train, Y_train)  # dict {"wR":..., "wP":..., "wC":..., "wS":...}
+        # важность признаков (point-biserial corr)
+        imp = _feature_importance_corr(X_train, Y_train)
 
-        # нормируем до суммирования в 1, клиппим по границам и снова нормируем
+        # нормировка + клиппинг + повторная нормировка
         weights = _normalize_weights(imp, clip_min=WEIGHT_CLIP_MIN, clip_max=WEIGHT_CLIP_MAX)
 
-        # доп. политика: гарантируем минимальную долю R и ограничиваем C сверху (как в рантайме)
-        # это делает поведение стабильным даже при «шумной» истории
+        # доп. политика: гарантируем минимальную долю R и ограничиваем C сверху
         min_R = 0.25
         max_C = 0.35
         wR = max(weights["wR"], min_R)
@@ -207,14 +223,10 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
         s = wR + wP + wC + wS
         weights = {"wR": wR / s, "wP": wP / s, "wC": wC / s, "wS": wS / s}
 
-        # при желании можно оценить «качество» на holdout как корреляцию прогнозов с меткой,
-        # но для простоты — просто логируем размер holdout
-        log.info(
-            "📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
-            strategy_id, time_frame, samples, train, holdout, weights
-        )
+        log.info("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
+                 strategy_id, time_frame, samples, train, holdout, weights)
 
-        # активируем новые веса в БД (деактивируем старые по паре strategy/tf)
+        # активируем новые веса (деактивируем старые для пары strategy/tf)
         await conn.execute(
             """
             UPDATE oracle_conf_model
@@ -233,7 +245,6 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
             f"auto_{time.strftime('%Y%m%d_%H%M%S')}",
             int(strategy_id),
             str(time_frame),
-            # храним только 4 веса; baseline_mode оставляем neutral
             json.dumps(weights),
             '{"baseline_mode":"neutral"}',
         )
