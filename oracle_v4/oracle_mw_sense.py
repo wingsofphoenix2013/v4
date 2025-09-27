@@ -1,4 +1,4 @@
-# oracle_mw_sense.py — воркер расчёта sense_score по MW-агрегатам (онлайн-адаптация, сглаживание по последним 7 значениям)
+# oracle_mw_sense.py — воркер расчёта sense_score по MW-агрегатам (подписка на confidence_ready, сглаживание, публикация Redis KV)
 
 # 🔸 Импорты
 import asyncio
@@ -14,28 +14,30 @@ import infra
 log = logging.getLogger("ORACLE_MW_SENSE")
 
 # 🔸 Константы воркера / параметры исполнения
-STREAM = "oracle:mw:reports_ready"      # источник событий о готовых MW-отчётах
-GROUP = "oracle_mw_sense_v1"            # своя consumer group, чтобы не мешать другим
-CONSUMER = "sense_worker_1"             # имя потребителя
-BLOCK_MS = 5000                         # таймаут ожидания XREADGROUP (мс)
-BATCH_COUNT = 64                        # сколько сообщений за раз читаем
+STREAM = "oracle:mw_sense:reports_ready"  # новый стрим от confidence-воркера
+GROUP = "oracle_mw_sense_v1"              # consumer group для sense
+CONSUMER = "sense_worker_1"               # имя потребителя
+BLOCK_MS = 5000                           # таймаут ожидания XREADGROUP (мс)
+BATCH_COUNT = 64                          # сколько сообщений за раз читаем
 
-SMOOTH_WINDOW_N = 7                     # сглаживание по 7 последним значениям (включая текущее)
-METHOD_VERSION = "sense_v1_online_w7"   # версия методики (для трассировки)
+SMOOTH_WINDOW_N = 7                       # сглаживание по 7 последним значениям (включая текущее)
+METHOD_VERSION = "sense_v1_online_w7"     # версия методики (для трассировки)
+
+# 🔸 Настройки Redis KV сводки
+KV_TTL_SEC = 5 * 60 * 60                  # 5 часов
+KV_PREFIX = "oracle:sense:summary"        # формат ключа:
+# oracle:sense:summary:{strategy_id}:{time_frame}:{timeframe}:{direction}:{agg_base}:{agg_state}
 
 # 🔸 Вспомогательные математические функции
 def _safe_div(a: float, b: float) -> float:
-    # защита от деления на ноль
     return (a / b) if b else 0.0
 
 def _bin_entropy(q: float) -> float:
-    # бинарная энтропия в натуральных логарифмах; 0<=q<=1
     if q <= 0.0 or q >= 1.0:
         return 0.0
     return -(q * math.log(q) + (1.0 - q) * math.log(1.0 - q))
 
 def _geom_mean(values: List[float]) -> float:
-    # геометрическое среднее по [0..1]; если список пуст — 0
     if not values:
         return 0.0
     prod = 1.0
@@ -50,23 +52,18 @@ def _geom_mean(values: List[float]) -> float:
 
 # 🔸 Парсер ISO-времени из события → datetime (UTC-naive под схему timestamp)
 def _to_dt(x: Optional[str]) -> Optional[datetime]:
-    # условия достаточности
     if not x:
         return None
     s = str(x)
-    # поддержка суффикса 'Z' (UTC)
     if s.endswith("Z"):
         try:
             return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
         except Exception:
             pass
-    # стандартный ISO (с или без микросекунд, с таймзоной или без)
     try:
         dt = datetime.fromisoformat(s)
-        # если aware — делаем naive (UTC по инвариантам системы)
         return dt.replace(tzinfo=None)
     except Exception:
-        # запасной вариант: откусываем смещение/суффиксы
         base = s.split("+")[0].split("Z")[0]
         try:
             return datetime.fromisoformat(base).replace(tzinfo=None)
@@ -75,13 +72,11 @@ def _to_dt(x: Optional[str]) -> Optional[datetime]:
 
 # 🔸 Инициализация consumer group
 async def _ensure_group(redis):
-    # создаём группу, если её ещё нет
     try:
         await redis.xgroup_create(name=STREAM, groupname=GROUP, id="$", mkstream=True)
         log.info("Создана consumer group '%s' на стриме '%s'", GROUP, STREAM)
     except Exception:
-        # вероятно, уже существует
-        pass
+        pass  # уже существует
 
 # 🔸 Публичная точка запуска воркера (встраивается в oracle_v4_main.py через run_safe_loop)
 async def run_oracle_mw_sense():
@@ -91,7 +86,7 @@ async def run_oracle_mw_sense():
         return
 
     await _ensure_group(infra.redis_client)
-    log.info("📡 ORACLE_MW_SENSE запущен (group=%s, consumer=%s)", GROUP, CONSUMER)
+    log.info("📡 ORACLE_MW_SENSE запущен (stream=%s, group=%s, consumer=%s)", STREAM, GROUP, CONSUMER)
 
     # основной цикл чтения событий
     while True:
@@ -106,7 +101,6 @@ async def run_oracle_mw_sense():
             if not messages:
                 continue
 
-            # формат ответов: [(stream, [(id, {fields}), ...])]
             for _stream, entries in messages:
                 for msg_id, fields in entries:
                     try:
@@ -118,7 +112,7 @@ async def run_oracle_mw_sense():
                         raise
                     except Exception:
                         log.exception("❌ Ошибка обработки сообщения sense, msg_id=%s", msg_id)
-                        # не ack — останется в pending для ретрая
+                        # не ack — останется в pending
         except asyncio.CancelledError:
             log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу")
             raise
@@ -126,9 +120,8 @@ async def run_oracle_mw_sense():
             log.exception("❌ Ошибка основного цикла ORACLE_MW_SENSE")
             await asyncio.sleep(2.0)
 
-# 🔸 Обработка одного события REPORT_READY
+# 🔸 Обработка одного события CONFIDENCE_REPORT_READY
 async def _process_report_event(evt: Dict):
-    # условия достаточности события
     if not evt or "report_id" not in evt:
         return
 
@@ -138,11 +131,10 @@ async def _process_report_event(evt: Dict):
     window_start = _to_dt(evt.get("window_start"))
     window_end = _to_dt(evt.get("window_end"))
 
-    # логируем заголовок
     log.info("[SENSE] обработка report_id=%s strategy_id=%s time_frame=%s", report_id, strategy_id, time_frame)
 
     async with infra.pg_pool.acquire() as conn:
-        # читаем агрегаты отчёта
+        # читаем агрегаты отчёта (confidence уже рассчитан)
         rows = await conn.fetch(
             """
             SELECT direction, timeframe, agg_base, agg_state,
@@ -170,12 +162,14 @@ async def _process_report_event(evt: Dict):
                 }
             )
 
-        # получим число закрытых сделок по направлению (для coverage)
-        t_all_by_dir: Dict[str, int] = {"long": 0, "short": 0}
+        # агрегаты по направлению для сводки (closed_total/winrate)
+        closed_by_dir: Dict[str, Dict[str, float]] = {"long": {"t": 0, "w": 0}, "short": {"t": 0, "w": 0}}
         if window_start and window_end and strategy_id:
-            t_all_rows = await conn.fetch(
+            dir_rows = await conn.fetch(
                 """
-                SELECT direction, COUNT(*)::int AS cnt
+                SELECT direction,
+                       COUNT(*)::int AS cnt,
+                       COALESCE(SUM((pnl > 0)::int),0)::int AS wins
                   FROM positions_v4
                  WHERE strategy_id = $1
                    AND status = 'closed'
@@ -185,18 +179,19 @@ async def _process_report_event(evt: Dict):
                 """,
                 strategy_id, window_start, window_end,
             )
-            for rr in t_all_rows:
-                t_all_by_dir[str(rr["direction"])] = int(rr["cnt"])
+            for rr in dir_rows:
+                d = str(rr["direction"])
+                closed_by_dir[d] = {"t": int(rr["cnt"]), "w": int(rr["wins"])}
 
         # обработка каждой группы → компоненты и итоговый sense
         for (direction, timeframe, agg_base), items in group_map.items():
-            # суммарные t и w
+            # суммарные t и w в базе
             T = sum(x["t"] for x in items)
             W = sum(x["w"] for x in items)
             wr_overall = _safe_div(W, T)
 
             # coverage: доля сделок по направлению, покрытых данной базой
-            T_all_dir = t_all_by_dir.get(direction, 0)
+            T_all_dir = int(closed_by_dir.get(direction, {}).get("t", 0))
             coverage = max(0.0, min(1.0, _safe_div(T, T_all_dir))) if T_all_dir else 0.0
 
             # распределение p_s и энтропия
@@ -223,13 +218,13 @@ async def _process_report_event(evt: Dict):
             else:
                 ig_norm = 0.0
 
-            # средневзвешенный confidence
+            # средневзвешенный confidence (ожидаем готовый)
             if T > 0:
                 confidence_avg = sum((x["t"] / T) * max(0.0, min(1.0, x["conf"])) for x in items if x["t"] > 0)
             else:
                 confidence_avg = 0.0
 
-            # итоговый raw sense — без ручных весов (геометрическое среднее 4 факторов)
+            # итоговый raw sense — геометрическое среднее 4 факторов
             sense_raw = _geom_mean([coverage, entropy_norm, ig_norm, confidence_avg])
 
             # сглаживание по последним N=7 значений (включая текущее): простое скользящее среднее
@@ -328,7 +323,7 @@ async def _process_report_event(evt: Dict):
                 ),
             )
 
-            # лог на результат по ключу
+            # лог на результат по базе
             log.info(
                 "[SENSE] sid=%s win=%s tf=%s dir=%s base=%s | raw=%.4f smooth=%.4f | cov=%.4f ent=%.4f ig=%.4f conf=%.4f | T=%d K=%d",
                 strategy_id, time_frame, timeframe, direction, agg_base,
@@ -337,5 +332,35 @@ async def _process_report_event(evt: Dict):
                 int(T), int(K_obs),
             )
 
-    # финальный лог по отчёту
+            # публикация Redis KV для каждого agg_state этой базы
+            closed_total_dir = int(closed_by_dir.get(direction, {}).get("t", 0))
+            wins_total_dir = int(closed_by_dir.get(direction, {}).get("w", 0))
+            winrate_dir = _safe_div(wins_total_dir, closed_total_dir)
+
+            for x in items:
+                kv_key = f"{KV_PREFIX}:{strategy_id}:{time_frame}:{timeframe}:{direction}:{agg_base}:{x['agg_state']}"
+                kv_val = {
+                    "strategy_id": strategy_id,
+                    "time_frame": time_frame,
+                    "timeframe": timeframe,
+                    "direction": direction,
+                    "agg_base": agg_base,
+                    "agg_state": x["agg_state"],
+                    "report_id": report_id,
+                    "window_start": window_start.isoformat() if window_start else None,
+                    "window_end": window_end.isoformat() if window_end else None,
+                    "closed_total": closed_total_dir,
+                    "winrate": round(winrate_dir, 4),
+                    "confidence_score": round(max(0.0, min(1.0, float(x["conf"]))), 4),
+                    "sense_score_raw": round(float(sense_raw), 4),
+                    "sense_score_smooth": round(float(sense_smooth), 4),
+                }
+                await infra.redis_client.set(kv_key, json.dumps(kv_val, separators=(",", ":")), ex=KV_TTL_SEC)
+
+                log.info(
+                    "[SENSE_KV] set key=%s | closed_total=%d winrate=%.4f conf=%.4f sense_raw=%.4f sense_smooth=%.4f",
+                    kv_key, closed_total_dir, round(winrate_dir, 4),
+                    round(float(x["conf"]), 4), round(float(sense_raw), 4), round(float(sense_smooth), 4)
+                )
+
     log.info("[SENSE] report_id=%s — расчёт sense завершён", report_id)

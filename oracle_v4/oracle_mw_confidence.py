@@ -6,6 +6,7 @@ import json
 import math
 import time
 from typing import Dict, List, Tuple, Optional
+from datetime import datetime  # для generated_at
 
 import infra
 
@@ -15,6 +16,10 @@ log = logging.getLogger("ORACLE_CONFIDENCE")
 REPORT_STREAM = "oracle:mw:reports_ready"
 REPORT_CONSUMER_GROUP = "oracle_confidence_group"
 REPORT_CONSUMER_NAME = "oracle_confidence_worker"
+
+# 🔸 Новый стрим: сигнал для sense-воркера «отчёт полностью готов по confidence»
+SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
+SENSE_REPORT_READY_MAXLEN = 10000  # мягкий предел длины
 
 # 🔸 Геометрия окна (шаг 4 часа → 6 прогонов в сутки)
 WINDOW_STEPS = {"7d": 7 * 6, "14d": 14 * 6, "28d": 28 * 6}
@@ -82,6 +87,39 @@ async def run_oracle_confidence():
         except Exception:
             log.exception("❌ Ошибка цикла confidence — пауза 5 секунд")
             await asyncio.sleep(5)
+
+
+# 🔸 Публикация события «отчёт готов для sense» в Redis Stream
+async def _emit_sense_report_ready(
+    *,
+    report_id: int,
+    strategy_id: int,
+    time_frame: str,
+    window_start: Optional[str],
+    window_end: Optional[str],
+    aggregate_rows: int,
+):
+    # собираем пейлоад в едином стиле проекта: одно поле 'data' со строкой JSON
+    payload = {
+        "report_id": int(report_id),
+        "strategy_id": int(strategy_id),
+        "time_frame": str(time_frame),
+        "window_start": window_start,
+        "window_end": window_end,
+        "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+        "aggregate_rows": int(aggregate_rows),
+    }
+    fields = {"data": json.dumps(payload, separators=(",", ":"))}
+    await infra.redis_client.xadd(
+        name=SENSE_REPORT_READY_STREAM,
+        fields=fields,
+        maxlen=SENSE_REPORT_READY_MAXLEN,
+        approximate=True,
+    )
+    log.infо(
+        "[SENSE_REPORT_READY] sid=%s win=%s report_id=%s rows=%d",
+        strategy_id, time_frame, report_id, aggregate_rows,
+    )
 
 
 # 🔸 Обработка всего отчёта (по report_id)
@@ -168,10 +206,35 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str):
             except Exception:
                 log.exception("❌ Ошибка обновления confidence для aggregated_id=%s", row["id"])
 
-        log.info(
+        log.debug(
             "✅ Обновлён confidence для report_id=%s (strategy_id=%s, time_frame=%s): %d строк",
             report_id, strategy_id, time_frame, updated
         )
+
+        # шапка отчёта — чтобы отдать окно (window_start/window_end)
+        hdr = await conn.fetchrow(
+            """
+            SELECT window_start, window_end
+            FROM oracle_report_stat
+            WHERE id = $1
+            """,
+            report_id,
+        )
+        window_start = hdr["window_start"].isoformat() if hdr and hdr["window_start"] else None
+        window_end = hdr["window_end"].isoformat() if hdr and hdr["window_end"] else None
+
+    # вне транзакции/коннекта — публикация события для sense-воркера
+    try:
+        await _emit_sense_report_ready(
+            report_id=report_id,
+            strategy_id=strategy_id,
+            time_frame=time_frame,
+            window_start=window_start,
+            window_end=window_end,
+            aggregate_rows=updated,
+        )
+    except Exception:
+        log.exception("❌ Ошибка публикации события в %s (report_id=%s)", SENSE_REPORT_READY_STREAM, report_id)
 
 
 # 🔸 Выборка когорты (все состояния agg_state внутри одного среза и времени отчёта)
