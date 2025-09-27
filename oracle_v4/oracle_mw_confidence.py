@@ -45,7 +45,7 @@ async def run_oracle_confidence():
         await infra.redis_client.xgroup_create(
             name=REPORT_STREAM, groupname=REPORT_CONSUMER_GROUP, id="$", mkstream=True
         )
-        log.info("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
+        log.debug("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
     except Exception as e:
         if "BUSYGROUP" in str(e):
             pass
@@ -53,7 +53,7 @@ async def run_oracle_confidence():
             log.exception("❌ Ошибка инициализации группы Redis Stream")
             return
 
-    log.info("🚀 Старт воркера confidence (динамическая модель)")
+    log.debug("🚀 Старт воркера confidence (динамическая модель)")
 
     # основной цикл чтения стрима
     while True:
@@ -82,7 +82,7 @@ async def run_oracle_confidence():
                         log.exception("❌ Ошибка обработки сообщения из Redis Stream")
 
         except asyncio.CancelledError:
-            log.info("⏹️ Воркер confidence остановлен по сигналу")
+            log.debug("⏹️ Воркер confidence остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ Ошибка цикла confidence — пауза 5 секунд")
@@ -116,7 +116,8 @@ async def _emit_sense_report_ready(
         maxlen=SENSE_REPORT_READY_MAXLEN,
         approximate=True,
     )
-    log.infо(
+    # исправлено: латинское 'o' в log.debug
+    log.debug(
         "[SENSE_REPORT_READY] sid=%s win=%s report_id=%s rows=%d",
         strategy_id, time_frame, report_id, aggregate_rows,
     )
@@ -149,7 +150,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str):
             report_id,
         )
         if not rows:
-            log.info("ℹ️ Для report_id=%s нет агрегатов", report_id)
+            log.debug("ℹ️ Для report_id=%s нет агрегатов", report_id)
             return
 
         # когорты для адаптивных нормировок считаем один раз на отчёт и срез
@@ -344,13 +345,17 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
     wC = float(weights.get("wC", defaults_w["wC"]))
     wS = float(weights.get("wS", defaults_w["wS"]))
 
+    # 🔸 мягкие ограничения на веса (защита от доминирования C и деградации R)
+    wC = min(wC, 0.35)
+    wR = max(wR, 0.25)
+
     # если все веса нулевые/некорректные — падём на дефолт
     total = wR + wP + wC + wS
     if not math.isfinite(total) or total <= 0:
         wR, wP, wC, wS = defaults_w["wR"], defaults_w["wP"], defaults_w["wC"], defaults_w["wS"]
         total = wR + wP + wC + wS
 
-    # нормализация до суммы 1 (без изменения относительных долей)
+    # нормализация до суммы 1 (без изменения относительных долей после клиппинга)
     wR, wP, wC, wS = (wR / total, wP / total, wC / total, wS / total)
     weights_norm = {"wR": wR, "wP": wP, "wC": wC, "wS": wS}
 
@@ -361,6 +366,7 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
     _weights_cache[(None, None)] = (weights_norm, opts, ts)
 
     return weights_norm, opts
+
 
 # 🔸 Расчёт confidence (динамическая модель)
 async def _calc_confidence(
@@ -402,7 +408,13 @@ async def _calc_confidence(
     N_effect = max(N_effect, floor)
     N_effect = float(max(0.0, min(1.0, N_effect)))
 
-    # Загруженные веса
+    # 🔸 дополнительная «абсолютная масса»: сглаживание малых n относительно медианы по когорте
+    n_pos = [v for v in cohort_n if v > 0]
+    n_med = _median([float(v) for v in n_pos]) if n_pos else 1.0
+    abs_mass = math.sqrt(n / (n + n_med)) if (n_med > 0 and n >= 0) else 0.0
+    N_effect = float(max(0.0, min(1.0, N_effect * abs_mass)))
+
+    # Загруженные (и уже откорректированные) веса
     wR = float(weights.get("wR", 0.4))
     wP = float(weights.get("wP", 0.25))
     wC = float(weights.get("wC", 0.2))
@@ -530,7 +542,8 @@ async def _cross_window_coherence(conn, row: dict) -> float:
         # иначе — окно неопределённое, не учитываем
 
     total_weight = sum(weights)
-    if total_weight <= 0.0:
+    # 🔸 требуем минимум 2 уверенных окна, иначе согласованности нет
+    if total_weight <= 0.0 or len(weights) < 2:
         return 0.0
 
     signed_weight = sum(s * w for s, w in zip(signs, weights))

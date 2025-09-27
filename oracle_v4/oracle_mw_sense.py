@@ -74,7 +74,7 @@ def _to_dt(x: Optional[str]) -> Optional[datetime]:
 async def _ensure_group(redis):
     try:
         await redis.xgroup_create(name=STREAM, groupname=GROUP, id="$", mkstream=True)
-        log.info("Создана consumer group '%s' на стриме '%s'", GROUP, STREAM)
+        log.debug("Создана consumer group '%s' на стриме '%s'", GROUP, STREAM)
     except Exception:
         pass  # уже существует
 
@@ -86,7 +86,7 @@ async def run_oracle_mw_sense():
         return
 
     await _ensure_group(infra.redis_client)
-    log.info("📡 ORACLE_MW_SENSE запущен (stream=%s, group=%s, consumer=%s)", STREAM, GROUP, CONSUMER)
+    log.debug("📡 ORACLE_MW_SENSE запущен (stream=%s, group=%s, consumer=%s)", STREAM, GROUP, CONSUMER)
 
     # основной цикл чтения событий
     while True:
@@ -108,13 +108,13 @@ async def run_oracle_mw_sense():
                         await _process_report_event(data)
                         await infra.redis_client.xack(STREAM, GROUP, msg_id)
                     except asyncio.CancelledError:
-                        log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу (msg_id=%s)", msg_id)
+                        log.debug("⏹️ ORACLE_MW_SENSE остановлен по сигналу (msg_id=%s)", msg_id)
                         raise
                     except Exception:
                         log.exception("❌ Ошибка обработки сообщения sense, msg_id=%s", msg_id)
                         # не ack — останется в pending
         except asyncio.CancelledError:
-            log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу")
+            log.debug("⏹️ ORACLE_MW_SENSE остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ Ошибка основного цикла ORACLE_MW_SENSE")
@@ -131,7 +131,7 @@ async def _process_report_event(evt: Dict):
     window_start = _to_dt(evt.get("window_start"))
     window_end = _to_dt(evt.get("window_end"))
 
-    log.info("[SENSE] обработка report_id=%s strategy_id=%s time_frame=%s", report_id, strategy_id, time_frame)
+    log.debug("[SENSE] обработка report_id=%s strategy_id=%s time_frame=%s", report_id, strategy_id, time_frame)
 
     async with infra.pg_pool.acquire() as conn:
         # читаем агрегаты отчёта (confidence уже рассчитан)
@@ -145,7 +145,7 @@ async def _process_report_event(evt: Dict):
             report_id,
         )
         if not rows:
-            log.info("[SENSE] report_id=%s — агрегатов нет, пропуск", report_id)
+            log.debug("[SENSE] report_id=%s — агрегатов нет, пропуск", report_id)
             return
 
         # группируем по (direction, timeframe, agg_base) → внутри по agg_state
@@ -324,7 +324,7 @@ async def _process_report_event(evt: Dict):
             )
 
             # лог на результат по базе
-            log.info(
+            log.debug(
                 "[SENSE] sid=%s win=%s tf=%s dir=%s base=%s | raw=%.4f smooth=%.4f | cov=%.4f ent=%.4f ig=%.4f conf=%.4f | T=%d K=%d",
                 strategy_id, time_frame, timeframe, direction, agg_base,
                 round(sense_raw, 4), round(sense_smooth, 4),
@@ -357,10 +357,10 @@ async def _process_report_event(evt: Dict):
                 }
                 await infra.redis_client.set(kv_key, json.dumps(kv_val, separators=(",", ":")), ex=KV_TTL_SEC)
 
-                log.info(
+                log.debug(
                     "[SENSE_KV] set key=%s | closed_total=%d winrate=%.4f conf=%.4f sense_raw=%.4f sense_smooth=%.4f",
                     kv_key, closed_total_dir, round(winrate_dir, 4),
                     round(float(x["conf"]), 4), round(float(sense_raw), 4), round(float(sense_smooth), 4)
                 )
 
-    log.info("[SENSE] report_id=%s — расчёт sense завершён", report_id)
+    log.debug("[SENSE] report_id=%s — расчёт sense завершён", report_id)

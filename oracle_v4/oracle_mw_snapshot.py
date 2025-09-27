@@ -481,7 +481,7 @@ async def _emit_report_ready(
     await redis.xadd(name=REPORT_READY_STREAM, fields=fields, maxlen=REPORT_READY_MAXLEN, approximate=True)
 
     # лог на результат
-    log.info(
+    log.debug(
         "[REPORT_READY] sid=%s win=%s report_id=%s rows=%d tf_done=%s",
         strategy_id, time_frame, report_id, aggregate_rows, ",".join(tf_done) if tf_done else "-",
     )
