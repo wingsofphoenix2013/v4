@@ -122,7 +122,13 @@ async def _emit_sense_report_ready(
 
 # 🔸 Пакетная обработка одного комплекта окон (ключ = strategy_id + window_end)
 async def _process_window_batch(strategy_id: int, window_end_iso: str):
-    # идемпотентность: отметим комплект как «обрабатывается впервые»
+    # приводим ISO-строку к datetime для корректной подстановки в запросы asyncpg
+    try:
+        window_end_dt = datetime.fromisoformat(window_end_iso.replace("Z", ""))
+    except Exception:
+        log.exception("❌ Неверный формат window_end: %r", window_end_iso)
+        return
+
     async with infra.pg_pool.acquire() as conn:
         # сначала проверим, что комплект (7d/14d/28d) вообще собран
         rows = await conn.fetch(
@@ -130,10 +136,10 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
             SELECT id, time_frame, created_at
             FROM oracle_report_stat
             WHERE strategy_id = $1
-              AND window_end = $2::timestamp
+              AND window_end  = $2
               AND time_frame IN ('7d','14d','28d')
             """,
-            int(strategy_id), str(window_end_iso)
+            int(strategy_id), window_end_dt
         )
         if len(rows) < 3:
             log.debug("⌛ Комплект не готов: sid=%s window_end=%s (нашли %d из 3)", strategy_id, window_end_iso, len(rows))
@@ -143,11 +149,11 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
         inserted = await conn.fetchrow(
             """
             INSERT INTO oracle_conf_processed (strategy_id, window_end)
-            VALUES ($1, $2::timestamp)
+            VALUES ($1, $2)
             ON CONFLICT DO NOTHING
             RETURNING 1
             """,
-            int(strategy_id), str(window_end_iso)
+            int(strategy_id), window_end_dt
         )
         if not inserted:
             log.info("⏭️ Пропуск: комплект уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
@@ -205,7 +211,10 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
                 cohort_cache[cohort_key] = await _fetch_cohort(conn, row)
 
             # берём веса из локального снэпшота для конкретного окна строки
-            weights, opts = batch_weights.get(row["time_frame"], ({"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}, {"baseline_mode": "neutral"}))
+            weights, opts = batch_weights.get(
+                row["time_frame"],
+                ({"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}, {"baseline_mode": "neutral"})
+            )
 
             try:
                 confidence, inputs = await _calc_confidence_by_window_end(
@@ -464,7 +473,6 @@ async def _calc_confidence_by_window_end(
 
 # 🔸 C по конкретному комплекту report_id (7d/14d/28d) для ключа строки
 async def _cross_window_coherence_by_ids(conn, row: dict, report_ids: Dict[str, int]) -> float:
-    # собираем для текущего ключа строки (direction/timeframe/agg_type/base/state) показатели по каждому report_id
     rows = await conn.fetch(
         """
         SELECT a.time_frame, a.trades_total, a.trades_wins
@@ -493,20 +501,16 @@ async def _cross_window_coherence_by_ids(conn, row: dict, report_ids: Dict[str, 
         if n <= 0:
             continue
         lb, ub = _wilson_bounds(w, n, Z)
-        # уверенно выше baseline → +1
         if lb > BASELINE_WR:
             dist = max(lb - BASELINE_WR, ub - BASELINE_WR)
             if dist > 0:
                 signs.append(+1); weights.append(dist)
-        # уверенно ниже baseline → -1
         elif ub < BASELINE_WR:
             dist = max(BASELINE_WR - lb, BASELINE_WR - ub)
             if dist > 0:
                 signs.append(-1); weights.append(dist)
-        # иначе окно неопределённое — пропускаем
 
     total_weight = sum(weights)
-    # требуем минимум 2 уверенных окна
     if total_weight <= 0.0 or len(weights) < 2:
         return 0.0
 
@@ -517,7 +521,6 @@ async def _cross_window_coherence_by_ids(conn, row: dict, report_ids: Dict[str, 
 
 # 🔸 Persistence-метрики: presence_rate и growth_hist (ECDF по историческим n)
 async def _persistence_metrics(conn, row: dict, L: int) -> Tuple[float, float, List[int]]:
-    # последние L отчётов (created_at) по стратегии/окну до и включая текущий отчёт
     last_rows = await conn.fetch(
         """
         WITH last_reports AS (
