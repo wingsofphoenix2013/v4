@@ -22,7 +22,7 @@ from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERV
 from oracle_mw_confidence import run_oracle_confidence
 # 🔸 импорт воркера ночной автокалибровки confidence
 from oracle_mw_confidence_night import run_oracle_confidence_night, INITIAL_DELAY_H, INTERVAL_H
-# 🔸 импорт воркера sense
+# 🔸 импорт воркера эффективности
 from oracle_mw_sense import run_oracle_mw_sense
 
 log = logging.getLogger("ORACLE_MAIN")

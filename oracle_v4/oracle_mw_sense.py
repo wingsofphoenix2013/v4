@@ -1,440 +1,300 @@
-# oracle_mw_sense.py — воркер расчёта sense_score по MW-агрегатам (подписка на confidence_ready, окно из БД, сглаживание, Redis KV)
+# oracle_mw_sense.py — расчёт метрик полезности agg_base (Coverage / Discrimination / Net Effect) и запись в oracle_mw_sense
 
 # 🔸 Импорты
 import asyncio
 import json
-import math
 import logging
+import math
 from collections import defaultdict
-from typing import Dict, Tuple, List, Optional
-from datetime import datetime
+from typing import Dict, List, Tuple
 
 import infra
 
+# 🔸 Логгер
 log = logging.getLogger("ORACLE_MW_SENSE")
 
-# 🔸 Константы воркера / параметры исполнения
-STREAM = "oracle:mw_sense:reports_ready"   # стрим-сигнал от oracle_mw_confidence.py
-GROUP = "oracle_mw_sense_v1"               # consumer group для sense
-CONSUMER = "sense_worker_1"                # имя потребителя
-BLOCK_MS = 5000                            # таймаут ожидания XREADGROUP (мс)
-BATCH_COUNT = 64                           # сколько сообщений за раз читаем
+# 🔸 Константы Redis Stream (читает события о готовности отчётов для sense)
+SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
+SENSE_GROUP = "oracle_mw_sense_group"
+SENSE_CONSUMER = "oracle_mw_sense_worker"
 
-SMOOTH_WINDOW_N = 7                        # сглаживание по 7 последним значениям (включая текущее)
-METHOD_VERSION = "sense_v1_online_w7"      # версия методики (для трассировки)
-
-# 🔸 Настройки Redis KV сводки
-KV_TTL_SEC = 5 * 60 * 60                   # 5 часов
-KV_PREFIX = "oracle:sense:summary"         # ключ: oracle:sense:summary:{sid}:{win}:{tf}:{dir}:{base}:{state}
+# 🔸 Параметры
+BASELINE_WR = 0.535  # жёсткая точка безубыточности по системе
+Z = 1.96             # Wilson 95%
 
 
-# 🔸 Вспомогательные математические функции
-def _safe_div(a: float, b: float) -> float:
-    return (a / b) if b else 0.0
-
-def _bin_entropy(q: float) -> float:
-    if q <= 0.0 or q >= 1.0:
-        return 0.0
-    return -(q * math.log(q) + (1.0 - q) * math.log(1.0 - q))
-
-def _geom_mean(values: List[float]) -> float:
-    if not values:
-        return 0.0
-    prod = 1.0
-    n = 0
-    for v in values:
-        v_clamped = max(0.0, min(1.0, float(v)))
-        prod *= v_clamped
-        n += 1
-        if prod == 0.0:
-            return 0.0
-    return prod ** (1.0 / n)
-
-
-# 🔸 Инициализация consumer group
-async def _ensure_group(redis):
-    try:
-        await redis.xgroup_create(name=STREAM, groupname=GROUP, id="$", mkstream=True)
-        log.info("Создана consumer group '%s' на стриме '%s'", GROUP, STREAM)
-    except Exception:
-        # уже существует
-        pass
-
-
-# 🔸 Публичная точка запуска воркера (встраивается в oracle_v4_main.py через run_safe_loop)
+# 🔸 Публичная точка входа воркера (запускать через oracle_v4_main.py → run_safe_loop)
 async def run_oracle_mw_sense():
     # условия достаточности
-    if infra.redis_client is None or infra.pg_pool is None:
-        log.debug("❌ Пропуск: PG/Redis не инициализированы")
+    if infra.pg_pool is None or infra.redis_client is None:
+        log.info("❌ Пропуск ORACLE_MW_SENSE: PG/Redis не инициализированы")
         return
 
-    await _ensure_group(infra.redis_client)
-    log.info("📡 ORACLE_MW_SENSE запущен (stream=%s, group=%s, consumer=%s)", STREAM, GROUP, CONSUMER)
+    # создание группы потребителей (идемпотентно)
+    try:
+        await infra.redis_client.xgroup_create(
+            name=SENSE_REPORT_READY_STREAM, groupname=SENSE_GROUP, id="$", mkstream=True
+        )
+        log.info("📡 Создана группа потребителей в Redis Stream: %s", SENSE_GROUP)
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            pass
+        else:
+            log.exception("❌ Ошибка инициализации группы Redis Stream")
+            return
 
-    # основной цикл чтения событий
+    log.info("🚀 Старт воркера ORACLE_MW_SENSE (метрики agg_base)")
+
+    # основной цикл чтения стрима
     while True:
         try:
-            messages = await infra.redis_client.xreadgroup(
-                groupname=GROUP,
-                consumername=CONSUMER,
-                streams={STREAM: ">"},
-                count=BATCH_COUNT,
-                block=BLOCK_MS,
+            resp = await infra.redis_client.xreadgroup(
+                groupname=SENSE_GROUP,
+                consumername=SENSE_CONSUMER,
+                streams={SENSE_REPORT_READY_STREAM: ">"},
+                count=64,
+                block=30_000,
             )
-            if not messages:
+            if not resp:
                 continue
 
-            for _stream, entries in messages:
-                for msg_id, fields in entries:
+            # обработка сообщений
+            for stream_name, msgs in resp:
+                for msg_id, fields in msgs:
                     try:
-                        data = json.loads(fields.get("data", "{}"))
-                        # маршрутизация форматов payload
-                        await _route_event(data)
-                        await infra.redis_client.xack(STREAM, GROUP, msg_id)
-                    except asyncio.CancelledError:
-                        log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу (msg_id=%s)", msg_id)
-                        raise
+                        # условия достаточности
+                        data_raw = fields.get("data", "{}")
+                        payload = json.loads(data_raw) if isinstance(data_raw, str) else {}
+                        report_id = int(payload.get("report_id") or 0)
+                        strategy_id = int(payload.get("strategy_id") or 0)
+                        time_frame = str(payload.get("time_frame") or "")
+                        if not (report_id and strategy_id and time_frame):
+                            log.info("ℹ️ Пропуск сообщения: неполный payload: %s", payload)
+                            await infra.redis_client.xack(SENSE_REPORT_READY_STREAM, SENSE_GROUP, msg_id)
+                            continue
+
+                        # расчёт по одному report_id
+                        await _process_report(report_id=report_id, strategy_id=strategy_id, time_frame=time_frame)
+
+                        # ack сообщения
+                        await infra.redis_client.xack(SENSE_REPORT_READY_STREAM, SENSE_GROUP, msg_id)
+
                     except Exception:
-                        log.exception("❌ Ошибка обработки сообщения sense, msg_id=%s payload=%r", msg_id, fields)
-                        # не ack — останется в pending
+                        log.exception("❌ Ошибка обработки сообщения ORACLE_MW_SENSE")
+
         except asyncio.CancelledError:
-            log.info("⏹️ ORACLE_MW_SENSE остановлен по сигналу")
+            log.info("⏹️ Воркер ORACLE_MW_SENSE остановлен по сигналу")
             raise
         except Exception:
-            log.exception("❌ Ошибка основного цикла ORACLE_MW_SENSE")
-            await asyncio.sleep(2.0)
+            log.exception("❌ Ошибка цикла ORACLE_MW_SENSE — пауза 5 секунд")
+            await asyncio.sleep(5)
 
 
-# 🔸 Маршрутизация события: поддержка двух форматов payload
-async def _route_event(evt: Dict):
-    if not evt:
-        log.warning("[SENSE] пустой payload — пропуск")
-        return
-
-    # современный формат: единичный отчёт
-    if "report_id" in evt:
-        rid = int(evt.get("report_id"))
-        sid = int(evt.get("strategy_id", 0))
-        tf_win = str(evt.get("time_frame", ""))
-        log.info("[SENSE] start report_id=%s strategy_id=%s time_frame=%s", rid, sid, tf_win)
-        await _process_report(rid)
-        log.info("[SENSE] done report_id=%s", rid)
-        return
-
-    # совместимость: сводный пакет по окну без report_id
-    if "strategy_id" in evt and "time_frames" in evt:
-        sid = int(evt.get("strategy_id", 0))
-        time_frames = evt.get("time_frames") or {}
-        win_end_iso = evt.get("window_end")
-        win_end_dt = _to_dt_aware_or_naive(win_end_iso)
-
-        for tf_win in ("7d", "14d", "28d"):
-            if tf_win not in time_frames:
-                continue
-            rid = await _find_report_id_by_sid_win(sid, tf_win, win_end_dt)
-            if rid:
-                log.info("[SENSE] start report_id=%s strategy_id=%s time_frame=%s (compat)", rid, sid, tf_win)
-                await _process_report(rid)
-                log.info("[SENSE] done report_id=%s (compat)", rid)
-            else:
-                log.warning("[SENSE] report_id не найден по sid=%s time_frame=%s window_end=%s", sid, tf_win, win_end_iso)
-        return
-
-    log.warning("[SENSE] некорректный payload (нет report_id / time_frames): %r", evt)
-
-
-# (вложенный) условия достаточности
-def _to_dt_aware_or_naive(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return datetime.fromisoformat(s)
-    except Exception:
-        try:
-            base = s.split("+")[0].split("Z")[0]
-            return datetime.fromisoformat(base)
-        except Exception:
-            return None
-
-
-# 🔸 Поиск отчёта по (strategy_id, time_frame, window_end)
-async def _find_report_id_by_sid_win(strategy_id: int, time_frame: str, window_end: Optional[datetime]) -> Optional[int]:
+# 🔸 Обработка одного отчёта: группировка по timeframe → agg_base, расчёт и UPSERT
+async def _process_report(*, report_id: int, strategy_id: int, time_frame: str):
+    # читаем все агрегаты одного отчёта (по всем TF и базам)
     async with infra.pg_pool.acquire() as conn:
-        if window_end:
-            row = await conn.fetchrow(
-                """
-                SELECT id
-                  FROM oracle_report_stat
-                 WHERE strategy_id = $1
-                   AND time_frame  = $2
-                   AND window_end  = $3
-                 LIMIT 1
-                """,
-                strategy_id, time_frame, window_end.replace(tzinfo=None)
-            )
-            if row:
-                return int(row["id"])
-        # fallback: последний отчёт по окну
-        row = await conn.fetchrow(
-            """
-            SELECT id
-              FROM oracle_report_stat
-             WHERE strategy_id = $1
-               AND time_frame  = $2
-             ORDER BY created_at DESC
-             LIMIT 1
-            """,
-            strategy_id, time_frame
-        )
-        return int(row["id"]) if row else None
-
-
-# 🔸 Обработка одного отчёта по report_id (окно всегда читаем из БД)
-async def _process_report(report_id: int):
-    async with infra.pg_pool.acquire() as conn:
-        # шапка отчёта — источник истины
-        hdr = await conn.fetchrow(
-            """
-            SELECT strategy_id, time_frame, window_start, window_end
-              FROM oracle_report_stat
-             WHERE id = $1
-            """,
-            report_id,
-        )
-        if not hdr:
-            log.warning("[SENSE] report_id=%s — не найден в oracle_report_stat", report_id)
-            return
-
-        strategy_id = int(hdr["strategy_id"])
-        time_frame = str(hdr["time_frame"])
-        window_start: Optional[datetime] = hdr["window_start"]
-        window_end: Optional[datetime] = hdr["window_end"]
-
-        # агрегаты отчёта (confidence уже посчитан)
         rows = await conn.fetch(
             """
-            SELECT direction, timeframe, agg_base, agg_state,
-                   trades_total, trades_wins, winrate, confidence
-              FROM oracle_mw_aggregated_stat
-             WHERE report_id = $1
+            SELECT
+              timeframe,
+              agg_base,
+              agg_state,
+              trades_total,
+              trades_wins,
+              winrate
+            FROM oracle_mw_aggregated_stat
+            WHERE report_id = $1
             """,
-            report_id,
+            int(report_id),
         )
         if not rows:
-            log.info("[SENSE] report_id=%s — агрегатов нет, пропуск", report_id)
+            log.info("[SENSE] report_id=%s sid=%s tf=%s: агрегатов нет — пропуск", report_id, strategy_id, time_frame)
             return
 
-        # группировка по базе (dir, tf, base)
-        group_map: Dict[Tuple[str, str, str], List[dict]] = defaultdict(list)
+        # группировка: timeframe → agg_base → список строк состояний
+        groups: Dict[str, Dict[str, List[dict]]] = defaultdict(lambda: defaultdict(list))
         for r in rows:
-            key = (r["direction"], r["timeframe"], r["agg_base"])
-            group_map[key].append(
+            timeframe = str(r["timeframe"])
+            base = str(r["agg_base"])
+            groups[timeframe][base].append(
                 {
-                    "agg_state": r["agg_state"],
-                    "t": int(r["trades_total"]),
-                    "w": int(r["trades_wins"]),
-                    "wr": float(r["winrate"]),
-                    "conf": float(r["confidence"]),
+                    "state": str(r["agg_state"]),
+                    "n": int(r["trades_total"] or 0),
+                    "w": int(r["trades_wins"] or 0),
+                    "wr": float(r["winrate"] or 0.0),
                 }
             )
 
-        # coverage и сводка по направлению — строго по окну из oracle_report_stat
-        closed_by_dir: Dict[str, Dict[str, float]] = {"long": {"t": 0, "w": 0}, "short": {"t": 0, "w": 0}}
-        if window_start and window_end:
-            dir_rows = await conn.fetch(
-                """
-                SELECT direction,
-                       COUNT(*)::int AS cnt,
-                       COALESCE(SUM((pnl > 0)::int),0)::int AS wins
-                  FROM positions_v4
-                 WHERE strategy_id = $1
-                   AND status = 'closed'
-                   AND closed_at >= $2
-                   AND closed_at <  $3
-                 GROUP BY direction
-                """,
-                strategy_id, window_start, window_end,
-            )
-            for rr in dir_rows:
-                d = str(rr["direction"])
-                closed_by_dir[d] = {"t": int(rr["cnt"]), "w": int(rr["wins"])}
-        else:
-            log.warning("[SENSE] report_id=%s — окно без дат (window_start/window_end NULL), coverage может быть некорректен", report_id)
+        total_written = 0
+        # обход TF → agg_base
+        for timeframe, base_map in groups.items():
+            for agg_base, state_rows in base_map.items():
+                # вычисление метрик
+                metrics, inputs_json = _compute_metrics_for_base(state_rows)
+                # парсинг базы на арность/компоненты
+                agg_arity, agg_components = _parse_base_components(agg_base)
 
-        # расчёт по каждой базе
-        for (direction, timeframe, agg_base), items in group_map.items():
-            T = sum(x["t"] for x in items)
-            W = sum(x["w"] for x in items)
-            wr_overall = _safe_div(W, T)
-
-            # coverage
-            T_all_dir = int(closed_by_dir.get(direction, {}).get("t", 0))
-            coverage = max(0.0, min(1.0, _safe_div(T, T_all_dir))) if T_all_dir else 0.0
-
-            # entropy_norm
-            K_obs = sum(1 for x in items if x["t"] > 0)
-            if T > 0 and K_obs > 1:
-                p = [x["t"] / T for x in items if x["t"] > 0]
-                H = -sum(pi * math.log(pi) for pi in p)
-                H_max = math.log(len(p))
-                entropy_norm = _safe_div(H, H_max)
-            else:
-                entropy_norm = 0.0
-
-            # ig_norm
-            if T > 0:
-                H_y = _bin_entropy(wr_overall)
-                H_y_s = 0.0
-                for x in items:
-                    if x["t"] <= 0:
-                        continue
-                    ps = x["t"] / T
-                    H_y_s += ps * _bin_entropy(x["wr"])
-                IG = max(0.0, H_y - H_y_s)
-                ig_norm = _safe_div(IG, H_y) if H_y > 0 else 0.0
-            else:
-                ig_norm = 0.0
-
-            # confidence_avg
-            confidence_avg = sum((x["t"] / T) * max(0.0, min(1.0, x["conf"])) for x in items if T > 0 and x["t"] > 0) if T > 0 else 0.0
-
-            # итоговые sense
-            sense_raw = _geom_mean([coverage, entropy_norm, ig_norm, confidence_avg])
-
-            # сглаживание (SMA по N=7)
-            prev_rows = await conn.fetch(
-                """
-                SELECT sense_score_raw
-                  FROM oracle_mw_sense_stat
-                 WHERE strategy_id = $1
-                   AND time_frame  = $2
-                   AND timeframe   = $3
-                   AND direction   = $4
-                   AND agg_base    = $5
-                 ORDER BY computed_at DESC
-                 LIMIT $6
-                """,
-                strategy_id, time_frame, timeframe, direction, agg_base, SMOOTH_WINDOW_N - 1,
-            )
-            history = [float(r["sense_score_raw"]) for r in prev_rows]
-            smooth_vals = [sense_raw] + history
-            sense_smooth = sum(smooth_vals) / len(smooth_vals)
-
-            # UPSERT
-            await conn.execute(
-                """
-                INSERT INTO oracle_mw_sense_stat (
-                    report_id, strategy_id, time_frame, timeframe, direction, agg_base,
-                    sense_score_raw, sense_score_smooth,
-                    coverage, entropy_norm, ig_norm, confidence_avg,
-                    trades_total, states_count,
-                    method_version, smoothing_window_n, inputs
+                # UPSERT результата
+                await conn.execute(
+                    """
+                    INSERT INTO oracle_mw_sense (
+                        report_id, strategy_id, time_frame, timeframe, agg_base,
+                        coverage_entropy_norm, discrimination_cramers_v,
+                        net_effect_loose, net_effect_strict,
+                        coverage_included_loose, coverage_included_strict,
+                        trades_total_all_states, states_used_count, baseline_wr,
+                        inputs_json, agg_arity, agg_components,
+                        created_at, updated_at
+                    )
+                    VALUES (
+                        $1,$2,$3,$4,$5,
+                        $6,$7,
+                        $8,$9,
+                        $10,$11,
+                        $12,$13,$14,
+                        $15,$16,$17,
+                        now(), now()
+                    )
+                    ON CONFLICT (report_id, strategy_id, time_frame, timeframe, agg_base)
+                    DO UPDATE SET
+                        coverage_entropy_norm    = EXCLUDED.coverage_entropy_norm,
+                        discrimination_cramers_v = EXCLUDED.discrimination_cramers_v,
+                        net_effect_loose         = EXCLUDED.net_effect_loose,
+                        net_effect_strict        = EXCLUDED.net_effect_strict,
+                        coverage_included_loose  = EXCLUDED.coverage_included_loose,
+                        coverage_included_strict = EXCLUDED.coverage_included_strict,
+                        trades_total_all_states  = EXCLUDED.trades_total_all_states,
+                        states_used_count        = EXCLUDED.states_used_count,
+                        baseline_wr              = EXCLUDED.baseline_wr,
+                        inputs_json              = EXCLUDED.inputs_json,
+                        agg_arity                = EXCLUDED.agg_arity,
+                        agg_components           = EXCLUDED.agg_components,
+                        updated_at               = now()
+                    """,
+                    int(report_id),
+                    int(strategy_id),
+                    str(time_frame),
+                    str(timeframe),
+                    str(agg_base),
+                    float(metrics["coverage_entropy_norm"]),
+                    float(metrics["discrimination_cramers_v"]),
+                    float(metrics["net_effect_loose"]),
+                    float(metrics["net_effect_strict"]),
+                    float(metrics["coverage_included_loose"]),
+                    float(metrics["coverage_included_strict"]),
+                    int(metrics["trades_total_all_states"]),
+                    int(metrics["states_used_count"]),
+                    float(BASELINE_WR),
+                    json.dumps(inputs_json, separators=(",", ":")),
+                    int(agg_arity),
+                    agg_components,
                 )
-                VALUES (
-                    $1, $2, $3, $4, $5, $6,
-                    $7, $8,
-                    $9, $10, $11, $12,
-                    $13, $14,
-                    $15, $16, $17
-                )
-                ON CONFLICT (report_id, strategy_id, time_frame, timeframe, direction, agg_base)
-                DO UPDATE SET
-                    sense_score_raw     = EXCLUDED.sense_score_raw,
-                    sense_score_smooth  = EXCLUDED.sense_score_smooth,
-                    coverage            = EXCLUDED.coverage,
-                    entropy_norm        = EXCLUDED.entropy_norm,
-                    ig_norm             = EXCLUDED.ig_norm,
-                    confidence_avg      = EXCLUDED.confidence_avg,
-                    trades_total        = EXCLUDED.trades_total,
-                    states_count        = EXCLUDED.states_count,
-                    method_version      = EXCLUDED.method_version,
-                    smoothing_window_n  = EXCLUDED.smoothing_window_n,
-                    inputs              = EXCLUDED.inputs,
-                    computed_at         = now()
-                """,
-                report_id,
-                strategy_id,
-                time_frame,
-                timeframe,
-                direction,
-                agg_base,
-                round(float(sense_raw), 4),
-                round(float(sense_smooth), 4),
-                round(float(coverage), 4),
-                round(float(entropy_norm), 4),
-                round(float(ig_norm), 4),
-                round(float(confidence_avg), 4),
-                int(T),
-                int(K_obs),
-                METHOD_VERSION,
-                SMOOTH_WINDOW_N,
-                json.dumps(
-                    {
-                        "window_start": window_start.isoformat() if window_start else None,
-                        "window_end": window_end.isoformat() if window_end else None,
-                        "components": {
-                            "coverage": coverage,
-                            "entropy_norm": entropy_norm,
-                            "ig_norm": ig_norm,
-                            "confidence_avg": confidence_avg,
-                        },
-                        "totals": {"T": T, "W": W, "wr_overall": wr_overall},
-                        "states": [
-                            {
-                                "agg_state": x["agg_state"],
-                                "t": x["t"],
-                                "w": x["w"],
-                                "wr": x["wr"],
-                                "conf": x["conf"],
-                                "p": _safe_div(x["t"], T) if T > 0 else 0.0,
-                            }
-                            for x in items
-                        ],
-                        "version": METHOD_VERSION,
-                        "smooth": {"window_n": SMOOTH_WINDOW_N},
-                    },
-                    separators=(",", ":"),
-                ),
-            )
+                total_written += 1
 
-            # лог результата
-            log.info(
-                "[SENSE] sid=%s win=%s tf=%s dir=%s base=%s | raw=%.4f smooth=%.4f | cov=%.4f ent=%.4f ig=%.4f conf=%.4f | T=%d K=%d",
-                strategy_id, time_frame, timeframe, direction, agg_base,
-                round(sense_raw, 4), round(sense_smooth, 4),
-                round(coverage, 4), round(entropy_norm, 4), round(ig_norm, 4), round(confidence_avg, 4),
-                int(T), int(K_obs),
-            )
+        log.info(
+            "✅ [SENSE] report_id=%s sid=%s tf=%s → записано баз: %d (TF=%d)",
+            report_id, strategy_id, time_frame, total_written, len(groups),
+        )
 
-            # публикация Redis KV по каждому agg_state
-            closed_total_dir = int(closed_by_dir.get(direction, {}).get("t", 0))
-            wins_total_dir = int(closed_by_dir.get(direction, {}).get("w", 0))
-            winrate_dir = _safe_div(wins_total_dir, closed_total_dir)
 
-            for x in items:
-                kv_key = f"{KV_PREFIX}:{strategy_id}:{time_frame}:{timeframe}:{direction}:{agg_base}:{x['agg_state']}"
-                kv_val = {
-                    "strategy_id": strategy_id,
-                    "time_frame": time_frame,
-                    "timeframe": timeframe,
-                    "direction": direction,
-                    "agg_base": agg_base,
-                    "agg_state": x["agg_state"],
-                    "report_id": report_id,
-                    "window_start": window_start.isoformat() if window_start else None,
-                    "window_end": window_end.isoformat() if window_end else None,
-                    "closed_total": closed_total_dir,
-                    "winrate": round(winrate_dir, 4),
-                    "confidence_score": round(max(0.0, min(1.0, float(x["conf"]))), 4),
-                    "sense_score_raw": round(float(sense_raw), 4),
-                    "sense_score_smooth": round(float(sense_smooth), 4),
-                }
-                await infra.redis_client.set(kv_key, json.dumps(kv_val, separators=(",", ":")), ex=KV_TTL_SEC)
+# 🔸 Расчёт метрик по одному agg_base (в рамках одного report_id × timeframe)
+def _compute_metrics_for_base(state_rows: List[dict]) -> Tuple[Dict[str, float], Dict[str, dict]]:
+    # подготовка входов
+    # фильтруем состояния без сделок
+    rows = [r for r in state_rows if (r.get("n", 0) or 0) > 0]
+    N = sum(r["n"] for r in rows)
+    S = len(rows)
 
-                log.info(
-                    "[SENSE_KV] set key=%s | closed_total=%d winrate=%.4f conf=%.4f sense_raw=%.4f sense_smooth=%.4f",
-                    kv_key, closed_total_dir, round(winrate_dir, 4),
-                    round(float(x["conf"]), 4), round(float(sense_raw), 4), round(float(sense_smooth), 4)
-                )
+    # inputs_json для аудита
+    inputs_json = {r["state"]: {"n": int(r["n"]), "w": int(r["w"]), "wr": float(r["wr"])} for r in rows}
+
+    # граничные случаи
+    if N <= 0 or S <= 0:
+        return (
+            {
+                "coverage_entropy_norm": 0.0,
+                "discrimination_cramers_v": 0.0,
+                "net_effect_loose": 0.0,
+                "net_effect_strict": 0.0,
+                "coverage_included_loose": 0.0,
+                "coverage_included_strict": 0.0,
+                "trades_total_all_states": 0,
+                "states_used_count": 0,
+            },
+            inputs_json,
+        )
+
+    # Coverage: нормированная энтропия по долям p_s
+    ps = [r["n"] / N for r in rows]
+    H = -sum(p * math.log(p) for p in ps if p > 0)
+    Hmax = math.log(S) if S > 1 else 1.0
+    coverage_entropy_norm = 0.0 if S <= 1 else (H / Hmax if Hmax > 0 else 0.0)
+    coverage_entropy_norm = float(max(0.0, min(1.0, coverage_entropy_norm)))
+
+    # Discrimination: Cramér’s V для таблицы |S|×2 (win/loss)
+    wins = [r["w"] for r in rows]
+    losses = [r["n"] - r["w"] for r in rows]
+    total_wins = sum(wins)
+    total_losses = sum(losses)
+    chi2 = 0.0
+    for i in range(S):
+        exp_w = (rows[i]["n"] * total_wins) / N if N > 0 else 0.0
+        exp_l = (rows[i]["n"] * total_losses) / N if N > 0 else 0.0
+        if exp_w > 0:
+            chi2 += ((wins[i] - exp_w) ** 2) / exp_w
+        if exp_l > 0:
+            chi2 += ((losses[i] - exp_l) ** 2) / exp_l
+    k = 1 if S > 1 else 0  # c-1 = 1 для win/loss
+    V = math.sqrt(chi2 / (N * k)) if (N > 0 and k > 0) else 0.0
+    discrimination_cramers_v = float(max(0.0, min(1.0, V)))
+
+    # Net Effect (loose/strict) и coverage включённых
+    ne_loose = 0.0
+    ne_strict = 0.0
+    cov_loose = 0.0
+    cov_strict = 0.0
+    for r in rows:
+        p = r["n"] / N
+        wr = r["wr"]
+        # loose: по сырому WR
+        if wr >= BASELINE_WR:
+            ne_loose += p * (wr - BASELINE_WR)
+            cov_loose += p
+        # strict: по нижней границе Wilson
+        lb = _wilson_lower_bound(r["w"], r["n"], Z)
+        if lb > BASELINE_WR:
+            ne_strict += p * (wr - BASELINE_WR)
+            cov_strict += p
+
+    metrics = {
+        "coverage_entropy_norm": coverage_entropy_norm,
+        "discrimination_cramers_v": discrimination_cramers_v,
+        "net_effect_loose": float(ne_loose),
+        "net_effect_strict": float(ne_strict),
+        "coverage_included_loose": float(min(1.0, max(0.0, cov_loose))),
+        "coverage_included_strict": float(min(1.0, max(0.0, cov_strict))),
+        "trades_total_all_states": int(N),
+        "states_used_count": int(S),
+    }
+    return metrics, inputs_json
+
+
+# 🔸 Парсинг базы в арность и список компонент (для удобных срезов)
+def _parse_base_components(agg_base: str) -> Tuple[int, List[str]]:
+    parts = [p for p in str(agg_base).split("_") if p]
+    arity = max(1, len(parts))
+    components = parts  # сохраняем естественный порядок формирования
+    return arity, components
+
+
+# 🔸 Wilson lower bound (для strict-отбора)
+def _wilson_lower_bound(wins: int, n: int, z: float) -> float:
+    if n <= 0:
+        return 0.0
+    p = wins / n
+    denom = 1.0 + (z * z) / n
+    center = p + (z * z) / (2.0 * n)
+    adj = z * math.sqrt((p * (1.0 - p) / n) + (z * z) / (4.0 * n * n))
+    lb = (center - adj) / denom
+    return float(max(0.0, min(1.0, lb)))
