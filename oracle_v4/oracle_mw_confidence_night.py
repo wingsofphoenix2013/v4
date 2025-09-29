@@ -34,13 +34,13 @@ WEIGHTS_TOLERANCE        = 1e-9    # защита от деления на но�
 async def run_oracle_confidence_night():
     # условия достаточности
     if infra.pg_pool is None:
-        log.info("❌ Пропуск ночного тюнера: нет PG-пула")
+        log.debug("❌ Пропуск ночного тюнера: нет PG-пула")
         return
 
     # получаем список стратегий для тюнинга (активные и market_watcher=true)
     strategies = await _load_target_strategies()
     if not strategies:
-        log.info("ℹ️ Нечего тюнить: нет стратегий с market_watcher=true")
+        log.debug("ℹ️ Нечего тюнить: нет стратегий с market_watcher=true")
         return
 
     # перебор стратегий и окон (7d/14d/28d)
@@ -54,7 +54,7 @@ async def run_oracle_confidence_night():
             except Exception:
                 log.exception("❌ Ошибка тюнинга весов: strategy_id=%s, time_frame=%s", sid, tf)
 
-    log.info("✅ Ночной тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
+    log.debug("✅ Ночной тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
 
 
 # 🔸 Загрузка целевых стратегий
@@ -88,7 +88,7 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
             strategy_id, time_frame, limit_reports
         )
         if len(reports) < 3:
-            log.info("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
+            log.debug("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
             return False
 
         # пары (t, t+1) по времени
@@ -197,7 +197,7 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
 
         samples = len(Y)
         if samples < MIN_SAMPLES_PER_STRATEGY:
-            log.info("ℹ️ strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
+            log.debug("ℹ️ strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
                      strategy_id, time_frame, samples, MIN_SAMPLES_PER_STRATEGY)
             return False
 
@@ -223,7 +223,7 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
         s = wR + wP + wC + wS
         weights = {"wR": wR / s, "wP": wP / s, "wC": wC / s, "wS": wS / s}
 
-        log.info("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
+        log.debug("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
                  strategy_id, time_frame, samples, train, holdout, weights)
 
         # активируем новые веса (деактивируем старые для пары strategy/tf)
@@ -248,7 +248,7 @@ async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool
             json.dumps(weights),
             '{"baseline_mode":"neutral"}',
         )
-        log.info("✅ Активированы новые веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
+        log.debug("✅ Активированы новые веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
         return True
 
 

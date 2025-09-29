@@ -45,7 +45,7 @@ async def run_oracle_confidence():
         await infra.redis_client.xgroup_create(
             name=REPORT_STREAM, groupname=REPORT_CONSUMER_GROUP, id="$", mkstream=True
         )
-        log.info("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
+        log.debug("📡 Создана группа потребителей в Redis Stream: %s", REPORT_CONSUMER_GROUP)
     except Exception as e:
         if "BUSYGROUP" in str(e):
             pass
@@ -53,7 +53,7 @@ async def run_oracle_confidence():
             log.exception("❌ Ошибка инициализации группы Redis Stream")
             return
 
-    log.info("🚀 Старт воркера confidence (пакет по window_end)")
+    log.debug("🚀 Старт воркера confidence (пакет по window_end)")
 
     # основной цикл чтения стрима
     while True:
@@ -87,7 +87,7 @@ async def run_oracle_confidence():
                         log.exception("❌ Ошибка обработки сообщения из Redis Stream")
 
         except asyncio.CancelledError:
-            log.info("⏹️ Воркер confidence остановлен по сигналу")
+            log.debug("⏹️ Воркер confidence остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ Ошибка цикла confidence — пауза 5 секунд")
@@ -119,7 +119,7 @@ async def _emit_sense_report_ready_for_report(
         maxlen=SENSE_REPORT_READY_MAXLEN,
         approximate=True,
     )
-    log.info("[SENSE_REPORT_READY] report_id=%s sid=%s tf=%s rows=%d", report_id, strategy_id, time_frame, aggregate_rows)
+    log.debug("[SENSE_REPORT_READY] report_id=%s sid=%s tf=%s rows=%d", report_id, strategy_id, time_frame, aggregate_rows)
 
 
 # 🔸 Пакетная обработка одного комплекта окон (ключ = strategy_id + window_end)
@@ -158,7 +158,7 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
             int(strategy_id), window_end_dt
         )
         if not inserted:
-            log.info("⏭️ Пропуск: комплект уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
+            log.debug("⏭️ Пропуск: комплект уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
             return
 
         report_ids = {str(r["time_frame"]): int(r["id"]) for r in rows}  # {'7d': id7, '14d': id14, '28d': id28}
@@ -250,7 +250,7 @@ async def _process_window_batch(strategy_id: int, window_end_iso: str):
             except Exception:
                 log.exception("❌ Ошибка обновления confidence для aggregated_id=%s", row["id"])
 
-        log.info(
+        log.debug(
             "✅ Обновлён confidence (пакет): sid=%s window_end=%s rows_total=%d rows_7d=%d rows_14d=%d rows_28d=%d",
             strategy_id,
             window_end_iso,
