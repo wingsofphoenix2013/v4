@@ -335,15 +335,20 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             # масса / N_effect (как в MW)
             cohort_n = [int(x["trades_total"] or 0) for x in cohort_rows]
             ecdf_cohort = _ecdf_rank(n, cohort_n) if cohort_n else 0.0
+            
             # история n для этого ключа (для смешивания при малой когорте)
-            ecdf_hist = _ecdf_rank(n, [int(v) for v in hist_n]) if hist_n else 0.0
+            hist_vals = [int(v) for v in (hist_n or []) if v is not None]
+            ecdf_hist = _ecdf_rank(int(n), hist_vals) if hist_vals else 0.0
+
             if len(cohort_n) < 5:
                 N_effect = 0.5 * ecdf_cohort + 0.5 * ecdf_hist
             else:
                 N_effect = ecdf_cohort
+
             floor = 1.0 / float(max(2, len(cohort_n)) + 1)
             N_effect = max(N_effect, floor)
             N_effect = float(max(0.0, min(1.0, N_effect)))
+
             n_pos = [v for v in cohort_n if v > 0]
             n_med = _median([float(v) for v in n_pos]) if n_pos else 1.0
             abs_mass = math.sqrt(n / (n + n_med)) if (n_med > 0 and n >= 0) else 0.0
