@@ -1,5 +1,6 @@
-# 🔸 oracle_pack_snapshot.py — воркер PACK-отчётов: агрегация по RSI (solo/combos), каркас под остальные PACK-и
+# oracle_pack_snapshot.py — воркер PACK-отчётов: агрегация по PACK (RSI/MFI/BB/LR/ATR/ADX_DMI/EMA/MACD) + публикация события в стрим
 
+# 🔸 Импорты
 import asyncio
 import logging
 import json
@@ -8,12 +9,12 @@ from typing import Dict, List, Tuple
 
 import infra
 
+# 🔸 Логгер
 log = logging.getLogger("ORACLE_PACK_SNAPSHOT")
 
 # 🔸 Константы воркера / параметры исполнения
 INITIAL_DELAY_SEC = 90                    # первый запуск через 90 секунд
 INTERVAL_SEC = 4 * 60 * 60                # периодичность — каждые 4 часа
-REDIS_TTL_SEC = 8 * 60 * 60               # TTL KV публикаций — 8 часов
 BATCH_SIZE = 500                          # размер батча по позициям
 WINDOW_TAGS = ("7d", "14d", "28d")
 WINDOW_SIZES = {
@@ -23,7 +24,7 @@ WINDOW_SIZES = {
 }
 TF_ORDER = ("m5", "m15", "h1")
 
-# 🔸 Белые списки полей по PACK (ориентир для агрегации)
+# 🔸 Параметры PACK (whitelist полей и комбинации)
 PACK_FIELDS = {
     "rsi":     ["bucket_low", "trend"],
     "mfi":     ["bucket_low", "trend"],
@@ -146,6 +147,11 @@ PACK_COMBOS = {
     ],
 }
 
+# 🔸 Настройки Redis Stream для сигнала «отчёт готов» по PACK
+REPORT_READY_STREAM = "oracle:pack:reports_ready"
+REPORT_READY_MAXLEN = 10000  # XADD MAXLEN ~
+
+
 # 🔸 Публичная точка запуска воркера (используется из oracle_v4_main.py → run_periodic)
 async def run_oracle_pack_snapshot():
     # условия достаточности окружения
@@ -204,27 +210,59 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
 
         if closed_total == 0:
             log.debug("[PACK REPORT] sid=%s win=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
+            # несмотря на total=0, downstream может хотеть знать, что отчёт сформирован
+            try:
+                await _emit_report_ready(
+                    redis=infra.redis_client,
+                    report_id=report_id,
+                    strategy_id=strategy_id,
+                    time_frame=tag,
+                    window_start=win_start,
+                    window_end=win_end,
+                    aggregate_rows=0,
+                    tf_done=[],
+                    generated_at=datetime.utcnow().replace(tzinfo=None),
+                )
+            except Exception:
+                log.exception("❌ Ошибка публикации события PACK REPORT_READY sid=%s win=%s (total=0)", strategy_id, tag)
             continue
 
-        # последовательный проход по TF — считаем ПАКИ (RSI + MFI)
+        # последовательный проход по TF — считаем все ПАКи
+        tf_done: List[str] = []
         for tf in TF_ORDER:
             try:
                 await _process_timeframe_rsi(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_mfi(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_bb(conn,   report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_lr(conn,   report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_atr(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_adx(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_ema(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                await _process_timeframe_macd(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_mfi(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_bb(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_lr(conn,  report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_atr(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_adx(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_ema(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                await _process_timeframe_macd(conn,report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+                # если дошли сюда — TF обработан
+                tf_done.append(tf)
             except Exception:
                 log.exception("❌ Ошибка PACK агрегации sid=%s win=%s tf=%s", strategy_id, tag, tf)
 
-        # публикация KV сводок по этому report (на pack-ключи)
+        # публикация события «отчёт готов» в Redis Stream (для PACK-confidence)
         try:
-            await _publish_kv_bulk(conn, infra.redis_client, report_id, strategy_id, tag)
+            row_count = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM oracle_pack_aggregated_stat WHERE report_id = $1",
+                report_id,
+            )
+            await _emit_report_ready(
+                redis=infra.redis_client,
+                report_id=report_id,
+                strategy_id=strategy_id,
+                time_frame=tag,
+                window_start=win_start,
+                window_end=win_end,
+                aggregate_rows=int(row_count or 0),
+                tf_done=tf_done,
+                generated_at=datetime.utcnow().replace(tzinfo=None),
+            )
         except Exception:
-            log.exception("❌ Ошибка публикации PACK KV sid=%s win=%s", strategy_id, tag)
+            log.exception("❌ Ошибка публикации события PACK REPORT_READY sid=%s win=%s", strategy_id, tag)
 
         log.debug(
             "[PACK REPORT] sid=%s win=%s report_id=%s total=%d wins=%d wr=%.4f pnl_sum=%.4f avg_pnl=%.4f avg_tpd=%.4f",
@@ -374,7 +412,6 @@ async def _process_timeframe_rsi(
             else:
                 # численное — храним как компактную строку (без засорения)
                 num = float(r["value_num"] or 0.0)
-                # RSI bucket_low — как правило целое кратно 5 → формат без лишних нулей
                 val = f"{num:.8f}".rstrip('0').rstrip('.') if '.' in f"{num:.8f}" else f"{int(num)}"
 
             by_uid.setdefault(uid, {}).setdefault(base, {})[name] = val
@@ -424,6 +461,7 @@ async def _process_timeframe_rsi(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.debug("[PACK-RSI] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+
 
 # 🔸 Обработка TF: PACK=MFI (solo + combo внутри MFI)
 async def _process_timeframe_mfi(
@@ -545,6 +583,7 @@ async def _process_timeframe_mfi(
 
     log.debug("[PACK-MFI] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
 
+
 # 🔸 Обработка TF: PACK=BB (solo + combos внутри BB)
 async def _process_timeframe_bb(
     conn,
@@ -655,7 +694,7 @@ async def _process_timeframe_bb(
                     inc["t"] += 1
                     if is_win:
                         inc["w"] += 1
-                        inc["pw"] = round(inc["pw"] + pnl, 4)
+                    inc["pw"] = round(inc["pw"] + (pnl if is_win else 0.0), 4)
                     inc["pt"] = round(inc["pt"] + pnl, 4)
 
         if inc_map:
@@ -663,6 +702,7 @@ async def _process_timeframe_bb(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.debug("[PACK-BB] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+
 
 # 🔸 Обработка TF: PACK=LR (solo + combos внутри LR)
 async def _process_timeframe_lr(
@@ -783,6 +823,7 @@ async def _process_timeframe_lr(
 
     log.debug("[PACK-LR] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
 
+
 # 🔸 Обработка TF: PACK=EMA (solo + пары/тройки/четвёрка)
 async def _process_timeframe_ema(
     conn,
@@ -827,12 +868,12 @@ async def _process_timeframe_ema(
         rows_pack = await conn.fetch(
             """
             SELECT position_uid, timeframe, param_base, param_name, value_num, value_text, status
-              FROM indicator_position_stat
-             WHERE position_uid = ANY($1::text[])
-               AND param_type = 'pack'
-               AND timeframe = $2
-               AND param_base LIKE 'ema%'
-               AND param_name = ANY($3::text[])
+             FROM indicator_position_stat
+            WHERE position_uid = ANY($1::text[])
+              AND param_type = 'pack'
+              AND timeframe = $2
+              AND param_base LIKE 'ema%'
+              AND param_name = ANY($3::text[])
             """,
             uid_list, timeframe, ema_fields,
         )
@@ -903,6 +944,7 @@ async def _process_timeframe_ema(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.debug("[PACK-EMA] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+
 
 # 🔸 Обработка TF: PACK=ATR (solo + combo bucket|bucket_delta)
 async def _process_timeframe_atr(
@@ -1021,6 +1063,7 @@ async def _process_timeframe_atr(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.debug("[PACK-ATR] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+
 
 # 🔸 Обработка TF: PACK=ADX_DMI (solo только bucket-поля; пары/тройки — по согласованному списку)
 async def _process_timeframe_adx(
@@ -1149,6 +1192,7 @@ async def _process_timeframe_adx(
 
     log.debug("[PACK-ADX_DMI] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
 
+
 # 🔸 Обработка TF: PACK=MACD (solo + пары/тройки/четвёрки)
 async def _process_timeframe_macd(
     conn,
@@ -1269,7 +1313,8 @@ async def _process_timeframe_macd(
             ok_rows += sum(v["t"] for v in inc_map.values())
 
     log.debug("[PACK-MACD] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
-    
+
+
 # 🔸 Батчевый UPSERT (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):
     # ключ: (report_id, strategy_id, time_frame, direction, timeframe, pack_base, agg_type, agg_key, agg_value)
@@ -1354,51 +1399,43 @@ async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]],
         days_in_window,
     )
 
-# 🔸 Публикация KV сводок (пер-TF)
-async def _publish_kv_bulk(conn, redis, report_id: int, strategy_id: int, time_frame: str):
-    row_rep = await conn.fetchrow("SELECT closed_total FROM oracle_report_stat WHERE id = $1", report_id)
-    if not row_rep:
-        return
-    closed_total = int(row_rep["closed_total"] or 0)
 
-    rows = await conn.fetch(
-        """
-        SELECT DISTINCT ON (direction, timeframe, pack_base, agg_key, agg_value)
-               direction, timeframe, pack_base, agg_key, agg_value, trades_total, winrate
-          FROM oracle_pack_aggregated_stat
-         WHERE report_id = $1
-         ORDER BY direction, timeframe, pack_base, agg_key, agg_value, updated_at DESC
-        """,
-        report_id,
+# 🔸 Публикация события «отчёт готов» в Redis Stream (PACK)
+async def _emit_report_ready(
+    redis,
+    *,
+    report_id: int,
+    strategy_id: int,
+    time_frame: str,
+    window_start: datetime,
+    window_end: datetime,
+    aggregate_rows: int,
+    tf_done: List[str],
+    generated_at: datetime,
+):
+    # собираем пейлоад
+    payload = {
+        "report_id": int(report_id),
+        "strategy_id": int(strategy_id),
+        "time_frame": str(time_frame),
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "generated_at": generated_at.isoformat(),
+        "aggregate_rows": int(aggregate_rows),
+        "tf_done": list(tf_done or []),
+    }
+    fields = {"data": json.dumps(payload, separators=(",", ":"))}
+
+    # отправка в Redis Stream (мягкое ограничение длины)
+    await redis.xadd(
+        name=REPORT_READY_STREAM,
+        fields=fields,
+        maxlen=REPORT_READY_MAXLEN,
+        approximate=True,
     )
-    if not rows:
-        return
 
-    pipe = redis.pipeline()
-    for r in rows:
-        direction = r["direction"]
-        timeframe = r["timeframe"]
-        pack_base = r["pack_base"]
-        agg_key = r["agg_key"]
-        agg_value = r["agg_value"]
-        trades_total = int(r["trades_total"] or 0)
-        winrate = float(r["winrate"] or 0.0)
-
-        # ключ теперь включает TF (m5/m15/h1)
-        key = f"oracle:pack:{strategy_id}:{direction}:{timeframe}:{pack_base}:{agg_key}:{agg_value}:{time_frame}"
-        payload = {
-            "strategy_id": strategy_id,
-            "direction": direction,
-            "timeframe": timeframe,
-            "pack_base": pack_base,
-            "agg_key": agg_key,
-            "agg_value": agg_value,
-            "time_frame": time_frame,
-            "report_id": report_id,
-            "closed_total": closed_total,
-            "agg_trades_total": trades_total,
-            "winrate": f"{winrate:.4f}",
-        }
-        pipe.set(key, json.dumps(payload), ex=REDIS_TTL_SEC)
-
-    await pipe.execute()
+    # лог на результат
+    log.debug(
+        "[PACK_REPORT_READY] sid=%s win=%s report_id=%s rows=%d tf_done=%s",
+        strategy_id, time_frame, report_id, aggregate_rows, ",".join(tf_done) if tf_done else "-",
+    )
