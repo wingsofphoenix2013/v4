@@ -217,36 +217,29 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             BATCH = 200
             for i in range(0, len(cohort_keys), BATCH):
                 chunk = cohort_keys[i:i+BATCH]
-                # распаковываем в массивы параметров для IN (tuple IN (...))
-                # из-за отсутствия прямой поддержки tuple-array в asyncpg — собираем OR из кортежей
-                # но оптимальнее: временная таблица. Для простоты — делаем через VALUES().
-                params = []
-                for ck in chunk:
-                    params.append(ck)
-                # VALUES-построитель
-                values_sql = ",".join(
-                    [
-                        "ROW($1[$%d]::int, $2[$%d]::text, $3[$%d]::text, $4[$%d]::text, $5[$%d]::text, $6[$%d]::text, $7[$%d]::text, $8[$%d]::timestamp)"
-                        % (idx+1, idx+1, idx+1, idx+1, idx+1, idx+1, idx+1, idx+1)
-                        for idx in range(len(chunk))
-                    ]
-                )
-                # подготовим столбцы как массивы
-                sid_a      = [ck[0] for ck in chunk]
-                tf_a       = [ck[1] for ck in chunk]
-                dir_a      = [ck[2] for ck in chunk]
-                timeframe_a= [ck[3] for ck in chunk]
-                pbase_a    = [ck[4] for ck in chunk]
-                atype_a    = [ck[5] for ck in chunk]
-                akey_a     = [ck[6] for ck in chunk]
-                rcat_a     = [ck[7] for ck in chunk]
+
+                # подготовим столбцы как массивы для UNNEST
+                sid_a       = [ck[0] for ck in chunk]            # int[]
+                tf_a        = [ck[1] for ck in chunk]            # text[]
+                dir_a       = [ck[2] for ck in chunk]            # text[]
+                timeframe_a = [ck[3] for ck in chunk]            # text[]
+                pbase_a     = [ck[4] for ck in chunk]            # text[]
+                atype_a     = [ck[5] for ck in chunk]            # text[]
+                akey_a      = [ck[6] for ck in chunk]            # text[]
+                rcat_a      = [ck[7] for ck in chunk]            # timestamp[]
 
                 rows_coh = await conn.fetch(
-                    f"""
-                    WITH keys(k_sid,k_tf,k_dir,k_timeframe,k_pbase,k_atype,k_akey,k_rcat) AS (
-                      SELECT * FROM (
-                        VALUES {values_sql}
-                      ) AS t
+                    """
+                    WITH keys AS (
+                      SELECT
+                        unnest($1::int[])        AS k_sid,
+                        unnest($2::text[])       AS k_tf,
+                        unnest($3::text[])       AS k_dir,
+                        unnest($4::text[])       AS k_timeframe,
+                        unnest($5::text[])       AS k_pbase,
+                        unnest($6::text[])       AS k_atype,
+                        unnest($7::text[])       AS k_akey,
+                        unnest($8::timestamp[])  AS k_rcat
                     )
                     SELECT
                       v.strategy_id, v.time_frame, v.direction, v.timeframe,
@@ -265,6 +258,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                     """,
                     sid_a, tf_a, dir_a, timeframe_a, pbase_a, atype_a, akey_a, rcat_a
                 )
+
                 for rr in rows_coh:
                     ck = (
                         rr["strategy_id"], rr["time_frame"], rr["direction"], rr["timeframe"],
