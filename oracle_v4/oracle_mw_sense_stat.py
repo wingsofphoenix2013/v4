@@ -76,7 +76,7 @@ async def run_oracle_sense_stat():
             log.exception("❌ Ошибка инициализации группы Redis Stream")
             return
 
-    log.info("🚀 Старт воркера sense-stat")
+    log.debug("🚀 Старт воркера sense-stat")
 
     # основной цикл
     while True:
@@ -140,7 +140,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
         )
 
         if not rows:
-            log.info("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s)",
+            log.debug("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s)",
                      CONF_THRESHOLD_SENSE, report_id, strategy_id, time_frame)
             return
 
@@ -211,13 +211,13 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
                     )
                     updated += 1
 
-        log.info("✅ sense-stat готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
+        log.debug("✅ sense-stat готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
                  report_id, strategy_id, time_frame, window_end_iso, updated)
 
         # формирование whitelist только для 7d
         if str(time_frame) == "7d":
             inserted = await _build_whitelist_for_7d(conn, report_id, strategy_id, window_end_dt)
-            log.info("✅ whitelist обновлён (7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted)
+            log.debug("✅ whitelist обновлён (7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted)
             # событие о готовности whitelist
             try:
                 payload = {
