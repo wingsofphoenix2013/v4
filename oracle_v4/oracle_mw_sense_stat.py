@@ -40,14 +40,18 @@ AGG_BASES = (
     "trend_volatility_extremes_momentum",
 )
 SMOOTH_HISTORY_N = 5
-CONF_THRESHOLD_SENSE = 0.1
+CONF_THRESHOLD_SENSE = 0.1  # включаем в расчёт sense только состояния с confidence > 0.1
 EPS = 1e-12
 
-# 🔸 Пороговые значения для whitelist
-SCORE_SENSE_MIN = 0.5          # по базе (score_smoothed > 0.5)
-CONF_THRESHOLD_WL = 0.25       # по строке агрегата (confidence > 0.25)
-WR_MIN_WL = 0.25               # минимальный winrate для попадания в WL (>= 0.25)
+# 🔸 Пороговые значения для whitelist (настраиваются перезапуском сервиса)
+SCORE_SENSE_MIN = 0.5    # база попадает в WL только если score_smoothed > 0.5
+CONF_THRESHOLD_WL = 0.25 # строка агрегата (agg_state) — confidence > 0.25
+WL_WR_MIN = 0.55         # минимальный winrate для попадания строки в whitelist (>= 0.55)
 
+# 🔸 Пороговые значения для вычисления confirmation по confidence
+CONFIRM_T0 = 0.75  # => confirmation = 0
+CONFIRM_T1 = 0.50  # => confirmation = 1  (если conf в [0.50, 0.75))
+CONFIRM_T2 = 0.25  # => confirmation = 2  (если conf в [0.25, 0.50))
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_sense_stat():
@@ -113,7 +117,6 @@ async def run_oracle_sense_stat():
             log.exception("❌ Ошибка цикла sense-stat — пауза 5 секунд")
             await asyncio.sleep(5)
 
-
 # 🔸 Обработка одного отчёта: расчёт sense-stat + (если 7d) построение whitelist
 async def _process_report(report_id: int, strategy_id: int, time_frame: str, window_end_iso: str):
     # парсинг window_end
@@ -139,7 +142,6 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
         if not rows:
             log.info("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s)",
                      CONF_THRESHOLD_SENSE, report_id, strategy_id, time_frame)
-            # даже если нет данных для sense, whitelist для 7d обновлять не из чего
             return
 
         # группировка по (timeframe, direction, agg_base)
@@ -236,10 +238,9 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
             except Exception:
                 log.exception("❌ Ошибка публикации события в %s", WHITELIST_READY_STREAM)
 
-
 # 🔸 Построение whitelist для 7d: очищаем по стратегии и заполняем свежим набором
 async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window_end_dt: datetime) -> int:
-    # быстрый список баз с score_smoothed > 0.5 для данного отчёта
+    # список баз (по данному report_id), у которых score_smoothed > SCORE_SENSE_MIN
     bases_rows = await conn.fetch(
         """
         SELECT timeframe, direction, agg_base
@@ -251,14 +252,14 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
         report_id, float(SCORE_SENSE_MIN)
     )
     if not bases_rows:
-        # очищаем whitelist по стратегии, если что-то было
-        await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
+        # актуализируем пустым срезом для стратегии
+        async with conn.transaction():
+            await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
         return 0
 
-    # подготавливаем фильтры по (timeframe, direction, agg_base)
     selectors = {(r["timeframe"], r["direction"], r["agg_base"]) for r in bases_rows}
 
-    # выборка кандидатов из агрегатов под эти базы
+    # выборка кандидатов из агрегатов (по выбранным базам)
     cand_rows = await conn.fetch(
         """
         SELECT
@@ -277,27 +278,27 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
           AND a.confidence > $3
           AND a.winrate >= $4
         """,
-        report_id, strategy_id, float(CONF_THRESHOLD_WL), float(WR_MIN_WL)
+        report_id, strategy_id, float(CONF_THRESHOLD_WL), float(WL_WR_MIN)
     )
 
-    # фильтрация по выбранным базам (score_smoothed > 0.5)
+    # фильтрация по выбранным базам (score_smoothed > SCORE_SENSE_MIN)
     filtered = [
         dict(r) for r in cand_rows
         if (r["timeframe"], r["direction"], r["agg_base"]) in selectors
     ]
 
-    # вычисляем confirmation в Python и готовим батч на вставку
+    # вычисляем confirmation по confidence и готовим батч на вставку
     to_insert = []
     for r in filtered:
         wr = float(r["winrate"] or 0.0)
-        if wr >= 0.75:
-            confm = 0
-        elif wr >= 0.50:
-            confm = 1
-        elif wr >= 0.25:
-            confm = 2
-        else:
-            continue  # защита, хотя уже отфильтровано
+        conf_val = float(r["confidence"] or 0.0)
+
+        # дополнительная защита по winrate (SQL уже отфильтровал)
+        if wr < WL_WR_MIN:
+            continue
+
+        # вычисление confirmation по confidence
+        confm = _confirmation_by_confidence(conf_val)
 
         to_insert.append({
             "aggregated_id": int(r["aggregated_id"]),
@@ -307,45 +308,41 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
             "agg_base": str(r["agg_base"]),
             "agg_state": str(r["agg_state"]),
             "winrate": float(wr),
-            "confidence": float(r["confidence"] or 0.0),
+            "confidence": conf_val,
             "confirmation": int(confm),
         })
 
-    # очищаем текущее содержимое по стратегии (таблица — актуальный срез)
-    await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
+    # атомарно обновляем срез для стратегии
+    async with conn.transaction():
+        await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
 
-    if not to_insert:
-        return 0
-
-    # батчевая вставка
-    # используем executemany с простым INSERT
-    await conn.executemany(
-        """
-        INSERT INTO oracle_mw_whitelist (
-            aggregated_id, strategy_id, direction, timeframe,
-            agg_base, agg_state, winrate, confidence, confirmation
-        ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9
-        )
-        """,
-        [
-            (
-                row["aggregated_id"],
-                row["strategy_id"],
-                row["direction"],
-                row["timeframe"],
-                row["agg_base"],
-                row["agg_state"],
-                row["winrate"],
-                row["confidence"],
-                row["confirmation"],
+        if to_insert:
+            await conn.executemany(
+                """
+                INSERT INTO oracle_mw_whitelist (
+                    aggregated_id, strategy_id, direction, timeframe,
+                    agg_base, agg_state, winrate, confidence, confirmation
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9
+                )
+                """,
+                [
+                    (
+                        row["aggregated_id"],
+                        row["strategy_id"],
+                        row["direction"],
+                        row["timeframe"],
+                        row["agg_base"],
+                        row["agg_state"],
+                        row["winrate"],
+                        row["confidence"],
+                        row["confirmation"],
+                    )
+                    for row in to_insert
+                ]
             )
-            for row in to_insert
-        ]
-    )
 
     return len(to_insert)
-
 
 # 🔸 Расчёт разделяющей силы (winrate по состояниям внутри базы)
 def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
@@ -385,7 +382,6 @@ def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
     }
     return score, len(states), comps
 
-
 # 🔸 Сглаживание (среднее по текущему и ≤5 предыдущим)
 def _smooth_mean(current: float, history: List[float]) -> float:
     vals = [float(current)] + [float(x) for x in history if x is not None]
@@ -394,3 +390,13 @@ def _smooth_mean(current: float, history: List[float]) -> float:
     sm = sum(vals) / len(vals)
     sm = max(0.0, min(1.0, float(round(sm, 4))))
     return sm
+
+# 🔸 Вычисление confirmation по confidence
+def _confirmation_by_confidence(conf: float) -> int:
+    if conf >= CONFIRM_T0:
+        return 0
+    if conf >= CONFIRM_T1:
+        return 1
+    if conf >= CONFIRM_T2:
+        return 2
+    return 2
