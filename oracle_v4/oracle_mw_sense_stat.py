@@ -1,4 +1,4 @@
-# oracle_mw_sense_stat.py — воркер sense-stat: оценка «разделяющей силы» agg_base (0..1) по winrate, с учётом последних 5 прогонов
+# oracle_mw_sense_stat.py — воркер sense-stat: оценка «разделяющей силы» agg_base (0..1) и формирование whitelist (7d)
 
 # 🔸 Импорты
 import asyncio
@@ -12,28 +12,42 @@ import infra
 # 🔸 Логгер
 log = logging.getLogger("ORACLE_SENSE_STAT")
 
-# 🔸 Константы Redis Stream (инициируемся по готовности отчётов ДЛЯ sense)
+# 🔸 Константы Redis Stream (инициация по готовности отчётов ДЛЯ sense)
 SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
 SENSE_CONSUMER_GROUP = "oracle_sense_stat_group"
 SENSE_CONSUMER_NAME = "oracle_sense_stat_worker"
 
-# 🔸 Константы расчёта
+# 🔸 Константы Redis Stream для whitelist
+WHITELIST_READY_STREAM = "oracle:mw_whitelist:reports_ready"
+WHITELIST_READY_MAXLEN = 10_000
+
+# 🔸 Константы расчёта sense
 TF_LIST = ("m5", "m15", "h1")
 DIRECTIONS = ("long", "short")
 AGG_BASES = (
+    # solo
     "trend", "volatility", "extremes", "momentum",
+    # pairs
     "trend_volatility", "trend_extremes", "trend_momentum",
     "volatility_extremes", "volatility_momentum",
     "extremes_momentum",
+    # triples
     "trend_volatility_extremes",
     "trend_volatility_momentum",
     "trend_extremes_momentum",
     "volatility_extremes_momentum",
+    # quadruple
     "trend_volatility_extremes_momentum",
 )
 SMOOTH_HISTORY_N = 5
-CONF_THRESHOLD = 0.1
+CONF_THRESHOLD_SENSE = 0.1
 EPS = 1e-12
+
+# 🔸 Пороговые значения для whitelist
+SCORE_SENSE_MIN = 0.5          # по базе (score_smoothed > 0.5)
+CONF_THRESHOLD_WL = 0.25       # по строке агрегата (confidence > 0.25)
+WR_MIN_WL = 0.25               # минимальный winrate для попадания в WL (>= 0.25)
+
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_sense_stat():
@@ -42,7 +56,7 @@ async def run_oracle_sense_stat():
         log.debug("❌ Пропуск: PG/Redis не инициализированы")
         return
 
-    # создание группы потребителей (идемпотентно)
+    # создание группы потребителей (идемпотентно, только новые сообщения)
     try:
         await infra.redis_client.xgroup_create(
             name=SENSE_REPORT_READY_STREAM,
@@ -99,8 +113,10 @@ async def run_oracle_sense_stat():
             log.exception("❌ Ошибка цикла sense-stat — пауза 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Обработка одного отчёта
+
+# 🔸 Обработка одного отчёта: расчёт sense-stat + (если 7d) построение whitelist
 async def _process_report(report_id: int, strategy_id: int, time_frame: str, window_end_iso: str):
+    # парсинг window_end
     try:
         window_end_dt = datetime.fromisoformat(str(window_end_iso).replace("Z", ""))
     except Exception:
@@ -108,6 +124,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
         return
 
     async with infra.pg_pool.acquire() as conn:
+        # выборка агрегатов текущего отчёта (confidence > 0.1 для sense)
         rows = await conn.fetch(
             """
             SELECT timeframe, direction, agg_base, agg_state,
@@ -116,14 +133,16 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
              WHERE report_id = $1
                AND confidence > $2
             """,
-            report_id, CONF_THRESHOLD
+            report_id, CONF_THRESHOLD_SENSE
         )
 
         if not rows:
             log.info("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s)",
-                     CONF_THRESHOLD, report_id, strategy_id, time_frame)
+                     CONF_THRESHOLD_SENSE, report_id, strategy_id, time_frame)
+            # даже если нет данных для sense, whitelist для 7d обновлять не из чего
             return
 
+        # группировка по (timeframe, direction, agg_base)
         data: Dict[Tuple[str, str, str], List[dict]] = {}
         for r in rows:
             key = (r["timeframe"], r["direction"], r["agg_base"])
@@ -140,10 +159,11 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
                 for base in AGG_BASES:
                     states = data.get((tf, direction, base), [])
                     if not states:
-                        continue  # ⬅️ если нет состояний — не создаём строку
+                        continue  # только если есть хотя бы одно состояние
 
                     score_current, states_used, components = _compute_score(states)
 
+                    # сглаживание по истории (≤5 предыдущих прогонов)
                     prev_vals = await conn.fetch(
                         """
                         SELECT score_current
@@ -163,6 +183,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
                     hist = [float(x["score_current"]) for x in prev_vals] if prev_vals else []
                     score_smoothed = _smooth_mean(score_current, hist)
 
+                    # запись/обновление строки sense
                     await conn.execute(
                         """
                         INSERT INTO oracle_mw_sense_stat (
@@ -191,8 +212,144 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
         log.info("✅ sense-stat готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
                  report_id, strategy_id, time_frame, window_end_iso, updated)
 
-# 🔸 Расчёт разделяющей силы
+        # формирование whitelist только для 7d
+        if str(time_frame) == "7d":
+            inserted = await _build_whitelist_for_7d(conn, report_id, strategy_id, window_end_dt)
+            log.info("✅ whitelist обновлён (7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted)
+            # событие о готовности whitelist
+            try:
+                payload = {
+                    "strategy_id": int(strategy_id),
+                    "report_id": int(report_id),
+                    "time_frame": "7d",
+                    "window_end": window_end_dt.isoformat(),
+                    "rows_inserted": int(inserted),
+                    "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+                }
+                await infra.redis_client.xadd(
+                    name=WHITELIST_READY_STREAM,
+                    fields={"data": json.dumps(payload, separators=(",", ":"))},
+                    maxlen=WHITELIST_READY_MAXLEN,
+                    approximate=True,
+                )
+                log.debug("[WHITELIST_READY] sid=%s report_id=%s rows=%d", strategy_id, report_id, inserted)
+            except Exception:
+                log.exception("❌ Ошибка публикации события в %s", WHITELIST_READY_STREAM)
+
+
+# 🔸 Построение whitelist для 7d: очищаем по стратегии и заполняем свежим набором
+async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window_end_dt: datetime) -> int:
+    # быстрый список баз с score_smoothed > 0.5 для данного отчёта
+    bases_rows = await conn.fetch(
+        """
+        SELECT timeframe, direction, agg_base
+          FROM oracle_mw_sense_stat
+         WHERE report_id = $1
+           AND time_frame = '7d'
+           AND score_smoothed > $2
+        """,
+        report_id, float(SCORE_SENSE_MIN)
+    )
+    if not bases_rows:
+        # очищаем whitelist по стратегии, если что-то было
+        await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
+        return 0
+
+    # подготавливаем фильтры по (timeframe, direction, agg_base)
+    selectors = {(r["timeframe"], r["direction"], r["agg_base"]) for r in bases_rows}
+
+    # выборка кандидатов из агрегатов под эти базы
+    cand_rows = await conn.fetch(
+        """
+        SELECT
+            a.id          AS aggregated_id,
+            a.strategy_id AS strategy_id,
+            a.direction   AS direction,
+            a.timeframe   AS timeframe,
+            a.agg_base    AS agg_base,
+            a.agg_state   AS agg_state,
+            a.winrate     AS winrate,
+            a.confidence  AS confidence
+        FROM oracle_mw_aggregated_stat a
+        WHERE a.report_id = $1
+          AND a.time_frame = '7d'
+          AND a.strategy_id = $2
+          AND a.confidence > $3
+          AND a.winrate >= $4
+        """,
+        report_id, strategy_id, float(CONF_THRESHOLD_WL), float(WR_MIN_WL)
+    )
+
+    # фильтрация по выбранным базам (score_smoothed > 0.5)
+    filtered = [
+        dict(r) for r in cand_rows
+        if (r["timeframe"], r["direction"], r["agg_base"]) in selectors
+    ]
+
+    # вычисляем confirmation в Python и готовим батч на вставку
+    to_insert = []
+    for r in filtered:
+        wr = float(r["winrate"] or 0.0)
+        if wr >= 0.75:
+            confm = 0
+        elif wr >= 0.50:
+            confm = 1
+        elif wr >= 0.25:
+            confm = 2
+        else:
+            continue  # защита, хотя уже отфильтровано
+
+        to_insert.append({
+            "aggregated_id": int(r["aggregated_id"]),
+            "strategy_id": int(r["strategy_id"]),
+            "direction": str(r["direction"]),
+            "timeframe": str(r["timeframe"]),
+            "agg_base": str(r["agg_base"]),
+            "agg_state": str(r["agg_state"]),
+            "winrate": float(wr),
+            "confidence": float(r["confidence"] or 0.0),
+            "confirmation": int(confm),
+        })
+
+    # очищаем текущее содержимое по стратегии (таблица — актуальный срез)
+    await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
+
+    if not to_insert:
+        return 0
+
+    # батчевая вставка
+    # используем executemany с простым INSERT
+    await conn.executemany(
+        """
+        INSERT INTO oracle_mw_whitelist (
+            aggregated_id, strategy_id, direction, timeframe,
+            agg_base, agg_state, winrate, confidence, confirmation
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9
+        )
+        """,
+        [
+            (
+                row["aggregated_id"],
+                row["strategy_id"],
+                row["direction"],
+                row["timeframe"],
+                row["agg_base"],
+                row["agg_state"],
+                row["winrate"],
+                row["confidence"],
+                row["confirmation"],
+            )
+            for row in to_insert
+        ]
+    )
+
+    return len(to_insert)
+
+
+# 🔸 Расчёт разделяющей силы (winrate по состояниям внутри базы)
 def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
+    # должно быть минимум 2 состояния с n>0
     if len([s for s in states if s["n"] > 0]) < 2:
         comps = {"k_states": len(states), "n_total": sum(int(s["n"]) for s in states), "reason": "insufficient_states"}
         return 0.0, len(states), comps
@@ -210,7 +367,9 @@ def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
         if n_i <= 0:
             continue
         p_i = float(s["p"])
+        # межгрупповая дисперсия: вклад состояния
         ss_between += n_i * (p_i - p_bar) ** 2
+        # внутригрупповая вариативность: сумма p(1-p) как аппроксимация
         ss_within += p_i * (1.0 - p_i)
 
     score = ss_between / (ss_between + ss_within + EPS)
@@ -226,7 +385,8 @@ def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
     }
     return score, len(states), comps
 
-# 🔸 Сглаживание
+
+# 🔸 Сглаживание (среднее по текущему и ≤5 предыдущим)
 def _smooth_mean(current: float, history: List[float]) -> float:
     vals = [float(current)] + [float(x) for x in history if x is not None]
     if not vals:
