@@ -14,9 +14,8 @@ from config_loader import (
     config_event_listener,
 )
 
-# 🔸 импорт воркера MW-отчётов
+# 🔸 импорт воркера отчётов
 from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
-# 🔸 импорт воркера PACK-отчётов
 from oracle_pack_snapshot import run_oracle_pack_snapshot as run_pack, INITIAL_DELAY_SEC as PACK_INIT_DELAY, INTERVAL_SEC as PACK_INTERVAL
 # 🔸 импорт воркера confidence
 from oracle_mw_confidence import run_oracle_confidence
