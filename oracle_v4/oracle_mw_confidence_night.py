@@ -1,5 +1,6 @@
-# 🔸 oracle_mw_confidence_night.py — ночной тюнер: автокалибровка весов (wR,wP,wC,wS) per-strategy/per-window раз в сутки
+# oracle_mw_confidence_night.py — ночной тюнер: автокалибровка весов (wR,wP,wC,wS) per-strategy/per-window раз в сутки
 
+# 🔸 Импорты
 import asyncio
 import logging
 from typing import Dict, List, Tuple, Optional
@@ -8,14 +9,17 @@ import time
 import json
 
 import infra
-# 🔸 используем готовые утилиты/константы из основного воркера confidence
+# 🔸 используем актуальные утилиты/константы из переписанного воркера confidence
 from oracle_mw_confidence import (
     WINDOW_STEPS, Z, BASELINE_WR,
     _wilson_lower_bound, _wilson_bounds,
-    _persistence_metrics, _cross_window_coherence_by_ids, _stability_key_dynamic,
+    _persistence_matrix_mw,     # матрица n по последним L отчётам
+    _coherence_from_rows_mw,    # согласованность по трём окнам
+    _stability_key_dynamic_mw,  # стабильность wr по когорте
     _ecdf_rank, _median, _mad, _iqr,
 )
 
+# 🔸 Логгер
 log = logging.getLogger("ORACLE_CONFIDENCE_NIGHT")
 
 # 🔸 Параметры запуска воркера (задержка старта и интервал в часах — подключаются через run_periodic в main)
@@ -45,14 +49,15 @@ async def run_oracle_confidence_night():
 
     # перебор стратегий и окон (7d/14d/28d)
     updated_total = 0
-    for sid in strategies:
-        for tf in ("7d", "14d", "28d"):
-            try:
-                ok = await _train_and_activate_weights(strategy_id=sid, time_frame=tf)
-                if ok:
-                    updated_total += 1
-            except Exception:
-                log.exception("❌ Ошибка тюнинга весов: strategy_id=%s, time_frame=%s", sid, tf)
+    async with infra.pg_pool.acquire() as conn:
+        for sid in strategies:
+            for tf in ("7d", "14d", "28d"):
+                try:
+                    ok = await _train_and_activate_weights(conn, strategy_id=sid, time_frame=tf)
+                    if ok:
+                        updated_total += 1
+                except Exception:
+                    log.exception("❌ Ошибка тюнинга весов: strategy_id=%s, time_frame=%s", sid, tf)
 
     log.debug("✅ Ночной тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
 
@@ -72,184 +77,214 @@ async def _load_target_strategies() -> List[int]:
     return [int(r["id"]) for r in rows]
 
 
-# 🔸 Обучение и активация весов для одной пары (strategy_id, time_frame)
-async def _train_and_activate_weights(strategy_id: int, time_frame: str) -> bool:
-    async with infra.pg_pool.acquire() as conn:
-        # выбираем отчёты по стратегии/окну в порядке времени (ASC)
-        limit_reports = int(WINDOW_STEPS.get(time_frame, 42) * 2)
-        reports = await conn.fetch(
-            """
-            SELECT id, created_at
-            FROM oracle_report_stat
-            WHERE strategy_id = $1 AND time_frame = $2
-            ORDER BY created_at ASC
-            LIMIT $3
-            """,
-            strategy_id, time_frame, limit_reports
+# 🔸 Обучение и активация весов для одной пары (strategy_id, time_frame) — MW
+async def _train_and_activate_weights(conn, strategy_id: int, time_frame: str) -> bool:
+    # выбираем отчёты по стратегии/окну в порядке времени (ASC), ограничим ~2*L для свежести
+    limit_reports = int(WINDOW_STEPS.get(time_frame, 42) * 2)
+    reports = await conn.fetch(
+        """
+        SELECT id, created_at
+        FROM oracle_report_stat
+        WHERE strategy_id = $1 AND time_frame = $2
+        ORDER BY created_at ASC
+        LIMIT $3
+        """,
+        strategy_id, time_frame, limit_reports
+    )
+    if len(reports) < 3:
+        log.debug("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
+        return False
+
+    # пары (t, t+1) по времени
+    pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]] = []
+    for i in range(len(reports) - 1):
+        pairs.append(
+            ((int(reports[i]["id"]), str(reports[i]["created_at"])),
+             (int(reports[i+1]["id"]), str(reports[i+1]["created_at"])))
         )
-        if len(reports) < 3:
-            log.debug("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
-            return False
 
-        # пары (t, t+1) по времени
-        pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]] = []
-        for i in range(len(reports) - 1):
-            pairs.append(
-                ((int(reports[i]["id"]), str(reports[i]["created_at"])),
-                 (int(reports[i+1]["id"]), str(reports[i+1]["created_at"])))
-            )
+    # датасет признаков и меток
+    X: List[Tuple[float, float, float, float]] = []  # (R,P,C,S)
+    Y: List[int] = []
 
-        # датасет признаков и меток
-        X: List[Tuple[float, float, float, float]] = []
-        Y: List[int] = []
+    # кэш когорт для ускорения
+    cohort_cache: Dict[Tuple, List[dict]] = {}
 
-        # кэш когорт для ускорения
-        cohort_cache: Dict[Tuple, List[dict]] = {}
+    for (rep_id_t, created_t), (rep_id_n, created_n) in pairs:
+        # строки T
+        rows_t = await conn.fetch(
+            """
+            SELECT
+              id, report_id, strategy_id, time_frame, direction, timeframe,
+              agg_type, agg_base, agg_state, trades_total, trades_wins, winrate, avg_pnl_per_trade, report_created_at
+            FROM v_mw_aggregated_with_time
+            WHERE report_id = $1
+            """,
+            rep_id_t
+        )
+        if not rows_t:
+            continue
 
-        for (rep_id_t, created_t), (rep_id_n, created_n) in pairs:
-            # строки T
-            rows_t = await conn.fetch(
-                """
-                SELECT
-                  id, report_id, strategy_id, time_frame, direction, timeframe,
-                  agg_type, agg_base, agg_state, trades_total, trades_wins, winrate, avg_pnl_per_trade, report_created_at
-                FROM v_mw_aggregated_with_time
-                WHERE report_id = $1
-                """,
-                rep_id_t
-            )
-            if not rows_t:
+        # строки T+1 (для целевой метки)
+        rows_n = await conn.fetch(
+            """
+            SELECT
+              id, report_id, strategy_id, time_frame, direction, timeframe,
+              agg_type, agg_base, agg_state, trades_total, trades_wins, winrate, report_created_at
+            FROM v_mw_aggregated_with_time
+            WHERE report_id = $1
+            """,
+            rep_id_n
+        )
+        key2row_n: Dict[Tuple, dict] = {}
+        for rn in rows_n:
+            kn = (rn["direction"], rn["timeframe"], rn["agg_type"], rn["agg_base"], rn["agg_state"])
+            key2row_n[kn] = dict(rn)
+
+        # window_end текущего отчёта T → подбираем «тройку» (7d/14d/28d) с тем же window_end
+        hdr_t = await conn.fetchrow(
+            "SELECT strategy_id, window_end FROM oracle_report_stat WHERE id = $1",
+            rep_id_t
+        )
+        trio_rows = await conn.fetch(
+            """
+            SELECT id, time_frame
+            FROM oracle_report_stat
+            WHERE strategy_id = $1
+              AND window_end  = $2
+              AND time_frame  IN ('7d','14d','28d')
+            """,
+            int(hdr_t["strategy_id"]), hdr_t["window_end"]
+        )
+        trio_ids = {str(r["time_frame"]): int(r["id"]) for r in trio_rows}
+
+        for rt in rows_t:
+            row_t = dict(rt)
+            key = (row_t["direction"], row_t["timeframe"], row_t["agg_type"], row_t["agg_base"], row_t["agg_state"])
+            row_next = key2row_n.get(key)
+            if not row_next:
                 continue
 
-            # строки T+1 (для целевой метки)
-            rows_n = await conn.fetch(
-                """
-                SELECT
-                  id, report_id, strategy_id, time_frame, direction, timeframe,
-                  agg_type, agg_base, agg_state, trades_total, trades_wins, winrate, report_created_at
-                FROM v_mw_aggregated_with_time
-                WHERE report_id = $1
-                """,
-                rep_id_n
+            # когорта для T (все agg_state внутри оси на одном отчёте)
+            cohort_key = (
+                row_t["strategy_id"], row_t["time_frame"], row_t["direction"], row_t["timeframe"],
+                row_t["agg_type"], row_t["agg_base"], row_t["report_created_at"]
             )
-            key2row_n: Dict[Tuple, dict] = {}
-            for rn in rows_n:
-                kn = (rn["direction"], rn["timeframe"], rn["agg_type"], rn["agg_base"], rn["agg_state"])
-                key2row_n[kn] = dict(rn)
+            if cohort_key not in cohort_cache:
+                cohort_cache[cohort_key] = await _fetch_cohort_for(conn, row_t)
 
-            # window_end текущего репорта T для подбора трёх окон
-            hdr_t = await conn.fetchrow(
-                "SELECT strategy_id, window_end FROM oracle_report_stat WHERE id = $1",
-                rep_id_t
+            # R (на t)
+            n_t = int(row_t["trades_total"] or 0)
+            w_t = int(row_t["trades_wins"] or 0)
+            R_t = _wilson_lower_bound(w_t, n_t, Z) if n_t > 0 else 0.0
+
+            # P (на t) — матрица последних L отчётов
+            L = int(WINDOW_STEPS.get(time_frame, 42))
+            mat = await _persistence_matrix_mw(
+                conn,
+                int(row_t["strategy_id"]),
+                str(row_t["time_frame"]),
+                row_t["report_created_at"],
+                L
             )
-            # три report_id с тем же window_end
-            trio_rows = await conn.fetch(
-                """
-                SELECT id, time_frame
-                FROM oracle_report_stat
-                WHERE strategy_id = $1
-                  AND window_end  = $2
-                  AND time_frame  IN ('7d','14d','28d')
-                """,
-                int(hdr_t["strategy_id"]), hdr_t["window_end"]
-            )
-            trio_ids = {str(r["time_frame"]): int(r["id"]) for r in trio_rows}
+            keyP = (row_t["direction"], row_t["timeframe"], row_t["agg_type"], row_t["agg_base"], row_t["agg_state"])
+            hist_n = mat.get(keyP, [])
 
-            for rt in rows_t:
-                row_t = dict(rt)
-                key = (row_t["direction"], row_t["timeframe"], row_t["agg_type"], row_t["agg_base"], row_t["agg_state"])
-                row_next = key2row_n.get(key)
-                if not row_next:
-                    continue
+            present_flags = [1 if v is not None and int(v) > 0 else 0 for v in (hist_n or [])]
+            L_eff = len(present_flags)
+            presence_rate_t = (sum(present_flags) / L_eff) if L_eff > 0 else 0.0
 
-                # кэш когорты для T
-                cohort_key = (
-                    row_t["strategy_id"], row_t["time_frame"], row_t["direction"],
-                    row_t["timeframe"], row_t["agg_type"], row_t["agg_base"], row_t["report_created_at"]
+            hist_vals = [int(v) for v in (hist_n or []) if v is not None]
+            growth_hist_t = _ecdf_rank(int(row_t["trades_total"] or 0), hist_vals) if hist_vals else 0.0
+
+            P_t = 0.6 * presence_rate_t + 0.4 * growth_hist_t
+
+            # C (на t) — по трём окнам с тем же window_end
+            if len(trio_ids) >= 2:
+                rows_c = await conn.fetch(
+                    """
+                    SELECT a.time_frame, a.trades_total, a.trades_wins
+                    FROM oracle_mw_aggregated_stat a
+                    WHERE a.report_id = ANY($1::bigint[])
+                      AND a.strategy_id = $2
+                      AND a.direction   = $3
+                      AND a.timeframe   = $4
+                      AND a.agg_type    = $5
+                      AND a.agg_base    = $6
+                      AND a.agg_state   = $7
+                    """,
+                    list(trio_ids.values()),
+                    int(row_t["strategy_id"]), row_t["direction"], row_t["timeframe"],
+                    row_t["agg_type"], row_t["agg_base"], row_t["agg_state"]
                 )
-                if cohort_key not in cohort_cache:
-                    cohort_cache[cohort_key] = await _fetch_cohort_for(conn, row_t)
+                C_t = _coherence_from_rows_mw([dict(x) for x in rows_c])
+            else:
+                C_t = 0.0
 
-                # R (на t)
-                n_t = int(row_t["trades_total"] or 0)
-                w_t = int(row_t["trades_wins"] or 0)
-                R_t = _wilson_lower_bound(w_t, n_t, Z) if n_t > 0 else 0.0
+            # S (на t) — стабильность wr по когорте
+            S_t, _len_hist, _meta = _stability_key_dynamic_mw(row_t, L, cohort_cache[cohort_key])
 
-                # P (на t)
-                L = int(WINDOW_STEPS.get(time_frame, 42))
-                presence_rate_t, growth_hist_t, _hist_n_t = await _persistence_metrics(conn, row_t, L)
-                P_t = 0.6 * presence_rate_t + 0.4 * growth_hist_t
+            # цель y: оба знака уверенные и совпадают
+            y = _target_same_sign_next(row_t, row_next)
 
-                # C (на t) — пакетный расчёт по трём report_id с тем же window_end; если найдено <2 окон — C=0.0
-                if len(trio_ids) >= 2:
-                    C_t = await _cross_window_coherence_by_ids(conn, row_t, trio_ids)
-                else:
-                    C_t = 0.0
+            X.append((R_t, P_t, C_t, S_t))
+            Y.append(y)
 
-                # S (на t)
-                S_t, _len_hist, _meta = await _stability_key_dynamic(conn, row_t, L, cohort_cache[cohort_key])
+    samples = len(Y)
+    if samples < MIN_SAMPLES_PER_STRATEGY:
+        log.debug("ℹ️ strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
+                 strategy_id, time_frame, samples, MIN_SAMPLES_PER_STRATEGY)
+        return False
 
-                # цель y: знак wr относительно baseline на t и t+1 должны совпадать, и t+1 должен быть «уверенным»
-                y = _target_same_sign_next(row_t, row_next)
+    # разбиение на train/holdout
+    holdout = max(1, int(samples * HOLDOUT_FRACTION))
+    train = samples - holdout
+    X_train, Y_train = X[:train], Y[:train]
+    # X_hold, Y_hold = X[train:], Y[train:]  # резерв под оффлайн-метрики
 
-                X.append((R_t, P_t, C_t, S_t))
-                Y.append(y)
+    # важность признаков (point-biserial corr)
+    imp = _feature_importance_corr(X_train, Y_train)
 
-        samples = len(Y)
-        if samples < MIN_SAMPLES_PER_STRATEGY:
-            log.debug("ℹ️ strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
-                     strategy_id, time_frame, samples, MIN_SAMPLES_PER_STRATEGY)
-            return False
+    # нормировка + клиппинг + повторная нормировка
+    weights = _normalize_weights(imp, clip_min=WEIGHT_CLIP_MIN, clip_max=WEIGHT_CLIP_MAX)
 
-        # разбиение на train/holdout
-        holdout = max(1, int(samples * HOLDOUT_FRACTION))
-        train = samples - holdout
-        X_train, Y_train = X[:train], Y[:train]
-        X_hold, Y_hold = X[train:], Y[train:]
+    # политика: гарантируем минимальную долю R и ограничиваем C сверху
+    min_R = 0.25
+    max_C = 0.35
+    wR = max(weights["wR"], min_R)
+    wC = min(weights["wC"], max_C)
+    wP = weights["wP"]
+    wS = weights["wS"]
+    s = wR + wP + wC + wS
+    weights = {"wR": wR / s, "wP": wP / s, "wC": wC / s, "wS": wS / s}
 
-        # важность признаков (point-biserial corr)
-        imp = _feature_importance_corr(X_train, Y_train)
+    log.debug("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
+             strategy_id, time_frame, samples, train, holdout, weights)
 
-        # нормировка + клиппинг + повторная нормировка
-        weights = _normalize_weights(imp, clip_min=WEIGHT_CLIP_MIN, clip_max=WEIGHT_CLIP_MAX)
-
-        # доп. политика: гарантируем минимальную долю R и ограничиваем C сверху
-        min_R = 0.25
-        max_C = 0.35
-        wR = max(weights["wR"], min_R)
-        wC = min(weights["wC"], max_C)
-        wP = weights["wP"]
-        wS = weights["wS"]
-        s = wR + wP + wC + wS
-        weights = {"wR": wR / s, "wP": wP / s, "wC": wC / s, "wS": wS / s}
-
-        log.debug("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
-                 strategy_id, time_frame, samples, train, holdout, weights)
-
-        # активируем новые веса (деактивируем старые для пары strategy/tf)
-        await conn.execute(
-            """
-            UPDATE oracle_conf_model
-               SET is_active = false
-             WHERE is_active = true
-               AND COALESCE(strategy_id, -1) = $1
-               AND COALESCE(time_frame, '') = $2
-            """,
-            int(strategy_id), str(time_frame)
-        )
-        await conn.execute(
-            """
-            INSERT INTO oracle_conf_model (name, strategy_id, time_frame, weights, opts, is_active)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, true)
-            """,
-            f"auto_{time.strftime('%Y%m%d_%H%M%S')}",
-            int(strategy_id),
-            str(time_frame),
-            json.dumps(weights),
-            '{"baseline_mode":"neutral"}',
-        )
-        log.debug("✅ Активированы новые веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
-        return True
+    # активируем новые веса (деактивируем старые для пары strategy/tf)
+    await conn.execute(
+        """
+        UPDATE oracle_conf_model
+           SET is_active = false
+         WHERE is_active = true
+           AND COALESCE(strategy_id, -1) = $1
+           AND COALESCE(time_frame, '') = $2
+        """,
+        int(strategy_id), str(time_frame)
+    )
+    await conn.execute(
+        """
+        INSERT INTO oracle_conf_model (name, strategy_id, time_frame, weights, opts, is_active)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, true)
+        """,
+        f"auto_{time.strftime('%Y%m%d_%H%M%S')}",
+        int(strategy_id),
+        str(time_frame),
+        json.dumps(weights),
+        '{"baseline_mode":"neutral"}',
+    )
+    log.debug("✅ Активированы новые веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
+    return True
 
 
 # 🔸 Когорта для одного отчёта (все состояния внутри среза; используется для S и ECDF(n) при расчётах в обучении)
@@ -312,8 +347,7 @@ def _feature_importance_corr(X: List[Tuple[float, float, float, float]], Y: List
     covs = [0.0, 0.0, 0.0, 0.0]
 
     for i in range(n):
-        xi = X[i]
-        yi = Y[i]
+        xi = X[i]; yi = Y[i]
         for j in range(4):
             x = float(xi[j])
             sums[j] += x
@@ -326,8 +360,7 @@ def _feature_importance_corr(X: List[Tuple[float, float, float, float]], Y: List
         var_x = max(0.0, (sums2[j] / n) - (mean_x * mean_x))
         std_x = math.sqrt(var_x)
         cov_xy = (covs[j] / n) - (mean_x * mean_y)
-        # дисперсия бинарной метки: p*(1-p)
-        std_y = math.sqrt(max(1e-12, mean_y * (1.0 - mean_y)))
+        std_y = math.sqrt(max(1e-12, mean_y * (1.0 - mean_y)))  # дисперсия бинарной метки p(1-p)
         corr = 0.0 if std_x < 1e-12 else (cov_xy / (std_x * std_y))
         imps.append(abs(corr))
 
