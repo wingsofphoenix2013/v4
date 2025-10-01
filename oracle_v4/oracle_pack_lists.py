@@ -146,7 +146,7 @@ async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: 
             # очистим текущий WL/BL по стратегии — срез пустой
             async with conn.transaction():
                 await conn.execute("DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1", strategy_id)
-            log.info("ℹ️ PACK-lists: нет осей sense>%.2f (sid=%s, report=%s) — списки очищены", SENSE_SCORE_MIN, strategy_id, report_id)
+            log.debug("ℹ️ PACK-lists: нет осей sense>%.2f (sid=%s, report=%s) — списки очищены", SENSE_SCORE_MIN, strategy_id, report_id)
             return 0, 0, 0
 
         selectors = {(r["timeframe"], r["direction"], r["pack_base"], r["agg_type"], r["agg_key"]) for r in axes}
@@ -240,7 +240,7 @@ async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: 
                 )
 
         rows_total = len(to_insert)
-        log.info("✅ PACK-lists обновлён (7d): sid=%s report_id=%s rows_total=%d wl=%d bl=%d",
+        log.debug("✅ PACK-lists обновлён (7d): sid=%s report_id=%s rows_total=%d wl=%d bl=%d",
                  strategy_id, report_id, rows_total, rows_wl, rows_bl)
 
         return rows_total, rows_wl, rows_bl

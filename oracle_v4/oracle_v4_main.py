@@ -15,17 +15,17 @@ from config_loader import (
 )
 
 # 🔸 импорт воркера MW-отчётов
-# from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
+from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
 # 🔸 импорт воркера PACK-отчётов
 from oracle_pack_snapshot import run_oracle_pack_snapshot as run_pack, INITIAL_DELAY_SEC as PACK_INIT_DELAY, INTERVAL_SEC as PACK_INTERVAL
 # 🔸 импорт воркера confidence
-# from oracle_mw_confidence import run_oracle_confidence
+from oracle_mw_confidence import run_oracle_confidence
 from oracle_pack_confidence import run_oracle_pack_confidence
 # 🔸 импорт воркера ночной автокалибровки confidence
-# from oracle_mw_confidence_night import run_oracle_confidence_night, INITIAL_DELAY_H, INTERVAL_H
+from oracle_mw_confidence_night import run_oracle_confidence_night, INITIAL_DELAY_H, INTERVAL_H
 from oracle_pack_confidence_night import run_oracle_pack_confidence_night, INITIAL_DELAY_H as PACK_CONF_INIT_H, INTERVAL_H as PACK_CONF_INTERVAL_H
 # 🔸 импорт воркера проверки sense
-# from oracle_mw_sense_stat import run_oracle_sense_stat
+from oracle_mw_sense_stat import run_oracle_sense_stat
 from oracle_pack_sense_stat import run_oracle_pack_sense
 from oracle_pack_lists import run_oracle_pack_lists
 
@@ -96,10 +96,10 @@ async def main():
         run_periodic(run_oracle_pack_confidence_night, PACK_CONF_INTERVAL_H * 60 * 60, "ORACLE_PACK_CONFIDENCE_NIGHT", initial_delay=PACK_CONF_INIT_H * 60 * 60),
         run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
         run_safe_loop(run_oracle_pack_lists, "ORACLE_PACK_LISTS"),
-#         run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
-#         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
-#         run_periodic(run_oracle_confidence_night, INTERVAL_H * 60 * 60, "ORACLE_CONFIDENCE_NIGHT", initial_delay=INITIAL_DELAY_H * 60 * 60),
-#         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
+        run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
+        run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
+        run_periodic(run_oracle_confidence_night, INTERVAL_H * 60 * 60, "ORACLE_CONFIDENCE_NIGHT", initial_delay=INITIAL_DELAY_H * 60 * 60),
+        run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
     )
 
 if __name__ == "__main__":

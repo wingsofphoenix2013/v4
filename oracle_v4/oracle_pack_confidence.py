@@ -407,7 +407,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             )
 
         # 11) Лог
-        log.info(
+        log.debug(
             "✅ PACK-confidence обновлён: sid=%s window_end=%s rows_total=%d rows_7d=%d rows_14d=%d rows_28d=%d",
             strategy_id,
             window_end_iso,

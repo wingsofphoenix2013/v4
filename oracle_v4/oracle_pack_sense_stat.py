@@ -197,7 +197,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
             )
             updated += 1
 
-        log.info("✅ PACK-sense готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
+        log.debug("✅ PACK-sense готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
                  report_id, strategy_id, time_frame, window_end_iso, updated)
 
         # после записи sense — отправляем событие для сборки списков
