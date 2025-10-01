@@ -2,8 +2,8 @@
 
 import json
 import logging
-import infra
-from infra import (
+import laboratory_infra as infra
+from laboratory_infra import (
     set_enabled_tickers,
     set_enabled_strategies,
     start_pack_update,

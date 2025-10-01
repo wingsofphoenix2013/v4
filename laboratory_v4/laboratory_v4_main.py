@@ -3,13 +3,13 @@
 import asyncio
 import logging
 
-import infra
-from infra import (
+import laboratory_infra as infra
+from laboratory_infra import (
     setup_logging,
     setup_pg,
     setup_redis_client,
 )
-from config import (
+from laboratory_config import (
     load_enabled_tickers,
     load_enabled_strategies,
     load_pack_whitelist,
