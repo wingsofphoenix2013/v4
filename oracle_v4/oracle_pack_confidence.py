@@ -112,7 +112,6 @@ async def _process_window_batch_guard(sem: asyncio.Semaphore, items: List[Tuple[
         except Exception:
             log.exception("❌ Сбой обработки комплекта sid=%s window_end=%s", strategy_id, window_end_iso)
 
-
 # 🔸 Пакетная обработка одного комплекта (ключ = strategy_id + window_end)
 async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int, window_end_iso: str):
     # привести ISO-строку к datetime (UTC-naive)
@@ -125,7 +124,21 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         return
 
     async with infra.pg_pool.acquire() as conn:
-        # проверяем, что комплект 7d/14d/28d готов по шапкам
+        # 0) Ранний гейт идемпотентности: если уже обработан — ACK и выходим
+        already = await conn.fetchval(
+            """
+            SELECT 1
+            FROM oracle_pack_conf_processed
+            WHERE strategy_id = $1 AND window_end = $2
+            """,
+            int(strategy_id), window_end_dt
+        )
+        if already:
+            await infra.redis_client.xack(PACK_REPORT_STREAM, PACK_CONSUMER_GROUP, *[mid for (mid, _) in items])
+            log.debug("⏭️ Пропуск PACK комплекта: уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
+            return
+
+        # 1) Проверяем, что комплект 7d/14d/28d готов по шапкам
         rows = await conn.fetch(
             """
             SELECT id, time_frame, created_at
@@ -144,7 +157,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         # идентификаторы отчётов
         report_ids: Dict[str, int] = {str(r["time_frame"]): int(r["id"]) for r in rows}  # {'7d': id7, '14d': id14, '28d': id28}
 
-        # проверяем, что у каждого окна есть хотя бы строки агрегатов
+        # 2) Проверяем, что у каждого окна есть хотя бы строки агрегатов
         cnt_rows = await conn.fetch(
             """
             SELECT report_id, COUNT(*)::int AS cnt
@@ -160,13 +173,13 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             log.debug("⌛ PACK комплект не готов (агрегаты): sid=%s window_end=%s cnts=%s", strategy_id, window_end_iso, counts)
             return
 
-        # загрузка активных весов для трёх окон (снэпшот)
+        # 3) Предзагрузка активных весов для трёх окон (снэпшот)
         weights_by_tf: Dict[str, Tuple[Dict[str, float], Dict]] = {}
         for tf in ("7d", "14d", "28d"):
             w, o = await _get_active_weights_pack(conn, strategy_id, tf)
             weights_by_tf[tf] = (w, o)
 
-        # забрать ВСЕ агрегаты по трём отчётам одним запросом
+        # 4) Забираем ВСЕ агрегаты по трём отчётам одним запросом
         agg_rows = await conn.fetch(
             """
             SELECT
@@ -193,11 +206,11 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         )
         if not agg_rows:
             log.debug("ℹ️ Нет PACK-агрегатов для комплекта: sid=%s window_end=%s", strategy_id, window_end_iso)
-            # теоретически не должно быть при прошедшей проверке counts>0, но выходим без ACK — пусть повторит
+            # теоретически не должно быть при прошедшей проверке counts>0; не ACK — повторим позже
             return
 
-        # подготовим когорты: ключ когорты = без agg_value, + report_created_at
-        # (strategy_id, time_frame, direction, timeframe, pack_base, agg_type, agg_key, report_created_at)
+        # 5) Подготовим когорты: ключ когорты = без agg_value + report_created_at
+        #    (strategy_id, time_frame, direction, timeframe, pack_base, agg_type, agg_key, report_created_at)
         cohort_keys: List[Tuple] = []
         for r in agg_rows:
             cohort_keys.append((
@@ -206,7 +219,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             ))
         cohort_keys = list({ck for ck in cohort_keys})
 
-        # загрузим все когорты батчами через UNNEST
+        # 6) Загрузим все когорты батчами через UNNEST
         cohort_cache: Dict[Tuple, List[dict]] = {}
         if cohort_keys:
             BATCH = 200
@@ -258,7 +271,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                     )
                     cohort_cache.setdefault(ck, []).append(dict(rr))
 
-        # подготовим persistence-матрицы (последние L отчётов) для каждого окна
+        # 7) Persistence-матрицы (последние L отчётов) для каждого окна
         persistence_by_tf: Dict[str, Dict[Tuple, List[Optional[int]]]] = {}
         for tf in ("7d", "14d", "28d"):
             rep_created = None
@@ -269,7 +282,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             L = int(WINDOW_STEPS.get(tf, 42))
             persistence_by_tf[tf] = await _persistence_matrix_pack(conn, strategy_id, tf, rep_created, L) if rep_created else {}
 
-        # сгруппируем строки по ключу для C (кросс-оконная согласованность)
+        # 8) Сгруппируем строки по ключу для C (кросс-оконная согласованность)
         rows_by_key: Dict[Tuple, List[dict]] = {}
         agg_list = [dict(r) for r in agg_rows]
         for r in agg_list:
@@ -279,11 +292,10 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             )
             rows_by_key.setdefault(kC, []).append(r)
 
-        # расчёт и запись — атомарно
+        # 9) Расчёт и запись — атомарно
         updated_per_report: Dict[int, int] = {rid: 0 for rid in report_ids.values()}
         ids, confs, inputs = [], [], []
 
-        # расчёт confidence на всём комплекте
         for r in agg_list:
             n = int(r["trades_total"] or 0)
             w = int(r["trades_wins"] or 0)
@@ -371,7 +383,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             inputs.append(json.dumps(inputs_json, separators=(",", ":")))
             updated_per_report[int(r["report_id"])] = updated_per_report.get(int(r["report_id"]), 0) + 1
 
-        # атомарная запись: апдейты + маркер processed
+        # 10) Атомарная запись: апдейты + маркер processed
         async with conn.transaction():
             if ids:
                 await conn.executemany(
@@ -384,7 +396,6 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                     """,
                     list(zip(ids, confs, inputs))
                 )
-
             # маркер идемпотентности — в самом конце, после успешных апдейтов
             await conn.execute(
                 """
@@ -395,8 +406,8 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                 int(strategy_id), window_end_dt
             )
 
-        # лог
-        log.debug(
+        # 11) Лог
+        log.info(
             "✅ PACK-confidence обновлён: sid=%s window_end=%s rows_total=%d rows_7d=%d rows_14d=%d rows_28d=%d",
             strategy_id,
             window_end_iso,
@@ -406,7 +417,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             updated_per_report.get(report_ids.get("28d", -1), 0),
         )
 
-        # публикуем ТРИ события — по одному на каждый отчёт (для будущего sense-воркера)
+        # 12) Публикуем ТРИ события — по одному на каждый отчёт (для sense-воркера)
         try:
             for tf in ("7d", "14d", "28d"):
                 rid = report_ids[tf]
@@ -429,9 +440,8 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         except Exception:
             log.exception("❌ Ошибка публикации событий в %s", PACK_SENSE_REPORT_READY_STREAM)
 
-        # ACK всех сообщений комплекта — только теперь, после успешного commit
+        # 13) ACK всех сообщений комплекта — только теперь, после успешного commit
         await infra.redis_client.xack(PACK_REPORT_STREAM, PACK_CONSUMER_GROUP, *[mid for (mid, _) in items])
-
 
 # 🔸 Загрузка активных весов для PACK (с простым кэшем; структура как у MW)
 async def _get_active_weights_pack(conn, strategy_id: int, time_frame: str) -> Tuple[Dict[str, float], Dict]:
