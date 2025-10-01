@@ -1,4 +1,4 @@
-# oracle_pack_lists.py — воркер PACK-lists: сбор whitelist/blacklist по правилам (7d, score_smoothed>0.5; confidence>0.5; wr>=0.55 → WL, wr<0.5 → BL)
+# oracle_pack_lists.py — воркер PACK-lists: сбор whitelist/blacklist по правилам (7d, sense>0.5; confidence>0.5; wr≥0.55 → WL, wr<0.5 → BL) + уведомления о готовности
 
 # 🔸 Импорты
 import asyncio
@@ -12,10 +12,14 @@ import infra
 # 🔸 Логгер
 log = logging.getLogger("ORACLE_PACK_LISTS")
 
-# 🔸 Стрим-источник (готовность sense по одному отчёту)
-PACK_SENSE_REPORT_READY_STREAM = "oracle:pack_sense:reports_ready"
+# 🔸 Стрим-источник (готовность SENSE → время собирать списки)
+PACK_LISTS_BUILD_READY_STREAM = "oracle:pack_lists:build_ready"
 PACK_LISTS_CONSUMER_GROUP = "oracle_pack_lists_group"
 PACK_LISTS_CONSUMER_NAME = "oracle_pack_lists_worker"
+
+# 🔸 Стрим-уведомление: списки готовы
+PACK_LISTS_REPORTS_READY_STREAM = "oracle:pack_lists:reports_ready"
+PACK_LISTS_REPORTS_READY_MAXLEN = 10_000
 
 # 🔸 Пороговые значения (легко меняются → перезапуск сервиса)
 SENSE_SCORE_MIN = 0.5     # score_smoothed > 0.5 на оси (pack_base+agg_type+agg_key)
@@ -33,7 +37,7 @@ async def run_oracle_pack_lists():
     # создаём consumer group (идемпотентно)
     try:
         await infra.redis_client.xgroup_create(
-            name=PACK_SENSE_REPORT_READY_STREAM,
+            name=PACK_LISTS_BUILD_READY_STREAM,
             groupname=PACK_LISTS_CONSUMER_GROUP,
             id="$",
             mkstream=True,
@@ -54,7 +58,7 @@ async def run_oracle_pack_lists():
             resp = await infra.redis_client.xreadgroup(
                 groupname=PACK_LISTS_CONSUMER_GROUP,
                 consumername=PACK_LISTS_CONSUMER_NAME,
-                streams={PACK_SENSE_REPORT_READY_STREAM: ">"},
+                streams={PACK_LISTS_BUILD_READY_STREAM: ">"},
                 count=64,
                 block=30_000,
             )
@@ -72,16 +76,40 @@ async def run_oracle_pack_lists():
 
                         if not (report_id and strategy_id and time_frame and window_end):
                             log.debug("ℹ️ Пропуск: мало данных в сообщении %s", payload)
-                            await infra.redis_client.xack(PACK_SENSE_REPORT_READY_STREAM, PACK_LISTS_CONSUMER_GROUP, msg_id)
+                            await infra.redis_client.xack(PACK_LISTS_BUILD_READY_STREAM, PACK_LISTS_CONSUMER_GROUP, msg_id)
                             continue
 
                         # обрабатываем ТОЛЬКО 7d (как договорились)
                         if str(time_frame) != "7d":
-                            await infra.redis_client.xack(PACK_SENSE_REPORT_READY_STREAM, PACK_LISTS_CONSUMER_GROUP, msg_id)
+                            await infra.redis_client.xack(PACK_LISTS_BUILD_READY_STREAM, PACK_LISTS_CONSUMER_GROUP, msg_id)
                             continue
 
-                        await _build_lists_for_7d(report_id, strategy_id, window_end)
-                        await infra.redis_client.xack(PACK_SENSE_REPORT_READY_STREAM, PACK_LISTS_CONSUMER_GROUP, msg_id)
+                        rows_total, rows_wl, rows_bl = await _build_lists_for_7d(report_id, strategy_id, window_end)
+
+                        # уведомляем downstream: списки готовы
+                        try:
+                            payload2 = {
+                                "strategy_id": int(strategy_id),
+                                "report_id": int(report_id),
+                                "time_frame": "7d",
+                                "window_end": datetime.fromisoformat(str(window_end).replace("Z", "")).isoformat(),
+                                "rows_total": int(rows_total),
+                                "rows_whitelist": int(rows_wl),
+                                "rows_blacklist": int(rows_bl),
+                                "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+                            }
+                            await infra.redis_client.xadd(
+                                name=PACK_LISTS_REPORTS_READY_STREAM,
+                                fields={"data": json.dumps(payload2, separators=(",", ":"))},
+                                maxlen=PACK_LISTS_REPORTS_READY_MAXLEN,
+                                approximate=True,
+                            )
+                            log.debug("[PACK_LISTS_REPORTS_READY] sid=%s report_id=%s wl=%d bl=%d",
+                                      strategy_id, report_id, rows_wl, rows_bl)
+                        except Exception:
+                            log.exception("❌ Ошибка публикации события в %s", PACK_LISTS_REPORTS_READY_STREAM)
+
+                        await infra.redis_client.xack(PACK_LISTS_BUILD_READY_STREAM, PACK_LISTS_CONSUMER_GROUP, msg_id)
 
                     except Exception:
                         log.exception("❌ Ошибка обработки сообщения PACK-lists")
@@ -95,12 +123,12 @@ async def run_oracle_pack_lists():
 
 
 # 🔸 Сбор WL/BL для 7d: очищаем по стратегии и вставляем свежий набор
-async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: str) -> None:
+async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: str) -> Tuple[int, int, int]:
     try:
         window_end_dt = datetime.fromisoformat(str(window_end_iso).replace("Z", ""))
     except Exception:
         log.exception("❌ Неверный формат window_end: %r", window_end_iso)
-        return
+        return 0, 0, 0
 
     async with infra.pg_pool.acquire() as conn:
         # 1) оси, прошедшие sense-фильтр (score_smoothed > 0.5) на этом отчёте
@@ -118,8 +146,8 @@ async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: 
             # очистим текущий WL/BL по стратегии — срез пустой
             async with conn.transaction():
                 await conn.execute("DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1", strategy_id)
-            log.debug("ℹ️ PACK-lists: нет осей sense>%.2f (sid=%s, report=%s) — списки очищены", SENSE_SCORE_MIN, strategy_id, report_id)
-            return
+            log.info("ℹ️ PACK-lists: нет осей sense>%.2f (sid=%s, report=%s) — списки очищены", SENSE_SCORE_MIN, strategy_id, report_id)
+            return 0, 0, 0
 
         selectors = {(r["timeframe"], r["direction"], r["pack_base"], r["agg_type"], r["agg_key"]) for r in axes}
 
@@ -148,18 +176,19 @@ async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: 
 
         # 3) фильтр по осям из sense и классификация WL/BL в Python (по winrate)
         to_insert = []
+        rows_wl = 0
+        rows_bl = 0
         for r in cand_rows:
             key = (r["timeframe"], r["direction"], r["pack_base"], r["agg_type"], r["agg_key"])
             if key not in selectors:
                 continue
 
             wr = float(r["winrate"] or 0.0)
-            conf = float(r["confidence"] or 0.0)
 
             if wr >= WR_WL_MIN:
-                list_tag = "whitelist"
+                list_tag = "whitelist"; rows_wl += 1
             elif wr < WR_BL_MAX:
-                list_tag = "blacklist"
+                list_tag = "blacklist"; rows_bl += 1
             else:
                 continue  # диапазон [0.5, 0.549...] не попадает
 
@@ -173,7 +202,7 @@ async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: 
                 "agg_key": str(r["agg_key"]),
                 "agg_value": str(r["agg_value"]),
                 "winrate": float(wr),
-                "confidence": float(conf),
+                "confidence": float(r["confidence"] or 0.0),
                 "list": list_tag,
             })
 
@@ -210,4 +239,8 @@ async def _build_lists_for_7d(report_id: int, strategy_id: int, window_end_iso: 
                     ]
                 )
 
-        log.debug("✅ PACK-lists обновлён (7d): sid=%s report_id=%s rows=%d (WL/BL вместе)", strategy_id, report_id, len(to_insert))
+        rows_total = len(to_insert)
+        log.info("✅ PACK-lists обновлён (7d): sid=%s report_id=%s rows_total=%d wl=%d bl=%d",
+                 strategy_id, report_id, rows_total, rows_wl, rows_bl)
+
+        return rows_total, rows_wl, rows_bl

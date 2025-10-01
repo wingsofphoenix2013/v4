@@ -17,6 +17,10 @@ PACK_SENSE_REPORT_READY_STREAM = "oracle:pack_sense:reports_ready"
 PACK_SENSE_CONSUMER_GROUP = "oracle_pack_sense_group"
 PACK_SENSE_CONSUMER_NAME = "oracle_pack_sense_worker"
 
+# 🔸 Стрим для сборки списков после завершения sense
+PACK_LISTS_BUILD_READY_STREAM = "oracle:pack_lists:build_ready"
+PACK_LISTS_BUILD_READY_MAXLEN = 10_000
+
 # 🔸 Константы расчёта
 TF_LIST = ("m5", "m15", "h1")
 DIRECTIONS = ("long", "short")
@@ -193,9 +197,29 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
             )
             updated += 1
 
-        log.debug("✅ PACK-sense готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
+        log.info("✅ PACK-sense готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
                  report_id, strategy_id, time_frame, window_end_iso, updated)
 
+        # после записи sense — отправляем событие для сборки списков
+        try:
+            payload = {
+                "strategy_id": int(strategy_id),
+                "report_id": int(report_id),
+                "time_frame": str(time_frame),
+                "window_end": window_end_dt.isoformat(),
+                "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+                "axes_updated": int(updated),
+            }
+            await infra.redis_client.xadd(
+                name=PACK_LISTS_BUILD_READY_STREAM,
+                fields={"data": json.dumps(payload, separators=(",", ":"))},
+                maxlen=PACK_LISTS_BUILD_READY_MAXLEN,
+                approximate=True,
+            )
+            log.debug("[PACK_LISTS_BUILD_READY] sid=%s report_id=%s tf=%s axes=%d",
+                      strategy_id, report_id, time_frame, updated)
+        except Exception:
+            log.exception("❌ Ошибка публикации события в %s", PACK_LISTS_BUILD_READY_STREAM)
 
 # 🔸 Расчёт разделяющей силы по списку states (agg_value: p, n)
 def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
