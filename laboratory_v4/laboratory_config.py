@@ -2,6 +2,8 @@
 
 import json
 import logging
+import asyncio
+
 import laboratory_infra as infra
 from laboratory_infra import (
     set_enabled_tickers,
@@ -15,7 +17,6 @@ from laboratory_infra import (
     set_mw_whitelist_for_strategy,
     clear_mw_whitelist_for_strategy,
 )
-import asyncio
 
 log = logging.getLogger("LAB_CONFIG")
 
@@ -68,7 +69,7 @@ async def load_mw_whitelist():
         log.info("✅ Загружено MW whitelist (стратегий: %d)", len(grouped))
 
 
-# 🔸 Точечное обновление стратегии (по событию)
+# 🔸 Точечное обновление стратегии (по событию Pub/Sub)
 async def handle_strategy_event(payload: dict):
     sid = payload.get("id")
     if not sid:
@@ -112,6 +113,53 @@ async def config_event_listener():
             log.exception("❌ Ошибка при обработке события: %s", e)
 
 
+# 🔸 Вспомогательное: распаковка payload из записи XREAD/XREADGROUP
+def _extract_stream_payload(fields: dict) -> dict:
+    """
+    Поддерживает два формата:
+      1) Плоские поля: strategy_id=..., report_id=..., ...
+      2) Один ключ 'data' с JSON-строкой: {"strategy_id":..., ...}
+    Также нормализует синонимы метрик: rows_whitelist/rows_blacklist ↔ wl/bl, rows_inserted ↔ rows_total.
+    """
+    # базовая распаковка
+    payload: dict = {}
+    for k, v in fields.items():
+        if isinstance(v, str) and v.startswith("{"):
+            try:
+                payload[k] = json.loads(v)
+            except Exception:
+                payload[k] = v
+        else:
+            payload[k] = v
+
+    # если всё лежит под 'data' — разворачиваем
+    if "data" in payload and isinstance(payload["data"], dict):
+        payload = payload["data"]
+
+    # нормализация типов (числа могут прийти как строки)
+    def _as_int(x, default=None):
+        try:
+            return int(x)
+        except Exception:
+            return default
+
+    # синонимы полей
+    if "wl" not in payload and "rows_whitelist" in payload:
+        payload["wl"] = payload["rows_whitelist"]
+    if "bl" not in payload and "rows_blacklist" in payload:
+        payload["bl"] = payload["rows_blacklist"]
+    if "rows_total" not in payload and "rows_inserted" in payload:
+        payload["rows_total"] = payload["rows_inserted"]
+
+    # приведение ключевых полей к ожидаемым типам
+    if "strategy_id" in payload:
+        payload["strategy_id"] = _as_int(payload["strategy_id"], None)
+    if "report_id" in payload:
+        payload["report_id"] = _as_int(payload["report_id"], None)
+
+    return payload
+
+
 # 🔸 Слушатель Streams обновлений whitelist (PACK + MW)
 async def whitelist_stream_listener():
     streams = {
@@ -130,32 +178,55 @@ async def whitelist_stream_listener():
                 for msg_id, fields in messages:
                     last_ids[stream_name] = msg_id
                     try:
-                        payload = {k: json.loads(v) if v.startswith("{") else v for k, v in fields.items()}
-                        sid = int(payload.get("strategy_id", 0))
+                        # нормализуем payload
+                        payload = _extract_stream_payload(fields)
+
+                        sid = payload.get("strategy_id")
                         if not sid:
+                            log.info("⚠️ Пропуск события stream=%s msg=%s: нет strategy_id в payload=%s", stream_name, msg_id, payload)
                             continue
+
                         if streams[stream_name] == "pack":
                             await start_pack_update(sid)
                             try:
                                 async with infra.pg_pool.acquire() as conn:
                                     rows = await conn.fetch("SELECT * FROM oracle_pack_whitelist WHERE strategy_id=$1", sid)
                                 if rows:
-                                    set_pack_whitelist_for_strategy(sid, [dict(r) for r in rows], {"report": payload})
+                                    meta = {
+                                        "report_id": payload.get("report_id"),
+                                        "time_frame": payload.get("time_frame"),
+                                        "window_end": payload.get("window_end"),
+                                        "generated_at": payload.get("generated_at"),
+                                        "rows_total": payload.get("rows_total"),
+                                        "wl": payload.get("wl"),
+                                        "bl": payload.get("bl"),
+                                    }
+                                    set_pack_whitelist_for_strategy(sid, [dict(r) for r in rows], meta)
                                 else:
                                     clear_pack_whitelist_for_strategy(sid)
                             finally:
                                 finish_pack_update(sid)
+
                         elif streams[stream_name] == "mw":
                             await start_mw_update(sid)
                             try:
                                 async with infra.pg_pool.acquire() as conn:
                                     rows = await conn.fetch("SELECT * FROM oracle_mw_whitelist WHERE strategy_id=$1", sid)
                                 if rows:
-                                    set_mw_whitelist_for_strategy(sid, [dict(r) for r in rows], {"report": payload})
+                                    meta = {
+                                        "report_id": payload.get("report_id"),
+                                        "time_frame": payload.get("time_frame"),
+                                        "window_end": payload.get("window_end"),
+                                        "generated_at": payload.get("generated_at"),
+                                        "rows_total": payload.get("rows_total"),
+                                        "wl": payload.get("wl") or payload.get("rows_whitelist"),
+                                    }
+                                    set_mw_whitelist_for_strategy(sid, [dict(r) for r in rows], meta)
                                 else:
                                     clear_mw_whitelist_for_strategy(sid)
                             finally:
                                 finish_mw_update(sid)
+
                     except Exception:
                         log.exception("❌ Ошибка при обновлении WL по событию (stream=%s, msg=%s)", stream_name, msg_id)
         except asyncio.CancelledError:
