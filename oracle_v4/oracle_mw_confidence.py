@@ -22,7 +22,7 @@ SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
 SENSE_REPORT_READY_MAXLEN = 10000
 
 # 🔸 Геометрия окна (шаг 4 часа → 6 прогонов в сутки)
-WINDOW_STEPS = {"7d": 7 * 6, "14d": 14 * 6, "28d": 28 * 6}
+WINDOW_STEPS = {"7d": 7 * 6, "14d": 7 * 6, "28d": 7 * 6}
 
 # 🔸 Параметры статистики
 Z = 1.96

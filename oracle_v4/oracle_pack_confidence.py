@@ -58,7 +58,7 @@ async def run_oracle_pack_confidence():
             return
 
     sem = asyncio.Semaphore(MAX_CONCURRENT_STRATEGIES)
-    log.info("🚀 Старт воркера PACK-confidence (max_parallel_strategies=%d)", MAX_CONCURRENT_STRATEGIES)
+    log.debug("🚀 Старт воркера PACK-confidence (max_parallel_strategies=%d)", MAX_CONCURRENT_STRATEGIES)
 
     # основной цикл чтения стрима
     while True:
@@ -396,7 +396,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             )
 
         # лог
-        log.info(
+        log.debug(
             "✅ PACK-confidence обновлён: sid=%s window_end=%s rows_total=%d rows_7d=%d rows_14d=%d rows_28d=%d",
             strategy_id,
             window_end_iso,
