@@ -166,7 +166,7 @@ async def whitelist_stream_listener():
         "oracle:pack_lists:reports_ready": "pack",
         "oracle:mw_whitelist:reports_ready": "mw",
     }
-    last_ids = {k: "0-0" for k in streams.keys()}
+    last_ids = {k: "$" for k in streams.keys()}
     log.info("📡 Подписка на Streams: %s", ", ".join(streams.keys()))
 
     while True:
