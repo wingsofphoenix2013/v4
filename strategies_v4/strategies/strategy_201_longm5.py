@@ -1,4 +1,4 @@
-# strategy_201_longm5.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5; ожидание по last-id, таймаут 90с, корректный разбор status=error)
+# strategy_201_longm5.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5; ожидание по last-id, таймаут 90с; подробные INFO-логи диалога с лабораторией)
 
 # 🔸 Импорты
 import logging
@@ -38,32 +38,42 @@ class Strategy201Longm5:
         # мастер-стратегия из market_mirrow
         master_sid = strategy_cfg.get("market_mirrow")
         if not master_sid:
-            log.warning("⚠️ У стратегии нет market_mirrow → отказ")
+            log.info("⚠️ [IGNORE] log_uid=%s reason=\"no_market_mirrow\"", signal.get("log_uid"))
             return ("ignore", "отсутствует привязка к мастер-стратегии")
 
-        # нормализуем тикер
+        # нормализация тикера
         symbol = str(signal["symbol"]).upper()
+        client_sid = str(signal["strategy_id"])
+        log_uid = signal.get("log_uid")
+        tfs = "m5"
 
         # получаем last-generated-id ответа ДО отправки запроса
         last_resp_id = await self._get_stream_last_id(redis, "laboratory:decision_response")
 
-        # формируем запрос в laboratory: m5, включаем trace; client_strategy_id = ID зеркала
+        # формируем запрос в laboratory
         req_payload = {
-            "log_uid": signal.get("log_uid"),
-            "strategy_id": str(master_sid),                   # SID мастера (правила WL/BL)
-            "client_strategy_id": str(signal["strategy_id"]),# SID зеркала (ворота/anti-dup)
+            "log_uid": log_uid,
+            "strategy_id": str(master_sid),           # SID мастера (правила WL/BL)
+            "client_strategy_id": client_sid,         # SID зеркала (ворота/anti-dup)
             "direction": "long",
             "symbol": symbol,
-            "timeframes": "m5",
+            "timeframes": tfs,
             "trace": "true",
         }
+
+        # лог запроса
+        log.info(
+            "[LAB_REQUEST] log_uid=%s master=%s client=%s symbol=%s tf=%s",
+            log_uid, master_sid, client_sid, symbol, tfs
+        )
 
         try:
             # отправляем запрос в laboratory:decision_request
             req_id = await redis.xadd("laboratory:decision_request", req_payload)
-            log.debug(f"📤 Запрос в laboratory: {req_payload} (req_id={req_id})")
+            log.info("[LAB_XADD] req_id=%s", req_id)
 
             # ждём ответ из laboratory:decision_response (таймаут 90с)
+            log.info("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
             allow, reason = await self._wait_for_response(redis, req_id, last_resp_id, timeout_seconds=90)
         except Exception:
             log.exception("❌ Ошибка взаимодействия с laboratory_v4")
@@ -73,22 +83,27 @@ class Strategy201Longm5:
         if allow:
             # готовим заявку на открытие позиции от имени зеркала
             payload = {
-                "strategy_id": str(signal["strategy_id"]),  # SID зеркала
+                "strategy_id": client_sid,       # SID зеркала
                 "symbol": symbol,
                 "direction": "long",
-                "log_uid": signal.get("log_uid"),
+                "log_uid": log_uid,
                 "route": "new_entry",
                 "received_at": signal.get("received_at"),
             }
+            log.info(
+                "[OPEN_REQ] log_uid=%s client_sid=%s symbol=%s direction=%s",
+                log_uid, client_sid, symbol, "long"
+            )
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.debug(f"📤 Отправлено в opener: {payload}")
+                log.info("[OPEN_SENT] log_uid=%s position_request_published=true", log_uid)
                 return ("ok", "passed_laboratory")
             except Exception as e:
-                log.warning(f"⚠️ Ошибка при отправке в strategy_opener_stream: {e}")
+                log.info("[OPEN_FAIL] log_uid=%s error=%s", log_uid, str(e))
                 return ("ignore", "ошибка отправки в opener")
         else:
             # отказ лаборатории → формируем ignore с причиной
+            log.info("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
             return ("ignore", f"отказ лаборатории по причине {reason}")
 
     # 🔸 Получение last-generated-id для стрима (чтение только нового)
@@ -111,13 +126,18 @@ class Strategy201Longm5:
         while True:
             # страховой выход по таймауту
             if time.monotonic() > deadline:
-                log.warning(f"⏱️ laboratory_v4 timeout по req_id={req_id}")
+                log.info("[LAB_TIMEOUT] req_id=%s", req_id)
                 return False, "lab_timeout"
 
             # читаем только новые записи после read_id
             entries = await redis.xread({stream: read_id}, block=1000, count=50)
             if not entries:
                 continue
+
+            # логируем факт получения батча (без избыточного спама)
+            total = sum(len(records) for _, records in entries)
+            if total:
+                log.info("[LAB_READ] req_id=%s batch=%d", req_id, total)
 
             for _, records in entries:
                 for record_id, data in records:
@@ -133,14 +153,16 @@ class Strategy201Longm5:
                     # успешная обработка
                     if status == "ok":
                         allow = str(data.get("allow", "false")).lower() == "true"
-                        reason = data.get("reason", "") or ""
+                        reason = (data.get("reason", "") or "")
+                        log.info("[LAB_RESP] req_id=%s status=%s allow=%s reason=\"%s\"",
+                                 req_id, status, str(allow).lower(), reason)
                         return allow, reason
 
                     # техническая ошибка лаборатории
                     if status == "error":
                         err_code = data.get("error", "unknown")
                         message = data.get("message", "")
-                        log.debug(f"🧪 laboratory error: error={err_code} msg={message} req_id={req_id}")
+                        log.info("[LAB_ERROR] req_id=%s error=%s message=\"%s\"", req_id, err_code, message)
                         return False, f"lab_error:{err_code}"
 
             # продолжаем до дедлайна
