@@ -1,4 +1,4 @@
-# laboratory_decision_maker.py — обработчик решений (allow/deny): Stream, шторка per (strategy,symbol) с очередью, MW→(PACK параллельно), ответ и аудит (WL/BL детали)
+# laboratory_decision_maker.py — обработчик решений (allow/deny): шторка per (strategy,symbol) + очередь, MW→(PACK параллельно), ответ и аудит с деталями WL/BL и динамикой blacklist
 
 import asyncio
 import json
@@ -13,12 +13,12 @@ import laboratory_infra as infra
 # 🔸 Логгер
 log = logging.getLogger("LAB_DECISION")
 
-# 🔸 Константы потоков и шлюзов
+# 🔸 Потоки и шлюз
 DECISION_REQ_STREAM = "laboratory:decision_request"
 DECISION_RESP_STREAM = "laboratory:decision_response"
 GATEWAY_REQ_STREAM = "indicator_gateway_request"
 
-# 🔸 Параметры производительности (согласованные)
+# 🔸 Параметры производительности
 XREAD_BLOCK_MS = 2000
 XREAD_COUNT = 50
 MAX_IN_FLIGHT_DECISIONS = 32
@@ -26,10 +26,10 @@ MAX_CONCURRENT_GATEWAY_CALLS = 32
 COALESCE_TTL_SEC = 3
 SAFETY_DEADLINE_MS = 60_000  # общий потолок на запрос
 
-# 🔸 Поддерживаемые TF и порядок обработки
+# 🔸 Порядок TF
 TF_ORDER = ("m5", "m15", "h1")
 
-# 🔸 Префиксы публичного кэша для PACK
+# 🔸 Публичные префиксы PACK-кэша
 PACK_PUBLIC_PREFIX = {
     "bb": "bbpos_pack",
     "lr": "lrpos_pack",
@@ -39,15 +39,15 @@ PACK_PUBLIC_PREFIX = {
     # по умолчанию: f"{indicator}_pack"
 }
 
-# 🔸 Семафоры для конкуренции
+# 🔸 Семафоры конкуренции
 _decisions_sem = asyncio.Semaphore(MAX_IN_FLIGHT_DECISIONS)
 _gateway_sem = asyncio.Semaphore(MAX_CONCURRENT_GATEWAY_CALLS)
 
-# 🔸 Коалесценс (in-process) — key → (expire_ms, Future)
+# 🔸 Коалесценс (in-process) — key -> (expire_ms, future)
 _coalesce: Dict[str, Tuple[float, asyncio.Future]] = {}
 
 
-# 🔸 Вспомогательные парсеры и нормализация
+# 🔸 Парсинг и нормализация
 def _parse_timeframes(tf_str: str) -> List[str]:
     items = [x.strip().lower() for x in (tf_str or "").split(",") if x.strip()]
     seen, ordered = set(), []
@@ -118,18 +118,15 @@ def _qfields_key(req_id: str) -> str:
     return f"lab:qfields:{req_id}"
 
 
-# 🔸 Чтение публичного кэша gateway (MGET пачкой)
+# 🔸 MGET JSON пачкой
 async def _mget_json(keys: List[str]) -> Dict[str, Optional[dict]]:
     if not keys:
         return {}
     values = await infra.redis_client.mget(*keys)
-    out: Dict[str, Optional[dict]] = {}
-    for k, v in zip(keys, values):
-        out[k] = _json_or_none(v)
-    return out
+    return {k: _json_or_none(v) for k, v in zip(keys, values)}
 
 
-# 🔸 Отправка запроса в indicator_gateway + ожидание появления публичного ключа
+# 🔸 Гарантия наличия PACK через gateway (cache-first + ожидание public KV)
 async def _ensure_pack_available(
     symbol: str,
     tf: str,
@@ -171,7 +168,7 @@ async def _ensure_pack_available(
             elif indicator == "macd":
                 F = int(gw_params.get("fast", 0))
                 if F:
-                    req["length"] = str(F)  # fast
+                    req["length"] = str(F)
             elif indicator == "bb":
                 L = int(gw_params.get("length", 0))
                 S = float(gw_params.get("std", 2.0))
@@ -211,7 +208,7 @@ async def _ensure_pack_available(
                     _coalesce.pop(ck, None)
 
 
-# 🔸 Получение MW состояний (только требуемые базы)
+# 🔸 Получение MW-состояний (только нужные базы)
 async def _get_mw_states(
     symbol: str,
     tf: str,
@@ -228,24 +225,14 @@ async def _get_mw_states(
         k = _public_mw_key(base, symbol, tf)
         obj = kv.get(k)
         if obj and isinstance(obj, dict):
-            pack = obj.get("pack") or {}
-            st = pack.get("state")
+            st = (obj.get("pack") or {}).get("state")
             if isinstance(st, str) and st:
                 state = st
 
         if state is None:
-            obj = await _ensure_pack_available(
-                symbol=symbol,
-                tf=tf,
-                indicator=base,
-                base=base,
-                gw_params={},
-                precision=precision,
-                deadline_ms=deadline_ms,
-            )
+            obj = await _ensure_pack_available(symbol, tf, base, base, {}, precision, deadline_ms)
             if obj:
-                pack = obj.get("pack") or {}
-                st = pack.get("state")
+                st = (obj.get("pack") or {}).get("state")
                 if isinstance(st, str) and st:
                     state = st
 
@@ -255,15 +242,14 @@ async def _get_mw_states(
     return out
 
 
-# 🔸 Матчинг MW → required_confirmation (winrate игнорируем; учитываем все совпадения)
+# 🔸 Матчинг MW → required_confirmation (winrate не используем, учитываем все совпадения)
 def _mw_match_and_required_confirmation(
     mw_rows: List[Dict[str, Any]],
     states: Dict[str, Optional[str]],
 ) -> Tuple[bool, Optional[int]]:
     if not mw_rows:
         return False, None
-
-    matched_confirmations: List[int] = []
+    matched_confs: List[int] = []
 
     for r in mw_rows:
         agg_base = (r.get("agg_base") or "").strip().lower()
@@ -274,10 +260,10 @@ def _mw_match_and_required_confirmation(
         bases = agg_base.split("_")
         if len(bases) == 1:
             base = bases[0]
-            cur_state = states.get(base)
-            if not cur_state:
+            st = states.get(base)
+            if not st:
                 continue
-            fact = cur_state.strip().lower()
+            fact = st.strip().lower()
         else:
             parts, ok = [], True
             for b in bases:
@@ -292,31 +278,26 @@ def _mw_match_and_required_confirmation(
 
         if fact == agg_state:
             try:
-                matched_confirmations.append(int(r.get("confirmation")))
+                matched_confs.append(int(r.get("confirmation")))
             except Exception:
                 continue
 
-    if not matched_confirmations:
+    if not matched_confs:
         return False, None
-    if any(c == 0 for c in matched_confirmations):
+    if any(c == 0 for c in matched_confs):
         return True, 0
-    req = min([c for c in matched_confirmations if c in (1, 2)], default=None)
+    req = min([c for c in matched_confs if c in (1, 2)], default=None)
     if req is None:
         return False, None
     return True, req
 
 
-# 🔸 Получение PACK объектов по нужным base (частично из кэша, остальное — ПАРАЛЛЕЛЬНО через gateway)
+# 🔸 Параллельное получение PACK объектов по нужным base
 async def _get_pack_objects_for_bases(
-    symbol: str,
-    tf: str,
-    bases: List[str],
-    precision: int,
-    deadline_ms: int,
+    symbol: str, tf: str, bases: List[str], precision: int, deadline_ms: int
 ) -> Dict[str, Optional[dict]]:
     results: Dict[str, Optional[dict]] = {}
-    keys = []
-    meta: List[Tuple[str, str, Dict[str, Any]]] = []
+    keys, meta = [], []
 
     for base in bases:
         ind, params = _parse_pack_base(base)
@@ -350,15 +331,21 @@ async def _get_pack_objects_for_bases(
     return results
 
 
-# 🔸 Матчинг PACK: blacklist → whitelist count + детали (для БД)
+# 🔸 Динамический учёт blacklist: детали + winrate
 def _pack_bl_wl_stats_with_details(
     pack_rows: List[Dict[str, Any]],
     pack_objs: Dict[str, Optional[dict]],
-) -> Tuple[bool, int, List[Dict[str, Any]], List[Dict[str, Any]]]:
-    bl_hit = False
+) -> Tuple[int, int, List[Dict[str, Any]], List[Dict[str, Any]], List[float]]:
+    """
+    Возвращает:
+      bl_hits, wl_hits, bl_details[], wl_details[], bl_winrates[]
+    где детали: {id, pack_base, agg_key, agg_value, winrate?}
+    """
+    bl_hits = 0
     wl_hits = 0
     bl_details: List[Dict[str, Any]] = []
     wl_details: List[Dict[str, Any]] = []
+    bl_winrates: List[float] = []
 
     for r in pack_rows:
         base = (r.get("pack_base") or "").strip().lower()
@@ -388,25 +375,37 @@ def _pack_bl_wl_stats_with_details(
         fact = "|".join(parts)
 
         if fact == agg_val:
-            row_id = r.get("id")
-            # заносим детали совпадений
             det = {
-                "id": int(row_id) if row_id is not None else None,
+                "id": int(r.get("id")) if r.get("id") is not None else None,
                 "pack_base": base,
                 "agg_key": agg_key,
                 "agg_value": agg_val,
             }
             if list_type == "blacklist":
-                bl_hit = True
+                bl_hits += 1
+                # winrate может быть NUMERIC; приводим к float
+                try:
+                    w = float(r.get("winrate"))
+                except Exception:
+                    w = None
+                if w is not None:
+                    bl_winrates.append(w)
+                    det["winrate"] = w
                 bl_details.append(det)
             elif list_type == "whitelist":
                 wl_hits += 1
+                try:
+                    w = float(r.get("winrate"))
+                except Exception:
+                    w = None
+                if w is not None:
+                    det["winrate"] = w
                 wl_details.append(det)
 
-    return bl_hit, wl_hits, bl_details, wl_details
+    return bl_hits, wl_hits, bl_details, wl_details, bl_winrates
 
 
-# 🔸 Обработка одного TF (MW → PACK при необходимости; PACK — параллельно; в БД — детали WL/BL)
+# 🔸 Обработка одного TF (MW → PACK с динамикой blacklist)
 async def _process_tf(
     sid: int,
     symbol: str,
@@ -431,6 +430,7 @@ async def _process_tf(
         log.info("[TF:%s] ❌ MW: нет строк в WL — отказ", tf)
         return False, tf_trace
 
+    # какие MW-базы нужны
     needed_bases: List[str] = []
     for r in mw_rows:
         base = (r.get("agg_base") or "").strip().lower()
@@ -443,54 +443,94 @@ async def _process_tf(
     precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
     states = await _get_mw_states(symbol, tf, needed_bases, precision, deadline_ms)
 
-    matched, required_conf = _mw_match_and_required_confirmation(mw_rows, states)
+    matched, conf_req = _mw_match_and_required_confirmation(mw_rows, states)
     if trace:
         tf_trace["mw"] = {"matched": matched}
         if matched:
-            tf_trace["mw"]["confirmation"] = required_conf
+            tf_trace["mw"]["confirmation"] = conf_req
     if not matched:
         log.info("[TF:%s] ❌ MW: совпадений нет — отказ", tf)
         return False, tf_trace
-    if required_conf == 0:
+
+    if conf_req == 0:
         log.info("[TF:%s] ✅ MW: confirmation=0 — TF пройден без PACK", tf)
         return True, tf_trace
 
+    # PACK: готовим базу
     bases: List[str] = []
     for r in pack_rows:
         base = (r.get("pack_base") or "").strip().lower()
         if base and base not in bases:
             bases.append(base)
-
     if not bases:
-        tf_trace["pack"] = {"bl_hits": 0, "wl_hits": 0, "required": required_conf}
-        log.info("[TF:%s] ❌ PACK: WL пуст — подтверждений нет (need=%s)", tf, required_conf)
+        tf_trace["pack"] = {"bl_hits": 0, "wl_hits": 0, "required": conf_req}
+        log.info("[TF:%s] ❌ PACK: WL пуст — подтверждений нет (need=%s)", tf, conf_req)
         return False, tf_trace
 
     pack_objs = await _get_pack_objects_for_bases(symbol, tf, bases, precision, deadline_ms)
-    bl_hit, wl_hits, bl_details, wl_details = _pack_bl_wl_stats_with_details(pack_rows, pack_objs)
+    bl_hits, wl_hits, bl_details, wl_details, bl_winrates = _pack_bl_wl_stats_with_details(pack_rows, pack_objs)
+
+    # динамическая шкала по blacklist
+    extra_required = 0
+    total_required = conf_req
+
+    if bl_hits > 1:
+        # безусловный отказ
+        if trace:
+            tf_trace["pack"] = {
+                "bl_hits": bl_hits, "wl_hits": wl_hits,
+                "required": conf_req, "extra_required": None, "total_required": None,
+                "bl_details": bl_details, "wl_details": wl_details,
+            }
+        log.info("[TF:%s] ❌ PACK: blacklist count > 1 — отказ", tf)
+        return False, tf_trace
+
+    if bl_hits == 1:
+        # берём единственный winrate (если почему-то несколько — используем минимальный)
+        w = min(bl_winrates) if bl_winrates else None
+        if w is not None:
+            if w < 0.35:
+                if trace:
+                    tf_trace["pack"] = {
+                        "bl_hits": bl_hits, "wl_hits": wl_hits,
+                        "required": conf_req, "extra_required": None, "total_required": None,
+                        "bl_details": bl_details, "wl_details": wl_details,
+                    }
+                log.info("[TF:%s] ❌ PACK: blacklist w=%.3f < 0.35 — отказ", tf, w)
+                return False, tf_trace
+            elif 0.35 <= w < 0.40:
+                extra_required = 3
+            elif 0.40 <= w < 0.45:
+                extra_required = 2
+            elif 0.45 <= w < 0.50:
+                extra_required = 1
+            # w >= 0.50 — теоретически редкость; трактуем как +1 (или можно 0). Оставим +1 для консервативности:
+            elif w >= 0.50:
+                extra_required = 1
+
+    total_required = conf_req + extra_required
 
     if trace:
         tf_trace["pack"] = {
-            "bl_hits": int(bl_hit),
+            "bl_hits": bl_hits,
             "wl_hits": wl_hits,
-            "required": required_conf,
+            "required": conf_req,
+            "extra_required": extra_required,
+            "total_required": total_required,
             "bl_details": bl_details,
             "wl_details": wl_details,
         }
 
-    if bl_hit:
-        log.info("[TF:%s] ❌ PACK: blacklist hit — отказ", tf)
-        return False, tf_trace
-
-    if wl_hits >= (required_conf or 0):
-        log.info("[TF:%s] ✅ PACK: подтверждений достаточно (need=%s got=%s)", tf, required_conf, wl_hits)
+    # итог по PACK с динамикой
+    if wl_hits >= total_required:
+        log.info("[TF:%s] ✅ PACK: подтверждений достаточно (need=%s got=%s)", tf, total_required, wl_hits)
         return True, tf_trace
 
-    log.info("[TF:%s] ❌ PACK: подтверждений недостаточно (need=%s got=%s)", tf, required_conf, wl_hits)
+    log.info("[TF:%s] ❌ PACK: подтверждений недостаточно (need=%s got=%s)", tf, total_required, wl_hits)
     return False, tf_trace
 
 
-# 🔸 Сохранение результата в БД (best-effort, после ответа)
+# 🔸 Сохранение результата (после ответа)
 async def _persist_decision(
     req_id: str,
     log_uid: str,
@@ -535,7 +575,7 @@ async def _persist_decision(
     log.info("[AUDIT] 💾 Сохранено решение log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
 
 
-# 🔸 Шторка-ворота per (sid,symbol): попытка стать лидером или постановка в очередь
+# 🔸 Шторка/очередь: попытка стать лидером или постановка в очередь
 async def _acquire_gate_or_enqueue(
     msg_id: str,
     fields: Dict[str, str],
@@ -543,81 +583,51 @@ async def _acquire_gate_or_enqueue(
     symbol: str,
     gate_ttl_sec: int = 60,
 ) -> Tuple[bool, Optional[str]]:
-    """
-    Возвращает (is_leader, reason_if_enqueued).
-      is_leader=True  → можно начинать обработку прямо сейчас.
-      is_leader=False → запрос поставлен в очередь; reason 'enqueued'.
-    """
     gk = _gate_key(sid, symbol)
     qk = _queue_key(sid, symbol)
     fk = _qfields_key(msg_id)
 
-    # пытаемся стать лидером
     ok = await infra.redis_client.set(gk, msg_id, ex=gate_ttl_sec, nx=True)
     if ok:
         log.info("[GATE] 🔐 Лидер получен sid=%s %s req_id=%s", sid, symbol, msg_id)
         return True, None
 
-    # уже есть лидер → ставим в очередь
     await infra.redis_client.rpush(qk, msg_id)
     await infra.redis_client.set(fk, json.dumps(fields, ensure_ascii=False), ex=gate_ttl_sec + 60)
     log.info("[GATE] ⏸️ В очередь sid=%s %s req_id=%s", sid, symbol, msg_id)
     return False, "enqueued"
 
 
-# 🔸 Освобождение ворот и реакция на результат лидера
-async def _on_leader_finished(
-    sid: int,
-    symbol: str,
-    leader_req_id: str,
-    allow: bool,
-):
-    """
-    Если allow=True  → всем ожидающим по (sid,symbol) отправляем allow=false, reason=duplicated_entry и очищаем очередь.
-    Если allow=False → продвигаем очередной запрос (если есть) в роль лидера.
-    """
+# 🔸 Реакция на завершение лидера
+async def _on_leader_finished(sid: int, symbol: str, leader_req_id: str, allow: bool):
     gk = _gate_key(sid, symbol)
     qk = _queue_key(sid, symbol)
-
-    # снимаем текущий lock (на всякий случай)
     await infra.redis_client.delete(gk)
 
     if allow:
-        # забираем всю очередь
         pending = await infra.redis_client.lrange(qk, 0, -1)
         await infra.redis_client.delete(qk)
-
         if pending:
             log.info("[GATE] 🚫 DUPLICATED sid=%s %s — отказываем очереди (%d шт.)", sid, symbol, len(pending))
-            # шлём ответ каждому ожидающему
             for req_id in pending:
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
-                    "req_id": req_id,
-                    "status": "ok",
-                    "allow": "false",
-                    "reason": "duplicated_entry"
+                    "req_id": req_id, "status": "ok", "allow": "false", "reason": "duplicated_entry"
                 })
-                # чистим сохранённые поля (пусть TTL, но можно удалить)
                 await infra.redis_client.delete(_qfields_key(req_id))
         return
 
-    # allow == False → подхватываем следующий
     next_req_id = await infra.redis_client.lpop(qk)
     if not next_req_id:
         log.info("[GATE] 🔁 Очередь пуста sid=%s %s — ждём новые запросы", sid, symbol)
         return
 
-    # перезапираем ворота под нового лидера
     ok = await infra.redis_client.set(gk, next_req_id, ex=60, nx=True)
     if not ok:
-        # теоретически маловероятно — кто-то уже захватил, просто выходим
         log.info("[GATE] ⚠️ Не удалось назначить нового лидера sid=%s %s req=%s", sid, symbol, next_req_id)
         return
 
-    # поднимаем сохранённые поля и запускаем как обычный запрос
     raw = await infra.redis_client.get(_qfields_key(next_req_id))
     if not raw:
-        # нет полей → отвечаем ошибкой
         await infra.redis_client.xadd(DECISION_RESP_STREAM, {
             "req_id": next_req_id, "status": "error", "error": "internal_error", "message": "queued payload missing"
         })
@@ -633,16 +643,15 @@ async def _on_leader_finished(
         log.info("[GATE] ⚠️ Невалидные поля для queued req_id=%s — отправлен error", next_req_id)
         return
 
-    # запускаем обработку нового лидера как отдельную таску
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-# 🔸 Полная обработка запроса (для лидера) — ядро
+
+# 🔸 Ядро обработки запроса (для лидера)
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
     async with _decisions_sem:
         t0 = _now_monotonic_ms()
         received_at_dt = datetime.utcnow()
 
-        # базовая валидация
         log_uid = fields.get("log_uid") or ""
         strategy_id_s = fields.get("strategy_id") or ""
         direction = (fields.get("direction") or "").strip().lower()
@@ -699,7 +708,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         allow = True
         reason: Optional[str] = None
 
-        # последовательная обработка TF
+        # последовательная проверка TF
         for tf in tfs:
             tf_ok, tf_trace = await _process_tf(
                 sid=sid, symbol=symbol, direction=direction, tf=tf,
@@ -713,9 +722,10 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 if "mw" in tf_trace and not tf_trace["mw"].get("matched", True):
                     reason = f"mw_no_match@{tf}"
                 elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 0:
+                    # если BL>1 или BL==1, но не хватило WL по расширенному правилу
                     reason = f"pack_blacklist_hit@{tf}"
                 elif "pack" in tf_trace:
-                    need = tf_trace["pack"].get("required")
+                    need = tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")
                     got = tf_trace["pack"].get("wl_hits")
                     reason = f"pack_not_enough_confirm@{tf}: need={need} got={got}"
                 else:
@@ -749,7 +759,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
         log.info("[RESP] 📤 log_uid=%s sid=%s allow=%s dur=%dms", log_uid, sid, allow, duration_ms)
 
-        # запись в БД (после ответа)
+        # запись в БД
         try:
             tf_results_json = json.dumps(tf_results, ensure_ascii=False) if trace_flag else None
             await _persist_decision(
@@ -772,13 +782,12 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         except Exception:
             log.exception("[AUDIT] ❌ Ошибка записи аудита log_uid=%s sid=%s", log_uid, sid)
 
-        # реакция ворот на завершение лидера
+        # реакция ворот
         await _on_leader_finished(sid=sid, symbol=symbol, leader_req_id=msg_id, allow=allow)
 
 
-# 🔸 Обработка входящего сообщения: шторка/очередь → либо лидер, либо пауза
+# 🔸 Обработка входящего: шторка/очередь → лидер или ожидание
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
-    # извлекаем sid/symbol из полей для ключей ворот
     strategy_id_s = fields.get("strategy_id") or ""
     symbol = (fields.get("symbol") or "").strip().upper()
     if not strategy_id_s.isdigit() or not symbol:
@@ -789,19 +798,18 @@ async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
         return
     sid = int(strategy_id_s)
 
-    is_leader, reason = await _acquire_gate_or_enqueue(msg_id, fields, sid, symbol, gate_ttl_sec=60)
+    is_leader, _ = await _acquire_gate_or_enqueue(msg_id, fields, sid, symbol, gate_ttl_sec=60)
     if is_leader:
         await _process_request_core(msg_id, fields)
     else:
-        # поставлен в очередь — ответ пока не отправляем, ждём исход лидера
         log.info("[REQ] ⏳ Запрос поставлен в очередь sid=%s %s req_id=%s", sid, symbol, msg_id)
 
 
-# 🔸 Основной слушатель decision_request
+# 🔸 Главный слушатель decision_request
 async def run_laboratory_decision_maker():
     """
     Слушает laboratory:decision_request и формирует ответы в laboratory:decision_response.
-    Обрабатывает только НОВЫЕ сообщения (старт с хвоста '$'). Встроена шторка/очередь per (strategy,symbol).
+    Обрабатывает только НОВЫЕ сообщения (старт с '$'). Встроены шторка/очередь per (strategy,symbol).
     """
     log.info("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d MAX=%d)",
              XREAD_BLOCK_MS, XREAD_COUNT, MAX_IN_FLIGHT_DECISIONS)
@@ -822,7 +830,6 @@ async def run_laboratory_decision_maker():
             for _, messages in resp:
                 for msg_id, fields in messages:
                     last_id = msg_id
-                    # обрабатываем входящий: шторка/очередь → либо лидер, либо ожидание
                     asyncio.create_task(_handle_incoming(msg_id, fields))
 
         except asyncio.CancelledError:
