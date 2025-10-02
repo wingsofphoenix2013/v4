@@ -523,13 +523,12 @@ async def _process_tf(
     log.debug("[TF:%s] ❌ PACK: подтверждений недостаточно (need=%s got=%s)", tf, total_required, wl_hits)
     return False, tf_trace
 
-
-# 🔸 Сохранение результата (после ответа), с client_strategy_id
+# 🔸 Сохранение результата (после ответа), с client_strategy_id — двухфазный upsert для partial unique indexes
 async def _persist_decision(
     req_id: str,
     log_uid: str,
-    strategy_id: int,            # master SID (WL/BL)
-    client_strategy_id: Optional[int],  # клиентский SID (gate), может быть None
+    strategy_id: int,                 # master SID (WL/BL)
+    client_strategy_id: Optional[int],# клиентский SID (gate), может быть None
     symbol: str,
     direction: str,
     tfr_req: str,
@@ -543,60 +542,150 @@ async def _persist_decision(
     cache_hits: int,
     gateway_requests: int,
 ):
-    query = """
-    INSERT INTO public.signal_laboratory_entries
-    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
-     timeframes_requested, timeframes_processed, protocol_version,
-     allow, reason, tf_results, errors,
-     received_at, finished_at, duration_ms, cache_hits, gateway_requests)
-    VALUES ($1,$2,$3,$4,$5,$6,
-            $7,$8,'v1',
-            $9,$10, COALESCE($11::jsonb, NULL), NULL,
-            $12,$13,$14,$15,$16)
-    ON CONFLICT (log_uid, strategy_id) WHERE client_strategy_id IS NULL DO UPDATE
-      SET req_id=$1, direction=$5, symbol=$6,
-          timeframes_requested=$7, timeframes_processed=$8,
-          allow=$9, reason=$10, tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
-          finished_at=$13, duration_ms=$14, cache_hits=$15, gateway_requests=$16
-    """
-    # ВНИМАНИЕ: для кейсов с client_strategy_id IS NOT NULL действует отдельный уникальный индекс
-    # (log_uid, strategy_id, client_strategy_id). Для него используем второй UPSERT.
-    query_with_client = """
-    INSERT INTO public.signal_laboratory_entries
-    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
-     timeframes_requested, timeframes_processed, protocol_version,
-     allow, reason, tf_results, errors,
-     received_at, finished_at, duration_ms, cache_hits, gateway_requests)
-    VALUES ($1,$2,$3,$4,$5,$6,
-            $7,$8,'v1',
-            $9,$10, COALESCE($11::jsonb, NULL), NULL,
-            $12,$13,$14,$15,$16)
-    ON CONFLICT (log_uid, strategy_id, client_strategy_id) DO UPDATE
-      SET req_id=$1, direction=$5, symbol=$6,
-          timeframes_requested=$7, timeframes_processed=$8,
-          allow=$9, reason=$10, tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
-          finished_at=$13, duration_ms=$14, cache_hits=$15, gateway_requests=$16
-    """
+    # 1) Сначала пробуем UPDATE (ключ разный для NULL/NOT NULL)
     async with infra.pg_pool.acquire() as conn:
         if client_strategy_id is None:
-            await conn.execute(
-                query,
+            upd_status = await conn.execute(
+                """
+                UPDATE public.signal_laboratory_entries
+                   SET req_id=$1,
+                       direction=$5,
+                       symbol=$6,
+                       timeframes_requested=$7,
+                       timeframes_processed=$8,
+                       allow=$9,
+                       reason=$10,
+                       tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$13,
+                       duration_ms=$14,
+                       cache_hits=$15,
+                       gateway_requests=$16
+                 WHERE log_uid=$2 AND strategy_id=$3 AND client_strategy_id IS NULL
+                """,
                 req_id, log_uid, strategy_id, None, direction, symbol,
-                tfr_req, tfr_proc,
-                allow, reason, tf_results_json,
+                tfr_req, tfr_proc, allow, reason, tf_results_json,
+                received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
+            )
+        else:
+            upd_status = await conn.execute(
+                """
+                UPDATE public.signal_laboratory_entries
+                   SET req_id=$1,
+                       direction=$5,
+                       symbol=$6,
+                       timeframes_requested=$7,
+                       timeframes_processed=$8,
+                       allow=$9,
+                       reason=$10,
+                       tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$13,
+                       duration_ms=$14,
+                       cache_hits=$15,
+                       gateway_requests=$16
+                 WHERE log_uid=$2 AND strategy_id=$3 AND client_strategy_id=$4
+                """,
+                req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol,
+                tfr_req, tfr_proc, allow, reason, tf_results_json,
+                received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
+            )
+
+        # asyncpg возвращает строку вида 'UPDATE 0' или 'UPDATE 1'
+        if upd_status.startswith("UPDATE 1"):
+            log.info("[AUDIT] 💾 Обновлено (UPDATE) log_uid=%s master_sid=%s client_sid=%s allow=%s",
+                     log_uid, strategy_id, client_strategy_id, allow)
+            return
+
+        # 2) UPDATE не нашёл строку → пробуем INSERT … ON CONFLICT DO NOTHING
+        if client_strategy_id is None:
+            ins_status = await conn.execute(
+                """
+                INSERT INTO public.signal_laboratory_entries
+                    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
+                     timeframes_requested, timeframes_processed, protocol_version,
+                     allow, reason, tf_results, errors,
+                     received_at, finished_at, duration_ms, cache_hits, gateway_requests)
+                VALUES ($1,$2,$3,NULL,$5,$6,
+                        $7,$8,'v1',
+                        $9,$10, COALESCE($11::jsonb, NULL), NULL,
+                        $12,$13,$14,$15,$16)
+                ON CONFLICT DO NOTHING
+                """,
+                req_id, log_uid, strategy_id, None, direction, symbol,
+                tfr_req, tfr_proc, allow, reason, tf_results_json,
+                received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
+            )
+        else:
+            ins_status = await conn.execute(
+                """
+                INSERT INTO public.signal_laboratory_entries
+                    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
+                     timeframes_requested, timeframes_processed, protocol_version,
+                     allow, reason, tf_results, errors,
+                     received_at, finished_at, duration_ms, cache_hits, gateway_requests)
+                VALUES ($1,$2,$3,$4,$5,$6,
+                        $7,$8,'v1',
+                        $9,$10, COALESCE($11::jsonb, NULL), NULL,
+                        $12,$13,$14,$15,$16)
+                ON CONFLICT DO NOTHING
+                """,
+                req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol,
+                tfr_req, tfr_proc, allow, reason, tf_results_json,
+                received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
+            )
+
+        # asyncpg: 'INSERT 0 1' при успехе, 'INSERT 0 0' если DO NOTHING
+        if ins_status.endswith(" 1"):
+            log.info("[AUDIT] 💾 Вставлено (INSERT) log_uid=%s master_sid=%s client_sid=%s allow=%s",
+                     log_uid, strategy_id, client_strategy_id, allow)
+            return
+
+        # 3) В гонке кто-то уже вставил — завершаем UPDATE-ом
+        if client_strategy_id is None:
+            await conn.execute(
+                """
+                UPDATE public.signal_laboratory_entries
+                   SET req_id=$1,
+                       direction=$5,
+                       symbol=$6,
+                       timeframes_requested=$7,
+                       timeframes_processed=$8,
+                       allow=$9,
+                       reason=$10,
+                       tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$13,
+                       duration_ms=$14,
+                       cache_hits=$15,
+                       gateway_requests=$16
+                 WHERE log_uid=$2 AND strategy_id=$3 AND client_strategy_id IS NULL
+                """,
+                req_id, log_uid, strategy_id, None, direction, symbol,
+                tfr_req, tfr_proc, allow, reason, tf_results_json,
                 received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
             )
         else:
             await conn.execute(
-                query_with_client,
+                """
+                UPDATE public.signal_laboratory_entries
+                   SET req_id=$1,
+                       direction=$5,
+                       symbol=$6,
+                       timeframes_requested=$7,
+                       timeframes_processed=$8,
+                       allow=$9,
+                       reason=$10,
+                       tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$13,
+                       duration_ms=$14,
+                       cache_hits=$15,
+                       gateway_requests=$16
+                 WHERE log_uid=$2 AND strategy_id=$3 AND client_strategy_id=$4
+                """,
                 req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol,
-                tfr_req, tfr_proc,
-                allow, reason, tf_results_json,
+                tfr_req, tfr_proc, allow, reason, tf_results_json,
                 received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
             )
-    log.debug("[AUDIT] 💾 Сохранено решение log_uid=%s master_sid=%s client_sid=%s allow=%s",
-             log_uid, strategy_id, client_strategy_id, allow)
-
+        log.info("[AUDIT] 💾 Обновлено (upsert-race) log_uid=%s master_sid=%s client_sid=%s allow=%s",
+                 log_uid, strategy_id, client_strategy_id, allow)
 
 # 🔸 Шторка/очередь: попытка стать лидером или постановка в очередь
 async def _acquire_gate_or_enqueue(
