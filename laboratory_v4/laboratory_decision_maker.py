@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 # 🔸 Внутренние импорты
@@ -434,7 +435,6 @@ def _pack_bl_wl_stats(
 
         pack = pack_obj.get("pack") or {}
         list_type = (r.get("list") or "").strip().lower()  # whitelist | blacklist
-        agg_type = (r.get("agg_type") or "").strip().lower()  # solo | combo
         agg_key = (r.get("agg_key") or "").strip().lower()
         agg_val = (r.get("agg_value") or "").strip().lower()
         if not agg_key or not agg_val:
@@ -449,7 +449,6 @@ def _pack_bl_wl_stats(
             if v is None:
                 ok = False
                 break
-            # все значения в pack — строки (по доке), приведём к str и lower
             parts.append(f"{k}:{str(v).strip().lower()}")
         if not ok:
             continue
@@ -458,7 +457,6 @@ def _pack_bl_wl_stats(
         if fact == agg_val:
             if list_type == "blacklist":
                 bl_hit = True
-                # продолжаем, но по логике сразу упадём наверху TF
             elif list_type == "whitelist":
                 wl_hits += 1
 
@@ -569,8 +567,8 @@ async def _persist_decision(
     allow: bool,
     reason: Optional[str],
     tf_results_json: Optional[str],
-    received_at_iso: str,
-    finished_at_iso: str,
+    received_at_dt: datetime,
+    finished_at_dt: datetime,
     duration_ms: int,
     cache_hits: int,
     gateway_requests: int,
@@ -597,7 +595,7 @@ async def _persist_decision(
             req_id, log_uid, strategy_id, direction, symbol,
             tfr_req, tfr_proc,
             allow, reason, tf_results_json,
-            received_at_iso, finished_at_iso, duration_ms, cache_hits, gateway_requests
+            received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
         )
     log.info("[AUDIT] 💾 Сохранено решение log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
 
@@ -606,7 +604,7 @@ async def _persist_decision(
 async def _process_request(msg_id: str, fields: Dict[str, str]):
     async with _decisions_sem:
         t0 = _now_monotonic_ms()
-        received_at_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        received_at_dt = datetime.utcnow()  # ✅ datetime для PG
 
         # базовая валидация и парсинг
         log_uid = fields.get("log_uid") or ""
@@ -701,7 +699,7 @@ async def _process_request(msg_id: str, fields: Dict[str, str]):
                 log.info("[TF:%s] ✅ TF пройден", tf)
 
         # ответ стратегии
-        finished_at_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        finished_at_dt = datetime.utcnow()  # ✅ datetime для PG
         duration_ms = _now_monotonic_ms() - t0
         resp = {
             "req_id": msg_id,
@@ -738,8 +736,8 @@ async def _process_request(msg_id: str, fields: Dict[str, str]):
                 allow=allow,
                 reason=reason,
                 tf_results_json=tf_results_json,
-                received_at_iso=received_at_iso,
-                finished_at_iso=finished_at_iso,
+                received_at_dt=received_at_dt,     # ✅ datetime
+                finished_at_dt=finished_at_dt,     # ✅ datetime
                 duration_ms=duration_ms,
                 cache_hits=telemetry.get("cache_hits", 0),
                 gateway_requests=telemetry.get("gateway_requests", 0),
@@ -774,7 +772,6 @@ async def run_laboratory_decision_maker():
             for _, messages in resp:
                 for msg_id, fields in messages:
                     last_id = msg_id  # двигаем хвост
-                    # поля приходят как строки → оставляем, парсим в _process_request
                     asyncio.create_task(_process_request(msg_id, fields))
 
         except asyncio.CancelledError:
