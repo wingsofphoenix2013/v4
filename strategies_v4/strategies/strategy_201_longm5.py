@@ -1,10 +1,11 @@
-# strategy_201_longm5.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5; ожидание по last-id, таймаут 90с; подробные INFO-логи диалога с лабораторией)
+# strategy_201_longm5.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
 
 # 🔸 Импорты
 import logging
 import json
 import asyncio
 import time
+from datetime import datetime
 
 from infra import infra
 
@@ -33,13 +34,18 @@ class Strategy201Longm5:
         redis = context.get("redis")
         strategy_cfg = context.get("strategy")
         if redis is None or strategy_cfg is None:
-            return ("ignore", "нет redis или strategy в context")
+            note = "нет redis или strategy в context"
+            # пишем сразу в очередь логов, чтобы появился след в БД
+            await self._log_ignore_to_queue(redis, signal.get("strategy_id"), signal.get("log_uid"), note)
+            return ("ignore", note)
 
         # мастер-стратегия из market_mirrow
         master_sid = strategy_cfg.get("market_mirrow")
         if not master_sid:
+            note = "отсутствует привязка к мастер-стратегии"
             log.info("⚠️ [IGNORE] log_uid=%s reason=\"no_market_mirrow\"", signal.get("log_uid"))
-            return ("ignore", "отсутствует привязка к мастер-стратегии")
+            await self._log_ignore_to_queue(redis, signal.get("strategy_id"), signal.get("log_uid"), note)
+            return ("ignore", note)
 
         # нормализация тикера
         symbol = str(signal["symbol"]).upper()
@@ -53,8 +59,8 @@ class Strategy201Longm5:
         # формируем запрос в laboratory
         req_payload = {
             "log_uid": log_uid,
-            "strategy_id": str(master_sid),           # SID мастера (правила WL/BL)
-            "client_strategy_id": client_sid,         # SID зеркала (ворота/anti-dup)
+            "strategy_id": str(master_sid),            # SID мастера (правила WL/BL)
+            "client_strategy_id": client_sid,          # SID зеркала (ворота/anti-dup)
             "direction": "long",
             "symbol": symbol,
             "timeframes": tfs,
@@ -76,8 +82,10 @@ class Strategy201Longm5:
             log.info("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
             allow, reason = await self._wait_for_response(redis, req_id, last_resp_id, timeout_seconds=90)
         except Exception:
+            note = "ошибка при работе с laboratory_v4"
             log.exception("❌ Ошибка взаимодействия с laboratory_v4")
-            return ("ignore", "ошибка при работе с laboratory_v4")
+            await self._log_ignore_to_queue(redis, client_sid, log_uid, note)
+            return ("ignore", note)
 
         # решение лаборатории
         if allow:
@@ -99,11 +107,14 @@ class Strategy201Longm5:
                 log.info("[OPEN_SENT] log_uid=%s position_request_published=true", log_uid)
                 return ("ok", "passed_laboratory")
             except Exception as e:
+                note = "ошибка отправки в opener"
                 log.info("[OPEN_FAIL] log_uid=%s error=%s", log_uid, str(e))
-                return ("ignore", "ошибка отправки в opener")
+                await self._log_ignore_to_queue(redis, client_sid, log_uid, note)
+                return ("ignore", note)
         else:
             # отказ лаборатории → формируем ignore с причиной
             log.info("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
+            await self._log_ignore_to_queue(redis, client_sid, log_uid, reason)
             return ("ignore", f"отказ лаборатории по причине {reason}")
 
     # 🔸 Получение last-generated-id для стрима (чтение только нового)
@@ -166,3 +177,21 @@ class Strategy201Longm5:
                         return False, f"lab_error:{err_code}"
 
             # продолжаем до дедлайна
+
+    # 🔸 Запись ignore-события в очередь логов (для последующей записи в БД)
+    async def _log_ignore_to_queue(self, redis, strategy_id, log_uid, note: str):
+        try:
+            if redis is None:
+                return
+            record = {
+                "log_uid": str(log_uid) if log_uid is not None else "",
+                "strategy_id": str(strategy_id) if strategy_id is not None else "",
+                "status": "ignore",
+                "note": note or "",
+                "position_uid": "",
+                "logged_at": datetime.utcnow().isoformat()
+            }
+            await redis.xadd("signal_log_queue", record)
+            log.info("[IGNORE_LOGGED] log_uid=%s note=\"%s\"", log_uid, note)
+        except Exception as e:
+            log.info("[IGNORE_LOG_FAIL] log_uid=%s error=%s", log_uid, str(e))
