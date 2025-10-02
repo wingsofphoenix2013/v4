@@ -1,4 +1,4 @@
-# laboratory_decision_maker.py — обработчик решений (allow/deny): шторка per (strategy,symbol) + очередь, MW→(PACK параллельно), ответ и аудит с деталями WL/BL и динамикой blacklist
+# laboratory_decision_maker.py — обработчик решений (allow/deny): шторка по (gate_sid, symbol) c очередью, MW→(PACK параллельно), динамика blacklist, ответ и аудит
 
 import asyncio
 import json
@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-# 🔸 Внутренние импорты
+# 🔸 Инфраструктура
 import laboratory_infra as infra
 
 # 🔸 Логгер
@@ -24,7 +24,7 @@ XREAD_COUNT = 50
 MAX_IN_FLIGHT_DECISIONS = 32
 MAX_CONCURRENT_GATEWAY_CALLS = 32
 COALESCE_TTL_SEC = 3
-SAFETY_DEADLINE_MS = 60_000  # общий потолок на запрос
+SAFETY_DEADLINE_MS = 60_000  # общий потолок на обработку одного запроса
 
 # 🔸 Порядок TF
 TF_ORDER = ("m5", "m15", "h1")
@@ -106,12 +106,12 @@ def _now_monotonic_ms() -> int:
 
 
 # 🔸 Ключи шторки/очереди
-def _gate_key(sid: int, symbol: str) -> str:
-    return f"lab:gate:{sid}:{symbol}"
+def _gate_key(gate_sid: int, symbol: str) -> str:
+    return f"lab:gate:{gate_sid}:{symbol}"
 
 
-def _queue_key(sid: int, symbol: str) -> str:
-    return f"lab:qids:{sid}:{symbol}"
+def _queue_key(gate_sid: int, symbol: str) -> str:
+    return f"lab:qids:{gate_sid}:{symbol}"
 
 
 def _qfields_key(req_id: str) -> str:
@@ -148,7 +148,7 @@ async def _ensure_pack_available(
     rec = _coalesce.get(co_key)
     if rec and now < rec[0]:
         fut = rec[1]
-        log.debug("[PACK] ⏳ Коалесценс ожидание существующего запроса key=%s", key)
+        log.info("[PACK] ⏳ Коалесценс ожидание существующего запроса key=%s", key)
         try:
             return await asyncio.wait_for(fut, timeout=max(0.1, (deadline_ms - _now_monotonic_ms()) / 1000))
         except Exception:
@@ -176,7 +176,7 @@ async def _ensure_pack_available(
                 req["std"] = f"{S:.2f}"
 
             req_id = await infra.redis_client.xadd(GATEWAY_REQ_STREAM, req)
-            log.debug("[PACK] 📤 GW запрос отправлен ind=%s base=%s req_id=%s key=%s", indicator, base, req_id, key)
+            log.info("[PACK] 📤 GW запрос отправлен ind=%s base=%s req_id=%s key=%s", indicator, base, req_id, key)
 
             poll_sleep = 0.1
             while _now_monotonic_ms() < deadline_ms:
@@ -191,7 +191,7 @@ async def _ensure_pack_available(
                 if poll_sleep < 0.2:
                     poll_sleep = 0.2
 
-            log.debug("[PACK] ⛔ Истёк дедлайн ожидания public KV ind=%s base=%s", indicator, base)
+            log.info("[PACK] ⛔ Истёк дедлайн ожидания public KV ind=%s base=%s", indicator, base)
             if not fut.done():
                 fut.set_result(None)
             return None
@@ -237,7 +237,7 @@ async def _get_mw_states(
                     state = st
 
         out[base] = state
-        log.debug("[MW] 🧩 %s %s/%s state=%s", base, symbol, tf, state)
+        log.info("[MW] 🧩 %s %s/%s state=%s", base, symbol, tf, state)
 
     return out
 
@@ -292,7 +292,7 @@ def _mw_match_and_required_confirmation(
     return True, req
 
 
-# 🔸 Параллельное получение PACK объектов по нужным base
+# 🔸 Параллельный сбор PACK объектов по нужным base
 async def _get_pack_objects_for_bases(
     symbol: str, tf: str, bases: List[str], precision: int, deadline_ms: int
 ) -> Dict[str, Optional[dict]]:
@@ -314,7 +314,7 @@ async def _get_pack_objects_for_bases(
         obj = got.get(k)
         if obj is not None:
             results[base] = obj
-            log.debug("[PACK] 📦 base=%s %s/%s present=%s", base, symbol, tf, bool(obj))
+            log.info("[PACK] 📦 base=%s %s/%s present=%s", base, symbol, tf, bool(obj))
         else:
             wanted.append((base, ind, params))
             tasks.append(asyncio.create_task(_ensure_pack_available(
@@ -326,7 +326,7 @@ async def _get_pack_objects_for_bases(
         fetched = await asyncio.gather(*tasks, return_exceptions=False)
         for (base, _ind, _params), obj in zip(wanted, fetched):
             results[base] = obj
-            log.debug("[PACK] 📦 base=%s %s/%s present=%s", base, symbol, tf, bool(obj))
+            log.info("[PACK] 📦 base=%s %s/%s present=%s", base, symbol, tf, bool(obj))
 
     return results
 
@@ -339,7 +339,7 @@ def _pack_bl_wl_stats_with_details(
     """
     Возвращает:
       bl_hits, wl_hits, bl_details[], wl_details[], bl_winrates[]
-    где детали: {id, pack_base, agg_key, agg_value, winrate?}
+    детали: {id, pack_base, agg_key, agg_value, winrate?}
     """
     bl_hits = 0
     wl_hits = 0
@@ -383,7 +383,6 @@ def _pack_bl_wl_stats_with_details(
             }
             if list_type == "blacklist":
                 bl_hits += 1
-                # winrate может быть NUMERIC; приводим к float
                 try:
                     w = float(r.get("winrate"))
                 except Exception:
@@ -423,14 +422,13 @@ async def _process_tf(
     mw_rows = [r for r in mw_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
     pack_rows = [r for r in pack_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
 
-    log.debug("[TF:%s] 🔎 WL срезы: MW=%d PACK=%d (sid=%s %s %s)", tf, len(mw_rows), len(pack_rows), sid, symbol, direction)
+    log.info("[TF:%s] 🔎 WL срезы: MW=%d PACK=%d (sid=%s %s %s)", tf, len(mw_rows), len(pack_rows), sid, symbol, direction)
 
     if not mw_rows:
         tf_trace["mw"] = {"matched": False}
-        log.debug("[TF:%s] ❌ MW: нет строк в WL — отказ", tf)
+        log.info("[TF:%s] ❌ MW: нет строк в WL — отказ", tf)
         return False, tf_trace
 
-    # какие MW-базы нужны
     needed_bases: List[str] = []
     for r in mw_rows:
         base = (r.get("agg_base") or "").strip().lower()
@@ -449,14 +447,14 @@ async def _process_tf(
         if matched:
             tf_trace["mw"]["confirmation"] = conf_req
     if not matched:
-        log.debug("[TF:%s] ❌ MW: совпадений нет — отказ", tf)
+        log.info("[TF:%s] ❌ MW: совпадений нет — отказ", tf)
         return False, tf_trace
 
     if conf_req == 0:
-        log.debug("[TF:%s] ✅ MW: confirmation=0 — TF пройден без PACK", tf)
+        log.info("[TF:%s] ✅ MW: confirmation=0 — TF пройден без PACK", tf)
         return True, tf_trace
 
-    # PACK: готовим базу
+    # PACK
     bases: List[str] = []
     for r in pack_rows:
         base = (r.get("pack_base") or "").strip().lower()
@@ -464,29 +462,27 @@ async def _process_tf(
             bases.append(base)
     if not bases:
         tf_trace["pack"] = {"bl_hits": 0, "wl_hits": 0, "required": conf_req}
-        log.debug("[TF:%s] ❌ PACK: WL пуст — подтверждений нет (need=%s)", tf, conf_req)
+        log.info("[TF:%s] ❌ PACK: WL пуст — подтверждений нет (need=%s)", tf, conf_req)
         return False, tf_trace
 
     pack_objs = await _get_pack_objects_for_bases(symbol, tf, bases, precision, deadline_ms)
     bl_hits, wl_hits, bl_details, wl_details, bl_winrates = _pack_bl_wl_stats_with_details(pack_rows, pack_objs)
 
-    # динамическая шкала по blacklist
+    # Динамическая шкала по blacklist
     extra_required = 0
     total_required = conf_req
 
     if bl_hits > 1:
-        # безусловный отказ
         if trace:
             tf_trace["pack"] = {
                 "bl_hits": bl_hits, "wl_hits": wl_hits,
                 "required": conf_req, "extra_required": None, "total_required": None,
                 "bl_details": bl_details, "wl_details": wl_details,
             }
-        log.debug("[TF:%s] ❌ PACK: blacklist count > 1 — отказ", tf)
+        log.info("[TF:%s] ❌ PACK: blacklist count > 1 — отказ", tf)
         return False, tf_trace
 
     if bl_hits == 1:
-        # берём единственный winrate (если почему-то несколько — используем минимальный)
         w = min(bl_winrates) if bl_winrates else None
         if w is not None:
             if w < 0.35:
@@ -496,7 +492,7 @@ async def _process_tf(
                         "required": conf_req, "extra_required": None, "total_required": None,
                         "bl_details": bl_details, "wl_details": wl_details,
                     }
-                log.debug("[TF:%s] ❌ PACK: blacklist w=%.3f < 0.35 — отказ", tf, w)
+                log.info("[TF:%s] ❌ PACK: blacklist w=%.3f < 0.35 — отказ", tf, w)
                 return False, tf_trace
             elif 0.35 <= w < 0.40:
                 extra_required = 3
@@ -504,7 +500,6 @@ async def _process_tf(
                 extra_required = 2
             elif 0.45 <= w < 0.50:
                 extra_required = 1
-            # w >= 0.50 — теоретически редкость; трактуем как +1 (или можно 0). Оставим +1 для консервативности:
             elif w >= 0.50:
                 extra_required = 1
 
@@ -521,12 +516,11 @@ async def _process_tf(
             "wl_details": wl_details,
         }
 
-    # итог по PACK с динамикой
     if wl_hits >= total_required:
-        log.debug("[TF:%s] ✅ PACK: подтверждений достаточно (need=%s got=%s)", tf, total_required, wl_hits)
+        log.info("[TF:%s] ✅ PACK: подтверждений достаточно (need=%s got=%s)", tf, total_required, wl_hits)
         return True, tf_trace
 
-    log.debug("[TF:%s] ❌ PACK: подтверждений недостаточно (need=%s got=%s)", tf, total_required, wl_hits)
+    log.info("[TF:%s] ❌ PACK: подтверждений недостаточно (need=%s got=%s)", tf, total_required, wl_hits)
     return False, tf_trace
 
 
@@ -572,43 +566,43 @@ async def _persist_decision(
             allow, reason, tf_results_json,
             received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
         )
-    log.debug("[AUDIT] 💾 Сохранено решение log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
+    log.info("[AUDIT] 💾 Сохранено решение log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
 
 
 # 🔸 Шторка/очередь: попытка стать лидером или постановка в очередь
 async def _acquire_gate_or_enqueue(
     msg_id: str,
     fields: Dict[str, str],
-    sid: int,
+    gate_sid: int,
     symbol: str,
     gate_ttl_sec: int = 60,
 ) -> Tuple[bool, Optional[str]]:
-    gk = _gate_key(sid, symbol)
-    qk = _queue_key(sid, symbol)
+    gk = _gate_key(gate_sid, symbol)
+    qk = _queue_key(gate_sid, symbol)
     fk = _qfields_key(msg_id)
 
     ok = await infra.redis_client.set(gk, msg_id, ex=gate_ttl_sec, nx=True)
     if ok:
-        log.debug("[GATE] 🔐 Лидер получен sid=%s %s req_id=%s", sid, symbol, msg_id)
+        log.info("[GATE] 🔐 Лидер получен gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
         return True, None
 
     await infra.redis_client.rpush(qk, msg_id)
     await infra.redis_client.set(fk, json.dumps(fields, ensure_ascii=False), ex=gate_ttl_sec + 60)
-    log.debug("[GATE] ⏸️ В очередь sid=%s %s req_id=%s", sid, symbol, msg_id)
+    log.info("[GATE] ⏸️ В очередь gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
     return False, "enqueued"
 
 
 # 🔸 Реакция на завершение лидера
-async def _on_leader_finished(sid: int, symbol: str, leader_req_id: str, allow: bool):
-    gk = _gate_key(sid, symbol)
-    qk = _queue_key(sid, symbol)
+async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, allow: bool):
+    gk = _gate_key(gate_sid, symbol)
+    qk = _queue_key(gate_sid, symbol)
     await infra.redis_client.delete(gk)
 
     if allow:
         pending = await infra.redis_client.lrange(qk, 0, -1)
         await infra.redis_client.delete(qk)
         if pending:
-            log.debug("[GATE] 🚫 DUPLICATED sid=%s %s — отказываем очереди (%d шт.)", sid, symbol, len(pending))
+            log.info("[GATE] 🚫 DUPLICATED gate_sid=%s %s — отказываем очереди (%d шт.)", gate_sid, symbol, len(pending))
             for req_id in pending:
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                     "req_id": req_id, "status": "ok", "allow": "false", "reason": "duplicated_entry"
@@ -618,12 +612,12 @@ async def _on_leader_finished(sid: int, symbol: str, leader_req_id: str, allow: 
 
     next_req_id = await infra.redis_client.lpop(qk)
     if not next_req_id:
-        log.debug("[GATE] 🔁 Очередь пуста sid=%s %s — ждём новые запросы", sid, symbol)
+        log.info("[GATE] 🔁 Очередь пуста gate_sid=%s %s — ждём новые запросы", gate_sid, symbol)
         return
 
     ok = await infra.redis_client.set(gk, next_req_id, ex=60, nx=True)
     if not ok:
-        log.debug("[GATE] ⚠️ Не удалось назначить нового лидера sid=%s %s req=%s", sid, symbol, next_req_id)
+        log.info("[GATE] ⚠️ Не удалось назначить нового лидера gate_sid=%s %s req=%s", gate_sid, symbol, next_req_id)
         return
 
     raw = await infra.redis_client.get(_qfields_key(next_req_id))
@@ -631,7 +625,7 @@ async def _on_leader_finished(sid: int, symbol: str, leader_req_id: str, allow: 
         await infra.redis_client.xadd(DECISION_RESP_STREAM, {
             "req_id": next_req_id, "status": "error", "error": "internal_error", "message": "queued payload missing"
         })
-        log.debug("[GATE] ⚠️ Нет полей для queued req_id=%s — отправлен error", next_req_id)
+        log.info("[GATE] ⚠️ Нет полей для queued req_id=%s — отправлен error", next_req_id)
         return
 
     try:
@@ -640,7 +634,7 @@ async def _on_leader_finished(sid: int, symbol: str, leader_req_id: str, allow: 
         await infra.redis_client.xadd(DECISION_RESP_STREAM, {
             "req_id": next_req_id, "status": "error", "error": "internal_error", "message": "queued payload invalid"
         })
-        log.debug("[GATE] ⚠️ Невалидные поля для queued req_id=%s — отправлен error", next_req_id)
+        log.info("[GATE] ⚠️ Невалидные поля для queued req_id=%s — отправлен error", next_req_id)
         return
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
@@ -654,6 +648,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
         log_uid = fields.get("log_uid") or ""
         strategy_id_s = fields.get("strategy_id") or ""
+        client_sid_s = fields.get("client_strategy_id") or ""  # опционально
         direction = (fields.get("direction") or "").strip().lower()
         symbol = (fields.get("symbol") or "").strip().upper()
         tfs_raw = fields.get("timeframes") or ""
@@ -669,33 +664,38 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                 "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing or invalid fields"
             })
-            log.debug("[REQ] ❌ bad_request fields=%s", fields)
+            log.info("[REQ] ❌ bad_request fields=%s", fields)
             return
 
+        # master SID (для WL/BL)
         sid = int(strategy_id_s)
+        # gate SID (для шторки/очереди): клиентский, если передан и валиден, иначе master
+        gate_sid = int(client_sid_s) if client_sid_s.isdigit() else sid
+
         tfs = _parse_timeframes(tfs_raw)
         if not tfs:
             await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                 "req_id": msg_id, "status": "error", "error": "bad_request", "message": "timeframes invalid"
             })
-            log.debug("[REQ] ❌ bad_request timeframes=%s", tfs_raw)
+            log.info("[REQ] ❌ bad_request timeframes=%s", tfs_raw)
             return
 
         if symbol not in infra.enabled_tickers:
             await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                 "req_id": msg_id, "status": "error", "error": "symbol_not_active", "message": f"{symbol}"
             })
-            log.debug("[REQ] ❌ symbol_not_active %s", symbol)
+            log.info("[REQ] ❌ symbol_not_active %s", symbol)
             return
 
         if sid not in infra.enabled_strategies:
             await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                 "req_id": msg_id, "status": "error", "error": "strategy_not_enabled", "message": f"{sid}"
             })
-            log.debug("[REQ] ❌ strategy_not_enabled %s", sid)
+            log.info("[REQ] ❌ strategy_not_enabled %s", sid)
             return
 
-        log.debug("[REQ] 📥 log_uid=%s sid=%s %s %s tfs=%s", log_uid, sid, symbol, direction, ",".join(tfs))
+        log.info("[REQ] 📥 log_uid=%s sid=%s gate_sid=%s %s %s tfs=%s",
+                 log_uid, sid, gate_sid, symbol, direction, ",".join(tfs))
 
         # ждём «шторки» WL (коротко)
         await infra.wait_mw_ready(sid, timeout_sec=5.0)
@@ -721,8 +721,8 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 allow = False
                 if "mw" in tf_trace and not tf_trace["mw"].get("matched", True):
                     reason = f"mw_no_match@{tf}"
-                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 0:
-                    # если BL>1 или BL==1, но не хватило WL по расширенному правилу
+                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 0 and tf_trace["pack"].get("wl_hits", 0) < (tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")):
+                    # BL сработал как блокирующий
                     reason = f"pack_blacklist_hit@{tf}"
                 elif "pack" in tf_trace:
                     need = tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")
@@ -730,25 +730,27 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                     reason = f"pack_not_enough_confirm@{tf}: need={need} got={got}"
                 else:
                     reason = f"deny@{tf}"
-                log.debug("[TF:%s] ⛔ Останов по причине: %s", tf, reason)
+                log.info("[TF:%s] ⛔ Останов по причине: %s", tf, reason)
                 break
             else:
-                log.debug("[TF:%s] ✅ TF пройден", tf)
+                log.info("[TF:%s] ✅ TF пройден", tf)
 
         finished_at_dt = datetime.utcnow()
         duration_ms = _now_monotonic_ms() - t0
 
-        # ответ стратегии
+        # формируем ответ
         resp = {
             "req_id": msg_id,
             "status": "ok",
             "allow": "true" if allow else "false",
             "log_uid": log_uid,
-            "strategy_id": str(sid),
-            "symbol": symbol,
+            "strategy_id": str(sid),           # master SID
             "direction": direction,
+            "symbol": symbol,
             "timeframes": ",".join(tfs),
         }
+        if client_sid_s:
+            resp["client_strategy_id"] = client_sid_s
         if not allow and reason:
             resp["reason"] = reason
         if trace_flag:
@@ -756,8 +758,10 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 resp["tf_results"] = json.dumps(tf_results, ensure_ascii=False)
             except Exception:
                 pass
+
         await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
-        log.debug("[RESP] 📤 log_uid=%s sid=%s allow=%s dur=%dms", log_uid, sid, allow, duration_ms)
+        log.info("[RESP] 📤 log_uid=%s sid=%s gate_sid=%s allow=%s dur=%dms",
+                 log_uid, sid, gate_sid, allow, duration_ms)
 
         # запись в БД
         try:
@@ -782,36 +786,40 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         except Exception:
             log.exception("[AUDIT] ❌ Ошибка записи аудита log_uid=%s sid=%s", log_uid, sid)
 
-        # реакция ворот
-        await _on_leader_finished(sid=sid, symbol=symbol, leader_req_id=msg_id, allow=allow)
+        # реакция ворот (используем gate_sid)
+        await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow)
 
 
 # 🔸 Обработка входящего: шторка/очередь → лидер или ожидание
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     strategy_id_s = fields.get("strategy_id") or ""
+    client_sid_s = fields.get("client_strategy_id") or ""
     symbol = (fields.get("symbol") or "").strip().upper()
     if not strategy_id_s.isdigit() or not symbol:
         await infra.redis_client.xadd(DECISION_RESP_STREAM, {
             "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing sid/symbol"
         })
-        log.debug("[REQ] ❌ bad_request (no sid/symbol) fields=%s", fields)
+        log.info("[REQ] ❌ bad_request (no sid/symbol) fields=%s", fields)
         return
-    sid = int(strategy_id_s)
 
-    is_leader, _ = await _acquire_gate_or_enqueue(msg_id, fields, sid, symbol, gate_ttl_sec=60)
+    sid = int(strategy_id_s)
+    gate_sid = int(client_sid_s) if client_sid_s.isdigit() else sid
+
+    is_leader, _ = await _acquire_gate_or_enqueue(msg_id, fields, gate_sid, symbol, gate_ttl_sec=60)
     if is_leader:
         await _process_request_core(msg_id, fields)
     else:
-        log.debug("[REQ] ⏳ Запрос поставлен в очередь sid=%s %s req_id=%s", sid, symbol, msg_id)
+        log.info("[REQ] ⏳ Запрос поставлен в очередь gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
 
 
 # 🔸 Главный слушатель decision_request
 async def run_laboratory_decision_maker():
     """
     Слушает laboratory:decision_request и формирует ответы в laboratory:decision_response.
-    Обрабатывает только НОВЫЕ сообщения (старт с '$'). Встроены шторка/очередь per (strategy,symbol).
+    Обрабатывает только НОВЫЕ сообщения (старт с '$'). Встроены шторка/очередь per (gate_sid, symbol),
+    где gate_sid = client_strategy_id (если передан) иначе strategy_id (master).
     """
-    log.debug("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d MAX=%d)",
+    log.info("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d MAX=%d)",
              XREAD_BLOCK_MS, XREAD_COUNT, MAX_IN_FLIGHT_DECISIONS)
 
     last_id = "$"  # только новые, без истории
@@ -833,7 +841,7 @@ async def run_laboratory_decision_maker():
                     asyncio.create_task(_handle_incoming(msg_id, fields))
 
         except asyncio.CancelledError:
-            log.debug("⏹️ LAB_DECISION остановлен по сигналу")
+            log.info("⏹️ LAB_DECISION остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ LAB_DECISION ошибка в основном цикле")
