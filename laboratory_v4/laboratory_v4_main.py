@@ -1,14 +1,17 @@
-# laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск слушателей
+# laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск слушателей (WL, CONFIG, DECISION)
 
 import asyncio
 import logging
 
+# 🔸 Инфраструктура
 import laboratory_infra as infra
 from laboratory_infra import (
     setup_logging,
     setup_pg,
     setup_redis_client,
 )
+
+# 🔸 Загрузка конфигов и слушатели WL/CONFIG
 from laboratory_config import (
     load_enabled_tickers,
     load_enabled_strategies,
@@ -17,6 +20,9 @@ from laboratory_config import (
     config_event_listener,
     whitelist_stream_listener,
 )
+
+# 🔸 Обработчик решений (allow/deny)
+from laboratory_decision_maker import run_laboratory_decision_maker
 
 log = logging.getLogger("LAB_MAIN")
 
@@ -63,8 +69,12 @@ async def main():
     log.info("🚀 Запуск фоновых слушателей")
 
     await asyncio.gather(
+        # Слушатель изменений конфигов (тикеры/стратегии) — Pub/Sub
         run_safe_loop(config_event_listener, "CONFIG_EVENT_LISTENER"),
+        # Слушатель обновлений whitelist (PACK + MW) — Streams
         run_safe_loop(whitelist_stream_listener, "WL_STREAM_LISTENER"),
+        # Обработчик решений (allow/deny) — Streams: decision_request → decision_response
+        run_safe_loop(run_laboratory_decision_maker, "LAB_DECISION"),
     )
 
 
