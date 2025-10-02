@@ -43,7 +43,7 @@ class Strategy201Longm5:
         master_sid = strategy_cfg.get("market_mirrow")
         if not master_sid:
             note = "отсутствует привязка к мастер-стратегии"
-            log.info("⚠️ [IGNORE] log_uid=%s reason=\"no_market_mirrow\"", signal.get("log_uid"))
+            log.debug("⚠️ [IGNORE] log_uid=%s reason=\"no_market_mirrow\"", signal.get("log_uid"))
             await self._log_ignore_to_queue(redis, signal.get("strategy_id"), signal.get("log_uid"), note)
             return ("ignore", note)
 
@@ -68,7 +68,7 @@ class Strategy201Longm5:
         }
 
         # лог запроса
-        log.info(
+        log.debug(
             "[LAB_REQUEST] log_uid=%s master=%s client=%s symbol=%s tf=%s",
             log_uid, master_sid, client_sid, symbol, tfs
         )
@@ -76,10 +76,10 @@ class Strategy201Longm5:
         try:
             # отправляем запрос в laboratory:decision_request
             req_id = await redis.xadd("laboratory:decision_request", req_payload)
-            log.info("[LAB_XADD] req_id=%s", req_id)
+            log.debug("[LAB_XADD] req_id=%s", req_id)
 
             # ждём ответ из laboratory:decision_response (таймаут 90с)
-            log.info("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
+            log.debug("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
             allow, reason = await self._wait_for_response(redis, req_id, last_resp_id, timeout_seconds=90)
         except Exception:
             note = "ошибка при работе с laboratory_v4"
@@ -98,22 +98,22 @@ class Strategy201Longm5:
                 "route": "new_entry",
                 "received_at": signal.get("received_at"),
             }
-            log.info(
+            log.debug(
                 "[OPEN_REQ] log_uid=%s client_sid=%s symbol=%s direction=%s",
                 log_uid, client_sid, symbol, "long"
             )
             try:
                 await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-                log.info("[OPEN_SENT] log_uid=%s position_request_published=true", log_uid)
+                log.debug("[OPEN_SENT] log_uid=%s position_request_published=true", log_uid)
                 return ("ok", "passed_laboratory")
             except Exception as e:
                 note = "ошибка отправки в opener"
-                log.info("[OPEN_FAIL] log_uid=%s error=%s", log_uid, str(e))
+                log.debug("[OPEN_FAIL] log_uid=%s error=%s", log_uid, str(e))
                 await self._log_ignore_to_queue(redis, client_sid, log_uid, note)
                 return ("ignore", note)
         else:
             # отказ лаборатории → формируем ignore с причиной
-            log.info("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
+            log.debug("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
             await self._log_ignore_to_queue(redis, client_sid, log_uid, reason)
             return ("ignore", f"отказ лаборатории по причине {reason}")
 
@@ -137,7 +137,7 @@ class Strategy201Longm5:
         while True:
             # страховой выход по таймауту
             if time.monotonic() > deadline:
-                log.info("[LAB_TIMEOUT] req_id=%s", req_id)
+                log.debug("[LAB_TIMEOUT] req_id=%s", req_id)
                 return False, "lab_timeout"
 
             # читаем только новые записи после read_id
@@ -148,7 +148,7 @@ class Strategy201Longm5:
             # логируем факт получения батча (без избыточного спама)
             total = sum(len(records) for _, records in entries)
             if total:
-                log.info("[LAB_READ] req_id=%s batch=%d", req_id, total)
+                log.debug("[LAB_READ] req_id=%s batch=%d", req_id, total)
 
             for _, records in entries:
                 for record_id, data in records:
@@ -165,7 +165,7 @@ class Strategy201Longm5:
                     if status == "ok":
                         allow = str(data.get("allow", "false")).lower() == "true"
                         reason = (data.get("reason", "") or "")
-                        log.info("[LAB_RESP] req_id=%s status=%s allow=%s reason=\"%s\"",
+                        log.debug("[LAB_RESP] req_id=%s status=%s allow=%s reason=\"%s\"",
                                  req_id, status, str(allow).lower(), reason)
                         return allow, reason
 
@@ -173,7 +173,7 @@ class Strategy201Longm5:
                     if status == "error":
                         err_code = data.get("error", "unknown")
                         message = data.get("message", "")
-                        log.info("[LAB_ERROR] req_id=%s error=%s message=\"%s\"", req_id, err_code, message)
+                        log.debug("[LAB_ERROR] req_id=%s error=%s message=\"%s\"", req_id, err_code, message)
                         return False, f"lab_error:{err_code}"
 
             # продолжаем до дедлайна
@@ -192,6 +192,6 @@ class Strategy201Longm5:
                 "logged_at": datetime.utcnow().isoformat()
             }
             await redis.xadd("signal_log_queue", record)
-            log.info("[IGNORE_LOGGED] log_uid=%s note=\"%s\"", log_uid, note)
+            log.debug("[IGNORE_LOGGED] log_uid=%s note=\"%s\"", log_uid, note)
         except Exception as e:
-            log.info("[IGNORE_LOG_FAIL] log_uid=%s error=%s", log_uid, str(e))
+            log.debug("[IGNORE_LOG_FAIL] log_uid=%s error=%s", log_uid, str(e))

@@ -1,4 +1,4 @@
-# strategy_201_longm5m15.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5 + m15; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
+# strategy_301_longm5m15h1.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5 + m15 + h1; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
 
 # 🔸 Импорты
 import logging
@@ -10,10 +10,10 @@ from datetime import datetime
 from infra import infra
 
 # 🔸 Логгер стратегии
-log = logging.getLogger("strategy_201_longm5m15")
+log = logging.getLogger("strategy_301_longm5m15h1")
 
 # 🔸 Класс стратегии
-class Strategy201Longm5m15:
+class Strategy301Longm5m15h1:
     # 🔸 Проверка сигнала на допустимость
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
@@ -51,7 +51,7 @@ class Strategy201Longm5m15:
         symbol = str(signal["symbol"]).upper()
         client_sid = str(signal["strategy_id"])
         log_uid = signal.get("log_uid")
-        tfs = "m5,m15"
+        tfs = "m5,m15,h1"
 
         # получаем last-generated-id ответа ДО отправки запроса
         last_resp_id = await self._get_stream_last_id(redis, "laboratory:decision_response")

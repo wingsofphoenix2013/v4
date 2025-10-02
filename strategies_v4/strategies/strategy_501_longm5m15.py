@@ -1,4 +1,4 @@
-# strategy_201_longm5m15.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5 + m15; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
+# strategy_501_longm5m15.py — зеркальная стратегия (лонг; laboratory_v4 TF: m5 + m15; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
 
 # 🔸 Импорты
 import logging
@@ -10,10 +10,10 @@ from datetime import datetime
 from infra import infra
 
 # 🔸 Логгер стратегии
-log = logging.getLogger("strategy_201_longm5m15")
+log = logging.getLogger("strategy_501_longm5m15")
 
 # 🔸 Класс стратегии
-class Strategy201Longm5m15:
+class Strategy501Longm5m15:
     # 🔸 Проверка сигнала на допустимость
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
