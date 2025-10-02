@@ -1,4 +1,4 @@
-# laboratory_decision_maker.py — обработчик решений (allow/deny): шторка по (gate_sid, symbol) c очередью, MW→(PACK параллельно), динамика blacklist, ответ и аудит
+# laboratory_decision_maker.py — обработчик решений (allow/deny): шторка по (gate_sid, symbol) c очередью, MW→(PACK параллельно), динамика blacklist, ответ и аудит (с client_strategy_id)
 
 import asyncio
 import json
@@ -524,11 +524,12 @@ async def _process_tf(
     return False, tf_trace
 
 
-# 🔸 Сохранение результата (после ответа)
+# 🔸 Сохранение результата (после ответа), с client_strategy_id
 async def _persist_decision(
     req_id: str,
     log_uid: str,
-    strategy_id: int,
+    strategy_id: int,            # master SID (WL/BL)
+    client_strategy_id: Optional[int],  # клиентский SID (gate), может быть None
     symbol: str,
     direction: str,
     tfr_req: str,
@@ -544,29 +545,57 @@ async def _persist_decision(
 ):
     query = """
     INSERT INTO public.signal_laboratory_entries
-    (req_id, log_uid, strategy_id, direction, symbol,
+    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
      timeframes_requested, timeframes_processed, protocol_version,
      allow, reason, tf_results, errors,
      received_at, finished_at, duration_ms, cache_hits, gateway_requests)
-    VALUES ($1,$2,$3,$4,$5,
-            $6,$7,'v1',
-            $8,$9, COALESCE($10::jsonb, NULL), NULL,
-            $11,$12,$13,$14,$15)
-    ON CONFLICT (log_uid, strategy_id) DO UPDATE
-      SET req_id=$1, direction=$4, symbol=$5,
-          timeframes_requested=$6, timeframes_processed=$7,
-          allow=$8, reason=$9, tf_results=COALESCE($10::jsonb, signal_laboratory_entries.tf_results),
-          finished_at=$12, duration_ms=$13, cache_hits=$14, gateway_requests=$15
+    VALUES ($1,$2,$3,$4,$5,$6,
+            $7,$8,'v1',
+            $9,$10, COALESCE($11::jsonb, NULL), NULL,
+            $12,$13,$14,$15,$16)
+    ON CONFLICT (log_uid, strategy_id) WHERE client_strategy_id IS NULL DO UPDATE
+      SET req_id=$1, direction=$5, symbol=$6,
+          timeframes_requested=$7, timeframes_processed=$8,
+          allow=$9, reason=$10, tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
+          finished_at=$13, duration_ms=$14, cache_hits=$15, gateway_requests=$16
+    """
+    # ВНИМАНИЕ: для кейсов с client_strategy_id IS NOT NULL действует отдельный уникальный индекс
+    # (log_uid, strategy_id, client_strategy_id). Для него используем второй UPSERT.
+    query_with_client = """
+    INSERT INTO public.signal_laboratory_entries
+    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
+     timeframes_requested, timeframes_processed, protocol_version,
+     allow, reason, tf_results, errors,
+     received_at, finished_at, duration_ms, cache_hits, gateway_requests)
+    VALUES ($1,$2,$3,$4,$5,$6,
+            $7,$8,'v1',
+            $9,$10, COALESCE($11::jsonb, NULL), NULL,
+            $12,$13,$14,$15,$16)
+    ON CONFLICT (log_uid, strategy_id, client_strategy_id) DO UPDATE
+      SET req_id=$1, direction=$5, symbol=$6,
+          timeframes_requested=$7, timeframes_processed=$8,
+          allow=$9, reason=$10, tf_results=COALESCE($11::jsonb, signal_laboratory_entries.tf_results),
+          finished_at=$13, duration_ms=$14, cache_hits=$15, gateway_requests=$16
     """
     async with infra.pg_pool.acquire() as conn:
-        await conn.execute(
-            query,
-            req_id, log_uid, strategy_id, direction, symbol,
-            tfr_req, tfr_proc,
-            allow, reason, tf_results_json,
-            received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
-        )
-    log.info("[AUDIT] 💾 Сохранено решение log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
+        if client_strategy_id is None:
+            await conn.execute(
+                query,
+                req_id, log_uid, strategy_id, None, direction, symbol,
+                tfr_req, tfr_proc,
+                allow, reason, tf_results_json,
+                received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
+            )
+        else:
+            await conn.execute(
+                query_with_client,
+                req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol,
+                tfr_req, tfr_proc,
+                allow, reason, tf_results_json,
+                received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
+            )
+    log.info("[AUDIT] 💾 Сохранено решение log_uid=%s master_sid=%s client_sid=%s allow=%s",
+             log_uid, strategy_id, client_strategy_id, allow)
 
 
 # 🔸 Шторка/очередь: попытка стать лидером или постановка в очередь
@@ -694,8 +723,8 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             log.info("[REQ] ❌ strategy_not_enabled %s", sid)
             return
 
-        log.info("[REQ] 📥 log_uid=%s sid=%s gate_sid=%s %s %s tfs=%s",
-                 log_uid, sid, gate_sid, symbol, direction, ",".join(tfs))
+        log.info("[REQ] 📥 log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s",
+                 log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs))
 
         # ждём «шторки» WL (коротко)
         await infra.wait_mw_ready(sid, timeout_sec=5.0)
@@ -721,8 +750,9 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 allow = False
                 if "mw" in tf_trace and not tf_trace["mw"].get("matched", True):
                     reason = f"mw_no_match@{tf}"
-                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 0 and tf_trace["pack"].get("wl_hits", 0) < (tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")):
-                    # BL сработал как блокирующий
+                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 1:
+                    reason = f"pack_blacklist_hit@{tf}"
+                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) == 1 and tf_trace["pack"].get("wl_hits", 0) < (tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")):
                     reason = f"pack_blacklist_hit@{tf}"
                 elif "pack" in tf_trace:
                     need = tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")
@@ -760,8 +790,8 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 pass
 
         await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
-        log.info("[RESP] 📤 log_uid=%s sid=%s gate_sid=%s allow=%s dur=%dms",
-                 log_uid, sid, gate_sid, allow, duration_ms)
+        log.info("[RESP] 📤 log_uid=%s master_sid=%s client_sid=%s allow=%s dur=%dms",
+                 log_uid, sid, (client_sid_s or "-"), allow, duration_ms)
 
         # запись в БД
         try:
@@ -770,6 +800,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 req_id=msg_id,
                 log_uid=log_uid,
                 strategy_id=sid,
+                client_strategy_id=int(client_sid_s) if client_sid_s.isdigit() else None,
                 symbol=symbol,
                 direction=direction,
                 tfr_req=tfs_raw,
@@ -784,7 +815,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 gateway_requests=telemetry.get("gateway_requests", 0),
             )
         except Exception:
-            log.exception("[AUDIT] ❌ Ошибка записи аудита log_uid=%s sid=%s", log_uid, sid)
+            log.exception("[AUDIT] ❌ Ошибка записи аудита log_uid=%s master_sid=%s client_sid=%s", log_uid, sid, client_sid_s or "-")
 
         # реакция ворот (используем gate_sid)
         await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow)
