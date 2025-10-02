@@ -10,7 +10,7 @@ from infra import infra
 log = logging.getLogger("strategy_201_longm5")
 
 # 🔸 Класс стратегии
-class Strategy201LongM5:
+class Strategy201Longm5:
     # 🔸 Проверка сигнала на допустимость
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
