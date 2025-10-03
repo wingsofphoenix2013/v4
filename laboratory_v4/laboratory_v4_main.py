@@ -24,6 +24,9 @@ from laboratory_config import (
 # 🔸 Обработчик решений (allow/deny)
 from laboratory_decision_maker import run_laboratory_decision_maker
 
+# 🔸 Пост-allow писатель статистики (filler)
+from laboratory_decision_filler import run_laboratory_decision_filler
+
 log = logging.getLogger("LAB_MAIN")
 
 
@@ -75,6 +78,8 @@ async def main():
         run_safe_loop(whitelist_stream_listener, "WL_STREAM_LISTENER"),
         # Обработчик решений (allow/deny) — Streams: decision_request → decision_response
         run_safe_loop(run_laboratory_decision_maker, "LAB_DECISION"),
+        # Пост-allow наполнитель статистики — Streams: laboratory_decision_filler → laboratoty_position_stat
+        run_safe_loop(run_laboratory_decision_filler, "LAB_DECISION_FILLER"),
     )
 
 

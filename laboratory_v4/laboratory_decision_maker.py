@@ -17,6 +17,7 @@ log = logging.getLogger("LAB_DECISION")
 DECISION_REQ_STREAM = "laboratory:decision_request"
 DECISION_RESP_STREAM = "laboratory:decision_response"
 GATEWAY_REQ_STREAM = "indicator_gateway_request"
+DECISION_FILLER_STREAM = "laboratory_decision_filler"
 
 # 🔸 Параметры производительности
 XREAD_BLOCK_MS = 2000
@@ -566,7 +567,7 @@ async def _persist_decision(
                 req_id, direction, symbol, tfr_req, tfr_proc, allow, reason, tf_results_json, finished_at_dt, duration_ms, cache_hits, gateway_requests, log_uid, strategy_id
             )
             if upd_status.startswith("UPDATE 1"):
-                log.info("[AUDIT] 💾 UPDATE (master-only) log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
+                log.debug("[AUDIT] 💾 UPDATE (master-only) log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
                 return
 
             # 2) INSERT … DO NOTHING (client_strategy_id=NULL)
@@ -587,7 +588,7 @@ async def _persist_decision(
                 req_id, log_uid, strategy_id, direction, symbol, tfr_req, tfr_proc, allow, reason, tf_results_json, received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
             )
             if ins_status.endswith(" 1"):
-                log.info("[AUDIT] 💾 INSERT (master-only) log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
+                log.debug("[AUDIT] 💾 INSERT (master-only) log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
                 return
 
             # 3) В гонке — повторный UPDATE
@@ -611,7 +612,7 @@ async def _persist_decision(
                 req_id, direction, symbol, tfr_req, tfr_proc, allow, reason, tf_results_json,
                 finished_at_dt, duration_ms, cache_hits, gateway_requests, log_uid, strategy_id
             )
-            log.info("[AUDIT] 💾 UPDATE (race-master) log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
+            log.debug("[AUDIT] 💾 UPDATE (race-master) log_uid=%s sid=%s allow=%s", log_uid, strategy_id, allow)
             return
 
         else:
@@ -639,7 +640,7 @@ async def _persist_decision(
                 req_id, direction, symbol, tfr_req, tfr_proc, allow, reason, tf_results_json, finished_at_dt, duration_ms, cache_hits, gateway_requests, log_uid, strategy_id, int(client_strategy_id)
             )
             if upd_status.startswith("UPDATE 1"):
-                log.info("[AUDIT] 💾 UPDATE (client) log_uid=%s sid=%s csid=%s allow=%s", log_uid, strategy_id, client_strategy_id, allow)
+                log.debug("[AUDIT] 💾 UPDATE (client) log_uid=%s sid=%s csid=%s allow=%s", log_uid, strategy_id, client_strategy_id, allow)
                 return
 
             # 2) INSERT … DO NOTHING (client_strategy_id NOT NULL)
@@ -660,7 +661,7 @@ async def _persist_decision(
                 req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol, tfr_req, tfr_proc, allow, reason, tf_results_json, received_at_dt, finished_at_dt, duration_ms, cache_hits, gateway_requests
             )
             if ins_status.endswith(" 1"):
-                log.info("[AUDIT] 💾 INSERT (client) log_uid=%s sid=%s csid=%s allow=%s", log_uid, strategy_id, client_strategy_id, allow)
+                log.debug("[AUDIT] 💾 INSERT (client) log_uid=%s sid=%s csid=%s allow=%s", log_uid, strategy_id, client_strategy_id, allow)
                 return
 
             # 3) В гонке — повторный UPDATE
@@ -684,7 +685,7 @@ async def _persist_decision(
                 req_id, direction, symbol, tfr_req, tfr_proc, allow, reason, tf_results_json,
                 finished_at_dt, duration_ms, cache_hits, gateway_requests, log_uid, strategy_id, int(client_strategy_id)
             )
-            log.info("[AUDIT] 💾 UPDATE (race-client) log_uid=%s sid=%s csid=%s allow=%s", log_uid, strategy_id, client_strategy_id, allow)
+            log.debug("[AUDIT] 💾 UPDATE (race-client) log_uid=%s sid=%s csid=%s allow=%s", log_uid, strategy_id, client_strategy_id, allow)
             return
             
 # 🔸 Шторка/очередь: попытка стать лидером или постановка в очередь
@@ -757,7 +758,6 @@ async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, al
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-
 # 🔸 Ядро обработки запроса (для лидера)
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
     async with _decisions_sem:
@@ -813,7 +813,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             return
 
         log.debug("[REQ] 📥 log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s",
-                 log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs))
+                  log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs))
 
         # ждём «шторки» WL (коротко)
         await infra.wait_mw_ready(sid, timeout_sec=5.0)
@@ -880,9 +880,39 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
         await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
         log.debug("[RESP] 📤 log_uid=%s master_sid=%s client_sid=%s allow=%s dur=%dms",
-                 log_uid, sid, (client_sid_s or "-"), allow, duration_ms)
+                  log_uid, sid, (client_sid_s or "-"), allow, duration_ms)
 
-        # запись в БД
+        # 🔸 Публикация seed-события для наполнителя статистики (только при allow=true)
+        if allow:
+            # Определяем, участвовал ли PACK в решении (для инфо; не влияет на семантику)
+            trace_basis = "mw_only"
+            if (not trace_flag and reason is None) or trace_flag:
+                try:
+                    if trace_flag and any(("pack" in tr) for tr in tf_results):
+                        trace_basis = "mw_pack"
+                    # если trace выключен, но в будущем захотим эвристику — можно оставить mw_only
+                except Exception:
+                    trace_basis = "mw_only"
+
+            filler_payload = {
+                "log_uid": log_uid,
+                "strategy_id": str(sid),
+                "symbol": symbol,
+                "direction": direction,
+                "timeframes": ",".join(tfs),
+                "trace_basis": trace_basis,
+            }
+            if client_sid_s:
+                filler_payload["client_strategy_id"] = client_sid_s
+
+            try:
+                await infra.redis_client.xadd(DECISION_FILLER_STREAM, filler_payload)
+                log.debug("[FILLER] seed published log_uid=%s master_sid=%s client_sid=%s tfs=%s",
+                         log_uid, sid, (client_sid_s or "-"), ",".join(tfs))
+            except Exception:
+                log.exception("[FILLER] ❌ Ошибка публикации seed-события log_uid=%s", log_uid)
+
+        # запись в БД (журнал решений)
         try:
             tf_results_json = json.dumps(tf_results, ensure_ascii=False) if trace_flag else None
             await _persist_decision(
@@ -908,7 +938,6 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
         # реакция ворот (используем gate_sid)
         await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow)
-
 
 # 🔸 Обработка входящего: шторка/очередь → лидер или ожидание
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
