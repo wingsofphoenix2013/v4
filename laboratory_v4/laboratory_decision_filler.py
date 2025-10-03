@@ -1,4 +1,4 @@
-# laboratory_decision_filler.py — post-allow «писатель» статистики: читает seed-ивенты, собирает ВСЕ совпадения MW/PACK по TF и пишет в laboratoty_position_stat
+# laboratory_decision_filler.py — post-allow «писатель» статистики:
 
 import asyncio
 import json
@@ -14,8 +14,13 @@ import laboratory_infra as infra
 log = logging.getLogger("LAB_DECISION_FILLER")
 
 # 🔸 Потоки и шлюз
-DECISION_FILLER_STREAM = "laboratory_decision_filler"       # источник seed-событий от decision_maker
-GATEWAY_REQ_STREAM      = "indicator_gateway_request"       # indicator_gateway входящий стрим
+DECISION_FILLER_STREAM   = "laboratory_decision_filler"  # источник seed-событий от decision_maker
+POSITION_CLOSE_STREAM    = "signal_log_queue"            # поток событий по позициям (от стратегий)
+GATEWAY_REQ_STREAM       = "indicator_gateway_request"   # indicator_gateway входящий стрим
+
+# 🔸 Consumer Group для закрытий (чтобы не мешать другим)
+POS_CLOSE_GROUP          = "lab_pos_closed"
+POS_CLOSE_CONSUMER       = "filler-consumer-1"
 
 # 🔸 Производительность
 XREAD_BLOCK_MS = 2000
@@ -268,7 +273,7 @@ async def _collect_mw(
     return states, matches
 
 
-# 🔸 PACK: собрать ВСЕ WL/BL совпадения (по WL/BL таблицам)
+# 🔸 PACK: собрать ВСЕ WL/BL совпадения и счётчики по семействам
 async def _collect_pack(
     sid: int,
     symbol: str,
@@ -358,7 +363,6 @@ async def _collect_pack(
             }
             if list_type == "whitelist":
                 wl_matches.append(det)
-                # считаем по семействам WL
                 if ind in wl_family_counts:
                     wl_family_counts[ind] += 1
             elif list_type == "blacklist":
@@ -590,7 +594,71 @@ async def _process_seed(msg_id: str, fields: Dict[str, str]):
                  log_uid, sid, client_sid, ",".join(tfs), dur)
 
 
-# 🔸 Главный слушатель filler-стрима
+# 🔸 Обработка события закрытия позиции из signal_log_queue
+async def _process_position_closed(msg_id: str, fields: Dict[str, str]):
+    """
+    Сообщение публикуется ПОСЛЕ записи в positions_v4 — позиция уже есть.
+    Берём log_uid, client_strategy_id (из strategy_id поля события), position_uid и дописываем в laboratoty_position_stat:
+    position_uid, pnl, result, closed_at — для всех TF по (log_uid, client_strategy_id).
+    """
+    log_uid = fields.get("log_uid") or ""
+    client_sid_s = fields.get("strategy_id") or ""  # в этом стриме это ИМЕННО клиентская стратегия
+    status = (fields.get("status") or "").strip().lower()
+    position_uid = fields.get("position_uid") or ""
+
+    if status != "closed":
+        # игнорируем другие статусы; ack произойдёт в вызывающем месте
+        log.debug("[CLOSE] skip non-closed msg=%s status=%s", msg_id, status)
+        return
+
+    if not log_uid or not client_sid_s.isdigit() or not position_uid:
+        log.debug("[CLOSE] ❌ bad closed event msg=%s fields=%s", msg_id, fields)
+        return
+
+    client_sid = int(client_sid_s)
+
+    # читаем факт позиции
+    async with infra.pg_pool.acquire() as conn:
+        pos = await conn.fetchrow(
+            """
+            SELECT id, position_uid, pnl, closed_at
+            FROM public.positions_v4
+            WHERE position_uid = $1
+            """,
+            position_uid
+        )
+        if not pos:
+            # по условиям это маловероятно (событие публикуется после записи), но если так — просто лог и выходим
+            log.debug("[CLOSE] ℹ️ position not found (uid=%s), skip", position_uid)
+            return
+
+        pnl = pos["pnl"]
+        closed_at = pos["closed_at"] or datetime.utcnow()
+        result = (pnl is not None and pnl > 0)
+
+        # апдейт ВСЕХ TF-строк по (log_uid, client_sid)
+        upd_status = await conn.execute(
+            """
+            UPDATE public.laboratoty_position_stat
+               SET position_uid = $1,
+                   pnl = $2,
+                   result = $3,
+                   closed_at = $4,
+                   updated_at = NOW()
+             WHERE log_uid = $5
+               AND client_strategy_id = $6
+            """,
+            position_uid, pnl, result, closed_at, log_uid, client_sid
+        )
+
+        # Если обновлено 0 строк — это не ошибка (старые позиции, мы их не обогащали seed'ом)
+        if upd_status.startswith("UPDATE 0"):
+            log.debug("[CLOSE] ℹ️ no LPS rows for log_uid=%s csid=%s (probably legacy), skip", log_uid, client_sid)
+        else:
+            log.info("[CLOSE] ✅ LPS updated for log_uid=%s csid=%s (%s)", log_uid, client_sid, upd_status)
+
+
+# 🔸 Главный слушатель seed-стрима
 async def run_laboratory_decision_filler():
     """
     Слушает laboratory_decision_filler и формирует строки в laboratoty_position_stat:
@@ -599,7 +667,7 @@ async def run_laboratory_decision_filler():
       — делает upsert (без позиционных полей).
     Обрабатывает только НОВЫЕ сообщения (старт с '$').
     """
-    log.debug("🛰️ LAB_DECISION_FILLER слушатель запущен (BLOCK=%d COUNT=%d MAX=%d)",
+    log.debug("🛰️ LAB_DECISION_FILLER(seeds) запущен (BLOCK=%d COUNT=%d MAX=%d)",
              XREAD_BLOCK_MS, XREAD_COUNT, MAX_IN_FLIGHT)
 
     last_id = "$"
@@ -618,8 +686,58 @@ async def run_laboratory_decision_filler():
                     asyncio.create_task(_process_seed(msg_id, fields))
 
         except asyncio.CancelledError:
-            log.debug("⏹️ LAB_DECISION_FILLER остановлен по сигналу")
+            log.debug("⏹️ LAB_DECISION_FILLER(seeds) остановлен по сигналу")
             raise
         except Exception:
-            log.exception("❌ LAB_DECISION_FILLER ошибка в основном цикле")
+            log.exception("❌ LAB_DECISION_FILLER(seeds) ошибка в основном цикле")
+            await asyncio.sleep(1.0)
+
+
+# 🔸 Слушатель закрытий позиций (consumer group, чтобы не мешать другим)
+async def run_position_close_updater():
+    """
+    Слушает signal_log_queue в своей consumer group и дописывает финальные поля в laboratoty_position_stat
+    по каждому закрытию позиции (status=closed).
+    """
+    log.debug("🛰️ LAB_DECISION_FILLER(close) запущен (GROUP=%s)", POS_CLOSE_GROUP)
+    redis = infra.redis_client
+
+    # создаём consumer group идемпотентно
+    try:
+        await redis.xgroup_create(POS_CLOSE_STREAM=POSITION_CLOSE_STREAM)  # intentionally wrong to force NameError to remind fix
+    except TypeError:
+        # корректный вызов:
+        try:
+            await redis.xgroup_create(POSITION_CLOSE_STREAM, POS_CLOSE_GROUP, id="$", mkstream=True)
+        except Exception as e:
+            if "BUSYGROUP" not in str(e):
+                log.warning("xgroup_create error: %s", e)
+
+    while True:
+        try:
+            resp = await redis.xreadgroup(
+                POS_CLOSE_GROUP, POS_CLOSE_CONSUMER,
+                streams={POSITION_CLOSE_STREAM: ">"},
+                count=XREAD_COUNT,
+                block=XREAD_BLOCK_MS
+            )
+            if not resp:
+                continue
+
+            for _, messages in resp:
+                for msg_id, fields in messages:
+                    try:
+                        await _process_position_closed(msg_id, fields)
+                        # подтверждаем обработку независимо от того, были LPS-строки или нет
+                        await redis.xack(POSITION_CLOSE_STREAM, POS_CLOSE_GROUP, msg_id)
+                    except Exception:
+                        log.exception("[CLOSE] ❌ Ошибка обработки msg=%s", msg_id)
+                        # ack всё равно, чтобы не зациклиться (нагрузка низкая, сообщений много не будет)
+                        await redis.xack(POSITION_CLOSE_STREAM, POS_CLOSE_GROUP, msg_id)
+
+        except asyncio.CancelledError:
+            log.debug("⏹️ LAB_DECISION_FILLER(close) остановлен по сигналу")
+            raise
+        except Exception:
+            log.exception("❌ LAB_DECISION_FILLER(close) ошибка в основном цикле")
             await asyncio.sleep(1.0)
