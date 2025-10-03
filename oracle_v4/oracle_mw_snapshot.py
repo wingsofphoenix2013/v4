@@ -139,19 +139,17 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
             strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
         )
 
-
-# 🔸 Создание черновика шапки отчёта
+# 🔸 Создание черновика шапки отчёта (с указанием source='mw')
 async def _create_report_header(conn, strategy_id: int, time_frame: str, win_start: datetime, win_end: datetime) -> int:
     row = await conn.fetchrow(
         """
-        INSERT INTO oracle_report_stat (strategy_id, time_frame, window_start, window_end)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO oracle_report_stat (strategy_id, time_frame, window_start, window_end, source)
+        VALUES ($1, $2, $3, $4, 'mw')
         RETURNING id
         """,
         strategy_id, time_frame, win_start, win_end
     )
     return int(row["id"])
-
 
 # 🔸 Расчёт агрегатов для шапки (одним SQL)
 async def _calc_report_head_metrics(conn, strategy_id: int, win_start: datetime, win_end: datetime):

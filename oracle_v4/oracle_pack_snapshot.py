@@ -269,13 +269,13 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
             strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
         )
 
-# 🔸 Создание (или возврат id) шапки отчёта
+# 🔸 Создание (или возврат id) шапки отчёта (source='pack')
 async def _create_report_header(conn, strategy_id: int, time_frame: str, win_start: datetime, win_end: datetime) -> int:
     row = await conn.fetchrow(
         """
-        INSERT INTO oracle_report_stat (strategy_id, time_frame, window_start, window_end)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (strategy_id, time_frame, window_start, window_end)
+        INSERT INTO oracle_report_stat (strategy_id, time_frame, window_start, window_end, source)
+        VALUES ($1, $2, $3, $4, 'pack')
+        ON CONFLICT (strategy_id, time_frame, window_start, window_end, source)
         DO UPDATE SET created_at = oracle_report_stat.created_at
         RETURNING id
         """,

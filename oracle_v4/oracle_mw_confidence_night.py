@@ -23,7 +23,7 @@ from oracle_mw_confidence import (
 log = logging.getLogger("ORACLE_CONFIDENCE_NIGHT")
 
 # 🔸 Параметры запуска воркера (задержка старта и интервал в часах — подключаются через run_periodic в main)
-INITIAL_DELAY_H = 3        # первый запуск через 24 часа после старта сервиса
+INITIAL_DELAY_H = 25        # первый запуск через 3 часа после старта сервиса
 INTERVAL_H      = 24        # затем раз в 24 часа
 
 # 🔸 Параметры обучения/отбора
@@ -59,7 +59,7 @@ async def run_oracle_confidence_night():
                 except Exception:
                     log.exception("❌ Ошибка тюнинга весов: strategy_id=%s, time_frame=%s", sid, tf)
 
-    log.debug("✅ Ночной тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
+    log.info("✅ Ночной тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
 
 
 # 🔸 Загрузка целевых стратегий
@@ -85,14 +85,14 @@ async def _train_and_activate_weights(conn, strategy_id: int, time_frame: str) -
         """
         SELECT id, created_at
         FROM oracle_report_stat
-        WHERE strategy_id = $1 AND time_frame = $2
+        WHERE strategy_id = $1 AND time_frame = $2 AND source = 'mw'
         ORDER BY created_at ASC
         LIMIT $3
         """,
         strategy_id, time_frame, limit_reports
     )
     if len(reports) < 3:
-        log.debug("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
+        log.info("ℹ️ strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
         return False
 
     # пары (t, t+1) по времени
@@ -153,6 +153,7 @@ async def _train_and_activate_weights(conn, strategy_id: int, time_frame: str) -
             WHERE strategy_id = $1
               AND window_end  = $2
               AND time_frame  IN ('7d','14d','28d')
+              AND source = 'mw'
             """,
             int(hdr_t["strategy_id"]), hdr_t["window_end"]
         )
@@ -232,7 +233,7 @@ async def _train_and_activate_weights(conn, strategy_id: int, time_frame: str) -
 
     samples = len(Y)
     if samples < MIN_SAMPLES_PER_STRATEGY:
-        log.debug("ℹ️ strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
+        log.info("ℹ️ strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
                  strategy_id, time_frame, samples, MIN_SAMPLES_PER_STRATEGY)
         return False
 
@@ -283,7 +284,7 @@ async def _train_and_activate_weights(conn, strategy_id: int, time_frame: str) -
         json.dumps(weights),
         '{"baseline_mode":"neutral"}',
     )
-    log.debug("✅ Активированы новые веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
+    log.info("✅ Активированы новые веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
     return True
 
 

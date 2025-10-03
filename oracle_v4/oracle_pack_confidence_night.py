@@ -15,12 +15,14 @@ from oracle_mw_confidence import (
     _wilson_lower_bound, _wilson_bounds,
     _ecdf_rank, _median, _mad, _iqr,
 )
+# 🔸 стабильность S для PACK берём из рантайм-воркера PACK-confidence
+from oracle_pack_confidence import _stability_key_dynamic_pack
 
 # 🔸 Логгер
 log = logging.getLogger("ORACLE_PACK_CONFIDENCE_NIGHT")
 
 # 🔸 Параметры запуска воркера (запускается через run_periodic в oracle_v4_main)
-INITIAL_DELAY_H = 3        # первый запуск через 24 часа после старта сервиса
+INITIAL_DELAY_H = 25        # первый запуск через 24 часа после старта сервиса
 INTERVAL_H      = 24        # затем раз в 24 часа
 
 # 🔸 Параметры обучения/отбора
@@ -56,7 +58,7 @@ async def run_oracle_pack_confidence_night():
                 except Exception:
                     log.exception("❌ Ошибка PACK-тюнинга весов: strategy_id=%s, time_frame=%s", sid, tf)
 
-    log.debug("✅ Ночной PACK-тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
+    log.info("✅ Ночной PACK-тюнер завершён: обновлено активных весов для %d пар (strategy_id × time_frame)", updated_total)
 
 
 # 🔸 Загрузка целевых стратегий
@@ -82,7 +84,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
         """
         SELECT id, created_at
         FROM oracle_report_stat
-        WHERE strategy_id = $1 AND time_frame = $2
+        WHERE strategy_id = $1 AND time_frame = $2 AND source = 'pack'
         ORDER BY created_at ASC
         LIMIT $3
         """,
@@ -152,6 +154,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
             WHERE strategy_id = $1
               AND window_end  = $2
               AND time_frame  IN ('7d','14d','28d')
+              AND source = 'pack'
             """,
             int(hdr_t["strategy_id"]), hdr_t["window_end"]
         )
@@ -189,7 +192,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
                 C_t = 0.0
 
             # S (на t) — робастная стабильность wr
-            S_t, _len_hist, _meta = await _stability_key_dynamic_pack(conn, row_t, L, cohort_cache[cohort_key])
+            S_t, _len_hist, _meta = _stability_key_dynamic_pack(row_t, L, cohort_cache[cohort_key])
 
             # целевая метка y: оба знака относительно baseline уверенные и совпадают
             y = _target_same_sign_next_pack(row_t, row_next)
@@ -250,7 +253,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
         json.dumps(weights),
         '{"baseline_mode":"neutral"}',
     )
-    log.debug("✅ Активированы новые PACK-веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
+    log.info("✅ Активированы новые PACK-веса для strategy=%s tf=%s: %s", strategy_id, time_frame, weights)
     return True
 
 
@@ -285,6 +288,7 @@ async def _persistence_metrics_pack(conn, row: dict, L: int) -> Tuple[float, flo
           WHERE strategy_id = $1
             AND time_frame  = $2
             AND created_at <= $3
+            AND source = 'pack'
           ORDER BY created_at DESC
           LIMIT $4
         )

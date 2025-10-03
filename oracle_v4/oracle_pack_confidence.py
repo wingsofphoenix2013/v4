@@ -146,6 +146,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             WHERE strategy_id = $1
               AND window_end  = $2
               AND time_frame IN ('7d','14d','28d')
+              AND source = 'pack'
             """,
             int(strategy_id), window_end_dt
         )
@@ -538,6 +539,7 @@ async def _persistence_matrix_pack(conn, strategy_id: int, time_frame: str, cuto
         WHERE strategy_id = $1
           AND time_frame  = $2
           AND created_at <= $3
+          AND source = 'pack'
         ORDER BY created_at DESC
         LIMIT $4
         """,

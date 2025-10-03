@@ -25,8 +25,8 @@ SENSE_REPORT_READY_MAXLEN = 10_000
 # 🔸 Параллелизм
 MAX_CONCURRENT_STRATEGIES = 2  # одновременно обрабатываем до 2 стратегий (комплектов window_end)
 
-# 🔸 Геометрия окна (шаг 4 часа → 6 прогонов в сутки)
-WINDOW_STEPS = {"7d": 7 * 6, "14d": 14 * 6, "28d": 28 * 6}
+# Геометрия окна (шаг 6 часов → 4 прогона в сутки)
+WINDOW_STEPS = {"7d": 7 * 4, "14d": 14 * 4, "28d": 28 * 4}
 
 # 🔸 Параметры статистики
 Z = 1.96
@@ -143,6 +143,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             WHERE strategy_id = $1
               AND window_end  = $2
               AND time_frame IN ('7d','14d','28d')
+              AND source = 'mw'
             """,
             int(strategy_id), window_end_dt
         )
@@ -495,6 +496,7 @@ async def _persistence_matrix_mw(conn, strategy_id: int, time_frame: str, cutoff
         WHERE strategy_id = $1
           AND time_frame  = $2
           AND created_at <= $3
+          AND source = 'mw'
         ORDER BY created_at DESC
         LIMIT $4
         """,
