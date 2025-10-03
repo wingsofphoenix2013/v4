@@ -584,7 +584,7 @@ async def _process_seed(msg_id: str, fields: Dict[str, str]):
                     pack_bl_matches=pack_bl_matches,
                     wl_family_counts=wl_family_counts,
                 )
-                log.info("[FILLER] ✅ TF записан log_uid=%s sid=%s csid=%s %s %s", log_uid, sid, client_sid, symbol, tf)
+                log.debug("[FILLER] ✅ TF записан log_uid=%s sid=%s csid=%s %s %s", log_uid, sid, client_sid, symbol, tf)
 
             except Exception:
                 log.exception("[FILLER] ❌ Ошибка TF log_uid=%s sid=%s tf=%s", log_uid, sid, tf)
@@ -655,7 +655,7 @@ async def _process_position_closed(msg_id: str, fields: Dict[str, str]):
         if upd_status.startswith("UPDATE 0"):
             log.debug("[CLOSE] ℹ️ no LPS rows for log_uid=%s csid=%s (probably legacy), skip", log_uid, client_sid)
         else:
-            log.info("[CLOSE] ✅ LPS updated for log_uid=%s csid=%s (%s)", log_uid, client_sid, upd_status)
+            log.debug("[CLOSE] ✅ LPS updated for log_uid=%s csid=%s (%s)", log_uid, client_sid, upd_status)
 
 
 # 🔸 Главный слушатель seed-стрима

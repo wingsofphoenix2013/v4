@@ -404,8 +404,7 @@ def _pack_bl_wl_stats_with_details(
 
     return bl_hits, wl_hits, bl_details, wl_details, bl_winrates
 
-
-# 🔸 Обработка одного TF (MW → PACK с динамикой blacklist)
+# 🔸 Обработка одного TF (MW → PACK; PACK проверяется на BL всегда, даже при MW confirmation=0)
 async def _process_tf(
     sid: int,
     symbol: str,
@@ -415,6 +414,14 @@ async def _process_tf(
     deadline_ms: int,
     telemetry: Dict[str, int],
 ) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Возвращает (tf_ok, trace_obj)
+    Новая политика:
+      - MW: если совпадений нет → отказ.
+      - MW: если confirmation=0 → TF пройдёт ТОЛЬКО если в PACK нет ни одного BL-хита; WL не требуется.
+      - MW: если confirmation=1|2 → PACK должен дать WL-хитов >= confirmation И не дать ни одного BL-хита.
+      - Никакой динамики/послаблений по BL — BL>=1 ⇒ отказ.
+    """
     tf_trace: Dict[str, Any] = {"tf": tf}
 
     mw_rows_all = (infra.mw_wl_by_strategy.get(sid) or {}).get("rows", [])
@@ -425,11 +432,13 @@ async def _process_tf(
 
     log.debug("[TF:%s] 🔎 WL срезы: MW=%d PACK=%d (sid=%s %s %s)", tf, len(mw_rows), len(pack_rows), sid, symbol, direction)
 
+    # 1) MW: если по TF нет ни одного MW-матча — отказ
     if not mw_rows:
         tf_trace["mw"] = {"matched": False}
         log.debug("[TF:%s] ❌ MW: нет строк в WL — отказ", tf)
         return False, tf_trace
 
+    # 2) Определяем, какие MW-базы нужны и снимаем текущее состояние
     needed_bases: List[str] = []
     for r in mw_rows:
         base = (r.get("agg_base") or "").strip().lower()
@@ -442,6 +451,7 @@ async def _process_tf(
     precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
     states = await _get_mw_states(symbol, tf, needed_bases, precision, deadline_ms)
 
+    # 3) MW: считаем, прошли ли матчи и что требует MW (0/1/2)
     matched, conf_req = _mw_match_and_required_confirmation(mw_rows, states)
     if trace:
         tf_trace["mw"] = {"matched": matched}
@@ -451,78 +461,54 @@ async def _process_tf(
         log.debug("[TF:%s] ❌ MW: совпадений нет — отказ", tf)
         return False, tf_trace
 
-    if conf_req == 0:
-        log.debug("[TF:%s] ✅ MW: confirmation=0 — TF пройден без PACK", tf)
-        return True, tf_trace
-
-    # PACK
+    # 4) PACK: собираем pack_base из WL/BL по TF; получаем объекты (cache-first → gateway)
+    #    ВАЖНО: PACK проверяется ВСЕГДА — даже при confirmation=0 (мы ищем BL).
     bases: List[str] = []
     for r in pack_rows:
         base = (r.get("pack_base") or "").strip().lower()
         if base and base not in bases:
             bases.append(base)
-    if not bases:
-        tf_trace["pack"] = {"bl_hits": 0, "wl_hits": 0, "required": conf_req}
-        log.debug("[TF:%s] ❌ PACK: WL пуст — подтверждений нет (need=%s)", tf, conf_req)
-        return False, tf_trace
 
-    pack_objs = await _get_pack_objects_for_bases(symbol, tf, bases, precision, deadline_ms)
-    bl_hits, wl_hits, bl_details, wl_details, bl_winrates = _pack_bl_wl_stats_with_details(pack_rows, pack_objs)
+    pack_objs: Dict[str, Optional[dict]] = {}
+    if bases:
+        pack_objs = await _get_pack_objects_for_bases(symbol, tf, bases, precision, deadline_ms)
 
-    # Динамическая шкала по blacklist
-    extra_required = 0
-    total_required = conf_req
-
-    if bl_hits > 1:
-        if trace:
-            tf_trace["pack"] = {
-                "bl_hits": bl_hits, "wl_hits": wl_hits,
-                "required": conf_req, "extra_required": None, "total_required": None,
-                "bl_details": bl_details, "wl_details": wl_details,
-            }
-        log.debug("[TF:%s] ❌ PACK: blacklist count > 1 — отказ", tf)
-        return False, tf_trace
-
-    if bl_hits == 1:
-        w = min(bl_winrates) if bl_winrates else None
-        if w is not None:
-            if w < 0.35:
-                if trace:
-                    tf_trace["pack"] = {
-                        "bl_hits": bl_hits, "wl_hits": wl_hits,
-                        "required": conf_req, "extra_required": None, "total_required": None,
-                        "bl_details": bl_details, "wl_details": wl_details,
-                    }
-                log.debug("[TF:%s] ❌ PACK: blacklist w=%.3f < 0.35 — отказ", tf, w)
-                return False, tf_trace
-            elif 0.35 <= w < 0.40:
-                extra_required = 3
-            elif 0.40 <= w < 0.45:
-                extra_required = 2
-            elif 0.45 <= w < 0.50:
-                extra_required = 1
-            elif w >= 0.50:
-                extra_required = 1
-
-    total_required = conf_req + extra_required
+    # 5) Считаем BL/WL совпадения (детали вернём в trace)
+    bl_hit, wl_hits, bl_details, wl_details = False, 0, [], []
+    if pack_rows and pack_objs:
+        # переиспользуем функцию с деталями
+        _bl_hit, _wl_hits, _bl_details, _wl_details = _pack_bl_wl_stats_with_details(pack_rows, pack_objs)
+        bl_hit, wl_hits, bl_details, wl_details = _bl_hit, _wl_hits, _bl_details, _wl_details
 
     if trace:
         tf_trace["pack"] = {
-            "bl_hits": bl_hits,
+            "bl_hits": int(bl_hit),
             "wl_hits": wl_hits,
-            "required": conf_req,
-            "extra_required": extra_required,
-            "total_required": total_required,
+            "required": conf_req if conf_req else 0,  # для наглядности
             "bl_details": bl_details,
             "wl_details": wl_details,
         }
 
-    if wl_hits >= total_required:
-        log.debug("[TF:%s] ✅ PACK: подтверждений достаточно (need=%s got=%s)", tf, total_required, wl_hits)
-        return True, tf_trace
+    # 6) Новые правила по PACK
 
-    log.debug("[TF:%s] ❌ PACK: подтверждений недостаточно (need=%s got=%s)", tf, total_required, wl_hits)
-    return False, tf_trace
+    # 6.1) Любой BL-хит ⇒ отказ немедленно (без послаблений)
+    if bl_hit:
+        log.debug("[TF:%s] ❌ PACK: blacklist hit — отказ", tf)
+        return False, tf_trace
+
+    # 6.2) Если MW требовал подтверждения (1 или 2) — WL-хитов должно хватить
+    if conf_req in (1, 2):
+        if wl_hits >= conf_req:
+            log.debug("[TF:%s] ✅ PACK: wl_hits достаточно (need=%s got=%s)", tf, conf_req, wl_hits)
+            return True, tf_trace
+        else:
+            log.debug("[TF:%s] ❌ PACK: wl_hits недостаточно (need=%s got=%s)", tf, conf_req, wl_hits)
+            return False, tf_trace
+
+    # 6.3) Если MW дал confirmation=0 — TF пройдёт, т.к. BL уже проверили и его нет
+    #      (WL-хиты в этом случае не требуются)
+    log.debug("[TF:%s] ✅ MW: confirmation=0 и BL нет — TF пройден", tf)
+    return True, tf_trace
 
 # 🔸 Сохранение результата (после ответа), с client_strategy_id — двухфазный upsert для partial unique indexes
 async def _persist_decision(
@@ -837,18 +823,20 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
             if not tf_ok:
                 allow = False
+                # Причина отказа по новой политике:
                 if "mw" in tf_trace and not tf_trace["mw"].get("matched", True):
                     reason = f"mw_no_match@{tf}"
-                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 1:
-                    reason = f"pack_blacklist_hit@{tf}"
-                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) == 1 and tf_trace["pack"].get("wl_hits", 0) < (tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")):
+                elif "pack" in tf_trace and tf_trace["pack"].get("bl_hits", 0) > 0:
+                    # Любой BL-хит => немедленный отказ
                     reason = f"pack_blacklist_hit@{tf}"
                 elif "pack" in tf_trace:
-                    need = tf_trace["pack"].get("total_required") or tf_trace["pack"].get("required")
-                    got = tf_trace["pack"].get("wl_hits")
+                    # Недостаточно WL-подтверждений при conf=1|2
+                    need = tf_trace["pack"].get("required", 0)
+                    got  = tf_trace["pack"].get("wl_hits", 0)
                     reason = f"pack_not_enough_confirm@{tf}: need={need} got={got}"
                 else:
                     reason = f"deny@{tf}"
+
                 log.debug("[TF:%s] ⛔ Останов по причине: %s", tf, reason)
                 break
             else:
