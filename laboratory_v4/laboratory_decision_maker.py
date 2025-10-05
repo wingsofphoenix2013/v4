@@ -426,9 +426,14 @@ async def _process_tf(
     """
     tf_trace: Dict[str, Any] = {"tf": tf}
 
+    # старт TF-проверки
+    log.debug("[TF:%s] ▶️ start sid=%s symbol=%s dir=%s mode=%s", tf, sid, symbol, direction,
+             "mw_then_pack" if use_pack_fallback else "mw_only")
+
     # 1) MW: строки WL по TF/направлению
     mw_rows_all = (infra.mw_wl_by_strategy.get(sid) or {}).get("rows", [])
     mw_rows = [r for r in mw_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
+    log.info("[TF:%s] MW rows: %d", tf, len(mw_rows))
 
     # Если по TF нет MW-строк вовсе
     if not mw_rows:
@@ -436,6 +441,7 @@ async def _process_tf(
             tf_trace["mw"] = {"matched": False}
         # При отсутствии строк MW переходим сразу к fallback (если включён)
         if not use_pack_fallback:
+            log.debug("[TF:%s] ❌ no MW rules and fallback=OFF — deny", tf)
             return False, tf_trace
     else:
         # 2) Снимаем MW-состояния и проверяем совпадения
@@ -449,7 +455,10 @@ async def _process_tf(
                     needed_bases.append(b)
 
         precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
+        log.debug("[TF:%s] MW bases to read: %s", tf, ",".join(needed_bases) if needed_bases else "-")
         states = await _get_mw_states(symbol, tf, needed_bases, precision, deadline_ms)
+        # чтобы не шуметь — показываем коротко
+        log.info("[TF:%s] MW states: %s", tf, states if states else "{}")
 
         matched, _ = _mw_match_and_required_confirmation(mw_rows, states)
         if trace:
@@ -457,12 +466,16 @@ async def _process_tf(
 
         if matched:
             # MW дал минимум одно совпадение — TF пройден
+            log.info("[TF:%s] ✅ allow by MW", tf)
             tf_trace["origin"] = "mw"
             return True, tf_trace
+        else:
+            log.info("[TF:%s] ℹ️ MW has no matches", tf)
 
     # 3) Fallback по PACK WL (только если разрешён)
     if not use_pack_fallback:
         # MW не совпал и fallback выключен
+        log.info("[TF:%s] ❌ fallback=OFF — deny", tf)
         return False, tf_trace
 
     # PACK-строки WL/BL по TF/направлению (в решении используем только WL)
@@ -476,6 +489,7 @@ async def _process_tf(
         if base and base not in bases:
             bases.append(base)
 
+    log.info("[TF:%s] 🧩 PACK fallback: bases=%d", tf, len(bases))
     wl_hits = 0
     if bases:
         precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
@@ -516,12 +530,16 @@ async def _process_tf(
         tf_trace["pack"]["wl_hits"] = wl_hits
         tf_trace["pack"]["fallback_used"] = True
 
+    log.debug("[TF:%s] PACK WL hits: %d", tf, wl_hits)
+
     if wl_hits >= 1:
+        log.info("[TF:%s] ✅ allow by PACK fallback", tf)
         tf_trace["origin"] = "pack"
         return True, tf_trace
 
+    log.info("[TF:%s] ❌ deny (no MW match, no PACK WL)", tf)
     return False, tf_trace
-                
+                    
 # 🔸 Сохранение результата (после ответа), с client_strategy_id — двухфазный upsert для partial unique indexes
 async def _persist_decision(
     req_id: str,
