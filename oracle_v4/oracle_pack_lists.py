@@ -24,7 +24,7 @@ PACK_LISTS_REPORTS_READY_MAXLEN = 10_000
 # 🔸 Пороговые значения (легко меняются → перезапуск сервиса)
 SENSE_SCORE_MIN = 0.5     # score_smoothed > 0.5 на оси (pack_base+agg_type+agg_key)
 CONF_MIN = 0.5            # aggregated confidence > 0.5
-WR_WL_MIN = 0.6          # в whitelist при winrate ≥ 0.6
+WR_WL_MIN = 0.55          # в whitelist при winrate ≥ 0.55
 WR_BL_MAX = 0.5           # в blacklist при winrate < 0.5
 
 # 🔸 Публичная точка входа воркера

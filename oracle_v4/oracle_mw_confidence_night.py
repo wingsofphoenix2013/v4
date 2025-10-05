@@ -38,13 +38,13 @@ WEIGHTS_TOLERANCE        = 1e-9    # защита от деления на но�
 async def run_oracle_confidence_night():
     # условия достаточности
     if infra.pg_pool is None:
-        log.debug("❌ Пропуск ночного тюнера: нет PG-пула")
+        log.info("❌ Пропуск ночного тюнера: нет PG-пула")
         return
 
     # получаем список стратегий для тюнинга (активные и market_watcher=true)
     strategies = await _load_target_strategies()
     if not strategies:
-        log.debug("ℹ️ Нечего тюнить: нет стратегий с market_watcher=true")
+        log.info("ℹ️ Нечего тюнить: нет стратегий с market_watcher=true")
         return
 
     # перебор стратегий и окон (7d/14d/28d)
@@ -259,7 +259,7 @@ async def _train_and_activate_weights(conn, strategy_id: int, time_frame: str) -
     s = wR + wP + wC + wS
     weights = {"wR": wR / s, "wP": wP / s, "wC": wC / s, "wS": wS / s}
 
-    log.debug("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
+    log.info("📊 Тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
              strategy_id, time_frame, samples, train, holdout, weights)
 
     # активируем новые веса (деактивируем старые для пары strategy/tf)

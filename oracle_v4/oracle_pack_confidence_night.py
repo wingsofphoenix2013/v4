@@ -37,13 +37,13 @@ WEIGHTS_TOLERANCE        = 1e-9    # защита от деления на но�
 async def run_oracle_pack_confidence_night():
     # условия достаточности
     if infra.pg_pool is None:
-        log.debug("❌ Пропуск ночного PACK-тюнера: нет PG-пула")
+        log.info("❌ Пропуск ночного PACK-тюнера: нет PG-пула")
         return
 
     # список стратегий для тюнинга (активные и market_watcher=true)
     strategies = await _load_target_strategies()
     if not strategies:
-        log.debug("ℹ️ Нечего тюнить: нет стратегий с market_watcher=true")
+        log.info("ℹ️ Нечего тюнить: нет стратегий с market_watcher=true")
         return
 
     # перебор стратегий и окон (7d/14d/28d)
@@ -91,7 +91,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
         strategy_id, time_frame, limit_reports
     )
     if len(reports) < 3:
-        log.debug("ℹ️ PACK strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
+        log.info("ℹ️ PACK strategy=%s tf=%s: недостаточно отчётов (%d < 3)", strategy_id, time_frame, len(reports))
         return False
 
     # пары (t, t+1)
@@ -202,7 +202,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
 
     samples = len(Y)
     if samples < MIN_SAMPLES_PER_STRATEGY:
-        log.debug("ℹ️ PACK strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
+        log.info("ℹ️ PACK strategy=%s tf=%s: мало данных для тюнинга (samples=%d < %d)",
                  strategy_id, time_frame, samples, MIN_SAMPLES_PER_STRATEGY)
         return False
 
@@ -228,7 +228,7 @@ async def _train_and_activate_weights_pack(conn, strategy_id: int, time_frame: s
     s = wR + wP + wC + wS
     weights = {"wR": wR / s, "wP": wP / s, "wC": wC / s, "wS": wS / s}
 
-    log.debug("📊 PACK-тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
+    log.info("📊 PACK-тюнинг strategy=%s tf=%s: samples=%d (train=%d, holdout=%d) → weights=%s",
              strategy_id, time_frame, samples, train, holdout, weights)
 
     # активируем новые веса (деактивируем старые для пары strategy/tf)
