@@ -52,6 +52,9 @@ class Strategy201Shortm5m15:
         log_uid = signal.get("log_uid")
         tfs = "m5,m15"
 
+        # режим принятия решения лабораторией: "mw_only" или "mw_then_pack"
+        decision_mode = "mw_then_pack"
+        
         # получаем last-generated-id ответа ДО отправки запроса
         last_resp_id = await self._get_stream_last_id(redis, "laboratory:decision_response")
 
@@ -64,6 +67,7 @@ class Strategy201Shortm5m15:
             "symbol": symbol,
             "timeframes": tfs,
             "trace": "true",
+            "decision_mode": decision_mode,
         }
 
         log.debug(

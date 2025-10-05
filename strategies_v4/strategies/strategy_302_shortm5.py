@@ -1,4 +1,4 @@
-# strategy_401_shortm5m15.py — зеркальная стратегия (шорт; laboratory_v4 TF: m5,m15; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
+# strategy_302_shortm5.py — зеркальная стратегия (шорт; laboratory_v4 TF: m5; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
 
 # 🔸 Импорты
 import logging
@@ -10,10 +10,10 @@ from datetime import datetime
 from infra import infra
 
 # 🔸 Логгер стратегии
-log = logging.getLogger("strategy_401_shortm5m15")
+log = logging.getLogger("strategy_302_shortm5")
 
 # 🔸 Класс стратегии
-class Strategy401Shortm5m15:
+class Strategy302Shortm5:
     # 🔸 Проверка сигнала на допустимость
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
@@ -50,10 +50,10 @@ class Strategy401Shortm5m15:
         symbol = str(signal["symbol"]).upper()
         client_sid = str(signal["strategy_id"])
         log_uid = signal.get("log_uid")
-        tfs = "m5,m15"
+        tfs = "m5"
 
         # режим принятия решения лабораторией: "mw_only" или "mw_then_pack"
-        decision_mode = "mw_then_pack"
+        decision_mode = "mw_only"
         
         # получаем last-generated-id ответа ДО отправки запроса
         last_resp_id = await self._get_stream_last_id(redis, "laboratory:decision_response")
