@@ -427,7 +427,7 @@ async def _process_tf(
     tf_trace: Dict[str, Any] = {"tf": tf}
 
     # старт TF-проверки
-    log.debug("[TF:%s] ▶️ start sid=%s symbol=%s dir=%s mode=%s", tf, sid, symbol, direction,
+    log.info("[TF:%s] ▶️ start sid=%s symbol=%s dir=%s mode=%s", tf, sid, symbol, direction,
              "mw_then_pack" if use_pack_fallback else "mw_only")
 
     # 1) MW: строки WL по TF/направлению
@@ -458,7 +458,7 @@ async def _process_tf(
         log.debug("[TF:%s] MW bases to read: %s", tf, ",".join(needed_bases) if needed_bases else "-")
         states = await _get_mw_states(symbol, tf, needed_bases, precision, deadline_ms)
         # чтобы не шуметь — показываем коротко
-        log.info("[TF:%s] MW states: %s", tf, states if states else "{}")
+        log.debug("[TF:%s] MW states: %s", tf, states if states else "{}")
 
         matched, _ = _mw_match_and_required_confirmation(mw_rows, states)
         if trace:
@@ -475,7 +475,7 @@ async def _process_tf(
     # 3) Fallback по PACK WL (только если разрешён)
     if not use_pack_fallback:
         # MW не совпал и fallback выключен
-        log.info("[TF:%s] ❌ fallback=OFF — deny", tf)
+        log.debug("[TF:%s] ❌ fallback=OFF — deny", tf)
         return False, tf_trace
 
     # PACK-строки WL/BL по TF/направлению (в решении используем только WL)
@@ -489,7 +489,7 @@ async def _process_tf(
         if base and base not in bases:
             bases.append(base)
 
-    log.info("[TF:%s] 🧩 PACK fallback: bases=%d", tf, len(bases))
+    log.debug("[TF:%s] 🧩 PACK fallback: bases=%d", tf, len(bases))
     wl_hits = 0
     if bases:
         precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
@@ -533,11 +533,11 @@ async def _process_tf(
     log.debug("[TF:%s] PACK WL hits: %d", tf, wl_hits)
 
     if wl_hits >= 1:
-        log.info("[TF:%s] ✅ allow by PACK fallback", tf)
+        log.debug("[TF:%s] ✅ allow by PACK fallback", tf)
         tf_trace["origin"] = "pack"
         return True, tf_trace
 
-    log.info("[TF:%s] ❌ deny (no MW match, no PACK WL)", tf)
+    log.debug("[TF:%s] ❌ deny (no MW match, no PACK WL)", tf)
     return False, tf_trace
                     
 # 🔸 Сохранение результата (после ответа), с client_strategy_id — двухфазный upsert для partial unique indexes
