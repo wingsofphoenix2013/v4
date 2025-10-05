@@ -404,7 +404,7 @@ def _pack_bl_wl_stats_with_details(
 
     return bl_hits, wl_hits, bl_details, wl_details, bl_winrates
 
-# 🔸 Обработка одного TF (MW-only): решение принимается ТОЛЬКО по MW-совпадениям; PACK в decision-path не используется
+# 🔸 Обработка одного TF (MW-first; опционально — fallback на PACK по WL; BL не используется в решении)
 async def _process_tf(
     sid: int,
     symbol: str,
@@ -413,57 +413,115 @@ async def _process_tf(
     trace: bool,
     deadline_ms: int,
     telemetry: Dict[str, int],
+    use_pack_fallback: bool = False,   # переключатель сценария
 ) -> Tuple[bool, Dict[str, Any]]:
     """
-    Возвращает (tf_ok, trace_obj)
+    Возвращает (tf_ok, tf_trace)
 
-    Новая политика (упрощённая):
-      - TF считается пройденным, если по MW-whitelist есть ХОТЯ БЫ ОДНО совпадение на текущих MW-состояниях.
-      - Требования confirmation ИГНОРИРУЕМ (0/1/2 не учитываем).
-      - PACK (WL/BL) в принятии решения НЕ участвует и здесь НЕ запрашивается.
-      - Полная аналитика (все MW/PACK совпадения) собирается асинхронно в laboratory_decision_filler.py.
+    Политика:
+      1) Сначала ищем ХОТЯ БЫ ОДНО совпадение в MW WL — если есть, TF пройден (origin="mw").
+      2) Если MW-совпадений НЕТ и включён fallback → ищем PACK WL:
+         - BL не используем в решении (фиксируется филлером).
+         - Если WL>=1 → TF пройден (origin="pack"), иначе отказ.
     """
     tf_trace: Dict[str, Any] = {"tf": tf}
 
-    # 1) Срезы WL по TF/направлению
+    # 1) MW: строки WL по TF/направлению
     mw_rows_all = (infra.mw_wl_by_strategy.get(sid) or {}).get("rows", [])
     mw_rows = [r for r in mw_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
 
-    log.debug("[TF:%s] 🔎 WL срезы: MW=%d (sid=%s %s %s)", tf, len(mw_rows), sid, symbol, direction)
-
-    # Если по TF нет строк MW → совпасть нечему
+    # Если по TF нет MW-строк вовсе
     if not mw_rows:
         if trace:
             tf_trace["mw"] = {"matched": False}
-        log.debug("[TF:%s] ❌ MW: нет строк в WL — отказ", tf)
+        # При отсутствии строк MW переходим сразу к fallback (если включён)
+        if not use_pack_fallback:
+            return False, tf_trace
+    else:
+        # 2) Снимаем MW-состояния и проверяем совпадения
+        needed_bases: List[str] = []
+        for r in mw_rows:
+            base = (r.get("agg_base") or "").strip().lower()
+            if not base:
+                continue
+            for b in base.split("_"):
+                if b in ("trend", "volatility", "extremes", "momentum") and b not in needed_bases:
+                    needed_bases.append(b)
+
+        precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
+        states = await _get_mw_states(symbol, tf, needed_bases, precision, deadline_ms)
+
+        matched, _ = _mw_match_and_required_confirmation(mw_rows, states)
+        if trace:
+            tf_trace["mw"] = {"matched": matched}
+
+        if matched:
+            # MW дал минимум одно совпадение — TF пройден
+            tf_trace["origin"] = "mw"
+            return True, tf_trace
+
+    # 3) Fallback по PACK WL (только если разрешён)
+    if not use_pack_fallback:
+        # MW не совпал и fallback выключен
         return False, tf_trace
 
-    # 2) Снимаем MW-состояния по нужным базам
-    needed_bases: List[str] = []
-    for r in mw_rows:
-        base = (r.get("agg_base") or "").strip().lower()
-        if not base:
-            continue
-        for b in base.split("_"):
-            if b in ("trend", "volatility", "extremes", "momentum") and b not in needed_bases:
-                needed_bases.append(b)
+    # PACK-строки WL/BL по TF/направлению (в решении используем только WL)
+    pack_rows_all = (infra.pack_wl_by_strategy.get(sid) or {}).get("rows", [])
+    rows_tf = [r for r in pack_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
 
-    precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
-    states = await _get_mw_states(symbol, tf, needed_bases, precision, deadline_ms)
+    # Уникальные pack_base и загрузка объектов (cache-first → gateway)
+    bases: List[str] = []
+    for r in rows_tf:
+        base = (r.get("pack_base") or "").strip().lower()
+        if base and base not in bases:
+            bases.append(base)
 
-    # 3) Проверяем наличие ХОТЯ БЫ ОДНОГО совпадения MW
-    matched, _conf_req = _mw_match_and_required_confirmation(mw_rows, states)
+    wl_hits = 0
+    if bases:
+        precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
+        pack_objs: Dict[str, Optional[dict]] = await _get_pack_objects_for_bases(symbol, tf, bases, precision, deadline_ms)
+
+        # Считаем ТОЛЬКО WL-совпадения (BL в решении не используется)
+        for r in rows_tf:
+            if (r.get("list") or "").strip().lower() != "whitelist":
+                continue
+            base = (r.get("pack_base") or "").strip().lower()
+            po = pack_objs.get(base)
+            if not po:
+                continue
+            pack = (po.get("pack") or {})
+            agg_key = (r.get("agg_key") or "").strip().lower()
+            agg_val = (r.get("agg_value") or "").strip().lower()
+            if not agg_key or not agg_val:
+                continue
+
+            # Сформировать факт в порядке ключей
+            keys_k = [k.strip() for k in agg_key.split("|") if k.strip()]
+            parts, ok = [], True
+            for k in keys_k:
+                v = pack.get(k)
+                if v is None:
+                    ok = False
+                    break
+                parts.append(f"{k}:{str(v).strip().lower()}")
+            if not ok:
+                continue
+            fact = "|".join(parts)
+
+            if fact == agg_val:
+                wl_hits += 1
 
     if trace:
-        tf_trace["mw"] = {"matched": matched}
+        tf_trace.setdefault("pack", {})
+        tf_trace["pack"]["wl_hits"] = wl_hits
+        tf_trace["pack"]["fallback_used"] = True
 
-    if matched:
-        log.debug("[TF:%s] ✅ MW: есть совпадления — TF пройден", tf)
+    if wl_hits >= 1:
+        tf_trace["origin"] = "pack"
         return True, tf_trace
 
-    log.debug("[TF:%s] ❌ MW: совпадений нет — отказ", tf)
     return False, tf_trace
-    
+                
 # 🔸 Сохранение результата (после ответа), с client_strategy_id — двухфазный upsert для partial unique indexes
 async def _persist_decision(
     req_id: str,
@@ -698,7 +756,7 @@ async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, al
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-# 🔸 Ядро обработки запроса (для лидера) — MW-only решение; PACK не участвует в decision-path
+# 🔸 Ядро обработки запроса (для лидера) — MW-first; опционально fallback на PACK (WL), BL не участвует в решении
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
     async with _decisions_sem:
         t0 = _now_monotonic_ms()
@@ -711,6 +769,18 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         symbol = (fields.get("symbol") or "").strip().upper()
         tfs_raw = fields.get("timeframes") or ""
         trace_flag = (fields.get("trace") or "false").lower() == "true"
+
+        # 🔸 Режим принятия решения: только MW или MW с fallback на PACK (WL)
+        decision_mode = (fields.get("decision_mode") or "").strip().lower()
+        use_pack_fallback = False
+        if decision_mode in ("mw_then_pack", "mw_pack", "pack_fallback"):
+            use_pack_fallback = True
+        elif decision_mode in ("mw_only", ""):
+            fb_raw = (fields.get("fallback_pack") or "").strip().lower()
+            use_pack_fallback = (fb_raw == "true")
+        # Нормализованный текстовый режим
+        normalized_mode = "mw_then_pack" if use_pack_fallback else "mw_only"
+
         deadline_ms_req = None
         try:
             if "deadline_ms" in fields:
@@ -718,6 +788,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         except Exception:
             deadline_ms_req = None
 
+        # 🔸 Базовая валидация
         if not log_uid or not strategy_id_s.isdigit() or direction not in ("long", "short") or not symbol or not tfs_raw:
             await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                 "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing or invalid fields"
@@ -752,36 +823,55 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             log.debug("[REQ] ❌ strategy_not_enabled %s", sid)
             return
 
-        log.debug("[REQ] 📥 log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s",
-                  log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs))
+        log.debug("[REQ] 📥 log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s",
+                  log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), normalized_mode)
 
-        # ждём «шторки» MW (PACK в decision-path не нужен)
+        # ждём «шторки» MW (PACK в decision-path вызывается только при fallback)
         await infra.wait_mw_ready(sid, timeout_sec=5.0)
 
         deadline_ms = t0 + (deadline_ms_req or SAFETY_DEADLINE_MS)
 
         telemetry = {"cache_hits": 0, "gateway_requests": 0}
         tf_results: List[Dict[str, Any]] = []
+        tf_origins: Dict[str, str] = {}  # для фиксации источника прохода TF: "mw" | "pack"
         allow = True
         reason: Optional[str] = None
 
-        # последовательная проверка TF (MW-only)
+        # последовательная проверка TF (MW-first, опционально fallback на PACK WL)
         for tf in tfs:
             tf_ok, tf_trace = await _process_tf(
-                sid=sid, symbol=symbol, direction=direction, tf=tf,
-                trace=trace_flag, deadline_ms=deadline_ms, telemetry=telemetry,
+                sid=sid,
+                symbol=symbol,
+                direction=direction,
+                tf=tf,
+                trace=trace_flag,
+                deadline_ms=deadline_ms,
+                telemetry=telemetry,
+                use_pack_fallback=use_pack_fallback,
             )
+
+            # Сохраним origin для текущего TF (если он пройден)
+            if tf_ok:
+                origin = tf_trace.get("origin")
+                if origin in ("mw", "pack"):
+                    tf_origins[tf] = origin
+
             if trace_flag:
                 tf_results.append(tf_trace)
 
             if not tf_ok:
                 allow = False
-                # В новой политике единственная причина — отсутствуют MW-совпадения по TF
-                reason = f"mw_no_match@{tf}"
+                mw_matched = bool(tf_trace.get("mw", {}).get("matched", False))
+                if not mw_matched and use_pack_fallback:
+                    # MW нет, fallback разрешён, но WL по PACK не нашлось
+                    reason = f"pack_no_wl@{tf}"
+                else:
+                    # либо fallback выключен, либо MW-совпадений нет
+                    reason = f"mw_no_match@{tf}"
                 log.debug("[TF:%s] ⛔ Останов по причине: %s", tf, reason)
                 break
             else:
-                log.debug("[TF:%s] ✅ TF пройден", tf)
+                log.debug("[TF:%s] ✅ TF пройден (origin=%s)", tf, tf_origins.get(tf, "mw"))
 
         finished_at_dt = datetime.utcnow()
         duration_ms = _now_monotonic_ms() - t0
@@ -813,21 +903,26 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
         # 🔸 Публикация seed-события для наполнителя статистики (только при allow=true)
         if allow:
+            # компактная строка источников прохода TF: "m5:mw,m15:pack"
+            decision_tf_origins = ",".join(f"{k}:{v}" for k, v in tf_origins.items()) if tf_origins else ""
+
             filler_payload = {
                 "log_uid": log_uid,
                 "strategy_id": str(sid),
                 "symbol": symbol,
                 "direction": direction,
                 "timeframes": ",".join(tfs),
-                "trace_basis": "mw_only",
+                "trace_basis": normalized_mode,
+                "decision_mode": normalized_mode,
+                "decision_tf_origins": decision_tf_origins,
             }
             if client_sid_s:
                 filler_payload["client_strategy_id"] = client_sid_s
 
             try:
                 await infra.redis_client.xadd(DECISION_FILLER_STREAM, filler_payload)
-                log.debug("[FILLER] seed published log_uid=%s master_sid=%s client_sid=%s tfs=%s",
-                          log_uid, sid, (client_sid_s or "-"), ",".join(tfs))
+                log.debug("[FILLER] seed published log_uid=%s master_sid=%s client_sid=%s tfs=%s mode=%s origins=%s",
+                          log_uid, sid, (client_sid_s or "-"), ",".join(tfs), normalized_mode, decision_tf_origins)
             except Exception:
                 log.exception("[FILLER] ❌ Ошибка публикации seed-события log_uid=%s", log_uid)
 
@@ -857,7 +952,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
         # реакция ворот (используем gate_sid)
         await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow)
-        
+                        
 # 🔸 Обработка входящего: шторка/очередь → лидер или ожидание
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     strategy_id_s = fields.get("strategy_id") or ""

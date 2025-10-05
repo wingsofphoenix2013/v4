@@ -384,6 +384,8 @@ async def _upsert_lps(
     pack_wl_matches: List[Dict[str, Any]],
     pack_bl_matches: List[Dict[str, Any]],
     wl_family_counts: Dict[str, int],
+    decision_mode: Optional[str] = None,
+    decision_origin: Optional[str] = None,
 ):
     mw_match_count      = len(mw_matches)
     pack_wl_match_count = len(pack_wl_matches)
@@ -410,12 +412,14 @@ async def _upsert_lps(
                        pack_wl_match_count = $6,
                        pack_bl_match_count = $7,
                        pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
+                       decision_mode = COALESCE($9, decision_mode),
+                       decision_origin = COALESCE($10, decision_origin),
                        updated_at = NOW()
-                 WHERE log_uid=$9 AND strategy_id=$10 AND client_strategy_id IS NULL AND tf=$11
+                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id IS NULL AND tf=$13
                 """,
                 states_json, mw_json, wl_json, bl_json,
                 mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, log_uid, sid, tf
+                fam_json, decision_mode, decision_origin, log_uid, sid, tf
             )
             if upd.startswith("UPDATE 1"):
                 log.debug("[FILLER] ✏️ LPS UPDATE log_uid=%s sid=%s tf=%s (master)", log_uid, sid, tf)
@@ -428,17 +432,20 @@ async def _upsert_lps(
                     (log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
                      mw_states, mw_matches, pack_wl_matches, pack_bl_matches,
                      mw_match_count, pack_wl_match_count, pack_bl_match_count, pack_family_counts,
+                     decision_mode, decision_origin,
                      created_at, updated_at)
                 VALUES ($1,$2,NULL,$3,$4,$5,
                         COALESCE($6::jsonb, NULL), COALESCE($7::jsonb, NULL),
                         COALESCE($8::jsonb, NULL), COALESCE($9::jsonb, NULL),
                         $10,$11,$12,COALESCE($13::jsonb, NULL),
+                        $14,$15,
                         NOW(), NOW())
                 ON CONFLICT DO NOTHING
                 """,
                 log_uid, sid, symbol, direction, tf,
                 states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count, fam_json
+                mw_match_count, pack_wl_match_count, pack_bl_match_count, fam_json,
+                decision_mode, decision_origin
             )
             if ins.endswith(" 1"):
                 log.debug("[FILLER] ✍️  LPS INSERT log_uid=%s sid=%s tf=%s (master)", log_uid, sid, tf)
@@ -456,12 +463,14 @@ async def _upsert_lps(
                        pack_wl_match_count = $6,
                        pack_bl_match_count = $7,
                        pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
+                       decision_mode = COALESCE($9, decision_mode),
+                       decision_origin = COALESCE($10, decision_origin),
                        updated_at = NOW()
-                 WHERE log_uid=$9 AND strategy_id=$10 AND client_strategy_id IS NULL AND tf=$11
+                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id IS NULL AND tf=$13
                 """,
                 states_json, mw_json, wl_json, bl_json,
                 mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, log_uid, sid, tf
+                fam_json, decision_mode, decision_origin, log_uid, sid, tf
             )
             log.debug("[FILLER] ✏️ LPS UPDATE (race) log_uid=%s sid=%s tf=%s (master)", log_uid, sid, tf)
 
@@ -478,12 +487,14 @@ async def _upsert_lps(
                        pack_wl_match_count = $6,
                        pack_bl_match_count = $7,
                        pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
+                       decision_mode = COALESCE($9, decision_mode),
+                       decision_origin = COALESCE($10, decision_origin),
                        updated_at = NOW()
-                 WHERE log_uid=$9 AND strategy_id=$10 AND client_strategy_id=$11 AND tf=$12
+                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id=$13 AND tf=$14
                 """,
                 states_json, mw_json, wl_json, bl_json,
                 mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, log_uid, sid, int(client_sid), tf
+                fam_json, decision_mode, decision_origin, log_uid, sid, int(client_sid), tf
             )
             if upd.startswith("UPDATE 1"):
                 log.debug("[FILLER] ✏️ LPS UPDATE log_uid=%s sid=%s csid=%s tf=%s", log_uid, sid, client_sid, tf)
@@ -496,17 +507,20 @@ async def _upsert_lps(
                     (log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
                      mw_states, mw_matches, pack_wl_matches, pack_bl_matches,
                      mw_match_count, pack_wl_match_count, pack_bl_match_count, pack_family_counts,
+                     decision_mode, decision_origin,
                      created_at, updated_at)
                 VALUES ($1,$2,$3,$4,$5,$6,
                         COALESCE($7::jsonb, NULL), COALESCE($8::jsonb, NULL),
                         COALESCE($9::jsonb, NULL), COALESCE($10::jsonb, NULL),
                         $11,$12,$13,COALESCE($14::jsonb, NULL),
+                        $15,$16,
                         NOW(), NOW())
                 ON CONFLICT DO NOTHING
                 """,
                 log_uid, sid, int(client_sid), symbol, direction, tf,
                 states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count, fam_json
+                mw_match_count, pack_wl_match_count, pack_bl_match_count, fam_json,
+                decision_mode, decision_origin
             )
             if ins.endswith(" 1"):
                 log.debug("[FILLER] ✍️  LPS INSERT log_uid=%s sid=%s csid=%s tf=%s", log_uid, sid, client_sid, tf)
@@ -524,16 +538,17 @@ async def _upsert_lps(
                        pack_wl_match_count = $6,
                        pack_bl_match_count = $7,
                        pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
+                       decision_mode = COALESCE($9, decision_mode),
+                       decision_origin = COALESCE($10, decision_origin),
                        updated_at = NOW()
-                 WHERE log_uid=$9 AND strategy_id=$10 AND client_strategy_id=$11 AND tf=$12
+                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id=$13 AND tf=$14
                 """,
                 states_json, mw_json, wl_json, bl_json,
                 mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, log_uid, sid, int(client_sid), tf
+                fam_json, decision_mode, decision_origin, log_uid, sid, int(client_sid), tf
             )
             log.debug("[FILLER] ✏️ LPS UPDATE (race) log_uid=%s sid=%s csid=%s tf=%s", log_uid, sid, client_sid, tf)
-
-
+            
 # 🔸 Обработка одного seed-сообщения (полный цикл по TF)
 async def _process_seed(msg_id: str, fields: Dict[str, str]):
     async with _filler_sem:
@@ -546,7 +561,20 @@ async def _process_seed(msg_id: str, fields: Dict[str, str]):
         direction = (fields.get("direction") or "").strip().lower()
         tfs_raw   = fields.get("timeframes") or ""
 
-        if not log_uid or not sid_s.isdigit() or not symbol or direction not in ("long","short") or not tfs_raw:
+        # 🔸 Новые поля для фиксации режима и источника
+        decision_mode = (fields.get("decision_mode") or "").strip().lower() or None
+        origins_raw   = (fields.get("decision_tf_origins") or "").strip()
+        tf_origins: Dict[str, str] = {}
+        if origins_raw:
+            try:
+                for part in origins_raw.split(","):
+                    if ":" in part:
+                        tf, origin = part.split(":", 1)
+                        tf_origins[tf.strip()] = origin.strip()
+            except Exception:
+                log.debug("[FILLER] ⚠️ Ошибка парсинга decision_tf_origins: %s", origins_raw)
+
+        if not log_uid or not sid_s.isdigit() or not symbol or direction not in ("long", "short") or not tfs_raw:
             log.debug("[FILLER] ❌ bad seed msg=%s fields=%s", msg_id, fields)
             return
 
@@ -570,7 +598,10 @@ async def _process_seed(msg_id: str, fields: Dict[str, str]):
                     sid, symbol, tf, direction, precision, deadline_ms
                 )
 
-                # Запись
+                # определяем источник прохода TF (mw или pack)
+                decision_origin = tf_origins.get(tf)
+
+                # Запись в таблицу с новыми полями
                 await _upsert_lps(
                     log_uid=log_uid,
                     sid=sid,
@@ -583,16 +614,22 @@ async def _process_seed(msg_id: str, fields: Dict[str, str]):
                     pack_wl_matches=pack_wl_matches,
                     pack_bl_matches=pack_bl_matches,
                     wl_family_counts=wl_family_counts,
+                    decision_mode=decision_mode,
+                    decision_origin=decision_origin,
                 )
-                log.debug("[FILLER] ✅ TF записан log_uid=%s sid=%s csid=%s %s %s", log_uid, sid, client_sid, symbol, tf)
+                log.debug(
+                    "[FILLER] ✅ TF записан log_uid=%s sid=%s csid=%s %s %s (mode=%s origin=%s)",
+                    log_uid, sid, client_sid, symbol, tf, decision_mode, decision_origin
+                )
 
             except Exception:
                 log.exception("[FILLER] ❌ Ошибка TF log_uid=%s sid=%s tf=%s", log_uid, sid, tf)
 
         dur = _now_monotonic_ms() - t0
-        log.debug("[FILLER] 📦 seed done log_uid=%s sid=%s csid=%s tfs=%s dur=%dms",
-                 log_uid, sid, client_sid, ",".join(tfs), dur)
-
+        log.debug(
+            "[FILLER] 📦 seed done log_uid=%s sid=%s csid=%s tfs=%s dur=%dms mode=%s",
+            log_uid, sid, client_sid, ",".join(tfs), dur, decision_mode
+        )
 
 # 🔸 Обработка события закрытия позиции из signal_log_queue
 async def _process_position_closed(msg_id: str, fields: Dict[str, str]):
