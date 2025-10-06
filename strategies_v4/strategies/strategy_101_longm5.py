@@ -43,7 +43,7 @@ class Strategy101Longm5:
         master_sid = strategy_cfg.get("market_mirrow")
         if not master_sid:
             note = "отсутствует привязка к мастер-стратегии"
-            log.info("⚠️ [IGNORE] log_uid=%s reason=\"no_market_mirrow\"", signal.get("log_uid"))
+            log.debug("⚠️ [IGNORE] log_uid=%s reason=\"no_market_mirrow\"", signal.get("log_uid"))
             await self._log_ignore_to_queue(redis, signal.get("strategy_id"), signal.get("log_uid"), note)
             return ("ignore", note)
 
@@ -72,7 +72,7 @@ class Strategy101Longm5:
         }
 
         # лог запроса
-        log.info(
+        log.debug(
             "[LAB_REQUEST] log_uid=%s master=%s client=%s symbol=%s tf=%s",
             log_uid, master_sid, client_sid, symbol, tfs
         )
@@ -80,10 +80,10 @@ class Strategy101Longm5:
         try:
             # отправляем запрос в laboratory:decision_request
             req_id = await redis.xadd("laboratory:decision_request", req_payload)
-            log.info("[LAB_XADD] req_id=%s", req_id)
+            log.debug("[LAB_XADD] req_id=%s", req_id)
 
             # ждём ответ из laboratory:decision_response (таймаут 90с)
-            log.info("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
+            log.debug("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
             allow, reason = await self._wait_for_response(redis, req_id, last_resp_id, timeout_seconds=90)
         except Exception:
             note = "ошибка при работе с laboratory_v4"
@@ -117,7 +117,7 @@ class Strategy101Longm5:
                 return ("ignore", note)
         else:
             # отказ лаборатории → формируем ignore с причиной
-            log.info("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
+            log.debug("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
             await self._log_ignore_to_queue(redis, client_sid, log_uid, reason)
             return ("ignore", f"отказ лаборатории по причине {reason}")
 
@@ -141,7 +141,7 @@ class Strategy101Longm5:
         while True:
             # страховой выход по таймауту
             if time.monotonic() > deadline:
-                log.info("[LAB_TIMEOUT] req_id=%s", req_id)
+                log.debug("[LAB_TIMEOUT] req_id=%s", req_id)
                 return False, "lab_timeout"
 
             # читаем только новые записи после read_id
@@ -152,7 +152,7 @@ class Strategy101Longm5:
             # логируем факт получения батча (без избыточного спама)
             total = sum(len(records) for _, records in entries)
             if total:
-                log.info("[LAB_READ] req_id=%s batch=%d", req_id, total)
+                log.debug("[LAB_READ] req_id=%s batch=%d", req_id, total)
 
             for _, records in entries:
                 for record_id, data in records:
@@ -169,7 +169,7 @@ class Strategy101Longm5:
                     if status == "ok":
                         allow = str(data.get("allow", "false")).lower() == "true"
                         reason = (data.get("reason", "") or "")
-                        log.info("[LAB_RESP] req_id=%s status=%s allow=%s reason=\"%s\"",
+                        log.debug("[LAB_RESP] req_id=%s status=%s allow=%s reason=\"%s\"",
                                  req_id, status, str(allow).lower(), reason)
                         return allow, reason
 
