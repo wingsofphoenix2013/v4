@@ -1,9 +1,8 @@
-# laboratory_decision_filler.py — post-allow «писатель» статистики:
+# laboratory_decision_filler.py — пост-allow наполнитель статистики (LPS): сидинг из SLE и допись по закрытию позиций
 
 import asyncio
 import json
 import logging
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,750 +10,384 @@ from typing import Any, Dict, List, Optional, Tuple
 import laboratory_infra as infra
 
 # 🔸 Логгер
-log = logging.getLogger("LAB_DECISION_FILLER")
+log = logging.getLogger("LAB_FILLER")
 
-# 🔸 Потоки и шлюз
-DECISION_FILLER_STREAM   = "laboratory_decision_filler"  # источник seed-событий от decision_maker
-POSITION_CLOSE_STREAM    = "signal_log_queue"            # поток событий по позициям (от стратегий)
-GATEWAY_REQ_STREAM       = "indicator_gateway_request"   # indicator_gateway входящий стрим
+# 🔸 Стримы
+DECISION_FILLER_STREAM = "laboratory_decision_filler"   # сидинг после allow=true
+SIGNAL_LOG_QUEUE_STREAM = "signal_log_queue"            # внешняя шина: событие закрытия позиции
 
-# 🔸 Consumer Group для закрытий (чтобы не мешать другим)
-POS_CLOSE_GROUP          = "lab_pos_closed"
-POS_CLOSE_CONSUMER       = "filler-consumer-1"
-
-# 🔸 Производительность
+# 🔸 Параметры чтения стримов
 XREAD_BLOCK_MS = 2000
-XREAD_COUNT    = 50
-MAX_IN_FLIGHT  = 16
-MAX_CONCURRENT_GATEWAY_CALLS = 32
-COALESCE_TTL_SEC = 3
-
-# 🔸 Порядок TF
-TF_ORDER = ("m5", "m15", "h1")
-
-# 🔸 Публичные префиксы PACK-кэша
-PACK_PUBLIC_PREFIX = {
-    "bb": "bbpos_pack",
-    "lr": "lrpos_pack",
-    "atr": "atr_pack",
-    "adx_dmi": "adx_dmi_pack",
-    "macd": "macd_pack",
-    # по умолчанию: f"{indicator}_pack"
-}
-
-# 🔸 Семафоры конкуренции
-_filler_sem  = asyncio.Semaphore(MAX_IN_FLIGHT)
-_gateway_sem = asyncio.Semaphore(MAX_CONCURRENT_GATEWAY_CALLS)
-
-# 🔸 Коалесценс (in-process): key -> (expire_ms, future)
-_coalesce: Dict[str, Tuple[float, asyncio.Future]] = {}
+XREAD_COUNT = 50
 
 
-# 🔸 Утилиты времени/парсинга
-def _now_monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
+# 🔸 Утилиты
+
+def _now_ms() -> int:
+    return int(asyncio.get_running_loop().time() * 1000)
 
 
-def _parse_timeframes(tf_str: str) -> List[str]:
-    items = [x.strip().lower() for x in (tf_str or "").split(",") if x.strip()]
-    seen, ordered = set(), []
-    for tf in TF_ORDER:
-        if tf in items and tf not in seen:
-            seen.add(tf)
-            ordered.append(tf)
-    return ordered
-
-
-def _parse_pack_base(base: str) -> Tuple[str, Dict[str, Any]]:
-    """Возвращает (indicator, params) по pack_base (rsi14, ema21, bb20_2_0, macd12, adx_dmi14, lr50, atr14)."""
-    s = base.strip().lower()
-    if s.startswith("bb"):
-        rest = s[2:]
-        parts = rest.split("_", 2)
-        L = int(parts[0])
-        std = float(parts[1].replace("_", ".", 1)) if len(parts) > 1 else 2.0
-        return "bb", {"length": L, "std": std}
-    if s.startswith("macd"):
-        return "macd", {"fast": int(s[4:])}
-    if s.startswith("adx_dmi"):
-        return "adx_dmi", {"length": int(s[7:])}
-    if s.startswith("ema"):
-        return "ema", {"length": int(s[3:])}
-    if s.startswith("rsi"):
-        return "rsi", {"length": int(s[3:])}
-    if s.startswith("mfi"):
-        return "mfi", {"length": int(s[3:])}
-    if s.startswith("lr"):
-        return "lr", {"length": int(s[2:])}
-    if s.startswith("atr"):
-        return "atr", {"length": int(s[3:])}
-    return s, {}
-
-
-def _public_pack_key(indicator: str, symbol: str, tf: str, base: str) -> str:
-    pref = PACK_PUBLIC_PREFIX.get(indicator, f"{indicator}_pack")
-    return f"{pref}:{symbol}:{tf}:{base}"
-
-
-def _public_mw_key(kind: str, symbol: str, tf: str) -> str:
-    return f"{kind}_pack:{symbol}:{tf}:{kind}"
-
-
-def _json_or_none(s: Optional[str]) -> Optional[dict]:
-    if not s:
-        return None
+def _as_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     try:
-        return json.loads(s)
+        return int(x)
     except Exception:
-        return None
+        return default
 
 
-async def _mget_json(keys: List[str]) -> Dict[str, Optional[dict]]:
-    if not keys:
-        return {}
-    values = await infra.redis_client.mget(*keys)
-    return {k: _json_or_none(v) for k, v in zip(keys, values)}
+def _lower_str(x: Any) -> str:
+    return str(x).strip().lower()
 
 
-# 🔸 Гарантированно получить pack-объект (cache-first + gateway)
-async def _ensure_pack_available(
-    symbol: str,
-    tf: str,
-    indicator: str,
-    base: str,
-    gw_params: Dict[str, Any],
-    precision: int,
-    deadline_ms: int,
-) -> Optional[dict]:
-    key = _public_pack_key(indicator, symbol, tf, base)
-    cached = await infra.redis_client.get(key)
-    if cached:
-        obj = _json_or_none(cached)
-        if obj:
-            return obj
-
-    co_key = f"COAL::pack::{key}"
-    now = _now_monotonic_ms()
-    rec = _coalesce.get(co_key)
-    if rec and now < rec[0]:
-        fut = rec[1]
-        try:
-            return await asyncio.wait_for(fut, timeout=max(0.2, (deadline_ms - _now_monotonic_ms()) / 1000))
-        except Exception:
-            return None
-
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    _coalesce[co_key] = (now + COALESCE_TTL_SEC * 1000, fut)
-
-    async with _gateway_sem:
-        try:
-            req = {"symbol": symbol, "timeframe": tf, "indicator": indicator, "mode": "pack"}
-            if indicator in ("ema", "rsi", "mfi", "lr", "atr", "adx_dmi"):
-                L = int(gw_params.get("length", 0))
-                if L:
-                    req["length"] = str(L)
-            elif indicator == "macd":
-                F = int(gw_params.get("fast", 0))
-                if F:
-                    req["length"] = str(F)
-            elif indicator == "bb":
-                L = int(gw_params.get("length", 0))
-                S = float(gw_params.get("std", 2.0))
-                req["length"] = str(L)
-                req["std"] = f"{S:.2f}"
-
-            await infra.redis_client.xadd(GATEWAY_REQ_STREAM, req)
-            poll_sleep = 0.1
-            while _now_monotonic_ms() < deadline_ms:
-                cached = await infra.redis_client.get(key)
-                if cached:
-                    obj = _json_or_none(cached)
-                    if obj:
-                        if not fut.done():
-                            fut.set_result(obj)
-                        return obj
-                await asyncio.sleep(poll_sleep)
-                if poll_sleep < 0.25:
-                    poll_sleep = 0.25
-
-            if not fut.done():
-                fut.set_result(None)
-            return None
-
-        except Exception:
-            log.exception("[FILLER] ❌ Ошибка запроса в gateway ind=%s base=%s", indicator, base)
-            if not fut.done():
-                fut.set_result(None)
-            return None
-        finally:
-            now2 = _now_monotonic_ms()
-            for ck, (exp, f) in list(_coalesce.items()):
-                if now2 > exp or (f.done() and _json_or_none(f.result()) is None):
-                    _coalesce.pop(ck, None)
-
-
-# 🔸 MW: снять состояния + построить ВСЕ совпадения
-async def _collect_mw(
-    sid: int,
-    symbol: str,
-    tf: str,
-    direction: str,
-    precision: int,
-    deadline_ms: int,
-) -> Tuple[Dict[str, Optional[str]], List[Dict[str, Any]]]:
-    """Возвращает (mw_states, mw_matches[])."""
-    mw_rows_all = (infra.mw_wl_by_strategy.get(sid) or {}).get("rows", [])
-    mw_rows = [r for r in mw_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
-
-    # какие базы нужны
-    needed_bases: List[str] = []
-    for r in mw_rows:
-        base = (r.get("agg_base") or "").strip().lower()
-        if not base:
-            continue
-        for b in base.split("_"):
-            if b in ("trend", "volatility", "extremes", "momentum") and b not in needed_bases:
-                needed_bases.append(b)
-
-    # states: cache-first → gateway
-    states: Dict[str, Optional[str]] = {}
-    keys = [_public_mw_key(b, symbol, tf) for b in needed_bases]
-    kv = await _mget_json(keys)
-    for base in needed_bases:
-        st = None
-        obj = kv.get(_public_mw_key(base, symbol, tf))
-        if obj and isinstance(obj, dict):
-            st = (obj.get("pack") or {}).get("state")
-        if not st:
-            obj = await _ensure_pack_available(symbol, tf, base, base, {}, precision, deadline_ms)
-            if obj:
-                st = (obj.get("pack") or {}).get("state")
-        states[base] = st
-
-    # построим ВСЕ совпадения
-    matches: List[Dict[str, Any]] = []
-    for r in mw_rows:
-        agg_base = (r.get("agg_base") or "").strip().lower()
-        agg_state = (r.get("agg_state") or "").strip().lower()
-        if not agg_base or not agg_state:
-            continue
-        bases = agg_base.split("_")
-
-        # построить факт
-        if len(bases) == 1:
-            base = bases[0]
-            cur = states.get(base)
-            if not cur:
-                continue
-            fact = cur.strip().lower()
+def _extract_stream_payload(fields: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Поддерживает два формата:
+      - плоские поля
+      - {'data': '<json>'} или {'data':'{...}'}
+    """
+    payload: Dict[str, Any] = {}
+    # базовая распаковка
+    for k, v in fields.items():
+        if isinstance(v, str) and v.startswith("{"):
+            try:
+                payload[k] = json.loads(v)
+            except Exception:
+                payload[k] = v
         else:
-            parts, ok = [], True
-            for b in bases:
-                cur = states.get(b)
-                if not cur:
-                    ok = False
-                    break
-                parts.append(f"{b}:{cur.strip().lower()}")
-            if not ok:
-                continue
-            fact = "|".join(parts)
+            payload[k] = v
 
-        if fact == agg_state:
-            matches.append({
-                "id": int(r.get("id")) if r.get("id") is not None else None,
-                "agg_base": agg_base,
-                "agg_state": agg_state,
-                "confirmation": int(r.get("confirmation")) if r.get("confirmation") is not None else None,
-                "winrate": float(r.get("winrate")) if r.get("winrate") is not None else None,
-                "confidence": float(r.get("confidence")) if r.get("confidence") is not None else None,
-            })
+    # если всё лежит под 'data' — разворачиваем
+    if "data" in payload and isinstance(payload["data"], dict):
+        payload = payload["data"]
 
-    return states, matches
+    return payload
 
 
-# 🔸 PACK: собрать ВСЕ WL/BL совпадения и счётчики по семействам
-async def _collect_pack(
-    sid: int,
-    symbol: str,
-    tf: str,
-    direction: str,
-    precision: int,
-    deadline_ms: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
-    """Возвращает (wl_matches[], bl_matches[], wl_family_counts)."""
-    pack_rows_all = (infra.pack_wl_by_strategy.get(sid) or {}).get("rows", [])
-    rows_tf = [r for r in pack_rows_all if (r.get("timeframe") == tf and r.get("direction") == direction)]
+def _pack_family_from_base(pack_base: str) -> str:
+    s = _lower_str(pack_base)
+    if s.startswith("ema"):
+        return "ema"
+    if s.startswith("macd"):
+        return "macd"
+    if s.startswith("lr"):
+        return "lr"
+    if s.startswith("adx_dmi"):
+        return "adx_dmi"
+    if s.startswith("bb"):
+        return "bb"
+    if s.startswith("atr"):
+        return "atr"
+    if s.startswith("rsi"):
+        return "rsi"
+    if s.startswith("mfi"):
+        return "mfi"
+    return s.split("_", 1)[0] if "_" in s else s
 
-    # Список уникальных pack_base
-    bases: List[str] = []
-    for r in rows_tf:
-        base = (r.get("pack_base") or "").strip().lower()
-        if base and base not in bases:
-            bases.append(base)
 
-    # Получаем объекты PACK (cache-first → gateway) параллельно
-    pack_objs: Dict[str, Optional[dict]] = {}
-    keys, meta = [], []
-    for base in bases:
-        ind, params = _parse_pack_base(base)
-        meta.append((base, ind, params))
-        keys.append(_public_pack_key(ind, symbol, tf, base))
+def _match_pack_rule(rule: Dict[str, Any], pack_objs: Dict[str, Any]) -> bool:
+    """
+    Сопоставление PACK-правила с объектом:
+      - rule['agg_key'] = "key1|key2"
+      - rule['agg_value'] = "key1:val1|key2:val2" или "some_scalar" (solo с ключом)
+      - сравнение выполняем как полное равенство факт-строки и agg_value (оба в lower)
+    """
+    base = _lower_str(rule.get("pack_base", ""))
+    if not base:
+        return False
+    po = pack_objs.get(base) or {}
+    pack = po.get("pack") or {}
+    agg_key = _lower_str(rule.get("agg_key", ""))
+    agg_val = _lower_str(rule.get("agg_value", ""))
+    if not agg_key or not agg_val:
+        return False
 
-    got = await _mget_json(keys)
-    tasks: List[asyncio.Task] = []
-    wanted: List[Tuple[str, str, Dict[str, Any]]] = []
-    for (base, ind, params) in meta:
-        k = _public_pack_key(ind, symbol, tf, base)
-        obj = got.get(k)
-        if obj is not None:
-            pack_objs[base] = obj
+    keys = [k.strip() for k in agg_key.split("|") if k.strip()]
+    parts: List[str] = []
+    for k in keys:
+        v = pack.get(k)
+        if v is None:
+            return False
+        parts.append(f"{k}:{_lower_str(v)}")
+    fact = "|".join(parts)
+    return fact == agg_val
+
+
+def _compute_pack_family_counts_for_matches(tf_pack: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    """
+    Считает pack_family_counts по СОВПАВШИМ правилам (отдельно WL/BL):
+      {"ema":{"wl":5,"bl":1}, "lr":{"wl":3,"bl":0}, ...}
+    """
+    rules: List[Dict[str, Any]] = (tf_pack or {}).get("rules") or []
+    objs: Dict[str, Any] = (tf_pack or {}).get("objects") or {}
+    out: Dict[str, Dict[str, int]] = {}
+    if not rules or not objs:
+        return out
+
+    for r in rules:
+        list_tag = _lower_str(r.get("list", ""))
+        if list_tag not in ("whitelist", "blacklist"):
+            continue
+        matched = _match_pack_rule(r, objs)
+        if not matched:
+            continue
+        fam = _pack_family_from_base(str(r.get("pack_base", "")))
+        out.setdefault(fam, {"wl": 0, "bl": 0})
+        if list_tag == "whitelist":
+            out[fam]["wl"] += 1
         else:
-            wanted.append((base, ind, params))
-            tasks.append(asyncio.create_task(_ensure_pack_available(
-                symbol=symbol, tf=tf, indicator=ind, base=base,
-                gw_params=params, precision=precision, deadline_ms=deadline_ms
-            )))
-    if tasks:
-        fetched = await asyncio.gather(*tasks, return_exceptions=False)
-        for (base, _ind, _params), obj in zip(wanted, fetched):
-            pack_objs[base] = obj
+            out[fam]["bl"] += 1
 
-    # Строим ВСЕ совпадения WL/BL
-    wl_matches: List[Dict[str, Any]] = []
-    bl_matches: List[Dict[str, Any]] = []
-    wl_family_counts: Dict[str, int] = {"ema":0,"lr":0,"rsi":0,"mfi":0,"bb":0,"atr":0,"adx_dmi":0,"macd":0}
+    return out
 
-    for r in rows_tf:
-        base = (r.get("pack_base") or "").strip().lower()
-        if not base:
+
+def _parse_tf_origin_map(s: Optional[str]) -> Dict[str, str]:
+    """
+    Принимает строку вида "m5:mw,m15:pack" → {"m5":"mw","m15":"pack"}
+    """
+    out: Dict[str, str] = {}
+    if not s:
+        return out
+    for part in str(s).split(","):
+        part = part.strip()
+        if not part or ":" not in part:
             continue
-        po = pack_objs.get(base)
-        if not po:
-            continue
-        pack = (po.get("pack") or {})
-        list_type = (r.get("list") or "").strip().lower()
-        agg_key = (r.get("agg_key") or "").strip().lower()
-        agg_val = (r.get("agg_value") or "").strip().lower()
-        if not agg_key or not agg_val:
-            continue
-
-        # строим факт в порядке ключей
-        keys_k = [k.strip() for k in agg_key.split("|") if k.strip()]
-        parts, ok = [], True
-        for k in keys_k:
-            v = pack.get(k)
-            if v is None:
-                ok = False
-                break
-            parts.append(f"{k}:{str(v).strip().lower()}")
-        if not ok:
-            continue
-        fact = "|".join(parts)
-
-        if fact == agg_val:
-            ind, _ = _parse_pack_base(base)
-            det = {
-                "id": int(r.get("id")) if r.get("id") is not None else None,
-                "pack_base": base,
-                "agg_key": agg_key,
-                "agg_value": agg_val,
-                "winrate": float(r.get("winrate")) if r.get("winrate") is not None else None,
-            }
-            if list_type == "whitelist":
-                wl_matches.append(det)
-                if ind in wl_family_counts:
-                    wl_family_counts[ind] += 1
-            elif list_type == "blacklist":
-                bl_matches.append(det)
-
-    return wl_matches, bl_matches, wl_family_counts
+        tf, origin = part.split(":", 1)
+        tf = _lower_str(tf)
+        origin = _lower_str(origin)
+        if tf in ("m5", "m15", "h1") and origin in ("mw", "pack"):
+            out[tf] = origin
+    return out
 
 
-# 🔸 Запись/апсерта в laboratoty_position_stat (двухфазный upsert)
-async def _upsert_lps(
+# 🔸 Сидинг LPS из SLE по одному allow-событию
+async def _seed_lps_from_sle(
+    req_id: str,
     log_uid: str,
-    sid: int,
-    client_sid: Optional[int],
-    symbol: str,
-    direction: str,
-    tf: str,
-    mw_states: Dict[str, Optional[str]],
-    mw_matches: List[Dict[str, Any]],
-    pack_wl_matches: List[Dict[str, Any]],
-    pack_bl_matches: List[Dict[str, Any]],
-    wl_family_counts: Dict[str, int],
-    decision_mode: Optional[str] = None,
-    decision_origin: Optional[str] = None,
-):
-    mw_match_count      = len(mw_matches)
-    pack_wl_match_count = len(pack_wl_matches)
-    pack_bl_match_count = len(pack_bl_matches)
-
-    # json dumps
-    states_json = json.dumps(mw_states, ensure_ascii=False) if mw_states else None
-    mw_json     = json.dumps(mw_matches, ensure_ascii=False) if mw_matches else None
-    wl_json     = json.dumps(pack_wl_matches, ensure_ascii=False) if pack_wl_matches else None
-    bl_json     = json.dumps(pack_bl_matches, ensure_ascii=False) if pack_bl_matches else None
-    fam_json    = json.dumps(wl_family_counts, ensure_ascii=False) if wl_family_counts else None
+    master_sid: int,
+    client_sid_opt: Optional[int],
+    decision_mode_opt: Optional[str],
+    decision_tf_origins_opt: Optional[str],
+) -> int:
+    """
+    Берёт строки из signal_laboratory_entries по (log_uid, strategy_id, [client_strategy_id]) и заводит/обновляет
+    по одной строке на каждый TF в laboratoty_position_stat.
+    Возвращает количество обработанных TF-строк.
+    """
+    tf_origin_map = _parse_tf_origin_map(decision_tf_origins_opt)
 
     async with infra.pg_pool.acquire() as conn:
-        if client_sid is None:
-            # UPDATE
-            upd = await conn.execute(
+        # читаем все TF-строки по конкретному запросу
+        if client_sid_opt is not None:
+            rows = await conn.fetch(
                 """
-                UPDATE public.laboratoty_position_stat
-                   SET mw_states = COALESCE($1::jsonb, mw_states),
-                       mw_matches = COALESCE($2::jsonb, mw_matches),
-                       pack_wl_matches = COALESCE($3::jsonb, pack_wl_matches),
-                       pack_bl_matches = COALESCE($4::jsonb, pack_bl_matches),
-                       mw_match_count = $5,
-                       pack_wl_match_count = $6,
-                       pack_bl_match_count = $7,
-                       pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
-                       decision_mode = COALESCE($9, decision_mode),
-                       decision_origin = COALESCE($10, decision_origin),
-                       updated_at = NOW()
-                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id IS NULL AND tf=$13
+                SELECT
+                    strategy_id, client_strategy_id, symbol, direction,
+                    timeframes_processed, tf_results,
+                    mw_wl_match_count, pack_wl_match_count, pack_bl_match_count
+                FROM signal_laboratory_entries
+                WHERE log_uid = $1
+                  AND strategy_id = $2
+                  AND client_strategy_id = $3
                 """,
-                states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, decision_mode, decision_origin, log_uid, sid, tf
+                log_uid, master_sid, client_sid_opt
             )
-            if upd.startswith("UPDATE 1"):
-                log.debug("[FILLER] ✏️ LPS UPDATE log_uid=%s sid=%s tf=%s (master)", log_uid, sid, tf)
-                return
-
-            # INSERT DO NOTHING
-            ins = await conn.execute(
-                """
-                INSERT INTO public.laboratoty_position_stat
-                    (log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
-                     mw_states, mw_matches, pack_wl_matches, pack_bl_matches,
-                     mw_match_count, pack_wl_match_count, pack_bl_match_count, pack_family_counts,
-                     decision_mode, decision_origin,
-                     created_at, updated_at)
-                VALUES ($1,$2,NULL,$3,$4,$5,
-                        COALESCE($6::jsonb, NULL), COALESCE($7::jsonb, NULL),
-                        COALESCE($8::jsonb, NULL), COALESCE($9::jsonb, NULL),
-                        $10,$11,$12,COALESCE($13::jsonb, NULL),
-                        $14,$15,
-                        NOW(), NOW())
-                ON CONFLICT DO NOTHING
-                """,
-                log_uid, sid, symbol, direction, tf,
-                states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count, fam_json,
-                decision_mode, decision_origin
-            )
-            if ins.endswith(" 1"):
-                log.debug("[FILLER] ✍️  LPS INSERT log_uid=%s sid=%s tf=%s (master)", log_uid, sid, tf)
-                return
-
-            # race → UPDATE
-            await conn.execute(
-                """
-                UPDATE public.laboratoty_position_stat
-                   SET mw_states = COALESCE($1::jsonb, mw_states),
-                       mw_matches = COALESCE($2::jsonb, mw_matches),
-                       pack_wl_matches = COALESCE($3::jsonb, pack_wl_matches),
-                       pack_bl_matches = COALESCE($4::jsonb, pack_bl_matches),
-                       mw_match_count = $5,
-                       pack_wl_match_count = $6,
-                       pack_bl_match_count = $7,
-                       pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
-                       decision_mode = COALESCE($9, decision_mode),
-                       decision_origin = COALESCE($10, decision_origin),
-                       updated_at = NOW()
-                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id IS NULL AND tf=$13
-                """,
-                states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, decision_mode, decision_origin, log_uid, sid, tf
-            )
-            log.debug("[FILLER] ✏️ LPS UPDATE (race) log_uid=%s sid=%s tf=%s (master)", log_uid, sid, tf)
-
         else:
-            # UPDATE
-            upd = await conn.execute(
+            rows = await conn.fetch(
                 """
-                UPDATE public.laboratoty_position_stat
-                   SET mw_states = COALESCE($1::jsonb, mw_states),
-                       mw_matches = COALESCE($2::jsonb, mw_matches),
-                       pack_wl_matches = COALESCE($3::jsonb, pack_wl_matches),
-                       pack_bl_matches = COALESCE($4::jsonb, pack_bl_matches),
-                       mw_match_count = $5,
-                       pack_wl_match_count = $6,
-                       pack_bl_match_count = $7,
-                       pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
-                       decision_mode = COALESCE($9, decision_mode),
-                       decision_origin = COALESCE($10, decision_origin),
-                       updated_at = NOW()
-                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id=$13 AND tf=$14
+                SELECT
+                    strategy_id, client_strategy_id, symbol, direction,
+                    timeframes_processed, tf_results,
+                    mw_wl_match_count, pack_wl_match_count, pack_bl_match_count
+                FROM signal_laboratory_entries
+                WHERE log_uid = $1
+                  AND strategy_id = $2
+                  AND client_strategy_id IS NULL
                 """,
-                states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, decision_mode, decision_origin, log_uid, sid, int(client_sid), tf
+                log_uid, master_sid
             )
-            if upd.startswith("UPDATE 1"):
-                log.debug("[FILLER] ✏️ LPS UPDATE log_uid=%s sid=%s csid=%s tf=%s", log_uid, sid, client_sid, tf)
-                return
 
-            # INSERT DO NOTHING
-            ins = await conn.execute(
-                """
-                INSERT INTO public.laboratoty_position_stat
-                    (log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
-                     mw_states, mw_matches, pack_wl_matches, pack_bl_matches,
-                     mw_match_count, pack_wl_match_count, pack_bl_match_count, pack_family_counts,
-                     decision_mode, decision_origin,
-                     created_at, updated_at)
-                VALUES ($1,$2,$3,$4,$5,$6,
-                        COALESCE($7::jsonb, NULL), COALESCE($8::jsonb, NULL),
-                        COALESCE($9::jsonb, NULL), COALESCE($10::jsonb, NULL),
-                        $11,$12,$13,COALESCE($14::jsonb, NULL),
-                        $15,$16,
-                        NOW(), NOW())
-                ON CONFLICT DO NOTHING
-                """,
-                log_uid, sid, int(client_sid), symbol, direction, tf,
-                states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count, fam_json,
-                decision_mode, decision_origin
-            )
-            if ins.endswith(" 1"):
-                log.debug("[FILLER] ✍️  LPS INSERT log_uid=%s sid=%s csid=%s tf=%s", log_uid, sid, client_sid, tf)
-                return
+        if not rows:
+            log.info("[SEED] ⚠️ SLE не найден (log_uid=%s sid=%s csid=%s)", log_uid, master_sid, client_sid_opt or "-")
+            return 0
 
-            # race → UPDATE
-            await conn.execute(
-                """
-                UPDATE public.laboratoty_position_stat
-                   SET mw_states = COALESCE($1::jsonb, mw_states),
-                       mw_matches = COALESCE($2::jsonb, mw_matches),
-                       pack_wl_matches = COALESCE($3::jsonb, pack_wl_matches),
-                       pack_bl_matches = COALESCE($4::jsonb, pack_bl_matches),
-                       mw_match_count = $5,
-                       pack_wl_match_count = $6,
-                       pack_bl_match_count = $7,
-                       pack_family_counts = COALESCE($8::jsonb, pack_family_counts),
-                       decision_mode = COALESCE($9, decision_mode),
-                       decision_origin = COALESCE($10, decision_origin),
-                       updated_at = NOW()
-                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id=$13 AND tf=$14
-                """,
-                states_json, mw_json, wl_json, bl_json,
-                mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                fam_json, decision_mode, decision_origin, log_uid, sid, int(client_sid), tf
-            )
-            log.debug("[FILLER] ✏️ LPS UPDATE (race) log_uid=%s sid=%s csid=%s tf=%s", log_uid, sid, client_sid, tf)
-            
-# 🔸 Обработка одного seed-сообщения (полный цикл по TF)
-async def _process_seed(msg_id: str, fields: Dict[str, str]):
-    async with _filler_sem:
-        t0 = _now_monotonic_ms()
+        processed = 0
+        for r in rows:
+            tf = _lower_str(r["timeframes_processed"] or "")
+            if tf not in ("m5", "m15", "h1"):
+                continue
 
-        log_uid   = fields.get("log_uid") or ""
-        sid_s     = fields.get("strategy_id") or ""
-        client_s  = fields.get("client_strategy_id") or ""
-        symbol    = (fields.get("symbol") or "").strip().upper()
-        direction = (fields.get("direction") or "").strip().lower()
-        tfs_raw   = fields.get("timeframes") or ""
+            symbol = str(r["symbol"]).upper()
+            direction = _lower_str(r["direction"])
+            mw_cnt = int(r["mw_wl_match_count"] or 0)
+            pack_wl_cnt = int(r["pack_wl_match_count"] or 0)
+            pack_bl_cnt = int(r["pack_bl_match_count"] or 0)
 
-        # 🔸 Новые поля для фиксации режима и источника
-        decision_mode = (fields.get("decision_mode") or "").strip().lower() or None
-        origins_raw   = (fields.get("decision_tf_origins") or "").strip()
-        tf_origins: Dict[str, str] = {}
-        if origins_raw:
+            # tf_results — одна TF-структура (мы писали по строке на TF)
             try:
-                for part in origins_raw.split(","):
-                    if ":" in part:
-                        tf, origin = part.split(":", 1)
-                        tf_origins[tf.strip()] = origin.strip()
+                tf_obj = json.loads(r["tf_results"]) if r["tf_results"] else {}
             except Exception:
-                log.debug("[FILLER] ⚠️ Ошибка парсинга decision_tf_origins: %s", origins_raw)
+                tf_obj = {}
 
-        if not log_uid or not sid_s.isdigit() or not symbol or direction not in ("long", "short") or not tfs_raw:
-            log.debug("[FILLER] ❌ bad seed msg=%s fields=%s", msg_id, fields)
-            return
+            mw_states = (tf_obj.get("mw") or {}).get("states")
+            pack_family_counts = _compute_pack_family_counts_for_matches(tf_obj.get("pack") or {})
 
-        sid = int(sid_s)
-        client_sid = int(client_s) if client_s.isdigit() else None
-        tfs = _parse_timeframes(tfs_raw)
-        if not tfs:
-            log.debug("[FILLER] ❌ empty TF seed log_uid=%s", log_uid)
-            return
+            # decision_origin по TF
+            tf_origin = tf_origin_map.get(tf)
+            if not tf_origin:
+                # эвристика: если MW дал совпадение — "mw", иначе (allow=true гарантировал хотя бы одно подтверждение) → "pack"
+                tf_origin = "mw" if mw_cnt >= 1 else ("pack" if pack_wl_cnt >= 1 else None)
 
-        precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
-        deadline_ms = _now_monotonic_ms() + 60_000  # верхний потолок на обогащение одной заявки
-
-        for tf in tfs:
+            # upsert в LPS по уникальному ключу uq_lps_unique
             try:
-                # MW
-                mw_states, mw_matches = await _collect_mw(sid, symbol, tf, direction, precision, deadline_ms)
-
-                # PACK
-                pack_wl_matches, pack_bl_matches, wl_family_counts = await _collect_pack(
-                    sid, symbol, tf, direction, precision, deadline_ms
+                await conn.execute(
+                    """
+                    INSERT INTO laboratoty_position_stat (
+                        log_uid, strategy_id, client_strategy_id,
+                        symbol, direction, tf,
+                        mw_states,
+                        mw_match_count, pack_wl_match_count, pack_bl_match_count,
+                        pack_family_counts,
+                        decision_mode, decision_origin,
+                        created_at, updated_at
+                    ) VALUES (
+                        $1, $2, $3,
+                        $4, $5, $6,
+                        COALESCE($7::jsonb, NULL),
+                        $8, $9, $10,
+                        COALESCE($11::jsonb, NULL),
+                        $12, $13,
+                        NOW(), NOW()
+                    )
+                    ON CONFLICT ON CONSTRAINT uq_lps_unique DO UPDATE SET
+                        mw_states = COALESCE(EXCLUDED.mw_states, laboratoty_position_stat.mw_states),
+                        mw_match_count = EXCLUDED.mw_match_count,
+                        pack_wl_match_count = EXCLUDED.pack_wl_match_count,
+                        pack_bl_match_count = EXCLUDED.pack_bl_match_count,
+                        pack_family_counts = COALESCE(EXCLUDED.pack_family_counts, laboratoty_position_stat.pack_family_counts),
+                        decision_mode = COALESCE(EXCLUDED.decision_mode, laboratoty_position_stat.decision_mode),
+                        decision_origin = COALESCE(EXCLUDED.decision_origin, laboratoty_position_stat.decision_origin),
+                        updated_at = NOW()
+                    """,
+                    log_uid, int(r["strategy_id"]), _as_int(r["client_strategy_id"]),
+                    symbol, direction, tf,
+                    json.dumps(mw_states, ensure_ascii=False) if isinstance(mw_states, dict) else None,
+                    mw_cnt, pack_wl_cnt, pack_bl_cnt,
+                    json.dumps(pack_family_counts, ensure_ascii=False) if pack_family_counts else None,
+                    (decision_mode_opt or None),
+                    (tf_origin or None),
                 )
-
-                # определяем источник прохода TF (mw или pack)
-                decision_origin = tf_origins.get(tf)
-
-                # Запись в таблицу с новыми полями
-                await _upsert_lps(
-                    log_uid=log_uid,
-                    sid=sid,
-                    client_sid=client_sid,
-                    symbol=symbol,
-                    direction=direction,
-                    tf=tf,
-                    mw_states=mw_states,
-                    mw_matches=mw_matches,
-                    pack_wl_matches=pack_wl_matches,
-                    pack_bl_matches=pack_bl_matches,
-                    wl_family_counts=wl_family_counts,
-                    decision_mode=decision_mode,
-                    decision_origin=decision_origin,
-                )
-                log.debug(
-                    "[FILLER] ✅ TF записан log_uid=%s sid=%s csid=%s %s %s (mode=%s origin=%s)",
-                    log_uid, sid, client_sid, symbol, tf, decision_mode, decision_origin
-                )
-
+                processed += 1
             except Exception:
-                log.exception("[FILLER] ❌ Ошибка TF log_uid=%s sid=%s tf=%s", log_uid, sid, tf)
+                log.exception("[SEED] ❌ ошибка upsert LPS (log_uid=%s tf=%s)", log_uid, tf)
 
-        dur = _now_monotonic_ms() - t0
-        log.debug(
-            "[FILLER] 📦 seed done log_uid=%s sid=%s csid=%s tfs=%s dur=%dms mode=%s",
-            log_uid, sid, client_sid, ",".join(tfs), dur, decision_mode
+        log.info(
+            "[SEED] ✅ LPS upsert завершён: log_uid=%s sid=%s csid=%s rows=%d",
+            log_uid, master_sid, client_sid_opt or "-", processed
         )
+        return processed
 
-# 🔸 Обработка события закрытия позиции из signal_log_queue
-async def _process_position_closed(msg_id: str, fields: Dict[str, str]):
-    """
-    Сообщение публикуется ПОСЛЕ записи в positions_v4 — позиция уже есть.
-    Берём log_uid, client_strategy_id (из strategy_id поля события), position_uid и дописываем в laboratoty_position_stat:
-    position_uid, pnl, result, closed_at — для всех TF по (log_uid, client_strategy_id).
-    """
-    log_uid = fields.get("log_uid") or ""
-    client_sid_s = fields.get("strategy_id") or ""  # в этом стриме это ИМЕННО клиентская стратегия
-    status = (fields.get("status") or "").strip().lower()
-    position_uid = fields.get("position_uid") or ""
 
-    if status != "closed":
-        # игнорируем другие статусы; ack произойдёт в вызывающем месте
-        log.debug("[CLOSE] skip non-closed msg=%s status=%s", msg_id, status)
+# 🔸 Обработчик события allow=true из decision_maker
+async def _handle_seed_message(msg_id: str, fields: Dict[str, str]):
+    payload = _extract_stream_payload(fields)
+
+    log_uid = payload.get("log_uid")
+    req_id = payload.get("req_id")
+    master_sid = _as_int(payload.get("strategy_id"))
+    client_sid = _as_int(payload.get("client_strategy_id"))
+    decision_mode = _lower_str(payload.get("decision_mode", "")) or None
+    tf_origins = payload.get("decision_tf_origins")  # "m5:mw,m15:pack" (если передано)
+
+    if not log_uid or not master_sid or not req_id:
+        log.info("[SEED] ⚠️ пропуск msg=%s: недостаточно полей payload=%s", msg_id, payload)
         return
 
-    if not log_uid or not client_sid_s.isdigit() or not position_uid:
-        log.debug("[CLOSE] ❌ bad closed event msg=%s fields=%s", msg_id, fields)
+    try:
+        await _seed_lps_from_sle(
+            req_id=req_id,
+            log_uid=str(log_uid),
+            master_sid=int(master_sid),
+            client_sid_opt=client_sid,
+            decision_mode_opt=decision_mode,
+            decision_tf_origins_opt=tf_origins,
+        )
+    except Exception:
+        log.exception("[SEED] ❌ ошибка обработки seed-сообщения (log_uid=%s)", log_uid)
+
+
+# 🔸 Обновление LPS по событию закрытия позиции
+async def _handle_close_message(msg_id: str, fields: Dict[str, str]):
+    payload = _extract_stream_payload(fields)
+
+    if _lower_str(payload.get("status", "")) != "closed":
         return
 
-    client_sid = int(client_sid_s)
+    log_uid = payload.get("log_uid")
+    position_uid = payload.get("position_uid")
+    client_sid = _as_int(payload.get("strategy_id"))  # в этом стриме — SID зеркала!
 
-    # читаем факт позиции
+    if not log_uid or not position_uid or client_sid is None:
+        log.info("[CLOSE] ⚠️ пропуск msg=%s: нет log_uid/position_uid/strategy_id payload=%s", msg_id, payload)
+        return
+
+    # читаем позицию (уже обновлена внешним модулем)
     async with infra.pg_pool.acquire() as conn:
         pos = await conn.fetchrow(
             """
-            SELECT id, position_uid, pnl, closed_at
-            FROM public.positions_v4
+            SELECT position_uid, pnl, closed_at
+            FROM positions_v4
             WHERE position_uid = $1
             """,
             position_uid
         )
         if not pos:
-            # по условиям это маловероятно (событие публикуется после записи), но если так — просто лог и выходим
-            log.debug("[CLOSE] ℹ️ position not found (uid=%s), skip", position_uid)
+            log.info("[CLOSE] ⚠️ позиция не найдена position_uid=%s", position_uid)
             return
 
         pnl = pos["pnl"]
-        closed_at = pos["closed_at"] or datetime.utcnow()
-        result = (pnl is not None and pnl > 0)
+        closed_at = pos["closed_at"]
+        # result: строго > 0
+        result_flag = bool(pnl is not None and float(pnl) > 0.0)
 
-        # апдейт ВСЕХ TF-строк по (log_uid, client_sid)
-        upd_status = await conn.execute(
-            """
-            UPDATE public.laboratoty_position_stat
-               SET position_uid = $1,
-                   pnl = $2,
-                   result = $3,
-                   closed_at = $4,
-                   updated_at = NOW()
-             WHERE log_uid = $5
-               AND client_strategy_id = $6
-            """,
-            position_uid, pnl, result, closed_at, log_uid, client_sid
-        )
+        # апдейт всех TF-строк LPS по (log_uid, client_sid)
+        try:
+            status = await conn.execute(
+                """
+                UPDATE laboratoty_position_stat
+                   SET position_uid = $1,
+                       pnl = $2,
+                       result = $3,
+                       closed_at = $4,
+                       updated_at = NOW()
+                 WHERE log_uid = $5
+                   AND client_strategy_id = $6
+                """,
+                position_uid, pnl, result_flag, closed_at, log_uid, client_sid
+            )
+            # status выглядит как "UPDATE <n>"
+            updated = int(status.split()[-1]) if status.startswith("UPDATE") else 0
+            log.info(
+                "[CLOSE] ✅ LPS обновлён: log_uid=%s csid=%s pos=%s pnl=%s result=%s rows=%d",
+                log_uid, client_sid, position_uid, str(pnl), str(result_flag).lower(), updated
+            )
+        except Exception:
+            log.exception("[CLOSE] ❌ ошибка обновления LPS (log_uid=%s csid=%s)", log_uid, client_sid)
 
-        # Если обновлено 0 строк — это не ошибка (старые позиции, мы их не обогащали seed'ом)
-        if upd_status.startswith("UPDATE 0"):
-            log.debug("[CLOSE] ℹ️ no LPS rows for log_uid=%s csid=%s (probably legacy), skip", log_uid, client_sid)
-        else:
-            log.debug("[CLOSE] ✅ LPS updated for log_uid=%s csid=%s (%s)", log_uid, client_sid, upd_status)
 
-
-# 🔸 Главный слушатель seed-стрима
+# 🔸 Главный слушатель: сидинг после allow=true
 async def run_laboratory_decision_filler():
     """
-    Слушает laboratory_decision_filler и формирует строки в laboratoty_position_stat:
-      — по каждому TF собирает ВСЕ совпадения MW/PACK,
-      — считает короткие счётчики,
-      — делает upsert (без позиционных полей).
-    Обрабатывает только НОВЫЕ сообщения (старт с '$').
+    Слушает laboratory_decision_filler и на каждое allow=true событие создаёт/обновляет строки в laboratoty_position_stat
+    по всем TF данного запроса (по данным из signal_laboratory_entries).
     """
-    log.debug("🛰️ LAB_DECISION_FILLER(seeds) запущен (BLOCK=%d COUNT=%d MAX=%d)",
-             XREAD_BLOCK_MS, XREAD_COUNT, MAX_IN_FLIGHT)
+    log.debug("🛰️ LAB_DECISION_FILLER слушатель запущен (BLOCK=%d COUNT=%d)", XREAD_BLOCK_MS, XREAD_COUNT)
 
     last_id = "$"
     redis = infra.redis_client
 
     while True:
         try:
-            resp = await redis.xread(streams={DECISION_FILLER_STREAM: last_id},
-                                     count=XREAD_COUNT, block=XREAD_BLOCK_MS)
-            if not resp:
-                continue
-
-            for _, messages in resp:
-                for msg_id, fields in messages:
-                    last_id = msg_id
-                    asyncio.create_task(_process_seed(msg_id, fields))
-
-        except asyncio.CancelledError:
-            log.debug("⏹️ LAB_DECISION_FILLER(seeds) остановлен по сигналу")
-            raise
-        except Exception:
-            log.exception("❌ LAB_DECISION_FILLER(seeds) ошибка в основном цикле")
-            await asyncio.sleep(1.0)
-
-
-# 🔸 Слушатель закрытий позиций (consumer group, чтобы не мешать другим)
-async def run_position_close_updater():
-    """
-    Слушает signal_log_queue в своей consumer group и дописывает финальные поля в laboratoty_position_stat
-    по каждому закрытию позиции (status=closed).
-    """
-    log.debug("🛰️ LAB_DECISION_FILLER(close) запущен (GROUP=%s)", POS_CLOSE_GROUP)
-    redis = infra.redis_client
-
-    # создаём consumer group идемпотентно
-    try:
-        await redis.xgroup_create(POS_CLOSE_STREAM=POSITION_CLOSE_STREAM)  # intentionally wrong to force NameError to remind fix
-    except TypeError:
-        # корректный вызов:
-        try:
-            await redis.xgroup_create(POSITION_CLOSE_STREAM, POS_CLOSE_GROUP, id="$", mkstream=True)
-        except Exception as e:
-            if "BUSYGROUP" not in str(e):
-                log.warning("xgroup_create error: %s", e)
-
-    while True:
-        try:
-            resp = await redis.xreadgroup(
-                POS_CLOSE_GROUP, POS_CLOSE_CONSUMER,
-                streams={POSITION_CLOSE_STREAM: ">"},
+            resp = await redis.xread(
+                streams={DECISION_FILLER_STREAM: last_id},
                 count=XREAD_COUNT,
                 block=XREAD_BLOCK_MS
             )
@@ -763,18 +396,52 @@ async def run_position_close_updater():
 
             for _, messages in resp:
                 for msg_id, fields in messages:
+                    last_id = msg_id
                     try:
-                        await _process_position_closed(msg_id, fields)
-                        # подтверждаем обработку независимо от того, были LPS-строки или нет
-                        await redis.xack(POSITION_CLOSE_STREAM, POS_CLOSE_GROUP, msg_id)
+                        await _handle_seed_message(msg_id, fields)
                     except Exception:
-                        log.exception("[CLOSE] ❌ Ошибка обработки msg=%s", msg_id)
-                        # ack всё равно, чтобы не зациклиться (нагрузка низкая, сообщений много не будет)
-                        await redis.xack(POSITION_CLOSE_STREAM, POS_CLOSE_GROUP, msg_id)
+                        log.exception("❌ Ошибка seed-сообщения msg_id=%s", msg_id)
 
         except asyncio.CancelledError:
-            log.debug("⏹️ LAB_DECISION_FILLER(close) остановлен по сигналу")
+            log.debug("⏹️ LAB_DECISION_FILLER остановлен по сигналу")
             raise
         except Exception:
-            log.exception("❌ LAB_DECISION_FILLER(close) ошибка в основном цикле")
+            log.exception("❌ LAB_DECISION_FILLER ошибка цикла")
+            await asyncio.sleep(1.0)
+
+
+# 🔸 Слушатель закрытия позиций: дополняет LPS pnl/result/closed_at/position_uid
+async def run_position_close_updater():
+    """
+    Слушает signal_log_queue. На событиях со status='closed' подтягивает из positions_v4 PnL/closed_at
+    и дописывает их в laboratoty_position_stat (по log_uid + client_strategy_id).
+    """
+    log.debug("🛰️ LAB_POS_CLOSE_FILLER слушатель запущен (BLOCK=%d COUNT=%d)", XREAD_BLOCK_MS, XREAD_COUNT)
+
+    last_id = "$"
+    redis = infra.redis_client
+
+    while True:
+        try:
+            resp = await redis.xread(
+                streams={SIGNAL_LOG_QUEUE_STREAM: last_id},
+                count=XREAD_COUNT,
+                block=XREAD_BLOCK_MS
+            )
+            if not resp:
+                continue
+
+            for _, messages in resp:
+                for msg_id, fields in messages:
+                    last_id = msg_id
+                    try:
+                        await _handle_close_message(msg_id, fields)
+                    except Exception:
+                        log.exception("❌ Ошибка close-сообщения msg_id=%s", msg_id)
+
+        except asyncio.CancelledError:
+            log.debug("⏹️ LAB_POS_CLOSE_FILLER остановлен по сигналу")
+            raise
+        except Exception:
+            log.exception("❌ LAB_POS_CLOSE_FILLER ошибка цикла")
             await asyncio.sleep(1.0)
