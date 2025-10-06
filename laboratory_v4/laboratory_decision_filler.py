@@ -157,137 +157,9 @@ def _parse_tf_origin_map(s: Optional[str]) -> Dict[str, str]:
             out[tf] = origin
     return out
 
-
-# 🔸 Сидинг LPS из SLE по одному allow-событию
-async def _seed_lps_from_sle(
-    req_id: str,
-    log_uid: str,
-    master_sid: int,
-    client_sid_opt: Optional[int],
-    decision_mode_opt: Optional[str],
-    decision_tf_origins_opt: Optional[str],
-) -> int:
-    """
-    Берёт строки из signal_laboratory_entries по (log_uid, strategy_id, [client_strategy_id]) и заводит/обновляет
-    по одной строке на каждый TF в laboratoty_position_stat.
-    Возвращает количество обработанных TF-строк.
-    """
-    tf_origin_map = _parse_tf_origin_map(decision_tf_origins_opt)
-
-    async with infra.pg_pool.acquire() as conn:
-        # читаем все TF-строки по конкретному запросу
-        if client_sid_opt is not None:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    strategy_id, client_strategy_id, symbol, direction,
-                    timeframes_processed, tf_results,
-                    mw_wl_match_count, pack_wl_match_count, pack_bl_match_count
-                FROM signal_laboratory_entries
-                WHERE log_uid = $1
-                  AND strategy_id = $2
-                  AND client_strategy_id = $3
-                """,
-                log_uid, master_sid, client_sid_opt
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    strategy_id, client_strategy_id, symbol, direction,
-                    timeframes_processed, tf_results,
-                    mw_wl_match_count, pack_wl_match_count, pack_bl_match_count
-                FROM signal_laboratory_entries
-                WHERE log_uid = $1
-                  AND strategy_id = $2
-                  AND client_strategy_id IS NULL
-                """,
-                log_uid, master_sid
-            )
-
-        if not rows:
-            log.info("[SEED] ⚠️ SLE не найден (log_uid=%s sid=%s csid=%s)", log_uid, master_sid, client_sid_opt or "-")
-            return 0
-
-        processed = 0
-        for r in rows:
-            tf = _lower_str(r["timeframes_processed"] or "")
-            if tf not in ("m5", "m15", "h1"):
-                continue
-
-            symbol = str(r["symbol"]).upper()
-            direction = _lower_str(r["direction"])
-            mw_cnt = int(r["mw_wl_match_count"] or 0)
-            pack_wl_cnt = int(r["pack_wl_match_count"] or 0)
-            pack_bl_cnt = int(r["pack_bl_match_count"] or 0)
-
-            # tf_results — одна TF-структура (мы писали по строке на TF)
-            try:
-                tf_obj = json.loads(r["tf_results"]) if r["tf_results"] else {}
-            except Exception:
-                tf_obj = {}
-
-            mw_states = (tf_obj.get("mw") or {}).get("states")
-            pack_family_counts = _compute_pack_family_counts_for_matches(tf_obj.get("pack") or {})
-
-            # decision_origin по TF
-            tf_origin = tf_origin_map.get(tf)
-            if not tf_origin:
-                # эвристика: если MW дал совпадение — "mw", иначе (allow=true гарантировал хотя бы одно подтверждение) → "pack"
-                tf_origin = "mw" if mw_cnt >= 1 else ("pack" if pack_wl_cnt >= 1 else None)
-
-            # upsert в LPS по уникальному ключу uq_lps_unique
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO laboratoty_position_stat (
-                        log_uid, strategy_id, client_strategy_id,
-                        symbol, direction, tf,
-                        mw_states,
-                        mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                        pack_family_counts,
-                        decision_mode, decision_origin,
-                        created_at, updated_at
-                    ) VALUES (
-                        $1, $2, $3,
-                        $4, $5, $6,
-                        COALESCE($7::jsonb, NULL),
-                        $8, $9, $10,
-                        COALESCE($11::jsonb, NULL),
-                        $12, $13,
-                        NOW(), NOW()
-                    )
-                    ON CONFLICT ON CONSTRAINT uq_lps_unique DO UPDATE SET
-                        mw_states = COALESCE(EXCLUDED.mw_states, laboratoty_position_stat.mw_states),
-                        mw_match_count = EXCLUDED.mw_match_count,
-                        pack_wl_match_count = EXCLUDED.pack_wl_match_count,
-                        pack_bl_match_count = EXCLUDED.pack_bl_match_count,
-                        pack_family_counts = COALESCE(EXCLUDED.pack_family_counts, laboratoty_position_stat.pack_family_counts),
-                        decision_mode = COALESCE(EXCLUDED.decision_mode, laboratoty_position_stat.decision_mode),
-                        decision_origin = COALESCE(EXCLUDED.decision_origin, laboratoty_position_stat.decision_origin),
-                        updated_at = NOW()
-                    """,
-                    log_uid, int(r["strategy_id"]), _as_int(r["client_strategy_id"]),
-                    symbol, direction, tf,
-                    json.dumps(mw_states, ensure_ascii=False) if isinstance(mw_states, dict) else None,
-                    mw_cnt, pack_wl_cnt, pack_bl_cnt,
-                    json.dumps(pack_family_counts, ensure_ascii=False) if pack_family_counts else None,
-                    (decision_mode_opt or None),
-                    (tf_origin or None),
-                )
-                processed += 1
-            except Exception:
-                log.exception("[SEED] ❌ ошибка upsert LPS (log_uid=%s tf=%s)", log_uid, tf)
-
-        log.info(
-            "[SEED] ✅ LPS upsert завершён: log_uid=%s sid=%s csid=%s rows=%d",
-            log_uid, master_sid, client_sid_opt or "-", processed
-        )
-        return processed
-
 # 🔸 Обработка seed-сообщения (allow=true): тянем строки из SLE и апсертим LPS
 async def _handle_seed_message(msg_id: str, fields: dict):
-    # payload может прийти в разных формах — нормализуем
+    # нормализация payload
     payload = {}
     for k, v in (fields or {}).items():
         if isinstance(v, str) and v.startswith("{"):
@@ -312,27 +184,20 @@ async def _handle_seed_message(msg_id: str, fields: dict):
         rows = await conn.fetch(
             """
             SELECT
-                req_id,
-                log_uid,
-                strategy_id,
-                client_strategy_id,
-                symbol,
-                direction,
+                req_id, log_uid, strategy_id, client_strategy_id, symbol, direction,
                 tf,
-                -- в SLE колонок allow_tf/reason_tf нет: берём allow/reason с алиасами
-                allow  AS allow_tf,
+                allow AS allow_tf,
                 reason AS reason_tf,
+                -- счётчики из колонок SLE
                 mw_wl_hits,
-                mw_wl_total,
+                mw_wl_rules_total,
                 pack_wl_hits,
-                pack_wl_total,
+                pack_wl_rules_total,
                 pack_bl_hits,
-                pack_bl_total,
+                pack_bl_rules_total,
                 tf_results
             FROM public.signal_laboratory_entries
-            WHERE req_id = $1
-              AND log_uid = $2
-              AND tf IS NOT NULL
+            WHERE req_id = $1 AND log_uid = $2
             """,
             req_id, log_uid
         )
@@ -344,14 +209,18 @@ async def _handle_seed_message(msg_id: str, fields: dict):
         upserts = 0
         for r in rows:
             sid = int(r["strategy_id"])
-            csid = r["client_strategy_id"]
-            csid = int(csid) if csid is not None else None
+            csid_raw = r["client_strategy_id"]
+            try:
+                csid = int(csid_raw) if csid_raw is not None else None
+            except Exception:
+                csid = None
+
             symbol = str(r["symbol"])
             direction = str(r["direction"])
             tf = str(r["tf"])
 
-            # decision_origin из reason_tf, если allow_tf=true
-            reason_tf = (r["reason_tf"] or "").lower()
+            # origin из reason при allow=true
+            reason_tf = (r["reason_tf"] or "").lower() if r["reason_tf"] is not None else ""
             allow_tf = bool(r["allow_tf"])
             decision_origin = None
             if allow_tf:
@@ -360,9 +229,9 @@ async def _handle_seed_message(msg_id: str, fields: dict):
                 elif reason_tf.startswith("ok_by_pack"):
                     decision_origin = "pack"
                 elif reason_tf.startswith("ok_by_mw_and_pack"):
-                    decision_origin = "mw"  # для mw_and_pack — обе, но зафиксируем как mw по умолчанию
+                    decision_origin = "mw"  # для mw_and_pack — обе плоскости; фиксируем как mw
 
-            # decision_mode пробуем достать из tf_results (если туда писали), иначе NULL
+            # decision_mode из tf_results.meta (в SLE отдельной колонки нет)
             decision_mode = None
             tr = r["tf_results"]
             if isinstance(tr, str):
@@ -373,15 +242,19 @@ async def _handle_seed_message(msg_id: str, fields: dict):
             if isinstance(tr, dict):
                 decision_mode = tr.get("decision_mode") or (tr.get("meta") or {}).get("decision_mode")
 
-            # счётчики 1-в-1 из SLE
-            mw_hits = int(r["mw_wl_hits"] or 0)
-            pack_wl_hits = int(r["pack_wl_hits"] or 0)
-            pack_bl_hits = int(r["pack_bl_hits"] or 0)
+            # счётчики: берём hits из SLE-колонок (totals нам в LPS не требуются)
+            def _i(x): 
+                try: return int(x)
+                except Exception: return 0
+
+            mw_hits       = _i(r["mw_wl_hits"])
+            pack_wl_hits  = _i(r["pack_wl_hits"])
+            pack_bl_hits  = _i(r["pack_bl_hits"])
 
             # апсерт в LPS (идемпотентно по uq_lps_unique)
             await conn.execute(
                 """
-                INSERT INTO laboratoty_position_stat (
+                INSERT INTO public.laboratoty_position_stat (
                     log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
                     mw_match_count, pack_wl_match_count, pack_bl_match_count,
                     decision_mode, decision_origin, created_at, updated_at
@@ -406,6 +279,7 @@ async def _handle_seed_message(msg_id: str, fields: dict):
             upserts += 1
 
         log.info("[SEED] ✅ upsert LPS: req_id=%s log_uid=%s rows=%d", req_id, log_uid, upserts)
+
 # 🔸 Обновление LPS по событию закрытия позиции
 async def _handle_close_message(msg_id: str, fields: Dict[str, str]):
     payload = _extract_stream_payload(fields)
