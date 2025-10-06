@@ -312,15 +312,27 @@ async def _handle_seed_message(msg_id: str, fields: dict):
         rows = await conn.fetch(
             """
             SELECT
-                req_id, log_uid, strategy_id, client_strategy_id, symbol, direction,
+                req_id,
+                log_uid,
+                strategy_id,
+                client_strategy_id,
+                symbol,
+                direction,
                 tf,
-                allow_tf, reason_tf,
-                mw_wl_hits, mw_wl_total,
-                pack_wl_hits, pack_wl_total,
-                pack_bl_hits, pack_bl_total,
+                -- в SLE колонок allow_tf/reason_tf нет: берём allow/reason с алиасами
+                allow  AS allow_tf,
+                reason AS reason_tf,
+                mw_wl_hits,
+                mw_wl_total,
+                pack_wl_hits,
+                pack_wl_total,
+                pack_bl_hits,
+                pack_bl_total,
                 tf_results
-            FROM signal_laboratory_entries
-            WHERE req_id = $1 AND log_uid = $2
+            FROM public.signal_laboratory_entries
+            WHERE req_id = $1
+              AND log_uid = $2
+              AND tf IS NOT NULL
             """,
             req_id, log_uid
         )
@@ -363,11 +375,8 @@ async def _handle_seed_message(msg_id: str, fields: dict):
 
             # счётчики 1-в-1 из SLE
             mw_hits = int(r["mw_wl_hits"] or 0)
-            mw_total = int(r["mw_wl_total"] or 0)
             pack_wl_hits = int(r["pack_wl_hits"] or 0)
-            pack_wl_total = int(r["pack_wl_total"] or 0)
             pack_bl_hits = int(r["pack_bl_hits"] or 0)
-            pack_bl_total = int(r["pack_bl_total"] or 0)
 
             # апсерт в LPS (идемпотентно по uq_lps_unique)
             await conn.execute(
@@ -397,7 +406,6 @@ async def _handle_seed_message(msg_id: str, fields: dict):
             upserts += 1
 
         log.info("[SEED] ✅ upsert LPS: req_id=%s log_uid=%s rows=%d", req_id, log_uid, upserts)
-
 # 🔸 Обновление LPS по событию закрытия позиции
 async def _handle_close_message(msg_id: str, fields: Dict[str, str]):
     payload = _extract_stream_payload(fields)
