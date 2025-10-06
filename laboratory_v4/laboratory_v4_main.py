@@ -24,8 +24,9 @@ from laboratory_config import (
 # 🔸 Обработчик решений (allow/deny)
 from laboratory_decision_maker import run_laboratory_decision_maker
 
-# 🔸 Пост-allow писатель статистики (filler)
+# 🔸 Пост-allow писатель статистики (filler/postproc)
 from laboratory_decision_filler import run_laboratory_decision_filler
+from laboratory_decision_postproc import run_laboratory_decision_postproc
 
 log = logging.getLogger("LAB_MAIN")
 
@@ -80,6 +81,7 @@ async def main():
         run_safe_loop(run_laboratory_decision_maker, "LAB_DECISION"),
         # Пост-allow наполнитель статистики — Streams: laboratory_decision_filler → laboratoty_position_stat
         run_safe_loop(run_laboratory_decision_filler, "LAB_DECISION_FILLER"),
+        run_safe_loop(run_laboratory_decision_postproc, "LAB_DECISION_POSTPROC"),
     )
 
 

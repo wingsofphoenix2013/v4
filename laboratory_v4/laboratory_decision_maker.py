@@ -969,7 +969,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                     log.exception("[FILLER] ❌ Ошибка публикации seed в %s", DECISION_FILLER_STREAM)
                     
             # финальный лог (log.debug)
-            log.info(
+            log.debug(
                 "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
                 ("✅ allow" if final_allow else "⛔ deny"),
                 log_uid, sid, (client_sid_s or "-"), (final_reason or "-"),

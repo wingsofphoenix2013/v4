@@ -344,7 +344,7 @@ async def _process_seed(req_id: str, log_uid: str):
             req_id,
         )
         if not rows:
-            log.info("[LPS] ⚠️ нет строк SLE для req_id=%s log_uid=%s (allow=true)", req_id, log_uid)
+            log.debug("[LPS] ⚠️ нет строк SLE для req_id=%s log_uid=%s (allow=true)", req_id, log_uid)
             return
 
         for r in rows:
@@ -363,7 +363,7 @@ async def _process_seed(req_id: str, log_uid: str):
 
     # лог результата
     uniq_tfs = ",".join(sorted(set(tfs), key=lambda x: ["m5", "m15", "h1"].index(x) if x in ("m5","m15","h1") else 9))
-    log.info(
+    log.debug(
         "[LPS] ✅ filled req_id=%s log_uid=%s sid=%s csid=%s %s tfs=[%s] ins=%d upd=%d",
         req_id, log_uid, (sid if sid is not None else "-"), (csid if csid is not None else "-"),
         (symbol or "-"), uniq_tfs, inserted, updated
@@ -408,7 +408,7 @@ async def run_laboratory_decision_filler():
                             except Exception:
                                 pass
                     if not req_id or not log_uid:
-                        log.info("[LPS] ⚠️ пропуск seed msg=%s: неполные поля: %s", msg_id, fields)
+                        log.debug("[LPS] ⚠️ пропуск seed msg=%s: неполные поля: %s", msg_id, fields)
                         continue
 
                     # обработка seed
