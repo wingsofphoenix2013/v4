@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 # 🔸 Инфраструктура
@@ -48,7 +49,32 @@ _gateway_sem = asyncio.Semaphore(MAX_CONCURRENT_GATEWAY_CALLS)
 # 🔸 Коалесценс (in-process): key -> (expire_ms, future)
 _coalesce: Dict[str, Tuple[float, asyncio.Future]] = {}
 
-
+# 🔸 Преобразование произвольного объекта к JSON-safe виду
+def _to_json_safe(obj: Any) -> Any:
+    # простые типы
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # Decimal -> float
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return str(obj)
+    # datetime -> ISO
+    if isinstance(obj, datetime):
+        try:
+            return obj.replace(tzinfo=None).isoformat()
+        except Exception:
+            return str(obj)
+    # dict -> рекурсивно
+    if isinstance(obj, dict):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    # list/tuple -> рекурсивно
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_safe(v) for v in obj]
+    # fallback: строковое представление
+    return str(obj)
+    
 # 🔸 Вспомогательные парсеры/утилиты
 def _parse_timeframes(tf_str: str) -> List[str]:
     items = [x.strip().lower() for x in (tf_str or "").split(",") if x.strip()]
@@ -660,9 +686,13 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         }
         if client_sid_s:
             resp["client_strategy_id"] = client_sid_s
+            
+        # формируем JSON-safe снимок и вкладываем его в ответ
+        tf_results_safe = _to_json_safe(tf_results)
         try:
-            resp["tf_results"] = json.dumps(tf_results, ensure_ascii=False)
+            resp["tf_results"] = json.dumps(tf_results_safe, ensure_ascii=False)
         except Exception:
+            # на всякий случай не роняем ответ
             pass
 
         await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
@@ -675,7 +705,8 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
         # запись в БД
         try:
-            tf_results_json = json.dumps(tf_results, ensure_ascii=False)
+            # сериализация в БД — через безопасную версию
+            tf_results_json = json.dumps(tf_results_safe, ensure_ascii=False)
             await _persist_decision(
                 req_id=msg_id,
                 log_uid=log_uid,
