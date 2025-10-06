@@ -18,6 +18,7 @@ log = logging.getLogger("LAB_DECISION")
 # 🔸 Потоки и шлюзы
 DECISION_REQ_STREAM = "laboratory:decision_request"
 DECISION_RESP_STREAM = "laboratory:decision_response"
+DECISION_FILLER_STREAM = "laboratory_decision_filler"
 GATEWAY_REQ_STREAM = "indicator_gateway_request"
 
 # 🔸 Параметры производительности/дедлайнов/конкуренции
@@ -715,7 +716,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                     "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing or invalid fields"
                 })
-                log.info("[REQ] ❌ bad_request log_uid=%s sid=%s symbol=%s dir=%s tfs=%s", log_uid, strategy_id_s, symbol, direction, tfs_raw)
+                log.debug("[REQ] ❌ bad_request log_uid=%s sid=%s symbol=%s dir=%s tfs=%s", log_uid, strategy_id_s, symbol, direction, tfs_raw)
                 return
 
             # требуемый режим
@@ -723,7 +724,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                     "req_id": msg_id, "status": "error", "error": "incomplete_request", "message": "decision_mode required"
                 })
-                log.info("[REQ] ❌ incomplete_request (decision_mode missing) log_uid=%s", log_uid)
+                log.debug("[REQ] ❌ incomplete_request (decision_mode missing) log_uid=%s", log_uid)
                 return
             decision_mode = decision_mode_raw
 
@@ -735,13 +736,13 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                     "req_id": msg_id, "status": "error", "error": "symbol_not_active", "message": f"{symbol}"
                 })
-                log.info("[REQ] ❌ symbol_not_active log_uid=%s sid=%s %s", log_uid, sid, symbol)
+                log.debug("[REQ] ❌ symbol_not_active log_uid=%s sid=%s %s", log_uid, sid, symbol)
                 return
             if sid not in infra.enabled_strategies:
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                     "req_id": msg_id, "status": "error", "error": "strategy_not_enabled", "message": f"{sid}"
                 })
-                log.info("[REQ] ❌ strategy_not_enabled log_uid=%s sid=%s", log_uid, sid)
+                log.debug("[REQ] ❌ strategy_not_enabled log_uid=%s sid=%s", log_uid, sid)
                 return
 
             # нормализация TF и дедлайн
@@ -752,7 +753,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             await infra.wait_mw_ready(sid, timeout_sec=5.0)
 
             # лог старта
-            log.info(
+            log.debug(
                 "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s deadline=90s",
                 log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), decision_mode
             )
@@ -851,7 +852,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 tf_results_for_response.append(tf_result_obj)
 
                 # лог по TF
-                log.info(
+                log.debug(
                     "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  allow=%s reason=%s  incomplete=%s  kv_hits=%d gw_reqs=%d",
                     tf, mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
                     str(allow_tf).lower(), reason_tf, str(incomplete).lower(),
@@ -923,7 +924,33 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
             await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
 
-            # финальный лог (log.info)
+            # лог ответа
+            log.debug(
+                "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
+                "✅ allow" if final_allow else "⛔ deny",
+                log_uid, sid, (client_sid_s or "-"),
+                (final_reason or "-"),
+                duration_ms_total,
+                telemetry.get("kv_hits", 0),
+                telemetry.get("gateway_requests", 0),
+            )
+
+            # публикация seed для laboratory_decision_filler (только при allow=true)
+            if final_allow:
+                try:
+                    await infra.redis_client.xadd(
+                        DECISION_FILLER_STREAM,
+                        {
+                            "req_id": msg_id,
+                            "log_uid": log_uid,
+                        },
+                    )
+                    log.debug("[FILLER] seed published req_id=%s log_uid=%s stream=%s",
+                             msg_id, log_uid, DECISION_FILLER_STREAM)
+                except Exception:
+                    log.exception("[FILLER] ❌ Ошибка публикации seed в %s", DECISION_FILLER_STREAM)
+                    
+            # финальный лог (log.debug)
             log.info(
                 "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
                 ("✅ allow" if final_allow else "⛔ deny"),
@@ -951,7 +978,7 @@ async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
         await infra.redis_client.xadd(DECISION_RESP_STREAM, {
             "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing sid/symbol"
         })
-        log.info("[REQ] ❌ bad_request (no sid/symbol) fields=%s", fields)
+        log.debug("[REQ] ❌ bad_request (no sid/symbol) fields=%s", fields)
         return
 
     sid = int(strategy_id_s)
@@ -972,7 +999,7 @@ async def run_laboratory_decision_maker():
     и allow=true|false. При некорректном запросе — status=error с кодом.
     Работает только с НОВЫМИ сообщениями (старт с '$'). Встроены ворота/очередь per (gate_sid, symbol).
     """
-    log.info("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d DEADLINE=%ds)",
+    log.debug("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d DEADLINE=%ds)",
              XREAD_BLOCK_MS, XREAD_COUNT, LAB_DEADLINE_MS // 1000)
 
     last_id = "$"  # только новые
@@ -994,7 +1021,7 @@ async def run_laboratory_decision_maker():
                     asyncio.create_task(_handle_incoming(msg_id, fields))
 
         except asyncio.CancelledError:
-            log.info("⏹️ LAB_DECISION остановлен по сигналу")
+            log.debug("⏹️ LAB_DECISION остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ LAB_DECISION ошибка в основном цикле")
