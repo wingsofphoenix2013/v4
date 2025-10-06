@@ -1,4 +1,4 @@
-# laboratory_decision_maker.py — Этап 2: сбор полного снимка MW/PACK по запросу (всегда deny) + подсчёт совпадений (MW-WL / PACK-WL / PACK-BL) и запись по КАЖДОМУ TF
+# laboratory_decision_maker.py — Этап 3: сценарии принятия решения (mw_only / mw_then_pack / mw_and_pack) + запись по КАЖДОМУ TF
 
 # 🔸 Импорты
 import asyncio
@@ -236,7 +236,11 @@ async def _ensure_pack_available(
             # очистка устаревших записей коалесценса
             now2 = _now_monotonic_ms()
             for ck, (exp, f) in list(_coalesce.items()):
-                if now2 > exp or (f.done() and _json_or_none(f.result()) is None):
+                try:
+                    done_and_none = f.done() and _json_or_none(f.result()) is None
+                except Exception:
+                    done_and_none = True
+                if now2 > exp or done_and_none:
                     _coalesce.pop(ck, None)
 
 # 🔸 Снятие MW-пакета (cache-first → gateway)
@@ -249,7 +253,7 @@ async def _get_mw_pack(symbol: str, tf: str, kind: str, deadline_ms: int, teleme
             telemetry["kv_hits"] = telemetry.get("kv_hits", 0) + 1
             return obj, "kv"
 
-    # если нет — обратимся к gateway (ind=kind, base=kind)
+    # если нет — запросим через gateway (ind=kind, base=kind)
     obj, src = await _ensure_pack_available(
         symbol=symbol, tf=tf, indicator=kind, base=kind, gw_params={}, deadline_ms=deadline_ms, telemetry=telemetry
     )
@@ -411,7 +415,7 @@ def _pack_count_hits(
 
     return wl_hits, wl_total, bl_hits, bl_total
 
-# 🔸 Персист одной строки по КОНКРЕТНОМУ TF (Этап 2: всегда allow=false + reason=stage2_count_only + счётчики)
+# 🔸 Персист одной строки по КОНКРЕТНОМУ TF (Этап 3: allow/deny per TF + счётчики)
 async def _persist_decision_tf(
     req_id: str,
     log_uid: str,
@@ -433,6 +437,8 @@ async def _persist_decision_tf(
     pack_wl_total: int,
     pack_bl_hits: int,
     pack_bl_total: int,
+    allow_tf: bool,
+    reason_tf: str,
 ):
     async with infra.pg_pool.acquire() as conn:
         if client_strategy_id is None:
@@ -446,22 +452,22 @@ async def _persist_decision_tf(
                        tf=$4,
                        timeframes_requested=$5,
                        timeframes_processed=$6,
-                       allow=false,
-                       reason='stage2_count_only',
-                       tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
-                       finished_at=$8,
-                       duration_ms=$9,
-                       cache_hits=$10,
-                       gateway_requests=$11,
-                       mw_wl_rules_total=$12,
-                       mw_wl_hits=$13,
-                       pack_wl_rules_total=$14,
-                       pack_wl_hits=$15,
-                       pack_bl_rules_total=$16,
-                       pack_bl_hits=$17
-                 WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id IS NULL AND tf=$4
+                       allow=$7,
+                       reason=$8,
+                       tf_results=COALESCE($9::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$10,
+                       duration_ms=$11,
+                       cache_hits=$12,
+                       gateway_requests=$13,
+                       mw_wl_rules_total=$14,
+                       mw_wl_hits=$15,
+                       pack_wl_rules_total=$16,
+                       pack_wl_hits=$17,
+                       pack_bl_rules_total=$18,
+                       pack_bl_hits=$19
+                 WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id IS NULL AND tf=$4
                 """,
-                req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+                req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
                 finished_at_dt, duration_ms, kv_hits, gateway_requests,
                 mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
                 log_uid, strategy_id
@@ -479,13 +485,13 @@ async def _persist_decision_tf(
                      mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits)
                 VALUES ($1,$2,$3,NULL,$4,$5,$6,
                         $7,$8,'v1',
-                        false,'stage2_count_only',COALESCE($9::jsonb,NULL),NULL,
-                        $10,$11,$12,$13,$14,
-                        $15,$16,$17,$18,$19,$20)
+                        $9,$10,COALESCE($11::jsonb,NULL),NULL,
+                        $12,$13,$14,$15,$16,
+                        $17,$18,$19,$20,$21,$22)
                 ON CONFLICT DO NOTHING
                 """,
                 req_id, log_uid, strategy_id, direction, symbol, tf,
-                tfr_req, tf, tf_result_json,
+                tfr_req, tf, allow_tf, reason_tf, tf_result_json,
                 received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests,
                 mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits
             )
@@ -501,22 +507,22 @@ async def _persist_decision_tf(
                        tf=$4,
                        timeframes_requested=$5,
                        timeframes_processed=$6,
-                       allow=false,
-                       reason='stage2_count_only',
-                       tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
-                       finished_at=$8,
-                       duration_ms=$9,
-                       cache_hits=$10,
-                       gateway_requests=$11,
-                       mw_wl_rules_total=$12,
-                       mw_wl_hits=$13,
-                       pack_wl_rules_total=$14,
-                       pack_wl_hits=$15,
-                       pack_bl_rules_total=$16,
-                       pack_bl_hits=$17
-                 WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id IS NULL AND tf=$4
+                       allow=$7,
+                       reason=$8,
+                       tf_results=COALESCE($9::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$10,
+                       duration_ms=$11,
+                       cache_hits=$12,
+                       gateway_requests=$13,
+                       mw_wl_rules_total=$14,
+                       mw_wl_hits=$15,
+                       pack_wl_rules_total=$16,
+                       pack_wl_hits=$17,
+                       pack_bl_rules_total=$18,
+                       pack_bl_hits=$19
+                 WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id IS NULL AND tf=$4
                 """,
-                req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+                req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
                 finished_at_dt, duration_ms, kv_hits, gateway_requests,
                 mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
                 log_uid, strategy_id
@@ -533,22 +539,22 @@ async def _persist_decision_tf(
                    tf=$4,
                    timeframes_requested=$5,
                    timeframes_processed=$6,
-                   allow=false,
-                   reason='stage2_count_only',
-                   tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
-                   finished_at=$8,
-                   duration_ms=$9,
-                   cache_hits=$10,
-                   gateway_requests=$11,
-                   mw_wl_rules_total=$12,
-                   mw_wl_hits=$13,
-                   pack_wl_rules_total=$14,
-                   pack_wl_hits=$15,
-                   pack_bl_rules_total=$16,
-                   pack_bl_hits=$17
-             WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id=$20 AND tf=$4
+                   allow=$7,
+                   reason=$8,
+                   tf_results=COALESCE($9::jsonb, signal_laboratory_entries.tf_results),
+                   finished_at=$10,
+                   duration_ms=$11,
+                   cache_hits=$12,
+                   gateway_requests=$13,
+                   mw_wl_rules_total=$14,
+                   mw_wl_hits=$15,
+                   pack_wl_rules_total=$16,
+                   pack_wl_hits=$17,
+                   pack_bl_rules_total=$18,
+                   pack_bl_hits=$19
+             WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id=$22 AND tf=$4
             """,
-            req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+            req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
             finished_at_dt, duration_ms, kv_hits, gateway_requests,
             mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
             log_uid, strategy_id, int(client_strategy_id)
@@ -565,13 +571,13 @@ async def _persist_decision_tf(
                  mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits)
             VALUES ($1,$2,$3,$4,$5,$6,$7,
                     $8,$9,'v1',
-                    false,'stage2_count_only',COALESCE($10::jsonb,NULL),NULL,
-                    $11,$12,$13,$14,$15,
-                    $16,$17,$18,$19,$20,$21)
+                    $10,$11,COALESCE($12::jsonb,NULL),NULL,
+                    $13,$14,$15,$16,$17,
+                    $18,$19,$20,$21,$22,$23)
             ON CONFLICT DO NOTHING
             """,
             req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol, tf,
-            tfr_req, tf, tf_result_json,
+            tfr_req, tf, allow_tf, reason_tf, tf_result_json,
             received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests,
             mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits
         )
@@ -586,22 +592,22 @@ async def _persist_decision_tf(
                    tf=$4,
                    timeframes_requested=$5,
                    timeframes_processed=$6,
-                   allow=false,
-                   reason='stage2_count_only',
-                   tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
-                   finished_at=$8,
-                   duration_ms=$9,
-                   cache_hits=$10,
-                   gateway_requests=$11,
-                   mw_wl_rules_total=$12,
-                   mw_wl_hits=$13,
-                   pack_wl_rules_total=$14,
-                   pack_wl_hits=$15,
-                   pack_bl_rules_total=$16,
-                   pack_bl_hits=$17
-             WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id=$20 AND tf=$4
+                   allow=$7,
+                   reason=$8,
+                   tf_results=COALESCE($9::jsonb, signal_laboratory_entries.tf_results),
+                   finished_at=$10,
+                   duration_ms=$11,
+                   cache_hits=$12,
+                   gateway_requests=$13,
+                   mw_wl_rules_total=$14,
+                   mw_wl_hits=$15,
+                   pack_wl_rules_total=$16,
+                   pack_wl_hits=$17,
+                   pack_bl_rules_total=$18,
+                   pack_bl_hits=$19
+             WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id=$22 AND tf=$4
             """,
-            req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+            req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
             finished_at_dt, duration_ms, kv_hits, gateway_requests,
             mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
             log_uid, strategy_id, int(client_strategy_id)
@@ -639,7 +645,7 @@ async def _acquire_gate_or_enqueue(
     log.debug("[GATE] ⏸️ в очередь gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
     return False, "enqueued"
 
-# 🔸 Реакция по завершении лидера (allow=false → назначить следующего)
+# 🔸 Реакция по завершении лидера (allow=true → отказ очереди; allow=false → следующий лидер)
 async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, allow: bool):
     gk = _gate_key(gate_sid, symbol)
     qk = _queue_key(gate_sid, symbol)
@@ -684,180 +690,257 @@ async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, al
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-# 🔸 Ядро обработки запроса (Этап 2: сбор снимка + подсчёт совпадений; ВСЕГДА deny в ответ)
+# 🔸 Ядро обработки запроса (Этап 3: сценарии mw_only / mw_then_pack / mw_and_pack)
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
-    async with _decisions_sem:
-        t0 = _now_monotonic_ms()
-        received_at_dt = datetime.utcnow()
+    # всегда освобождаем ворота
+    allow_for_gate = False
+    gate_sid = None
+    symbol = (fields.get("symbol") or "").strip().upper()
 
-        # парсинг базовых полей
-        log_uid = fields.get("log_uid") or ""
-        strategy_id_s = fields.get("strategy_id") or ""
-        client_sid_s = fields.get("client_strategy_id") or ""
-        direction = (fields.get("direction") or "").strip().lower()
-        symbol = (fields.get("symbol") or "").strip().upper()
-        tfs_raw = fields.get("timeframes") or ""
+    try:
+        async with _decisions_sem:
+            t0 = _now_monotonic_ms()
+            received_at_dt = datetime.utcnow()
 
-        # базовая валидация
-        if not log_uid or not strategy_id_s.isdigit() or direction not in ("long", "short") or not symbol or not tfs_raw:
-            await infra.redis_client.xadd(DECISION_RESP_STREAM, {
-                "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing or invalid fields"
-            })
-            log.info("[REQ] ❌ bad_request log_uid=%s sid=%s symbol=%s dir=%s tfs=%s", log_uid, strategy_id_s, symbol, direction, tfs_raw)
-            return
+            # парсинг базовых полей
+            log_uid = fields.get("log_uid") or ""
+            strategy_id_s = fields.get("strategy_id") or ""
+            client_sid_s = fields.get("client_strategy_id") or ""
+            direction = (fields.get("direction") or "").strip().lower()
+            tfs_raw = fields.get("timeframes") or ""
+            decision_mode_raw = (fields.get("decision_mode") or "").strip().lower()
 
-        sid = int(strategy_id_s)
-        gate_sid = int(client_sid_s) if client_sid_s.isdigit() else sid
+            # базовая валидация полей верхнего уровня
+            if not log_uid or not strategy_id_s.isdigit() or direction not in ("long", "short") or not symbol or not tfs_raw:
+                await infra.redis_client.xadd(DECISION_RESP_STREAM, {
+                    "req_id": msg_id, "status": "error", "error": "bad_request", "message": "missing or invalid fields"
+                })
+                log.info("[REQ] ❌ bad_request log_uid=%s sid=%s symbol=%s dir=%s tfs=%s", log_uid, strategy_id_s, symbol, direction, tfs_raw)
+                return
 
-        # активность тикера/стратегии
-        if symbol not in infra.enabled_tickers:
-            await infra.redis_client.xadd(DECISION_RESP_STREAM, {
-                "req_id": msg_id, "status": "error", "error": "symbol_not_active", "message": f"{symbol}"
-            })
-            log.info("[REQ] ❌ symbol_not_active log_uid=%s sid=%s %s", log_uid, sid, symbol)
-            return
-        if sid not in infra.enabled_strategies:
-            await infra.redis_client.xadd(DECISION_RESP_STREAM, {
-                "req_id": msg_id, "status": "error", "error": "strategy_not_enabled", "message": f"{sid}"
-            })
-            log.info("[REQ] ❌ strategy_not_enabled log_uid=%s sid=%s", log_uid, sid)
-            return
+            # требуемый режим
+            if decision_mode_raw not in ("mw_only", "mw_then_pack", "mw_and_pack"):
+                await infra.redis_client.xadd(DECISION_RESP_STREAM, {
+                    "req_id": msg_id, "status": "error", "error": "incomplete_request", "message": "decision_mode required"
+                })
+                log.info("[REQ] ❌ incomplete_request (decision_mode missing) log_uid=%s", log_uid)
+                return
+            decision_mode = decision_mode_raw
 
-        # нормализация TF и дедлайн
-        tfs = _parse_timeframes(tfs_raw)
-        deadline_ms = t0 + LAB_DEADLINE_MS
+            sid = int(strategy_id_s)
+            gate_sid = int(client_sid_s) if client_sid_s.isdigit() else sid
 
-        # ожидание готовности MW-кэша для стратегии (шторка)
-        await infra.wait_mw_ready(sid, timeout_sec=5.0)
+            # активность тикера/стратегии
+            if symbol not in infra.enabled_tickers:
+                await infra.redis_client.xadd(DECISION_RESP_STREAM, {
+                    "req_id": msg_id, "status": "error", "error": "symbol_not_active", "message": f"{symbol}"
+                })
+                log.info("[REQ] ❌ symbol_not_active log_uid=%s sid=%s %s", log_uid, sid, symbol)
+                return
+            if sid not in infra.enabled_strategies:
+                await infra.redis_client.xadd(DECISION_RESP_STREAM, {
+                    "req_id": msg_id, "status": "error", "error": "strategy_not_enabled", "message": f"{sid}"
+                })
+                log.info("[REQ] ❌ strategy_not_enabled log_uid=%s sid=%s", log_uid, sid)
+                return
 
-        # лог старта
-        log.info(
-            "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s deadline=90s",
-            log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs)
-        )
+            # нормализация TF и дедлайн
+            tfs = _parse_timeframes(tfs_raw)
+            deadline_ms = t0 + LAB_DEADLINE_MS
 
-        telemetry: Dict[str, int] = {"kv_hits": 0, "gateway_requests": 0}
-        tf_results_for_response: List[Dict[str, Any]] = []
+            # ожидание готовности MW-кэша для стратегии (шторка)
+            await infra.wait_mw_ready(sid, timeout_sec=5.0)
 
-        # цикл по каждой запрошенной TF — сбор снимка, подсчёт матчей и запись ОДНОЙ строки на TF
-        for tf in tfs:
-            # MW snapshot
-            mw_snap = await _collect_mw_snapshot(
-                sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
+            # лог старта
+            log.info(
+                "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s deadline=90s",
+                log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), decision_mode
             )
 
-            # PACK snapshot
-            pack_snap = await _collect_pack_snapshot(
-                sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
-            )
+            telemetry: Dict[str, int] = {"kv_hits": 0, "gateway_requests": 0}
+            tf_results_for_response: List[Dict[str, Any]] = []
 
-            # флаг неполного сбора по TF
-            incomplete = False
-            for kind in ("trend", "volatility", "momentum", "extremes"):
-                node = mw_snap["states"].get(kind)
-                if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
-                    incomplete = True
-                    break
-            if not incomplete:
-                for base, node in (pack_snap.get("objects") or {}).items():
+            # итог решения по запросу: AND по TF
+            final_allow = True
+            final_reason: Optional[str] = None
+
+            # цикл по каждой запрошенной TF — сбор снимка, подсчёт матчей, принятие решения per TF и запись строки
+            for tf in tfs:
+                # MW snapshot
+                mw_snap = await _collect_mw_snapshot(
+                    sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
+                )
+
+                # PACK snapshot
+                pack_snap = await _collect_pack_snapshot(
+                    sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
+                )
+
+                # флаг неполного сбора по TF
+                incomplete = False
+                for kind in ("trend", "volatility", "momentum", "extremes"):
+                    node = mw_snap["states"].get(kind)
                     if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
                         incomplete = True
                         break
+                if not incomplete:
+                    for base, node in (pack_snap.get("objects") or {}).items():
+                        if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
+                            incomplete = True
+                            break
 
-            # Подсчёт совпадений MW
-            mw_hits, mw_total = _mw_count_hits(mw_snap.get("rules", []), mw_snap.get("states", {}))
+                # Подсчёт совпадений MW
+                mw_hits, mw_total = _mw_count_hits(mw_snap.get("rules", []), mw_snap.get("states", {}))
 
-            # Подсчёт совпадений PACK (WL/BL)
-            pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total = _pack_count_hits(
-                pack_snap.get("rules", []), pack_snap.get("objects", {})
-            )
-
-            # соберём одиночный TF-результат (для БД и ответа)
-            tf_result_obj = {
-                "tf": tf,
-                "collect_incomplete": incomplete,
-                "mw": mw_snap,
-                "pack": pack_snap,
-                "counters": {
-                    "mw_wl_hits": mw_hits, "mw_wl_total": mw_total,
-                    "pack_wl_hits": pack_wl_hits, "pack_wl_total": pack_wl_total,
-                    "pack_bl_hits": pack_bl_hits, "pack_bl_total": pack_bl_total,
-                },
-            }
-            tf_results_for_response.append(tf_result_obj)
-
-            # лог по TF (log.info)
-            log.info(
-                "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  incomplete=%s  kv_hits=%d gw_reqs=%d",
-                tf, mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
-                str(incomplete).lower(), telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
-            )
-
-            # запись ОДНОЙ строки на TF
-            finished_at_dt = datetime.utcnow()
-            duration_ms = _now_monotonic_ms() - t0
-            try:
-                tf_json_safe = _to_json_safe(tf_result_obj)
-                tf_json_text = json.dumps(tf_json_safe, ensure_ascii=False)
-                await _persist_decision_tf(
-                    req_id=msg_id,
-                    log_uid=log_uid,
-                    strategy_id=sid,
-                    client_strategy_id=int(client_sid_s) if client_sid_s.isdigit() else None,
-                    symbol=symbol,
-                    direction=direction,
-                    tf=tf,
-                    tfr_req=tfs_raw,
-                    tf_result_json=tf_json_text,
-                    received_at_dt=received_at_dt,
-                    finished_at_dt=finished_at_dt,
-                    duration_ms=duration_ms,
-                    kv_hits=telemetry.get("kv_hits", 0),
-                    gateway_requests=telemetry.get("gateway_requests", 0),
-                    mw_wl_hits=mw_hits,
-                    mw_wl_total=mw_total,
-                    pack_wl_hits=pack_wl_hits,
-                    pack_wl_total=pack_wl_total,
-                    pack_bl_hits=pack_bl_hits,
-                    pack_bl_total=pack_bl_total,
+                # Подсчёт совпадений PACK (WL/BL)
+                pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total = _pack_count_hits(
+                    pack_snap.get("rules", []), pack_snap.get("objects", {})
                 )
+
+                # принятие решения per TF по сценарию
+                allow_tf = False
+                reason_tf = ""
+
+                # если сбор неполный — сразу отказ
+                if incomplete:
+                    allow_tf = False
+                    reason_tf = f"timeout_collect@{tf}"
+                else:
+                    # MW → PACK (всегда MW сначала)
+                    if decision_mode == "mw_only":
+                        allow_tf = (mw_hits >= 1)
+                        reason_tf = "ok_by_mw" if allow_tf else f"mw_no_match@{tf}"
+
+                    elif decision_mode == "mw_then_pack":
+                        if mw_hits >= 1:
+                            allow_tf = True
+                            reason_tf = "ok_by_mw"
+                        else:
+                            allow_tf = (pack_wl_hits >= 1)
+                            reason_tf = "ok_by_pack" if allow_tf else f"pack_no_wl@{tf}"
+
+                    else:  # mw_and_pack
+                        need_mw = (mw_hits >= 1)
+                        need_pack = (pack_wl_hits >= 1)
+                        if need_mw and need_pack:
+                            allow_tf = True
+                            reason_tf = "ok_by_mw"  # обе плоскости ок, фиксируем как ок по MW (доп. инфо не требуется)
+                        else:
+                            allow_tf = False
+                            if not need_mw and not need_pack:
+                                # обе отсутствуют — укажем приоритетно MW
+                                reason_tf = f"mw_missing@{tf}"
+                            elif not need_mw:
+                                reason_tf = f"mw_missing@{tf}"
+                            else:
+                                reason_tf = f"pack_missing@{tf}"
+
+                # одиночный TF-результат (для ответа)
+                tf_result_obj = {
+                    "tf": tf,
+                    "collect_incomplete": incomplete,
+                    "mw": mw_snap,
+                    "pack": pack_snap,
+                    "counters": {
+                        "mw_wl_hits": mw_hits, "mw_wl_total": mw_total,
+                        "pack_wl_hits": pack_wl_hits, "pack_wl_total": pack_wl_total,
+                        "pack_bl_hits": pack_bl_hits, "pack_bl_total": pack_bl_total,
+                    },
+                    "decision": {"allow": allow_tf, "reason": reason_tf},
+                }
+                tf_results_for_response.append(tf_result_obj)
+
+                # лог по TF
+                log.info(
+                    "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  allow=%s reason=%s  incomplete=%s  kv_hits=%d gw_reqs=%d",
+                    tf, mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
+                    str(allow_tf).lower(), reason_tf, str(incomplete).lower(),
+                    telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
+                )
+
+                # запись ОДНОЙ строки на TF
+                finished_at_dt = datetime.utcnow()
+                duration_ms = _now_monotonic_ms() - t0
+                try:
+                    tf_json_safe = _to_json_safe(tf_result_obj)
+                    tf_json_text = json.dumps(tf_json_safe, ensure_ascii=False)
+                    await _persist_decision_tf(
+                        req_id=msg_id,
+                        log_uid=log_uid,
+                        strategy_id=sid,
+                        client_strategy_id=int(client_sid_s) if client_sid_s.isdigit() else None,
+                        symbol=symbol,
+                        direction=direction,
+                        tf=tf,
+                        tfr_req=tfs_raw,
+                        tf_result_json=tf_json_text,
+                        received_at_dt=received_at_dt,
+                        finished_at_dt=finished_at_dt,
+                        duration_ms=duration_ms,
+                        kv_hits=telemetry.get("kv_hits", 0),
+                        gateway_requests=telemetry.get("gateway_requests", 0),
+                        mw_wl_hits=mw_hits,
+                        mw_wl_total=mw_total,
+                        pack_wl_hits=pack_wl_hits,
+                        pack_wl_total=pack_wl_total,
+                        pack_bl_hits=pack_bl_hits,
+                        pack_bl_total=pack_bl_total,
+                        allow_tf=allow_tf,
+                        reason_tf=reason_tf,
+                    )
+                except Exception:
+                    log.exception("[AUDIT] ❌ ошибка записи строки TF=%s log_uid=%s sid=%s csid=%s", tf, log_uid, sid, client_sid_s or "-")
+
+                # агрегируем итог запроса
+                if not allow_tf and final_allow:
+                    final_allow = False
+                    final_reason = reason_tf  # первая причина в порядке m5→m15→h1
+
+            # формируем ОТВЕТ стратегии — уже с осмысленным allow/deny
+            finished_at_dt = datetime.utcnow()
+            duration_ms_total = _now_monotonic_ms() - t0
+
+            resp = {
+                "req_id": msg_id,
+                "status": "ok",
+                "allow": "true" if final_allow else "false",
+                "log_uid": log_uid,
+                "strategy_id": str(sid),
+                "direction": direction,
+                "symbol": symbol,
+                "timeframes": ",".join(tfs),
+            }
+            if not final_allow and final_reason:
+                resp["reason"] = final_reason
+            if client_sid_s:
+                resp["client_strategy_id"] = client_sid_s
+
+            # трасса (оставим как есть — удобно для дебага стратегий)
+            try:
+                resp["tf_results"] = json.dumps(_to_json_safe(tf_results_for_response), ensure_ascii=False)
             except Exception:
-                log.exception("[AUDIT] ❌ ошибка записи строки TF=%s log_uid=%s sid=%s csid=%s", tf, log_uid, sid, client_sid_s or "-")
+                pass
 
-        # формируем ОТВЕТ стратегии — всегда deny на Этапе 2 (единый ответ на весь запрос)
-        finished_at_dt = datetime.utcnow()
-        duration_ms_total = _now_monotonic_ms() - t0
+            await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
 
-        resp = {
-            "req_id": msg_id,
-            "status": "ok",
-            "allow": "false",
-            "reason": "stage2_count_only",
-            "log_uid": log_uid,
-            "strategy_id": str(sid),
-            "direction": direction,
-            "symbol": symbol,
-            "timeframes": ",".join(tfs),
-        }
-        if client_sid_s:
-            resp["client_strategy_id"] = client_sid_s
+            # финальный лог (log.info)
+            log.info(
+                "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
+                ("✅ allow" if final_allow else "⛔ deny"),
+                log_uid, sid, (client_sid_s or "-"), (final_reason or "-"),
+                duration_ms_total, telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
+            )
 
-        # положим сводный массив TF в ответ (для трассировки)
-        try:
-            resp["tf_results"] = json.dumps(_to_json_safe(tf_results_for_response), ensure_ascii=False)
-        except Exception:
-            pass
+            # признак для ворот: если allow=true — дубли отрубим
+            allow_for_gate = final_allow
 
-        await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
-
-        # финальный лог (log.info)
-        log.info(
-            "[RESP] ⛔ deny log_uid=%s sid=%s csid=%s reason=stage2_count_only dur=%dms kv_hits=%d gw_reqs=%d",
-            log_uid, sid, (client_sid_s or "-"), duration_ms_total, telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
-        )
-
-        # завершение ворот: allow=false → подобрать следующего из очереди
-        await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=False)
+    finally:
+        # всегда освобождаем ворота (если могли определить gate_sid)
+        if gate_sid is not None and symbol:
+            try:
+                await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow_for_gate)
+            except Exception:
+                log.exception("[GATE] ❌ ошибка завершения ворот gate_sid=%s symbol=%s", gate_sid, symbol)
 
 # 🔸 Обработка входящего сообщения: получить лидерство или встать в очередь
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
@@ -880,12 +963,13 @@ async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     else:
         log.debug("[REQ] ⏳ queued gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
 
-# 🔸 Главный слушатель decision_request (Этап 2)
+# 🔸 Главный слушатель decision_request (Этап 3)
 async def run_laboratory_decision_maker():
     """
-    Слушает laboratory:decision_request, собирает снимок MW/PACK, считает совпадения (MW-WL / PACK-WL / PACK-BL)
-    и пишет ПО ОДНОЙ строке на каждый запрошенный TF в signal_laboratory_entries. В ответ стратегии возвращает
-    status=ok, allow=false, reason=stage2_count_only.
+    Слушает laboratory:decision_request, собирает снимок MW/PACK, считает совпадения,
+    принимает решение по сценариям (mw_only / mw_then_pack / mw_and_pack) и пишет ПО ОДНОЙ строке
+    на каждый запрошенный TF в signal_laboratory_entries. В ответ стратегии возвращает status=ok
+    и allow=true|false. При некорректном запросе — status=error с кодом.
     Работает только с НОВЫМИ сообщениями (старт с '$'). Встроены ворота/очередь per (gate_sid, symbol).
     """
     log.info("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d DEADLINE=%ds)",
