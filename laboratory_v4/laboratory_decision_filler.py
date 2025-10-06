@@ -261,7 +261,7 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
                 COALESCE($7::jsonb,NULL), COALESCE($8::jsonb,NULL), COALESCE($9::jsonb,NULL), COALESCE($10::jsonb,NULL),
                 $11,$12,$13,
                 COALESCE($14::jsonb,NULL), $15, $16)
-        ON CONFLICT ON CONSTRAINT uq_lps_unique DO NOTHING
+        ON CONFLICT (log_uid, strategy_id, (COALESCE(client_strategy_id, '-1'::integer)), tf) DO NOTHING
         """,
         lps["log_uid"],
         lps["strategy_id"],
