@@ -28,7 +28,7 @@ XREAD_COUNT = 50
 MAX_IN_FLIGHT_DECISIONS = 32
 MAX_CONCURRENT_GATEWAY_CALLS = 32
 COALESCE_TTL_SEC = 3                     # коалесценс одинаковых gateway-запросов внутри процесса
-GATE_TTL_SEC = 100                       # TTL «ворот» (gate_sid,symbol), чуть больше дедлайна
+GATE_TTL_SEC = LAB_DEADLINE_MS // 1000 + 30
 
 # 🔸 Таймфреймы (порядок нормализации)
 TF_ORDER = ("m5", "m15", "h1")
@@ -836,6 +836,19 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                             else:
                                 reason_tf = f"pack_missing@{tf}"
 
+                # вычисление decision.origin для TF
+                origin_tf: Optional[str] = None
+                if allow_tf:
+                    if decision_mode == "mw_only":
+                        origin_tf = "mw_only"
+                    elif decision_mode == "mw_and_pack":
+                        origin_tf = "mw_and_pack"
+                    else:  # mw_then_pack
+                        if reason_tf == "ok_by_mw":
+                            origin_tf = "mw"
+                        elif reason_tf == "ok_by_pack":
+                            origin_tf = "pack"
+
                 # одиночный TF-результат (для ответа)
                 tf_result_obj = {
                     "tf": tf,
@@ -847,7 +860,12 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                         "pack_wl_hits": pack_wl_hits, "pack_wl_total": pack_wl_total,
                         "pack_bl_hits": pack_bl_hits, "pack_bl_total": pack_bl_total,
                     },
-                    "decision": {"allow": allow_tf, "reason": reason_tf},
+                    "decision": {
+                        "allow": allow_tf,
+                        "reason": reason_tf,
+                        "mode": decision_mode,
+                        "origin": origin_tf,
+                    },
                 }
                 tf_results_for_response.append(tf_result_obj)
 
@@ -968,7 +986,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow_for_gate)
             except Exception:
                 log.exception("[GATE] ❌ ошибка завершения ворот gate_sid=%s symbol=%s", gate_sid, symbol)
-
+                
 # 🔸 Обработка входящего сообщения: получить лидерство или встать в очередь
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     strategy_id_s = fields.get("strategy_id") or ""

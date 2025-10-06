@@ -1,5 +1,6 @@
-# laboratory_decision_filler.py — пост-allow наполнитель статистики (LPS): сидинг из SLE и допись по закрытию позиций
+# laboratory_decision_filler.py — пост-allow наполнитель LPS и (заглушка) апдейтер закрытий
 
+# 🔸 Импорты
 import asyncio
 import json
 import logging
@@ -9,415 +10,375 @@ from typing import Any, Dict, List, Optional, Tuple
 # 🔸 Инфраструктура
 import laboratory_infra as infra
 
-# 🔸 Логгер
-log = logging.getLogger("LAB_FILLER")
+# 🔸 Логгеры
+log = logging.getLogger("LAB_DECISION_FILLER")
+log_pos = logging.getLogger("LAB_POS_CLOSE_FILLER")
 
-# 🔸 Стримы
-DECISION_FILLER_STREAM = "laboratory_decision_filler"   # сидинг после allow=true
-SIGNAL_LOG_QUEUE_STREAM = "signal_log_queue"            # внешняя шина: событие закрытия позиции
+# 🔸 Константы Streams/таблиц
+DECISION_FILLER_STREAM = "laboratory_decision_filler"  # seed: {req_id, log_uid}
+SLE_TABLE = "public.signal_laboratory_entries"
+LPS_TABLE = "public.laboratoty_position_stat"
 
-# 🔸 Параметры чтения стримов
-XREAD_BLOCK_MS = 2000
+# 🔸 Параметры чтения Streams
+XREAD_BLOCK_MS = 1_000
 XREAD_COUNT = 50
 
+# 🔸 Утилиты JSON (совместимо со стилем maker)
+def _to_json_safe(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, datetime):
+        try:
+            return obj.replace(tzinfo=None).isoformat()
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_safe(v) for v in obj]
+    return str(obj)
 
-# 🔸 Утилиты
-
-def _now_ms() -> int:
-    return int(asyncio.get_running_loop().time() * 1000)
-
-
-def _as_int(x: Any, default: Optional[int] = None) -> Optional[int]:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def _lower_str(x: Any) -> str:
-    return str(x).strip().lower()
-
-
-def _extract_stream_payload(fields: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Поддерживает два формата:
-      - плоские поля
-      - {'data': '<json>'} или {'data':'{...}'}
-    """
-    payload: Dict[str, Any] = {}
-    # базовая распаковка
-    for k, v in fields.items():
-        if isinstance(v, str) and v.startswith("{"):
-            try:
-                payload[k] = json.loads(v)
-            except Exception:
-                payload[k] = v
-        else:
-            payload[k] = v
-
-    # если всё лежит под 'data' — разворачиваем
-    if "data" in payload and isinstance(payload["data"], dict):
-        payload = payload["data"]
-
-    return payload
-
-
-def _pack_family_from_base(pack_base: str) -> str:
-    s = _lower_str(pack_base)
-    if s.startswith("ema"):
-        return "ema"
-    if s.startswith("macd"):
-        return "macd"
-    if s.startswith("lr"):
-        return "lr"
-    if s.startswith("adx_dmi"):
-        return "adx_dmi"
+# 🔸 Парсинг PACK-базы для семейства (совместимо с maker)
+def _parse_pack_base_family(base: str) -> str:
+    s = (base or "").strip().lower()
+    if not s:
+        return ""
     if s.startswith("bb"):
         return "bb"
-    if s.startswith("atr"):
-        return "atr"
+    if s.startswith("macd"):
+        return "macd"
+    if s.startswith("adx_dmi"):
+        return "adx_dmi"
+    if s.startswith("ema"):
+        return "ema"
     if s.startswith("rsi"):
         return "rsi"
     if s.startswith("mfi"):
         return "mfi"
-    return s.split("_", 1)[0] if "_" in s else s
+    if s.startswith("lr"):
+        return "lr"
+    if s.startswith("atr"):
+        return "atr"
+    return s  # fallback
 
+# 🔸 Построение факта MW по agg_base (совместимо с maker)
+def _build_mw_fact(states: Dict[str, Any], agg_base: str) -> Optional[str]:
+    if not agg_base:
+        return None
+    parts: List[str] = []
+    for base in agg_base.strip().lower().split("_"):
+        node = (states or {}).get(base) or {}
+        pack = node.get("pack") or {}
+        st = pack.get("state")
+        if not isinstance(st, str) or not st:
+            return None
+        parts.append(f"{base}:{st.strip().lower()}")
+    return "|".join(parts)
 
-def _match_pack_rule(rule: Dict[str, Any], pack_objs: Dict[str, Any]) -> bool:
-    """
-    Сопоставление PACK-правила с объектом:
-      - rule['agg_key'] = "key1|key2"
-      - rule['agg_value'] = "key1:val1|key2:val2" или "some_scalar" (solo с ключом)
-      - сравнение выполняем как полное равенство факт-строки и agg_value (оба в lower)
-    """
-    base = _lower_str(rule.get("pack_base", ""))
-    if not base:
-        return False
-    po = pack_objs.get(base) or {}
-    pack = po.get("pack") or {}
-    agg_key = _lower_str(rule.get("agg_key", ""))
-    agg_val = _lower_str(rule.get("agg_value", ""))
-    if not agg_key or not agg_val:
-        return False
-
-    keys = [k.strip() for k in agg_key.split("|") if k.strip()]
+# 🔸 Построение факта PACK по agg_key (совместимо с maker)
+def _build_pack_fact(pack_obj: Dict[str, Any], agg_key: str) -> Optional[str]:
+    if not agg_key:
+        return None
+    payload = (pack_obj or {}).get("pack") or {}
+    keys = [k.strip() for k in agg_key.strip().lower().split("|") if k.strip()]
     parts: List[str] = []
     for k in keys:
-        v = pack.get(k)
+        v = payload.get(k)
         if v is None:
-            return False
-        parts.append(f"{k}:{_lower_str(v)}")
-    fact = "|".join(parts)
-    return fact == agg_val
+            return None
+        parts.append(f"{k}:{str(v).strip().lower()}")
+    return "|".join(parts)
 
+# 🔸 Безопасный доступ к tf_results (jsonb → dict)
+def _as_dict(maybe_json) -> Dict[str, Any]:
+    if maybe_json is None:
+        return {}
+    if isinstance(maybe_json, dict):
+        return maybe_json
+    if isinstance(maybe_json, str):
+        try:
+            return json.loads(maybe_json)
+        except Exception:
+            return {}
+    return {}
 
-def _compute_pack_family_counts_for_matches(tf_pack: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
-    """
-    Считает pack_family_counts по СОВПАВШИМ правилам (отдельно WL/BL):
-      {"ema":{"wl":5,"bl":1}, "lr":{"wl":3,"bl":0}, ...}
-    """
-    rules: List[Dict[str, Any]] = (tf_pack or {}).get("rules") or []
-    objs: Dict[str, Any] = (tf_pack or {}).get("objects") or {}
-    out: Dict[str, Dict[str, int]] = {}
-    if not rules or not objs:
-        return out
+# 🔸 Извлечение и расчёт полей LPS из одной строки SLE
+def _extract_lps_from_sle_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    # базовые поля
+    log_uid: str = row["log_uid"]
+    strategy_id: int = int(row["strategy_id"])
+    client_strategy_id = row.get("client_strategy_id")
+    symbol: str = row["symbol"]
+    direction: str = row["direction"]
+    tf: str = row["tf"]
 
-    for r in rules:
-        list_tag = _lower_str(r.get("list", ""))
-        if list_tag not in ("whitelist", "blacklist"):
+    # tf_results
+    tfres = _as_dict(row.get("tf_results"))
+    mw = _as_dict(tfres.get("mw"))
+    pack = _as_dict(tfres.get("pack"))
+    mw_states = _as_dict(mw.get("states"))
+    mw_rules: List[Dict[str, Any]] = list(mw.get("rules") or [])
+
+    pack_objs: Dict[str, Any] = _as_dict(pack.get("objects"))
+    pack_rules: List[Dict[str, Any]] = list(pack.get("rules") or [])
+
+    # counters (копируем как есть)
+    counters = _as_dict(tfres.get("counters"))
+    mw_match_count = int(counters.get("mw_wl_hits") or 0)
+    pack_wl_match_count = int(counters.get("pack_wl_hits") or 0)
+    pack_bl_match_count = int(counters.get("pack_bl_hits") or 0)
+
+    # decision.{mode,origin} (мы уже пишем их в maker)
+    decision = _as_dict(tfres.get("decision"))
+    decision_mode = decision.get("mode")
+    decision_origin = decision.get("origin")
+
+    # расчёт совпавших правил (без внешних запросов)
+    mw_matches: List[Dict[str, Any]] = []
+    for r in mw_rules:
+        agg_base = str(r.get("agg_base") or "").strip().lower()
+        agg_state = str(r.get("agg_state") or "").strip().lower()
+        if not agg_base or not agg_state:
             continue
-        matched = _match_pack_rule(r, objs)
-        if not matched:
+        fact = _build_mw_fact(mw_states, agg_base)
+        if fact is not None and fact == agg_state:
+            mw_matches.append(r)
+
+    pack_wl_matches: List[Dict[str, Any]] = []
+    pack_bl_matches: List[Dict[str, Any]] = []
+    pack_family_counts: Dict[str, Dict[str, int]] = {}
+
+    for r in pack_rules:
+        list_type = str(r.get("list") or "").strip().lower()
+        base = str(r.get("pack_base") or "").strip().lower()
+        agg_key = str(r.get("agg_key") or "").strip().lower()
+        agg_val = str(r.get("agg_value") or "").strip().lower()
+        if not base or not agg_key or not agg_val or list_type not in ("whitelist", "blacklist"):
             continue
-        fam = _pack_family_from_base(str(r.get("pack_base", "")))
-        out.setdefault(fam, {"wl": 0, "bl": 0})
-        if list_tag == "whitelist":
-            out[fam]["wl"] += 1
+        pack_obj = _as_dict(pack_objs.get(base))
+        if not pack_obj:
+            continue
+        fact = _build_pack_fact(pack_obj, agg_key)
+        if fact is None or fact != agg_val:
+            continue
+        # матч по типу списка
+        if list_type == "whitelist":
+            pack_wl_matches.append(r)
         else:
-            out[fam]["bl"] += 1
+            pack_bl_matches.append(r)
 
-    return out
+        # агрегаты по семейству
+        fam = _parse_pack_base_family(base)
+        fam_stat = pack_family_counts.setdefault(fam, {"wl": 0, "bl": 0})
+        if list_type == "whitelist":
+            fam_stat["wl"] += 1
+        else:
+            fam_stat["bl"] += 1
 
+    # итоговая мапа для UPSERT
+    lps_values = {
+        "log_uid": log_uid,
+        "strategy_id": strategy_id,
+        "client_strategy_id": int(client_strategy_id) if client_strategy_id is not None else None,
+        "symbol": symbol,
+        "direction": direction,
+        "tf": tf,
+        "mw_states": json.dumps(_to_json_safe(mw_states), ensure_ascii=False),
+        "mw_matches": json.dumps(_to_json_safe(mw_matches), ensure_ascii=False),
+        "pack_wl_matches": json.dumps(_to_json_safe(pack_wl_matches), ensure_ascii=False),
+        "pack_bl_matches": json.dumps(_to_json_safe(pack_bl_matches), ensure_ascii=False),
+        "mw_match_count": mw_match_count if mw_match_count is not None else len(mw_matches),
+        "pack_wl_match_count": pack_wl_match_count if pack_wl_match_count is not None else len(pack_wl_matches),
+        "pack_bl_match_count": pack_bl_match_count if pack_bl_match_count is not None else len(pack_bl_matches),
+        "pack_family_counts": json.dumps(_to_json_safe(pack_family_counts), ensure_ascii=False),
+        "decision_mode": decision_mode,
+        "decision_origin": decision_origin,
+    }
 
-def _parse_tf_origin_map(s: Optional[str]) -> Dict[str, str]:
-    """
-    Принимает строку вида "m5:mw,m15:pack" → {"m5":"mw","m15":"pack"}
-    """
-    out: Dict[str, str] = {}
-    if not s:
-        return out
-    for part in str(s).split(","):
-        part = part.strip()
-        if not part or ":" not in part:
-            continue
-        tf, origin = part.split(":", 1)
-        tf = _lower_str(tf)
-        origin = _lower_str(origin)
-        if tf in ("m5", "m15", "h1") and origin in ("mw", "pack"):
-            out[tf] = origin
-    return out
+    # ключ для логов
+    key = {
+        "log_uid": log_uid,
+        "sid": strategy_id,
+        "csid": int(client_strategy_id) if client_strategy_id is not None else None,
+        "symbol": symbol,
+        "tf": tf,
+    }
+    return lps_values, key
 
-# 🔸 Сидинг LPS из SLE по одному allow-событию
-async def _seed_lps_from_sle(
-    req_id: str,
-    log_uid: str,
-    master_sid: int,
-    client_sid_opt: Optional[int],
-    decision_mode_opt: Optional[str],
-    decision_tf_origins_opt: Optional[str],
-) -> int:
-    """
-    Берёт TF-строки из signal_laboratory_entries по (req_id, log_uid, strategy_id, [client_strategy_id])
-    и делает upsert в laboratoty_position_stat по одной строке на TF.
-    Возвращает количество обработанных TF-строк.
-    """
-    # 🔸 карта источников по TF из payload (например, "m5:mw,m15:pack")
-    tf_origin_map = _parse_tf_origin_map(decision_tf_origins_opt)
+# 🔸 UPSERT одной TF-строки в LPS (UPDATE → INSERT DO NOTHING → UPDATE)
+async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
+    # update (сохранить значения полей закрытия, не трогать их)
+    upd_status = await conn.execute(
+        f"""
+        UPDATE {LPS_TABLE}
+           SET symbol=$1,
+               direction=$2,
+               mw_states=COALESCE($3::jsonb, mw_states),
+               mw_matches=COALESCE($4::jsonb, mw_matches),
+               pack_wl_matches=COALESCE($5::jsonb, pack_wl_matches),
+               pack_bl_matches=COALESCE($6::jsonb, pack_bl_matches),
+               mw_match_count=$7,
+               pack_wl_match_count=$8,
+               pack_bl_match_count=$9,
+               pack_family_counts=COALESCE($10::jsonb, pack_family_counts),
+               decision_mode=$11,
+               decision_origin=$12,
+               updated_at=now()
+         WHERE log_uid=$13
+           AND strategy_id=$14
+           AND ((client_strategy_id IS NULL AND $15::int IS NULL) OR client_strategy_id=$15::int)
+           AND tf=$16
+        """,
+        lps["symbol"],
+        lps["direction"],
+        lps["mw_states"],
+        lps["mw_matches"],
+        lps["pack_wl_matches"],
+        lps["pack_bl_matches"],
+        lps["mw_match_count"],
+        lps["pack_wl_match_count"],
+        lps["pack_bl_match_count"],
+        lps["pack_family_counts"],
+        lps["decision_mode"],
+        lps["decision_origin"],
+        lps["log_uid"],
+        lps["strategy_id"],
+        lps["client_strategy_id"],
+        lps["tf"],
+    )
+    if upd_status.startswith("UPDATE 1"):
+        return "updated"
+
+    # insert (не задаём position_uid/pnl/result/closed_at)
+    ins_status = await conn.execute(
+        f"""
+        INSERT INTO {LPS_TABLE}
+            (log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
+             mw_states, mw_matches, pack_wl_matches, pack_bl_matches,
+             mw_match_count, pack_wl_match_count, pack_bl_match_count,
+             pack_family_counts, decision_mode, decision_origin)
+        VALUES ($1,$2,$3,$4,$5,$6,
+                COALESCE($7::jsonb,NULL), COALESCE($8::jsonb,NULL), COALESCE($9::jsonb,NULL), COALESCE($10::jsonb,NULL),
+                $11,$12,$13,
+                COALESCE($14::jsonb,NULL), $15, $16)
+        ON CONFLICT ON CONSTRAINT uq_lps_unique DO NOTHING
+        """,
+        lps["log_uid"],
+        lps["strategy_id"],
+        lps["client_strategy_id"],
+        lps["symbol"],
+        lps["direction"],
+        lps["tf"],
+        lps["mw_states"],
+        lps["mw_matches"],
+        lps["pack_wl_matches"],
+        lps["pack_bl_matches"],
+        lps["mw_match_count"],
+        lps["pack_wl_match_count"],
+        lps["pack_bl_match_count"],
+        lps["pack_family_counts"],
+        lps["decision_mode"],
+        lps["decision_origin"],
+    )
+    if ins_status.endswith(" 1"):
+        return "inserted"
+
+    # race: update again
+    await conn.execute(
+        f"""
+        UPDATE {LPS_TABLE}
+           SET symbol=$1,
+               direction=$2,
+               mw_states=COALESCE($3::jsonb, mw_states),
+               mw_matches=COALESCE($4::jsonb, mw_matches),
+               pack_wl_matches=COALESCE($5::jsonb, pack_wl_matches),
+               pack_bl_matches=COALESCE($6::jsonb, pack_bl_matches),
+               mw_match_count=$7,
+               pack_wl_match_count=$8,
+               pack_bl_match_count=$9,
+               pack_family_counts=COALESCE($10::jsonb, pack_family_counts),
+               decision_mode=$11,
+               decision_origin=$12,
+               updated_at=now()
+         WHERE log_uid=$13
+           AND strategy_id=$14
+           AND ((client_strategy_id IS NULL AND $15::int IS NULL) OR client_strategy_id=$15::int)
+           AND tf=$16
+        """,
+        lps["symbol"],
+        lps["direction"],
+        lps["mw_states"],
+        lps["mw_matches"],
+        lps["pack_wl_matches"],
+        lps["pack_bl_matches"],
+        lps["mw_match_count"],
+        lps["pack_wl_match_count"],
+        lps["pack_bl_match_count"],
+        lps["pack_family_counts"],
+        lps["decision_mode"],
+        lps["decision_origin"],
+        lps["log_uid"],
+        lps["strategy_id"],
+        lps["client_strategy_id"],
+        lps["tf"],
+    )
+    return "updated"
+
+# 🔸 Обработка одного seed (req_id, log_uid) → перенос в LPS
+async def _process_seed(req_id: str, log_uid: str):
+    # логичное предположение: у одного запроса все строки SLE имеют один sid/csid/symbol
+    inserted = 0
+    updated = 0
+    tfs: List[str] = []
+    sid: Optional[int] = None
+    csid: Optional[int] = None
+    symbol: Optional[str] = None
 
     async with infra.pg_pool.acquire() as conn:
-        # 🔸 читаем все TF-строки по этому запросу и конкретной связке master/client
-        if client_sid_opt is not None:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    strategy_id,
-                    client_strategy_id,
-                    symbol,
-                    direction,
-                    COALESCE(tf, timeframes_processed) AS tf,
-                    tf_results,
-                    mw_wl_hits,
-                    pack_wl_hits,
-                    pack_bl_hits
-                FROM public.signal_laboratory_entries
-                WHERE req_id = $1
-                  AND log_uid = $2
-                  AND strategy_id = $3
-                  AND client_strategy_id = $4
-                  AND allow = TRUE
-                """,
-                req_id, log_uid, master_sid, client_sid_opt
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    strategy_id,
-                    client_strategy_id,
-                    symbol,
-                    direction,
-                    COALESCE(tf, timeframes_processed) AS tf,
-                    tf_results,
-                    mw_wl_hits,
-                    pack_wl_hits,
-                    pack_bl_hits
-                FROM public.signal_laboratory_entries
-                WHERE req_id = $1
-                  AND log_uid = $2
-                  AND strategy_id = $3
-                  AND client_strategy_id IS NULL
-                  AND allow = TRUE
-                """,
-                req_id, log_uid, master_sid
-            )
-
-        if not rows:
-            log.info(
-                "[SEED] ⚠️ SLE не найден (req_id=%s log_uid=%s sid=%s csid=%s)",
-                req_id, log_uid, master_sid, client_sid_opt or "-"
-            )
-            return 0
-
-        processed = 0
-        for r in rows:
-            # 🔸 базовые поля
-            sid = int(r["strategy_id"])
-            csid = _as_int(r["client_strategy_id"])
-            symbol = str(r["symbol"]).upper()
-            direction = _lower_str(r["direction"])
-            tf = _lower_str(r["tf"] or "")
-            if tf not in ("m5", "m15", "h1"):
-                continue
-
-            # 🔸 счётчики совпадений из SLE
-            mw_cnt = int(r["mw_wl_hits"] or 0)
-            pack_wl_cnt = int(r["pack_wl_hits"] or 0)
-            pack_bl_cnt = int(r["pack_bl_hits"] or 0)
-
-            # 🔸 разбор tf_results (одна TF-структура)
-            tf_obj: Dict[str, Any]
-            raw_tf = r["tf_results"]
-            if isinstance(raw_tf, str):
-                try:
-                    tf_obj = json.loads(raw_tf)
-                except Exception:
-                    tf_obj = {}
-            else:
-                tf_obj = raw_tf or {}
-
-            # 🔸 MW states (для удобства последующего анализа)
-            mw_states = (tf_obj.get("mw") or {}).get("states")
-            # 🔸 Сводка по семействам PACK только для совпавших правил
-            pack_family_counts = _compute_pack_family_counts_for_matches(tf_obj.get("pack") or {})
-
-            # 🔸 decision_mode и decision_origin для данного TF
-            decision_mode = (decision_mode_opt or
-                             (tf_obj.get("decision_mode") or (tf_obj.get("meta") or {}).get("decision_mode")))
-
-            tf_origin = tf_origin_map.get(tf)
-            if not tf_origin:
-                # Явный случай для строгого режима: обе плоскости требуются
-                if decision_mode == "mw_and_pack":
-                    tf_origin = "mw_and_pack"
-                else:
-                    # Эвристика: если есть MW-хит → "mw", иначе (при allow=true) → "pack"
-                    tf_origin = "mw" if mw_cnt >= 1 else ("pack" if pack_wl_cnt >= 1 else None)
-
-            # 🔸 upsert в LPS по уникальному ключу uq_lps_unique
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO public.laboratoty_position_stat (
-                        log_uid, strategy_id, client_strategy_id,
-                        symbol, direction, tf,
-                        mw_states,
-                        mw_match_count, pack_wl_match_count, pack_bl_match_count,
-                        pack_family_counts,
-                        decision_mode, decision_origin,
-                        created_at, updated_at
-                    ) VALUES (
-                        $1, $2, $3,
-                        $4, $5, $6,
-                        COALESCE($7::jsonb, NULL),
-                        $8, $9, $10,
-                        COALESCE($11::jsonb, NULL),
-                        $12, $13,
-                        NOW(), NOW()
-                    )
-                    ON CONFLICT ON CONSTRAINT uq_lps_unique DO UPDATE SET
-                        mw_states = COALESCE(EXCLUDED.mw_states, laboratoty_position_stat.mw_states),
-                        mw_match_count = EXCLUDED.mw_match_count,
-                        pack_wl_match_count = EXCLUDED.pack_wl_match_count,
-                        pack_bl_match_count = EXCLUDED.pack_bl_match_count,
-                        pack_family_counts = COALESCE(EXCLUDED.pack_family_counts, laboratoty_position_stat.pack_family_counts),
-                        decision_mode = COALESCE(EXCLUDED.decision_mode, laboratoty_position_stat.decision_mode),
-                        decision_origin = COALESCE(EXCLUDED.decision_origin, laboratoty_position_stat.decision_origin),
-                        updated_at = NOW()
-                    """,
-                    log_uid, sid, csid,
-                    symbol, direction, tf,
-                    json.dumps(mw_states, ensure_ascii=False) if isinstance(mw_states, dict) else None,
-                    mw_cnt, pack_wl_cnt, pack_bl_cnt,
-                    json.dumps(pack_family_counts, ensure_ascii=False) if pack_family_counts else None,
-                    decision_mode, tf_origin
-                )
-                processed += 1
-            except Exception:
-                log.exception("[SEED] ❌ ошибка upsert LPS (log_uid=%s tf=%s)", log_uid, tf)
-
-        log.info(
-            "[SEED] ✅ LPS upsert завершён: req_id=%s log_uid=%s sid=%s csid=%s rows=%d",
-            req_id, log_uid, master_sid, client_sid_opt or "-", processed
-        )
-        return processed
-        
-# 🔸 Обработка seed-сообщения (allow=true): тянем строки из SLE и апсертим LPS
-async def _handle_seed_message(msg_id: str, fields: dict):
-    # нормализация payload (поддержка {'data': {...}} и плоских полей)
-    payload = _extract_stream_payload(fields)
-
-    req_id = payload.get("req_id")
-    log_uid = payload.get("log_uid")
-    master_sid = _as_int(payload.get("strategy_id"))
-    client_sid_opt = _as_int(payload.get("client_strategy_id"))
-    decision_mode_opt = _lower_str(payload.get("decision_mode")) if payload.get("decision_mode") else None
-    decision_tf_origins_opt = payload.get("decision_tf_origins")
-
-    if not req_id or not log_uid or master_sid is None:
-        log.info("[SEED] ⚠️ пропуск msg=%s: нет req_id/log_uid/strategy_id payload=%r", msg_id, payload)
-        return
-
-    try:
-        rows = await _seed_lps_from_sle(
-            req_id=req_id,
-            log_uid=log_uid,
-            master_sid=master_sid,
-            client_sid_opt=client_sid_opt,
-            decision_mode_opt=decision_mode_opt,
-            decision_tf_origins_opt=decision_tf_origins_opt,
-        )
-        log.info("[SEED] ✅ upsert LPS: req_id=%s log_uid=%s rows=%d", req_id, log_uid, rows)
-    except Exception:
-        log.exception("[SEED] ❌ ошибка обработки seed req_id=%s log_uid=%s", req_id, log_uid)
-        
-# 🔸 Обновление LPS по событию закрытия позиции
-async def _handle_close_message(msg_id: str, fields: Dict[str, str]):
-    payload = _extract_stream_payload(fields)
-
-    if _lower_str(payload.get("status", "")) != "closed":
-        return
-
-    log_uid = payload.get("log_uid")
-    position_uid = payload.get("position_uid")
-    client_sid = _as_int(payload.get("strategy_id"))  # в этом стриме — SID зеркала!
-
-    if not log_uid or not position_uid or client_sid is None:
-        log.info("[CLOSE] ⚠️ пропуск msg=%s: нет log_uid/position_uid/strategy_id payload=%s", msg_id, payload)
-        return
-
-    # читаем позицию (уже обновлена внешним модулем)
-    async with infra.pg_pool.acquire() as conn:
-        pos = await conn.fetchrow(
-            """
-            SELECT position_uid, pnl, closed_at
-            FROM positions_v4
-            WHERE position_uid = $1
+        rows = await conn.fetch(
+            f"""
+            SELECT log_uid, strategy_id, client_strategy_id, symbol, direction, tf, tf_results
+              FROM {SLE_TABLE}
+             WHERE req_id=$1 AND allow=true
             """,
-            position_uid
+            req_id,
         )
-        if not pos:
-            log.info("[CLOSE] ⚠️ позиция не найдена position_uid=%s", position_uid)
+        if not rows:
+            log.info("[LPS] ⚠️ нет строк SLE для req_id=%s log_uid=%s (allow=true)", req_id, log_uid)
             return
 
-        pnl = pos["pnl"]
-        closed_at = pos["closed_at"]
-        # result: строго > 0
-        result_flag = bool(pnl is not None and float(pnl) > 0.0)
+        for r in rows:
+            lps_values, key = _extract_lps_from_sle_row(dict(r))
+            res = await _upsert_lps(conn, lps_values)
+            if res == "inserted":
+                inserted += 1
+            else:
+                updated += 1
 
-        # апдейт всех TF-строк LPS по (log_uid, client_sid)
-        try:
-            status = await conn.execute(
-                """
-                UPDATE laboratoty_position_stat
-                   SET position_uid = $1,
-                       pnl = $2,
-                       result = $3,
-                       closed_at = $4,
-                       updated_at = NOW()
-                 WHERE log_uid = $5
-                   AND client_strategy_id = $6
-                """,
-                position_uid, pnl, result_flag, closed_at, log_uid, client_sid
-            )
-            # status выглядит как "UPDATE <n>"
-            updated = int(status.split()[-1]) if status.startswith("UPDATE") else 0
-            log.info(
-                "[CLOSE] ✅ LPS обновлён: log_uid=%s csid=%s pos=%s pnl=%s result=%s rows=%d",
-                log_uid, client_sid, position_uid, str(pnl), str(result_flag).lower(), updated
-            )
-        except Exception:
-            log.exception("[CLOSE] ❌ ошибка обновления LPS (log_uid=%s csid=%s)", log_uid, client_sid)
+            # сбор агрегатов для лога
+            sid = sid or key["sid"]
+            csid = csid if csid is not None else key["csid"]
+            symbol = symbol or key["symbol"]
+            tfs.append(key["tf"])
 
+    # лог результата
+    uniq_tfs = ",".join(sorted(set(tfs), key=lambda x: ["m5", "m15", "h1"].index(x) if x in ("m5","m15","h1") else 9))
+    log.info(
+        "[LPS] ✅ filled req_id=%s log_uid=%s sid=%s csid=%s %s tfs=[%s] ins=%d upd=%d",
+        req_id, log_uid, (sid if sid is not None else "-"), (csid if csid is not None else "-"),
+        (symbol or "-"), uniq_tfs, inserted, updated
+    )
 
-# 🔸 Главный слушатель: сидинг после allow=true
+# 🔸 Главный слушатель seed → перенос SLE → LPS
 async def run_laboratory_decision_filler():
     """
-    Слушает laboratory_decision_filler и на каждое allow=true событие создаёт/обновляет строки в laboratoty_position_stat
-    по всем TF данного запроса (по данным из signal_laboratory_entries).
+    Слушает laboratory_decision_filler и для каждого seed {req_id, log_uid}
+    переносит готовые данные из signal_laboratory_entries в laboratoty_position_stat.
+    Не запрашивает on-demand никакие индикаторы.
     """
     log.debug("🛰️ LAB_DECISION_FILLER слушатель запущен (BLOCK=%d COUNT=%d)", XREAD_BLOCK_MS, XREAD_COUNT)
 
-    last_id = "$"
+    last_id = "$"  # только новые
     redis = infra.redis_client
 
     while True:
@@ -425,7 +386,7 @@ async def run_laboratory_decision_filler():
             resp = await redis.xread(
                 streams={DECISION_FILLER_STREAM: last_id},
                 count=XREAD_COUNT,
-                block=XREAD_BLOCK_MS
+                block=XREAD_BLOCK_MS,
             )
             if not resp:
                 continue
@@ -433,51 +394,32 @@ async def run_laboratory_decision_filler():
             for _, messages in resp:
                 for msg_id, fields in messages:
                     last_id = msg_id
+                    # распаковка полей
+                    req_id = (fields.get("req_id") or "").strip()
+                    log_uid = (fields.get("log_uid") or "").strip()
+                    if not req_id or not log_uid:
+                        # вложенный формат с key 'data' (на всякий случай)
+                        raw = fields.get("data")
+                        if raw and isinstance(raw, str):
+                            try:
+                                data = json.loads(raw)
+                                req_id = (data.get("req_id") or req_id).strip()
+                                log_uid = (data.get("log_uid") or log_uid).strip()
+                            except Exception:
+                                pass
+                    if not req_id or not log_uid:
+                        log.info("[LPS] ⚠️ пропуск seed msg=%s: неполные поля: %s", msg_id, fields)
+                        continue
+
+                    # обработка seed
                     try:
-                        await _handle_seed_message(msg_id, fields)
+                        await _process_seed(req_id=req_id, log_uid=log_uid)
                     except Exception:
-                        log.exception("❌ Ошибка seed-сообщения msg_id=%s", msg_id)
+                        log.exception("[LPS] ❌ ошибка обработки seed req_id=%s log_uid=%s", req_id, log_uid)
 
         except asyncio.CancelledError:
             log.debug("⏹️ LAB_DECISION_FILLER остановлен по сигналу")
             raise
         except Exception:
-            log.exception("❌ LAB_DECISION_FILLER ошибка цикла")
-            await asyncio.sleep(1.0)
-
-
-# 🔸 Слушатель закрытия позиций: дополняет LPS pnl/result/closed_at/position_uid
-async def run_position_close_updater():
-    """
-    Слушает signal_log_queue. На событиях со status='closed' подтягивает из positions_v4 PnL/closed_at
-    и дописывает их в laboratoty_position_stat (по log_uid + client_strategy_id).
-    """
-    log.debug("🛰️ LAB_POS_CLOSE_FILLER слушатель запущен (BLOCK=%d COUNT=%d)", XREAD_BLOCK_MS, XREAD_COUNT)
-
-    last_id = "$"
-    redis = infra.redis_client
-
-    while True:
-        try:
-            resp = await redis.xread(
-                streams={SIGNAL_LOG_QUEUE_STREAM: last_id},
-                count=XREAD_COUNT,
-                block=XREAD_BLOCK_MS
-            )
-            if not resp:
-                continue
-
-            for _, messages in resp:
-                for msg_id, fields in messages:
-                    last_id = msg_id
-                    try:
-                        await _handle_close_message(msg_id, fields)
-                    except Exception:
-                        log.exception("❌ Ошибка close-сообщения msg_id=%s", msg_id)
-
-        except asyncio.CancelledError:
-            log.debug("⏹️ LAB_POS_CLOSE_FILLER остановлен по сигналу")
-            raise
-        except Exception:
-            log.exception("❌ LAB_POS_CLOSE_FILLER ошибка цикла")
+            log.exception("❌ LAB_DECISION_FILLER ошибка в основном цикле")
             await asyncio.sleep(1.0)

@@ -25,10 +25,7 @@ from laboratory_config import (
 from laboratory_decision_maker import run_laboratory_decision_maker
 
 # 🔸 Пост-allow писатель статистики (filler)
-from laboratory_decision_filler import (
-    run_laboratory_decision_filler,      # seed → первичное наполнение
-    run_position_close_updater,          # signal_log_queue → допись pnl/result/closed_at
-)
+from laboratory_decision_filler import run_laboratory_decision_filler
 
 log = logging.getLogger("LAB_MAIN")
 
@@ -83,7 +80,6 @@ async def main():
         run_safe_loop(run_laboratory_decision_maker, "LAB_DECISION"),
         # Пост-allow наполнитель статистики — Streams: laboratory_decision_filler → laboratoty_position_stat
         run_safe_loop(run_laboratory_decision_filler, "LAB_DECISION_FILLER"),
-        run_safe_loop(run_position_close_updater, "LAB_POS_CLOSE_FILLER"),
     )
 
 
