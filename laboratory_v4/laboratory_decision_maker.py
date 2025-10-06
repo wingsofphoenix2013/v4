@@ -1,4 +1,4 @@
-# laboratory_decision_maker.py — Этап 1: сбор полного снимка MW/PACK по запросу стратегии (всегда deny)
+# laboratory_decision_maker.py — Этап 2: сбор полного снимка MW/PACK по запросу (всегда deny) + подсчёт совпадений (MW-WL / PACK-WL / PACK-BL) и запись по КАЖДОМУ TF
 
 # 🔸 Импорты
 import asyncio
@@ -74,7 +74,7 @@ def _to_json_safe(obj: Any) -> Any:
         return [_to_json_safe(v) for v in obj]
     # fallback: строковое представление
     return str(obj)
-    
+
 # 🔸 Вспомогательные парсеры/утилиты
 def _parse_timeframes(tf_str: str) -> List[str]:
     items = [x.strip().lower() for x in (tf_str or "").split(",") if x.strip()]
@@ -84,7 +84,6 @@ def _parse_timeframes(tf_str: str) -> List[str]:
             seen.add(tf)
             ordered.append(tf)
     return ordered
-
 
 # 🔸 Парсинг pack_base → (indicator, params)
 def _parse_pack_base(base: str) -> Tuple[str, Dict[str, Any]]:
@@ -116,17 +115,14 @@ def _parse_pack_base(base: str) -> Tuple[str, Dict[str, Any]]:
         return s, {}
     return s, {}
 
-
 # 🔸 Формирование публичного KV-ключа для PACK-объекта
 def _public_pack_key(indicator: str, symbol: str, tf: str, base: str) -> str:
     pref = PACK_PUBLIC_PREFIX.get(indicator, f"{indicator}_pack")
     return f"{pref}:{symbol}:{tf}:{base}"
 
-
 # 🔸 Публичный KV-ключ MW-пакета
 def _public_mw_key(kind: str, symbol: str, tf: str) -> str:
     return f"{kind}_pack:{symbol}:{tf}:{kind}"
-
 
 # 🔸 Безопасный json.loads
 def _json_or_none(s: Optional[str]) -> Optional[dict]:
@@ -137,11 +133,9 @@ def _json_or_none(s: Optional[str]) -> Optional[dict]:
     except Exception:
         return None
 
-
 # 🔸 Текущее монотонное время в мс
 def _now_monotonic_ms() -> int:
     return int(time.monotonic() * 1000)
-
 
 # 🔸 MGET JSON пачкой
 async def _mget_json(keys: List[str]) -> Dict[str, Optional[dict]]:
@@ -149,7 +143,6 @@ async def _mget_json(keys: List[str]) -> Dict[str, Optional[dict]]:
         return {}
     values = await infra.redis_client.mget(*keys)
     return {k: _json_or_none(v) for k, v in zip(keys, values)}
-
 
 # 🔸 Запрос и ожидание появления PACK в публичном KV (cache-first, с коалесценсом)
 async def _ensure_pack_available(
@@ -246,7 +239,6 @@ async def _ensure_pack_available(
                 if now2 > exp or (f.done() and _json_or_none(f.result()) is None):
                     _coalesce.pop(ck, None)
 
-
 # 🔸 Снятие MW-пакета (cache-first → gateway)
 async def _get_mw_pack(symbol: str, tf: str, kind: str, deadline_ms: int, telemetry: Dict[str, int]) -> Tuple[Optional[dict], str]:
     key = _public_mw_key(kind, symbol, tf)
@@ -263,7 +255,6 @@ async def _get_mw_pack(symbol: str, tf: str, kind: str, deadline_ms: int, teleme
     )
     return obj, src
 
-
 # 🔸 Снимок MW для (sid, symbol, direction, tf)
 async def _collect_mw_snapshot(
     sid: int, symbol: str, direction: str, tf: str, deadline_ms: int, telemetry: Dict[str, int]
@@ -274,7 +265,6 @@ async def _collect_mw_snapshot(
     for kind in ("trend", "volatility", "momentum", "extremes"):
         obj, src = await _get_mw_pack(symbol, tf, kind, deadline_ms, telemetry)
         if obj:
-            # аккуратно добавим метку источника (копию объекта не делаем глубокой)
             obj2 = dict(obj)
             obj2["source"] = src
             out["states"][kind] = obj2
@@ -288,7 +278,6 @@ async def _collect_mw_snapshot(
         if (str(r.get("timeframe")) == tf and str(r.get("direction")).lower() == direction)
     ]
     return out
-
 
 # 🔸 Снимок PACK для (sid, symbol, direction, tf)
 async def _collect_pack_snapshot(
@@ -333,23 +322,117 @@ async def _collect_pack_snapshot(
 
     return out
 
+# 🔸 Построение факта для MW по agg_base
+def _build_mw_fact(states: Dict[str, Any], agg_base: str) -> Optional[str]:
+    if not agg_base:
+        return None
+    parts: List[str] = []
+    for base in (agg_base.strip().lower().split("_")):
+        node = states.get(base) or {}
+        pack = node.get("pack") or {}
+        st = pack.get("state")
+        if not isinstance(st, str) or not st:
+            return None
+        parts.append(f"{base}:{st.strip().lower()}")
+    return "|".join(parts)
 
-# 🔸 Персист решения (Этап 1: всегда allow=false с reason=stage1_collect_only)
-async def _persist_decision(
+# 🔸 Подсчёт совпадений для MW-WL
+def _mw_count_hits(mw_rules: List[Dict[str, Any]], states: Dict[str, Any]) -> Tuple[int, int]:
+    total = 0
+    hits = 0
+    for r in mw_rules:
+        agg_base = str(r.get("agg_base") or "").strip().lower()
+        agg_state = str(r.get("agg_state") or "").strip().lower()
+        if not agg_base or not agg_state:
+            continue
+        total += 1
+        fact = _build_mw_fact(states, agg_base)
+        if fact is not None and fact == agg_state:
+            hits += 1
+    return hits, total
+
+# 🔸 Построение факта для PACK по agg_key из pack payload
+def _build_pack_fact(pack_obj: Dict[str, Any], agg_key: str) -> Optional[str]:
+    if not agg_key:
+        return None
+    pack_payload = (pack_obj or {}).get("pack") or {}
+    keys = [k.strip() for k in agg_key.strip().lower().split("|") if k.strip()]
+    parts: List[str] = []
+    for k in keys:
+        v = pack_payload.get(k)
+        if v is None:
+            return None
+        parts.append(f"{k}:{str(v).strip().lower()}")
+    return "|".join(parts)
+
+# 🔸 Подсчёт совпадений для PACK (WL/BL)
+def _pack_count_hits(
+    pack_rules: List[Dict[str, Any]],
+    pack_objs: Dict[str, Optional[dict]],
+) -> Tuple[int, int, int, int]:
+    """
+    Возвращает: (wl_hits, wl_total, bl_hits, bl_total)
+    """
+    wl_total = 0
+    wl_hits = 0
+    bl_total = 0
+    bl_hits = 0
+
+    for r in pack_rules:
+        list_type = str(r.get("list") or "").strip().lower()
+        base = str(r.get("pack_base") or "").strip().lower()
+        agg_key = str(r.get("agg_key") or "").strip().lower()
+        agg_val = str(r.get("agg_value") or "").strip().lower()
+        if not base or not agg_key or not agg_val:
+            continue
+
+        # считаем totals по типу
+        if list_type == "whitelist":
+            wl_total += 1
+        elif list_type == "blacklist":
+            bl_total += 1
+        else:
+            continue
+
+        pack_obj = pack_objs.get(base)
+        if not pack_obj:
+            # объект не собран/timeout — не считаем hit
+            continue
+
+        fact = _build_pack_fact(pack_obj, agg_key)
+        if fact is None:
+            continue
+
+        if fact == agg_val:
+            if list_type == "whitelist":
+                wl_hits += 1
+            else:
+                bl_hits += 1
+
+    return wl_hits, wl_total, bl_hits, bl_total
+
+# 🔸 Персист одной строки по КОНКРЕТНОМУ TF (Этап 2: всегда allow=false + reason=stage2_count_only + счётчики)
+async def _persist_decision_tf(
     req_id: str,
     log_uid: str,
     strategy_id: int,
     client_strategy_id: Optional[int],
     symbol: str,
     direction: str,
+    tf: str,
     tfr_req: str,
-    tfr_proc: str,
-    tf_results_json: Optional[str],
+    tf_result_json: Optional[str],
     received_at_dt: datetime,
     finished_at_dt: datetime,
     duration_ms: int,
     kv_hits: int,
     gateway_requests: int,
+    mw_wl_hits: int,
+    mw_wl_total: int,
+    pack_wl_hits: int,
+    pack_wl_total: int,
+    pack_bl_hits: int,
+    pack_bl_total: int,
 ):
     async with infra.pg_pool.acquire() as conn:
         if client_strategy_id is None:
@@ -360,19 +443,28 @@ async def _persist_decision(
                    SET req_id=$1,
                        direction=$2,
                        symbol=$3,
-                       timeframes_requested=$4,
-                       timeframes_processed=$5,
+                       tf=$4,
+                       timeframes_requested=$5,
+                       timeframes_processed=$6,
                        allow=false,
-                       reason='stage1_collect_only',
-                       tf_results=COALESCE($6::jsonb, signal_laboratory_entries.tf_results),
-                       finished_at=$7,
-                       duration_ms=$8,
-                       cache_hits=$9,
-                       gateway_requests=$10
-                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id IS NULL
+                       reason='stage2_count_only',
+                       tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$8,
+                       duration_ms=$9,
+                       cache_hits=$10,
+                       gateway_requests=$11,
+                       mw_wl_rules_total=$12,
+                       mw_wl_hits=$13,
+                       pack_wl_rules_total=$14,
+                       pack_wl_hits=$15,
+                       pack_bl_rules_total=$16,
+                       pack_bl_hits=$17
+                 WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id IS NULL AND tf=$4
                 """,
-                req_id, direction, symbol, tfr_req, tfr_proc, tf_results_json,
-                finished_at_dt, duration_ms, kv_hits, gateway_requests, log_uid, strategy_id
+                req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+                finished_at_dt, duration_ms, kv_hits, gateway_requests,
+                mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+                log_uid, strategy_id
             )
             if upd_status.startswith("UPDATE 1"):
                 return
@@ -380,19 +472,22 @@ async def _persist_decision(
             ins_status = await conn.execute(
                 """
                 INSERT INTO public.signal_laboratory_entries
-                    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
+                    (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol, tf,
                      timeframes_requested, timeframes_processed, protocol_version,
                      allow, reason, tf_results, errors,
-                     received_at, finished_at, duration_ms, cache_hits, gateway_requests)
-                VALUES ($1,$2,$3,NULL,$4,$5,
-                        $6,$7,'v1',
-                        false,'stage1_collect_only',COALESCE($8::jsonb,NULL),NULL,
-                        $9,$10,$11,$12,$13)
+                     received_at, finished_at, duration_ms, cache_hits, gateway_requests,
+                     mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits)
+                VALUES ($1,$2,$3,NULL,$4,$5,$6,
+                        $7,$8,'v1',
+                        false,'stage2_count_only',COALESCE($9::jsonb,NULL),NULL,
+                        $10,$11,$12,$13,$14,
+                        $15,$16,$17,$18,$19,$20)
                 ON CONFLICT DO NOTHING
                 """,
-                req_id, log_uid, strategy_id, direction, symbol,
-                tfr_req, tfr_proc, tf_results_json,
-                received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests
+                req_id, log_uid, strategy_id, direction, symbol, tf,
+                tfr_req, tf, tf_result_json,
+                received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests,
+                mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits
             )
             if ins_status.endswith(" 1"):
                 return
@@ -403,19 +498,28 @@ async def _persist_decision(
                    SET req_id=$1,
                        direction=$2,
                        symbol=$3,
-                       timeframes_requested=$4,
-                       timeframes_processed=$5,
+                       tf=$4,
+                       timeframes_requested=$5,
+                       timeframes_processed=$6,
                        allow=false,
-                       reason='stage1_collect_only',
-                       tf_results=COALESCE($6::jsonb, signal_laboratory_entries.tf_results),
-                       finished_at=$7,
-                       duration_ms=$8,
-                       cache_hits=$9,
-                       gateway_requests=$10
-                 WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id IS NULL
+                       reason='stage2_count_only',
+                       tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
+                       finished_at=$8,
+                       duration_ms=$9,
+                       cache_hits=$10,
+                       gateway_requests=$11,
+                       mw_wl_rules_total=$12,
+                       mw_wl_hits=$13,
+                       pack_wl_rules_total=$14,
+                       pack_wl_hits=$15,
+                       pack_bl_rules_total=$16,
+                       pack_bl_hits=$17
+                 WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id IS NULL AND tf=$4
                 """,
-                req_id, direction, symbol, tfr_req, tfr_proc, tf_results_json,
-                finished_at_dt, duration_ms, kv_hits, gateway_requests, log_uid, strategy_id
+                req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+                finished_at_dt, duration_ms, kv_hits, gateway_requests,
+                mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+                log_uid, strategy_id
             )
             return
 
@@ -426,38 +530,50 @@ async def _persist_decision(
                SET req_id=$1,
                    direction=$2,
                    symbol=$3,
-                   timeframes_requested=$4,
-                   timeframes_processed=$5,
+                   tf=$4,
+                   timeframes_requested=$5,
+                   timeframes_processed=$6,
                    allow=false,
-                   reason='stage1_collect_only',
-                   tf_results=COALESCE($6::jsonb, signal_laboratory_entries.tf_results),
-                   finished_at=$7,
-                   duration_ms=$8,
-                   cache_hits=$9,
-                   gateway_requests=$10
-             WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id=$13
+                   reason='stage2_count_only',
+                   tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
+                   finished_at=$8,
+                   duration_ms=$9,
+                   cache_hits=$10,
+                   gateway_requests=$11,
+                   mw_wl_rules_total=$12,
+                   mw_wl_hits=$13,
+                   pack_wl_rules_total=$14,
+                   pack_wl_hits=$15,
+                   pack_bl_rules_total=$16,
+                   pack_bl_hits=$17
+             WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id=$20 AND tf=$4
             """,
-            req_id, direction, symbol, tfr_req, tfr_proc, tf_results_json,
-            finished_at_dt, duration_ms, kv_hits, gateway_requests, log_uid, strategy_id, int(client_strategy_id)
+            req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+            finished_at_dt, duration_ms, kv_hits, gateway_requests,
+            mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+            log_uid, strategy_id, int(client_strategy_id)
         )
         if upd_status.startswith("UPDATE 1"):
             return
         ins_status = await conn.execute(
             """
             INSERT INTO public.signal_laboratory_entries
-                (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol,
+                (req_id, log_uid, strategy_id, client_strategy_id, direction, symbol, tf,
                  timeframes_requested, timeframes_processed, protocol_version,
                  allow, reason, tf_results, errors,
-                 received_at, finished_at, duration_ms, cache_hits, gateway_requests)
-            VALUES ($1,$2,$3,$4,$5,$6,
-                    $7,$8,'v1',
-                    false,'stage1_collect_only',COALESCE($9::jsonb,NULL),NULL,
-                    $10,$11,$12,$13,$14)
+                 received_at, finished_at, duration_ms, cache_hits, gateway_requests,
+                 mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,
+                    $8,$9,'v1',
+                    false,'stage2_count_only',COALESCE($10::jsonb,NULL),NULL,
+                    $11,$12,$13,$14,$15,
+                    $16,$17,$18,$19,$20,$21)
             ON CONFLICT DO NOTHING
             """,
-            req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol,
-            tfr_req, tfr_proc, tf_results_json,
-            received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests
+            req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol, tf,
+            tfr_req, tf, tf_result_json,
+            received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests,
+            mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits
         )
         if ins_status.endswith(" 1"):
             return
@@ -467,34 +583,39 @@ async def _persist_decision(
                SET req_id=$1,
                    direction=$2,
                    symbol=$3,
-                   timeframes_requested=$4,
-                   timeframes_processed=$5,
+                   tf=$4,
+                   timeframes_requested=$5,
+                   timeframes_processed=$6,
                    allow=false,
-                   reason='stage1_collect_only',
-                   tf_results=COALESCE($6::jsonb, signal_laboratory_entries.tf_results),
-                   finished_at=$7,
-                   duration_ms=$8,
-                   cache_hits=$9,
-                   gateway_requests=$10
-             WHERE log_uid=$11 AND strategy_id=$12 AND client_strategy_id=$13
+                   reason='stage2_count_only',
+                   tf_results=COALESCE($7::jsonb, signal_laboratory_entries.tf_results),
+                   finished_at=$8,
+                   duration_ms=$9,
+                   cache_hits=$10,
+                   gateway_requests=$11,
+                   mw_wl_rules_total=$12,
+                   mw_wl_hits=$13,
+                   pack_wl_rules_total=$14,
+                   pack_wl_hits=$15,
+                   pack_bl_rules_total=$16,
+                   pack_bl_hits=$17
+             WHERE log_uid=$18 AND strategy_id=$19 AND client_strategy_id=$20 AND tf=$4
             """,
-            req_id, direction, symbol, tfr_req, tfr_proc, tf_results_json,
-            finished_at_dt, duration_ms, kv_hits, gateway_requests, log_uid, strategy_id, int(client_strategy_id)
+            req_id, direction, symbol, tf, tfr_req, tf, tf_result_json,
+            finished_at_dt, duration_ms, kv_hits, gateway_requests,
+            mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+            log_uid, strategy_id, int(client_strategy_id)
         )
-
 
 # 🔸 Ключи шторки/очереди
 def _gate_key(gate_sid: int, symbol: str) -> str:
     return f"lab:gate:{gate_sid}:{symbol}"
 
-
 def _queue_key(gate_sid: int, symbol: str) -> str:
     return f"lab:qids:{gate_sid}:{symbol}"
 
-
 def _qfields_key(req_id: str) -> str:
     return f"lab:qfields:{req_id}"
-
 
 # 🔸 Получить лидерство или встать в очередь (anti-dup per (gate_sid,symbol))
 async def _acquire_gate_or_enqueue(
@@ -517,7 +638,6 @@ async def _acquire_gate_or_enqueue(
     await infra.redis_client.set(fk, json.dumps(fields, ensure_ascii=False), ex=gate_ttl_sec + 60)
     log.debug("[GATE] ⏸️ в очередь gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
     return False, "enqueued"
-
 
 # 🔸 Реакция по завершении лидера (allow=false → назначить следующего)
 async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, allow: bool):
@@ -564,8 +684,7 @@ async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, al
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-
-# 🔸 Ядро обработки запроса (Этап 1: сбор снимка, всегда deny с stage1_collect_only)
+# 🔸 Ядро обработки запроса (Этап 2: сбор снимка + подсчёт совпадений; ВСЕГДА deny в ответ)
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
     async with _decisions_sem:
         t0 = _now_monotonic_ms()
@@ -618,12 +737,10 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         )
 
         telemetry: Dict[str, int] = {"kv_hits": 0, "gateway_requests": 0}
-        tf_results: List[Dict[str, Any]] = []
+        tf_results_for_response: List[Dict[str, Any]] = []
 
-        # сбор снимка по каждому TF
+        # цикл по каждой запрошенной TF — сбор снимка, подсчёт матчей и запись ОДНОЙ строки на TF
         for tf in tfs:
-            precision = int(infra.enabled_tickers.get(symbol, {}).get("precision_price", 7))
-
             # MW snapshot
             mw_snap = await _collect_mw_snapshot(
                 sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
@@ -636,48 +753,86 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
             # флаг неполного сбора по TF
             incomplete = False
-            # проверим MW-пакеты
             for kind in ("trend", "volatility", "momentum", "extremes"):
                 node = mw_snap["states"].get(kind)
                 if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
                     incomplete = True
                     break
-            # проверим PACK-объекты
             if not incomplete:
                 for base, node in (pack_snap.get("objects") or {}).items():
                     if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
                         incomplete = True
                         break
 
-            tf_results.append({
+            # Подсчёт совпадений MW
+            mw_hits, mw_total = _mw_count_hits(mw_snap.get("rules", []), mw_snap.get("states", {}))
+
+            # Подсчёт совпадений PACK (WL/BL)
+            pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total = _pack_count_hits(
+                pack_snap.get("rules", []), pack_snap.get("objects", {})
+            )
+
+            # соберём одиночный TF-результат (для БД и ответа)
+            tf_result_obj = {
                 "tf": tf,
                 "collect_incomplete": incomplete,
                 "mw": mw_snap,
                 "pack": pack_snap,
-            })
+                "counters": {
+                    "mw_wl_hits": mw_hits, "mw_wl_total": mw_total,
+                    "pack_wl_hits": pack_wl_hits, "pack_wl_total": pack_wl_total,
+                    "pack_bl_hits": pack_bl_hits, "pack_bl_total": pack_bl_total,
+                },
+            }
+            tf_results_for_response.append(tf_result_obj)
 
-            # итоги TF (log.info)
+            # лог по TF (log.info)
             log.info(
-                "[TF:%s] 🧩 collect mw_states=%d pack_bases=%d rules_mw=%d rules_pack=%d kv_hits=%d gw_reqs=%d incomplete=%s",
-                tf,
-                len(mw_snap.get("states", {})),
-                len(pack_snap.get("objects", {})),
-                len(mw_snap.get("rules", [])),
-                len(pack_snap.get("rules", [])),
-                telemetry.get("kv_hits", 0),
-                telemetry.get("gateway_requests", 0),
-                str(incomplete).lower(),
+                "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  incomplete=%s  kv_hits=%d gw_reqs=%d",
+                tf, mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
+                str(incomplete).lower(), telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
             )
 
-        finished_at_dt = datetime.utcnow()
-        duration_ms = _now_monotonic_ms() - t0
+            # запись ОДНОЙ строки на TF
+            finished_at_dt = datetime.utcnow()
+            duration_ms = _now_monotonic_ms() - t0
+            try:
+                tf_json_safe = _to_json_safe(tf_result_obj)
+                tf_json_text = json.dumps(tf_json_safe, ensure_ascii=False)
+                await _persist_decision_tf(
+                    req_id=msg_id,
+                    log_uid=log_uid,
+                    strategy_id=sid,
+                    client_strategy_id=int(client_sid_s) if client_sid_s.isdigit() else None,
+                    symbol=symbol,
+                    direction=direction,
+                    tf=tf,
+                    tfr_req=tfs_raw,
+                    tf_result_json=tf_json_text,
+                    received_at_dt=received_at_dt,
+                    finished_at_dt=finished_at_dt,
+                    duration_ms=duration_ms,
+                    kv_hits=telemetry.get("kv_hits", 0),
+                    gateway_requests=telemetry.get("gateway_requests", 0),
+                    mw_wl_hits=mw_hits,
+                    mw_wl_total=mw_total,
+                    pack_wl_hits=pack_wl_hits,
+                    pack_wl_total=pack_wl_total,
+                    pack_bl_hits=pack_bl_hits,
+                    pack_bl_total=pack_bl_total,
+                )
+            except Exception:
+                log.exception("[AUDIT] ❌ ошибка записи строки TF=%s log_uid=%s sid=%s csid=%s", tf, log_uid, sid, client_sid_s or "-")
 
-        # ответ стратегии — всегда deny на Этапе 1
+        # формируем ОТВЕТ стратегии — всегда deny на Этапе 2 (единый ответ на весь запрос)
+        finished_at_dt = datetime.utcnow()
+        duration_ms_total = _now_monotonic_ms() - t0
+
         resp = {
             "req_id": msg_id,
             "status": "ok",
             "allow": "false",
-            "reason": "stage1_collect_only",
+            "reason": "stage2_count_only",
             "log_uid": log_uid,
             "strategy_id": str(sid),
             "direction": direction,
@@ -686,49 +841,23 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
         }
         if client_sid_s:
             resp["client_strategy_id"] = client_sid_s
-            
-        # формируем JSON-safe снимок и вкладываем его в ответ
-        tf_results_safe = _to_json_safe(tf_results)
+
+        # положим сводный массив TF в ответ (для трассировки)
         try:
-            resp["tf_results"] = json.dumps(tf_results_safe, ensure_ascii=False)
+            resp["tf_results"] = json.dumps(_to_json_safe(tf_results_for_response), ensure_ascii=False)
         except Exception:
-            # на всякий случай не роняем ответ
             pass
 
         await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
 
         # финальный лог (log.info)
         log.info(
-            "[RESP] ⛔ deny log_uid=%s sid=%s csid=%s reason=stage1_collect_only dur=%dms kv_hits=%d gw_reqs=%d",
-            log_uid, sid, (client_sid_s or "-"), duration_ms, telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
+            "[RESP] ⛔ deny log_uid=%s sid=%s csid=%s reason=stage2_count_only dur=%dms kv_hits=%d gw_reqs=%d",
+            log_uid, sid, (client_sid_s or "-"), duration_ms_total, telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
         )
-
-        # запись в БД
-        try:
-            # сериализация в БД — через безопасную версию
-            tf_results_json = json.dumps(tf_results_safe, ensure_ascii=False)
-            await _persist_decision(
-                req_id=msg_id,
-                log_uid=log_uid,
-                strategy_id=sid,
-                client_strategy_id=int(client_sid_s) if client_sid_s.isdigit() else None,
-                symbol=symbol,
-                direction=direction,
-                tfr_req=tfs_raw,
-                tfr_proc=",".join(tfs),
-                tf_results_json=tf_results_json,
-                received_at_dt=received_at_dt,
-                finished_at_dt=finished_at_dt,
-                duration_ms=duration_ms,
-                kv_hits=telemetry.get("kv_hits", 0),
-                gateway_requests=telemetry.get("gateway_requests", 0),
-            )
-        except Exception:
-            log.exception("[AUDIT] ❌ ошибка записи снимка log_uid=%s sid=%s csid=%s", log_uid, sid, client_sid_s or "-")
 
         # завершение ворот: allow=false → подобрать следующего из очереди
         await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=False)
-
 
 # 🔸 Обработка входящего сообщения: получить лидерство или встать в очередь
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
@@ -751,11 +880,12 @@ async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     else:
         log.debug("[REQ] ⏳ queued gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
 
-
-# 🔸 Главный слушатель decision_request (Этап 1)
+# 🔸 Главный слушатель decision_request (Этап 2)
 async def run_laboratory_decision_maker():
     """
-    Слушает laboratory:decision_request и возвращает снимок MW/PACK (allow=false, reason=stage1_collect_only).
+    Слушает laboratory:decision_request, собирает снимок MW/PACK, считает совпадения (MW-WL / PACK-WL / PACK-BL)
+    и пишет ПО ОДНОЙ строке на каждый запрошенный TF в signal_laboratory_entries. В ответ стратегии возвращает
+    status=ok, allow=false, reason=stage2_count_only.
     Работает только с НОВЫМИ сообщениями (старт с '$'). Встроены ворота/очередь per (gate_sid, symbol).
     """
     log.info("🛰️ LAB_DECISION слушатель запущен (BLOCK=%d COUNT=%d DEADLINE=%ds)",
