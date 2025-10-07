@@ -1,5 +1,5 @@
 # signal_processor.py
-
+import os
 import asyncio
 import logging
 import json
@@ -23,12 +23,34 @@ def set_strategy_registry(registry: dict):
     global strategy_registry
     strategy_registry = registry
 
+# 🔸 Лимит одновременно обрабатываемых сигналов (fan-out)
+MAX_SIGNAL_TASKS = int(os.getenv("MAX_SIGNAL_TASKS", "500"))
+_signals_sem = asyncio.Semaphore(MAX_SIGNAL_TASKS)
+
+# 🔸 Хартбит-лог загрузки по сигналам (для наблюдаемости)
+_hb_task: asyncio.Task | None = None
+
+async def _signals_load_logger():
+    while True:
+        try:
+            # занято сейчас слотов
+            inflight = MAX_SIGNAL_TASKS - _signals_sem._value
+            log.debug("[LOAD] inflight_signals=%d/%d", inflight, MAX_SIGNAL_TASKS)
+        except Exception:
+            log.exception("❌ Ошибка в heartbeat логгере сигналов")
+        await asyncio.sleep(15)
+
 # 🔸 Главный воркер: слушает Redis Stream и обрабатывает сигналы
 async def run_signal_loop():
     stream = "strategy_input_stream"
     last_id = "$"
 
     log.debug(f"📡 Подписка на Redis Stream: {stream}")
+
+    # запускаем heartbeat один раз
+    global _hb_task
+    if _hb_task is None or _hb_task.done():
+        _hb_task = asyncio.create_task(_signals_load_logger())
 
     while True:
         try:
@@ -39,7 +61,10 @@ async def run_signal_loop():
             for stream_name, records in entries:
                 for record_id, data in records:
                     last_id = record_id
-                    asyncio.create_task(process_signal(data))
+
+                    # ждём свободный слот и только потом создаём задачу
+                    await _signals_sem.acquire()
+                    asyncio.create_task(_run_with_sem_acquired(data))
 
         except Exception:
             log.exception("❌ Ошибка чтения из Redis Stream")
@@ -199,6 +224,16 @@ async def process_signal(data: dict):
 
     except Exception:
         log.exception("❌ Ошибка обработки сигнала")
+
+# 🔸 Запуск обработки под семафором (слот освобождаем в finally)
+async def _run_with_sem_acquired(payload: dict):
+    try:
+        await process_signal(payload)
+    except Exception:
+        log.exception("❌ Ошибка process_signal")
+    finally:
+        _signals_sem.release()
+        
 # 🔸 Маршрут ignore: логируем отказ
 async def route_ignore(strategy_id, symbol, direction, log_uid, reason: str):
     log.debug(f"⚠️ [IGNORE] {symbol} (strategy {strategy_id}, {direction}): {reason}")
