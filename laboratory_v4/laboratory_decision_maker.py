@@ -984,30 +984,20 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                     final_allow = False
                     final_reason = reason_tf  # первая причина в порядке m5→m15→h1
 
-            # формируем ОТВЕТ стратегии — уже с осмысленным allow/deny
+            # формируем ОТВЕТ стратегии — минимальный
             finished_at_dt = datetime.utcnow()
             duration_ms_total = _now_monotonic_ms() - t0
 
             resp = {
-                "req_id": msg_id,
+                "req_id": msg_id,                          # идентификатор запроса
                 "status": "ok",
                 "allow": "true" if final_allow else "false",
-                "log_uid": log_uid,
-                "strategy_id": str(sid),
-                "direction": direction,
-                "symbol": symbol,
-                "timeframes": ",".join(tfs),
+                "log_uid": log_uid,                        # служебный для корреляции
             }
-            if not final_allow and final_reason:
-                resp["reason"] = final_reason
             if client_sid_s:
-                resp["client_strategy_id"] = client_sid_s
-
-            # трасса (оставим как есть — удобно для дебага стратегий)
-            try:
-                resp["tf_results"] = json.dumps(_to_json_safe(tf_results_for_response), ensure_ascii=False)
-            except Exception:
-                pass
+                resp["client_strategy_id"] = client_sid_s  # опционально
+            if not final_allow and final_reason:
+                resp["reason"] = final_reason              # причина отказа
 
             await infra.redis_client.xadd(DECISION_RESP_STREAM, resp)
 
