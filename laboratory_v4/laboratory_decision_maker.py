@@ -43,6 +43,51 @@ PACK_PUBLIC_PREFIX = {
     # по умолчанию: f"{indicator}_pack"
 }
 
+# 🔸 BL: парсер булевого флага из строки ("true"/"1"/"yes"/"on")
+def _parse_bool_flag(s: str) -> bool:
+    v = (s or "").strip().lower()
+    return v in {"1", "true", "yes", "on", "y", "t"}
+
+
+# 🔸 BL: ключ KV с активным порогом для мастера и TF (laboratory:bl:k:{sid}:{tf})
+def _bl_k_key(master_sid: int, tf: str) -> str:
+    return f"laboratory:bl:k:{int(master_sid)}:{tf.strip().lower()}"
+
+
+# 🔸 BL: чтение порогов по всем запрошенным TF одним MGET → {tf: K}
+async def _read_bl_thresholds(master_sid: int, tfs: list[str]) -> dict[str, int]:
+    """
+    Читает компактные пороги из Redis для ключей вида laboratory:bl:k:{master_sid}:{tf}.
+    Отсутствующие ключи трактуются как 0 (фильтр выключен).
+    """
+    # нормализация уникального списка TF (сохраняем порядок вызова)
+    seen = set()
+    tf_list: list[str] = []
+    for tf in tfs or []:
+        t = (tf or "").strip().lower()
+        if t and t not in seen:
+            seen.add(t)
+            tf_list.append(t)
+    if not tf_list:
+        return {}
+
+    # MGET всех ключей сразу
+    keys = [_bl_k_key(master_sid, tf) for tf in tf_list]
+    try:
+        values = await infra.redis_client.mget(*keys)
+    except Exception:
+        # при ошибке сети/Redis — безопасно вернём нули
+        return {tf: 0 for tf in tf_list}
+
+    # приведение к int с дефолтом 0
+    out: dict[str, int] = {}
+    for tf, raw in zip(tf_list, values):
+        try:
+            out[tf] = int(raw) if raw is not None else 0
+        except Exception:
+            out[tf] = 0
+    return out
+    
 # 🔸 Семафоры конкуренции
 _decisions_sem = asyncio.Semaphore(MAX_IN_FLIGHT_DECISIONS)
 _gateway_sem = asyncio.Semaphore(MAX_CONCURRENT_GATEWAY_CALLS)
@@ -691,7 +736,7 @@ async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, al
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-# 🔸 Ядро обработки запроса (Этап 3: сценарии mw_only / mw_then_pack / mw_and_pack)
+# 🔸 Ядро обработки запроса (Этап 3: сценарии mw_only / mw_then_pack / mw_and_pack + опциональный BL-вeto)
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
     # всегда освобождаем ворота
     allow_for_gate = False
@@ -749,13 +794,20 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             tfs = _parse_timeframes(tfs_raw)
             deadline_ms = t0 + LAB_DEADLINE_MS
 
+            # флаг использования BL и чтение порогов по TF
+            use_bl = _parse_bool_flag(fields.get("use_bl"))
+            bl_thresholds: Dict[str, int] = {}
+            if use_bl and tfs:
+                # читаем единожды пороги из KV: laboratory:bl:k:{sid}:{tf}
+                bl_thresholds = await _read_bl_thresholds(sid, tfs)
+
             # ожидание готовности MW-кэша для стратегии (шторка)
             await infra.wait_mw_ready(sid, timeout_sec=5.0)
 
             # лог старта
             log.debug(
-                "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s deadline=90s",
-                log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), decision_mode
+                "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s use_bl=%s deadline=90s",
+                log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), decision_mode, str(use_bl).lower()
             )
 
             telemetry: Dict[str, int] = {"kv_hits": 0, "gateway_requests": 0}
@@ -798,7 +850,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                     pack_snap.get("rules", []), pack_snap.get("objects", {})
                 )
 
-                # принятие решения per TF по сценарию
+                # принятие решения per TF по сценарию (без учёта BL)
                 allow_tf = False
                 reason_tf = ""
 
@@ -836,7 +888,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                             else:
                                 reason_tf = f"pack_missing@{tf}"
 
-                # вычисление decision.origin для TF
+                # вычисление decision.origin для TF (до BL-вeto)
                 origin_tf: Optional[str] = None
                 if allow_tf:
                     if decision_mode == "mw_only":
@@ -848,6 +900,15 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                             origin_tf = "mw"
                         elif reason_tf == "ok_by_pack":
                             origin_tf = "pack"
+
+                # опциональное BL-вeto: берём порог K и сравниваем с pack_bl_hits
+                K = int(bl_thresholds.get(tf, 0)) if use_bl else 0
+                bl_veto = (use_bl and K > 0 and pack_bl_hits >= K)
+                if bl_veto and allow_tf:
+                    # если ранее был allow — переведём в deny с понятной причиной
+                    allow_tf = False
+                    reason_tf = f"bl_block@{tf}(k={K},hits={pack_bl_hits})"
+                    origin_tf = None  # источник прохода TF уже нерелевантен — применён блок по BL
 
                 # одиночный TF-результат (для ответа)
                 tf_result_obj = {
@@ -866,13 +927,21 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                         "mode": decision_mode,
                         "origin": origin_tf,
                     },
+                    # компактная трасса BL
+                    "bl": {
+                        "used": bool(use_bl),
+                        "k": K,
+                        "hits": pack_bl_hits,
+                        "veto": bool(bl_veto),
+                    },
                 }
                 tf_results_for_response.append(tf_result_obj)
 
-                # лог по TF
+                # лог по TF (добавим короткую метку BL)
                 log.debug(
-                    "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  allow=%s reason=%s  incomplete=%s  kv_hits=%d gw_reqs=%d",
+                    "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  bl=%s/%s veto=%s  allow=%s reason=%s  incomplete=%s  kv_hits=%d gw_reqs=%d",
                     tf, mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
+                    K, pack_bl_hits, str(bl_veto).lower(),
                     str(allow_tf).lower(), reason_tf, str(incomplete).lower(),
                     telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
                 )
@@ -964,11 +1033,11 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                         },
                     )
                     log.debug("[FILLER] seed published req_id=%s log_uid=%s stream=%s",
-                             msg_id, log_uid, DECISION_FILLER_STREAM)
+                              msg_id, log_uid, DECISION_FILLER_STREAM)
                 except Exception:
                     log.exception("[FILLER] ❌ Ошибка публикации seed в %s", DECISION_FILLER_STREAM)
-                    
-            # финальный лог (log.debug)
+
+            # финальный лог (повторим кратко)
             log.debug(
                 "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
                 ("✅ allow" if final_allow else "⛔ deny"),
@@ -986,7 +1055,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow_for_gate)
             except Exception:
                 log.exception("[GATE] ❌ ошибка завершения ворот gate_sid=%s symbol=%s", gate_sid, symbol)
-                
+                                
 # 🔸 Обработка входящего сообщения: получить лидерство или встать в очередь
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     strategy_id_s = fields.get("strategy_id") or ""
