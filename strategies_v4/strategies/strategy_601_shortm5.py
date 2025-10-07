@@ -1,13 +1,13 @@
-# strategy_601_shortm5.py — зеркальная стратегия (шорт; laboratory_v4 TF: m5; ожидание по last-id, таймаут 90с; INFO-логи; запись ignore в signal_log_queue)
+# strategy_601_shortm5.py — зеркальная стратегия (шорт; laboratory_v4 TF: m5; таймаут ожидания 90с; INFO-логи; запись ignore в signal_log_queue)
 
 # 🔸 Импорты
 import logging
 import json
-import asyncio
 import time
 from datetime import datetime
 
-from infra import infra
+from infra import infra, lab_sema_acquire, lab_sema_release
+from lab_response_router import wait_lab_response
 
 # 🔸 Логгер стратегии
 log = logging.getLogger("strategy_601_shortm5")
@@ -35,6 +35,7 @@ class Strategy601Shortm5:
         strategy_cfg = context.get("strategy")
         if redis is None or strategy_cfg is None:
             note = "нет redis или strategy в context"
+            # пишем сразу в очередь логов, чтобы появился след в БД
             await self._log_ignore_to_queue(redis, signal.get("strategy_id"), signal.get("log_uid"), note)
             return ("ignore", note)
 
@@ -52,44 +53,57 @@ class Strategy601Shortm5:
         log_uid = signal.get("log_uid")
         tfs = "m5"
 
-        # режим принятия решения лабораторией: "mw_only" или "mw_then_pack"
+        # режим принятия решения лабораторией: "mw_only" или "mw_then_pack" или "mw_and_pack"
         decision_mode = "mw_then_pack"
-        
-        # получаем last-generated-id ответа ДО отправки запроса
-        last_resp_id = await self._get_stream_last_id(redis, "laboratory:decision_response")
 
         # формируем запрос в laboratory
         req_payload = {
             "log_uid": log_uid,
-            "strategy_id": str(master_sid),             # SID мастера
-            "client_strategy_id": client_sid,           # SID зеркала
+            "strategy_id": str(master_sid),            # SID мастера (правила WL/BL)
+            "client_strategy_id": client_sid,          # SID зеркала (ворота/anti-dup)
             "direction": "short",
             "symbol": symbol,
             "timeframes": tfs,
-            "trace": "true",
             "decision_mode": decision_mode,
         }
 
+        # лог запроса
         log.debug(
             "[LAB_REQUEST] log_uid=%s master=%s client=%s symbol=%s tf=%s",
             log_uid, master_sid, client_sid, symbol, tfs
         )
 
+        # резервируем слот на общий запрос в LAB (backpressure)
+        holder = f"{log_uid}:{time.monotonic_ns()}"
+        ok = await lab_sema_acquire(holder)  # лимиты читаются из ENV: LAB_SEMA_LIMIT/LAB_SEMA_TTL
+        if not ok:
+            note = "lab_backpressure"
+            await self._log_ignore_to_queue(redis, client_sid, log_uid, note)
+            return ("ignore", note)
+
         try:
+            # отправляем запрос в laboratory:decision_request
             req_id = await redis.xadd("laboratory:decision_request", req_payload)
             log.debug("[LAB_XADD] req_id=%s", req_id)
 
-            log.debug("[LAB_WAIT] req_id=%s last_id=%s deadline=90s", req_id, last_resp_id)
-            allow, reason = await self._wait_for_response(redis, req_id, last_resp_id, timeout_seconds=90)
+            # ждём ответ через общий роутер (таймаут 90с)
+            allow, reason = await wait_lab_response(req_id, timeout_seconds=90)
+
         except Exception:
             note = "ошибка при работе с laboratory_v4"
             log.exception("❌ Ошибка взаимодействия с laboratory_v4")
             await self._log_ignore_to_queue(redis, client_sid, log_uid, note)
             return ("ignore", note)
 
+        finally:
+            # освобождаем слот в любом случае
+            await lab_sema_release(holder)
+
+        # решение лаборатории
         if allow:
+            # готовим заявку на открытие позиции от имени зеркала
             payload = {
-                "strategy_id": client_sid,
+                "strategy_id": client_sid,       # SID зеркала
                 "symbol": symbol,
                 "direction": "short",
                 "log_uid": log_uid,
@@ -110,64 +124,19 @@ class Strategy601Shortm5:
                 await self._log_ignore_to_queue(redis, client_sid, log_uid, note)
                 return ("ignore", note)
         else:
+            # отказ лаборатории → формируем ignore с причиной
             log.debug("[IGNORE] log_uid=%s reason=\"%s\"", log_uid, reason)
             await self._log_ignore_to_queue(redis, client_sid, log_uid, reason)
             return ("ignore", f"отказ лаборатории по причине {reason}")
 
-    # 🔸 Получение last-generated-id
-    async def _get_stream_last_id(self, redis, stream_name: str) -> str:
-        try:
-            info = await redis.xinfo_stream(stream_name)
-            return info.get("last-generated-id") or info.get("last_generated_id") or "$"
-        except Exception:
-            return "$"
-
-    # 🔸 Ожидание ответа
-    async def _wait_for_response(self, redis, req_id: str, since_id: str, timeout_seconds: int = 90):
-        stream = "laboratory:decision_response"
-        deadline = time.monotonic() + timeout_seconds
-        read_id = since_id
-
-        while True:
-            if time.monotonic() > deadline:
-                log.debug("[LAB_TIMEOUT] req_id=%s", req_id)
-                return False, "lab_timeout"
-
-            entries = await redis.xread({stream: read_id}, block=1000, count=50)
-            if not entries:
-                continue
-
-            total = sum(len(records) for _, records in entries)
-            if total:
-                log.debug("[LAB_READ] req_id=%s batch=%d", req_id, total)
-
-            for _, records in entries:
-                for record_id, data in records:
-                    read_id = record_id
-                    if data.get("req_id") != req_id:
-                        continue
-
-                    status = data.get("status", "error")
-                    if status == "ok":
-                        allow = str(data.get("allow", "false")).lower() == "true"
-                        reason = data.get("reason", "") or ""
-                        log.debug("[LAB_RESP] req_id=%s status=%s allow=%s reason=\"%s\"",
-                                 req_id, status, str(allow).lower(), reason)
-                        return allow, reason
-                    if status == "error":
-                        err_code = data.get("error", "unknown")
-                        message = data.get("message", "")
-                        log.debug("[LAB_ERROR] req_id=%s error=%s message=\"%s\"", req_id, err_code, message)
-                        return False, f"lab_error:{err_code}"
-
-    # 🔸 Логирование ignore
+    # 🔸 Запись ignore-события в очередь логов (для последующей записи в БД)
     async def _log_ignore_to_queue(self, redis, strategy_id, log_uid, note: str):
         try:
             if redis is None:
                 return
             record = {
-                "log_uid": str(log_uid) if log_uid else "",
-                "strategy_id": str(strategy_id) if strategy_id else "",
+                "log_uid": str(log_uid) if log_uid is not None else "",
+                "strategy_id": str(strategy_id) if strategy_id is not None else "",
                 "status": "ignore",
                 "note": note or "",
                 "position_uid": "",

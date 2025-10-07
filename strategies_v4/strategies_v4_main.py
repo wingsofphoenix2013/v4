@@ -12,6 +12,7 @@ from position_opener import run_position_opener_loop
 from position_handler import run_position_handler
 from core_io import run_signal_log_writer, run_position_open_writer, run_position_update_writer
 from strategies_v4_cleaner import run_strategies_v4_cleaner
+from lab_response_router import run_lab_response_router
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("STRATEGY_MAIN")
@@ -74,6 +75,7 @@ async def main():
         run_safe_loop(run_position_update_writer, "POSITION_UPDATE_WRITER"),
         run_safe_loop(listen_strategy_update_stream, "STRATEGY_STREAM"),
         run_safe_loop(run_strategies_v4_cleaner, "STRATEGY_CLEANER"),
+        run_safe_loop(run_lab_response_router, "LAB_RESP_ROUTER"),
     )
     
 # 🔸 Запуск через CLI

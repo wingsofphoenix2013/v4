@@ -181,3 +181,68 @@ async def init_indicator_cache_via_redis():
             log.exception(f"❌ Ошибка при инициализации кеша для {symbol}-{interval}")
 
     log.debug("✅ Инициализация кеша индикаторов завершена")
+
+# 🔸 LAB: распределённый семафор в Redis для ограничения одновременных запросов в лабораторию
+
+# ключ по умолчанию (можно переопределить env)
+_LAB_SEMA_KEY = os.getenv("LAB_SEMA_KEY", "lab:sema:labreq")
+_LAB_SEMA_LIMIT = int(os.getenv("LAB_SEMA_LIMIT", "200"))
+_LAB_SEMA_TTL = int(os.getenv("LAB_SEMA_TTL", "120"))  # чуть больше дедлайна лаборатории
+
+# Lua-скрипты
+_LAB_SEMA_ACQ_SCRIPT = """
+-- KEYS[1] = key, ARGV[1] = limit, ARGV[2] = ttl_sec, ARGV[3] = holder
+local cur = redis.call('SCARD', KEYS[1])
+local limit = tonumber(ARGV[1])
+if cur >= limit then return 0 end
+redis.call('SADD', KEYS[1], ARGV[3])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+return 1
+"""
+
+_LAB_SEMA_REL_SCRIPT = """
+-- KEYS[1] = key, ARGV[1] = holder
+redis.call('SREM', KEYS[1], ARGV[1])
+return 1
+"""
+
+_lab_sema_acq_sha = None
+_lab_sema_rel_sha = None
+
+async def _lab_sema_ensure_loaded():
+    global _lab_sema_acq_sha, _lab_sema_rel_sha
+    if _lab_sema_acq_sha and _lab_sema_rel_sha:
+        return
+    rc = infra.redis_client
+    _lab_sema_acq_sha = await rc.script_load(_LAB_SEMA_ACQ_SCRIPT)
+    _lab_sema_rel_sha = await rc.script_load(_LAB_SEMA_REL_SCRIPT)
+
+# 🔸 Захват слота (true/false)
+async def lab_sema_acquire(holder: str, *, limit: int | None = None, ttl: int | None = None, key: str | None = None) -> bool:
+    await _lab_sema_ensure_loaded()
+    rc = infra.redis_client
+    k = key or _LAB_SEMA_KEY
+    lim = limit if limit is not None else _LAB_SEMA_LIMIT
+    t = ttl if ttl is not None else _LAB_SEMA_TTL
+    try:
+        res = await rc.evalsha(_lab_sema_acq_sha, 1, k, lim, t, holder)
+        return bool(res)
+    except aioredis.ResponseError as e:
+        # fallback, если скрипт выгрузился
+        if "NOSCRIPT" in str(e):
+            await _lab_sema_ensure_loaded()
+            res = await rc.evalsha(_lab_sema_acq_sha, 1, k, lim, t, holder)
+            return bool(res)
+        raise
+
+# 🔸 Освобождение слота (безопасно вызывать в finally)
+async def lab_sema_release(holder: str, *, key: str | None = None) -> None:
+    await _lab_sema_ensure_loaded()
+    rc = infra.redis_client
+    k = key or _LAB_SEMA_KEY
+    try:
+        await rc.evalsha(_lab_sema_rel_sha, 1, k, holder)
+    except aioredis.ResponseError as e:
+        if "NOSCRIPT" in str(e):
+            await _lab_sema_ensure_loaded()
+            await rc.evalsha(_lab_sema_rel_sha, 1, k, holder)
