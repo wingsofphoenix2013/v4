@@ -19,9 +19,7 @@ async def run_signal_log_writer():
     buffer_limit = 100
     flush_interval_sec = 1.0
     redis = infra.redis_client
-    pg = infra.pg_pool
 
-    # 🔹 Попытка создать группу (один раз при запуске)
     try:
         await redis.xgroup_create(stream_name, group_name, id="$", mkstream=True)
         log.debug(f"🔧 Группа {group_name} создана для {stream_name}")
@@ -43,30 +41,39 @@ async def run_signal_log_writer():
                 count=buffer_limit,
                 block=int(flush_interval_sec * 1000)
             )
-
             if not entries:
                 continue
 
             for stream_key, records in entries:
                 buffer = []
-                ack_ids = []
+                ack_ok_ids = []     # ack после успешной БД-вставки
+                ack_drop_ids = []   # ack сразу (непарсибельные)
 
                 for record_id, data in records:
                     try:
                         buffer.append(_parse_signal_log_data(data))
-                        ack_ids.append(record_id)
+                        ack_ok_ids.append(record_id)
                     except Exception:
-                        log.exception(f"❌ Ошибка парсинга записи (id={record_id})")
+                        # Непарсибельная запись — лог и ACK сразу, иначе залипнет в pending
+                        log.exception(f"❌ Ошибка парсинга записи (id={record_id}) — запись будет пропущена")
+                        ack_drop_ids.append(record_id)
+
+                # ACK «плохих» сразу
+                if ack_drop_ids:
+                    await redis.xack(stream_name, group_name, *ack_drop_ids)
 
                 if buffer:
-                    await write_log_entry_batch(buffer)
-                    for rid in ack_ids:
-                        await redis.xack(stream_name, group_name, rid)
+                    # пытаемся записать в БД; ACK только если успех
+                    ok = await write_log_entry_batch(buffer)
+                    if ok and ack_ok_ids:
+                        await redis.xack(stream_name, group_name, *ack_ok_ids)
+                    elif not ok:
+                        # Не ACKаем — пусть останется pending для повторной попытки
+                        log.warning("⚠️ batch write failed — messages kept pending for retry")
 
         except Exception:
             log.exception("❌ Ошибка в loop Consumer Group")
             await asyncio.sleep(5)
-
 
 # 🔸 Преобразование данных из Redis Stream
 def _parse_signal_log_data(data: dict) -> tuple:
@@ -79,12 +86,10 @@ def _parse_signal_log_data(data: dict) -> tuple:
         datetime.fromisoformat(data["logged_at"])
     )
 
-
 # 🔸 Батч-запись логов в PostgreSQL
-async def write_log_entry_batch(batch: list[tuple]):
+async def write_log_entry_batch(batch: list[tuple]) -> bool:
     if not batch:
-        return
-
+        return True
     try:
         await infra.pg_pool.executemany(
             '''
@@ -96,9 +101,10 @@ async def write_log_entry_batch(batch: list[tuple]):
             batch
         )
         log.debug(f"✅ Записано логов сигналов: {len(batch)}")
+        return True
     except Exception:
         log.exception("❌ Ошибка записи логов сигналов в БД")
-
+        return False
 
 # 🔸 Воркер: запись открытых позиций из positions_open_stream
 async def run_position_open_writer():
