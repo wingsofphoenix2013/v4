@@ -46,7 +46,7 @@ async def _process_closed_event(position_uid: str, csid_s: str, log_uid: str):
 
     if not position_uid or not client_strategy_id or not log_uid:
         # пропускаем некорректные события
-        log.info("[POSTPROC] ⚠️ пропуск некорректного события: position_uid=%s csid=%s log_uid=%s",
+        log.debug("[POSTPROC] ⚠️ пропуск некорректного события: position_uid=%s csid=%s log_uid=%s",
                  position_uid or "-", csid_s or "-", log_uid or "-")
         return
 
@@ -63,7 +63,7 @@ async def _process_closed_event(position_uid: str, csid_s: str, log_uid: str):
 
         if not pos:
             # позиция отсутствует — это не ошибка для воркера
-            log.info("[POSTPROC] ⚠️ позиция не найдена position_uid=%s csid=%s log_uid=%s", position_uid, client_strategy_id, log_uid)
+            log.debug("[POSTPROC] ⚠️ позиция не найдена position_uid=%s csid=%s log_uid=%s", position_uid, client_strategy_id, log_uid)
             return
 
         # извлекаем поля
@@ -75,7 +75,7 @@ async def _process_closed_event(position_uid: str, csid_s: str, log_uid: str):
 
         # проверка статуса на всякий случай
         if status != "closed":
-            log.info("[POSTPROC] ⚠️ позиция ещё не закрыта (status=%s) position_uid=%s csid=%s", status or "-", position_uid, client_strategy_id)
+            log.debug("[POSTPROC] ⚠️ позиция ещё не закрыта (status=%s) position_uid=%s csid=%s", status or "-", position_uid, client_strategy_id)
 
         # вычисляем результат: win = pnl > 0, иначе lose (False)
         result_bool: bool = bool(pnl is not None and pnl > 0)
@@ -118,7 +118,7 @@ async def _process_closed_event(position_uid: str, csid_s: str, log_uid: str):
         updated_rows = _rows_affected(upd_status)
 
     # лог результата (не считаем отсутствие строк ошибкой)
-    log.info(
+    log.debug(
         "[POSTPROC] ✅ closed propagated: position_uid=%s csid=%s log_uid=%s %s dir=%s pnl=%s result=%s rows=%d",
         position_uid, client_strategy_id, log_uid, symbol, (direction or "-"),
         (str(pnl) if pnl is not None else "NULL"),
@@ -178,7 +178,7 @@ async def run_laboratory_decision_postproc():
 
                     if status != "closed" or not position_uid or not log_uid or not csid_s:
                         # пропуск неполного/неподходящего события
-                        log.info("[POSTPROC] ⚠️ пропуск msg=%s: status=%s position_uid=%s log_uid=%s csid=%s",
+                        log.debug("[POSTPROC] ⚠️ пропуск msg=%s: status=%s position_uid=%s log_uid=%s csid=%s",
                                  msg_id, status or "-", position_uid or "-", log_uid or "-", csid_s or "-")
                         continue
 
