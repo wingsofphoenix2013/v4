@@ -62,53 +62,89 @@ async def _fetch_closed_position_uids(strategy_id: int, limit: int) -> List[str]
     )
     return [r["position_uid"] for r in rows]
 
-
 # 🔹 Удалить один батч связанных данных по позициям (в транзакции)
-async def _delete_positions_batch(uids: List[str]) -> int:
+async def _delete_positions_batch(strategy_id: int, uids: List[str]) -> int:
     if not uids:
         return 0
 
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # 1) Цели позиции
+            # 0) Подготовка: подзапрос LogUID для выбранных position_uid
+            #    (используем в LPS/SLE очистке ниже)
+            #    Прямо в DELETE используем подзапрос, отдельный SELECT не нужен.
+
+            # 1) Очистка LPS (laboratoty_position_stat) по client_strategy_id и position_uid/log_uid
+            lps_status = await conn.execute(
+                """
+                DELETE FROM public.laboratoty_position_stat
+                 WHERE client_strategy_id = $2
+                   AND (
+                        position_uid = ANY ($1::text[])
+                        OR log_uid IN (
+                            SELECT log_uid FROM public.positions_v4
+                             WHERE position_uid = ANY ($1::text[])
+                        )
+                   )
+                """,
+                uids, strategy_id,
+            )
+
+            # 2) Очистка SLE (signal_laboratory_entries) по client_strategy_id и log_uid
+            sle_status = await conn.execute(
+                """
+                DELETE FROM public.signal_laboratory_entries
+                 WHERE client_strategy_id = $2
+                   AND log_uid IN (
+                       SELECT log_uid FROM public.positions_v4
+                        WHERE position_uid = ANY ($1::text[])
+                   )
+                """,
+                uids, strategy_id,
+            )
+
+            # 3) Цели позиции (TP/SL)
             await conn.execute(
                 """
-                DELETE FROM position_targets_v4
-                WHERE position_uid = ANY ($1::text[])
+                DELETE FROM public.position_targets_v4
+                 WHERE position_uid = ANY ($1::text[])
                 """,
                 uids,
             )
 
-            # 2) Логи позиции (uuid)
+            # 4) Логи позиции (uuid)
             await conn.execute(
                 """
-                DELETE FROM positions_log_v4
-                WHERE position_uid = ANY (SELECT unnest($1::text[])::uuid)
+                DELETE FROM public.positions_log_v4
+                 WHERE position_uid = ANY (SELECT unnest($1::text[])::uuid)
                 """,
                 uids,
             )
 
-            # 3) Логи сигналов по позиции
+            # 5) Логи сигналов по позиции
             await conn.execute(
                 """
-                DELETE FROM signal_log_entries_v4
-                WHERE position_uid = ANY ($1::text[])
+                DELETE FROM public.signal_log_entries_v4
+                 WHERE position_uid = ANY ($1::text[])
                 """,
                 uids,
             )
 
-            # 4) Сама позиция (страховка по статусу)
-            status = await conn.execute(
+            # 6) Сами позиции (страховка по статусу)
+            pos_status = await conn.execute(
                 """
-                DELETE FROM positions_v4
-                WHERE position_uid = ANY ($1::text[]) AND status = 'closed'
+                DELETE FROM public.positions_v4
+                 WHERE position_uid = ANY ($1::text[])
+                   AND status = 'closed'
                 """,
                 uids,
             )
 
-    deleted = _rows_affected(status)
+    # возвращаем только число удалённых позиций (как и раньше)
+    deleted = _rows_affected(pos_status)
+    # При желании можно раскомментировать debug-лог:
+    # log.debug("🧹 batch: LPS=%d SLE=%d POS=%d",
+    #           _rows_affected(lps_status), _rows_affected(sle_status), deleted)
     return deleted
-
 
 # 🔹 Выключить стратегию, оповестить системы и удалить её
 async def _disable_and_drop_strategy(strategy_id: int):
@@ -152,7 +188,7 @@ async def _process_strategy(strategy_id: int) -> Tuple[int, bool]:
         if not uids:
             break
 
-        deleted = await _delete_positions_batch(uids)
+        deleted = await _delete_positions_batch(strategy_id, uids)
         total_deleted += deleted
 
         log.info(
