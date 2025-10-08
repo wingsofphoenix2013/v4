@@ -73,7 +73,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     symbol_hint = _as_str(data.get("symbol"))
 
     if not position_uid:
-        log.info("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
+        log.debug("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
         return
 
     # проверяем: позиция вообще отслеживается нашим модулем?
@@ -86,7 +86,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid
     )
     if not tracked:
-        log.info("ℹ️ TRADER_CLOSER: позиция не отслеживается, пропуск uid=%s", position_uid)
+        log.debug("ℹ️ TRADER_CLOSER: позиция не отслеживается, пропуск uid=%s", position_uid)
         return
 
     # берём итоговые поля из positions_v4 (к этому моменту они уже записаны core_io)

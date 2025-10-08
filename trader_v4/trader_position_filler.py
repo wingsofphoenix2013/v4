@@ -27,7 +27,6 @@ MAX_ATTEMPTS = 4             # всего попыток: 1 (после INITIAL_
 async def run_trader_position_filler_loop():
     redis = infra.redis_client
 
-    # создание Consumer Group
     try:
         await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
         log.info("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
@@ -42,7 +41,6 @@ async def run_trader_position_filler_loop():
 
     while True:
         try:
-            # читаем по одной записи, чтобы гарантировать последовательность
             entries = await redis.xreadgroup(
                 groupname=CG_NAME,
                 consumername=CONSUMER,
@@ -59,7 +57,6 @@ async def run_trader_position_filler_loop():
                         await _handle_signal_opened(record_id, data)
                     except Exception:
                         log.exception("❌ Ошибка обработки записи (id=%s)", record_id)
-                        # даже при ошибке ack, чтобы не зависало
                         await redis.xack(SIGNAL_STREAM, CG_NAME, record_id)
                     else:
                         await redis.xack(SIGNAL_STREAM, CG_NAME, record_id)
@@ -71,7 +68,6 @@ async def run_trader_position_filler_loop():
 
 # 🔸 Обработка одного сообщения из signal_log_queue (интересует только status='opened')
 async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
-    # нормализация полей (Redis уже с decode_responses=True, но подстрахуемся)
     status = _as_str(data.get("status"))
     if status != "opened":
         return  # обрабатываем только открытия
@@ -91,23 +87,28 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     winners_set: Set[int] = set(winners_map.values())
 
     if strategy_id not in winners_set:
-        log.info("⏭️ Не победитель (sid=%s), пропуск события opened (uid=%s)", strategy_id, position_uid)
+        log.debug("⏭️ Не победитель (sid=%s), пропуск события opened (uid=%s)", strategy_id, position_uid)
         return
 
     # находим group_master_id (мастер группы) для этого победителя
     group_master_id = _find_group_master_for_winner(winners_map, strategy_id)
     if group_master_id is None:
-        # редкий случай: победитель есть, но маппинга не нашли — подстрахуемся запросом
         group_master_id = await _fetch_group_master_from_db(strategy_id)
-
     if group_master_id is None:
         log.info("⚠️ Не удалось определить group_master_id для sid=%s — пропуск uid=%s", strategy_id, position_uid)
         return
 
-    # ждём появления записи в positions_v4 и читаем её
+    # ждём появления записи в positions_v4 и читаем её (с добавленными полями status/closed_at)
     pos = await _fetch_position_with_retry(position_uid)
     if not pos:
         log.info("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
+        return
+
+    # если позиция уже закрыта к моменту фиксации — пропускаем вставку
+    status_db = _as_str(pos.get("status"))
+    closed_at_db = pos.get("closed_at")
+    if status_db == "closed" or closed_at_db is not None:
+        log.info("⏭️ Позиция уже закрыта к моменту фиксации, пропуск uid=%s (sid=%s)", position_uid, strategy_id)
         return
 
     # читаем leverage стратегии (и проверим, что >0)
@@ -201,7 +202,6 @@ def _find_group_master_for_winner(winners_map: Dict[int, int], winner_sid: int) 
 
 
 async def _fallback_winners_from_db() -> Dict[int, int]:
-    # одноразовый прогрев из БД: берём только непустых победителей
     rows = await infra.pg_pool.fetch(
         """
         SELECT group_master_id, current_winner_id
@@ -226,13 +226,13 @@ async def _fetch_group_master_from_db(strategy_id: int) -> Optional[int]:
 
 
 async def _fetch_position_with_retry(position_uid: str) -> Optional[Dict[str, Any]]:
-    # первая пауза
+    # условия достаточности: дождаться строки и убедиться, что она ещё не закрыта
     await asyncio.sleep(INITIAL_DELAY_SEC)
     attempts = 0
     while attempts < MAX_ATTEMPTS:
         row = await infra.pg_pool.fetchrow(
             """
-            SELECT symbol, notional_value, created_at
+            SELECT symbol, notional_value, created_at, status, closed_at
             FROM public.positions_v4
             WHERE position_uid = $1
             """,
