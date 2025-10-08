@@ -232,7 +232,6 @@ def _compute_group_winners(
 
     return group_winners, raw_results, groups_watchers
 
-
 # 🔸 Применение результатов в БД: trader_winner-флаги и апсерты в trader_rating_active
 async def _apply_results_to_db(
     group_winners: Dict[int, int | None],
@@ -273,12 +272,18 @@ async def _apply_results_to_db(
             for gm in group_ids:
                 winner = group_winners.get(gm)
                 raw_json = raw_results.get(gm, {"strategies": {}})
+
+                # ВАЖНО: явный каст параметров к int4, иначе NULL приводит к AmbiguousParameterError
                 await conn.execute(
                     """
                     INSERT INTO public.trader_rating_active AS tra (
                       group_master_id, current_winner_id, consecutive_wins, raw_results, last_run_at
                     ) VALUES
-                      ($1, $2, CASE WHEN $2 IS NULL THEN 0 ELSE 1 END, $3::jsonb, (now() at time zone 'UTC'))
+                      ($1::int4,
+                       $2::int4,
+                       CASE WHEN $2::int4 IS NULL THEN 0 ELSE 1 END,
+                       $3::jsonb,
+                       (now() at time zone 'UTC'))
                     ON CONFLICT (group_master_id) DO UPDATE
                     SET
                       current_winner_id = EXCLUDED.current_winner_id,
@@ -293,10 +298,9 @@ async def _apply_results_to_db(
                       last_run_at       = (now() at time zone 'UTC')
                     """,
                     gm,
-                    winner,
-                    raw_json,  # asyncpg сам сконвертирует dict → jsonb
+                    winner,     # может быть int или None — каст выше решает двусмысленность
+                    raw_json,   # dict → jsonb (asyncpg сам сериализует)
                 )
-
 
 # 🔸 Обновление in-memory списка победителей (глобальная переменная)
 def _update_inmemory_winners(group_winners: Dict[int, int | None]) -> None:
