@@ -1,4 +1,5 @@
-# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions + TG-уведомление об открытии (с TP/SL)
+# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions
+# + микро-гейт «актуальности» перед фиксацией и TG-уведомление об открытии (с TP/SL)
 
 # 🔸 Импорты
 import asyncio
@@ -22,6 +23,14 @@ CONSUMER = "trader_filler_1"
 INITIAL_DELAY_SEC = 5.0      # первая пауза после события "opened"
 RETRY_DELAY_SEC = 5.0        # задержка между повторными попытками
 MAX_ATTEMPTS = 4             # всего попыток: 1 (после INITIAL_DELAY) + 3 ретрая = 4
+
+# 🔸 Пороговые константы микро-гейта (в долях, должны совпадать с trader_rating.py)
+ROI24_FLOOR = Decimal("-0.005")   # -0.5%
+MOMENTUM_MIN = Decimal("0.001")   # +0.10%
+WR_BASE = Decimal("0.50")         # базовая устойчивость
+WR_MOMENTUM = Decimal("0.55")     # порог WR при моментуме
+LAPLACE_A = Decimal("1")          # сглаживание winrate (Лаплас)
+LAPLACE_B = Decimal("1")
 
 
 # 🔸 Основной цикл воркера (строго последовательно, без параллелизма)
@@ -133,6 +142,15 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         margin_used = (notional_value / leverage)
     except (InvalidOperation, ZeroDivisionError):
         log.debug("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
+        return
+
+    # 🔹 Микро-гейт «актуальности» по этой стратегии (свежие 24h/1h)
+    gate_ok, gate_dbg = await _passes_fresh_gate(strategy_id)
+    if not gate_ok:
+        log.debug(
+            "⛔ GATE-FAIL at open time: sid=%s | roi24=%.4f wr_shr=%.2f roi1h=%.4f (uid=%s)",
+            strategy_id, gate_dbg["roi24"], gate_dbg["wr_shr"], gate_dbg["roi1h"], position_uid
+        )
         return
 
     # правило 1: по этому symbol не должно быть открытых сделок
@@ -377,3 +395,59 @@ async def _fetch_targets_for_position(position_uid: str) -> Tuple[List[Dict[str,
             sl_list.append(obj)
 
     return tp_list, sl_list
+
+
+# 🔸 Микро-гейт «актуальности» — свежая проверка приемлемости стратегии
+async def _passes_fresh_gate(strategy_id: int) -> Tuple[bool, Dict[str, float]]:
+    # агрегаты за 24 часа
+    r24 = await infra.pg_pool.fetchrow(
+        """
+        SELECT
+          COUNT(*) AS closed_24,
+          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins_24,
+          COALESCE(SUM(pnl), 0) AS pnl_24
+        FROM public.positions_v4
+        WHERE status = 'closed'
+          AND strategy_id = $1
+          AND closed_at >= ((now() at time zone 'UTC') - interval '24 hours')
+        """,
+        strategy_id
+    )
+    # агрегаты за 1 час
+    r1h = await infra.pg_pool.fetchrow(
+        """
+        SELECT
+          COUNT(*) AS closed_1h,
+          COALESCE(SUM(pnl), 0) AS pnl_1h
+        FROM public.positions_v4
+        WHERE status = 'closed'
+          AND strategy_id = $1
+          AND closed_at >= ((now() at time zone 'UTC') - interval '1 hour')
+        """,
+        strategy_id
+    )
+    dep_row = await infra.pg_pool.fetchrow(
+        "SELECT deposit FROM public.strategies_v4 WHERE id = $1",
+        strategy_id
+    )
+
+    deposit = _as_decimal(dep_row["deposit"]) if dep_row and dep_row["deposit"] is not None else None
+    closed_24 = int(r24["closed_24"]) if r24 and r24["closed_24"] is not None else 0
+    wins_24 = int(r24["wins_24"]) if r24 and r24["wins_24"] is not None else 0
+    pnl_24 = _as_decimal(r24["pnl_24"]) if r24 and r24["pnl_24"] is not None else Decimal("0")
+    closed_1h = int(r1h["closed_1h"]) if r1h and r1h["closed_1h"] is not None else 0
+    pnl_1h = _as_decimal(r1h["pnl_1h"]) if r1h and r1h["pnl_1h"] is not None else Decimal("0")
+
+    if not deposit or deposit <= 0 or closed_24 <= 0:
+        return False, {"roi24": 0.0, "wr_shr": 0.0, "roi1h": 0.0}
+
+    roi24 = pnl_24 / deposit
+    roi1h = pnl_1h / deposit
+    wr_shr = (Decimal(wins_24) + LAPLACE_A) / (Decimal(closed_24) + LAPLACE_A + LAPLACE_B)
+
+    gate_ok = (roi24 > ROI24_FLOOR) and (
+        (roi24 >= 0 and wr_shr >= WR_BASE) or
+        (roi1h > MOMENTUM_MIN and wr_shr >= WR_MOMENTUM)
+    )
+
+    return bool(gate_ok), {"roi24": float(roi24), "wr_shr": float(wr_shr), "roi1h": float(roi1h)}
