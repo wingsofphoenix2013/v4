@@ -6,6 +6,7 @@ import logging
 
 from trader_infra import setup_logging, setup_pg, setup_redis_client
 from trader_config import init_trader_config_state, config_event_listener
+from trader_rating import run_trader_rating_job
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -70,8 +71,8 @@ async def main():
         # слушатель Pub/Sub апдейтов конфигурации с короткой паузой после старта
         run_with_delay(config_event_listener, "TRADER_CONFIG", start_delay=CONFIG_LISTENER_START_DELAY_SEC),
 
-        # сюда при необходимости добавляются периодические задачи:
-        # run_periodic(some_job, "SOME_JOB", start_delay=10.0, interval=300.0),
+        # Почасовой рейтинг стратегий (старт через 90с, затем раз в час)
+        run_periodic(run_trader_rating_job, "TRADER_RATING", start_delay=90.0, interval=3600.0),
     )
 
 # 🔸 Запуск через CLI
