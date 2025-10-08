@@ -8,6 +8,7 @@ from trader_infra import setup_logging, setup_pg, setup_redis_client
 from trader_config import init_trader_config_state, config_event_listener
 from trader_rating import run_trader_rating_job
 from trader_position_filler import run_trader_position_filler_loop
+from trader_position_closer import run_trader_position_closer_loop
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -75,6 +76,8 @@ async def main():
         run_periodic(run_trader_rating_job, "TRADER_RATING", start_delay=90.0, interval=3600.0),
         # Последовательный слушатель открытий: старт через 70 секунд
         run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=70.0),
+        # Последовательный слушатель закрытий
+        run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=70.0),
     )
 
 # 🔸 Запуск через CLI
