@@ -4,6 +4,7 @@
 import logging
 from decimal import Decimal
 from typing import Dict, List, Tuple, Any
+import json
 
 from trader_infra import infra
 
@@ -273,7 +274,9 @@ async def _apply_results_to_db(
                 winner = group_winners.get(gm)
                 raw_json = raw_results.get(gm, {"strategies": {}})
 
-                # ВАЖНО: явный каст параметров к int4, иначе NULL приводит к AmbiguousParameterError
+                # сериализуем dict → JSON-строку для jsonb
+                raw_json_str = json.dumps(raw_json, ensure_ascii=False, separators=(",", ":"))
+
                 await conn.execute(
                     """
                     INSERT INTO public.trader_rating_active AS tra (
@@ -298,10 +301,10 @@ async def _apply_results_to_db(
                       last_run_at       = (now() at time zone 'UTC')
                     """,
                     gm,
-                    winner,     # может быть int или None — каст выше решает двусмысленность
-                    raw_json,   # dict → jsonb (asyncpg сам сериализует)
+                    winner,        # int или None — CAST ::int4 выше
+                    raw_json_str,  # ← строка JSON, попадёт в jsonb
                 )
-
+                
 # 🔸 Обновление in-memory списка победителей (глобальная переменная)
 def _update_inmemory_winners(group_winners: Dict[int, int | None]) -> None:
     # очищаем и записываем только группы с валидными победителями
