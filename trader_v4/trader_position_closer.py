@@ -1,10 +1,11 @@
-# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление (с портфельным 24h ROI)
+# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление
+# (портфельные метрики: 24h/TOTAL ROI & Winrate, стратегия по strategies_v4.name)
 
 # 🔸 Импорты
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from trader_infra import infra
 from trader_tg_notifier import send_closed_notification
@@ -93,7 +94,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     # берём финальные поля из positions_v4 (к этому моменту они уже записаны core_io)
     row = await infra.pg_pool.fetchrow(
         """
-        SELECT symbol, pnl, closed_at, direction, entry_price, exit_price, created_at
+        SELECT symbol, pnl, closed_at, direction, created_at
         FROM public.positions_v4
         WHERE position_uid = $1
         """,
@@ -107,8 +108,6 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     pnl = _as_decimal(row["pnl"])
     closed_at = row["closed_at"]          # UTC timestamp (как в БД)
     direction = _as_str(row.get("direction")) or None
-    entry_price = _as_decimal(row.get("entry_price"))
-    exit_price = _as_decimal(row.get("exit_price"))
     created_at = row.get("created_at")
 
     # обновляем нашу таблицу
@@ -123,47 +122,70 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid, pnl, closed_at
     )
 
-    # портфельный скользящий ROI_24h:
-    #  - числитель: сумма pnl по всем закрытым строкам trader_positions за 24 часа
-    #  - знаменатель: средний deposit по всем стратегиям, присутствующим в trader_positions (distinct strategy_id)
-    roi_24h = await _compute_portfolio_roi_24h()
+    # имя стратегии (ТОЛЬКО strategies_v4.name)
+    strategy_name = await _fetch_strategy_name(strategy_id)
+
+    # портфельные метрики для сообщения
+    roi_24h, roi_total, wr_24h, wr_total = await _compute_portfolio_metrics()
 
     log.debug(
         "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s",
         position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl
     )
 
-    # уведомление в Telegram (🟢/🔴 в заголовке + стрелки направления + 24h ROI портфеля)
+    # уведомление в Telegram (win/loss header + стрелки направления + портфельные метрики + стратегия)
     try:
         await send_closed_notification(
             symbol=symbol,
             direction=direction,
-            entry_price=entry_price,
-            exit_price=exit_price,
             pnl=pnl,
+            strategy_name=strategy_name or f"strategy_{strategy_id}" if strategy_id is not None else "strategy",
             created_at=created_at,
             closed_at=closed_at,
             roi_24h=roi_24h,
+            roi_total=roi_total,
+            wr_24h=wr_24h,
+            wr_total=wr_total,
         )
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления о закрытии uid=%s", position_uid)
 
 
-# 🔸 Портфельный ROI за 24 часа (скользящее окно)
-async def _compute_portfolio_roi_24h() -> Optional[Decimal]:
-    # сумма pnl по закрытым строкам за 24 часа
-    pnl_row = await infra.pg_pool.fetchrow(
+# 🔸 Портфельные метрики: 24h/TOTAL ROI & Winrate (по trader_positions)
+async def _compute_portfolio_metrics() -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    # сумма pnl за 24ч и количество/победы
+    r24 = await infra.pg_pool.fetchrow(
         """
-        SELECT COALESCE(SUM(pnl), 0) AS pnl_sum
+        SELECT
+          COALESCE(SUM(pnl), 0) AS pnl_sum,
+          COUNT(*)               AS cnt,
+          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins
         FROM public.trader_positions
         WHERE status = 'closed'
           AND closed_at >= ((now() at time zone 'UTC') - interval '24 hours')
         """
     )
-    pnl_sum_24 = _as_decimal(pnl_row["pnl_sum"]) if pnl_row else Decimal("0")
+    pnl_24 = _as_decimal(r24["pnl_sum"]) if r24 else Decimal("0")
+    cnt_24 = int(r24["cnt"]) if r24 and r24["cnt"] is not None else 0
+    wins_24 = int(r24["wins"]) if r24 and r24["wins"] is not None else 0
 
-    # средний депозит по стратегиям, которые присутствуют в trader_positions (distinct strategy_id)
-    dep_row = await infra.pg_pool.fetchrow(
+    # сумма pnl за всё время и количество/победы
+    r_total = await infra.pg_pool.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(pnl), 0) AS pnl_sum,
+          COUNT(*)               AS cnt,
+          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins
+        FROM public.trader_positions
+        WHERE status = 'closed'
+        """
+    )
+    pnl_total = _as_decimal(r_total["pnl_sum"]) if r_total else Decimal("0")
+    cnt_total = int(r_total["cnt"]) if r_total and r_total["cnt"] is not None else 0
+    wins_total = int(r_total["wins"]) if r_total and r_total["wins"] is not None else 0
+
+    # средний депозит по стратегиям, присутствующим в trader_positions
+    r_dep = await infra.pg_pool.fetchrow(
         """
         SELECT AVG(s.deposit) AS avg_dep
         FROM (
@@ -173,14 +195,15 @@ async def _compute_portfolio_roi_24h() -> Optional[Decimal]:
         WHERE s.deposit IS NOT NULL AND s.deposit > 0
         """
     )
-    avg_dep = _as_decimal(dep_row["avg_dep"]) if dep_row and dep_row["avg_dep"] is not None else None
+    avg_dep = _as_decimal(r_dep["avg_dep"]) if r_dep and r_dep["avg_dep"] is not None else None
 
-    if not avg_dep or avg_dep <= 0:
-        return None
-    try:
-        return (pnl_sum_24 or Decimal("0")) / avg_dep
-    except Exception:
-        return None
+    roi_24h = (pnl_24 / avg_dep) if avg_dep and avg_dep > 0 else None
+    roi_total = (pnl_total / avg_dep) if avg_dep and avg_dep > 0 else None
+
+    wr24 = (Decimal(wins_24) / Decimal(cnt_24)) if cnt_24 > 0 else None
+    wr_total = (Decimal(wins_total) / Decimal(cnt_total)) if cnt_total > 0 else None
+
+    return roi_24h, roi_total, wr24, wr_total
 
 
 # 🔸 Вспомогательные функции
@@ -205,3 +228,15 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
         return Decimal(str(v))
     except Exception:
         return None
+
+async def _fetch_strategy_name(strategy_id: Optional[int]) -> Optional[str]:
+    if strategy_id is None:
+        return None
+    row = await infra.pg_pool.fetchrow(
+        "SELECT name FROM public.strategies_v4 WHERE id = $1",
+        strategy_id
+    )
+    if not row:
+        return None
+    name = row["name"]
+    return str(name) if name is not None else None

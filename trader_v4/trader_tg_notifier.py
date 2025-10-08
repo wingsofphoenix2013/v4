@@ -1,6 +1,8 @@
 # trader_tg_notifier.py — асинхронные уведомления в Telegram (open/close),
-# с ротируемыми заголовками, стрелками направления, аккуратными переносами строк
-# и 24h ROI (портфельно/или переданным вызывающей стороной)
+# с ротируемыми заголовками, стрелками направления, аккуратными переносами строк,
+# TP/SL в открытии и портфельными метриками (24h/TOTAL ROI & Winrate) в закрытии.
+#
+# ⚠️ Важно: в строке стратегии используем ТОЛЬКО strategies_v4.name (не human_name).
 
 # 🔸 Импорты
 import os
@@ -16,7 +18,7 @@ log = logging.getLogger("TRADER_TG")
 
 # 🔸 Конфигурация (берём из ENV)
 _BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # для каналов обычно отрицательное число
+_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # для каналов иногда отрицательное число
 
 # 🔸 Наборы заголовков (ротируются случайно)
 _OPEN_HEADERS = [
@@ -75,9 +77,7 @@ async def send_open_notification(
     symbol: str,
     direction: Optional[str],
     entry_price: Optional[Decimal],
-    # margin_used, sid, group — по требованиям больше НЕ выводим в сообщение
-    strategy_id: int,      # оставлено в сигнатуре для совместимости (не выводится)
-    group_id: int,         # оставлено в сигнатуре для совместимости (не выводится)
+    strategy_name: str,         # ← ТОЛЬКО strategies_v4.name
     created_at: datetime,
     tp_targets: Optional[Iterable[Any]] = None,  # список TP (dict/tuple)
     sl_targets: Optional[Iterable[Any]] = None,  # список SL (dict/tuple)
@@ -92,6 +92,7 @@ async def send_open_notification(
         direction=direction,
         entry_price=entry_price,
         created_at=created_at,
+        strategy_name=strategy_name,
         tp_targets=tp_targets,
         sl_targets=sl_targets,
     )
@@ -101,12 +102,14 @@ async def send_closed_notification(
     *,
     symbol: str,
     direction: Optional[str],
-    entry_price: Optional[Decimal],
-    exit_price: Optional[Decimal],
     pnl: Optional[Decimal],
-    created_at: Optional[datetime],
-    closed_at: Optional[datetime],
-    roi_24h: Optional[Decimal] = None,   # скользящий ROI за 24 часа (доля, не %)
+    strategy_name: str,          # ← ТОЛЬКО strategies_v4.name
+    created_at: Optional[datetime],  # для Held (минуты)
+    closed_at: Optional[datetime],   # для Held (минуты)
+    roi_24h: Optional[Decimal] = None,   # портфельный 24h ROI (доля)
+    roi_total: Optional[Decimal] = None, # портфельный TOTAL ROI (доля)
+    wr_24h: Optional[Decimal] = None,    # портфельный 24h Winrate (доля 0..1)
+    wr_total: Optional[Decimal] = None,  # портфельный TOTAL Winrate (доля 0..1)
     header: Optional[str] = None,
     silent: bool = False,
 ) -> None:
@@ -121,12 +124,14 @@ async def send_closed_notification(
         header=hdr,
         symbol=symbol,
         direction=direction,
-        entry_price=entry_price,
-        exit_price=exit_price,
         pnl=pnl,
+        strategy_name=strategy_name,
         created_at=created_at,
         closed_at=closed_at,
         roi_24h=roi_24h,
+        roi_total=roi_total,
+        wr_24h=wr_24h,
+        wr_total=wr_total,
     )
     await tg_send(text, disable_notification=silent)
 
@@ -243,18 +248,21 @@ def build_open_message(
     direction: Optional[str],
     entry_price: Optional[Decimal],
     created_at: datetime,
+    strategy_name: str,
     tp_targets: Optional[Iterable[Any]] = None,
     sl_targets: Optional[Iterable[Any]] = None,
 ) -> str:
     """
-    Формат (с дополнительными переносами строк и без лишних полей):
+    Итоговый формат:
     <header>
 
     ⬆️ LONG on <symbol>
-    
+
     🎯 Entry: <entry_price>
     🎯 TP1: <price>
     🛡️ SL: <price>
+
+    🧠 Strategy: <name>
 
     ⏳ <created_at UTC>
     """
@@ -266,16 +274,17 @@ def build_open_message(
         f"{header}",
         "",
         f"{arrow} {side} on <b>{symbol}</b>",
-        f"🎯 Entry: <code>{_fmt_money(entry_price)}</code>",
         "",
-        tp_block.rstrip("\n"),  # блок TP уже с переносами, уберём лишний трейлинг
+        f"🎯 Entry: <code>{_fmt_money(entry_price)}</code>",
+        tp_block.rstrip("\n"),
         sl_block.rstrip("\n"),
+        "",
+        f"🧠 Strategy: {strategy_name}",
         "",
         f"⏳ {_fmt_dt_utc(created_at)}",
     ]
-    # уберём возможные пустые строки от пустых TP/SL блоков, но сохраним общую структуру
+    # уберём лишние пустые строки от возможных пустых TP/SL блоков
     text = "\n".join([line for line in parts if line is not None])
-    # чистка двойных пустых строк, если TP/SL совсем пустые
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     return text
@@ -285,37 +294,57 @@ def build_closed_message(
     header: str,
     symbol: str,
     direction: Optional[str],
-    entry_price: Optional[Decimal],
-    exit_price: Optional[Decimal],
     pnl: Optional[Decimal],
+    strategy_name: str,
     created_at: Optional[datetime],
     closed_at: Optional[datetime],
-    roi_24h: Optional[Decimal] = None,  # ожидается доля (0.0123 → 1.23%)
+    roi_24h: Optional[Decimal] = None,   # доля (0.0123 → 1.23%)
+    roi_total: Optional[Decimal] = None, # доля
+    wr_24h: Optional[Decimal] = None,    # доля
+    wr_total: Optional[Decimal] = None,  # доля
 ) -> str:
     """
-    Закрытие: сохраняем прежнюю структуру, добавляя строку с 24h ROI.
-    В заголовке — 🟢/🔴 (win/loss), направление — стрелками.
+    Итоговый формат:
+    <win/loss header>
+
+    ⬆️ LONG on <symbol>
+    🧠 Strategy: <name>
+
+    💵 PnL: +...
+
+    📈 24h ROI: +..%
+    📊 TOTAL ROI: +..%
+
+    🥇 24h Winrate: ..%
+    🏆 TOTAL Winrate: ..%
+
+    🕓 Held: X minutes
     """
     arrow, side = _side_arrow_and_word(direction)
 
-    # длительность удержания
-    dur = "—"
+    # длительность удержания (минуты)
+    held_line = "🕓 Held: —"
     if created_at and closed_at:
         try:
             minutes = int((closed_at - created_at).total_seconds() // 60)
-            dur = f"{minutes} minutes"
+            held_line = f"🕓 Held: {minutes} minutes"
         except Exception:
             pass
 
-    roi_line = f"📈 24h ROI: <b>{_fmt_pct(roi_24h)}</b>\n"
-
-    return (
-        f"{header}\n\n"
-        f"{arrow} {side} on <b>{symbol}</b>\n"
-        f"🎯 Entry: <code>{_fmt_money(entry_price)}</code>\n"
-        f"🏁 Exit: <code>{_fmt_money(exit_price)}</code>\n"
-        f"💵 PnL: <b>{_fmt_signed(pnl)}</b>\n"
-        f"{roi_line}"
-        f"🕓 Held: {dur}\n"
-        f"⏳ {_fmt_dt_utc(created_at)} → {_fmt_dt_utc(closed_at)}"
-    )
+    lines = [
+        f"{header}",
+        "",
+        f"{arrow} {side} on <b>{symbol}</b>",
+        f"🧠 Strategy: {strategy_name}",
+        "",
+        f"💵 PnL: <b>{_fmt_signed(pnl)}</b>",
+        "",
+        f"📈 24h ROI: <b>{_fmt_pct(roi_24h)}</b>",
+        f"📊 TOTAL ROI: <b>{_fmt_pct(roi_total)}</b>",
+        "",
+        f"🥇 24h Winrate: <b>{_fmt_pct(wr_24h)}</b>",
+        f"🏆 TOTAL Winrate: <b>{_fmt_pct(wr_total)}</b>",
+        "",
+        held_line,
+    ]
+    return "\n".join(lines)
