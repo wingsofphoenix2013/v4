@@ -1,10 +1,10 @@
-# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions + TG-уведомление об открытии
+# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions + TG-уведомление об открытии (с TP/SL)
 
 # 🔸 Импорты
 import asyncio
 import logging
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, Tuple, List
 
 from trader_infra import infra
 from trader_rating import get_current_group_winners
@@ -77,7 +77,6 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     strategy_id = _as_int(data.get("strategy_id"))
     position_uid = _as_str(data.get("position_uid"))
     symbol_hint = _as_str(data.get("symbol"))  # может быть пустым — не критично
-    log_uid = _as_str(data.get("log_uid"))
 
     if not strategy_id or not position_uid:
         log.debug("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
@@ -171,7 +170,14 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         position_uid, symbol, strategy_id, group_master_id, margin_used
     )
 
-    # отправка уведомления в Telegram (стрелки направления; без 🟢/🔴 в заголовке)
+    # 🔹 Тянем TP/SL из position_targets_v4 для TG (если есть)
+    try:
+        tp_targets, sl_targets = await _fetch_targets_for_position(position_uid)
+    except Exception:
+        tp_targets, sl_targets = [], []
+        log.exception("⚠️ Не удалось получить TP/SL для uid=%s", position_uid)
+
+    # отправка уведомления в Telegram (стрелки направления; без 🟢/🔴 в заголовке; с TP/SL)
     try:
         await send_open_notification(
             symbol=symbol,
@@ -181,6 +187,8 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
             strategy_id=strategy_id,
             group_id=group_master_id,
             created_at=created_at,
+            tp_targets=tp_targets,
+            sl_targets=sl_targets,
         )
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления об открытии uid=%s", position_uid)
@@ -338,3 +346,35 @@ async def _insert_trader_position(
         """,
         group_strategy_id, strategy_id, position_uid, symbol, margin_used, created_at
     )
+
+
+# 🔸 Получение TP/SL целей для позиции (для TG)
+async def _fetch_targets_for_position(position_uid: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    rows = await infra.pg_pool.fetch(
+        """
+        SELECT type, level, price, quantity, hit, canceled
+        FROM public.position_targets_v4
+        WHERE position_uid = $1
+        ORDER BY type, level
+        """,
+        position_uid
+    )
+    tp_list: List[Dict[str, Any]] = []
+    sl_list: List[Dict[str, Any]] = []
+
+    for r in rows:
+        obj = {
+            "type": r["type"],
+            "level": r["level"],
+            "price": r["price"],
+            "quantity": r["quantity"],
+            "hit": r["hit"],
+            "canceled": r["canceled"],
+        }
+        if r["type"] == "tp":
+            tp_list.append(obj)
+        elif r["type"] == "sl":
+            # берём только первый «живой» SL для уведомления, но возвращаем все — форматтер сам покажет 1-й
+            sl_list.append(obj)
+
+    return tp_list, sl_list

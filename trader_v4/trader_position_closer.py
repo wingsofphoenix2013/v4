@@ -1,4 +1,4 @@
-# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление о закрытии (с 24h ROI)
+# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление (с портфельным 24h ROI)
 
 # 🔸 Импорты
 import asyncio
@@ -123,39 +123,17 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid, pnl, closed_at
     )
 
-    # считаем скользящий ROI_24h по стратегии (доля, не %)
-    roi_24h = None
-    if strategy_id is not None:
-        agg = await infra.pg_pool.fetchrow(
-            """
-            SELECT COALESCE(SUM(pnl), 0) AS pnl_sum
-            FROM public.positions_v4
-            WHERE status = 'closed'
-              AND strategy_id = $1
-              AND closed_at >= ((now() at time zone 'UTC') - interval '24 hours')
-            """,
-            strategy_id
-        )
-        pnl_sum_24 = _as_decimal(agg["pnl_sum"]) if agg else Decimal("0")
-
-        dep_row = await infra.pg_pool.fetchrow(
-            "SELECT deposit FROM public.strategies_v4 WHERE id = $1",
-            strategy_id
-        )
-        deposit = _as_decimal(dep_row["deposit"]) if dep_row and dep_row["deposit"] is not None else None
-
-        if deposit and deposit > 0:
-            try:
-                roi_24h = pnl_sum_24 / deposit
-            except Exception:
-                roi_24h = None
+    # портфельный скользящий ROI_24h:
+    #  - числитель: сумма pnl по всем закрытым строкам trader_positions за 24 часа
+    #  - знаменатель: средний deposit по всем стратегиям, присутствующим в trader_positions (distinct strategy_id)
+    roi_24h = await _compute_portfolio_roi_24h()
 
     log.debug(
         "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s",
         position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl
     )
 
-    # уведомление в Telegram (🟢/🔴 в заголовке + стрелки направления + 24h ROI)
+    # уведомление в Telegram (🟢/🔴 в заголовке + стрелки направления + 24h ROI портфеля)
     try:
         await send_closed_notification(
             symbol=symbol,
@@ -169,6 +147,40 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         )
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления о закрытии uid=%s", position_uid)
+
+
+# 🔸 Портфельный ROI за 24 часа (скользящее окно)
+async def _compute_portfolio_roi_24h() -> Optional[Decimal]:
+    # сумма pnl по закрытым строкам за 24 часа
+    pnl_row = await infra.pg_pool.fetchrow(
+        """
+        SELECT COALESCE(SUM(pnl), 0) AS pnl_sum
+        FROM public.trader_positions
+        WHERE status = 'closed'
+          AND closed_at >= ((now() at time zone 'UTC') - interval '24 hours')
+        """
+    )
+    pnl_sum_24 = _as_decimal(pnl_row["pnl_sum"]) if pnl_row else Decimal("0")
+
+    # средний депозит по стратегиям, которые присутствуют в trader_positions (distinct strategy_id)
+    dep_row = await infra.pg_pool.fetchrow(
+        """
+        SELECT AVG(s.deposit) AS avg_dep
+        FROM (
+          SELECT DISTINCT strategy_id FROM public.trader_positions
+        ) tp
+        JOIN public.strategies_v4 s ON s.id = tp.strategy_id
+        WHERE s.deposit IS NOT NULL AND s.deposit > 0
+        """
+    )
+    avg_dep = _as_decimal(dep_row["avg_dep"]) if dep_row and dep_row["avg_dep"] is not None else None
+
+    if not avg_dep or avg_dep <= 0:
+        return None
+    try:
+        return (pnl_sum_24 or Decimal("0")) / avg_dep
+    except Exception:
+        return None
 
 
 # 🔸 Вспомогательные функции

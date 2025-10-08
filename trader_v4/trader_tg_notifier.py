@@ -1,4 +1,4 @@
-# trader_tg_notifier.py — асинхронные уведомления в Telegram (open/close), с ротируемыми заголовками, стрелками направления и 24h ROI
+# trader_tg_notifier.py — асинхронные уведомления в Telegram (open/close), с ротируемыми заголовками, стрелками направления, TP/SL и 24h ROI (портфельно)
 
 # 🔸 Импорты
 import os
@@ -6,7 +6,7 @@ import logging
 import random
 from decimal import Decimal
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Iterable, Any
 import httpx
 
 # 🔸 Логгер телеграм-уведомлений
@@ -77,10 +77,12 @@ async def send_open_notification(
     strategy_id: int,
     group_id: int,
     created_at: datetime,
+    tp_targets: Optional[Iterable[Any]] = None,  # список TP (dict/tuple), см. _format_tp_section
+    sl_targets: Optional[Iterable[Any]] = None,  # список SL (dict/tuple), берём активный/первый
     header: Optional[str] = None,
     silent: bool = False,
 ) -> None:
-    # выбираем заголовок (без 🟢/🔴 для открытий)
+    # заголовок (без 🟢/🔴 для открытий)
     hdr = header or random.choice(_OPEN_HEADERS)
     text = build_open_message(
         header=hdr,
@@ -91,6 +93,8 @@ async def send_open_notification(
         strategy_id=strategy_id,
         group_id=group_id,
         created_at=created_at,
+        tp_targets=tp_targets,
+        sl_targets=sl_targets,
     )
     await tg_send(text, disable_notification=silent)
 
@@ -103,11 +107,11 @@ async def send_closed_notification(
     pnl: Optional[Decimal],
     created_at: Optional[datetime],
     closed_at: Optional[datetime],
-    roi_24h: Optional[Decimal] = None,   # скользящий ROI за 24 часа (доля, не %)
+    roi_24h: Optional[Decimal] = None,   # скользящий ROI за 24 часа (доля, не %); в нашем кейсе — портфельный
     header: Optional[str] = None,
     silent: bool = False,
 ) -> None:
-    # выбираем заголовок: win или loss (с 🟢/🔴 в заголовке)
+    # заголовок: win или loss (с 🟢/🔴)
     if header:
         hdr = header
     else:
@@ -169,7 +173,84 @@ def _side_arrow_and_word(direction: Optional[str]) -> tuple[str, str]:
     d = (direction or "").lower()
     return ("⬆️", "LONG") if d == "long" else ("⬇️", "SHORT")
 
-# 🔸 Конструктор сообщения об открытии
+def _level_from(obj: Any) -> Optional[int]:
+    try:
+        if isinstance(obj, dict):
+            return int(obj.get("level")) if obj.get("level") is not None else None
+        if isinstance(obj, (tuple, list)) and len(obj) >= 1:
+            return int(obj[0]) if obj[0] is not None else None
+    except Exception:
+        return None
+    return None
+
+def _price_from(obj: Any) -> Optional[Decimal]:
+    try:
+        if isinstance(obj, dict):
+            v = obj.get("price")
+        else:
+            v = obj[1] if isinstance(obj, (tuple, list)) and len(obj) >= 2 else None
+        if v is None:
+            return None
+        if isinstance(v, Decimal):
+            return v
+        return Decimal(str(v))
+    except Exception:
+        return None
+
+def _qty_from(obj: Any) -> Optional[Decimal]:
+    try:
+        if isinstance(obj, dict):
+            v = obj.get("quantity")
+        else:
+            v = obj[2] if isinstance(obj, (tuple, list)) and len(obj) >= 3 else None
+        if v is None:
+            return None
+        if isinstance(v, Decimal):
+            return v
+        return Decimal(str(v))
+    except Exception:
+        return None
+
+def _format_tp_section(tp_targets: Optional[Iterable[Any]], max_items: int = 3) -> str:
+    if not tp_targets:
+        return ""
+    # сортируем по level, показываем первые max_items
+    try:
+        tps = sorted(tp_targets, key=lambda t: (_level_from(t) or 10**9))
+    except Exception:
+        tps = list(tp_targets)
+
+    lines = []
+    shown = 0
+    for t in tps:
+        if shown >= max_items:
+            break
+        lvl = _level_from(t)
+        price = _price_from(t)
+        qty = _qty_from(t)
+        lvl_txt = f"TP{lvl}" if lvl is not None else "TP"
+        price_txt = _fmt_money(price)
+        qty_txt = f" (qty { _fmt_money(qty) })" if qty is not None else ""
+        lines.append(f"🎯 {lvl_txt}: <code>{price_txt}</code>{qty_txt}")
+        shown += 1
+
+    more = len(tps) - shown
+    suffix = f"\n➕ ... and {more} more TP" if more > 0 else ""
+    return ("\n".join(lines)) + suffix + ("\n" if lines or suffix else "")
+
+def _format_sl_section(sl_targets: Optional[Iterable[Any]]) -> str:
+    if not sl_targets:
+        return ""
+    # берём первый активный/первый по списку
+    sl = None
+    for s in sl_targets:
+        sl = s
+        break
+    price = _price_from(sl)
+    price_txt = _fmt_money(price)
+    return f"🛡️ SL: <code>{price_txt}</code>\n"
+
+# 🔸 Конструктор сообщения об открытии (с TP/SL)
 def build_open_message(
     *,
     header: str,
@@ -180,12 +261,18 @@ def build_open_message(
     strategy_id: int,
     group_id: int,
     created_at: datetime,
+    tp_targets: Optional[Iterable[Any]] = None,
+    sl_targets: Optional[Iterable[Any]] = None,
 ) -> str:
     arrow, side = _side_arrow_and_word(direction)
+    tp_block = _format_tp_section(tp_targets)
+    sl_block = _format_sl_section(sl_targets)
     return (
         f"{header}\n\n"
         f"{arrow} {side} on <b>{symbol}</b>\n"
         f"🎯 Entry: <code>{_fmt_money(entry_price)}</code>\n"
+        f"{tp_block}"
+        f"{sl_block}"
         f"💼 Margin used: <code>{_fmt_money(margin_used)}</code>\n"
         f"🏷️ sid={strategy_id}, group={group_id}\n"
         f"⏳ {_fmt_dt_utc(created_at)}"
@@ -202,7 +289,7 @@ def build_closed_message(
     pnl: Optional[Decimal],
     created_at: Optional[datetime],
     closed_at: Optional[datetime],
-    roi_24h: Optional[Decimal] = None,
+    roi_24h: Optional[Decimal] = None,  # скользящий ROI за 24 часа (портфельно/как передали)
 ) -> str:
     arrow, side = _side_arrow_and_word(direction)
 
