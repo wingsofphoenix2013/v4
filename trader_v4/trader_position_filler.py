@@ -183,7 +183,6 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
             symbol=symbol,
             direction=direction,
             entry_price=entry_price,
-            margin_used=margin_used,
             strategy_id=strategy_id,
             group_id=group_master_id,
             created_at=created_at,

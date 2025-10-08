@@ -46,7 +46,7 @@ _LOSS_HEADERS = [
 # 🔸 Базовая отправка текста (HTML)
 async def tg_send(text: str, *, disable_notification: bool = False) -> None:
     if not _BOT_TOKEN or not _CHAT_ID:
-        log.info("ℹ️ TG: пропуск — TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы")
+        log.debug("ℹ️ TG: пропуск — TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы")
         return
 
     url = f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage"
@@ -64,7 +64,7 @@ async def tg_send(text: str, *, disable_notification: bool = False) -> None:
             if r.status_code != 200:
                 log.warning("⚠️ TG: %s %s", r.status_code, r.text)
             else:
-                log.info("📨 TG: отправлено")
+                log.debug("📨 TG: отправлено")
     except Exception:
         log.exception("❌ TG: ошибка отправки")
 
