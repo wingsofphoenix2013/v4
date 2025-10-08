@@ -33,7 +33,7 @@ async def run_with_delay(coro_factory, label: str, start_delay: float = 0.0):
         await asyncio.sleep(start_delay)
     await run_safe_loop(coro_factory, label)
 
-# 🔸 Обёртка: периодическая «тик-задача» (для будущих задач по расписанию)
+# 🔸 Обёртка: периодическая «тик-задача»
 async def run_periodic(coro_factory, label: str, start_delay: float = 0.0, interval: float = 60.0):
     if start_delay and start_delay > 0:
         log.info(f"[{label}] Отложенный старт тик-задачи на {start_delay:.1f} сек")
@@ -41,7 +41,7 @@ async def run_periodic(coro_factory, label: str, start_delay: float = 0.0, inter
     while True:
         try:
             log.info(f"[{label}] Запуск периодической задачи")
-            await coro_factory()  # задача должна завершиться сама; цикл и повторы управляются здесь
+            await coro_factory()
             log.info(f"[{label}] Завершено успешно — следующий запуск через {interval:.1f} сек")
         except Exception:
             log.exception(f"[{label}] ❌ Ошибка — повтор через {interval:.1f} сек")
@@ -70,14 +70,17 @@ async def main():
     log.info("🚀 Запуск воркеров")
 
     await asyncio.gather(
-        # слушатель Pub/Sub апдейтов конфигурации с короткой паузой после старта
+        # слушатель Pub/Sub апдейтов конфигурации
         run_with_delay(config_event_listener, "TRADER_CONFIG", start_delay=CONFIG_LISTENER_START_DELAY_SEC),
-        # Почасовой рейтинг стратегий (старт через 90с, затем раз в час)
+
+        # последовательный слушатель открытий (signal_log_queue: status='opened')
+        run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=65.0),
+
+        # последовательный слушатель закрытий (signal_log_queue: status='closed')
+        run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=65.0),
+
+        # почасовой рейтинг стратегий (старт через 90с, затем раз в час)
         run_periodic(run_trader_rating_job, "TRADER_RATING", start_delay=90.0, interval=3600.0),
-        # Последовательный слушатель открытий: старт через 70 секунд
-        run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=70.0),
-        # Последовательный слушатель закрытий
-        run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=70.0),
     )
 
 # 🔸 Запуск через CLI

@@ -1,4 +1,4 @@
-# trader_position_closer.py — последовательное закрытие зафиксированных позиций по событиям из signal_log_queue
+# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление о закрытии
 
 # 🔸 Импорты
 import asyncio
@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from trader_infra import infra
+from trader_tg_notifier import send_closed_notification
 
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_CLOSER")
@@ -23,15 +24,15 @@ async def run_trader_position_closer_loop():
 
     try:
         await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
-        log.info("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
+        log.debug("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer Group уже существует: %s", CG_NAME)
+            log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info("🚦 TRADER_CLOSER запущен (последовательная обработка)")
+    log.debug("🚦 TRADER_CLOSER запущен (последовательная обработка)")
 
     while True:
         try:
@@ -92,19 +93,23 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     # берём итоговые поля из positions_v4 (к этому моменту они уже записаны core_io)
     row = await infra.pg_pool.fetchrow(
         """
-        SELECT symbol, pnl, closed_at
+        SELECT symbol, pnl, closed_at, direction, entry_price, exit_price, created_at
         FROM public.positions_v4
         WHERE position_uid = $1
         """,
         position_uid
     )
     if not row:
-        log.info("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
+        log.debug("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
         return
 
     symbol = row["symbol"] or tracked["symbol"] or symbol_hint
     pnl = _as_decimal(row["pnl"])
-    closed_at = row["closed_at"]  # UTC timestamp (как в БД)
+    closed_at = row["closed_at"]          # UTC timestamp (как в БД)
+    direction = _as_str(row.get("direction")) or None
+    entry_price = _as_decimal(row.get("entry_price"))
+    exit_price = _as_decimal(row.get("exit_price"))
+    created_at = row.get("created_at")
 
     # апдейт нашей таблицы (идемпотентно)
     await infra.pg_pool.execute(
@@ -118,10 +123,24 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid, pnl, closed_at
     )
 
-    log.info(
+    log.debug(
         "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s",
         position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl
     )
+
+    # отправка уведомления в Telegram (🟢/🔴 в заголовке + стрелки направления)
+    try:
+        await send_closed_notification(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            pnl=pnl,
+            created_at=created_at,
+            closed_at=closed_at,
+        )
+    except Exception:
+        log.exception("❌ TG: ошибка отправки уведомления о закрытии uid=%s", position_uid)
 
 
 # 🔸 Вспомогательные функции

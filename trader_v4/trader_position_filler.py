@@ -1,4 +1,4 @@
-# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions
+# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions + TG-уведомление об открытии
 
 # 🔸 Импорты
 import asyncio
@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, Set
 
 from trader_infra import infra
 from trader_rating import get_current_group_winners
+from trader_tg_notifier import send_open_notification
 
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_FILLER")
@@ -29,15 +30,15 @@ async def run_trader_position_filler_loop():
 
     try:
         await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
-        log.info("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
+        log.debug("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer Group уже существует: %s", CG_NAME)
+            log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info("🚦 TRADER_FILLER запущен (последовательная обработка)")
+    log.debug("🚦 TRADER_FILLER запущен (последовательная обработка)")
 
     while True:
         try:
@@ -79,7 +80,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     log_uid = _as_str(data.get("log_uid"))
 
     if not strategy_id or not position_uid:
-        log.info("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
+        log.debug("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
         return
 
     # актуальный набор победителей — сперва из in-memory, при пустоте одноразовый прогрев из БД
@@ -95,59 +96,61 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     if group_master_id is None:
         group_master_id = await _fetch_group_master_from_db(strategy_id)
     if group_master_id is None:
-        log.info("⚠️ Не удалось определить group_master_id для sid=%s — пропуск uid=%s", strategy_id, position_uid)
+        log.debug("⚠️ Не удалось определить group_master_id для sid=%s — пропуск uid=%s", strategy_id, position_uid)
         return
 
-    # ждём появления записи в positions_v4 и читаем её (с добавленными полями status/closed_at)
+    # ждём появления записи в positions_v4 и читаем её (с доп. полями для TG: direction, entry_price)
     pos = await _fetch_position_with_retry(position_uid)
     if not pos:
-        log.info("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
+        log.debug("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
         return
 
     # если позиция уже закрыта к моменту фиксации — пропускаем вставку
     status_db = _as_str(pos.get("status"))
     closed_at_db = pos.get("closed_at")
     if status_db == "closed" or closed_at_db is not None:
-        log.info("⏭️ Позиция уже закрыта к моменту фиксации, пропуск uid=%s (sid=%s)", position_uid, strategy_id)
+        log.debug("⏭️ Позиция уже закрыта к моменту фиксации, пропуск uid=%s (sid=%s)", position_uid, strategy_id)
         return
 
     # читаем leverage стратегии (и проверим, что >0)
     leverage = await _fetch_leverage(strategy_id)
     if leverage is None or leverage <= 0:
-        log.info("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
+        log.debug("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
         return
 
     # исходные данные позиции
     symbol = _as_str(pos["symbol"]) or symbol_hint
     notional_value = _as_decimal(pos["notional_value"]) or Decimal("0")
     created_at = pos["created_at"]  # timestamp из БД (UTC)
+    direction = _as_str(pos.get("direction")) or None
+    entry_price = _as_decimal(pos.get("entry_price"))
 
     if not symbol or notional_value <= 0:
-        log.info("⚠️ Пустой symbol или notional (symbol=%s, notional=%s) — пропуск uid=%s", symbol, notional_value, position_uid)
+        log.debug("⚠️ Пустой symbol или notional (symbol=%s, notional=%s) — пропуск uid=%s", symbol, notional_value, position_uid)
         return
 
     # расчёт использованной маржи
     try:
         margin_used = (notional_value / leverage)
     except (InvalidOperation, ZeroDivisionError):
-        log.info("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
+        log.debug("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
         return
 
     # правило 1: по этому symbol не должно быть открытых сделок
     if await _exists_open_for_symbol(symbol):
-        log.info("⛔ По символу %s уже есть открытая запись — пропуск uid=%s", symbol, position_uid)
+        log.debug("⛔ По символу %s уже есть открытая запись — пропуск uid=%s", symbol, position_uid)
         return
 
     # правило 2: суммарная маржа открытых сделок ≤ 95% минимального депозита среди победителей
     current_open_margin = await _sum_open_margin()
     min_deposit = await _min_deposit_among_winners()
     if min_deposit is None or min_deposit <= 0:
-        log.info("⚠️ Не удалось определить min(deposit) среди победителей — пропуск uid=%s", position_uid)
+        log.debug("⚠️ Не удалось определить min(deposit) среди победителей — пропуск uid=%s", position_uid)
         return
 
     limit = (Decimal("0.95") * min_deposit)
     if (current_open_margin + margin_used) > limit:
-        log.info(
+        log.debug(
             "⛔ Лимит маржи превышен: open=%s + cand=%s > limit=%s (min_dep=%s) — uid=%s",
             current_open_margin, margin_used, limit, min_deposit, position_uid
         )
@@ -163,10 +166,24 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         created_at=created_at
     )
 
-    log.info(
+    log.debug(
         "✅ TRADER_FILLER: зафиксирована позиция uid=%s | symbol=%s | sid=%s | group=%s | margin=%s",
         position_uid, symbol, strategy_id, group_master_id, margin_used
     )
+
+    # отправка уведомления в Telegram (стрелки направления; без 🟢/🔴 в заголовке)
+    try:
+        await send_open_notification(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            margin_used=margin_used,
+            strategy_id=strategy_id,
+            group_id=group_master_id,
+            created_at=created_at,
+        )
+    except Exception:
+        log.exception("❌ TG: ошибка отправки уведомления об открытии uid=%s", position_uid)
 
 
 # 🔸 Вспомогательные функции
@@ -211,7 +228,7 @@ async def _fallback_winners_from_db() -> Dict[int, int]:
     )
     m = {int(r["group_master_id"]): int(r["current_winner_id"]) for r in rows}
     if m:
-        log.info("♻️ Прогрет winners из БД: групп=%d", len(m))
+        log.debug("♻️ Прогрет winners из БД: групп=%d", len(m))
     return m
 
 
@@ -232,7 +249,7 @@ async def _fetch_position_with_retry(position_uid: str) -> Optional[Dict[str, An
     while attempts < MAX_ATTEMPTS:
         row = await infra.pg_pool.fetchrow(
             """
-            SELECT symbol, notional_value, created_at, status, closed_at
+            SELECT symbol, notional_value, created_at, status, closed_at, direction, entry_price
             FROM public.positions_v4
             WHERE position_uid = $1
             """,
