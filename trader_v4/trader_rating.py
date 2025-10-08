@@ -26,7 +26,7 @@ async def run_trader_rating_job():
     # собираем кандидатов
     candidates = await _fetch_candidates()
     if not candidates:
-        log.info("ℹ️ TRADER_RATING: кандидатов нет (enabled & trader_watcher & market_mirrow) — пропуск")
+        log.debug("ℹ️ TRADER_RATING: кандидатов нет (enabled & trader_watcher & market_mirrow) — пропуск")
         return
 
     # строим список strategy_id для метрик
@@ -46,7 +46,7 @@ async def run_trader_rating_job():
 
     # сводка в лог
     winners_pretty = ", ".join(f"{gm}->{sid}" for gm, sid in group_winners.items() if sid is not None)
-    log.info(
+    log.debug(
         "✅ TRADER_RATING: обработано групп=%d, победителей=%d%s",
         len(groups_watchers),
         sum(1 for v in group_winners.values() if v is not None),

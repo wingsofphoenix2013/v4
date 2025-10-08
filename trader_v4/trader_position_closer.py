@@ -24,15 +24,15 @@ async def run_trader_position_closer_loop():
 
     try:
         await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
-        log.info("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
+        log.debug("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ Consumer Group уже существует: %s", CG_NAME)
+            log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info("🚦 TRADER_CLOSER запущен (последовательная обработка)")
+    log.debug("🚦 TRADER_CLOSER запущен (последовательная обработка)")
 
     while True:
         try:
@@ -74,7 +74,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     symbol_hint = _as_str(data.get("symbol"))
 
     if not position_uid:
-        log.info("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
+        log.debug("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
         return
 
     # проверяем: позиция отслеживается нашим модулем?
@@ -87,7 +87,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid
     )
     if not tracked:
-        log.info("ℹ️ TRADER_CLOSER: позиция не отслеживается, пропуск uid=%s", position_uid)
+        log.debug("ℹ️ TRADER_CLOSER: позиция не отслеживается, пропуск uid=%s", position_uid)
         return
 
     # берём финальные поля из positions_v4 (к этому моменту они уже записаны core_io)
@@ -100,7 +100,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid
     )
     if not row:
-        log.info("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
+        log.debug("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
         return
 
     symbol = row["symbol"] or tracked["symbol"] or symbol_hint
@@ -150,7 +150,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
             except Exception:
                 roi_24h = None
 
-    log.info(
+    log.debug(
         "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s",
         position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl
     )
