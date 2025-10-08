@@ -1,4 +1,4 @@
-# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление о закрытии
+# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление о закрытии (с 24h ROI)
 
 # 🔸 Импорты
 import asyncio
@@ -24,15 +24,15 @@ async def run_trader_position_closer_loop():
 
     try:
         await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
-        log.debug("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
+        log.info("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
+            log.info("ℹ️ Consumer Group уже существует: %s", CG_NAME)
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.debug("🚦 TRADER_CLOSER запущен (последовательная обработка)")
+    log.info("🚦 TRADER_CLOSER запущен (последовательная обработка)")
 
     while True:
         try:
@@ -53,7 +53,7 @@ async def run_trader_position_closer_loop():
                         await _handle_signal_closed(record_id, data)
                     except Exception:
                         log.exception("❌ Ошибка обработки записи (id=%s)", record_id)
-                        # даже при ошибке ack, чтобы не зависало
+                        # ack даже при ошибке, чтобы не зависало в pending
                         await redis.xack(SIGNAL_STREAM, CG_NAME, record_id)
                     else:
                         await redis.xack(SIGNAL_STREAM, CG_NAME, record_id)
@@ -74,10 +74,10 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     symbol_hint = _as_str(data.get("symbol"))
 
     if not position_uid:
-        log.debug("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
+        log.info("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
         return
 
-    # проверяем: позиция вообще отслеживается нашим модулем?
+    # проверяем: позиция отслеживается нашим модулем?
     tracked = await infra.pg_pool.fetchrow(
         """
         SELECT id, symbol
@@ -87,10 +87,10 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid
     )
     if not tracked:
-        log.debug("ℹ️ TRADER_CLOSER: позиция не отслеживается, пропуск uid=%s", position_uid)
+        log.info("ℹ️ TRADER_CLOSER: позиция не отслеживается, пропуск uid=%s", position_uid)
         return
 
-    # берём итоговые поля из positions_v4 (к этому моменту они уже записаны core_io)
+    # берём финальные поля из positions_v4 (к этому моменту они уже записаны core_io)
     row = await infra.pg_pool.fetchrow(
         """
         SELECT symbol, pnl, closed_at, direction, entry_price, exit_price, created_at
@@ -100,7 +100,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid
     )
     if not row:
-        log.debug("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
+        log.info("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
         return
 
     symbol = row["symbol"] or tracked["symbol"] or symbol_hint
@@ -111,7 +111,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     exit_price = _as_decimal(row.get("exit_price"))
     created_at = row.get("created_at")
 
-    # апдейт нашей таблицы (идемпотентно)
+    # обновляем нашу таблицу
     await infra.pg_pool.execute(
         """
         UPDATE public.trader_positions
@@ -123,12 +123,39 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         position_uid, pnl, closed_at
     )
 
-    log.debug(
+    # считаем скользящий ROI_24h по стратегии (доля, не %)
+    roi_24h = None
+    if strategy_id is not None:
+        agg = await infra.pg_pool.fetchrow(
+            """
+            SELECT COALESCE(SUM(pnl), 0) AS pnl_sum
+            FROM public.positions_v4
+            WHERE status = 'closed'
+              AND strategy_id = $1
+              AND closed_at >= ((now() at time zone 'UTC') - interval '24 hours')
+            """,
+            strategy_id
+        )
+        pnl_sum_24 = _as_decimal(agg["pnl_sum"]) if agg else Decimal("0")
+
+        dep_row = await infra.pg_pool.fetchrow(
+            "SELECT deposit FROM public.strategies_v4 WHERE id = $1",
+            strategy_id
+        )
+        deposit = _as_decimal(dep_row["deposit"]) if dep_row and dep_row["deposit"] is not None else None
+
+        if deposit and deposit > 0:
+            try:
+                roi_24h = pnl_sum_24 / deposit
+            except Exception:
+                roi_24h = None
+
+    log.info(
         "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s",
         position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl
     )
 
-    # отправка уведомления в Telegram (🟢/🔴 в заголовке + стрелки направления)
+    # уведомление в Telegram (🟢/🔴 в заголовке + стрелки направления + 24h ROI)
     try:
         await send_closed_notification(
             symbol=symbol,
@@ -138,6 +165,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
             pnl=pnl,
             created_at=created_at,
             closed_at=closed_at,
+            roi_24h=roi_24h,
         )
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления о закрытии uid=%s", position_uid)

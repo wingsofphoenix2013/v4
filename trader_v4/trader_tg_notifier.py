@@ -1,4 +1,4 @@
-# trader_tg_notifier.py — асинхронные уведомления в Telegram (open/close), с ротируемыми заголовками и стрелками направления
+# trader_tg_notifier.py — асинхронные уведомления в Telegram (open/close), с ротируемыми заголовками, стрелками направления и 24h ROI
 
 # 🔸 Импорты
 import os
@@ -103,6 +103,7 @@ async def send_closed_notification(
     pnl: Optional[Decimal],
     created_at: Optional[datetime],
     closed_at: Optional[datetime],
+    roi_24h: Optional[Decimal] = None,   # скользящий ROI за 24 часа (доля, не %)
     header: Optional[str] = None,
     silent: bool = False,
 ) -> None:
@@ -122,6 +123,7 @@ async def send_closed_notification(
         pnl=pnl,
         created_at=created_at,
         closed_at=closed_at,
+        roi_24h=roi_24h,
     )
     await tg_send(text, disable_notification=silent)
 
@@ -142,6 +144,17 @@ def _fmt_signed(x: Optional[Decimal], max_prec: int = 8) -> str:
     try:
         sign = "+" if x >= 0 else ""
         return f"{sign}{_fmt_money(x, max_prec)}"
+    except Exception:
+        return str(x)
+
+def _fmt_pct(x: Optional[Decimal], max_prec: int = 2) -> str:
+    if x is None:
+        return "—"
+    try:
+        val = x * Decimal("100")  # доля → проценты
+        sign = "+" if val >= 0 else ""
+        s = f"{val:.{max_prec}f}".rstrip("0").rstrip(".")
+        return f"{sign}{s}%"
     except Exception:
         return str(x)
 
@@ -178,7 +191,7 @@ def build_open_message(
         f"⏳ {_fmt_dt_utc(created_at)}"
     )
 
-# 🔸 Конструктор сообщения о закрытии
+# 🔸 Конструктор сообщения о закрытии (с 24h ROI)
 def build_closed_message(
     *,
     header: str,
@@ -189,10 +202,11 @@ def build_closed_message(
     pnl: Optional[Decimal],
     created_at: Optional[datetime],
     closed_at: Optional[datetime],
+    roi_24h: Optional[Decimal] = None,
 ) -> str:
     arrow, side = _side_arrow_and_word(direction)
 
-    # длительность
+    # длительность удержания
     dur = "—"
     if created_at and closed_at:
         try:
@@ -201,12 +215,15 @@ def build_closed_message(
         except Exception:
             pass
 
+    roi_line = f"📈 24h ROI: <b>{_fmt_pct(roi_24h)}</b>\n"
+
     return (
         f"{header}\n\n"
         f"{arrow} {side} on <b>{symbol}</b>\n"
         f"🎯 Entry: <code>{_fmt_money(entry_price)}</code>\n"
         f"🏁 Exit: <code>{_fmt_money(exit_price)}</code>\n"
         f"💵 PnL: <b>{_fmt_signed(pnl)}</b>\n"
+        f"{roi_line}"
         f"🕓 Held: {dur}\n"
         f"⏳ {_fmt_dt_utc(created_at)} → {_fmt_dt_utc(closed_at)}"
     )
