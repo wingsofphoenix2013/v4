@@ -341,7 +341,7 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
 
     return len(filtered)
 
-# 🔸 Построение whitelist v2 (7d): без sense/conf, только по доле сделок
+# 🔸 Построение whitelist v2 (7d): без sense/conf, по доле сделок и порогу winrate
 async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame: str, window_end_dt: datetime, min_share: float) -> int:
     # общий объём закрытых сделок из шапки отчёта (для текущего окна)
     closed_total = await conn.fetchval(
@@ -361,19 +361,19 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
     # порог по доле (> min_share от общего числа закрытых сделок)
     threshold = float(closed_total) * float(min_share)
 
-    # все агрегаты текущего отчёта
+    # все агрегаты текущего отчёта 7d
     cand_rows = await conn.fetch(
         """
         SELECT
-            a.id          AS aggregated_id,
-            a.strategy_id AS strategy_id,
-            a.direction   AS direction,
-            a.timeframe   AS timeframe,
-            a.agg_base    AS agg_base,
-            a.agg_state   AS agg_state,
-            a.winrate     AS winrate,
-            a.confidence  AS confidence,
-            a.trades_total AS trades_total
+            a.id            AS aggregated_id,
+            a.strategy_id   AS strategy_id,
+            a.direction     AS direction,
+            a.timeframe     AS timeframe,
+            a.agg_base      AS agg_base,
+            a.agg_state     AS agg_state,
+            a.winrate       AS winrate,
+            a.confidence    AS confidence,   -- не используем, но пишем как есть
+            a.trades_total  AS trades_total
         FROM oracle_mw_aggregated_stat a
         WHERE a.report_id = $1
           AND a.time_frame = $2
@@ -381,10 +381,11 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
         report_id, str(time_frame)
     )
 
-    # фильтр по порогу массы
+    # фильтр: масса > threshold И winrate >= WL_WR_MIN (без sense/conf)
     filtered = [
         dict(r) for r in cand_rows
         if float(r["trades_total"] or 0.0) > threshold
+           and float(r["winrate"] or 0.0) >= float(WL_WR_MIN)
     ]
 
     # атомарно перестраиваем v2-срез для стратегии
@@ -420,7 +421,7 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
             )
 
     return len(filtered)
-
+    
 # 🔸 Расчёт разделяющей силы (winrate по состояниям внутри базы)
 def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
     # должно быть минимум 2 состояния с n>0
