@@ -24,6 +24,8 @@ WHITELIST_READY_MAXLEN = 10_000
 # 🔸 Константы расчёта sense
 TF_LIST = ("m5", "m15", "h1")
 DIRECTIONS = ("long", "short")
+
+# ⚠️ Рабочий набор осей: solo=trend и комбо только с trend
 AGG_BASES = (
     "trend",
     "trend_volatility",
@@ -34,14 +36,18 @@ AGG_BASES = (
     "trend_extremes_momentum",
     "trend_volatility_extremes_momentum",
 )
+
 SMOOTH_HISTORY_N = 5
 CONF_THRESHOLD_SENSE = 0.1  # включаем в расчёт sense только состояния с confidence > 0.1
 EPS = 1e-12
 
-# 🔸 Пороговые значения для whitelist (настраиваются перезапуском сервиса)
+# 🔸 Пороговые значения для whitelist v1 (настраиваются перезапуском сервиса)
 SCORE_SENSE_MIN = 0.5    # база попадает в WL только если score_smoothed > 0.5
-CONF_THRESHOLD_WL = 0.5 # строка агрегата (agg_state) — confidence > 0.5
+CONF_THRESHOLD_WL = 0.5  # строка агрегата (agg_state) — confidence > 0.5
 WL_WR_MIN = 0.55         # минимальный winrate для попадания строки в whitelist (>= 0.55)
+
+# 🔸 Порог для whitelist v2 (доля от общего числа закрытых сделок в окне 7d)
+WL_V2_MIN_SHARE = 0.01   # 1%
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_sense_stat():
@@ -107,7 +113,7 @@ async def run_oracle_sense_stat():
             log.exception("❌ Ошибка цикла sense-stat — пауза 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Обработка одного отчёта: расчёт sense-stat + (если 7d) построение whitelist
+# 🔸 Обработка одного отчёта: расчёт sense-stat + WL v1 (7d) + WL v2 (7d)
 async def _process_report(report_id: int, strategy_id: int, time_frame: str, window_end_iso: str):
     # парсинг window_end
     try:
@@ -117,7 +123,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
         return
 
     async with infra.pg_pool.acquire() as conn:
-        # выборка агрегатов текущего отчёта (confidence > 0.1 для sense)
+        # выборка агрегатов текущего отчёта для sense (confidence > 0.1)
         rows = await conn.fetch(
             """
             SELECT timeframe, direction, agg_base, agg_state,
@@ -129,93 +135,93 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
             report_id, CONF_THRESHOLD_SENSE
         )
 
-        if not rows:
-            log.debug("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s)",
-                     CONF_THRESHOLD_SENSE, report_id, strategy_id, time_frame)
-            return
-
-        # группировка по (timeframe, direction, agg_base)
-        data: Dict[Tuple[str, str, str], List[dict]] = {}
-        for r in rows:
-            key = (r["timeframe"], r["direction"], r["agg_base"])
-            data.setdefault(key, []).append({
-                "agg_state": r["agg_state"],
-                "n": int(r["trades_total"] or 0),
-                "w": int(r["trades_wins"] or 0),
-                "p": float(r["winrate"] or 0.0),
-            })
-
         updated = 0
-        for tf in TF_LIST:
-            for direction in DIRECTIONS:
-                for base in AGG_BASES:
-                    states = data.get((tf, direction, base), [])
-                    if not states:
-                        continue  # только если есть хотя бы одно состояние
+        if rows:
+            # группировка по (timeframe, direction, agg_base)
+            data: Dict[Tuple[str, str, str], List[dict]] = {}
+            for r in rows:
+                key = (r["timeframe"], r["direction"], r["agg_base"])
+                data.setdefault(key, []).append({
+                    "agg_state": r["agg_state"],
+                    "n": int(r["trades_total"] or 0),
+                    "w": int(r["trades_wins"] or 0),
+                    "p": float(r["winrate"] or 0.0),
+                })
 
-                    score_current, states_used, components = _compute_score(states)
+            for tf in TF_LIST:
+                for direction in DIRECTIONS:
+                    for base in AGG_BASES:
+                        states = data.get((tf, direction, base), [])
+                        if not states:
+                            continue  # только если есть хотя бы одно состояние
 
-                    # сглаживание по истории (≤5 предыдущих прогонов)
-                    prev_vals = await conn.fetch(
-                        """
-                        SELECT score_current
-                          FROM oracle_mw_sense_stat
-                         WHERE strategy_id = $1
-                           AND time_frame  = $2
-                           AND timeframe   = $3
-                           AND direction   = $4
-                           AND agg_base    = $5
-                           AND window_end  < $6
-                         ORDER BY window_end DESC
-                         LIMIT $7
-                        """,
-                        strategy_id, time_frame, tf, direction, base,
-                        window_end_dt, int(SMOOTH_HISTORY_N)
-                    )
-                    hist = [float(x["score_current"]) for x in prev_vals] if prev_vals else []
-                    score_smoothed = _smooth_mean(score_current, hist)
+                        score_current, states_used, components = _compute_score(states)
 
-                    # запись/обновление строки sense
-                    await conn.execute(
-                        """
-                        INSERT INTO oracle_mw_sense_stat (
-                            report_id, strategy_id, time_frame, window_end,
-                            timeframe, direction, agg_base,
-                            states_used, score_current, score_smoothed, components,
-                            created_at, updated_at
-                        ) VALUES (
-                            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now()
+                        # сглаживание по истории (≤5 предыдущих прогонов)
+                        prev_vals = await conn.fetch(
+                            """
+                            SELECT score_current
+                              FROM oracle_mw_sense_stat
+                             WHERE strategy_id = $1
+                               AND time_frame  = $2
+                               AND timeframe   = $3
+                               AND direction   = $4
+                               AND agg_base    = $5
+                               AND window_end  < $6
+                             ORDER BY window_end DESC
+                             LIMIT $7
+                            """,
+                            strategy_id, time_frame, tf, direction, base,
+                            window_end_dt, int(SMOOTH_HISTORY_N)
                         )
-                        ON CONFLICT (report_id, timeframe, direction, agg_base)
-                        DO UPDATE SET
-                            states_used    = EXCLUDED.states_used,
-                            score_current  = EXCLUDED.score_current,
-                            score_smoothed = EXCLUDED.score_smoothed,
-                            components     = EXCLUDED.components,
-                            updated_at     = now()
-                        """,
-                        report_id, strategy_id, time_frame, window_end_dt,
-                        tf, direction, base,
-                        int(states_used), float(score_current), float(score_smoothed),
-                        json.dumps(components, separators=(",", ":"))
-                    )
-                    updated += 1
+                        hist = [float(x["score_current"]) for x in prev_vals] if prev_vals else []
+                        score_smoothed = _smooth_mean(score_current, hist)
 
-        log.debug("✅ sense-stat готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
-                 report_id, strategy_id, time_frame, window_end_iso, updated)
+                        # запись/обновление строки sense
+                        await conn.execute(
+                            """
+                            INSERT INTO oracle_mw_sense_stat (
+                                report_id, strategy_id, time_frame, window_end,
+                                timeframe, direction, agg_base,
+                                states_used, score_current, score_smoothed, components,
+                                created_at, updated_at
+                            ) VALUES (
+                                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now()
+                            )
+                            ON CONFLICT (report_id, timeframe, direction, agg_base)
+                            DO UPDATE SET
+                                states_used    = EXCLUDED.states_used,
+                                score_current  = EXCLUDED.score_current,
+                                score_smoothed = EXCLUDED.score_smoothed,
+                                components     = EXCLUDED.components,
+                                updated_at     = now()
+                            """,
+                            report_id, strategy_id, time_frame, window_end_dt,
+                            tf, direction, base,
+                            int(states_used), float(score_current), float(score_smoothed),
+                            json.dumps(components, separators=(",", ":"))
+                        )
+                        updated += 1
 
-        # формирование whitelist только для 7d
+            log.debug("✅ sense-stat готов: report_id=%s sid=%s tf=%s window_end=%s — строк=%d",
+                      report_id, strategy_id, time_frame, window_end_iso, updated)
+        else:
+            log.debug("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s) — sense пропущен",
+                      CONF_THRESHOLD_SENSE, report_id, strategy_id, time_frame)
+
+        # whitelist формируем ТОЛЬКО для 7d (и v1, и v2)
         if str(time_frame) == "7d":
-            inserted = await _build_whitelist_for_7d(conn, report_id, strategy_id, window_end_dt)
-            log.debug("✅ whitelist обновлён (7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted)
-            # событие о готовности whitelist
+            # v1 (по SENSE/CONF/WR)
+            inserted_v1 = await _build_whitelist_for_7d(conn, report_id, strategy_id, window_end_dt)
+            log.debug("✅ whitelist обновлён (v1, 7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted_v1)
             try:
                 payload = {
                     "strategy_id": int(strategy_id),
                     "report_id": int(report_id),
                     "time_frame": "7d",
+                    "version": "v1",
                     "window_end": window_end_dt.isoformat(),
-                    "rows_inserted": int(inserted),
+                    "rows_inserted": int(inserted_v1),
                     "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
                 }
                 await infra.redis_client.xadd(
@@ -224,11 +230,32 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
                     maxlen=WHITELIST_READY_MAXLEN,
                     approximate=True,
                 )
-                log.debug("[WHITELIST_READY] sid=%s report_id=%s rows=%d", strategy_id, report_id, inserted)
             except Exception:
-                log.exception("❌ Ошибка публикации события в %s", WHITELIST_READY_STREAM)
+                log.exception("❌ Ошибка публикации события в %s (v1)", WHITELIST_READY_STREAM)
 
-# 🔸 Построение whitelist для 7d: очищаем по стратегии и заполняем свежим набором (без confirmation)
+            # v2 (по доле от общего числа закрытых сделок; игнорируем sense/conf)
+            inserted_v2 = await _build_whitelist_v2(conn, report_id, strategy_id, "7d", window_end_dt, WL_V2_MIN_SHARE)
+            log.debug("✅ whitelist обновлён (v2, 7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted_v2)
+            try:
+                payload_v2 = {
+                    "strategy_id": int(strategy_id),
+                    "report_id": int(report_id),
+                    "time_frame": "7d",
+                    "version": "v2",
+                    "window_end": window_end_dt.isoformat(),
+                    "rows_inserted": int(inserted_v2),
+                    "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+                }
+                await infra.redis_client.xadd(
+                    name=WHITELIST_READY_STREAM,
+                    fields={"data": json.dumps(payload_v2, separators=(",", ":"))},
+                    maxlen=WHITELIST_READY_MAXLEN,
+                    approximate=True,
+                )
+            except Exception:
+                log.exception("❌ Ошибка публикации события в %s (v2)", WHITELIST_READY_STREAM)
+
+# 🔸 Построение whitelist v1 для 7d: очищаем ТОЛЬКО v1 по стратегии и заполняем свежим набором
 async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window_end_dt: datetime) -> int:
     # 1) оси (agg_base), прошедшие sense-фильтр (score_smoothed > SCORE_SENSE_MIN) на этом отчёте
     bases_rows = await conn.fetch(
@@ -242,9 +269,12 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
         report_id, float(SCORE_SENSE_MIN)
     )
     if not bases_rows:
-        # актуализируем пустым срезом для стратегии
+        # актуализируем пустым срезом только для v1
         async with conn.transaction():
-            await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
+            await conn.execute(
+                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1'",
+                strategy_id
+            )
         return 0
 
     selectors = {(r["timeframe"], r["direction"], r["agg_base"]) for r in bases_rows}
@@ -277,50 +307,120 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
         if (r["timeframe"], r["direction"], r["agg_base"]) in selectors
     ]
 
-    # 4) формируем батч на вставку (без confirmation)
-    to_insert = []
-    for r in filtered:
-        to_insert.append({
-            "aggregated_id": int(r["aggregated_id"]),
-            "strategy_id": int(r["strategy_id"]),
-            "direction": str(r["direction"]),
-            "timeframe": str(r["timeframe"]),
-            "agg_base": str(r["agg_base"]),
-            "agg_state": str(r["agg_state"]),
-            "winrate": float(r["winrate"] or 0.0),
-            "confidence": float(r["confidence"] or 0.0),
-        })
-
-    # 5) атомарно обновляем срез для стратегии
+    # 4) атомарно обновляем v1-срез для стратегии
     async with conn.transaction():
-        await conn.execute("DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1", strategy_id)
+        await conn.execute(
+            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1'",
+            strategy_id
+        )
 
-        if to_insert:
+        if filtered:
             await conn.executemany(
                 """
                 INSERT INTO oracle_mw_whitelist (
                     aggregated_id, strategy_id, direction, timeframe,
-                    agg_base, agg_state, winrate, confidence
+                    agg_base, agg_state, winrate, confidence, version
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8
+                    $1,$2,$3,$4,$5,$6,$7,$8,'v1'
                 )
                 """,
                 [
                     (
-                        row["aggregated_id"],
-                        row["strategy_id"],
-                        row["direction"],
-                        row["timeframe"],
-                        row["agg_base"],
-                        row["agg_state"],
-                        row["winrate"],
-                        row["confidence"],
+                        int(r["aggregated_id"]),
+                        int(r["strategy_id"]),
+                        str(r["direction"]),
+                        str(r["timeframe"]),
+                        str(r["agg_base"]),
+                        str(r["agg_state"]),
+                        float(r["winrate"] or 0.0),
+                        float(r["confidence"] or 0.0),
                     )
-                    for row in to_insert
+                    for r in filtered
                 ]
             )
 
-    return len(to_insert)
+    return len(filtered)
+
+# 🔸 Построение whitelist v2 (7d): без sense/conf, только по доле сделок
+async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame: str, window_end_dt: datetime, min_share: float) -> int:
+    # общий объём закрытых сделок из шапки отчёта (для текущего окна)
+    closed_total = await conn.fetchval(
+        "SELECT closed_total FROM oracle_report_stat WHERE id = $1",
+        report_id
+    )
+    closed_total = int(closed_total or 0)
+    if closed_total <= 0:
+        # очистим v2-срез для стратегии
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2'",
+                strategy_id
+            )
+        return 0
+
+    # порог по доле (> min_share от общего числа закрытых сделок)
+    threshold = float(closed_total) * float(min_share)
+
+    # все агрегаты текущего отчёта
+    cand_rows = await conn.fetch(
+        """
+        SELECT
+            a.id          AS aggregated_id,
+            a.strategy_id AS strategy_id,
+            a.direction   AS direction,
+            a.timeframe   AS timeframe,
+            a.agg_base    AS agg_base,
+            a.agg_state   AS agg_state,
+            a.winrate     AS winrate,
+            a.confidence  AS confidence,
+            a.trades_total AS trades_total
+        FROM oracle_mw_aggregated_stat a
+        WHERE a.report_id = $1
+          AND a.time_frame = $2
+        """,
+        report_id, str(time_frame)
+    )
+
+    # фильтр по порогу массы
+    filtered = [
+        dict(r) for r in cand_rows
+        if float(r["trades_total"] or 0.0) > threshold
+    ]
+
+    # атомарно перестраиваем v2-срез для стратегии
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2'",
+            strategy_id
+        )
+
+        if filtered:
+            await conn.executemany(
+                """
+                INSERT INTO oracle_mw_whitelist (
+                    aggregated_id, strategy_id, direction, timeframe,
+                    agg_base, agg_state, winrate, confidence, version
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,'v2'
+                )
+                """,
+                [
+                    (
+                        int(r["aggregated_id"]),
+                        int(r["strategy_id"]),
+                        str(r["direction"]),
+                        str(r["timeframe"]),
+                        str(r["agg_base"]),
+                        str(r["agg_state"]),
+                        float(r["winrate"] or 0.0),
+                        float(r["confidence"] or 0.0),
+                    )
+                    for r in filtered
+                ]
+            )
+
+    return len(filtered)
+
 # 🔸 Расчёт разделяющей силы (winrate по состояниям внутри базы)
 def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
     # должно быть минимум 2 состояния с n>0
