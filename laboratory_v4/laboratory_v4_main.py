@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск слушателей (WL, CONFIG, DECISION)
+# laboratory_v4_main.py — entrypoint laboratory_v4
 
 # 🔸 Импорты
 import asyncio

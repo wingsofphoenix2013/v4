@@ -1,4 +1,4 @@
-# laboratory_stream_cleaner.py — уборщик стримов laboratory_v4: XTRIM MINID по retention (start: +90s, period: 1h)
+# laboratory_stream_cleaner.py — уборщик стримов laboratory_v4
 
 # 🔸 Импорты
 import asyncio
