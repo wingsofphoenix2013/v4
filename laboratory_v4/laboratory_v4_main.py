@@ -1,5 +1,6 @@
 # laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск слушателей (WL, CONFIG, DECISION)
 
+# 🔸 Импорты
 import asyncio
 import logging
 
@@ -29,7 +30,10 @@ from laboratory_decision_filler import run_laboratory_decision_filler
 from laboratory_decision_postproc import run_laboratory_decision_postproc
 # 🔸 Аналитика blacklist (ежечасно, окно 7×24ч)
 from laboratory_bl_analyzer import run_laboratory_bl_analyzer
+# 🔸 Очистка собственных стримов (start +90s, затем раз в час)
+from laboratory_stream_cleaner import run_laboratory_stream_cleaner
 
+# 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
 
 
@@ -86,6 +90,8 @@ async def main():
         run_safe_loop(run_laboratory_decision_postproc, "LAB_DECISION_POSTPROC"),
         # Аналитика blacklist (ежечасно, окно 7×24ч)
         run_safe_loop(run_laboratory_bl_analyzer, "LAB_BL_ANALYZER"),
+        # Очистка наших стримов (start +90s, period 1h)
+        run_safe_loop(run_laboratory_stream_cleaner, "LAB_STREAM_CLEANER"),
     )
 
 
