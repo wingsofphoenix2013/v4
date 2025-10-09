@@ -151,7 +151,6 @@ async def run_oracle_pack_lists():
             log.exception("❌ Ошибка цикла PACK-lists — пауза 5 секунд")
             await asyncio.sleep(5)
 
-
 # 🔸 Сбор WL/BL v1 (7d): sense>0.5, confidence>0.5, по winrate → WL/BL
 async def _build_lists_v1_7d(report_id: int, strategy_id: int, window_end_iso: str) -> Tuple[int, int, int]:
     # парсинг времени
@@ -176,8 +175,12 @@ async def _build_lists_v1_7d(report_id: int, strategy_id: int, window_end_iso: s
         if not axes:
             # очищаем только v1-срез
             async with conn.transaction():
-                await conn.execute("DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1 AND version = 'v1'", strategy_id)
-            log.debug("ℹ️ PACK-lists v1: нет осей sense>%.2f (sid=%s, report=%s) — v1 очищен", SENSE_SCORE_MIN, strategy_id, report_id)
+                await conn.execute(
+                    "DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1 AND version = 'v1'",
+                    strategy_id
+                )
+            log.debug("ℹ️ PACK-lists v1: нет осей sense>%.2f (sid=%s, report=%s) — v1 очищен",
+                      SENSE_SCORE_MIN, strategy_id, report_id)
             return 0, 0, 0
 
         selectors = {(r["timeframe"], r["direction"], r["pack_base"], r["agg_type"], r["agg_key"]) for r in axes}
@@ -205,7 +208,7 @@ async def _build_lists_v1_7d(report_id: int, strategy_id: int, window_end_iso: s
             report_id, strategy_id, float(CONF_MIN)
         )
 
-        # классификация WL/BL по winrate
+        # классификация WL/BL по winrate (готовим сразу list_tag, чтобы не считать его в SQL)
         to_insert = []
         rows_wl = 0
         rows_bl = 0
@@ -215,7 +218,6 @@ async def _build_lists_v1_7d(report_id: int, strategy_id: int, window_end_iso: s
                 continue
 
             wr = float(r["winrate"] or 0.0)
-
             if wr >= WR_WL_MIN:
                 list_tag = "whitelist"; rows_wl += 1
             elif wr < WR_BL_MAX:
@@ -234,11 +236,15 @@ async def _build_lists_v1_7d(report_id: int, strategy_id: int, window_end_iso: s
                 str(r["agg_value"]),
                 float(wr),
                 float(r["confidence"] or 0.0),
+                list_tag,                 # ← передаём list как параметр
             ))
 
         # атомарно перестраиваем v1-срез
         async with conn.transaction():
-            await conn.execute("DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1 AND version = 'v1'", strategy_id)
+            await conn.execute(
+                "DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1 AND version = 'v1'",
+                strategy_id
+            )
             if to_insert:
                 await conn.executemany(
                     """
@@ -247,17 +253,16 @@ async def _build_lists_v1_7d(report_id: int, strategy_id: int, window_end_iso: s
                         pack_base, agg_type, agg_key, agg_value,
                         winrate, confidence, list, version
                     ) VALUES (
-                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,CASE WHEN $9 >= $11 THEN 'whitelist' ELSE 'blacklist' END,'v1'
+                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'v1'
                     )
                     """,
-                    [row + (WR_WL_MIN,) for row in to_insert]
+                    to_insert
                 )
 
         rows_total = len(to_insert)
         log.debug("✅ PACK-lists v1 обновлён (7d): sid=%s report_id=%s rows_total=%d wl=%d bl=%d",
                   strategy_id, report_id, rows_total, rows_wl, rows_bl)
         return rows_total, rows_wl, rows_bl
-
 
 # 🔸 Сбор WL/BL v2 (7d): по доле сделок и winrate (без sense/conf)
 async def _build_lists_v2_7d(report_id: int, strategy_id: int, window_end_iso: str) -> Tuple[int, int, int]:
