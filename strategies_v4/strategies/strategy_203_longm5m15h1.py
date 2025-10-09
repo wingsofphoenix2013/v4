@@ -65,6 +65,8 @@ class Strategy203Longm5m15h1:
             "symbol": symbol,
             "timeframes": tfs,
             "decision_mode": decision_mode,
+            "version": "v1",
+            "use_bl": "false",
         }
 
         # лог запроса
