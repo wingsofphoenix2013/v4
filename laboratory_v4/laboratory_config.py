@@ -1,5 +1,6 @@
-# laboratory_config.py — загрузка конфигов laboratory_v4: тикеры, стратегии, whitelist; слушатели Pub/Sub и Streams
+# laboratory_config.py — загрузка конфигов laboratory_v4: тикеры, стратегии, whitelist (версионные); слушатели Pub/Sub и Streams
 
+# 🔸 Импорты
 import json
 import logging
 import asyncio
@@ -18,6 +19,7 @@ from laboratory_infra import (
     clear_mw_whitelist_for_strategy,
 )
 
+# 🔸 Логгер
 log = logging.getLogger("LAB_CONFIG")
 
 
@@ -41,32 +43,42 @@ async def load_enabled_strategies():
         log.info("✅ Загружено стратегий: %d", len(strategies))
 
 
-# 🔸 Первичная загрузка whitelist (PACK)
+# 🔸 Первичная загрузка whitelist (PACK) — версионная
 async def load_pack_whitelist():
     query = "SELECT * FROM oracle_pack_whitelist"
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
-        grouped: dict[int, list] = {}
-        for r in rows:
-            sid = int(r["strategy_id"])
-            grouped.setdefault(sid, []).append(dict(r))
-        for sid, data in grouped.items():
-            set_pack_whitelist_for_strategy(sid, data, {"loaded": True})
-        log.info("✅ Загружено PACK whitelist (стратегий: %d)", len(grouped))
+
+    # группировка по (strategy_id, version)
+    grouped: dict[tuple[int, str], list] = {}
+    for r in rows:
+        sid = int(r["strategy_id"])
+        ver = str(r.get("version") or "v1").strip().lower()
+        grouped.setdefault((sid, ver), []).append(dict(r))
+
+    for (sid, ver), data in grouped.items():
+        set_pack_whitelist_for_strategy(sid, data, {"loaded": True}, version=ver)
+
+    log.info("✅ Загружено PACK whitelist (стратегий×версий: %d)", len(grouped))
 
 
-# 🔸 Первичная загрузка whitelist (MW)
+# 🔸 Первичная загрузка whitelist (MW) — версионная
 async def load_mw_whitelist():
     query = "SELECT * FROM oracle_mw_whitelist"
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(query)
-        grouped: dict[int, list] = {}
-        for r in rows:
-            sid = int(r["strategy_id"])
-            grouped.setdefault(sid, []).append(dict(r))
-        for sid, data in grouped.items():
-            set_mw_whitelist_for_strategy(sid, data, {"loaded": True})
-        log.info("✅ Загружено MW whitelist (стратегий: %d)", len(grouped))
+
+    # группировка по (strategy_id, version)
+    grouped: dict[tuple[int, str], list] = {}
+    for r in rows:
+        sid = int(r["strategy_id"])
+        ver = str(r.get("version") or "v1").strip().lower()
+        grouped.setdefault((sid, ver), []).append(dict(r))
+
+    for (sid, ver), data in grouped.items():
+        set_mw_whitelist_for_strategy(sid, data, {"loaded": True}, version=ver)
+
+    log.info("✅ Загружено MW whitelist (стратегий×версий: %d)", len(grouped))
 
 
 # 🔸 Точечное обновление стратегии (по событию Pub/Sub)
@@ -75,13 +87,16 @@ async def handle_strategy_event(payload: dict):
     if not sid:
         return
     sid = int(sid)
+
     async with infra.pg_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM strategies_v4 WHERE id=$1", sid)
+
     if not row:
         if sid in infra.enabled_strategies:
             infra.enabled_strategies.pop(sid, None)
             log.info("🧹 strategy id=%s удалена из кэша", sid)
         return
+
     enabled = bool(row["enabled"])
     if enabled:
         infra.enabled_strategies[sid] = dict(row)
@@ -120,6 +135,7 @@ def _extract_stream_payload(fields: dict) -> dict:
       1) Плоские поля: strategy_id=..., report_id=..., ...
       2) Один ключ 'data' с JSON-строкой: {"strategy_id":..., ...}
     Также нормализует синонимы метрик: rows_whitelist/rows_blacklist ↔ wl/bl, rows_inserted ↔ rows_total.
+    Добавляет нормализованную версию 'version' (v1 по умолчанию).
     """
     # базовая распаковка
     payload: dict = {}
@@ -157,10 +173,14 @@ def _extract_stream_payload(fields: dict) -> dict:
     if "report_id" in payload:
         payload["report_id"] = _as_int(payload["report_id"], None)
 
+    # нормализация версии
+    ver = str(payload.get("version") or "v1").strip().lower()
+    payload["version"] = ver
+
     return payload
 
 
-# 🔸 Слушатель Streams обновлений whitelist (PACK + MW)
+# 🔸 Слушатель Streams обновлений whitelist (PACK + MW) — версионный
 async def whitelist_stream_listener():
     streams = {
         "oracle:pack_lists:reports_ready": "pack",
@@ -174,6 +194,7 @@ async def whitelist_stream_listener():
             response = await infra.redis_client.xread(streams=last_ids, block=5000, count=10)
             if not response:
                 continue
+
             for stream_name, messages in response:
                 for msg_id, fields in messages:
                     last_ids[stream_name] = msg_id
@@ -182,17 +203,23 @@ async def whitelist_stream_listener():
                         payload = _extract_stream_payload(fields)
 
                         sid = payload.get("strategy_id")
+                        ver = payload.get("version") or "v1"
                         if not sid:
-                            log.info("⚠️ Пропуск события stream=%s msg=%s: нет strategy_id в payload=%s", stream_name, msg_id, payload)
+                            log.info("⚠️ Пропуск события stream=%s msg=%s: нет strategy_id в payload=%s",
+                                     stream_name, msg_id, payload)
                             continue
 
                         if streams[stream_name] == "pack":
-                            await start_pack_update(sid)
+                            await start_pack_update(sid, ver)
                             try:
                                 async with infra.pg_pool.acquire() as conn:
-                                    rows = await conn.fetch("SELECT * FROM oracle_pack_whitelist WHERE strategy_id=$1", sid)
+                                    rows = await conn.fetch(
+                                        "SELECT * FROM oracle_pack_whitelist WHERE strategy_id=$1 AND version=$2",
+                                        sid, ver
+                                    )
                                 if rows:
                                     meta = {
+                                        "version": ver,
                                         "report_id": payload.get("report_id"),
                                         "time_frame": payload.get("time_frame"),
                                         "window_end": payload.get("window_end"),
@@ -201,19 +228,23 @@ async def whitelist_stream_listener():
                                         "wl": payload.get("wl"),
                                         "bl": payload.get("bl"),
                                     }
-                                    set_pack_whitelist_for_strategy(sid, [dict(r) for r in rows], meta)
+                                    set_pack_whitelist_for_strategy(sid, [dict(r) for r in rows], meta, version=ver)
                                 else:
-                                    clear_pack_whitelist_for_strategy(sid)
+                                    clear_pack_whitelist_for_strategy(sid, version=ver)
                             finally:
-                                finish_pack_update(sid)
+                                finish_pack_update(sid, ver)
 
                         elif streams[stream_name] == "mw":
-                            await start_mw_update(sid)
+                            await start_mw_update(sid, ver)
                             try:
                                 async with infra.pg_pool.acquire() as conn:
-                                    rows = await conn.fetch("SELECT * FROM oracle_mw_whitelist WHERE strategy_id=$1", sid)
+                                    rows = await conn.fetch(
+                                        "SELECT * FROM oracle_mw_whitelist WHERE strategy_id=$1 AND version=$2",
+                                        sid, ver
+                                    )
                                 if rows:
                                     meta = {
+                                        "version": ver,
                                         "report_id": payload.get("report_id"),
                                         "time_frame": payload.get("time_frame"),
                                         "window_end": payload.get("window_end"),
@@ -221,14 +252,15 @@ async def whitelist_stream_listener():
                                         "rows_total": payload.get("rows_total"),
                                         "wl": payload.get("wl") or payload.get("rows_whitelist"),
                                     }
-                                    set_mw_whitelist_for_strategy(sid, [dict(r) for r in rows], meta)
+                                    set_mw_whitelist_for_strategy(sid, [dict(r) for r in rows], meta, version=ver)
                                 else:
-                                    clear_mw_whitelist_for_strategy(sid)
+                                    clear_mw_whitelist_for_strategy(sid, version=ver)
                             finally:
-                                finish_mw_update(sid)
+                                finish_mw_update(sid, ver)
 
                     except Exception:
                         log.exception("❌ Ошибка при обновлении WL по событию (stream=%s, msg=%s)", stream_name, msg_id)
+
         except asyncio.CancelledError:
             log.info("⏹️ Остановка слушателя Streams")
             raise

@@ -1,12 +1,16 @@
-# laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигов и WL, шторки/локи
+# laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигов и WL, шторки/локи (две версии WL)
 
+# 🔸 Импорты
 import os
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 import asyncpg
 import redis.asyncio as aioredis
 import asyncio
+
+# 🔸 Константы
+DEFAULT_VERSION = "v1"
 
 # 🔸 Глобальные переменные подключений
 pg_pool: asyncpg.Pool | None = None
@@ -16,15 +20,17 @@ redis_client: aioredis.Redis | None = None
 enabled_tickers: Dict[str, Dict[str, Any]] = {}       # {symbol -> row_dict (*все поля*)}
 enabled_strategies: Dict[int, Dict[str, Any]] = {}    # {strategy_id -> row_dict (*все поля*)}
 
-# 🔸 Кэши whitelist по стратегиям (полный срез строк)
-pack_wl_by_strategy: Dict[int, Dict[str, Any]] = {}   # {sid -> {"rows": List[dict], "meta": {...}}}
-mw_wl_by_strategy: Dict[int, Dict[str, Any]] = {}     # {sid -> {"rows": List[dict], "meta": {...}}}
+# 🔸 Кэши whitelist по стратегиям (версионные)
+#     Структура: pack_wl_by_strategy_ver[sid][version] -> {"rows": [...], "meta": {...}}
+#                mw_wl_by_strategy_ver[sid][version]   -> {"rows": [...], "meta": {...}}
+pack_wl_by_strategy_ver: Dict[int, Dict[str, Dict[str, Any]]] = {}
+mw_wl_by_strategy_ver: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
-# 🔸 Шторки (готовность данных) и локи (защита обновления) по стратегиям
-_pack_ready_events: Dict[int, asyncio.Event] = {}
-_mw_ready_events: Dict[int, asyncio.Event] = {}
-_pack_update_locks: Dict[int, asyncio.Lock] = {}
-_mw_update_locks: Dict[int, asyncio.Lock] = {}
+# 🔸 Шторки (готовность данных) и локи (защита обновления) по (strategy_id, version)
+_pack_ready_events: Dict[Tuple[int, str], asyncio.Event] = {}
+_mw_ready_events: Dict[Tuple[int, str], asyncio.Event] = {}
+_pack_update_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
+_mw_update_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
 
 # 🔸 Параметры окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -32,6 +38,16 @@ REDIS_USE_TLS = os.getenv("REDIS_USE_TLS", "false").lower() == "true"
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_INFRA")
+
+
+# 🔸 Внутренние утилиты нормализации
+def _norm_version(version: str | None) -> str:
+    v = (version or DEFAULT_VERSION).strip().lower()
+    return v or DEFAULT_VERSION
+
+
+def _k(sid: int, version: str | None) -> Tuple[int, str]:
+    return int(sid), _norm_version(version)
 
 
 # 🔸 Настройка логирования
@@ -102,110 +118,136 @@ def set_enabled_strategies(new_dict: Dict[int, Dict[str, Any]]):
 
 
 # 🔸 Обеспечение наличия шторок и локов (PACK)
-def _ensure_pack_sync_primitives(sid: int):
-    if sid not in _pack_ready_events:
-        _pack_ready_events[sid] = asyncio.Event()
-        _pack_ready_events[sid].set()  # по умолчанию «готово», пока не начнётся обновление
-    if sid not in _pack_update_locks:
-        _pack_update_locks[sid] = asyncio.Lock()
+def _ensure_pack_sync_primitives(sid: int, version: str):
+    k = _k(sid, version)
+    if k not in _pack_ready_events:
+        _pack_ready_events[k] = asyncio.Event()
+        _pack_ready_events[k].set()  # по умолчанию «готово», пока не начнётся обновление
+    if k not in _pack_update_locks:
+        _pack_update_locks[k] = asyncio.Lock()
 
 
 # 🔸 Обеспечение наличия шторок и локов (MW)
-def _ensure_mw_sync_primitives(sid: int):
-    if sid not in _mw_ready_events:
-        _mw_ready_events[sid] = asyncio.Event()
-        _mw_ready_events[sid].set()
-    if sid not in _mw_update_locks:
-        _mw_update_locks[sid] = asyncio.Lock()
+def _ensure_mw_sync_primitives(sid: int, version: str):
+    k = _k(sid, version)
+    if k not in _mw_ready_events:
+        _mw_ready_events[k] = asyncio.Event()
+        _mw_ready_events[k].set()
+    if k not in _mw_update_locks:
+        _mw_update_locks[k] = asyncio.Lock()
 
 
 # 🔸 Старт/финиш обновления PACK для стратегии (шторка+лок)
-async def start_pack_update(sid: int):
-    _ensure_pack_sync_primitives(sid)
+async def start_pack_update(sid: int, version: str):
+    _ensure_pack_sync_primitives(sid, version)
+    k = _k(sid, version)
     # опускаем шторку — читатели будут ждать свежие данные
-    _pack_ready_events[sid].clear()
-    await _pack_update_locks[sid].acquire()
-    log.info("🔧 PACK обновление начато (strategy_id=%s)", sid)
+    _pack_ready_events[k].clear()
+    await _pack_update_locks[k].acquire()
+    log.info("🔧 PACK обновление начато (strategy_id=%s, ver=%s)", sid, _norm_version(version))
 
 
-def finish_pack_update(sid: int):
+def finish_pack_update(sid: int, version: str):
+    k = _k(sid, version)
     # атомарная публикация нового среза уже должна быть выполнена до вызова
-    if sid in _pack_update_locks and _pack_update_locks[sid].locked():
-        _pack_update_locks[sid].release()
-    if sid in _pack_ready_events:
-        _pack_ready_events[sid].set()
-    log.info("✅ PACK обновление завершено (strategy_id=%s)", sid)
+    if k in _pack_update_locks and _pack_update_locks[k].locked():
+        _pack_update_locks[k].release()
+    if k in _pack_ready_events:
+        _pack_ready_events[k].set()
+    log.info("✅ PACK обновление завершено (strategy_id=%s, ver=%s)", sid, _norm_version(version))
 
 
 # 🔸 Старт/финиш обновления MW для стратегии (шторка+лок)
-async def start_mw_update(sid: int):
-    _ensure_mw_sync_primitives(sid)
-    _mw_ready_events[sid].clear()
-    await _mw_update_locks[sid].acquire()
-    log.info("🔧 MW обновление начато (strategy_id=%s)", sid)
+async def start_mw_update(sid: int, version: str):
+    _ensure_mw_sync_primitives(sid, version)
+    k = _k(sid, version)
+    _mw_ready_events[k].clear()
+    await _mw_update_locks[k].acquire()
+    log.info("🔧 MW обновление начато (strategy_id=%s, ver=%s)", sid, _norm_version(version))
 
 
-def finish_mw_update(sid: int):
-    if sid in _mw_update_locks and _mw_update_locks[sid].locked():
-        _mw_update_locks[sid].release()
-    if sid in _mw_ready_events:
-        _mw_ready_events[sid].set()
-    log.info("✅ MW обновление завершено (strategy_id=%s)", sid)
+def finish_mw_update(sid: int, version: str):
+    k = _k(sid, version)
+    if k in _mw_update_locks and _mw_update_locks[k].locked():
+        _mw_update_locks[k].release()
+    if k in _mw_ready_events:
+        _mw_ready_events[k].set()
+    log.info("✅ MW обновление завершено (strategy_id=%s, ver=%s)", sid, _norm_version(version))
 
 
-# 🔸 Ожидание готовности данных (читатели)
-async def wait_pack_ready(sid: int, timeout_sec: float | None = 5.0) -> bool:
-    _ensure_pack_sync_primitives(sid)
+# 🔸 Ожидание готовности данных (читатели) — PACK
+async def wait_pack_ready(sid: int, version: str, timeout_sec: float | None = 5.0) -> bool:
+    _ensure_pack_sync_primitives(sid, version)
     try:
-        await asyncio.wait_for(_pack_ready_events[sid].wait(), timeout=timeout_sec)
+        await asyncio.wait_for(_pack_ready_events[_k(sid, version)].wait(), timeout=timeout_sec)
         return True
     except asyncio.TimeoutError:
-        log.info("⏳ PACK ожидание свежих данных истекло (strategy_id=%s, timeout=%.1fs)", sid, timeout_sec or -1)
+        log.info("⏳ PACK ожидание свежих данных истекло (strategy_id=%s, ver=%s, timeout=%.1fs)",
+                 sid, _norm_version(version), timeout_sec or -1)
         return False
 
 
-# 🔸 Ожидание готовности данных (читатели)
-async def wait_mw_ready(sid: int, timeout_sec: float | None = 5.0) -> bool:
-    _ensure_mw_sync_primitives(sid)
+# 🔸 Ожидание готовности данных (читатели) — MW
+async def wait_mw_ready(sid: int, version: str, timeout_sec: float | None = 5.0) -> bool:
+    _ensure_mw_sync_primitives(sid, version)
     try:
-        await asyncio.wait_for(_mw_ready_events[sid].wait(), timeout=timeout_sec)
+        await asyncio.wait_for(_mw_ready_events[_k(sid, version)].wait(), timeout=timeout_sec)
         return True
     except asyncio.TimeoutError:
-        log.info("⏳ MW ожидание свежих данных истекло (strategy_id=%s, timeout=%.1fs)", sid, timeout_sec or -1)
+        log.info("⏳ MW ожидание свежих данных истекло (strategy_id=%s, ver=%s, timeout=%.1fs)",
+                 sid, _norm_version(version), timeout_sec or -1)
         return False
 
 
-# 🔸 Атомарная замена WL-среза (PACK) по стратегии
-def set_pack_whitelist_for_strategy(sid: int, rows: List[Dict[str, Any]] | None, meta: Dict[str, Any] | None = None):
-    pack_wl_by_strategy[sid] = {
+# 🔸 Атомарная замена WL-среза (PACK) по стратегии и версии
+def set_pack_whitelist_for_strategy(
+    sid: int,
+    rows: List[Dict[str, Any]] | None,
+    meta: Dict[str, Any] | None,
+    version: str,
+):
+    ver = _norm_version(version)
+    d = pack_wl_by_strategy_ver.setdefault(int(sid), {})
+    d[ver] = {
         "rows": rows or [],
-        "meta": meta or {},
+        "meta": {**(meta or {}), "version": ver},
     }
-    log.info("📦 PACK WL обновлён (strategy_id=%s, rows=%d)", sid, len(pack_wl_by_strategy[sid]["rows"]))
+    log.info("📦 PACK WL обновлён (strategy_id=%s, ver=%s, rows=%d)", sid, ver, len(d[ver]["rows"]))
 
 
-# 🔸 Очистка WL-среза (PACK) по стратегии
-def clear_pack_whitelist_for_strategy(sid: int):
-    pack_wl_by_strategy[sid] = {
+# 🔸 Очистка WL-среза (PACK) по стратегии и версии
+def clear_pack_whitelist_for_strategy(sid: int, version: str):
+    ver = _norm_version(version)
+    d = pack_wl_by_strategy_ver.setdefault(int(sid), {})
+    d[ver] = {
         "rows": [],
-        "meta": {"note": "cleared"},
+        "meta": {"note": "cleared", "version": ver},
     }
-    log.info("🧹 PACK WL очищён (strategy_id=%s)", sid)
+    log.info("🧹 PACK WL очищён (strategy_id=%s, ver=%s)", sid, ver)
 
 
-# 🔸 Атомарная замена WL-среза (MW) по стратегии
-def set_mw_whitelist_for_strategy(sid: int, rows: List[Dict[str, Any]] | None, meta: Dict[str, Any] | None = None):
-    mw_wl_by_strategy[sid] = {
+# 🔸 Атомарная замена WL-среза (MW) по стратегии и версии
+def set_mw_whitelist_for_strategy(
+    sid: int,
+    rows: List[Dict[str, Any]] | None,
+    meta: Dict[str, Any] | None,
+    version: str,
+):
+    ver = _norm_version(version)
+    d = mw_wl_by_strategy_ver.setdefault(int(sid), {})
+    d[ver] = {
         "rows": rows or [],
-        "meta": meta or {},
+        "meta": {**(meta or {}), "version": ver},
     }
-    log.info("📦 MW WL обновлён (strategy_id=%s, rows=%d)", sid, len(mw_wl_by_strategy[sid]["rows"]))
+    log.info("📦 MW WL обновлён (strategy_id=%s, ver=%s, rows=%d)", sid, ver, len(d[ver]["rows"]))
 
 
-# 🔸 Очистка WL-среза (MW) по стратегии
-def clear_mw_whitelist_for_strategy(sid: int):
-    mw_wl_by_strategy[sid] = {
+# 🔸 Очистка WL-среза (MW) по стратегии и версии
+def clear_mw_whitelist_for_strategy(sid: int, version: str):
+    ver = _norm_version(version)
+    d = mw_wl_by_strategy_ver.setdefault(int(sid), {})
+    d[ver] = {
         "rows": [],
-        "meta": {"note": "cleared"},
+        "meta": {"note": "cleared", "version": ver},
     }
-    log.info("🧹 MW WL очищён (strategy_id=%s)", sid)
+    log.info("🧹 MW WL очищён (strategy_id=%s, ver=%s)", sid, ver)

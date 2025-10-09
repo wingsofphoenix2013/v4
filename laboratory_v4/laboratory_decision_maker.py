@@ -1,4 +1,4 @@
-# laboratory_decision_maker.py — Этап 3: сценарии принятия решения (mw_only / mw_then_pack / mw_and_pack) + запись по КАЖДОМУ TF
+# laboratory_decision_maker.py — Этап 3: принятие решения (mw_only / mw_then_pack / mw_and_pack / pack_only) с поддержкой версий WL/BL (v1/v2)
 
 # 🔸 Импорты
 import asyncio
@@ -33,6 +33,10 @@ GATE_TTL_SEC = LAB_DEADLINE_MS // 1000 + 30
 # 🔸 Таймфреймы (порядок нормализации)
 TF_ORDER = ("m5", "m15", "h1")
 
+# 🔸 Версии oracle
+DEFAULT_VERSION = "v1"
+ALLOWED_VERSIONS = {"v1", "v2"}
+
 # 🔸 Публичные префиксы PACK-кэша (KV)
 PACK_PUBLIC_PREFIX = {
     "bb": "bbpos_pack",
@@ -49,20 +53,16 @@ def _parse_bool_flag(s: str) -> bool:
     return v in {"1", "true", "yes", "on", "y", "t"}
 
 
-# 🔸 BL: ключ KV с активным порогом для мастера и TF (laboratory:bl:k:{sid}:{tf})
-def _bl_k_key(master_sid: int, tf: str) -> str:
-    return f"laboratory:bl:k:{int(master_sid)}:{tf.strip().lower()}"
+# 🔸 BL: ключ KV с активным порогом для мастера, TF и версии (laboratory:bl:k:{sid}:{tf}:{ver})
+def _bl_k_key(master_sid: int, tf: str, version: str) -> str:
+    return f"laboratory:bl:k:{int(master_sid)}:{tf.strip().lower()}:{(version or DEFAULT_VERSION).strip().lower()}"
 
 
-# 🔸 BL: чтение порогов по всем запрошенным TF одним MGET → {tf: K}
-async def _read_bl_thresholds(master_sid: int, tfs: list[str]) -> dict[str, int]:
-    """
-    Читает компактные пороги из Redis для ключей вида laboratory:bl:k:{master_sid}:{tf}.
-    Отсутствующие ключи трактуются как 0 (фильтр выключен).
-    """
-    # нормализация уникального списка TF (сохраняем порядок вызова)
+# 🔸 BL: чтение порогов по всем запрошенным TF одним MGET → {tf: K} (только версионные ключи)
+async def _read_bl_thresholds(master_sid: int, tfs: List[str], version: str) -> Dict[str, int]:
+    # нормализация уникального списка TF (сохраняем порядок)
     seen = set()
-    tf_list: list[str] = []
+    tf_list: List[str] = []
     for tf in tfs or []:
         t = (tf or "").strip().lower()
         if t and t not in seen:
@@ -72,7 +72,7 @@ async def _read_bl_thresholds(master_sid: int, tfs: list[str]) -> dict[str, int]
         return {}
 
     # MGET всех ключей сразу
-    keys = [_bl_k_key(master_sid, tf) for tf in tf_list]
+    keys = [_bl_k_key(master_sid, tf, version) for tf in tf_list]
     try:
         values = await infra.redis_client.mget(*keys)
     except Exception:
@@ -80,14 +80,15 @@ async def _read_bl_thresholds(master_sid: int, tfs: list[str]) -> dict[str, int]
         return {tf: 0 for tf in tf_list}
 
     # приведение к int с дефолтом 0
-    out: dict[str, int] = {}
+    out: Dict[str, int] = {}
     for tf, raw in zip(tf_list, values):
         try:
             out[tf] = int(raw) if raw is not None else 0
         except Exception:
             out[tf] = 0
     return out
-    
+
+
 # 🔸 Семафоры конкуренции
 _decisions_sem = asyncio.Semaphore(MAX_IN_FLIGHT_DECISIONS)
 _gateway_sem = asyncio.Semaphore(MAX_CONCURRENT_GATEWAY_CALLS)
@@ -121,6 +122,7 @@ def _to_json_safe(obj: Any) -> Any:
     # fallback: строковое представление
     return str(obj)
 
+
 # 🔸 Вспомогательные парсеры/утилиты
 def _parse_timeframes(tf_str: str) -> List[str]:
     items = [x.strip().lower() for x in (tf_str or "").split(",") if x.strip()]
@@ -130,6 +132,7 @@ def _parse_timeframes(tf_str: str) -> List[str]:
             seen.add(tf)
             ordered.append(tf)
     return ordered
+
 
 # 🔸 Парсинг pack_base → (indicator, params)
 def _parse_pack_base(base: str) -> Tuple[str, Dict[str, Any]]:
@@ -161,14 +164,17 @@ def _parse_pack_base(base: str) -> Tuple[str, Dict[str, Any]]:
         return s, {}
     return s, {}
 
+
 # 🔸 Формирование публичного KV-ключа для PACK-объекта
 def _public_pack_key(indicator: str, symbol: str, tf: str, base: str) -> str:
     pref = PACK_PUBLIC_PREFIX.get(indicator, f"{indicator}_pack")
     return f"{pref}:{symbol}:{tf}:{base}"
 
+
 # 🔸 Публичный KV-ключ MW-пакета
 def _public_mw_key(kind: str, symbol: str, tf: str) -> str:
     return f"{kind}_pack:{symbol}:{tf}:{kind}"
+
 
 # 🔸 Безопасный json.loads
 def _json_or_none(s: Optional[str]) -> Optional[dict]:
@@ -179,9 +185,11 @@ def _json_or_none(s: Optional[str]) -> Optional[dict]:
     except Exception:
         return None
 
+
 # 🔸 Текущее монотонное время в мс
 def _now_monotonic_ms() -> int:
     return int(time.monotonic() * 1000)
+
 
 # 🔸 MGET JSON пачкой
 async def _mget_json(keys: List[str]) -> Dict[str, Optional[dict]]:
@@ -189,6 +197,7 @@ async def _mget_json(keys: List[str]) -> Dict[str, Optional[dict]]:
         return {}
     values = await infra.redis_client.mget(*keys)
     return {k: _json_or_none(v) for k, v in zip(keys, values)}
+
 
 # 🔸 Запрос и ожидание появления PACK в публичном KV (cache-first, с коалесценсом)
 async def _ensure_pack_available(
@@ -289,6 +298,7 @@ async def _ensure_pack_available(
                 if now2 > exp or done_and_none:
                     _coalesce.pop(ck, None)
 
+
 # 🔸 Снятие MW-пакета (cache-first → gateway)
 async def _get_mw_pack(symbol: str, tf: str, kind: str, deadline_ms: int, telemetry: Dict[str, int]) -> Tuple[Optional[dict], str]:
     key = _public_mw_key(kind, symbol, tf)
@@ -305,9 +315,10 @@ async def _get_mw_pack(symbol: str, tf: str, kind: str, deadline_ms: int, teleme
     )
     return obj, src
 
-# 🔸 Снимок MW для (sid, symbol, direction, tf)
+
+# 🔸 Снимок MW для (sid, symbol, direction, tf, version)
 async def _collect_mw_snapshot(
-    sid: int, symbol: str, direction: str, tf: str, deadline_ms: int, telemetry: Dict[str, int]
+    sid: int, symbol: str, direction: str, tf: str, deadline_ms: int, telemetry: Dict[str, int], version: str
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"states": {}, "rules": []}
 
@@ -321,22 +332,23 @@ async def _collect_mw_snapshot(
         else:
             out["states"][kind] = {"source": "timeout", "pack": None}
 
-    # MW правила из кэша стратегии
-    mw_rows_all = (infra.mw_wl_by_strategy.get(sid) or {}).get("rows", [])
+    # MW правила из кэша стратегии для нужной версии
+    mw_rows_all = ((infra.mw_wl_by_strategy_ver.get(sid) or {}).get(version) or {}).get("rows", [])
     out["rules"] = [
         dict(r) for r in mw_rows_all
         if (str(r.get("timeframe")) == tf and str(r.get("direction")).lower() == direction)
     ]
     return out
 
-# 🔸 Снимок PACK для (sid, symbol, direction, tf)
+
+# 🔸 Снимок PACK для (sid, symbol, direction, tf, version)
 async def _collect_pack_snapshot(
-    sid: int, symbol: str, direction: str, tf: str, deadline_ms: int, telemetry: Dict[str, int]
+    sid: int, symbol: str, direction: str, tf: str, deadline_ms: int, telemetry: Dict[str, int], version: str
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"objects": {}, "rules": []}
 
-    # все правила PACK (WL и BL) для данного TF/направления
-    pack_rows_all = (infra.pack_wl_by_strategy.get(sid) or {}).get("rows", [])
+    # все правила PACK (WL и BL) для данного TF/направления из нужной версии
+    pack_rows_all = ((infra.pack_wl_by_strategy_ver.get(sid) or {}).get(version) or {}).get("rows", [])
     rows_tf = [
         dict(r) for r in pack_rows_all
         if (str(r.get("timeframe")) == tf and str(r.get("direction")).lower() == direction)
@@ -372,6 +384,7 @@ async def _collect_pack_snapshot(
 
     return out
 
+
 # 🔸 Построение факта для MW по agg_base
 def _build_mw_fact(states: Dict[str, Any], agg_base: str) -> Optional[str]:
     if not agg_base:
@@ -385,6 +398,7 @@ def _build_mw_fact(states: Dict[str, Any], agg_base: str) -> Optional[str]:
             return None
         parts.append(f"{base}:{st.strip().lower()}")
     return "|".join(parts)
+
 
 # 🔸 Подсчёт совпадений для MW-WL
 def _mw_count_hits(mw_rules: List[Dict[str, Any]], states: Dict[str, Any]) -> Tuple[int, int]:
@@ -401,6 +415,7 @@ def _mw_count_hits(mw_rules: List[Dict[str, Any]], states: Dict[str, Any]) -> Tu
             hits += 1
     return hits, total
 
+
 # 🔸 Построение факта для PACK по agg_key из pack payload
 def _build_pack_fact(pack_obj: Dict[str, Any], agg_key: str) -> Optional[str]:
     if not agg_key:
@@ -414,6 +429,7 @@ def _build_pack_fact(pack_obj: Dict[str, Any], agg_key: str) -> Optional[str]:
             return None
         parts.append(f"{k}:{str(v).strip().lower()}")
     return "|".join(parts)
+
 
 # 🔸 Подсчёт совпадений для PACK (WL/BL)
 def _pack_count_hits(
@@ -461,7 +477,8 @@ def _pack_count_hits(
 
     return wl_hits, wl_total, bl_hits, bl_total
 
-# 🔸 Персист одной строки по КОНКРЕТНОМУ TF (Этап 3: allow/deny per TF + счётчики)
+
+# 🔸 Персист одной строки по КОНКРЕТНОМУ TF (Этап 3: allow/deny per TF + счётчики + oracle_version)
 async def _persist_decision_tf(
     req_id: str,
     log_uid: str,
@@ -485,6 +502,7 @@ async def _persist_decision_tf(
     pack_bl_total: int,
     allow_tf: bool,
     reason_tf: str,
+    oracle_version: str,
 ):
     async with infra.pg_pool.acquire() as conn:
         if client_strategy_id is None:
@@ -510,12 +528,14 @@ async def _persist_decision_tf(
                        pack_wl_rules_total=$16,
                        pack_wl_hits=$17,
                        pack_bl_rules_total=$18,
-                       pack_bl_hits=$19
-                 WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id IS NULL AND tf=$4
+                       pack_bl_hits=$19,
+                       oracle_version=$20
+                 WHERE log_uid=$21 AND strategy_id=$22 AND client_strategy_id IS NULL AND tf=$4 AND oracle_version=$20
                 """,
                 req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
                 finished_at_dt, duration_ms, kv_hits, gateway_requests,
                 mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+                oracle_version,
                 log_uid, strategy_id
             )
             if upd_status.startswith("UPDATE 1"):
@@ -528,18 +548,21 @@ async def _persist_decision_tf(
                      timeframes_requested, timeframes_processed, protocol_version,
                      allow, reason, tf_results, errors,
                      received_at, finished_at, duration_ms, cache_hits, gateway_requests,
-                     mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits)
+                     mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits,
+                     oracle_version)
                 VALUES ($1,$2,$3,NULL,$4,$5,$6,
                         $7,$8,'v1',
                         $9,$10,COALESCE($11::jsonb,NULL),NULL,
                         $12,$13,$14,$15,$16,
-                        $17,$18,$19,$20,$21,$22)
+                        $17,$18,$19,$20,$21,$22,
+                        $23)
                 ON CONFLICT DO NOTHING
                 """,
                 req_id, log_uid, strategy_id, direction, symbol, tf,
                 tfr_req, tf, allow_tf, reason_tf, tf_result_json,
                 received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests,
-                mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits
+                mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+                oracle_version
             )
             if ins_status.endswith(" 1"):
                 return
@@ -565,12 +588,14 @@ async def _persist_decision_tf(
                        pack_wl_rules_total=$16,
                        pack_wl_hits=$17,
                        pack_bl_rules_total=$18,
-                       pack_bl_hits=$19
-                 WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id IS NULL AND tf=$4
+                       pack_bl_hits=$19,
+                       oracle_version=$20
+                 WHERE log_uid=$21 AND strategy_id=$22 AND client_strategy_id IS NULL AND tf=$4 AND oracle_version=$20
                 """,
                 req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
                 finished_at_dt, duration_ms, kv_hits, gateway_requests,
                 mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+                oracle_version,
                 log_uid, strategy_id
             )
             return
@@ -597,12 +622,14 @@ async def _persist_decision_tf(
                    pack_wl_rules_total=$16,
                    pack_wl_hits=$17,
                    pack_bl_rules_total=$18,
-                   pack_bl_hits=$19
-             WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id=$22 AND tf=$4
+                   pack_bl_hits=$19,
+                   oracle_version=$20
+             WHERE log_uid=$21 AND strategy_id=$22 AND client_strategy_id=$23 AND tf=$4 AND oracle_version=$20
             """,
             req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
             finished_at_dt, duration_ms, kv_hits, gateway_requests,
             mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+            oracle_version,
             log_uid, strategy_id, int(client_strategy_id)
         )
         if upd_status.startswith("UPDATE 1"):
@@ -614,18 +641,21 @@ async def _persist_decision_tf(
                  timeframes_requested, timeframes_processed, protocol_version,
                  allow, reason, tf_results, errors,
                  received_at, finished_at, duration_ms, cache_hits, gateway_requests,
-                 mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits)
+                 mw_wl_rules_total, mw_wl_hits, pack_wl_rules_total, pack_wl_hits, pack_bl_rules_total, pack_bl_hits,
+                 oracle_version)
             VALUES ($1,$2,$3,$4,$5,$6,$7,
                     $8,$9,'v1',
                     $10,$11,COALESCE($12::jsonb,NULL),NULL,
                     $13,$14,$15,$16,$17,
-                    $18,$19,$20,$21,$22,$23)
+                    $18,$19,$20,$21,$22,$23,
+                    $24)
             ON CONFLICT DO NOTHING
             """,
             req_id, log_uid, strategy_id, int(client_strategy_id), direction, symbol, tf,
             tfr_req, tf, allow_tf, reason_tf, tf_result_json,
             received_at_dt, finished_at_dt, duration_ms, kv_hits, gateway_requests,
-            mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits
+            mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+            oracle_version
         )
         if ins_status.endswith(" 1"):
             return
@@ -650,14 +680,17 @@ async def _persist_decision_tf(
                    pack_wl_rules_total=$16,
                    pack_wl_hits=$17,
                    pack_bl_rules_total=$18,
-                   pack_bl_hits=$19
-             WHERE log_uid=$20 AND strategy_id=$21 AND client_strategy_id=$22 AND tf=$4
+                   pack_bl_hits=$19,
+                   oracle_version=$20
+             WHERE log_uid=$21 AND strategy_id=$22 AND client_strategy_id=$23 AND tf=$4 AND oracle_version=$20
             """,
             req_id, direction, symbol, tf, tfr_req, tf, allow_tf, reason_tf, tf_result_json,
             finished_at_dt, duration_ms, kv_hits, gateway_requests,
             mw_wl_total, mw_wl_hits, pack_wl_total, pack_wl_hits, pack_bl_total, pack_bl_hits,
+            oracle_version,
             log_uid, strategy_id, int(client_strategy_id)
         )
+
 
 # 🔸 Ключи шторки/очереди
 def _gate_key(gate_sid: int, symbol: str) -> str:
@@ -668,6 +701,7 @@ def _queue_key(gate_sid: int, symbol: str) -> str:
 
 def _qfields_key(req_id: str) -> str:
     return f"lab:qfields:{req_id}"
+
 
 # 🔸 Получить лидерство или встать в очередь (anti-dup per (gate_sid,symbol))
 async def _acquire_gate_or_enqueue(
@@ -690,6 +724,7 @@ async def _acquire_gate_or_enqueue(
     await infra.redis_client.set(fk, json.dumps(fields, ensure_ascii=False), ex=gate_ttl_sec + 60)
     log.debug("[GATE] ⏸️ в очередь gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
     return False, "enqueued"
+
 
 # 🔸 Реакция по завершении лидера (allow=true → отказ очереди; allow=false → следующий лидер)
 async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, allow: bool):
@@ -736,7 +771,8 @@ async def _on_leader_finished(gate_sid: int, symbol: str, leader_req_id: str, al
 
     asyncio.create_task(_process_request_core(next_req_id, fields))
 
-# 🔸 Ядро обработки запроса (Этап 3: сценарии mw_only / mw_then_pack / mw_and_pack + опциональный BL-вeto)
+
+# 🔸 Ядро обработки запроса (Этап 3: сценарии mw_only / mw_then_pack / mw_and_pack / pack_only + опциональный BL-вeto)
 async def _process_request_core(msg_id: str, fields: Dict[str, str]):
     # всегда освобождаем ворота
     allow_for_gate = False
@@ -755,6 +791,8 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             direction = (fields.get("direction") or "").strip().lower()
             tfs_raw = fields.get("timeframes") or ""
             decision_mode_raw = (fields.get("decision_mode") or "").strip().lower()
+            version_raw = (fields.get("version") or fields.get("oracle_version") or DEFAULT_VERSION).strip().lower()
+            version = version_raw if version_raw in ALLOWED_VERSIONS else DEFAULT_VERSION
 
             # базовая валидация полей верхнего уровня
             if not log_uid or not strategy_id_s.isdigit() or direction not in ("long", "short") or not symbol or not tfs_raw:
@@ -765,7 +803,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 return
 
             # требуемый режим
-            if decision_mode_raw not in ("mw_only", "mw_then_pack", "mw_and_pack"):
+            if decision_mode_raw not in ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only"):
                 await infra.redis_client.xadd(DECISION_RESP_STREAM, {
                     "req_id": msg_id, "status": "error", "error": "incomplete_request", "message": "decision_mode required"
                 })
@@ -798,16 +836,16 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
             use_bl = _parse_bool_flag(fields.get("use_bl"))
             bl_thresholds: Dict[str, int] = {}
             if use_bl and tfs:
-                # читаем единожды пороги из KV: laboratory:bl:k:{sid}:{tf}
-                bl_thresholds = await _read_bl_thresholds(sid, tfs)
+                bl_thresholds = await _read_bl_thresholds(sid, tfs, version)
 
-            # ожидание готовности MW-кэша для стратегии (шторка)
-            await infra.wait_mw_ready(sid, timeout_sec=5.0)
+            # ожидание готовности WL-кэшей для стратегии/версии (шторки)
+            await infra.wait_mw_ready(sid, version, timeout_sec=5.0)
+            await infra.wait_pack_ready(sid, version, timeout_sec=5.0)
 
             # лог старта
             log.debug(
-                "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s use_bl=%s deadline=90s",
-                log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), decision_mode, str(use_bl).lower()
+                "[REQ] ▶️ start log_uid=%s master_sid=%s client_sid=%s %s %s tfs=%s mode=%s ver=%s use_bl=%s deadline=90s",
+                log_uid, sid, (client_sid_s or "-"), symbol, direction, ",".join(tfs), decision_mode, version, str(use_bl).lower()
             )
 
             telemetry: Dict[str, int] = {"kv_hits": 0, "gateway_requests": 0}
@@ -819,28 +857,35 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
             # цикл по каждой запрошенной TF — сбор снимка, подсчёт матчей, принятие решения per TF и запись строки
             for tf in tfs:
-                # MW snapshot
+                # MW snapshot (всегда собираем — для протокола и LPS)
                 mw_snap = await _collect_mw_snapshot(
-                    sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
+                    sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry, version=version
                 )
 
                 # PACK snapshot
                 pack_snap = await _collect_pack_snapshot(
-                    sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry
+                    sid=sid, symbol=symbol, direction=direction, tf=tf, deadline_ms=deadline_ms, telemetry=telemetry, version=version
                 )
 
-                # флаг неполного сбора по TF
-                incomplete = False
+                # флаги неполного сбора
+                # для pack_only — таймауты MW не блокируют решение; для остальных — блокируют
+                incomplete_mw = False
                 for kind in ("trend", "volatility", "momentum", "extremes"):
                     node = mw_snap["states"].get(kind)
                     if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
-                        incomplete = True
+                        incomplete_mw = True
                         break
-                if not incomplete:
-                    for base, node in (pack_snap.get("objects") or {}).items():
-                        if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
-                            incomplete = True
-                            break
+
+                incomplete_pack = False
+                for base, node in (pack_snap.get("objects") or {}).items():
+                    if not node or (isinstance(node, dict) and node.get("source") == "timeout"):
+                        incomplete_pack = True
+                        break
+
+                if decision_mode == "pack_only":
+                    incomplete = incomplete_pack
+                else:
+                    incomplete = incomplete_mw or incomplete_pack
 
                 # Подсчёт совпадений MW
                 mw_hits, mw_total = _mw_count_hits(mw_snap.get("rules", []), mw_snap.get("states", {}))
@@ -850,56 +895,55 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                     pack_snap.get("rules", []), pack_snap.get("objects", {})
                 )
 
-                # принятие решения per TF по сценарию (без учёта BL)
+                # принятие решения per TF по сценарию (до BL-вeto)
                 allow_tf = False
                 reason_tf = ""
+                origin_tf: Optional[str] = None
 
-                # если сбор неполный — сразу отказ
+                # если сбор неполный — отказ (по выбранным правилам неполноты)
                 if incomplete:
                     allow_tf = False
                     reason_tf = f"timeout_collect@{tf}"
                 else:
-                    # MW → PACK (всегда MW сначала)
+                    # MW → PACK (всегда MW сначала, кроме pack_only)
                     if decision_mode == "mw_only":
                         allow_tf = (mw_hits >= 1)
                         reason_tf = "ok_by_mw" if allow_tf else f"mw_no_match@{tf}"
+                        if allow_tf:
+                            origin_tf = "mw_only"
 
                     elif decision_mode == "mw_then_pack":
                         if mw_hits >= 1:
                             allow_tf = True
                             reason_tf = "ok_by_mw"
+                            origin_tf = "mw"
                         else:
                             allow_tf = (pack_wl_hits >= 1)
                             reason_tf = "ok_by_pack" if allow_tf else f"pack_no_wl@{tf}"
+                            if allow_tf:
+                                origin_tf = "pack"
 
-                    else:  # mw_and_pack
+                    elif decision_mode == "mw_and_pack":
                         need_mw = (mw_hits >= 1)
                         need_pack = (pack_wl_hits >= 1)
                         if need_mw and need_pack:
                             allow_tf = True
-                            reason_tf = "ok_by_mw"  # обе плоскости ок, фиксируем как ок по MW (доп. инфо не требуется)
+                            reason_tf = "ok_by_mw"
+                            origin_tf = "mw_and_pack"
                         else:
                             allow_tf = False
                             if not need_mw and not need_pack:
-                                # обе отсутствуют — укажем приоритетно MW
                                 reason_tf = f"mw_missing@{tf}"
                             elif not need_mw:
                                 reason_tf = f"mw_missing@{tf}"
                             else:
                                 reason_tf = f"pack_missing@{tf}"
 
-                # вычисление decision.origin для TF (до BL-вeto)
-                origin_tf: Optional[str] = None
-                if allow_tf:
-                    if decision_mode == "mw_only":
-                        origin_tf = "mw_only"
-                    elif decision_mode == "mw_and_pack":
-                        origin_tf = "mw_and_pack"
-                    else:  # mw_then_pack
-                        if reason_tf == "ok_by_mw":
-                            origin_tf = "mw"
-                        elif reason_tf == "ok_by_pack":
-                            origin_tf = "pack"
+                    else:  # pack_only
+                        allow_tf = (pack_wl_hits >= 1)
+                        reason_tf = "ok_by_pack" if allow_tf else f"pack_no_wl@{tf}"
+                        if allow_tf:
+                            origin_tf = "pack_only"
 
                 # опциональное BL-вeto: берём порог K и сравниваем с pack_bl_hits
                 K = int(bl_thresholds.get(tf, 0)) if use_bl else 0
@@ -926,6 +970,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                         "reason": reason_tf,
                         "mode": decision_mode,
                         "origin": origin_tf,
+                        "version": version,
                     },
                     # компактная трасса BL
                     "bl": {
@@ -939,8 +984,9 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
                 # лог по TF (добавим короткую метку BL)
                 log.debug(
-                    "[TF:%s] match mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  bl=%s/%s veto=%s  allow=%s reason=%s  incomplete=%s  kv_hits=%d gw_reqs=%d",
-                    tf, mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
+                    "[TF:%s] mode=%s ver=%s | mw_wl: %d/%d  pack_wl: %d/%d  pack_bl: %d/%d  bl=%s/%s veto=%s  allow=%s reason=%s  incomplete=%s  kv_hits=%d gw_reqs=%d",
+                    tf, decision_mode, version,
+                    mw_hits, mw_total, pack_wl_hits, pack_wl_total, pack_bl_hits, pack_bl_total,
                     K, pack_bl_hits, str(bl_veto).lower(),
                     str(allow_tf).lower(), reason_tf, str(incomplete).lower(),
                     telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
@@ -975,6 +1021,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                         pack_bl_total=pack_bl_total,
                         allow_tf=allow_tf,
                         reason_tf=reason_tf,
+                        oracle_version=version,
                     )
                 except Exception:
                     log.exception("[AUDIT] ❌ ошибка записи строки TF=%s log_uid=%s sid=%s csid=%s", tf, log_uid, sid, client_sid_s or "-")
@@ -993,6 +1040,7 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 "status": "ok",
                 "allow": "true" if final_allow else "false",
                 "log_uid": log_uid,                        # служебный для корреляции
+                "version": version,
             }
             if client_sid_s:
                 resp["client_strategy_id"] = client_sid_s  # опционально
@@ -1003,9 +1051,9 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
             # лог ответа
             log.debug(
-                "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
+                "[RESP] %s log_uid=%s sid=%s csid=%s ver=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
                 "✅ allow" if final_allow else "⛔ deny",
-                log_uid, sid, (client_sid_s or "-"),
+                log_uid, sid, (client_sid_s or "-"), version,
                 (final_reason or "-"),
                 duration_ms_total,
                 telemetry.get("kv_hits", 0),
@@ -1029,9 +1077,9 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
 
             # финальный лог (повторим кратко)
             log.debug(
-                "[RESP] %s log_uid=%s sid=%s csid=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
+                "[RESP] %s log_uid=%s sid=%s csid=%s ver=%s reason=%s dur=%dms kv_hits=%d gw_reqs=%d",
                 ("✅ allow" if final_allow else "⛔ deny"),
-                log_uid, sid, (client_sid_s or "-"), (final_reason or "-"),
+                log_uid, sid, (client_sid_s or "-"), version, (final_reason or "-"),
                 duration_ms_total, telemetry.get("kv_hits", 0), telemetry.get("gateway_requests", 0)
             )
 
@@ -1045,7 +1093,8 @@ async def _process_request_core(msg_id: str, fields: Dict[str, str]):
                 await _on_leader_finished(gate_sid=gate_sid, symbol=symbol, leader_req_id=msg_id, allow=allow_for_gate)
             except Exception:
                 log.exception("[GATE] ❌ ошибка завершения ворот gate_sid=%s symbol=%s", gate_sid, symbol)
-                                
+
+
 # 🔸 Обработка входящего сообщения: получить лидерство или встать в очередь
 async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     strategy_id_s = fields.get("strategy_id") or ""
@@ -1067,12 +1116,13 @@ async def _handle_incoming(msg_id: str, fields: Dict[str, str]):
     else:
         log.debug("[REQ] ⏳ queued gate_sid=%s %s req_id=%s", gate_sid, symbol, msg_id)
 
+
 # 🔸 Главный слушатель decision_request (Этап 3)
 async def run_laboratory_decision_maker():
     """
     Слушает laboratory:decision_request, собирает снимок MW/PACK, считает совпадения,
-    принимает решение по сценариям (mw_only / mw_then_pack / mw_and_pack) и пишет ПО ОДНОЙ строке
-    на каждый запрошенный TF в signal_laboratory_entries. В ответ стратегии возвращает status=ok
+    принимает решение по сценариям (mw_only / mw_then_pack / mw_and_pack / pack_only) и пишет ПО ОДНОЙ строке
+    на каждый запрошенный TF в signal_laboratory_entries (с oracle_version=v1|v2). В ответ стратегии возвращает status=ok
     и allow=true|false. При некорректном запросе — status=error с кодом.
     Работает только с НОВЫМИ сообщениями (старт с '$'). Встроены ворота/очередь per (gate_sid, symbol).
     """

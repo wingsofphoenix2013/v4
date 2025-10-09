@@ -1,4 +1,4 @@
-# laboratory_decision_filler.py — пост-allow наполнитель LPS и (заглушка) апдейтер закрытий
+# laboratory_decision_filler.py — пост-allow наполнитель LPS (c версиями oracle v1/v2) и (заглушка) апдейтер закрытий
 
 # 🔸 Импорты
 import asyncio
@@ -23,6 +23,7 @@ LPS_TABLE = "public.laboratoty_position_stat"
 XREAD_BLOCK_MS = 1_000
 XREAD_COUNT = 50
 
+
 # 🔸 Утилиты JSON (совместимо со стилем maker)
 def _to_json_safe(obj: Any) -> Any:
     if obj is None or isinstance(obj, (str, int, float, bool)):
@@ -37,6 +38,7 @@ def _to_json_safe(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_to_json_safe(v) for v in obj]
     return str(obj)
+
 
 # 🔸 Парсинг PACK-базы для семейства (совместимо с maker)
 def _parse_pack_base_family(base: str) -> str:
@@ -61,6 +63,7 @@ def _parse_pack_base_family(base: str) -> str:
         return "atr"
     return s  # fallback
 
+
 # 🔸 Построение факта MW по agg_base (совместимо с maker)
 def _build_mw_fact(states: Dict[str, Any], agg_base: str) -> Optional[str]:
     if not agg_base:
@@ -74,6 +77,7 @@ def _build_mw_fact(states: Dict[str, Any], agg_base: str) -> Optional[str]:
             return None
         parts.append(f"{base}:{st.strip().lower()}")
     return "|".join(parts)
+
 
 # 🔸 Построение факта PACK по agg_key (совместимо с maker)
 def _build_pack_fact(pack_obj: Dict[str, Any], agg_key: str) -> Optional[str]:
@@ -89,6 +93,7 @@ def _build_pack_fact(pack_obj: Dict[str, Any], agg_key: str) -> Optional[str]:
         parts.append(f"{k}:{str(v).strip().lower()}")
     return "|".join(parts)
 
+
 # 🔸 Безопасный доступ к tf_results (jsonb → dict)
 def _as_dict(maybe_json) -> Dict[str, Any]:
     if maybe_json is None:
@@ -102,7 +107,8 @@ def _as_dict(maybe_json) -> Dict[str, Any]:
             return {}
     return {}
 
-# 🔸 Извлечение и расчёт полей LPS из одной строки SLE
+
+# 🔸 Извлечение и расчёт полей LPS из одной строки SLE (включая oracle_version)
 def _extract_lps_from_sle_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     # базовые поля
     log_uid: str = row["log_uid"]
@@ -128,10 +134,13 @@ def _extract_lps_from_sle_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
     pack_wl_match_count = int(counters.get("pack_wl_hits") or 0)
     pack_bl_match_count = int(counters.get("pack_bl_hits") or 0)
 
-    # decision.{mode,origin} (мы уже пишем их в maker)
+    # decision.{mode,origin,version} (мы уже пишем их в maker)
     decision = _as_dict(tfres.get("decision"))
     decision_mode = decision.get("mode")
     decision_origin = decision.get("origin")
+    # версия: колонка SLE приоритетна, иначе из tf_results.decision.version
+    oracle_version = (row.get("oracle_version") or decision.get("version") or "v1")
+    oracle_version = str(oracle_version).strip().lower()
 
     # расчёт совпавших правил (без внешних запросов)
     mw_matches: List[Dict[str, Any]] = []
@@ -193,6 +202,7 @@ def _extract_lps_from_sle_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
         "pack_family_counts": json.dumps(_to_json_safe(pack_family_counts), ensure_ascii=False),
         "decision_mode": decision_mode,
         "decision_origin": decision_origin,
+        "oracle_version": oracle_version,
     }
 
     # ключ для логов
@@ -205,7 +215,8 @@ def _extract_lps_from_sle_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
     }
     return lps_values, key
 
-# 🔸 UPSERT одной TF-строки в LPS (UPDATE → INSERT DO NOTHING → UPDATE)
+
+# 🔸 UPSERT одной TF-строки в LPS (UPDATE → INSERT DO NOTHING → UPDATE), c oracle_version
 async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
     # update (сохранить значения полей закрытия, не трогать их)
     upd_status = await conn.execute(
@@ -223,11 +234,13 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
                pack_family_counts=COALESCE($10::jsonb, pack_family_counts),
                decision_mode=$11,
                decision_origin=$12,
+               oracle_version=$17,
                updated_at=now()
          WHERE log_uid=$13
            AND strategy_id=$14
            AND ((client_strategy_id IS NULL AND $15::int IS NULL) OR client_strategy_id=$15::int)
            AND tf=$16
+           AND oracle_version=$17
         """,
         lps["symbol"],
         lps["direction"],
@@ -245,6 +258,7 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
         lps["strategy_id"],
         lps["client_strategy_id"],
         lps["tf"],
+        lps["oracle_version"],
     )
     if upd_status.startswith("UPDATE 1"):
         return "updated"
@@ -256,12 +270,12 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
             (log_uid, strategy_id, client_strategy_id, symbol, direction, tf,
              mw_states, mw_matches, pack_wl_matches, pack_bl_matches,
              mw_match_count, pack_wl_match_count, pack_bl_match_count,
-             pack_family_counts, decision_mode, decision_origin)
+             pack_family_counts, decision_mode, decision_origin, oracle_version)
         VALUES ($1,$2,$3,$4,$5,$6,
                 COALESCE($7::jsonb,NULL), COALESCE($8::jsonb,NULL), COALESCE($9::jsonb,NULL), COALESCE($10::jsonb,NULL),
                 $11,$12,$13,
-                COALESCE($14::jsonb,NULL), $15, $16)
-        ON CONFLICT (log_uid, strategy_id, (COALESCE(client_strategy_id, '-1'::integer)), tf) DO NOTHING
+                COALESCE($14::jsonb,NULL), $15, $16, $17)
+        ON CONFLICT (log_uid, strategy_id, (COALESCE(client_strategy_id, '-1'::integer)), tf, oracle_version) DO NOTHING
         """,
         lps["log_uid"],
         lps["strategy_id"],
@@ -279,6 +293,7 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
         lps["pack_family_counts"],
         lps["decision_mode"],
         lps["decision_origin"],
+        lps["oracle_version"],
     )
     if ins_status.endswith(" 1"):
         return "inserted"
@@ -299,11 +314,13 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
                pack_family_counts=COALESCE($10::jsonb, pack_family_counts),
                decision_mode=$11,
                decision_origin=$12,
+               oracle_version=$17,
                updated_at=now()
          WHERE log_uid=$13
            AND strategy_id=$14
            AND ((client_strategy_id IS NULL AND $15::int IS NULL) OR client_strategy_id=$15::int)
            AND tf=$16
+           AND oracle_version=$17
         """,
         lps["symbol"],
         lps["direction"],
@@ -321,8 +338,10 @@ async def _upsert_lps(conn, lps: Dict[str, Any]) -> str:
         lps["strategy_id"],
         lps["client_strategy_id"],
         lps["tf"],
+        lps["oracle_version"],
     )
     return "updated"
+
 
 # 🔸 Обработка одного seed (req_id, log_uid) → перенос в LPS
 async def _process_seed(req_id: str, log_uid: str):
@@ -337,7 +356,7 @@ async def _process_seed(req_id: str, log_uid: str):
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT log_uid, strategy_id, client_strategy_id, symbol, direction, tf, tf_results
+            SELECT log_uid, strategy_id, client_strategy_id, symbol, direction, tf, tf_results, oracle_version
               FROM {SLE_TABLE}
              WHERE req_id=$1 AND allow=true
             """,
@@ -362,19 +381,26 @@ async def _process_seed(req_id: str, log_uid: str):
             tfs.append(key["tf"])
 
     # лог результата
-    uniq_tfs = ",".join(sorted(set(tfs), key=lambda x: ["m5", "m15", "h1"].index(x) if x in ("m5","m15","h1") else 9))
+    uniq_tfs = ",".join(sorted(set(tfs), key=lambda x: ["m5", "m15", "h1"].index(x) if x in ("m5", "m15", "h1") else 9))
     log.debug(
         "[LPS] ✅ filled req_id=%s log_uid=%s sid=%s csid=%s %s tfs=[%s] ins=%d upd=%d",
-        req_id, log_uid, (sid if sid is not None else "-"), (csid if csid is not None else "-"),
-        (symbol or "-"), uniq_tfs, inserted, updated
+        req_id,
+        log_uid,
+        (sid if sid is not None else "-"),
+        (csid if csid is not None else "-"),
+        (symbol or "-"),
+        uniq_tfs,
+        inserted,
+        updated,
     )
+
 
 # 🔸 Главный слушатель seed → перенос SLE → LPS
 async def run_laboratory_decision_filler():
     """
     Слушает laboratory_decision_filler и для каждого seed {req_id, log_uid}
     переносит готовые данные из signal_laboratory_entries в laboratoty_position_stat.
-    Не запрашивает on-demand никакие индикаторы.
+    Не запрашивает on-demand никакие индикаторы. Учитывает oracle_version (v1/v2).
     """
     log.debug("🛰️ LAB_DECISION_FILLER слушатель запущен (BLOCK=%d COUNT=%d)", XREAD_BLOCK_MS, XREAD_COUNT)
 

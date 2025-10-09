@@ -1,11 +1,11 @@
-# laboratory_bl_analyzer.py — оффлайн-аналитика BL: ROI(K) по окну 7×24ч, выбор best_k, публикация компактного KV
+# laboratory_bl_analyzer.py — оффлайн-аналитика BL (версионная): ROI(K) по окну 7×24ч, выбор best_k, публикация KV с версией
 
 # 🔸 Импорты
 import asyncio
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 # 🔸 Инфраструктура
 import laboratory_infra as infra
@@ -26,15 +26,26 @@ SCAN_TABLE = "public.laboratory_bl_scan"
 SUMMARY_TABLE = "public.laboratory_bl_summary"
 ACTIVE_TABLE = "public.laboratory_bl_summary_active"
 
-# 🔸 Ключи Redis для «активных» порогов (минимальный формат)
-def _kv_key(master_sid: int, tf: str) -> str:
-    return f"laboratory:bl:k:{master_sid}:{tf}"
+# 🔸 Ключи Redis для «активных» порогов (версионный формат)
+def _kv_key(master_sid: int, tf: str, version: str) -> str:
+    return f"laboratory:bl:k:{master_sid}:{tf}:{version}"
 
 
-# 🔸 Структура ряда для расчёта
+# 🔸 Структура ряда для расчёта (включая версию)
 class Row:
-    __slots__ = ("csid", "master_sid", "tf", "direction", "bl_hits", "pnl", "deposit")
-    def __init__(self, csid: int, master_sid: int, tf: str, direction: str, bl_hits: int, pnl: Decimal, deposit: Decimal):
+    __slots__ = ("csid", "master_sid", "tf", "direction", "bl_hits", "pnl", "deposit", "version")
+
+    def __init__(
+        self,
+        csid: int,
+        master_sid: int,
+        tf: str,
+        direction: str,
+        bl_hits: int,
+        pnl: Decimal,
+        deposit: Decimal,
+        version: str,
+    ):
         self.csid = csid
         self.master_sid = master_sid
         self.tf = tf
@@ -42,6 +53,7 @@ class Row:
         self.bl_hits = bl_hits
         self.pnl = pnl
         self.deposit = deposit
+        self.version = version
 
 
 # 🔸 Забор данных в окно по закрытым позициям → ряды уровня LPS (по TF), только для стратегий с blacklist_watcher=true
@@ -50,13 +62,14 @@ async def _fetch_rows(window_start: datetime, window_end: datetime) -> List[Row]
         rows = await conn.fetch(
             f"""
             SELECT
-                lps.client_strategy_id AS csid,
-                lps.strategy_id        AS master_sid,
+                lps.client_strategy_id          AS csid,
+                lps.strategy_id                 AS master_sid,
                 lps.tf,
                 lps.direction,
                 COALESCE(lps.pack_bl_match_count, 0) AS bl_hits,
-                COALESCE(lps.pnl, p.pnl)              AS pnl,
-                s.deposit                              AS deposit
+                COALESCE(lps.pnl, p.pnl)        AS pnl,
+                s.deposit                       AS deposit,
+                lps.oracle_version              AS version
             FROM {LPS_TABLE} lps
             JOIN {POS_TABLE} p
               ON p.log_uid = lps.log_uid
@@ -69,8 +82,10 @@ async def _fetch_rows(window_start: datetime, window_end: datetime) -> List[Row]
               AND p.closed_at <= $2
               AND COALESCE(lps.pnl, p.pnl) IS NOT NULL
             """,
-            window_start, window_end
+            window_start,
+            window_end,
         )
+
     out: List[Row] = []
     for r in rows:
         try:
@@ -86,6 +101,7 @@ async def _fetch_rows(window_start: datetime, window_end: datetime) -> List[Row]
                     bl_hits=int(r["bl_hits"]),
                     pnl=Decimal(r["pnl"]),
                     deposit=dep,
+                    version=str(r["version"] or "v1").strip().lower(),
                 )
             )
         except Exception:
@@ -96,7 +112,7 @@ async def _fetch_rows(window_start: datetime, window_end: datetime) -> List[Row]
 
 # 🔸 Расчёт профиля ROI(K) + выбор best_k (максимальный ROI, baseline K=0 участвует)
 def _compute_profile(rows: List[Row], deposit: Decimal) -> Tuple[Dict[int, Dict], Dict]:
-    # rows — все сделки (LPS-строки) в группе csid×TF×direction
+    # rows — все сделки (LPS-строки) в группе csid×TF×direction×version
     if not rows or deposit is None or deposit <= 0:
         return {}, {}
 
@@ -154,51 +170,52 @@ def _compute_profile(rows: List[Row], deposit: Decimal) -> Tuple[Dict[int, Dict]
     return profile, summary
 
 
-# 🔸 Публикация компактных KV в Redis: per (master_sid, tf) → значение str(best_k)
-async def _publish_active_kv(items: List[Tuple[int, str, int, Decimal]]):
-    # items: [(master_sid, tf, best_k, roi_best)]
+# 🔸 Публикация компактных KV в Redis: per (master_sid, tf, version) → str(best_k)
+async def _publish_active_kv(items: List[Tuple[int, str, str, int, Decimal]]):
+    # items: [(master_sid, tf, version, best_k, roi_best)]
     if not items:
         log.info("[BL] ℹ️ KV: нет пар для публикации")
         return
 
-    # выберем по (master, tf) запись с максимальным roi_best (на случай нескольких csid под одним master)
-    chosen: Dict[Tuple[int, str], Tuple[int, Decimal]] = {}
-    masters: Dict[int, set] = {}
+    # выберем по (master, tf, version) запись с максимальным roi_best (на случай нескольких csid под одним master)
+    chosen: Dict[Tuple[int, str, str], Tuple[int, Decimal]] = {}
+    masters_versions: Dict[int, set] = {}
 
-    for master_sid, tf, best_k, roi_best in items:
-        key = (master_sid, tf)
-        masters.setdefault(master_sid, set()).add(tf)
+    for master_sid, tf, version, best_k, roi_best in items:
+        key = (master_sid, tf, version)
+        masters_versions.setdefault(master_sid, set()).add(version)
         prev = chosen.get(key)
         if prev is None or roi_best > prev[1]:
             chosen[key] = (best_k, roi_best)
 
-    # сначала зачистим ключи по каждому master_sid для стандартных TF, затем выставим актуальные
+    # сначала зачистим ключи по каждому master_sid/версии для стандартных TF, затем выставим актуальные
     tfs_all = ("m5", "m15", "h1")
     deleted = 0
     set_count = 0
 
-    for master_sid in masters.keys():
-        # удаляем старые ключи по всем стандартным TF
-        for tf in tfs_all:
-            del_key = _kv_key(master_sid, tf)
-            try:
-                res = await infra.redis_client.delete(del_key)
-                deleted += int(res or 0)
-            except Exception:
-                # безопасно игнорируем ошибки удаления
-                pass
+    for master_sid, versions in masters_versions.items():
+        # удаляем старые ключи по всем стандартным TF для каждой версии, замеченной в этом прогоне
+        for ver in versions:
+            for tf in tfs_all:
+                del_key = _kv_key(master_sid, tf, ver)
+                try:
+                    res = await infra.redis_client.delete(del_key)
+                    deleted += int(res or 0)
+                except Exception:
+                    # безопасно игнорируем ошибки удаления
+                    pass
 
-    for (master_sid, tf), (best_k, _roi) in chosen.items():
-        key = _kv_key(master_sid, tf)
+    for (master_sid, tf, ver), (best_k, _roi) in chosen.items():
+        key = _kv_key(master_sid, tf, ver)
         val = str(int(best_k))  # "0" — фильтр off
         await infra.redis_client.set(key, val)
         set_count += 1
 
     log.info("[BL] ✅ KV published: masters=%d keys_set=%d keys_deleted=%d",
-             len(masters), set_count, deleted)
+             len(masters_versions), set_count, deleted)
 
 
-# 🔸 Один прогон: построить профиль и сводку по всем csid×TF×direction и записать в таблицы + опубликовать KV
+# 🔸 Один прогон: профиль/сводка по всем csid×TF×direction×version + запись в БД + публикация KV
 async def _run_once(window_hours: int):
     window_end = datetime.utcnow().replace(tzinfo=None)
     window_start = window_end - timedelta(hours=window_hours)
@@ -211,42 +228,42 @@ async def _run_once(window_hours: int):
         log.info("[BL] ℹ️ окно[%s..%s]: нет данных для анализа", window_start.isoformat(), window_end.isoformat())
         return
 
-    # группировка по csid×TF×direction (мастер_id протащим отдельно)
-    groups: Dict[Tuple[int, str, str], List[Row]] = {}
-    master_of_group: Dict[Tuple[int, str, str], int] = {}
+    # группировка по csid×TF×direction×version (мастер_id протащим отдельно)
+    groups: Dict[Tuple[int, str, str, str], List[Row]] = {}
+    master_of_group: Dict[Tuple[int, str, str, str], int] = {}
     for r in rows:
-        key = (r.csid, r.tf, r.direction)
+        key = (r.csid, r.tf, r.direction, r.version)
         groups.setdefault(key, []).append(r)
         master_of_group[key] = r.master_sid  # по группе ожидаем один master
 
-    scan_rows: List[Tuple] = []     # для laboratory_bl_scan
-    summary_rows: List[Tuple] = []  # для laboratory_bl_summary
-    active_rows: List[Tuple] = []   # для laboratory_bl_summary_active
-    kv_items: List[Tuple[int, str, int, Decimal]] = []  # (master_sid, tf, best_k, roi_best)
+    scan_rows: List[Tuple] = []     # для laboratory_bl_scan (с версией)
+    summary_rows: List[Tuple] = []  # для laboratory_bl_summary (с версией)
+    active_rows: List[Tuple] = []   # для laboratory_bl_summary_active (с версией)
+    kv_items: List[Tuple[int, str, str, int, Decimal]] = []  # (master_sid, tf, version, best_k, roi_best)
 
     processed = 0
 
-    for (csid, tf, direction), vec in groups.items():
+    for (csid, tf, direction, version), vec in groups.items():
         # депозит берём из первого ряда (он одинаковый в группе, т.к. csid один)
         deposit = vec[0].deposit if vec and vec[0].deposit is not None else None
         if deposit is None or deposit <= 0:
-            log.info("[BL] ⚠️ пропуск csid=%s tf=%s dir=%s: deposit отсутствует/<=0", csid, tf, direction)
+            log.info("[BL] ⚠️ пропуск csid=%s tf=%s dir=%s ver=%s: deposit отсутствует/<=0", csid, tf, direction, version)
             continue
 
         profile, summary = _compute_profile(vec, deposit)
         if not profile:
             continue
 
-        # профиль по K — в SCAN
+        # профиль по K — в SCAN (с версией)
         for k, p in profile.items():
             scan_rows.append((
                 window_start, window_end, csid, tf, direction,            # ключ
                 p["threshold_k"], p["n_total"], p["n_blocked"], p["n_allowed"],
                 p["pnl_total"], p["pnl_allowed"], p["deposit"],
-                p["roi_base"], p["roi_k"]
+                p["roi_base"], p["roi_k"], version
             ))
 
-        # сводка (best_k + базовые) — в SUMMARY
+        # сводка (best_k + базовые) — в SUMMARY (с версией)
         summary_rows.append((
             window_start, window_end, csid, tf, direction,
             deposit, summary["n_total"],
@@ -254,12 +271,12 @@ async def _run_once(window_hours: int):
             summary["best_k"], summary["roi_best"],
             summary["n_blocked_best"], summary["n_allowed_best"],
             summary["uplift_abs"], summary["uplift_rel_pct"],
-            summary["criteria_note"]
+            summary["criteria_note"], version
         ))
 
-        # активный срез (перезапишем целиком таблицу после сбора всех групп)
+        # активный срез (перезапишем целиком таблицу после сбора всех групп) — с версией
         active_rows.append((
-            csid, tf, direction,
+            csid, tf, direction, version,
             WINDOW_HOURS, window_start, window_end, deposit, summary["n_total"],
             summary["roi_base"], summary["roi_bin"],
             summary["best_k"], summary["roi_best"],
@@ -268,9 +285,9 @@ async def _run_once(window_hours: int):
             summary["criteria_note"]
         ))
 
-        # подготовка KV: per master_sid×TF → best_k
-        master_sid = master_of_group[(csid, tf, direction)]
-        kv_items.append((master_sid, tf, int(summary["best_k"]), summary["roi_best"]))
+        # подготовка KV: per master_sid×TF×version → best_k
+        master_sid = master_of_group[(csid, tf, direction, version)]
+        kv_items.append((master_sid, tf, version, int(summary["best_k"]), summary["roi_best"]))
 
         processed += 1
 
@@ -281,18 +298,18 @@ async def _run_once(window_hours: int):
     # запись в БД + публикация KV
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # upsert SCAN
+            # upsert SCAN (с oracle_version)
             await conn.executemany(
                 f"""
                 INSERT INTO {SCAN_TABLE} (
                     window_start, window_end, client_strategy_id, tf, direction,
                     threshold_k, n_total, n_blocked, n_allowed,
                     pnl_total, pnl_allowed, deposit,
-                    roi_base, roi_k
+                    roi_base, roi_k, oracle_version
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
                 )
-                ON CONFLICT (window_end, client_strategy_id, tf, direction, threshold_k)
+                ON CONFLICT (window_end, client_strategy_id, tf, direction, threshold_k, oracle_version)
                 DO UPDATE SET
                     window_start = EXCLUDED.window_start,
                     n_total      = EXCLUDED.n_total,
@@ -308,18 +325,18 @@ async def _run_once(window_hours: int):
                 scan_rows
             )
 
-            # upsert SUMMARY (история часа)
+            # upsert SUMMARY (история часа; с oracle_version)
             await conn.executemany(
                 f"""
                 INSERT INTO {SUMMARY_TABLE} (
                     window_start, window_end, client_strategy_id, tf, direction,
                     deposit, n_total, roi_base, roi_bin,
                     best_k, roi_best, n_blocked_best, n_allowed_best,
-                    uplift_abs, uplift_rel_pct, criteria_note
+                    uplift_abs, uplift_rel_pct, criteria_note, oracle_version
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
                 )
-                ON CONFLICT (window_end, client_strategy_id, tf, direction)
+                ON CONFLICT (window_end, client_strategy_id, tf, direction, oracle_version)
                 DO UPDATE SET
                     window_start   = EXCLUDED.window_start,
                     deposit        = EXCLUDED.deposit,
@@ -338,18 +355,18 @@ async def _run_once(window_hours: int):
                 summary_rows
             )
 
-            # активный срез: полностью пересобираем таблицу (атомарно)
+            # активный срез: полностью пересобираем таблицу (атомарно), с oracle_version
             await conn.execute(f"TRUNCATE {ACTIVE_TABLE}")
             await conn.executemany(
                 f"""
                 INSERT INTO {ACTIVE_TABLE} (
-                    client_strategy_id, tf, direction,
+                    client_strategy_id, tf, direction, oracle_version,
                     window_hours, window_start, window_end, deposit, n_total,
                     roi_base, roi_bin, best_k, roi_best,
                     n_blocked_best, n_allowed_best, uplift_abs, uplift_rel_pct,
                     criteria_note
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
                 )
                 """,
                 active_rows
@@ -360,7 +377,7 @@ async def _run_once(window_hours: int):
 
     # лог результата прогона
     # подготовим компактную сводку TF
-    tf_seen = sorted({tf for _, tf, _, _ in kv_items}, key=lambda x: tf_order.get(x, 9))
+    tf_seen = sorted({tf for (_ms, tf, _ver, _k, _roi) in kv_items}, key=lambda x: tf_order.get(x, 9))
     log.info(
         "[BL] ✅ окно[%s..%s] групп=%d scan_rows=%d summary_rows=%d active_rows=%d kv_pairs=%d tfs=%s",
         window_start.isoformat(), window_end.isoformat(),
@@ -372,11 +389,11 @@ async def _run_once(window_hours: int):
 # 🔸 Главный цикл анализатора (ежечасно, со стартовой задержкой 90s)
 async def run_laboratory_bl_analyzer():
     """
-    Ежечасный анализ влияния blacklist по окну 7×24ч на уровне csid×TF×direction:
+    Ежечасный анализ влияния blacklist по окну 7×24ч на уровне csid×TF×direction×version:
     - строит ROI-профиль по порогам K (scan),
     - выбирает best_k по критерию max ROI (baseline K=0 участвует),
     - пишет историю часа (summary), пересобирает активный срез (summary_active),
-    - публикует в Redis компактные KV-ключи: laboratory:bl:k:{master_sid}:{tf} = "<best_k>".
+    - публикует в Redis компактные KV-ключи: laboratory:bl:k:{master_sid}:{tf}:{version} = "<best_k>".
     Учитываются только стратегии, где strategies_v4.blacklist_watcher = true.
     """
     log.debug("🛰️ LAB_BL_ANALYZER запущен: WINDOW=%dh, EVERY=%ds", WINDOW_HOURS, RUN_EVERY_SEC)
@@ -390,6 +407,6 @@ async def run_laboratory_bl_analyzer():
             log.debug("⏹️ LAB_BL_ANALYZER остановлен по сигналу")
             raise
         except Exception:
-            log.exception("❌ LAB_BL_ANALАЛYZER ошибка прогона")
+            log.exception("❌ LAB_BL_ANALYZER ошибка прогона")
         # пауза до следующего часа
         await asyncio.sleep(RUN_EVERY_SEC)
