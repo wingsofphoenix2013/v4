@@ -25,18 +25,13 @@ WHITELIST_READY_MAXLEN = 10_000
 TF_LIST = ("m5", "m15", "h1")
 DIRECTIONS = ("long", "short")
 AGG_BASES = (
-    # solo
-    "trend", "volatility", "extremes", "momentum",
-    # pairs
-    "trend_volatility", "trend_extremes", "trend_momentum",
-    "volatility_extremes", "volatility_momentum",
-    "extremes_momentum",
-    # triples
+    "trend",
+    "trend_volatility",
+    "trend_extremes",
+    "trend_momentum",
     "trend_volatility_extremes",
     "trend_volatility_momentum",
     "trend_extremes_momentum",
-    "volatility_extremes_momentum",
-    # quadruple
     "trend_volatility_extremes_momentum",
 )
 SMOOTH_HISTORY_N = 5

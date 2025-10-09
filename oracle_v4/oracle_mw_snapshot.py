@@ -21,7 +21,24 @@ WINDOW_SIZES = {
     "28d": timedelta(days=28),
 }
 TF_ORDER = ("m5", "m15", "h1")            # последовательная обработка TF
-MW_BASES = ("trend", "volatility", "extremes", "momentum")  # фиксированный порядок для combo
+
+# 🔸 Наборы баз для MW
+# Для выборки из БД мы оставляем все 4 базы (они же — фиксированный порядок для построения combo)
+MW_BASES_FETCH = ("trend", "volatility", "extremes", "momentum")
+# Какие solo-базы реально пишем в агрегаты
+SOLO_BASES = ("trend",)
+# Комбинации, которые пишем (только комбинации с 'trend')
+COMBOS_2_ALLOWED = (
+    ("trend", "volatility"),
+    ("trend", "extremes"),
+    ("trend", "momentum"),
+)
+COMBOS_3_ALLOWED = (
+    ("trend", "volatility", "extremes"),
+    ("trend", "volatility", "momentum"),
+    ("trend", "extremes", "momentum"),
+)
+COMBOS_4_ALLOWED = (tuple(MW_BASES_FETCH),)  # ('trend','volatility','extremes','momentum')
 
 # 🔸 Настройки Redis Stream для сигнала «отчёт готов»
 REPORT_READY_STREAM = "oracle:mw:reports_ready"   # имя стрима с уведомлениями о готовности отчёта
@@ -156,7 +173,7 @@ async def _calc_report_head_metrics(conn, strategy_id: int, win_start: datetime,
     r = await conn.fetchrow(
         """
         SELECT
-            COUNT(*)::int                         AS closed_total,
+            COUNT(*)::int                            AS closed_total,
             COALESCE(SUM( (pnl > 0)::int ), 0)::int AS closed_wins,
             COALESCE(SUM(pnl), 0)::numeric(24,4)    AS pnl_sum_total,
             COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0)::numeric(24,4) AS pnl_sum_wins
@@ -261,7 +278,7 @@ async def _process_timeframe(
             FROM mw m
             GROUP BY m.position_uid
             """,
-            uid_list, timeframe, list(MW_BASES),
+            uid_list, timeframe, list(MW_BASES_FETCH),
         )
 
         # подготовим агрегаты батча в памяти
@@ -270,21 +287,9 @@ async def _process_timeframe(
             continue
 
         # заготовки комбо (фиксированный порядок)
-        combos_2 = (
-            ("trend", "volatility"),
-            ("trend", "extremes"),
-            ("trend", "momentum"),
-            ("volatility", "extremes"),
-            ("volatility", "momentum"),
-            ("extremes", "momentum"),
-        )
-        combos_3 = (
-            ("trend", "volatility", "extremes"),
-            ("trend", "volatility", "momentum"),
-            ("trend", "extremes", "momentum"),
-            ("volatility", "extremes", "momentum"),
-        )
-        combos_4 = (tuple(MW_BASES),)
+        combos_2 = COMBOS_2_ALLOWED
+        combos_3 = COMBOS_3_ALLOWED
+        combos_4 = COMBOS_4_ALLOWED
 
         # обходим MW-строки
         for r in rows_mw:
@@ -308,8 +313,8 @@ async def _process_timeframe(
             if not isinstance(states_tf, dict) or not states_tf:
                 continue
 
-            # нормализуем только допустимые базы
-            states_tf = {k: v for k, v in states_tf.items() if k in MW_BASES and isinstance(v, str) and v}
+            # нормализуем только допустимые базы (все 4 — они нужны для комбо с 'trend')
+            states_tf = {k: v for k, v in states_tf.items() if k in MW_BASES_FETCH and isinstance(v, str) and v}
 
             if not states_tf:
                 continue
@@ -317,8 +322,8 @@ async def _process_timeframe(
             direction, pnl = uid_meta.get(uid, ("long", 0.0))
             is_win = pnl > 0.0
 
-            # solo: по каждой доступной базе фиксируем её state
-            for base in MW_BASES:
+            # solo: пишем только выбранные базы
+            for base in SOLO_BASES:
                 state = states_tf.get(base)
                 if not state:
                     continue
@@ -330,7 +335,7 @@ async def _process_timeframe(
                     inc["pw"] = round(inc["pw"] + pnl, 4)
                 inc["pt"] = round(inc["pt"] + pnl, 4)
 
-            # combos: формируем в фиксированном порядке с join состояния
+            # combos: формируем в фиксированном порядке с join состояния (только разрешённые комбо)
             def _touch_combo(combo: Tuple[str, ...]):
                 # условия достаточности
                 for b in combo:
