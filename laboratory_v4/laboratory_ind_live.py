@@ -4,7 +4,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 from lab_utils import floor_to_bar, load_ohlcv_df
 from compute_only import compute_snapshot_values_async
@@ -17,13 +17,14 @@ TF_SET = ("m5", "m15", "h1")          # работаем только с эти�
 LAB_PREFIX = "lab_live"               # префикс пространства лаборатории
 LAB_TTL_SEC = 45                      # TTL для всех lab_live ключей
 TICK_INTERVAL_SEC = 30                # период тика публикации
-MAX_CONCURRENCY = 64                  # параллельные (symbol, tf)
+MAX_CONCURRENCY = 100                  # параллельные (symbol, tf)
+INST_CONCURRENCY = 16                 # лёгкий параллелизм по инстансам внутри одной пары
 
 # 🔸 Путь KV-ключа для IND
 def _ind_key(symbol: str, tf: str, param_name: str) -> str:
     return f"{LAB_PREFIX}:ind:{symbol}:{tf}:{param_name}"
 
-# 🔸 Обработка одной пары (symbol, tf) на вибранном open_ms
+# 🔸 Обработка одной пары (symbol, tf) на выбранном open_ms
 async def _process_pair(
     redis,
     symbol: str,
@@ -34,7 +35,7 @@ async def _process_pair(
 ) -> Tuple[int, int]:
     """
     Возвращает (published_params, skipped_params).
-    skipped включает случаи: нет DF / нет инстансов / пустой расчёт.
+    skipped включает случаи: нет DF / нет инстансов / пустой расчёт / ошибки.
     """
     # загрузка OHLCV (до 800 баров к open_ms)
     df = await load_ohlcv_df(redis, symbol, tf, open_ms, bars=800)
@@ -49,28 +50,41 @@ async def _process_pair(
     published = 0
     skipped = 0
 
-    # последовательно по инстансам (DF один и тот же)
-    for inst in instances:
-        try:
-            values = await compute_snapshot_values_async(inst, symbol, df, precision)
-        except Exception as e:
-            log.warning("calc error %s/%s id=%s: %s", symbol, tf, inst.get("id"), e)
-            skipped += 1
-            continue
+    # параллелизм по инстансам ограничиваем локальным семафором
+    inst_sem = asyncio.Semaphore(INST_CONCURRENCY)
 
-        if not values:
-            skipped += 1
-            continue
+    async def _compute_and_publish(inst: Dict) -> Tuple[int, int]:
+        # параллельная обработка одного инстанса с ограничением
+        async with inst_sem:
+            try:
+                values = await compute_snapshot_values_async(inst, symbol, df, precision)
+            except Exception as e:
+                log.warning("calc error %s/%s id=%s: %s", symbol, tf, inst.get("id"), e)
+                return (0, 1)
 
-        # публикация KV с TTL (45 сек)
-        tasks = []
-        for param_name, str_value in values.items():
-            key = _ind_key(symbol, tf, param_name)
-            # Redis хранит строки — формат уже сделан в compute_only
-            tasks.append(redis.set(key, str_value, ex=LAB_TTL_SEC))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            published += len(tasks)
+            if not values:
+                return (0, 1)
+
+            # публикация KV с TTL (45 сек)
+            tasks = []
+            for param_name, str_value in values.items():
+                key = _ind_key(symbol, tf, param_name)
+                tasks.append(redis.set(key, str_value, ex=LAB_TTL_SEC))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                return (len(tasks), 0)
+            return (0, 0)
+
+    # запускаем параллельно все инстансы данной пары
+    results = await asyncio.gather(
+        *[asyncio.create_task(_compute_and_publish(inst)) for inst in instances],
+        return_exceptions=False,
+    )
+
+    # агрегируем результат
+    for pub, sk in results:
+        published += pub
+        skipped += sk
 
     return (published, skipped)
 
@@ -139,5 +153,4 @@ async def run_lab_ind_live(
         )
 
         # пауза до следующего тика
-        # (на случай долгой итерации — простой sleep без учёта перерасхода)
         await asyncio.sleep(tick_interval_sec)
