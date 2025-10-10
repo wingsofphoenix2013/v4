@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, подписчики Pub/Sub, IND-live воркер)
+# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, подписчики Pub/Sub, IND/MW-live воркеры)
 
 # 🔸 Импорты
 import asyncio
@@ -21,7 +21,8 @@ from laboratory_config import (
     run_watch_indicators_events,  # Pub/Sub: indicators_v4_events
     run_watch_ohlcv_ready_channel # Pub/Sub: bb:ohlcv_channel → обновляет last_bar
 )
-from laboratory_ind_live import run_lab_ind_live  # IND-live воркер публикации в lab_live:ind:*
+from laboratory_ind_live import run_lab_ind_live        # IND-live публикация в lab_live:ind:*
+from laboratory_mw_live import run_lab_mw_live          # MW-live публикация в lab_live:mw:*
 
 # 🔸 Параметры сервиса (локально, без ENV)
 LAB_SETTINGS = {
@@ -43,7 +44,7 @@ LAB_SETTINGS = {
 log = logging.getLogger("LAB_MAIN")
 
 
-# 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков
+# 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков и воркеров
 async def main():
     setup_logging()
     log.info("LAB: запуск инициализации")
@@ -67,7 +68,7 @@ async def main():
         stats.get("indicators", 0),
     )
 
-    # запуск фоновых подписчиков и IND-live воркера
+    # запуск фоновых подписчиков и live-воркеров
     await asyncio.gather(
         # Pub/Sub: тикеры
         run_safe_loop(
@@ -111,6 +112,18 @@ async def main():
                 tf_set=LAB_SETTINGS["TF_SET"],
             ),
             "LAB_IND_LIVE",
+        ),
+        # MW-live публикация (каждые 30 секунд публикует lab_live:mw:* с TTL 45s)
+        run_safe_loop(
+            lambda: run_lab_mw_live(
+                pg=pg,
+                redis=redis,
+                get_active_symbols=get_active_symbols,
+                get_precision=get_precision,
+                get_last_bar=get_last_bar,
+                tf_set=LAB_SETTINGS["TF_SET"],
+            ),
+            "LAB_MW_LIVE",
         ),
     )
 
