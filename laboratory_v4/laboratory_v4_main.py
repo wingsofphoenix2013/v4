@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, подписчики Pub/Sub, IND/MW-live воркеры)
+# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, Pub/Sub, IND/MW/PACK live)
 
 # 🔸 Импорты
 import asyncio
@@ -13,7 +13,7 @@ from laboratory_infra import (
 from laboratory_config import (
     bootstrap_caches,             # стартовая загрузка кешей (тикеры + индикаторы)
     get_cache_stats,              # метрики кешей для стартового лога
-    get_instances_by_tf,          # геттеры кешей для IND-воркера
+    get_instances_by_tf,          # геттеры кешей
     get_precision,
     get_active_symbols,
     get_last_bar,
@@ -21,8 +21,9 @@ from laboratory_config import (
     run_watch_indicators_events,  # Pub/Sub: indicators_v4_events
     run_watch_ohlcv_ready_channel # Pub/Sub: bb:ohlcv_channel → обновляет last_bar
 )
-from laboratory_ind_live import run_lab_ind_live        # IND-live публикация в lab_live:ind:*
-from laboratory_mw_live import run_lab_mw_live          # MW-live публикация в lab_live:mw:*
+from laboratory_ind_live import run_lab_ind_live        # IND-live публикация lab_live:ind:*
+from laboratory_mw_live import run_lab_mw_live          # MW-live публикация lab_live:mw:*
+from laboratory_pack_live import run_lab_pack_live      # PACK-live публикация lab_live:pack:*
 
 # 🔸 Параметры сервиса (локально, без ENV)
 LAB_SETTINGS = {
@@ -38,10 +39,22 @@ LAB_SETTINGS = {
     "DELAY_TICKERS": 0.5,
     "DELAY_INDICATORS": 0.5,
     "DELAY_OHLCV_CHANNEL": 2.0,
+
+    # Специальные задержки запуска live-воркеров (сек)
+    "DELAY_IND_LIVE": 60,
+    "DELAY_MW_LIVE": 75,
+    "DELAY_PACK_LIVE": 90,
 }
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
+
+
+# 🔸 Вспомогательное: запуск корутины с начальной задержкой
+async def _run_with_delay(coro_factory, delay: float):
+    if delay and delay > 0:
+        await asyncio.sleep(delay)
+    await coro_factory()
 
 
 # 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков и воркеров
@@ -100,30 +113,52 @@ async def main():
             ),
             "LAB_OHLCV_READY",
         ),
-        # IND-live публикация (каждые 30 секунд публикует lab_live:ind:* с TTL 45s)
+        # IND-live: старт через 60 секунд
         run_safe_loop(
-            lambda: run_lab_ind_live(
-                pg=pg,
-                redis=redis,
-                get_instances_by_tf=get_instances_by_tf,
-                get_precision=get_precision,
-                get_active_symbols=get_active_symbols,
-                get_last_bar=get_last_bar,
-                tf_set=LAB_SETTINGS["TF_SET"],
+            lambda: _run_with_delay(
+                lambda: run_lab_ind_live(
+                    pg=pg,
+                    redis=redis,
+                    get_instances_by_tf=get_instances_by_tf,
+                    get_precision=get_precision,
+                    get_active_symbols=get_active_symbols,
+                    get_last_bar=get_last_bar,
+                    tf_set=LAB_SETTINGS["TF_SET"],
+                ),
+                LAB_SETTINGS["DELAY_IND_LIVE"],
             ),
             "LAB_IND_LIVE",
         ),
-        # MW-live публикация (каждые 30 секунд публикует lab_live:mw:* с TTL 45s)
+        # MW-live: старт через 75 секунд
         run_safe_loop(
-            lambda: run_lab_mw_live(
-                pg=pg,
-                redis=redis,
-                get_active_symbols=get_active_symbols,
-                get_precision=get_precision,
-                get_last_bar=get_last_bar,
-                tf_set=LAB_SETTINGS["TF_SET"],
+            lambda: _run_with_delay(
+                lambda: run_lab_mw_live(
+                    pg=pg,
+                    redis=redis,
+                    get_active_symbols=get_active_symbols,
+                    get_precision=get_precision,
+                    get_last_bar=get_last_bar,
+                    tf_set=LAB_SETTINGS["TF_SET"],
+                ),
+                LAB_SETTINGS["DELAY_MW_LIVE"],
             ),
             "LAB_MW_LIVE",
+        ),
+        # PACK-live: старт через 90 секунд
+        run_safe_loop(
+            lambda: _run_with_delay(
+                lambda: run_lab_pack_live(
+                    pg=pg,
+                    redis=redis,
+                    get_active_symbols=get_active_symbols,
+                    get_precision=get_precision,
+                    get_instances_by_tf=get_instances_by_tf,
+                    get_last_bar=get_last_bar,
+                    tf_set=LAB_SETTINGS["TF_SET"],
+                ),
+                LAB_SETTINGS["DELAY_PACK_LIVE"],
+            ),
+            "LAB_PACK_LIVE",
         ),
     )
 
