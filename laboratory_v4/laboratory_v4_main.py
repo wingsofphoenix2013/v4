@@ -1,99 +1,180 @@
-# laboratory_v4_main.py — entrypoint laboratory_v4
+# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, воркеры-подписчики)
 
 # 🔸 Импорты
 import asyncio
 import logging
+from datetime import datetime, timezone
 
-# 🔸 Инфраструктура
-import laboratory_infra as infra
 from laboratory_infra import (
     setup_logging,
-    setup_pg,
-    setup_redis_client,
+    init_pg_pool,
+    init_redis_client,
+    run_safe_loop,
 )
-
-# 🔸 Загрузка конфигов и слушатели WL/CONFIG
 from laboratory_config import (
-    load_enabled_tickers,
-    load_enabled_strategies,
-    load_pack_whitelist,
-    load_mw_whitelist,
-    config_event_listener,
-    whitelist_stream_listener,
+    bootstrap_caches,            # стартовая загрузка кешей (тикеры + индикаторы) и лог итогов
+    get_cache_stats,             # метрики кешей для heartbeat
+    run_watch_tickers_events,    # подписчик Pub/Sub: tickers_v4_events
+    run_watch_indicators_events, # подписчик Pub/Sub: indicators_v4_events
+    run_watch_signals_events,    # подписчик Pub/Sub: signals_v4_events (лог)
+    run_watch_strategies_events, # подписчик Pub/Sub: strategies_v4_events (лог)
+    run_watch_signals_stream,    # потребитель Stream: signals_stream (лог)
+    run_watch_ohlcv_ready_stream # потребитель Stream: готовность свечей → обновляет last_bar
 )
 
-# 🔸 Обработчик решений (allow/deny)
-from laboratory_decision_maker import run_laboratory_decision_maker
-# 🔸 Пост-allow писатель статистики (filler)
-from laboratory_decision_filler import run_laboratory_decision_filler
-# 🔸 Постпроцессор закрытий → LPS
-from laboratory_decision_postproc import run_laboratory_decision_postproc
-# 🔸 Аналитика blacklist (ежечасно, окно 7×24ч)
-from laboratory_bl_analyzer import run_laboratory_bl_analyzer
-# 🔸 Очистка собственных стримов (start +90s, затем раз в час)
-from laboratory_stream_cleaner import run_laboratory_stream_cleaner
+# 🔸 Параметры сервиса (вместо ENV)
+LAB_SETTINGS = {
+    # TF фиксированы: работаем только с m5/m15/h1
+    "TF_SET": ("m5", "m15", "h1"),
+
+    # Redis каналы/стримы
+    "CHANNEL_TICKERS": "tickers_v4_events",
+    "CHANNEL_INDICATORS": "indicators_v4_events",
+    "CHANNEL_SIGNALS": "signals_v4_events",
+    "CHANNEL_STRATEGIES": "strategies_v4_events",
+    "STREAM_SIGNALS": "signals_stream",
+    "STREAM_OHLCV_READY": "bb:ohlcv_channel",  # используем как Stream готовности свечей
+
+    # Имена consumer-групп/консьюмеров (лабораторные, не конфликтуют с v4)
+    "GROUP_SIGNALS": "labv4_signals_group",
+    "CONSUMER_SIGNALS": "labv4_signals_1",
+    "GROUP_OHLCV": "labv4_ohlcv_group",
+    "CONSUMER_OHLCV": "labv4_ohlcv_1",
+
+    # Стартовые паузы на воркеры (сек)
+    "DELAY_TICKERS": 0.5,
+    "DELAY_INDICATORS": 0.5,
+    "DELAY_SIGNALS_PUBSUB": 2.0,
+    "DELAY_STRATEGIES_PUBSUB": 2.0,
+    "DELAY_SIGNALS_STREAM": 2.0,
+    "DELAY_OHLCV_STREAM": 4.0,
+
+    # Каденс heartbeat (сек)
+    "HEARTBEAT_SEC": 30,
+}
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
 
 
-# 🔸 Обёртка с автоперезапуском фоновой задачи
-async def run_safe_loop(coro, label: str):
+# 🔸 Воркер heartbeat (метрики кешей и “живость”)
+async def run_heartbeat(pg, redis, every_sec: int):
+    # простая периодическая метрика по кешам
     while True:
         try:
-            log.info(f"[{label}] 🚀 Запуск задачи")
-            await coro()
-        except asyncio.CancelledError:
-            log.info(f"[{label}] ⏹️ Остановлено по сигналу")
-            raise
-        except Exception:
-            log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
-            await asyncio.sleep(5)
+            stats = get_cache_stats()
+            # формируем человекочитаемую отметку
+            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            # лог финального вида
+            log.info(
+                "LAB HEARTBEAT: symbols=%d indicators=%d last_bars=%d at=%s",
+                stats.get("symbols", 0),
+                stats.get("indicators", 0),
+                stats.get("last_bars", 0),
+                now_iso,
+            )
+        except Exception as e:
+            log.error(f"HEARTBEAT error: {e}", exc_info=True)
+        await asyncio.sleep(every_sec)
 
 
-# 🔸 Главная точка входа
+# 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков
 async def main():
     setup_logging()
-    log.info("📦 Запуск сервиса laboratory_v4")
+    log.info("LAB: запуск инициализации")
 
-    # Подключения к внешним сервисам
-    try:
-        await setup_pg()
-        await setup_redis_client()
-        log.info("🔌 Подключения к PostgreSQL и Redis инициализированы")
-    except Exception:
-        log.exception("❌ Ошибка инициализации внешних сервисов")
-        return
+    # подключение к БД/Redis
+    pg = await init_pg_pool()
+    redis = await init_redis_client()
 
-    # Первичная загрузка конфигурации
-    try:
-        await load_enabled_tickers()
-        await load_enabled_strategies()
-        await load_pack_whitelist()
-        await load_mw_whitelist()
-        log.info("📦 Конфигурация загружена: тикеры, стратегии, whitelist")
-    except Exception:
-        log.exception("❌ Ошибка первичной загрузки конфигурации")
-        return
+    # стартовая загрузка кешей (тикеры + индикаторы)
+    await bootstrap_caches(
+        pg=pg,
+        redis=redis,
+        tf_set=LAB_SETTINGS["TF_SET"],
+    )
 
-    log.info("🚀 Запуск фоновых слушателей")
+    # лог успешного старта
+    stats = get_cache_stats()
+    log.info(
+        "LAB INIT: tickers=%d indicators=%d",
+        stats.get("symbols", 0),
+        stats.get("indicators", 0),
+    )
 
+    # запуск фоновых подписчиков/воркеров с паузами старта
     await asyncio.gather(
-        # Слушатель изменений конфигов (тикеры/стратегии) — Pub/Sub
-        run_safe_loop(config_event_listener, "CONFIG_EVENT_LISTENER"),
-        # Слушатель обновлений whitelist (PACK + MW) — Streams
-        run_safe_loop(whitelist_stream_listener, "WL_STREAM_LISTENER"),
-        # Обработчик решений (allow/deny)
-        run_safe_loop(run_laboratory_decision_maker, "LAB_DECISION"),
-        # Пост-allow наполнитель статистики — Streams: laboratory_decision_filler → laboratoty_position_stat
-        run_safe_loop(run_laboratory_decision_filler, "LAB_DECISION_FILLER"),
-        run_safe_loop(run_laboratory_decision_postproc, "LAB_DECISION_POSTPROC"),
-        # Аналитика blacklist (ежечасно, окно 7×24ч)
-        run_safe_loop(run_laboratory_bl_analyzer, "LAB_BL_ANALYZER"),
-        # Очистка наших стримов (start +90s, period 1h)
-        run_safe_loop(run_laboratory_stream_cleaner, "LAB_STREAM_CLEANER"),
+        # Pub/Sub: тикеры
+        run_safe_loop(
+            lambda: run_watch_tickers_events(
+                pg=pg,
+                redis=redis,
+                channel=LAB_SETTINGS["CHANNEL_TICKERS"],
+                initial_delay=LAB_SETTINGS["DELAY_TICKERS"],
+            ),
+            "LAB_TICKERS",
+        ),
+        # Pub/Sub: индикаторы
+        run_safe_loop(
+            lambda: run_watch_indicators_events(
+                pg=pg,
+                redis=redis,
+                channel=LAB_SETTINGS["CHANNEL_INDICATORS"],
+                initial_delay=LAB_SETTINGS["DELAY_INDICATORS"],
+                tf_set=LAB_SETTINGS["TF_SET"],
+            ),
+            "LAB_INDICATORS",
+        ),
+        # Pub/Sub: сигналы (логируем)
+        run_safe_loop(
+            lambda: run_watch_signals_events(
+                redis=redis,
+                channel=LAB_SETTINGS["CHANNEL_SIGNALS"],
+                initial_delay=LAB_SETTINGS["DELAY_SIGNALS_PUBSUB"],
+            ),
+            "LAB_SIGNALS_PUBSUB",
+        ),
+        # Pub/Sub: стратегии (логируем)
+        run_safe_loop(
+            lambda: run_watch_strategies_events(
+                redis=redis,
+                channel=LAB_SETTINGS["CHANNEL_STRATEGIES"],
+                initial_delay=LAB_SETTINGS["DELAY_STRATEGIES_PUBSUB"],
+            ),
+            "LAB_STRATEGIES_PUBSUB",
+        ),
+        # Stream: входящие сигналы (логируем пакетами)
+        run_safe_loop(
+            lambda: run_watch_signals_stream(
+                redis=redis,
+                stream=LAB_SETTINGS["STREAM_SIGNALS"],
+                group=LAB_SETTINGS["GROUP_SIGNALS"],
+                consumer=LAB_SETTINGS["CONSUMER_SIGNALS"],
+                initial_delay=LAB_SETTINGS["DELAY_SIGNALS_STREAM"],
+            ),
+            "LAB_SIGNALS_STREAM",
+        ),
+        # Stream: готовность свечей (обновляет кеш last_bar)
+        run_safe_loop(
+            lambda: run_watch_ohlcv_ready_stream(
+                redis=redis,
+                stream=LAB_SETTINGS["STREAM_OHLCV_READY"],
+                group=LAB_SETTINGS["GROUP_OHLCV"],
+                consumer=LAB_SETTINGS["CONSUMER_OHLCV"],
+                initial_delay=LAB_SETTINGS["DELAY_OHLCV_STREAM"],
+            ),
+            "LAB_OHLCV_READY",
+        ),
+        # Heartbeat
+        run_safe_loop(
+            lambda: run_heartbeat(
+                pg=pg, redis=redis, every_sec=LAB_SETTINGS["HEARTBEAT_SEC"]
+            ),
+            "LAB_HEARTBEAT",
+        ),
     )
 
 
+# 🔸 Точка входа
 if __name__ == "__main__":
     asyncio.run(main())
