@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, подписчики Pub/Sub)
+# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, подписчики Pub/Sub, IND-live воркер)
 
 # 🔸 Импорты
 import asyncio
@@ -11,12 +11,17 @@ from laboratory_infra import (
     run_safe_loop,
 )
 from laboratory_config import (
-    bootstrap_caches,             # стартовая загрузка кешей (тикеры + индикаторы) и лог итогов
+    bootstrap_caches,             # стартовая загрузка кешей (тикеры + индикаторы)
     get_cache_stats,              # метрики кешей для стартового лога
+    get_instances_by_tf,          # геттеры кешей для IND-воркера
+    get_precision,
+    get_active_symbols,
+    get_last_bar,
     run_watch_tickers_events,     # Pub/Sub: tickers_v4_events
     run_watch_indicators_events,  # Pub/Sub: indicators_v4_events
     run_watch_ohlcv_ready_channel # Pub/Sub: bb:ohlcv_channel → обновляет last_bar
 )
+from laboratory_ind_live import run_lab_ind_live  # IND-live воркер публикации в lab_live:ind:*
 
 # 🔸 Параметры сервиса (локально, без ENV)
 LAB_SETTINGS = {
@@ -62,7 +67,7 @@ async def main():
         stats.get("indicators", 0),
     )
 
-    # запуск фоновых подписчиков (только нужные)
+    # запуск фоновых подписчиков и IND-live воркера
     await asyncio.gather(
         # Pub/Sub: тикеры
         run_safe_loop(
@@ -93,6 +98,19 @@ async def main():
                 initial_delay=LAB_SETTINGS["DELAY_OHLCV_CHANNEL"],
             ),
             "LAB_OHLCV_READY",
+        ),
+        # IND-live публикация (каждые 30 секунд публикует lab_live:ind:* с TTL 45s)
+        run_safe_loop(
+            lambda: run_lab_ind_live(
+                pg=pg,
+                redis=redis,
+                get_instances_by_tf=get_instances_by_tf,
+                get_precision=get_precision,
+                get_active_symbols=get_active_symbols,
+                get_last_bar=get_last_bar,
+                tf_set=LAB_SETTINGS["TF_SET"],
+            ),
+            "LAB_IND_LIVE",
         ),
     )
 
