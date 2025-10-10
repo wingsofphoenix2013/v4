@@ -1,8 +1,11 @@
-# packs/pack_utils.py — утилиты для on-demand пакетов (RSI/MFI/…): время бара, загрузка OHLCV из TS, корзины и тренды
+# packs/pack_utils.py — утилиты для on-demand пакетов (время бара, загрузка OHLCV из TS, корзины/тренды) + in-process DF memo
 
+# 🔸 Импорты
 import asyncio
 import logging
+import time
 from datetime import datetime
+from typing import Optional
 import pandas as pd
 
 # 🔸 Логгер модуля
@@ -16,13 +19,29 @@ STEP_MS  = {"m5": 300_000, "m15": 900_000, "h1": 3_600_000}
 BB_TS_PREFIX = "bb:ts"  # bb:ts:{symbol}:{tf}:{field}
 IND_KV_PREFIX = "ind"   # ind:{symbol}:{tf}:{param_name}
 
+# 🔸 In-process memo для OHLCV DataFrame (снижает повторы TS.RANGE внутри тика)
+_DF_MEMO: dict[tuple[str, str, int, int], tuple[float, pd.DataFrame]] = {}  # (symbol, tf, end_ts_ms, bars) -> (exp_ts, df)
+DF_MEMO_TTL_SEC = 10
+
 # 🔸 Нормализация времени к началу бара
 def floor_to_bar(ts_ms: int, tf: str) -> int:
     step = STEP_MS[tf]
     return (ts_ms // step) * step
 
-# 🔸 Загрузка OHLCV из Redis TS (одним батчем) и сборка DataFrame
-async def load_ohlcv_df(redis, symbol: str, tf: str, end_ts_ms: int, bars: int = 800):
+# 🔸 Загрузка OHLCV из Redis TS (одним батчем) и сборка DataFrame (с memo)
+async def load_ohlcv_df(redis, symbol: str, tf: str, end_ts_ms: int, bars: int = 800) -> Optional[pd.DataFrame]:
+    # проверка memo
+    memo_key = (symbol, tf, int(end_ts_ms), int(bars))
+    rec = _DF_MEMO.get(memo_key)
+    if rec:
+        exp_ts, cached_df = rec
+        if time.monotonic() <= exp_ts:
+            # debug-лог без шума
+            log.debug("DF MEMO HIT %s/%s@%s bars=%d", symbol, tf, end_ts_ms, bars)
+            return cached_df
+        else:
+            _DF_MEMO.pop(memo_key, None)
+
     if tf not in STEP_MS:
         return None
 
@@ -64,7 +83,16 @@ async def load_ohlcv_df(redis, symbol: str, tf: str, end_ts_ms: int, bars: int =
         return None
 
     df.index.name = "open_time"
-    return df.sort_index()
+    df = df.sort_index()
+
+    # нижняя граница разумности (избегаем кэширования «крохи»)
+    if len(df) < min(bars // 2, 100):
+        log.debug("load_ohlcv_df: too few rows (%d) for %s/%s", len(df), symbol, tf)
+        return df  # возвращаем как есть, но не кэшируем
+
+    # положим в memo (TTL)
+    _DF_MEMO[memo_key] = (time.monotonic() + DF_MEMO_TTL_SEC, df)
+    return df
 
 # 🔸 RSI: корзина (нижняя граница, шаг 5)
 def rsi_bucket_low(value: float) -> int:
@@ -84,7 +112,7 @@ def classify_abs_delta(delta: float, tf: str) -> str:
     return "flat"
 
 # 🔸 Прочитать закрытое значение RSI из KV ind:{symbol}:{tf}:rsi{length}
-async def get_closed_rsi(redis, symbol: str, tf: str, length: int) -> float | None:
+async def get_closed_rsi(redis, symbol: str, tf: str, length: int) -> Optional[float]:
     key = f"{IND_KV_PREFIX}:{symbol}:{tf}:rsi{length}"
     try:
         s = await redis.get(key)
