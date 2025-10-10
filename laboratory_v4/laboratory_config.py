@@ -1,4 +1,4 @@
-# laboratory_config.py — стартовая загрузка кешей laboratory_v4 + подписчики Pub/Sub/Streams (тикеры, индикаторы, сигналы, готовность свечей)
+# laboratory_config.py — стартовая загрузка кешей laboratory_v4 + подписчики Pub/Sub/Streams (тикеры, индикаторы, готовность свечей)
 
 # 🔸 Импорты
 import asyncio
@@ -10,10 +10,9 @@ from datetime import datetime
 log = logging.getLogger("LAB_CONFIG")
 
 # 🔸 Кеши модуля (in-memory, общий доступ)
-lab_tickers: dict[str, dict] = {}         # symbol -> {"precision_price": int, "status": str, "tradepermission": str}
-lab_indicators: dict[int, dict] = {}      # instance_id -> {"indicator": str, "timeframe": str, "stream_publish": bool, "enabled_at": datetime|None, "params": dict}
-lab_last_bar: dict[tuple[str, str], int] = {}  # (symbol, tf) -> last open_time (ms)
-
+lab_tickers: dict[str, dict] = {}                # symbol -> {"precision_price": int, "status": str, "tradepermission": str}
+lab_indicators: dict[int, dict] = {}             # instance_id -> {"indicator": str, "timeframe": str, "stream_publish": bool, "enabled_at": datetime|None, "params": dict}
+lab_last_bar: dict[tuple[str, str], int] = {}    # (symbol, tf) -> last open_time (ms)
 
 # 🔸 Вспомогательные геттеры кешей
 def get_active_symbols() -> list[str]:
@@ -24,7 +23,6 @@ def get_precision(symbol: str) -> int | None:
     return int(info["precision_price"]) if info and info.get("precision_price") is not None else None
 
 def get_instances_by_tf(tf: str) -> list[dict]:
-    # возвращаем минимально достаточное представление
     return [
         {
             "id": iid,
@@ -47,7 +45,6 @@ def get_cache_stats() -> dict:
         "indicators": len(lab_indicators),
         "last_bars": len(lab_last_bar),
     }
-
 
 # 🔸 Стартовая загрузка кешей (тикеры + индикаторы)
 async def bootstrap_caches(pg, redis, tf_set: tuple[str, ...] = ("m5", "m15", "h1")):
@@ -78,7 +75,6 @@ async def bootstrap_caches(pg, redis, tf_set: tuple[str, ...] = ("m5", "m15", "h
         for inst in inst_rows:
             tf = inst["timeframe"]
             if tf not in tf_set:
-                # работаем только с m5/m15/h1
                 continue
             iid = int(inst["id"])
             params_rows = await conn.fetch("""
@@ -95,13 +91,11 @@ async def bootstrap_caches(pg, redis, tf_set: tuple[str, ...] = ("m5", "m15", "h
                 "params": params,
             }
 
-    # лог итогов старта
+    # итог
     log.info("LAB INIT (bootstrap): tickers=%d indicators=%d", added_tickers, len(lab_indicators))
-
 
 # 🔸 Помощники для обновлений кешей из БД
 async def _reload_ticker(pg, symbol: str) -> bool:
-    # возвращает True, если тикер добавлен/обновлён; False, если не найден/удалён
     async with pg.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT symbol, precision_price, status, tradepermission
@@ -120,7 +114,6 @@ async def _reload_ticker(pg, symbol: str) -> bool:
         return False
 
 async def _reload_indicator_instance(pg, iid: int, tf_set: tuple[str, ...]) -> bool:
-    # возвращает True, если инстанс добавлен/обновлён; False, если не найден/удалён/неподдерживаемый TF
     async with pg.acquire() as conn:
         inst = await conn.fetchrow("""
             SELECT id, indicator, timeframe, stream_publish, enabled_at, enabled
@@ -130,18 +123,15 @@ async def _reload_indicator_instance(pg, iid: int, tf_set: tuple[str, ...]) -> b
         if not inst:
             lab_indicators.pop(iid, None)
             return False
-
         if not inst["enabled"] or inst["timeframe"] not in tf_set:
             lab_indicators.pop(iid, None)
             return False
-
         params_rows = await conn.fetch("""
             SELECT param, value
             FROM indicator_parameters_v4
             WHERE instance_id = $1
         """, iid)
         params = {p["param"]: p["value"] for p in params_rows}
-
     lab_indicators[iid] = {
         "indicator": inst["indicator"],
         "timeframe": inst["timeframe"],
@@ -150,7 +140,6 @@ async def _reload_indicator_instance(pg, iid: int, tf_set: tuple[str, ...]) -> b
         "params": params,
     }
     return True
-
 
 # 🔸 Подписчик Pub/Sub: тикеры (tickers_v4_events)
 async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float = 0.0):
@@ -161,9 +150,7 @@ async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
 
-    # счётчики для пачечного логирования
     upd = rem = 0
-
     async for msg in pubsub.listen():
         if msg["type"] != "message":
             continue
@@ -173,12 +160,9 @@ async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float
             log.warning("LAB TICKERS: некорректный JSON: %r", msg.get("data"))
             continue
 
-        # ожидаем формат: {"type":"status","action":"enabled|disabled","symbol":"..."}
         sym = data.get("symbol")
         ev_type = data.get("type")
         action = data.get("action")
-
-        # условия достаточности
         if not sym or ev_type != "status" or action not in ("enabled", "disabled"):
             continue
 
@@ -193,10 +177,8 @@ async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float
         except Exception as e:
             log.warning("LAB TICKERS: ошибка обработки события %s: %s", sym, e)
 
-        # итоговый лог пакетами
         if (upd + rem) % 50 == 0:
             log.info("LAB TICKERS: updated=%d removed=%d active=%d", upd, rem, len(lab_tickers))
-
 
 # 🔸 Подписчик Pub/Sub: индикаторы (indicators_v4_events)
 async def run_watch_indicators_events(pg, redis, channel: str, initial_delay: float = 0.0, tf_set: tuple[str, ...] = ("m5","m15","h1")):
@@ -208,7 +190,6 @@ async def run_watch_indicators_events(pg, redis, channel: str, initial_delay: fl
     await pubsub.subscribe(channel)
 
     added = removed = updated = 0
-
     async for msg in pubsub.listen():
         if msg["type"] != "message":
             continue
@@ -234,122 +215,59 @@ async def run_watch_indicators_events(pg, redis, channel: str, initial_delay: fl
                 else:
                     if lab_indicators.pop(iid, None) is not None:
                         removed += 1
-            elif field == "stream_publish":
-                if iid in lab_indicators:
-                    lab_indicators[iid]["stream_publish"] = (action == "true")
-                    updated += 1
+            elif field == "stream_publish" and iid in lab_indicators:
+                lab_indicators[iid]["stream_publish"] = (action == "true")
+                updated += 1
         except Exception as e:
             log.warning("LAB IND: ошибка обработки %s: %s", iid, e)
 
-        # итоговый лог пакетами
         total = len(lab_indicators)
         if (added + removed + updated) % 50 == 0:
             log.info("LAB IND: added=%d removed=%d updated=%d total=%d", added, removed, updated, total)
 
-
-# 🔸 Подписчик Pub/Sub: сигналы (только логируем для диагностики)
-async def run_watch_signals_events(redis, channel: str, initial_delay: float = 0.0):
+# 🔸 Подписчик Pub/Sub: готовность свечей (bb:ohlcv_channel) → обновление lab_last_bar
+async def run_watch_ohlcv_ready_channel(redis, channel: str, initial_delay: float = 0.0):
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
-    log.info("LAB SIGNALS PUBSUB: подписка на канал %s", channel)
+    log.info("LAB OHLCV (channel): подписка на канал %s", channel)
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
 
-    cnt = 0
     async for msg in pubsub.listen():
         if msg["type"] != "message":
             continue
-        cnt += 1
-        # лёгкий разбор для логов
         try:
             data = json.loads(msg["data"])
-            kind = data.get("type") or "unknown"
-            sid = data.get("id") or data.get("signal_id")
-            log.debug("LAB SIGNALS PUBSUB: %s id=%s", kind, sid)
         except Exception:
-            log.debug("LAB SIGNALS PUBSUB: raw=%r", msg.get("data"))
-        if cnt % 200 == 0:
-            log.info("LAB SIGNALS PUBSUB: received=%d", cnt)
-
-
-# 🔸 Подписчик Pub/Sub: стратегии (только логируем для диагностики)
-async def run_watch_strategies_events(redis, channel: str, initial_delay: float = 0.0):
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    log.info("LAB STRATEGIES PUBSUB: подписка на канал %s", channel)
-
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(channel)
-
-    cnt = 0
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
+            log.warning("LAB OHLCV: некорректный JSON: %r", msg.get("data"))
             continue
-        cnt += 1
+
+        # ожидаем формат, как в v4: {"symbol","interval","timestamp"}
+        symbol = data.get("symbol")
+        interval = data.get("interval") or data.get("timeframe")
+        ts = data.get("timestamp") or data.get("open_time_ms") or data.get("open_time")
+        if not symbol or not interval or ts is None:
+            continue
+
         try:
-            data = json.loads(msg["data"])
-            kind = data.get("type") or "unknown"
-            sid = data.get("id")
-            log.debug("LAB STRATEGIES PUBSUB: %s id=%s", kind, sid)
+            open_ms = int(ts)
         except Exception:
-            log.debug("LAB STRATEGIES PUBSUB: raw=%r", msg.get("data"))
-        if cnt % 200 == 0:
-            log.info("LAB STRATEGIES PUBSUB: received=%d", cnt)
-
-
-# 🔸 Потребитель Stream: входящие сигналы (signals_stream) — только лог
-async def run_watch_signals_stream(redis, stream: str, group: str, consumer: str, initial_delay: float = 0.0):
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    log.info("LAB SIGNALS STREAM: подписка на stream=%s group=%s consumer=%s", stream, group, consumer)
-
-    # создать consumer-group (идемпотентно)
-    try:
-        await redis.xgroup_create(stream, group, id="$", mkstream=True)
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            log.warning("LAB SIGNALS STREAM: xgroup_create error: %s", e)
-
-    processed = 0
-
-    while True:
-        try:
-            resp = await redis.xreadgroup(groupname=group, consumername=consumer, streams={stream: ">"}, count=200, block=1000)
-        except Exception as e:
-            log.error("LAB SIGNALS STREAM: read error: %s", e, exc_info=True)
-            await asyncio.sleep(0.5)
-            continue
-
-        if not resp:
-            continue
-
-        to_ack = []
-        batch = 0
-        for _, messages in resp:
-            for msg_id, data in messages:
-                to_ack.append(msg_id)
-                batch += 1
-                # поверхностная диагностика
-                log.debug("LAB SIGNAL: %s", data)
-
-        if to_ack:
             try:
-                await redis.xack(stream, group, *to_ack)
-            except Exception as e:
-                log.warning("LAB SIGNALS STREAM: ack error: %s", e)
+                open_ms = int(datetime.fromisoformat(str(ts)).timestamp() * 1000)
+            except Exception:
+                continue
 
-        processed += batch
-        log.info("LAB SIGNALS STREAM: received batch=%d total=%d", batch, processed)
+        lab_last_bar[(symbol, interval)] = open_ms
+        open_iso = datetime.utcfromtimestamp(open_ms / 1000).isoformat()
+        log.info("LAB OHLCV: set last_bar %s/%s@%s", symbol, interval, open_iso)
 
-
-# 🔸 Потребитель Stream: готовность свечей → обновление lab_last_bar
+# 🔸 (Опционально) Потребитель Stream: готовность свечей — оставлен на случай, если источник будет стримом
 async def run_watch_ohlcv_ready_stream(redis, stream: str, group: str, consumer: str, initial_delay: float = 0.0):
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
-    log.info("LAB OHLCV: подписка на stream=%s group=%s consumer=%s", stream, group, consumer)
+    log.info("LAB OHLCV (stream): подписка на stream=%s group=%s consumer=%s", stream, group, consumer)
 
-    # создать consumer-group (идемпотентно)
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
     except Exception as e:
@@ -375,22 +293,16 @@ async def run_watch_ohlcv_ready_stream(redis, stream: str, group: str, consumer:
                     symbol = data.get("symbol")
                     interval = data.get("interval") or data.get("timeframe")
                     ts = data.get("timestamp") or data.get("open_time_ms") or data.get("open_time")
-                    # условия достаточности
                     if not symbol or not interval or ts is None:
                         continue
-
-                    # нормализуем timestamp в ms
                     try:
                         open_ms = int(ts)
                     except Exception:
-                        # если ISO
                         try:
                             open_ms = int(datetime.fromisoformat(str(ts)).timestamp() * 1000)
                         except Exception:
                             continue
-
                     lab_last_bar[(symbol, interval)] = open_ms
-                    # человекочитаемый лог
                     open_iso = datetime.utcfromtimestamp(open_ms / 1000).isoformat()
                     log.info("LAB OHLCV: set last_bar %s/%s@%s", symbol, interval, open_iso)
                 except Exception as e:
