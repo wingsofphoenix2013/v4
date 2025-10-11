@@ -179,8 +179,8 @@ async def run_lab_mw_live(
 
         # итоговый лог тика
         log.info(
-            "LAB MW: tick done pairs=%d states=%d skipped=%d elapsed_ms=%d",
-            total_pairs, total_published, total_skipped, elapsed_ms
+            "LAB MW: tick done tf=%s pairs=%d states=%d skipped=%d elapsed_ms=%d",
+            ",".join(tf_set), total_pairs, total_published, total_skipped, elapsed_ms
         )
 
         await asyncio.sleep(tick_interval_sec)

@@ -212,8 +212,8 @@ async def run_lab_pack_live(
 
         # итоговый лог тика
         log.info(
-            "LAB PACK: tick done pairs=%d packs=%d skipped=%d elapsed_ms=%d",
-            total_pairs, total_published, total_skipped, elapsed_ms
+            "LAB PACK: tick done tf=%s pairs=%d packs=%d skipped=%d elapsed_ms=%d",
+            ",".join(tf_set), total_pairs, total_published, total_skipped, elapsed_ms
         )
 
         await asyncio.sleep(tick_interval_sec)

@@ -148,8 +148,8 @@ async def run_lab_ind_live(
 
         # итоговый лог тика
         log.info(
-            "LAB IND: tick done pairs=%d params=%d skipped=%d elapsed_ms=%d",
-            total_pairs, total_published, total_skipped, elapsed_ms
+            "LAB IND: tick done tf=%s pairs=%d params=%d skipped=%d elapsed_ms=%d",
+            ",".join(tf_set), total_pairs, total_published, total_skipped, elapsed_ms
         )
 
         # пауза до следующего тика
