@@ -1,19 +1,12 @@
-# Асинхронный доступ к PostgreSQL
-asyncpg==0.29.0
-
-# Асинхронный Redis-клиент
-redis==5.0.1
-
-# Работа с базой данных через ORM
+redis>=5.0.0
+asyncio
+asyncpg
+python-dotenv
+aiohttp>=3.8.0
+numpy
+pandas
+scipy
 sqlalchemy>=2.0.0
 psycopg2-binary
-
-# Научные библиотеки для расчётов
-numpy==1.26.4
-scipy==1.13.0
-
-# Индикаторы
 ta==0.10.2
-
-# Для логирования (опционально)
 loguru==0.7.2
