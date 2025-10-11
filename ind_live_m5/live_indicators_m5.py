@@ -1,4 +1,4 @@
-# live_indicators_m5.py — фоновой воркер публикации «живых» индикаторов m5 в Redis KV (ind_live:*)
+# live_indicators_m5.py — фоновой воркер публикации «живых» индикаторов m5 в Redis KV (ind_live:*) + L1-кэш в памяти
 
 # 🔸 Импорты
 import asyncio
@@ -19,7 +19,7 @@ TF = "m5"                            # фиксированный таймфре
 BARS = 800                           # глубина истории для расчёта
 INITIAL_DELAY_SEC = 60               # задержка перед первым проходом
 SLEEP_BETWEEN_CYCLES_SEC = 3         # пауза между проходами
-TTL_SEC = 90                         # TTL для ind_live:* ключей, сек
+TTL_SEC = 90                         # TTL для ind_live:* ключей и L1, сек
 MAX_CONCURRENCY = 30                 # ограничение параллелизма по символам
 
 
@@ -45,8 +45,9 @@ async def _publish_values(redis, symbol: str, tf: str, values: dict[str, str]) -
     return ok, err
 
 
-# 🔸 Обработка одного символа: загрузка DF, вычисление по всем инстансам m5, публикация
+# 🔸 Обработка одного символа: загрузка DF, вычисление по всем инстансам m5, публикация в Redis и L1
 async def _process_symbol(redis,
+                          live_cache,  # объект L1-кэша; допускается None
                           symbol: str,
                           precision: int,
                           instances_m5: list[dict],
@@ -57,12 +58,16 @@ async def _process_symbol(redis,
     # загрузка OHLCV одним батчем
     df = await load_ohlcv_df(redis, symbol, TF, bar_open_ms, BARS)
     if df is None or df.empty:
+        # в этом случае и L1, и Redis не обновляем
         return {"symbol": symbol, "computed": 0, "written": 0, "errors": 0, "skipped": len(instances_m5)}
 
     computed = 0
     written = 0
     errors = 0
     skipped = 0
+
+    # агрегатор для L1: соберём все пары param->str по символу за проход
+    l1_values: dict[str, str] = {}
 
     # по всем инстансам m5
     for inst in instances_m5:
@@ -92,16 +97,32 @@ async def _process_symbol(redis,
         written += ok
         errors += err
 
+        # накопим в L1-агрегатор
+        try:
+            l1_values.update(values)
+        except Exception:
+            # не считаем как ошибку прохода, но зафиксируем для отладки
+            log.debug(f"LIVE_M5 L1 update skipped for {symbol}: merge error")
+
+    # финальное обновление L1 на символ (одним сетом)
+    if live_cache and l1_values:
+        try:
+            await live_cache.set(symbol, TF, bar_open_ms, l1_values, ttl_sec=TTL_SEC)
+        except Exception as e:
+            # не увеличиваем счётчик errors, чтобы не менять семантику метрик; просто лог
+            log.debug(f"LIVE_M5 L1 set error for {symbol}: {e}")
+
     return {"symbol": symbol, "computed": computed, "written": written, "errors": errors, "skipped": skipped}
 
 
-# 🔸 Основной воркер: каждые ~SLEEP_BETWEEN_CYCLES_SEC cчитает RAW индикаторы m5 для всех тикеров и пишет в ind_live:*
+# 🔸 Основной воркер: каждые ~SLEEP_BETWEEN_CYCLES_SEC cчитает RAW индикаторы m5 для всех тикеров и пишет в ind_live:* + L1
 async def run_live_indicators_m5(pg,
                                  redis,
                                  get_instances_by_tf,
                                  get_precision,
-                                 get_active_symbols):
-    log.debug("LIVE_M5: воркер запущен (Stage-1: только m5, только RAW → Redis ind_live:*)")
+                                 get_active_symbols,
+                                 live_cache=None):
+    log.debug("LIVE_M5: воркер запущен (Stage-1: только m5, только RAW → Redis ind_live:* + L1)")
 
     # начальная задержка, чтобы не стартовать вровень с другими процессами
     await asyncio.sleep(INITIAL_DELAY_SEC)
@@ -138,7 +159,7 @@ async def run_live_indicators_m5(pg,
                     precision = int(get_precision(symbol) or 8)
                 except Exception:
                     precision = 8
-                return await _process_symbol(redis, symbol, precision, instances_m5, now_ms)
+                return await _process_symbol(redis, live_cache, symbol, precision, instances_m5, now_ms)
 
         tasks = [asyncio.create_task(_wrap(sym)) for sym in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=False)
