@@ -4,7 +4,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import pandas as pd
 
@@ -122,4 +122,6 @@ async def get_closed_rsi(redis, symbol: str, tf: str, length: int) -> Optional[f
 
 # 🔸 Вспомогательное: ISO-время открытия бара по ms
 def bar_open_iso(bar_open_ms: int) -> str:
-    return datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+    dt = datetime.fromtimestamp(bar_open_ms / 1000, tz=timezone.utc)
+    # возвращаем UTC-naive ISO (как в остальной системе)
+    return dt.replace(tzinfo=None).isoformat()

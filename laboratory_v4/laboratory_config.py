@@ -150,7 +150,7 @@ async def bootstrap_caches(pg, redis, tf_set: tuple[str, ...] = ("m5", "m15", "h
                 "params": params,
             }
 
-    log.info("LAB INIT (bootstrap): tickers=%d indicators=%d", added_tickers, len(lab_indicators))
+    log.debug("LAB INIT (bootstrap): tickers=%d indicators=%d", added_tickers, len(lab_indicators))
 
 
 # 🔸 Помощники для обновлений кешей из БД
@@ -206,7 +206,7 @@ async def _reload_indicator_instance(pg, iid: int, tf_set: tuple[str, ...]) -> b
 async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float = 0.0):
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
-    log.info("LAB TICKERS: подписка на канал %s", channel)
+    log.debug("LAB TICKERS: подписка на канал %s", channel)
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
@@ -239,14 +239,14 @@ async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float
             log.warning("LAB TICKERS: ошибка обработки события %s: %s", sym, e)
 
         if (upd + rem) % 50 == 0:
-            log.info("LAB TICKERS: updated=%d removed=%d active=%d", upd, rem, len(lab_tickers))
+            log.debug("LAB TICKERS: updated=%d removed=%d active=%d", upd, rem, len(lab_tickers))
 
 
 # 🔸 Подписчик Pub/Sub: индикаторы (indicators_v4_events)
 async def run_watch_indicators_events(pg, redis, channel: str, initial_delay: float = 0.0, tf_set: tuple[str, ...] = ("m5","m15","h1")):
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
-    log.info("LAB IND: подписка на канал %s", channel)
+    log.debug("LAB IND: подписка на канал %s", channel)
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
@@ -285,14 +285,14 @@ async def run_watch_indicators_events(pg, redis, channel: str, initial_delay: fl
 
         total = len(lab_indicators)
         if (added + removed + updated) % 50 == 0:
-            log.info("LAB IND: added=%d removed=%d updated=%d total=%d", added, removed, updated, total)
+            log.debug("LAB IND: added=%d removed=%d updated=%d total=%d", added, removed, updated, total)
 
 
 # 🔸 Подписчик Pub/Sub: готовность свечей (bb:ohlcv_channel) → обновление lab_last_bar
 async def run_watch_ohlcv_ready_channel(redis, channel: str, initial_delay: float = 0.0):
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
-    log.info("LAB OHLCV (channel): подписка на канал %s", channel)
+    log.debug("LAB OHLCV (channel): подписка на канал %s", channel)
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
@@ -322,4 +322,4 @@ async def run_watch_ohlcv_ready_channel(redis, channel: str, initial_delay: floa
 
         lab_last_bar[(symbol, interval)] = open_ms
         open_iso = datetime.utcfromtimestamp(open_ms / 1000).isoformat()
-        log.info("LAB OHLCV: set last_bar %s/%s@%s", symbol, interval, open_iso)
+        log.debug("LAB OHLCV: set last_bar %s/%s@%s", symbol, interval, open_iso)
