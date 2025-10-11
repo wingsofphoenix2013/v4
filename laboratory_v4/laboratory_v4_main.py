@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — оркестратор фонового сервиса laboratory_v4 (инициализация, кеши, Pub/Sub, эксперимент: только IND m5)
+# laboratory_v4_main.py — оркестратор laboratory_v4 (инициализация, кеши, Pub/Sub, эксперимент: чередование IND↔MW для m5 с кешом)
 
 # 🔸 Импорты
 import asyncio
@@ -19,9 +19,10 @@ from laboratory_config import (
     get_last_bar,
     run_watch_tickers_events,     # Pub/Sub: tickers_v4_events
     run_watch_indicators_events,  # Pub/Sub: indicators_v4_events
-    run_watch_ohlcv_ready_channel # Pub/Sub: bb:ohlcv_channel → обновляет last_bar
+    run_watch_ohlcv_ready_channel # Pub/Sub: bb:ohlcv_channel → обновляет lab_last_bar
 )
-from laboratory_ind_live import run_lab_ind_live  # IND-live публикация lab_live:ind:*
+from laboratory_ind_live import tick_ind         # одиночный тик IND (без цикла)
+from laboratory_mw_live import tick_mw           # одиночный тик MW  (без цикла)
 
 # 🔸 Параметры сервиса (локально, без ENV)
 LAB_SETTINGS = {
@@ -35,14 +36,15 @@ LAB_SETTINGS = {
     "DELAY_INDICATORS": 0.5,
     "DELAY_OHLCV_CHANNEL": 2.0,
 
-    # Эксперимент: запуск только IND по m5
-    "IND_ONLY_TF_SET": ("m5",),  # полностью отключаем m15/h1
-    "IND_START_DELAY": 60,       # старт через 60 секунд после загрузки
-    "IND_TICK_SEC": 3,           # пауза между циклами 3 секунды
+    # Экспериментальный цикл (m5): IND → пауза → MW → пауза → …
+    "CYCLE_TF_SET": ("m5",),  # считаем только m5
+    "CYCLE_START_DELAY": 60,  # старт через 60 секунд после загрузки
+    "CYCLE_PAUSE_SEC": 3,     # пауза между IND и MW (и между итерациями)
 }
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
+
 
 # 🔸 Вспомогательное: запуск корутины с начальной задержкой
 async def _run_with_delay(coro_factory, delay: float):
@@ -50,10 +52,53 @@ async def _run_with_delay(coro_factory, delay: float):
         await asyncio.sleep(delay)
     await coro_factory()
 
-# 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков и IND-only воркера
+
+# 🔸 Координатор m5-цикла: IND(m5) → пауза → MW(m5) → пауза → …
+async def run_lab_cycle_m5(pg, redis):
+    tf_set = LAB_SETTINGS["CYCLE_TF_SET"]
+    pause = LAB_SETTINGS["CYCLE_PAUSE_SEC"]
+
+    while True:
+        # IND тик (обновляет кеш и пишет lab_live:ind:*)
+        pairs, published, skipped, elapsed_ms = await tick_ind(
+            pg=pg,
+            redis=redis,
+            get_instances_by_tf=get_instances_by_tf,
+            get_precision=get_precision,
+            get_active_symbols=get_active_symbols,
+            get_last_bar=get_last_bar,
+            tf_set=tf_set,
+        )
+        log.info(
+            "LAB CYCLE: IND tick tf=%s pairs=%d params=%d skipped=%d elapsed_ms=%d",
+            ",".join(tf_set), pairs, published, skipped, elapsed_ms
+        )
+
+        # пауза между IND и MW
+        await asyncio.sleep(pause)
+
+        # MW тик (берёт live из кеша, пишет lab_live:mw:*)
+        pairs, published, skipped, elapsed_ms = await tick_mw(
+            pg=pg,
+            redis=redis,
+            get_active_symbols=get_active_symbols,
+            get_precision=get_precision,
+            get_last_bar=get_last_bar,
+            tf_set=tf_set,
+        )
+        log.info(
+            "LAB CYCLE: MW tick tf=%s pairs=%d states=%d skipped=%d elapsed_ms=%d",
+            ",".join(tf_set), pairs, published, skipped, elapsed_ms
+        )
+
+        # пауза до следующего чередования
+        await asyncio.sleep(pause)
+
+
+# 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков и экспериментального цикла m5
 async def main():
     setup_logging()
-    log.info("LAB: запуск инициализации (experiment: IND-only m5)")
+    log.info("LAB: запуск инициализации (experiment: m5 IND↔MW alternation)")
 
     # подключение к БД/Redis
     pg = await init_pg_pool()
@@ -66,7 +111,7 @@ async def main():
     stats = get_cache_stats()
     log.info("LAB INIT: tickers=%d indicators=%d", stats.get("symbols", 0), stats.get("indicators", 0))
 
-    # запуск слушателей Pub/Sub и единственного IND-live воркера по m5
+    # запуск слушателей Pub/Sub и экспериментального цикла m5
     await asyncio.gather(
         # Pub/Sub: тикеры
         run_safe_loop(
@@ -89,7 +134,7 @@ async def main():
             ),
             "LAB_INDICATORS",
         ),
-        # Pub/Sub: готовность свечей
+        # Pub/Sub: готовность свечей (обновляет lab_last_bar)
         run_safe_loop(
             lambda: run_watch_ohlcv_ready_channel(
                 redis=redis,
@@ -98,24 +143,16 @@ async def main():
             ),
             "LAB_OHLCV_READY",
         ),
-        # IND-only m5: старт через 60 секунд, период 3 секунды
+        # Эксперимент: координатор IND↔MW для m5 (старт через 60 секунд, PACK отключён)
         run_safe_loop(
             lambda: _run_with_delay(
-                lambda: run_lab_ind_live(
-                    pg=pg,
-                    redis=redis,
-                    get_instances_by_tf=get_instances_by_tf,
-                    get_precision=get_precision,
-                    get_active_symbols=get_active_symbols,
-                    get_last_bar=get_last_bar,
-                    tf_set=LAB_SETTINGS["IND_ONLY_TF_SET"],       # ("m5",)
-                    tick_interval_sec=LAB_SETTINGS["IND_TICK_SEC"] # 3 секунды
-                ),
-                LAB_SETTINGS["IND_START_DELAY"],
+                lambda: run_lab_cycle_m5(pg=pg, redis=redis),
+                LAB_SETTINGS["CYCLE_START_DELAY"],
             ),
-            "LAB_IND_LIVE_m5",
+            "LAB_CYCLE_M5",
         ),
     )
+
 
 # 🔸 Точка входа
 if __name__ == "__main__":
