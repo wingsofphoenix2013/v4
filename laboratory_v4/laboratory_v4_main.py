@@ -41,11 +41,13 @@ LAB_SETTINGS = {
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
 
+
 # 🔸 Вспомогательное: запуск корутины с начальной задержкой
 async def _run_with_delay(coro_factory, delay: float):
     if delay and delay > 0:
         await asyncio.sleep(delay)
     await coro_factory()
+
 
 # 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков и per-TF воркеров
 async def main():
@@ -68,7 +70,7 @@ async def main():
     IND_SCHEDULE = [
         (("m5",),  20,  62),   # (tf_set, interval_sec, initial_delay_sec)
         (("m15",), 60,  78),
-        (("h1",),  90,  92),
+        (("h1",),  90,  93),
     ]
     MW_SCHEDULE = [
         (("m5",),  20,  63),
@@ -84,16 +86,22 @@ async def main():
     # 🔸 Запуск слушателей и per-TF воркеров
     tasks = [
         # слушатели Pub/Sub
-        run_safe_loop(lambda: run_watch_tickers_events(pg=pg, redis=redis,
-                          channel=LAB_SETTINGS["CHANNEL_TICKERS"],
-                          initial_delay=LAB_SETTINGS["DELAY_TICKERS"]), "LAB_TICKERS"),
-        run_safe_loop(lambda: run_watch_indicators_events(pg=pg, redis=redis,
-                          channel=LAB_SETTINGS["CHANNEL_INDICATORS"],
-                          initial_delay=LAB_SETTINGS["DELAY_INDICATORS"],
-                          tf_set=("m5", "m15", "h1")), "LAB_INDICATORS"),
-        run_safe_loop(lambda: run_watch_ohlcv_ready_channel(redis=redis,
-                          channel=LAB_SETTINGS["CHANNEL_OHLCV_READY"],
-                          initial_delay=LAB_SETTINGS["DELAY_OHLCV_CHANNEL"]), "LAB_OHLCV_READY"),
+        run_safe_loop(lambda: run_watch_tickers_events(
+            pg=pg, redis=redis,
+            channel=LAB_SETTINGS["CHANNEL_TICKERS"],
+            initial_delay=LAB_SETTINGS["DELAY_TICKERS"]
+        ), "LAB_TICKERS"),
+        run_safe_loop(lambda: run_watch_indicators_events(
+            pg=pg, redis=redis,
+            channel=LAB_SETTINGS["CHANNEL_INDICATORS"],
+            initial_delay=LAB_SETTINGS["DELAY_INDICATORS"],
+            tf_set=("m5", "m15", "h1")
+        ), "LAB_INDICATORS"),
+        run_safe_loop(lambda: run_watch_ohlcv_ready_channel(
+            redis=redis,
+            channel=LAB_SETTINGS["CHANNEL_OHLCV_READY"],
+            initial_delay=LAB_SETTINGS["DELAY_OHLCV_CHANNEL"]
+        ), "LAB_OHLCV_READY"),
     ]
 
     # IND per-TF
@@ -156,6 +164,7 @@ async def main():
         )
 
     await asyncio.gather(*tasks)
+
 
 # 🔸 Точка входа
 if __name__ == "__main__":
