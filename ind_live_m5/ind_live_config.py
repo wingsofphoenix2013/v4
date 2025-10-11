@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from typing import Dict, Tuple, Optional, Set, Any, List
 
 # 🔸 Логгер
 log = logging.getLogger("IND_LIVE_CONFIG")
@@ -29,10 +30,10 @@ def _mono() -> float:
 class LiveCache:
     # структура записи: {(symbol, tf): {"bar_open_ms": int, "expires_at": float, "values": dict[param->str]}}
     def __init__(self) -> None:
-        self._store: dict[tuple[str, str], dict] = {}
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._store: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._locks: Dict[Tuple[str, str], asyncio.Lock] = {}
 
-    async def set(self, symbol: str, tf: str, bar_open_ms: int, values: dict[str, str], ttl_sec: int = 90) -> None:
+    async def set(self, symbol: str, tf: str, bar_open_ms: int, values: Dict[str, str], ttl_sec: int = 90) -> None:
         key = (symbol, tf)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
@@ -42,7 +43,13 @@ class LiveCache:
                 "values": dict(values) if values else {},
             }
 
-    async def get(self, symbol: str, tf: str, needed: set[str] | None, expect_bar_open_ms: int) -> dict[str, str] | None:
+    async def get(
+        self,
+        symbol: str,
+        tf: str,
+        needed: Optional[Set[str]],
+        expect_bar_open_ms: int
+    ) -> Optional[Dict[str, str]]:
         key = (symbol, tf)
         rec = self._store.get(key)
         if not rec:
@@ -53,7 +60,7 @@ class LiveCache:
             return None
         if int(rec.get("bar_open_ms", -1)) != int(expect_bar_open_ms):
             return None
-        vals: dict[str, str] = rec.get("values", {})
+        vals: Dict[str, str] = rec.get("values", {})  # type: ignore[assignment]
         if not vals:
             return None
         if needed is None:
@@ -80,20 +87,20 @@ class IndLiveConfig:
         self.redis = redis
 
         # в памяти: активные тикеры и инстансы
-        self.active_tickers: dict[str, int] = {}         # symbol -> precision_price
-        self.indicator_instances: dict[int, dict] = {}   # id -> {indicator,timeframe,params,enabled_at}
+        self.active_tickers: Dict[str, int] = {}         # symbol -> precision_price
+        self.indicator_instances: Dict[int, Dict[str, Any]] = {}   # id -> {indicator,timeframe,params,enabled_at}
 
         # L1-кэш
         self.live_cache = LiveCache()
 
     # 🔸 Геттеры (для воркеров)
-    def get_active_symbols(self) -> list[str]:
+    def get_active_symbols(self) -> List[str]:
         return list(self.active_tickers.keys())
 
     def get_precision(self, symbol: str) -> int:
         return int(self.active_tickers.get(symbol, 8))
 
-    def get_instances_by_tf(self, tf: str) -> list[dict]:
+    def get_instances_by_tf(self, tf: str) -> List[Dict[str, Any]]:
         return [
             {
                 "id": iid,
@@ -143,7 +150,7 @@ class IndLiveConfig:
             """)
             id_list = [int(x["id"]) for x in instances]
             # загрузим параметры пачками
-            params_by_id: dict[int, dict] = {}
+            params_by_id: Dict[int, Dict[str, Any]] = {}
             for inst_id in id_list:
                 params = await conn.fetch(f"""
                     SELECT param, value

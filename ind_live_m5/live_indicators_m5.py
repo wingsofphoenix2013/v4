@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from typing import Dict, Optional, List, Any
 
 from indicators.compute_and_store import compute_snapshot_values_async
 from packs.pack_utils import floor_to_bar, load_ohlcv_df
@@ -24,7 +25,7 @@ MAX_CONCURRENCY = 30                 # ограничение параллели
 
 
 # 🔸 Публикация значений в Redis KV (ind_live:*), с TTL
-async def _publish_values(redis, symbol: str, tf: str, values: dict[str, str]) -> tuple[int, int]:
+async def _publish_values(redis, symbol: str, tf: str, values: Dict[str, str]) -> (int, int):
     # возвращаем (успешно_установлено, ошибок)
     ok = 0
     err = 0
@@ -50,8 +51,8 @@ async def _process_symbol(redis,
                           live_cache,  # объект L1-кэша; допускается None
                           symbol: str,
                           precision: int,
-                          instances_m5: list[dict],
-                          now_ms: int) -> dict:
+                          instances_m5: List[Dict[str, Any]],
+                          now_ms: int) -> Dict[str, int]:
     # нормализуем время к началу текущего бара
     bar_open_ms = floor_to_bar(now_ms, TF)
 
@@ -59,7 +60,7 @@ async def _process_symbol(redis,
     df = await load_ohlcv_df(redis, symbol, TF, bar_open_ms, BARS)
     if df is None or df.empty:
         # в этом случае и L1, и Redis не обновляем
-        return {"symbol": symbol, "computed": 0, "written": 0, "errors": 0, "skipped": len(instances_m5)}
+        return {"symbol": 0, "computed": 0, "written": 0, "errors": 0, "skipped": len(instances_m5)}
 
     computed = 0
     written = 0
@@ -67,7 +68,7 @@ async def _process_symbol(redis,
     skipped = 0
 
     # агрегатор для L1: соберём все пары param->str по символу за проход
-    l1_values: dict[str, str] = {}
+    l1_values: Dict[str, str] = {}
 
     # по всем инстансам m5
     for inst in instances_m5:
@@ -101,7 +102,6 @@ async def _process_symbol(redis,
         try:
             l1_values.update(values)
         except Exception:
-            # не считаем как ошибку прохода, но зафиксируем для отладки
             log.debug(f"LIVE_M5 L1 update skipped for {symbol}: merge error")
 
     # финальное обновление L1 на символ (одним сетом)
@@ -109,10 +109,9 @@ async def _process_symbol(redis,
         try:
             await live_cache.set(symbol, TF, bar_open_ms, l1_values, ttl_sec=TTL_SEC)
         except Exception as e:
-            # не увеличиваем счётчик errors, чтобы не менять семантику метрик; просто лог
             log.debug(f"LIVE_M5 L1 set error for {symbol}: {e}")
 
-    return {"symbol": symbol, "computed": computed, "written": written, "errors": errors, "skipped": skipped}
+    return {"symbol": 1, "computed": computed, "written": written, "errors": errors, "skipped": skipped}
 
 
 # 🔸 Основной воркер: каждые ~SLEEP_BETWEEN_CYCLES_SEC cчитает RAW индикаторы m5 для всех тикеров и пишет в ind_live:* + L1
@@ -140,7 +139,6 @@ async def run_live_indicators_m5(pg,
 
         # быстрые проверки наличия работы
         if not symbols or not instances_m5:
-            # пустой проход — но всё равно соблюдаем цикл и логируем
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             log.info(
                 f"LIVE_M5 PASS done: symbols={len(symbols)} instances={total_instances} "
