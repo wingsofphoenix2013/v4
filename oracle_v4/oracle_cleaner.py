@@ -119,9 +119,9 @@ async def _cleanup_once():
     # финальный лог-итог прохода
     log.info("🧹 Уборка завершена: cutoff_db=%s, stream_retention=%sh", cutoff_db, STREAM_RETENTION_HOURS)
 
-
 async def _cleanup_db():
-    # удаляем всё, что старше DB_RETENTION_DAYS
+    retention_td = timedelta(days=DB_RETENTION_DAYS)
+
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
             # удаляем маркеры processed (MW/PACK)
@@ -129,39 +129,38 @@ async def _cleanup_db():
                 """
                 WITH del AS (
                   DELETE FROM oracle_conf_processed
-                   WHERE window_end < (now() - $1::interval)
+                   WHERE window_end < (now() - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                f"{DB_RETENTION_DAYS} days",
+                retention_td,
             )
             conf_pack_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_conf_processed
-                   WHERE window_end < (now() - $1::interval)
+                   WHERE window_end < (now() - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                f"{DB_RETENTION_DAYS} days",
+                retention_td,
             )
 
-            # удаляем шапки отчётов (каскадом снесёт агрегаты, sense и WL/BL, привязанные к отчётам)
+            # удаляем шапки отчётов (каскадно почистит агрегаты/sense/WL/BL)
             reports_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_report_stat
-                   WHERE window_end < (now() - $1::interval)
+                   WHERE window_end < (now() - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                f"{DB_RETENTION_DAYS} days",
+                retention_td,
             )
 
-    # результат уборки по БД
     log.info(
         "🗄️ DB cleanup: reports_deleted=%d, conf_mw_deleted=%d, conf_pack_deleted=%d (retention=%sd)",
         int(reports_deleted or 0),
@@ -169,7 +168,6 @@ async def _cleanup_db():
         int(conf_pack_deleted or 0),
         DB_RETENTION_DAYS,
     )
-
 
 async def _trim_streams():
     # узнаём серверное время Redis (секунды, микросекунды) и считаем minid для XTRIM MINID
