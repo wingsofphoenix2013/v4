@@ -1,4 +1,4 @@
-# position_snapshot_live.py — live-снапшоты по открытым позициям из Redis-ключей (ind_live / ind_mw_live / pack_live) с записью в indicator_position_stat_live
+# position_snapshot_live.py — live-снапшоты по открытым позициям из Redis-ключей (ind_live / ind_mw_live / pack_live) с записью в indicator_position_stat
 
 # 🔸 Импорты
 import asyncio
@@ -46,8 +46,8 @@ RAW_TYPES  = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb","kama")
 PACK_TYPES = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb")
 MW_TYPES   = ("trend","volatility","momentum","extremes")
 
-# 🔸 Константы БД для live-записи
-TABLE_LIVE = "indicator_position_stat_live"
+# 🔸 Константы БД для записи (ПЕРЕКЛЮЧЕНО НА ОСНОВНУЮ ТАБЛИЦУ)
+TABLE_LIVE = "indicator_position_stat"
 DB_UPSERT_TIMEOUT_SEC = 15
 BATCH_INSERT_SIZE = 400
 
@@ -79,7 +79,6 @@ async def mget_map(redis, keys: List[str]) -> Dict[str, Optional[str]]:
         vals = await pipe.execute()
         out: Dict[str, Optional[str]] = {}
         for k, v in zip(keys, vals):
-            # значение либо str, либо None; остальное приведём к str
             out[k] = v if isinstance(v, str) or v is None else (str(v) if v is not None else None)
         return out
     except Exception as e:
@@ -95,14 +94,6 @@ async def mget_map(redis, keys: List[str]) -> Dict[str, Optional[str]]:
 
 # 🔸 Сбор ожидаемых RAW-параметров и PACK-баз по активным инстансам TF
 def collect_expectations(instances_all_tf: List[Dict[str, Any]], tf: str) -> Tuple[Dict[str, str], Dict[str, Set[Any]]]:
-    """
-    Возвращает:
-      raw_expect: param_name -> indicator_type (для RAW ind_live:{param_name})
-      pack_bases: dict[indicator -> set[bases]], где base:
-        - rsi/mfi/ema/atr/kama/lr/adx_dmi → length:int
-        - macd → fast:int
-        - bb → tuple(length:int, std:float2)
-    """
     raw_expect: Dict[str, str] = {}
     pack_bases: Dict[str, Set[Any]] = {k: set() for k in PACK_TYPES}
 
@@ -117,7 +108,6 @@ def collect_expectations(instances_all_tf: List[Dict[str, Any]], tf: str) -> Tup
             for pname in get_expected_param_names(ind, params):
                 raw_expect[pname] = ind
         except Exception:
-            # не блокируем из-за единичной ошибки
             pass
 
         # PACK базы
@@ -144,7 +134,6 @@ def make_row(position_uid: str, strategy_id: int, symbol: str, tf: str,
              param_type: str, param_base: str, param_name: str,
              value: Optional[str], open_time_iso: str,
              status: str = "ok", error_code: Optional[str] = None) -> Tuple:
-    # value_num / value_text XOR
     vnum = None
     vtext = None
     if status == "ok" and value is not None:
@@ -163,7 +152,7 @@ def make_row(position_uid: str, strategy_id: int, symbol: str, tf: str,
     )
 
 
-# 🔸 UPSERT в indicator_position_stat_live (батчами, с statement_timeout)
+# 🔸 UPSERT в indicator_position_stat (батчами, с statement_timeout)
 async def upsert_rows_live(pg, rows: List[Tuple]):
     if not rows:
         return
@@ -267,7 +256,6 @@ async def process_tf_live(redis,
                                          None, open_time_iso, status="error", error_code="state_missing"))
 
     # ----- PACK (pack_live) -----
-    # rsi/mfi/ema/atr/kama/lr/adx_dmi: базы по length
     for ind in ("rsi","mfi","ema","atr","lr","adx_dmi"):  # без 'kama' — у нас нет pack_live для KAMA
         for L in sorted(pack_bases.get(ind, set())):
             base = f"{ind}{int(L)}"
@@ -416,7 +404,7 @@ async def process_position_live(redis,
         all_rows_ok.extend(ok_rows)
         all_rows_err.extend(err_rows)
 
-    # запись в live-таблицу (одним батчем)
+    # запись в ТАБЛИЦУ ОСНОВНОГО ВОРКЕРА (см. TABLE_LIVE)
     try:
         await upsert_rows_live(pg, all_rows_ok + all_rows_err)
     except Exception as e:
@@ -433,7 +421,7 @@ async def run_position_snapshot_live(pg,
                                      redis,
                                      get_instances_by_tf,
                                      get_strategy_mw):
-    log.debug("POS_SNAPSHOT_LIVE: воркер запущен (чтение live-ключей → запись в indicator_position_stat_live)")
+    log.debug("POS_SNAPSHOT_LIVE: воркер запущен (чтение live-ключей → запись в indicator_position_stat)")
 
     # создаём consumer-group (идемпотентно, не конфликтует с другими)
     try:
@@ -445,7 +433,6 @@ async def run_position_snapshot_live(pg,
     sem = asyncio.Semaphore(POS_CONCURRENCY)
 
     async def handle_one(msg_id: str, data: dict) -> str:
-        # ограничение параллелизма по позициям
         async with sem:
             try:
                 await process_position_live(redis, get_instances_by_tf, get_strategy_mw, data, pg=pg)
