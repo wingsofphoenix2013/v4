@@ -20,13 +20,12 @@ from oracle_pack_snapshot import run_oracle_pack_snapshot as run_pack, INITIAL_D
 # 🔸 импорт воркера confidence
 from oracle_mw_confidence import run_oracle_confidence
 from oracle_pack_confidence import run_oracle_pack_confidence
-# 🔸 импорт воркера ночной автокалибровки confidence
-# from oracle_mw_confidence_night import run_oracle_confidence_night, INITIAL_DELAY_H, INTERVAL_H
-# from oracle_pack_confidence_night import run_oracle_pack_confidence_night, INITIAL_DELAY_H as PACK_CONF_INIT_H, INTERVAL_H as PACK_CONF_INTERVAL_H
 # 🔸 импорт воркера проверки sense
 from oracle_mw_sense_stat import run_oracle_sense_stat
 from oracle_pack_sense_stat import run_oracle_pack_sense
 from oracle_pack_lists import run_oracle_pack_lists
+# 🔸 импорт воркера уборщика
+from oracle_cleaner import run_oracle_cleaner
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -92,13 +91,12 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_periodic(run_pack, PACK_INTERVAL, "ORACLE_PACK_SNAPSHOT", initial_delay=PACK_INIT_DELAY),
         run_safe_loop(run_oracle_pack_confidence, "ORACLE_PACK_CONFIDENCE"),
-#         run_periodic(run_oracle_pack_confidence_night, PACK_CONF_INTERVAL_H * 60 * 60, "ORACLE_PACK_CONFIDENCE_NIGHT", initial_delay=PACK_CONF_INIT_H * 60 * 60),
         run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
         run_safe_loop(run_oracle_pack_lists, "ORACLE_PACK_LISTS"),
         run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
-#         run_periodic(run_oracle_confidence_night, INTERVAL_H * 60 * 60, "ORACLE_CONFIDENCE_NIGHT", initial_delay=INITIAL_DELAY_H * 60 * 60),
         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
+        run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
     )
 
 if __name__ == "__main__":
