@@ -1,4 +1,4 @@
-# position_snapshot_live.py — live-снапшоты по открытым позициям из Redis-ключей (ind_live / ind_mw_live / pack_live), без БД и без gateway
+# position_snapshot_live.py — live-снапшоты по открытым позициям из Redis-ключей (ind_live / ind_mw_live / pack_live) с записью в indicator_position_stat_live
 
 # 🔸 Импорты
 import asyncio
@@ -21,8 +21,8 @@ GROUP       = "possnap_live_group"               # отдельная consumer-g
 CONSUMER    = "possnap_live_1"
 
 POS_CONCURRENCY  = 10                            # одновременно обрабатываем позиций
-READ_COUNT       = 50                             # сколько сообщений за раз читаем из стрима
-READ_BLOCK_MS    = 2000                           # блокировка чтения (мс)
+READ_COUNT       = 50                            # сколько сообщений за раз читаем из стрима
+READ_BLOCK_MS    = 2000                          # блокировка чтения (мс)
 
 # 🔸 Таймфреймы для live-снимка
 TFS = ("m5", "m15", "h1")
@@ -41,10 +41,15 @@ PACK_WHITELIST: Dict[str, List[str]] = {
                 "hist_trend_strict", "hist_trend_smooth"],
 }
 
-# 🔸 Список типов индикаторов (для RAW/баз и PACK-баз)
-RAW_TYPES  = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb")
+# 🔸 Типы индикаторов
+RAW_TYPES  = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb","kama")
 PACK_TYPES = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb")
 MW_TYPES   = ("trend","volatility","momentum","extremes")
+
+# 🔸 Константы БД для live-записи
+TABLE_LIVE = "indicator_position_stat_live"
+DB_UPSERT_TIMEOUT_SEC = 15
+BATCH_INSERT_SIZE = 400
 
 
 # 🔸 Утилиты времени (ISO → ms и floor к началу бара TF)
@@ -63,7 +68,7 @@ def iso_to_ms(iso_str: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
-# 🔸 MGET-помощники
+# 🔸 MGET-помощник (pipeline)
 async def mget_map(redis, keys: List[str]) -> Dict[str, Optional[str]]:
     if not keys:
         return {}
@@ -74,11 +79,11 @@ async def mget_map(redis, keys: List[str]) -> Dict[str, Optional[str]]:
         vals = await pipe.execute()
         out: Dict[str, Optional[str]] = {}
         for k, v in zip(keys, vals):
+            # значение либо str, либо None; остальное приведём к str
             out[k] = v if isinstance(v, str) or v is None else (str(v) if v is not None else None)
         return out
     except Exception as e:
         log.debug(f"[MGET] pipeline error: {e}", exc_info=False)
-        # fallback по одному (редко)
         out: Dict[str, Optional[str]] = {}
         for k in keys:
             try:
@@ -89,7 +94,7 @@ async def mget_map(redis, keys: List[str]) -> Dict[str, Optional[str]]:
 
 
 # 🔸 Сбор ожидаемых RAW-параметров и PACK-баз по активным инстансам TF
-def collect_expectations(instances_m5m15h1: List[Dict[str, Any]], tf: str) -> Tuple[Dict[str, str], Dict[str, Set[Any]]]:
+def collect_expectations(instances_all_tf: List[Dict[str, Any]], tf: str) -> Tuple[Dict[str, str], Dict[str, Set[Any]]]:
     """
     Возвращает:
       raw_expect: param_name -> indicator_type (для RAW ind_live:{param_name})
@@ -101,7 +106,7 @@ def collect_expectations(instances_m5m15h1: List[Dict[str, Any]], tf: str) -> Tu
     raw_expect: Dict[str, str] = {}
     pack_bases: Dict[str, Set[Any]] = {k: set() for k in PACK_TYPES}
 
-    for inst in instances_m5m15h1:
+    for inst in instances_all_tf:
         if inst.get("timeframe") != tf:
             continue
         ind = inst.get("indicator")
@@ -134,7 +139,7 @@ def collect_expectations(instances_m5m15h1: List[Dict[str, Any]], tf: str) -> Tu
     return raw_expect, pack_bases
 
 
-# 🔸 Формирование «потенциальной строки БД» (совместимо по полям; мы пока не пишем в БД)
+# 🔸 Формирование «потенциальной строки БД» (совместимо по полям)
 def make_row(position_uid: str, strategy_id: int, symbol: str, tf: str,
              param_type: str, param_base: str, param_name: str,
              value: Optional[str], open_time_iso: str,
@@ -158,7 +163,41 @@ def make_row(position_uid: str, strategy_id: int, symbol: str, tf: str,
     )
 
 
-# 🔸 Обработка одного TF: собрать потенциальные строки RAW/PACK/MW из ключей
+# 🔸 UPSERT в indicator_position_stat_live (батчами, с statement_timeout)
+async def upsert_rows_live(pg, rows: List[Tuple]):
+    if not rows:
+        return
+    sql = f"""
+    INSERT INTO {TABLE_LIVE}
+      (position_uid, strategy_id, symbol, timeframe, param_type, param_base, param_name,
+       value_num, value_text, open_time, status, error_code)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    ON CONFLICT (position_uid, timeframe, param_type, param_base, param_name)
+    DO UPDATE SET
+      value_num  = EXCLUDED.value_num,
+      value_text = EXCLUDED.value_text,
+      open_time  = EXCLUDED.open_time,
+      status     = EXCLUDED.status,
+      error_code = EXCLUDED.error_code,
+      captured_at= NOW()
+    """
+    timeout_txt = f"{int(DB_UPSERT_TIMEOUT_SEC)}s"
+
+    i = 0
+    total = len(rows)
+    async with pg.acquire() as conn:
+        while i < total:
+            chunk = rows[i:i+BATCH_INSERT_SIZE]
+            async with conn.transaction():
+                try:
+                    await conn.execute(f"SET LOCAL statement_timeout = '{timeout_txt}'")
+                except Exception:
+                    pass
+                await conn.executemany(sql, chunk)
+            i += len(chunk)
+
+
+# 🔸 Обработка одного TF: собрать строки RAW/PACK/MW из ключей
 async def process_tf_live(redis,
                           get_instances_by_tf,
                           position_uid: str,
@@ -168,7 +207,7 @@ async def process_tf_live(redis,
                           created_at_ms: int) -> Tuple[List[Tuple], List[Tuple]]:
     tf_t0 = time.monotonic()
 
-    # косметика: фиксируем open_time для БД — привязка к времени открытия позиции (ключи не зависят от этого)
+    # косметика: фиксируем open_time для БД — привязка к времени открытия позиции
     bar_open_ms = floor_to_bar_ms(created_at_ms, tf)
     open_time_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
 
@@ -229,7 +268,7 @@ async def process_tf_live(redis,
 
     # ----- PACK (pack_live) -----
     # rsi/mfi/ema/atr/kama/lr/adx_dmi: базы по length
-    for ind in ("rsi","mfi","ema","atr","kama","lr","adx_dmi"):
+    for ind in ("rsi","mfi","ema","atr","lr","adx_dmi"):  # без 'kama' — у нас нет pack_live для KAMA
         for L in sorted(pack_bases.get(ind, set())):
             base = f"{ind}{int(L)}"
             pkey = f"pack_live:{ind}:{symbol}:{tf}:{base}"
@@ -255,7 +294,6 @@ async def process_tf_live(redis,
             for pname in fields:
                 val = pack.get(pname)
                 if val is None:
-                    # поле допустимо отсутствует — пропустим без ошибки
                     continue
                 rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
                                         "pack", base, pname,
@@ -329,11 +367,12 @@ async def process_tf_live(redis,
     return rows_ok, rows_err
 
 
-# 🔸 Обработка одной позиции: TF последовательно (m5 → m15 → h1), только логи, без БД
+# 🔸 Обработка одной позиции: TF последовательно (m5 → m15 → h1)
 async def process_position_live(redis,
                                 get_instances_by_tf,
                                 get_strategy_mw,
-                                pos_payload: Dict[str, Any]) -> None:
+                                pos_payload: Dict[str, Any],
+                                pg=None) -> None:
     pos_t0 = time.monotonic()
 
     # извлекаем базовые поля
@@ -352,7 +391,7 @@ async def process_position_live(redis,
         log.debug(f"[SKIP] bad position payload: {pos_payload}")
         return
 
-    # фильтр по стратегиям
+    # фильтр по стратегиям (market_watcher=true)
     try:
         if not get_strategy_mw(int(strategy_id)):
             log.debug(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
@@ -363,22 +402,38 @@ async def process_position_live(redis,
 
     created_at_ms = iso_to_ms(created_at_iso)
 
+    # аккумулируем строки со всех TF и пишем одним батчем
+    all_rows_ok: List[Tuple] = []
+    all_rows_err: List[Tuple] = []
     total_ok = total_err = 0
+
     for tf in TFS:
-        ok_rows, err_rows = await process_tf_live(redis, get_instances_by_tf, position_uid, strategy_id, symbol, tf, created_at_ms)
-        total_ok += len(ok_rows)
+        ok_rows, err_rows = await process_tf_live(
+            redis, get_instances_by_tf, position_uid, strategy_id, symbol, tf, created_at_ms
+        )
+        total_ok  += len(ok_rows)
         total_err += len(err_rows)
+        all_rows_ok.extend(ok_rows)
+        all_rows_err.extend(err_rows)
+
+    # запись в live-таблицу (одним батчем)
+    try:
+        await upsert_rows_live(pg, all_rows_ok + all_rows_err)
+    except Exception as e:
+        log.warning(f"POS_SNAPSHOT_LIVE db_upsert error uid={position_uid} sym={symbol}: {e}", exc_info=True)
 
     pos_ms = int((time.monotonic() - pos_t0) * 1000)
-    log.debug(f"POS_SNAPSHOT_LIVE OK uid={position_uid} sym={symbol} ok_rows={total_ok} err_rows={total_err} elapsed_ms={pos_ms}")
+    log.info(
+        f"POS_SNAPSHOT_LIVE WRITE uid={position_uid} sym={symbol} ok_rows={total_ok} err_rows={total_err} elapsed_ms={pos_ms}"
+    )
 
 
-# 🔸 Основной воркер: отдельная consumer-group, только логи (без записи в БД и без gateway)
+# 🔸 Основной воркер: отдельная consumer-group
 async def run_position_snapshot_live(pg,
                                      redis,
                                      get_instances_by_tf,
                                      get_strategy_mw):
-    log.debug("POS_SNAPSHOT_LIVE: воркер запущен (чтение live-ключей, без БД/gateway)")
+    log.debug("POS_SNAPSHOT_LIVE: воркер запущен (чтение live-ключей → запись в indicator_position_stat_live)")
 
     # создаём consumer-group (идемпотентно, не конфликтует с другими)
     try:
@@ -393,7 +448,7 @@ async def run_position_snapshot_live(pg,
         # ограничение параллелизма по позициям
         async with sem:
             try:
-                await process_position_live(redis, get_instances_by_tf, get_strategy_mw, data)
+                await process_position_live(redis, get_instances_by_tf, get_strategy_mw, data, pg=pg)
             except Exception as e:
                 log.warning(f"[LIVE] error {e}", exc_info=True)
             return msg_id
