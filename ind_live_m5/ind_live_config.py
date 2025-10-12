@@ -1,11 +1,10 @@
-# ind_live_config.py — конфигурация ind_live_v4: активные тикеры, инстансы индикаторов (m5/m15/h1), L1-кэш live-значений; подписка на Pub/Sub
+# ind_live_config.py — конфигурация ind_live_v4: активные тикеры, инстансы индикаторов (m5/m15/h1), стратегии (market_watcher), L1-кэш live-значений; подписка на Pub/Sub
 
 # 🔸 Импорты
 import asyncio
 import json
 import logging
 import time
-from datetime import datetime
 from typing import Dict, Tuple, Optional, Set, Any, List
 
 # 🔸 Логгер
@@ -13,12 +12,14 @@ log = logging.getLogger("IND_LIVE_CONFIG")
 
 
 # 🔸 Константы БД и каналов
-BB_TICKERS_TABLE = "tickers_bb"
-IND_INSTANCES_TABLE = "indicator_instances_v4"
-IND_PARAMS_TABLE = "indicator_parameters_v4"
+BB_TICKERS_TABLE      = "tickers_bb"
+IND_INSTANCES_TABLE   = "indicator_instances_v4"
+IND_PARAMS_TABLE      = "indicator_parameters_v4"
+STRATEGIES_TABLE      = "strategies_v4"
 
-PUBSUB_TICKERS = "tickers_v4_events"       # включение/выключение тикеров
-PUBSUB_INDICATORS = "indicators_v4_events" # включение/выключение индикаторов
+PUBSUB_TICKERS        = "tickers_v4_events"        # включение/выключение тикеров
+PUBSUB_INDICATORS     = "indicators_v4_events"     # включение/выключение индикаторов
+PUBSUB_STRATEGIES     = "strategies_v4_events"     # изменения стратегий (enabled/archived/market_watcher)
 
 
 # 🔸 Вспомогательное: монотонное время (для L1 TTL)
@@ -54,7 +55,6 @@ class LiveCache:
         rec = self._store.get(key)
         if not rec:
             return None
-        # проверка срока и бара
         if _mono() > float(rec.get("expires_at", 0)):
             self._store.pop(key, None)
             return None
@@ -65,7 +65,6 @@ class LiveCache:
             return None
         if needed is None:
             return dict(vals)
-        # проверяем наличие всех нужных параметров
         if not needed.issubset(vals.keys()):
             return None
         return {k: vals[k] for k in needed}
@@ -87,8 +86,11 @@ class IndLiveConfig:
         self.redis = redis
 
         # в памяти: активные тикеры и инстансы
-        self.active_tickers: Dict[str, int] = {}         # symbol -> precision_price
-        self.indicator_instances: Dict[int, Dict[str, Any]] = {}   # id -> {indicator,timeframe,params,enabled_at}
+        self.active_tickers: Dict[str, int] = {}                 # symbol -> precision_price
+        self.indicator_instances: Dict[int, Dict[str, Any]] = {} # id -> {indicator,timeframe,params,enabled_at}
+
+        # стратегии: id -> market_watcher (только enabled & not archived)
+        self.active_strategies: Dict[int, bool] = {}
 
         # L1-кэш
         self.live_cache = LiveCache()
@@ -113,12 +115,17 @@ class IndLiveConfig:
             if inst["timeframe"] == tf
         ]
 
-    # 🔸 Инициализация: одноразовая загрузка тикеров и инстансов из БД
+    def get_strategy_mw(self, strategy_id: int) -> bool:
+        return bool(self.active_strategies.get(int(strategy_id), False))
+
+    # 🔸 Инициализация: одноразовая загрузка тикеров, инстансов и стратегий из БД
     async def initialize(self) -> None:
         await self._load_initial_tickers()
         await self._load_initial_indicators()
+        await self._load_initial_strategies()
         log.info(
-            f"CONFIG INIT: symbols={len(self.active_tickers)} instances={len(self.indicator_instances)}"
+            f"CONFIG INIT: symbols={len(self.active_tickers)} instances={len(self.indicator_instances)} "
+            f"strategies={len(self.active_strategies)}"
         )
 
     # 🔸 Загрузка активных тикеров (enabled & tradepermission)
@@ -149,7 +156,6 @@ class IndLiveConfig:
                   AND timeframe IN ('m5','m15','h1')
             """)
             id_list = [int(x["id"]) for x in instances]
-            # загрузим параметры пачками
             params_by_id: Dict[int, Dict[str, Any]] = {}
             for inst_id in id_list:
                 params = await conn.fetch(f"""
@@ -171,6 +177,23 @@ class IndLiveConfig:
             log_init.debug(f"Indicator ON: id={iid} {inst['indicator']} {params_by_id.get(iid, {})}")
         log_init.info(f"Loaded active indicator instances: {len(self.indicator_instances)}")
 
+    # 🔸 Загрузка стратегий (enabled & not archived) с полем market_watcher
+    async def _load_initial_strategies(self) -> None:
+        log_init = logging.getLogger("CONFIG_INIT")
+        async with self.pg.acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT id, COALESCE(market_watcher, false) AS market_watcher
+                FROM {STRATEGIES_TABLE}
+                WHERE enabled = true AND archived = false
+            """)
+        self.active_strategies.clear()
+        for r in rows:
+            sid = int(r["id"])
+            mw = bool(r["market_watcher"])
+            self.active_strategies[sid] = mw
+            log_init.debug(f"Strategy ON: id={sid} market_watcher={mw}")
+        log_init.info(f"Loaded active strategies: {len(self.active_strategies)}")
+
     # 🔸 Подписка на события тикеров (Pub/Sub: tickers_v4_events)
     async def run_ticker_events(self) -> None:
         log_t = logging.getLogger("CFG_TICKERS")
@@ -186,16 +209,14 @@ class IndLiveConfig:
             except Exception:
                 continue
 
-            # поддерживаем несколько возможных форматов
             symbol = data.get("symbol")
             if not symbol:
                 continue
 
             status = str(data.get("status") or "").lower()
             tradepermission = str(data.get("tradepermission") or "").lower()
-            action = str(data.get("action") or "").lower()  # e.g. "enabled"/"disabled"
+            action = str(data.get("action") or "").lower()
 
-            # условия включения
             should_enable = False
             if action in ("enable", "enabled", "true", "on"):
                 should_enable = True
@@ -204,7 +225,6 @@ class IndLiveConfig:
 
             try:
                 if should_enable:
-                    # прецизионность: если не пришла — перечитаем из БД, чтобы быть точными
                     prec = data.get("precision_price")
                     if prec is None:
                         async with self.pg.acquire() as conn:
@@ -242,16 +262,14 @@ class IndLiveConfig:
             except Exception:
                 continue
 
-            ev_type = data.get("type")  # "enabled" | "stream_publish" | ...
+            ev_type = data.get("type")
             action = str(data.get("action") or "").lower()
 
             if ev_type != "enabled":
-                # нас интересуют только включение/выключение; остальное игнорируем
                 continue
 
             try:
                 if action in ("true", "enable", "enabled", "on"):
-                    # перечитка инстанса из БД (чтобы взять актуальные поля/параметры)
                     async with self.pg.acquire() as conn:
                         row = await conn.fetchrow(f"""
                             SELECT id, indicator, timeframe, enabled_at
@@ -259,16 +277,13 @@ class IndLiveConfig:
                             WHERE id = $1
                         """, iid)
                         if not row:
-                            # инстанс исчез — удалим из памяти
                             self.indicator_instances.pop(iid, None)
                             continue
 
-                        # поддерживаем только TF m5/m15/h1
                         if row["timeframe"] not in ("m5", "m15", "h1"):
                             self.indicator_instances.pop(iid, None)
                             continue
 
-                        # параметры
                         params = await conn.fetch(f"""
                             SELECT param, value
                             FROM {IND_PARAMS_TABLE}
@@ -288,3 +303,62 @@ class IndLiveConfig:
                         log_i.debug(f"Indicator OFF: id={iid}")
             except Exception as e:
                 log_i.warning(f"Indicator event error id={iid}: {e}", exc_info=True)
+
+    # 🔸 Подписка на события стратегий (Pub/Sub: strategies_v4_events); если формат неизвестен — делаем безопасную перечитку
+    async def run_strategy_events(self) -> None:
+        log_s = logging.getLogger("CFG_STRAT")
+        pubsub = self.redis.pubsub()
+        try:
+            await pubsub.subscribe(PUBSUB_STRATEGIES)
+            log_s.debug(f"Subscribed to {PUBSUB_STRATEGIES}")
+        except Exception as e:
+            log_s.warning(f"Subscribe error {PUBSUB_STRATEGIES}: {e}")
+
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+            try:
+                data = json.loads(msg["data"])
+            except Exception:
+                continue
+
+            sid_raw = data.get("id")
+            try:
+                sid = int(sid_raw)
+            except Exception:
+                sid = None
+
+            # возможные поля событий
+            action = str(data.get("action") or "").lower()
+            mw_val = data.get("market_watcher")
+            enabled = data.get("enabled")
+            archived = data.get("archived")
+
+            try:
+                if sid is None:
+                    # формат события неизвестен — обновим всё
+                    await self._load_initial_strategies()
+                    continue
+
+                # если явно пришёл market_watcher
+                if mw_val is not None:
+                    self.active_strategies[int(sid)] = bool(mw_val)
+                    log_s.debug(f"Strategy MW update: id={sid} → {bool(mw_val)}")
+                    continue
+
+                # если пришли enabled/archived — перечитаем одну стратегию
+                if (enabled is not None) or (archived is not None) or (action in ("enable","enabled","disable","disabled","on","off")):
+                    async with self.pg.acquire() as conn:
+                        row = await conn.fetchrow(f"""
+                            SELECT id, COALESCE(market_watcher, false) AS market_watcher
+                            FROM {STRATEGIES_TABLE}
+                            WHERE id = $1 AND enabled = true AND archived = false
+                        """, sid)
+                    if row:
+                        self.active_strategies[int(row["id"])] = bool(row["market_watcher"])
+                        log_s.debug(f"Strategy ON: id={sid} market_watcher={bool(row['market_watcher'])}")
+                    else:
+                        if self.active_strategies.pop(int(sid), None) is not None:
+                            log_s.debug(f"Strategy OFF: id={sid}")
+            except Exception as e:
+                log_s.warning(f"Strategy event error id={sid}: {e}", exc_info=True)
