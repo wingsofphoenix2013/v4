@@ -149,7 +149,7 @@ async def collect_live_mw_rows(redis, position_uid: str, strategy_id: int, symbo
             ))
         except Exception:
             # ошибки парсинга игнорируем, так как live-ключи считаются стабильными
-            log.debug(f"[MW] parse skip {symbol}/{tf}/{kind}")
+            log.info(f"[MW] parse skip {symbol}/{tf}/{kind}")
             continue
     return rows
 
@@ -188,7 +188,7 @@ async def collect_live_pack_rows(redis, position_uid: str, strategy_id: int, sym
                             when, "ok", None
                         ))
             except Exception:
-                log.debug(f"[PACK] parse skip {symbol}/{tf}/{ind}/{base}")
+                log.info(f"[PACK] parse skip {symbol}/{tf}/{ind}/{base}")
                 continue
     return rows
 
@@ -204,7 +204,7 @@ async def process_tf_live(pg, redis, position_uid: str, strategy_id: int, symbol
     pack_rows = await collect_live_pack_rows(redis, position_uid, strategy_id, symbol, tf, open_time_iso)
 
     rows = raw_rows + mw_rows + pack_rows
-    log.debug(f"[TF LIVE] {symbol}/{tf} rows={len(rows)} raw={len(raw_rows)} mw={len(mw_rows)} pack={len(pack_rows)}")
+    log.info(f"[TF LIVE] {symbol}/{tf} rows={len(rows)} raw={len(raw_rows)} mw={len(mw_rows)} pack={len(pack_rows)}")
 
     if not POS_DRY_RUN and rows:
         await upsert_rows(pg, rows)
@@ -219,16 +219,16 @@ async def process_position(pg, redis, get_strategy_mw, pos_payload: dict) -> Non
 
     # мимнимальные проверки
     if not position_uid or not symbol or strategy_id is None or not created_at_iso:
-        log.debug(f"[SKIP] bad position payload: {pos_payload}")
+        log.info(f"[SKIP] bad position payload: {pos_payload}")
         return
 
     # фильтр по стратегиям: только те, где market_watcher=true
     try:
         if not get_strategy_mw(int(strategy_id)):
-            log.debug(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
+            log.info(f"[SKIP] strategy_id={strategy_id} market_watcher=false")
             return
     except Exception:
-        log.debug(f"[SKIP] strategy_id={strategy_id} (mw flag check failed)")
+        log.info(f"[SKIP] strategy_id={strategy_id} (mw flag check failed)")
         return
 
     created_at_ms = iso_to_ms(created_at_iso)
@@ -244,11 +244,11 @@ async def process_position(pg, redis, get_strategy_mw, pos_payload: dict) -> Non
         # счётчики для лога на TF уровне уже пишутся; здесь оставим суммарный таймер при желании
         total_rows += 1  # условный счётчик пройденных TF
 
-    log.debug(f"POS_SNAPSHOT LIVE uid={position_uid} sym={symbol} tfs={total_rows}")
+    log.info(f"POS_SNAPSHOT LIVE uid={position_uid} sym={symbol} tfs={total_rows}")
 
 # 🔸 Основной воркер: подписка на positions_open_stream; TF последовательно; без ретраев/таймаутов
 async def run_position_snapshot_worker(pg, redis, get_instances_by_tf, get_precision, get_strategy_mw):
-    log.debug("POS_SNAPSHOT LIVE: воркер запущен")
+    log.info("POS_SNAPSHOT LIVE: воркер запущен")
 
     group = "possnap_group"
     consumer = "possnap_1"
