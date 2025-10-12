@@ -13,7 +13,7 @@ log = logging.getLogger("BB_PRECISION_UPDATER")
 # 🔸 Конфиг
 BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com")
 CATEGORY = "linear"                  # деривативы USDT-perp
-REFRESH_SEC = int(os.getenv("BB_PRECISION_REFRESH_SEC", "3600"))
+REFRESH_SEC = int(os.getenv("BB_PRECISION_REFRESH_SEC", "86400"))
 REQUEST_TIMEOUT = int(os.getenv("BB_HTTP_TIMEOUT_SEC", "15"))
 PER_SYMBOL_DELAY = float(os.getenv("BB_PER_SYMBOL_DELAY_SEC", "0.2"))
 
