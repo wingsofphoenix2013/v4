@@ -1,325 +1,334 @@
-# laboratory_config.py — стартовая загрузка кешей laboratory_v4 + подписчики Pub/Sub/Streams (тикеры, индикаторы, готовность свечей) + in-memory live cache
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/WL/BL и слушатели обновлений
 
 # 🔸 Импорты
 import asyncio
 import json
 import logging
-from datetime import datetime
+from typing import Dict, Set, Tuple
+
+import laboratory_infra as infra
+from laboratory_infra import (
+    set_lab_tickers,
+    set_lab_strategies,
+    replace_mw_whitelist,
+    replace_pack_list,
+    update_mw_whitelist_for_strategy,
+    update_pack_list_for_strategy,
+)
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_CONFIG")
 
-# 🔸 Кеши модуля (in-memory, общий доступ)
-lab_tickers: dict[str, dict] = {}                # symbol -> {"precision_price": int, "status": str, "tradepermission": str}
-lab_indicators: dict[int, dict] = {}             # instance_id -> {"indicator": str, "timeframe": str, "stream_publish": bool, "enabled_at": datetime|None, "params": dict}
-lab_last_bar: dict[tuple[str, str], int] = {}    # (symbol, tf) -> last open_time (ms)
+# 🔸 Константы потоков/групп
+MW_WL_READY_STREAM = "oracle:mw_whitelist:reports_ready"
+PACK_LISTS_READY_STREAM = "oracle:pack_lists:reports_ready"
 
-# 🔸 In-memory live cache от IND-тика (на один бар для пары (symbol, tf))
-# ключ = (symbol, tf, open_ms); значение: {"by_param": {param_name -> "строка-значение"}, "ts": float_monotonic}
-live_cache: dict[tuple[str, str, int], dict] = {}
+LAB_LISTS_GROUP = "LAB_LISTS_GROUP"
+LAB_LISTS_WORKER = "LAB_LISTS_WORKER"
 
-
-# 🔸 Вспомогательные геттеры кешей
-def get_active_symbols() -> list[str]:
-    return list(lab_tickers.keys())
-
-def get_precision(symbol: str) -> int | None:
-    info = lab_tickers.get(symbol)
-    return int(info["precision_price"]) if info and info.get("precision_price") is not None else None
-
-def get_instances_by_tf(tf: str) -> list[dict]:
-    return [
-        {
-            "id": iid,
-            "indicator": inst["indicator"],
-            "timeframe": inst["timeframe"],
-            "enabled_at": inst.get("enabled_at"),
-            "params": inst.get("params", {}),
-            "stream_publish": bool(inst.get("stream_publish", False)),
-        }
-        for iid, inst in lab_indicators.items()
-        if inst.get("timeframe") == tf
-    ]
-
-def get_last_bar(symbol: str, tf: str) -> int | None:
-    return lab_last_bar.get((symbol, tf))
-
-def get_cache_stats() -> dict:
-    return {
-        "symbols": len(lab_tickers),
-        "indicators": len(lab_indicators),
-        "last_bars": len(lab_last_bar),
-    }
+# 🔸 Константы каналов Pub/Sub
+PUBSUB_TICKERS = "bb:tickers_events"
+PUBSUB_STRATEGIES = "strategies_v4_events"
 
 
-# 🔸 Live-cache API (используется IND для записи, MW/другие — для чтения)
-def put_live_values(symbol: str, tf: str, open_ms: int, values: dict[str, str]) -> None:
-    """
-    Обновить live-значения IND для (symbol, tf, open_ms).
-    values — канонические ключи параметров (как в compute_snapshot_values), значения — строковые.
-    """
-    key = (symbol, tf, int(open_ms))
-    entry = live_cache.get(key)
-    if entry is None:
-        entry = {"by_param": {}, "ts": asyncio.get_running_loop().time() if asyncio.get_running_loop() else 0.0}
-        live_cache[key] = entry
-    by_param = entry.get("by_param") or {}
-    by_param.update(values)
-    entry["by_param"] = by_param
-    # метку времени обновим для простого GC
-    try:
-        entry["ts"] = asyncio.get_running_loop().time()
-    except Exception:
-        pass
+# 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL)
+async def load_initial_config():
+    # условия достаточности
+    if infra.pg_pool is None or infra.redis_client is None:
+        log.debug("❌ Пропуск initial_config: PG/Redis не инициализированы")
+        return
 
-def get_live_values(symbol: str, tf: str, open_ms: int) -> dict[str, str] | None:
-    """
-    Вернуть словарь by_param для (symbol, tf, open_ms) или None, если нет кеша.
-    """
-    entry = live_cache.get((symbol, tf, int(open_ms)))
-    if not entry:
-        return None
-    return entry.get("by_param") or None
+    # тикеры
+    await _load_active_tickers()
+    # стратегии
+    await _load_active_strategies()
+    # MW WL (v1/v2)
+    await _load_mw_whitelists_all()
+    # PACK WL/BL (v1/v2)
+    await _load_pack_lists_all()
 
-def gc_live_cache(max_age_sec: float = 30.0) -> int:
-    """
-    Простейший GC: удалить записи live_cache старше max_age_sec по ts.
-    Возвращает число удалённых записей. Вызывать по желанию (не критично).
-    """
-    try:
-        now = asyncio.get_running_loop().time()
-    except Exception:
-        # если нет loop (теоретически), ничего не делаем
-        return 0
-    removed = 0
-    stale_keys = []
-    for k, entry in live_cache.items():
-        ts = entry.get("ts")
-        if ts is None or (now - float(ts) > max_age_sec):
-            stale_keys.append(k)
-    for k in stale_keys:
-        live_cache.pop(k, None)
-        removed += 1
-    if removed:
-        log.debug("LIVE_CACHE GC: removed=%d", removed)
-    return removed
+    # итог
+    log.info("✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, mw_wl[v1]=%d, mw_wl[v2]=%d, pack_wl[v1]=%d, pack_wl[v2]=%d, pack_bl[v1]=%d, pack_bl[v2]=%d",
+             len(infra.lab_tickers),
+             len(infra.lab_strategies),
+             len(infra.lab_mw_wl.get('v1', {})),
+             len(infra.lab_mw_wl.get('v2', {})),
+             len(infra.lab_pack_wl.get('v1', {})),
+             len(infra.lab_pack_wl.get('v2', {})),
+             len(infra.lab_pack_bl.get('v1', {})),
+             len(infra.lab_pack_bl.get('v2', {})),
+             )
 
 
-# 🔸 Стартовая загрузка кешей (тикеры + индикаторы)
-async def bootstrap_caches(pg, redis, tf_set: tuple[str, ...] = ("m5", "m15", "h1")):
-    # загрузка активных тикеров
-    async with pg.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT symbol, precision_price, status, tradepermission
+# 🔸 Слушатель списков (Streams): обновление кэшей WL/BL oracle по сообщениям
+async def lists_stream_listener():
+    # условия достаточности
+    if infra.redis_client is None:
+        log.debug("❌ Пропуск lists_stream_listener: Redis не инициализирован")
+        return
+
+    # создать consumer group (идемпотентно)
+    for s in (MW_WL_READY_STREAM, PACK_LISTS_READY_STREAM):
+        try:
+            await infra.redis_client.xgroup_create(name=s, groupname=LAB_LISTS_GROUP, id="$", mkstream=True)
+            log.debug("📡 LAB: создана consumer group для стрима %s", s)
+        except Exception as e:
+            if "BUSYGROUP" in str(e):
+                pass
+            else:
+                log.exception("❌ LAB: ошибка создания consumer group для %s", s)
+                return
+
+    log.debug("🚀 LAB: старт lists_stream_listener")
+
+    # основной цикл
+    while True:
+        try:
+            resp = await infra.redis_client.xreadgroup(
+                groupname=LAB_LISTS_GROUP,
+                consumername=LAB_LISTS_WORKER,
+                streams={MW_WL_READY_STREAM: ">", PACK_LISTS_READY_STREAM: ">"},
+                count=128,
+                block=30_000,
+            )
+            if not resp:
+                continue
+
+            # аккумулируем ack
+            acks: Dict[str, list] = {}
+
+            for stream_name, msgs in resp:
+                for msg_id, fields in msgs:
+                    try:
+                        payload = json.loads(fields.get("data", "{}"))
+                        if stream_name == MW_WL_READY_STREAM:
+                            # ожидаем: {strategy_id, report_id, time_frame='7d', version='v1'|'v2', ...}
+                            sid = int(payload.get("strategy_id", 0))
+                            version = str(payload.get("version", "")).lower()
+                            if sid and version in ("v1", "v2"):
+                                await _reload_mw_wl_for_strategy(sid, version)
+                                log.info("🔁 LAB: MW WL обновлён из стрима (sid=%s, version=%s)", sid, version)
+                            else:
+                                log.debug("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
+
+                        elif stream_name == PACK_LISTS_READY_STREAM:
+                            # ожидаем: {strategy_id, report_id, time_frame='7d', version='v1'|'v2', rows_whitelist, rows_blacklist, ...}
+                            sid = int(payload.get("strategy_id", 0))
+                            version = str(payload.get("version", "")).lower()
+                            if sid and version in ("v1", "v2"):
+                                await _reload_pack_lists_for_strategy(sid, version)
+                                log.info("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
+                            else:
+                                log.debug("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
+
+                        acks.setdefault(stream_name, []).append(msg_id)
+                    except Exception:
+                        log.exception("❌ LAB: ошибка обработки сообщения в %s", stream_name)
+
+            # ACK после успешной обработки
+            for s, ids in acks.items():
+                if ids:
+                    try:
+                        await infra.redis_client.xack(s, LAB_LISTS_GROUP, *ids)
+                    except Exception:
+                        log.exception("⚠️ LAB: ошибка ACK в %s (ids=%s)", s, ids)
+
+        except asyncio.CancelledError:
+            log.debug("⏹️ LAB: lists_stream_listener остановлен по сигналу")
+            raise
+        except Exception:
+            log.exception("❌ LAB: ошибка цикла lists_stream_listener — пауза 5 секунд")
+            await asyncio.sleep(5)
+
+
+# 🔸 Слушатель Pub/Sub конфигов: тикеры и стратегии
+async def config_event_listener():
+    # условия достаточности
+    if infra.redis_client is None:
+        log.debug("❌ Пропуск config_event_listener: Redis не инициализирован")
+        return
+
+    pubsub = infra.redis_client.pubsub()
+    await pubsub.subscribe(PUBSUB_TICKERS, PUBSUB_STRATEGIES)
+    log.info("📡 LAB: подписка на каналы: %s, %s", PUBSUB_TICKERS, PUBSUB_STRATEGIES)
+
+    async for message in pubsub.listen():
+        if message.get("type") != "message":
+            continue
+        try:
+            channel = message["channel"]  # decode_responses=True → уже str
+            # события тикеров → полная перезагрузка кэша тикеров
+            if channel == PUBSUB_TICKERS:
+                await _load_active_tickers()
+                log.info("🔔 LAB: обновлён кэш тикеров по событию %s", channel)
+            # события стратегий → полная перезагрузка кэша стратегий
+            elif channel == PUBSUB_STRATEGIES:
+                await _load_active_strategies()
+                log.info("🔔 LAB: обновлён кэш стратегий по событию %s", channel)
+        except Exception:
+            log.exception("❌ LAB: ошибка обработки сообщения Pub/Sub")
+
+
+# 🔸 Загрузчики (SQL минимальный, вычисления в Python)
+
+async def _load_active_tickers():
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT symbol, precision_price, precision_qty, status, tradepermission, created_at
             FROM tickers_bb
             WHERE status = 'enabled' AND tradepermission = 'enabled'
-        """)
-    added_tickers = 0
+            """
+        )
+        tickers = {str(r["symbol"]): dict(r) for r in rows}
+        set_lab_tickers(tickers)
+    log.info("✅ LAB: загружены активные тикеры (%d)", len(infra.lab_tickers))
+
+
+async def _load_active_strategies():
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, name, human_name, enabled, COALESCE(archived,false) AS archived, created_at
+            FROM strategies_v4
+            WHERE enabled = true AND (archived IS NOT TRUE)
+            """
+        )
+        strategies = {int(r["id"]): dict(r) for r in rows}
+        set_lab_strategies(strategies)
+    log.info("✅ LAB: загружены активные стратегии (%d)", len(infra.lab_strategies))
+
+
+async def _load_mw_whitelists_all():
+    # строим карты по версиям: (sid, timeframe, direction) -> {(agg_base, agg_state)}
+    v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}}
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT w.version,
+                   w.strategy_id,
+                   a.timeframe,
+                   a.direction,
+                   a.agg_base,
+                   a.agg_state
+            FROM oracle_mw_whitelist w
+            JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE a.time_frame = '7d'
+            """
+        )
+
     for r in rows:
-        sym = r["symbol"]
-        lab_tickers[sym] = {
-            "precision_price": int(r["precision_price"]) if r["precision_price"] is not None else None,
-            "status": r["status"],
-            "tradepermission": r["tradepermission"],
-        }
-        added_tickers += 1
+        ver = str(r["version"]).lower()
+        sid = int(r["strategy_id"])
+        tf = str(r["timeframe"])
+        direction = str(r["direction"])
+        base = str(r["agg_base"])
+        state = str(r["agg_state"])
+        key = (sid, tf, direction)
+        bucket = v_maps.setdefault(ver, {}).setdefault(key, set())
+        bucket.add((base, state))
 
-    # загрузка инстансов индикаторов (+ параметры), только по заданным TF
-    async with pg.acquire() as conn:
-        inst_rows = await conn.fetch("""
-            SELECT id, indicator, timeframe, stream_publish, enabled_at, enabled
-            FROM indicator_instances_v4
-            WHERE enabled = true
-        """)
-        for inst in inst_rows:
-            tf = inst["timeframe"]
-            if tf not in tf_set:
-                continue
-            iid = int(inst["id"])
-            params_rows = await conn.fetch("""
-                SELECT param, value
-                FROM indicator_parameters_v4
-                WHERE instance_id = $1
-            """, iid)
-            params = {p["param"]: p["value"] for p in params_rows}
-            lab_indicators[iid] = {
-                "indicator": inst["indicator"],
-                "timeframe": tf,
-                "stream_publish": bool(inst["stream_publish"]),
-                "enabled_at": inst["enabled_at"],
-                "params": params,
-            }
+    # применяем замены кэшей
+    for ver in ("v1", "v2"):
+        replace_mw_whitelist(ver, v_maps.get(ver, {}))
 
-    log.debug("LAB INIT (bootstrap): tickers=%d indicators=%d", added_tickers, len(lab_indicators))
+    log.info("✅ LAB: MW WL загружены: v1=%d срезов, v2=%d срезов",
+             len(infra.lab_mw_wl.get("v1", {})),
+             len(infra.lab_mw_wl.get("v2", {})))
 
 
-# 🔸 Помощники для обновлений кешей из БД
-async def _reload_ticker(pg, symbol: str) -> bool:
-    async with pg.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT symbol, precision_price, status, tradepermission
-            FROM tickers_bb
-            WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
-        """, symbol)
-    if row:
-        lab_tickers[symbol] = {
-            "precision_price": int(row["precision_price"]) if row["precision_price"] is not None else None,
-            "status": row["status"],
-            "tradepermission": row["tradepermission"],
-        }
-        return True
-    else:
-        lab_tickers.pop(symbol, None)
-        return False
+async def _load_pack_lists_all():
+    # строим карты по версиям и типу списка
+    wl_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}}
+    bl_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}}
 
-async def _reload_indicator_instance(pg, iid: int, tf_set: tuple[str, ...]) -> bool:
-    async with pg.acquire() as conn:
-        inst = await conn.fetchrow("""
-            SELECT id, indicator, timeframe, stream_publish, enabled_at, enabled
-            FROM indicator_instances_v4
-            WHERE id = $1
-        """, iid)
-        if not inst:
-            lab_indicators.pop(iid, None)
-            return False
-        if not inst["enabled"] or inst["timeframe"] not in tf_set:
-            lab_indicators.pop(iid, None)
-            return False
-        params_rows = await conn.fetch("""
-            SELECT param, value
-            FROM indicator_parameters_v4
-            WHERE instance_id = $1
-        """, iid)
-        params = {p["param"]: p["value"] for p in params_rows}
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT w.version,
+                   w.list,
+                   w.strategy_id,
+                   a.timeframe,
+                   a.direction,
+                   a.pack_base,
+                   a.agg_key,
+                   a.agg_value
+            FROM oracle_pack_whitelist w
+            JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE a.time_frame = '7d'
+            """
+        )
 
-    lab_indicators[iid] = {
-        "indicator": inst["indicator"],
-        "timeframe": inst["timeframe"],
-        "stream_publish": bool(inst["stream_publish"]),
-        "enabled_at": inst["enabled_at"],
-        "params": params,
-    }
-    return True
+    for r in rows:
+        ver = str(r["version"]).lower()
+        list_tag = str(r["list"]).lower()  # 'whitelist'|'blacklist'
+        sid = int(r["strategy_id"])
+        tf = str(r["timeframe"])
+        direction = str(r["direction"])
+        pack_base = str(r["pack_base"])
+        agg_key = str(r["agg_key"])
+        agg_value = str(r["agg_value"])
+        key = (sid, tf, direction)
+        target = wl_maps if list_tag == "whitelist" else bl_maps
+        bucket = target.setdefault(ver, {}).setdefault(key, set())
+        bucket.add((pack_base, agg_key, agg_value))
 
+    # применяем замены кэшей
+    for ver in ("v1", "v2"):
+        replace_pack_list("whitelist", ver, wl_maps.get(ver, {}))
+        replace_pack_list("blacklist", ver, bl_maps.get(ver, {}))
 
-# 🔸 Подписчик Pub/Sub: тикеры (tickers_v4_events)
-async def run_watch_tickers_events(pg, redis, channel: str, initial_delay: float = 0.0):
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    log.debug("LAB TICKERS: подписка на канал %s", channel)
-
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(channel)
-
-    upd = rem = 0
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
-        try:
-            data = json.loads(msg["data"])
-        except Exception:
-            log.warning("LAB TICKERS: некорректный JSON: %r", msg.get("data"))
-            continue
-
-        sym = data.get("symbol")
-        ev_type = data.get("type")
-        action = data.get("action")
-        if not sym or ev_type != "status" or action not in ("enabled", "disabled"):
-            continue
-
-        try:
-            if action == "enabled":
-                ok = await _reload_ticker(pg, sym)
-                if ok:
-                    upd += 1
-            else:
-                lab_tickers.pop(sym, None)
-                rem += 1
-        except Exception as e:
-            log.warning("LAB TICKERS: ошибка обработки события %s: %s", sym, e)
-
-        if (upd + rem) % 50 == 0:
-            log.debug("LAB TICKERS: updated=%d removed=%d active=%d", upd, rem, len(lab_tickers))
+    log.info("✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, bl[v1]=%d, bl[v2]=%d",
+             len(infra.lab_pack_wl.get("v1", {})),
+             len(infra.lab_pack_wl.get("v2", {})),
+             len(infra.lab_pack_bl.get("v1", {})),
+             len(infra.lab_pack_bl.get("v2", {})))
 
 
-# 🔸 Подписчик Pub/Sub: индикаторы (indicators_v4_events)
-async def run_watch_indicators_events(pg, redis, channel: str, initial_delay: float = 0.0, tf_set: tuple[str, ...] = ("m5","m15","h1")):
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    log.debug("LAB IND: подписка на канал %s", channel)
+# 🔸 Точечные перезагрузки по сообщениям стримов
 
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(channel)
+async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
+    slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT a.timeframe, a.direction, a.agg_base, a.agg_state
+            FROM oracle_mw_whitelist w
+            JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2
+            """,
+            int(strategy_id), str(version)
+        )
+    for r in rows:
+        key = (str(r["timeframe"]), str(r["direction"]))
+        slice_map.setdefault(key, set()).add((str(r["agg_base"]), str(r["agg_state"])))
 
-    added = removed = updated = 0
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
-        try:
-            data = json.loads(msg["data"])
-        except Exception:
-            log.warning("LAB IND: некорректный JSON: %r", msg.get("data"))
-            continue
-
-        iid = data.get("id")
-        field = data.get("type")
-        action = data.get("action")
-        if iid is None or field not in ("enabled", "stream_publish"):
-            continue
-
-        iid = int(iid)
-        try:
-            if field == "enabled":
-                if action == "true":
-                    ok = await _reload_indicator_instance(pg, iid, tf_set)
-                    if ok:
-                        added += 1
-                else:
-                    if lab_indicators.pop(iid, None) is not None:
-                        removed += 1
-            elif field == "stream_publish" and iid in lab_indicators:
-                lab_indicators[iid]["stream_publish"] = (action == "true")
-                updated += 1
-        except Exception as e:
-            log.warning("LAB IND: ошибка обработки %s: %s", iid, e)
-
-        total = len(lab_indicators)
-        if (added + removed + updated) % 50 == 0:
-            log.debug("LAB IND: added=%d removed=%d updated=%d total=%d", added, removed, updated, total)
+    update_mw_whitelist_for_strategy(version, strategy_id, slice_map)
 
 
-# 🔸 Подписчик Pub/Sub: готовность свечей (bb:ohlcv_channel) → обновление lab_last_bar
-async def run_watch_ohlcv_ready_channel(redis, channel: str, initial_delay: float = 0.0):
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
-    log.debug("LAB OHLCV (channel): подписка на канал %s", channel)
+async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
+    wl_slice: Dict[Tuple[str, str], Set[Tuple[str, str, str]]] = {}
+    bl_slice: Dict[Tuple[str, str], Set[Tuple[str, str, str]]] = {}
 
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(channel)
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT w.list, a.timeframe, a.direction, a.pack_base, a.agg_key, a.agg_value
+            FROM oracle_pack_whitelist w
+            JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2
+            """,
+            int(strategy_id), str(version)
+        )
 
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
-        try:
-            data = json.loads(msg["data"])
-        except Exception:
-            log.warning("LAB OHLCV: некорректный JSON: %r", msg.get("data"))
-            continue
+    for r in rows:
+        key = (str(r["timeframe"]), str(r["direction"]))
+        tpl = (str(r["pack_base"]), str(r["agg_key"]), str(r["agg_value"]))
+        if str(r["list"]).lower() == "whitelist":
+            wl_slice.setdefault(key, set()).add(tpl)
+        else:
+            bl_slice.setdefault(key, set()).add(tpl)
 
-        symbol = data.get("symbol")
-        interval = data.get("interval") or data.get("timeframe")
-        ts = data.get("timestamp") or data.get("open_time_ms") or data.get("open_time")
-        if not symbol or not interval or ts is None:
-            continue
-
-        try:
-            open_ms = int(ts)
-        except Exception:
-            try:
-                open_ms = int(datetime.fromisoformat(str(ts)).timestamp() * 1000)
-            except Exception:
-                continue
-
-        lab_last_bar[(symbol, interval)] = open_ms
-        open_iso = datetime.utcfromtimestamp(open_ms / 1000).isoformat()
-        log.debug("LAB OHLCV: set last_bar %s/%s@%s", symbol, interval, open_iso)
+    update_pack_list_for_strategy("whitelist", version, strategy_id, wl_slice)
+    update_pack_list_for_strategy("blacklist", version, strategy_id, bl_slice)

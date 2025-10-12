@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — оркестратор laboratory_v4 (инициализация, кеши, Pub/Sub, эксперимент: m5 цикл IND → MW → PACK с паузами)
+# 🔸 laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск фоновых воркеров
 
 # 🔸 Импорты
 import asyncio
@@ -6,170 +6,107 @@ import logging
 
 from laboratory_infra import (
     setup_logging,
-    init_pg_pool,
-    init_redis_client,
-    run_safe_loop,
+    setup_pg,
+    setup_redis_client,
 )
 from laboratory_config import (
-    bootstrap_caches,             # стартовая загрузка кешей (тикеры + индикаторы)
-    get_cache_stats,              # метрики кешей для стартового лога
-    get_instances_by_tf,          # геттеры кешей
-    get_precision,
-    get_active_symbols,
-    get_last_bar,
-    run_watch_tickers_events,     # Pub/Sub: tickers_v4_events
-    run_watch_indicators_events,  # Pub/Sub: indicators_v4_events
-    run_watch_ohlcv_ready_channel # Pub/Sub: bb:ohlcv_channel → обновляет lab_last_bar
+    load_initial_config,
+    lists_stream_listener,
+    config_event_listener,
 )
-from laboratory_ind_live import tick_ind          # одиночный тик IND (без цикла)
-from laboratory_mw_live import tick_mw            # одиночный тик MW  (без цикла)
-from laboratory_pack_live import tick_pack        # одиночный тик PACK (без цикла)
-
-# 🔸 Параметры сервиса (локально, без ENV)
-LAB_SETTINGS = {
-    # Pub/Sub каналы
-    "CHANNEL_TICKERS": "tickers_v4_events",
-    "CHANNEL_INDICATORS": "indicators_v4_events",
-    "CHANNEL_OHLCV_READY": "bb:ohlcv_channel",
-
-    # Задержки старта слушателей (сек)
-    "DELAY_TICKERS": 0.5,
-    "DELAY_INDICATORS": 0.5,
-    "DELAY_OHLCV_CHANNEL": 2.0,
-
-    # Экспериментальный цикл (m5): IND → пауза → MW → пауза → PACK → пауза → …
-    "CYCLE_TF_SET": ("m5",),  # считаем только m5
-    "CYCLE_START_DELAY": 60,  # старт через 60 секунд после загрузки
-    "CYCLE_PAUSE_SEC": 3,     # пауза между IND/MW/PACK и между итерациями
-}
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
 
+# 🔸 Параметры запуска воркеров
+# задержки перед первым стартом (сек) — можно править при необходимости
+INITIAL_DELAY_LISTS = 0
+INITIAL_DELAY_CONFIG = 0
+# пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
+DEFAULT_INTERVAL_SEC = 6 * 60 * 60
 
-# 🔸 Вспомогательное: запуск корутины с начальной задержкой
-async def _run_with_delay(coro_factory, delay: float):
-    if delay and delay > 0:
-        await asyncio.sleep(delay)
-    await coro_factory()
 
-
-# 🔸 Координатор m5-цикла: IND → пауза → MW → пауза → PACK → пауза → …
-async def run_lab_cycle_m5(pg, redis):
-    tf_set = LAB_SETTINGS["CYCLE_TF_SET"]
-    pause = LAB_SETTINGS["CYCLE_PAUSE_SEC"]
-
+# 🔸 Обёртка с автоперезапуском воркера
+async def run_safe_loop(coro, label: str):
     while True:
-        # IND тик (обновляет кеш и пишет lab_live:ind:*)
-        pairs, published, skipped, elapsed_ms = await tick_ind(
-            pg=pg,
-            redis=redis,
-            get_instances_by_tf=get_instances_by_tf,
-            get_precision=get_precision,
-            get_active_symbols=get_active_symbols,
-            get_last_bar=get_last_bar,
-            tf_set=tf_set,
-        )
-        log.info(
-            "LAB CYCLE: IND tick tf=%s pairs=%d params=%d skipped=%d elapsed_ms=%d",
-            ",".join(tf_set), pairs, published, skipped, elapsed_ms
-        )
-
-        await asyncio.sleep(pause)
-
-        # MW тик (берёт live из кеша, пишет lab_live:mw:*)
-        pairs, published, skipped, elapsed_ms = await tick_mw(
-            pg=pg,
-            redis=redis,
-            get_active_symbols=get_active_symbols,
-            get_precision=get_precision,
-            get_last_bar=get_last_bar,
-            tf_set=tf_set,
-        )
-        log.info(
-            "LAB CYCLE: MW tick tf=%s pairs=%d states=%d skipped=%d elapsed_ms=%d",
-            ",".join(tf_set), pairs, published, skipped, elapsed_ms
-        )
-
-        await asyncio.sleep(pause)
-
-        # PACK тик (строит rsi/mfi/ema/atr/lr/adx_dmi/macd/bb, пишет lab_live:pack:*)
-        pairs, published, skipped, elapsed_ms = await tick_pack(
-            pg=pg,
-            redis=redis,
-            get_active_symbols=get_active_symbols,
-            get_precision=get_precision,
-            get_instances_by_tf=get_instances_by_tf,
-            get_last_bar=get_last_bar,
-            tf_set=tf_set,
-        )
-        log.info(
-            "LAB CYCLE: PACK tick tf=%s pairs=%d packs=%d skipped=%d elapsed_ms=%d",
-            ",".join(tf_set), pairs, published, skipped, elapsed_ms
-        )
-
-        await asyncio.sleep(pause)
+        try:
+            log.info(f"[{label}] 🚀 Запуск задачи")
+            await coro()
+        except asyncio.CancelledError:
+            log.info(f"[{label}] ⏹️ Остановлено по сигналу")
+            raise
+        except Exception:
+            log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
+            await asyncio.sleep(5)
 
 
-# 🔸 Основной запуск: инициализация, стартовая загрузка, запуск подписчиков и экспериментального цикла m5
+# 🔸 Обёртка для периодического запуска
+async def run_periodic(coro_func, interval_sec: int, label: str, initial_delay: int = 0):
+    if initial_delay > 0:
+        log.info(f"[{label}] ⏳ Ожидание {initial_delay} сек перед первым запуском")
+        await asyncio.sleep(initial_delay)
+    while True:
+        try:
+            log.info(f"[{label}] 🔁 Периодический запуск")
+            await coro_func()
+        except asyncio.CancelledError:
+            log.info(f"[{label}] ⏹️ Периодическая задача остановлена")
+            raise
+        except Exception:
+            log.exception(f"[{label}] ❌ Ошибка при периодическом выполнении")
+        await asyncio.sleep(int(interval_sec))
+
+
+# 🔸 Главная точка входа
 async def main():
     setup_logging()
-    log.info("LAB: запуск инициализации (experiment: m5 IND → MW → PACK alternation)")
+    log.info("📦 Запуск сервиса laboratory_v4")
 
-    # подключение к БД/Redis
-    pg = await init_pg_pool()
-    redis = await init_redis_client()
+    # подключения к внешним сервисам
+    try:
+        await setup_pg()
+        await setup_redis_client()
+        log.info("🔌 Подключения к PostgreSQL и Redis инициализированы")
+    except Exception:
+        log.exception("❌ Ошибка инициализации внешних сервисов")
+        return
 
-    # стартовая загрузка кешей (тикеры + индикаторы)
-    await bootstrap_caches(pg=pg, redis=redis, tf_set=("m5", "m15", "h1"))
+    # первичная загрузка конфигурации
+    try:
+        await load_initial_config()
+        log.info("📦 Стартовая конфигурация загружена")
+    except Exception:
+        log.exception("❌ Ошибка первичной загрузки конфигурации")
+        return
 
-    # лог успешного старта
-    stats = get_cache_stats()
-    log.info("LAB INIT: tickers=%d indicators=%d", stats.get("symbols", 0), stats.get("indicators", 0))
+    log.info("🚀 Запуск фоновых воркеров laboratory_v4")
 
-    # запуск слушателей Pub/Sub и экспериментального цикла m5
+    # слушатели: списки (Streams) и конфиги (Pub/Sub)
     await asyncio.gather(
-        # Pub/Sub: тикеры
+        # слушатель обновлений WL/BL из oracle (Redis Streams)
         run_safe_loop(
-            lambda: run_watch_tickers_events(
-                pg=pg,
-                redis=redis,
-                channel=LAB_SETTINGS["CHANNEL_TICKERS"],
-                initial_delay=LAB_SETTINGS["DELAY_TICKERS"],
-            ),
-            "LAB_TICKERS",
+            lambda: _start_with_delay(lists_stream_listener, INITIAL_DELAY_LISTS),
+            "LAB_LISTS_STREAMS",
         ),
-        # Pub/Sub: индикаторы
+        # слушатель событий конфигов (Pub/Sub тикеров/стратегий)
         run_safe_loop(
-            lambda: run_watch_indicators_events(
-                pg=pg,
-                redis=redis,
-                channel=LAB_SETTINGS["CHANNEL_INDICATORS"],
-                initial_delay=LAB_SETTINGS["DELAY_INDICATORS"],
-                tf_set=("m5", "m15", "h1"),
-            ),
-            "LAB_INDICATORS",
+            lambda: _start_with_delay(config_event_listener, INITIAL_DELAY_CONFIG),
+            "LAB_CONFIG_PUBSUB",
         ),
-        # Pub/Sub: готовность свечей (обновляет lab_last_bar)
-        run_safe_loop(
-            lambda: run_watch_ohlcv_ready_channel(
-                redis=redis,
-                channel=LAB_SETTINGS["CHANNEL_OHLCV_READY"],
-                initial_delay=LAB_SETTINGS["DELAY_OHLCV_CHANNEL"],
-            ),
-            "LAB_OHLCV_READY",
-        ),
-        # Эксперимент: координатор IND→MW→PACK для m5 (старт через 60 секунд)
-        run_safe_loop(
-            lambda: _run_with_delay(
-                lambda: run_lab_cycle_m5(pg=pg, redis=redis),
-                LAB_SETTINGS["CYCLE_START_DELAY"],
-            ),
-            "LAB_CYCLE_M5",
-        ),
+        # при необходимости здесь же можно добавлять периодические задачи через run_periodic(...)
     )
 
 
-# 🔸 Точка входа
+# 🔸 Вспомогательная функция запуска с задержкой
+async def _start_with_delay(coro_func, delay_sec: int):
+    # условия достаточности
+    if delay_sec and delay_sec > 0:
+        log.info("⏳ Ожидание %d сек перед стартом задачи", delay_sec)
+        await asyncio.sleep(int(delay_sec))
+    # запуск целевой корутины
+    await coro_func()
+
+
+# 🔸 Запуск модуля
 if __name__ == "__main__":
     asyncio.run(main())
