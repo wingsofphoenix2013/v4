@@ -48,7 +48,7 @@ async def load_initial_config():
     await _load_pack_lists_all()
 
     # итог
-    log.info(
+    log.debug(
         "✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, mw_wl[v1]=%d, mw_wl[v2]=%d, pack_wl[v1]=%d, pack_wl[v2]=%d, pack_bl[v1]=%d, pack_bl[v2]=%d",
         len(infra.lab_tickers),
         len(infra.lab_strategies),
@@ -108,7 +108,7 @@ async def lists_stream_listener():
                             version = str(payload.get("version", "")).lower()
                             if sid and version in ("v1", "v2"):
                                 await _reload_mw_wl_for_strategy(sid, version)
-                                log.info("🔁 LAB: MW WL обновлён из стрима (sid=%s, version=%s)", sid, version)
+                                log.debug("🔁 LAB: MW WL обновлён из стрима (sid=%s, version=%s)", sid, version)
                             else:
                                 log.debug("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
 
@@ -118,7 +118,7 @@ async def lists_stream_listener():
                             version = str(payload.get("version", "")).lower()
                             if sid and version in ("v1", "v2"):
                                 await _reload_pack_lists_for_strategy(sid, version)
-                                log.info("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
+                                log.debug("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
                             else:
                                 log.debug("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
 
@@ -151,7 +151,7 @@ async def config_event_listener():
 
     pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe(PUBSUB_TICKERS, PUBSUB_STRATEGIES)
-    log.info("📡 LAB: подписка на каналы: %s, %s", PUBSUB_TICKERS, PUBSUB_STRATEGIES)
+    log.debug("📡 LAB: подписка на каналы: %s, %s", PUBSUB_TICKERS, PUBSUB_STRATEGIES)
 
     async for message in pubsub.listen():
         if message.get("type") != "message":
@@ -161,11 +161,11 @@ async def config_event_listener():
             # события тикеров → полная перезагрузка кэша тикеров
             if channel == PUBSUB_TICKERS:
                 await _load_active_tickers()
-                log.info("🔔 LAB: обновлён кэш тикеров по событию %s", channel)
+                log.debug("🔔 LAB: обновлён кэш тикеров по событию %s", channel)
             # события стратегий → полная перезагрузка кэша стратегий
             elif channel == PUBSUB_STRATEGIES:
                 await _load_active_strategies()
-                log.info("🔔 LAB: обновлён кэш стратегий по событию %s", channel)
+                log.debug("🔔 LAB: обновлён кэш стратегий по событию %s", channel)
         except Exception:
             log.exception("❌ LAB: ошибка обработки сообщения Pub/Sub")
 
@@ -183,7 +183,7 @@ async def _load_active_tickers():
         )
         tickers = {str(r["symbol"]): dict(r) for r in rows}
         set_lab_tickers(tickers)
-    log.info("✅ LAB: загружены активные тикеры (%d)", len(infra.lab_tickers))
+    log.debug("✅ LAB: загружены активные тикеры (%d)", len(infra.lab_tickers))
 
 
 async def _load_active_strategies():
@@ -197,7 +197,7 @@ async def _load_active_strategies():
         )
         strategies = {int(r["id"]): dict(r) for r in rows}
         set_lab_strategies(strategies)
-    log.info("✅ LAB: загружены активные стратегии (%d)", len(infra.lab_strategies))
+    log.debug("✅ LAB: загружены активные стратегии (%d)", len(infra.lab_strategies))
 
 
 async def _load_mw_whitelists_all():
@@ -236,7 +236,7 @@ async def _load_mw_whitelists_all():
     for ver in ("v1", "v2"):
         replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
-    log.info("✅ LAB: MW WL загружены: v1=%d срезов, v2=%d срезов",
+    log.debug("✅ LAB: MW WL загружены: v1=%d срезов, v2=%d срезов",
              len(infra.lab_mw_wl.get("v1", {})),
              len(infra.lab_mw_wl.get("v2", {})))
 
@@ -287,7 +287,7 @@ async def _load_pack_lists_all():
         replace_pack_list("whitelist", ver, wl_maps.get(ver, {}), wr_map=wl_wr_maps.get(ver, {}))
         replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
-    log.info("✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, bl[v1]=%d, bl[v2]=%d",
+    log.debug("✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, bl[v1]=%d, bl[v2]=%d",
              len(infra.lab_pack_wl.get("v1", {})),
              len(infra.lab_pack_wl.get("v2", {})),
              len(infra.lab_pack_bl.get("v1", {})),

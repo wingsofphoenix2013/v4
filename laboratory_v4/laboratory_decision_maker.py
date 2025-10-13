@@ -63,7 +63,7 @@ async def run_laboratory_decision_maker():
             log.exception("❌ LAB_DECISION: ошибка создания consumer group")
             return
 
-    log.info("🚀 LAB_DECISION: старт воркера (parallel=%d)", MAX_CONCURRENCY)
+    log.debug("🚀 LAB_DECISION: старт воркера (parallel=%d)", MAX_CONCURRENCY)
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -559,7 +559,7 @@ async def _handle_request(payload: dict):
     )
 
     # лог сводный
-    log.info(
+    log.debug(
         "LAB_DECISION: req=%s sid=%s %s %s tfs=%s ver=%s mode=%s bl=%s -> allow=%s reason=%s duration_ms=%d",
         req_uid, strategy_id, symbol, direction, timeframes_raw, version, decision_mode, use_bl,
         final_allow, final_reason, duration_ms

@@ -49,7 +49,7 @@ async def run_laboratory_postproc():
             log.exception("❌ LAB_POSTPROC: ошибка создания consumer group")
             return
 
-    log.info("🚀 LAB_POSTPROC: старт воркера")
+    log.debug("🚀 LAB_POSTPROC: старт воркера")
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -239,7 +239,7 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
                 updated += 1
 
     # итоговые логи по событию
-    log.info(
+    log.debug(
         "LAB_POSTPROC: closed position stored (log_uid=%s, client_sid=%s, pos=%s, tfs=%s) -> inserted=%d updated=%d",
         log_uid, client_sid, position_uid, ",".join(tfs), inserted, updated
     )
