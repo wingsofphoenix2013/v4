@@ -1,4 +1,4 @@
-# 🔸 laboratory_decision_maker.py — воркер «советчика»: чтение запросов из Redis Stream, сверка с WL/BL, ответ в стрим и запись в БД
+# 🔸 laboratory_decision_maker.py — воркер «советчика»: запрос из Stream → сверка с WL/BL → мгновенный ответ → запись статистики в БД
 
 # 🔸 Импорты
 import asyncio
@@ -155,7 +155,7 @@ def _indicator_from_pack_base(pack_base: str) -> Optional[str]:
 
 
 async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
-    """Считывает текущие состояния MW-баз из ind_mw_live:{symbol}:{tf}:{kind} (JSON)."""
+    # считывает текущие состояния MW-баз из ind_mw_live:{symbol}:{tf}:{kind} (JSON)
     states: Dict[str, str] = {}
     for base in MW_BASES:
         key = f"ind_mw_live:{symbol}:{tf}:{base}"
@@ -167,7 +167,7 @@ async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
         except Exception:
             continue
 
-        # пробуем извлечь «state» из пака
+        # извлекаем «state» из пакета
         state = None
         if isinstance(obj, dict):
             state = obj.get("state") or obj.get("mw_state")
@@ -185,7 +185,7 @@ async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
 
 
 async def _get_live_pack(symbol: str, tf: str, indicator: str, pack_base: str) -> Optional[dict]:
-    """Читает JSON live-пака из pack_live:{indicator}:{symbol}:{tf}:{base}."""
+    # читает JSON live-пака из pack_live:{indicator}:{symbol}:{tf}:{base}
     key = f"pack_live:{indicator}:{symbol}:{tf}:{pack_base}"
     try:
         js = await infra.redis_client.get(key)
@@ -200,7 +200,7 @@ async def _get_live_pack(symbol: str, tf: str, indicator: str, pack_base: str) -
 
 
 def _get_field_from_pack(obj: dict, field: str) -> Optional[str]:
-    """Достаёт строковое значение поля из пака (прямо или из obj['pack'] или obj['features'])."""
+    # достаёт строковое значение поля из пака (прямо или из obj['pack'] или obj['features'])
     if not isinstance(obj, dict):
         return None
     val = obj.get(field)
@@ -216,7 +216,7 @@ def _get_field_from_pack(obj: dict, field: str) -> Optional[str]:
 
 
 def _build_mw_agg_state(agg_base: str, mw_states: Dict[str, str]) -> Optional[str]:
-    """Формирует каноническую строку agg_state для MW (или возвращает solo-state)."""
+    # формирует каноническую строку agg_state для MW (или возвращает solo-state)
     bases = agg_base.split("_")
     if len(bases) == 1:
         b = bases[0]
@@ -232,7 +232,7 @@ def _build_mw_agg_state(agg_base: str, mw_states: Dict[str, str]) -> Optional[st
 
 
 def _build_pack_agg_value(agg_key: str, pack_obj: dict) -> Optional[str]:
-    """Формирует каноническую строку agg_value из пака по agg_key (field1|field2|...)."""
+    # формирует каноническую строку agg_value из пака по agg_key (field1|field2|...)
     fields = [p.strip() for p in agg_key.split("|") if p.strip()]
     if not fields:
         return None
@@ -248,7 +248,7 @@ def _build_pack_agg_value(agg_key: str, pack_obj: dict) -> Optional[str]:
 # 🔸 Redis-ворота (ограничитель по тикеру/направлению/клиент-стратегии)
 
 async def _acquire_gate(req_uid: str, client_sid: Optional[int], symbol: str, direction: str) -> Tuple[bool, Optional[str]]:
-    """Пытается поставить ворота. Возвращает (acquired, gate_key). Если ворота уже стоят → False."""
+    # пытается поставить ворота. Возвращает (acquired, gate_key). Если ворота уже стоят → False.
     if client_sid is None:
         return True, None  # нет client_sid — не ограничиваем
     key = GATE_KEY_TMPL.format(client_sid=int(client_sid), symbol=symbol, direction=direction)
@@ -258,12 +258,11 @@ async def _acquire_gate(req_uid: str, client_sid: Optional[int], symbol: str, di
             return True, key
         return False, key
     except Exception:
-        # в случае ошибки Redis — не блокируем стратегию, но логируем
         log.exception("⚠️ LAB_DECISION: acquire_gate error (key=%s)", key)
         return True, None
 
 
-# скрипт безопасного релиза «только если значение совпадает» (чтобы не снести ворота другого запроса)
+# скрипт безопасного релиза «только если значение совпадает»
 _RELEASE_LUA = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
   return redis.call('del', KEYS[1])
@@ -338,6 +337,7 @@ async def _handle_request(payload: dict):
             t_fin=_now_utc_naive(),
             duration_ms=int((time.monotonic() - t0) * 1000),
             hits_summary={"mw": {}, "pwl": {}, "pbl": {}},
+            used_path_by_tf={},  # пустая сводка путей
         )
         return
 
@@ -363,6 +363,7 @@ async def _handle_request(payload: dict):
             t_fin=_now_utc_naive(),
             duration_ms=int((time.monotonic() - t0) * 1000),
             hits_summary={"mw": {}, "pwl": {}, "pbl": {}},
+            used_path_by_tf={},  # пустая сводка путей
         )
         return
 
@@ -371,6 +372,7 @@ async def _handle_request(payload: dict):
     hits_by_tf_mw: Dict[str, int] = {}
     hits_by_tf_pwl: Dict[str, int] = {}
     hits_by_tf_pbl: Dict[str, int] = {}
+    used_path_by_tf: Dict[str, str] = {}
 
     final_allow = True
     final_reason = "ok"
@@ -458,7 +460,7 @@ async def _handle_request(payload: dict):
                         pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
 
             # локальный вердикт по TF
-            tf_allow, tf_reason = _decide_per_tf(
+            tf_allow, tf_reason, path_used = _decide_per_tf(
                 decision_mode=decision_mode,
                 use_bl=use_bl,
                 mw_hits=mw_hits,
@@ -475,13 +477,14 @@ async def _handle_request(payload: dict):
             hits_by_tf_mw[tf] = mw_hits
             hits_by_tf_pwl[tf] = pack_wl_hits
             hits_by_tf_pbl[tf] = pack_bl_hits
+            used_path_by_tf[tf] = path_used
 
             # итог общий — AND по TF
             if not tf_allow and final_allow:
                 final_allow = False
                 final_reason = tf_reason or final_reason
 
-            # готовим строку для laboratory_request_tf
+            # детальный JSON для TF
             tf_results = {
                 "mw": {
                     "wl_total": mw_wl_total,
@@ -502,6 +505,7 @@ async def _handle_request(payload: dict):
                 },
             }
 
+            # собираем строку TF для БД
             tf_rows.append((tf, {
                 "mw_wl_rules_total": mw_wl_total,
                 "mw_wl_hits": mw_hits,
@@ -511,6 +515,7 @@ async def _handle_request(payload: dict):
                 "pack_bl_hits": pack_bl_hits,
                 "allow": tf_allow,
                 "reason": tf_reason,
+                "path_used": path_used,
                 "tf_results": tf_results,
                 "errors": None,
             }))
@@ -548,6 +553,7 @@ async def _handle_request(payload: dict):
             "pwl": hits_by_tf_pwl,
             "pbl": hits_by_tf_pbl,
         },
+        used_path_by_tf=used_path_by_tf,
     )
 
     # лог сводный
@@ -559,7 +565,6 @@ async def _handle_request(payload: dict):
 
 
 # 🔸 Локальная логика решения по TF
-
 def _decide_per_tf(
     decision_mode: str,
     use_bl: bool,
@@ -571,40 +576,44 @@ def _decide_per_tf(
     pack_bl_total: int,
     mw_states: Dict[str, str],
     live_missing: List[str],
-) -> Tuple[bool, str]:
-    """Возвращает (allow, reason) по одному TF."""
+) -> Tuple[bool, str, str]:
+    """
+    Возвращает (allow, reason, path_used) по одному TF.
+    path_used ∈ {'mw','pack','both','none','bl_veto'}
+    """
+    # BL-вето (если включён) — немедленный отказ
     if use_bl and pack_bl_hits > 0:
-        return False, "bl_match"
+        return False, "bl_match", "bl_veto"
 
     missing = bool(live_missing)
 
     if decision_mode == "mw_only":
         if mw_hits > 0:
-            return True, "ok"
-        return False, "no_mw_match" if not missing else "missing_live_data"
+            return True, "ok", "mw"
+        return False, ("missing_live_data" if missing else "no_mw_match"), "none"
 
     if decision_mode == "pack_only":
         if pack_wl_hits > 0:
-            return True, "ok"
-        return False, "no_pack_match" if not missing else "missing_live_data"
+            return True, "ok", "pack"
+        return False, ("missing_live_data" if missing else "no_pack_match"), "none"
 
     if decision_mode == "mw_then_pack":
         if mw_hits > 0:
-            return True, "ok"
+            return True, "ok", "mw"
         if pack_wl_hits > 0:
-            return True, "ok"
-        return False, "no_mw_or_pack_match" if not missing else "missing_live_data"
+            return True, "ok", "pack"
+        return False, ("missing_live_data" if missing else "no_mw_or_pack_match"), "none"
 
     if decision_mode == "mw_and_pack":
         if mw_hits > 0 and pack_wl_hits > 0:
-            return True, "ok"
-        return False, "no_mw_and_pack_match" if not missing else "missing_live_data"
+            return True, "ok", "both"
+        return False, ("missing_live_data" if missing else "no_mw_and_pack_match"), "none"
 
-    return False, "bad_decision_mode"
+    # fallback
+    return False, "bad_decision_mode", "none"
 
 
 # 🔸 Ответ в стрим (идемпотентно)
-
 async def _respond_once(req_uid: str, allow: bool, reason: str):
     if not req_uid:
         return
@@ -626,8 +635,7 @@ async def _respond_once(req_uid: str, allow: bool, reason: str):
             log.exception("❌ LAB_DECISION: не удалось отправить ответ в стрим")
 
 
-# 🔸 Запись в БД
-
+# 🔸 Запись в БД (только head)
 async def _write_request_head_only(
     req_id: str,
     log_uid: str,
@@ -645,10 +653,12 @@ async def _write_request_head_only(
     t_fin: datetime,
     duration_ms: int,
     hits_summary: Dict[str, Dict[str, int]],
+    used_path_by_tf: Optional[Dict[str, str]] = None,
 ):
-    mw_js = json.dumps(hits_summary.get("mw", {}), separators=(",", ":"))
+    mw_js  = json.dumps(hits_summary.get("mw",  {}), separators=(",", ":"))
     pwl_js = json.dumps(hits_summary.get("pwl", {}), separators=(",", ":"))
     pbl_js = json.dumps(hits_summary.get("pbl", {}), separators=(",", ":"))
+    upath_js = json.dumps(used_path_by_tf or {}, separators=(",", ":"))
 
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
@@ -659,9 +669,10 @@ async def _write_request_head_only(
                 decision_mode, oracle_version, use_bl,
                 allow, reason,
                 mw_wl_hits_by_tf, pack_wl_hits_by_tf, pack_bl_hits_by_tf,
+                used_path_by_tf,
                 received_at, finished_at, duration_ms
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16,$17,$18)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18,$19)
             ON CONFLICT (req_id) DO UPDATE SET
                 log_uid = EXCLUDED.log_uid,
                 strategy_id = EXCLUDED.strategy_id,
@@ -677,6 +688,7 @@ async def _write_request_head_only(
                 mw_wl_hits_by_tf = EXCLUDED.mw_wl_hits_by_tf,
                 pack_wl_hits_by_tf = EXCLUDED.pack_wl_hits_by_tf,
                 pack_bl_hits_by_tf = EXCLUDED.pack_bl_hits_by_tf,
+                used_path_by_tf = EXCLUDED.used_path_by_tf,
                 received_at = EXCLUDED.received_at,
                 finished_at = EXCLUDED.finished_at,
                 duration_ms = EXCLUDED.duration_ms
@@ -686,10 +698,12 @@ async def _write_request_head_only(
             decision_mode, oracle_version, bool(use_bl),
             bool(allow), reason or "",
             mw_js, pwl_js, pbl_js,
+            upath_js,
             t_recv, t_fin, int(duration_ms),
         )
 
 
+# 🔸 Полная запись (head + TF-строки)
 async def _write_request_full(
     req_id: str,
     log_uid: str,
@@ -708,10 +722,12 @@ async def _write_request_full(
     duration_ms: int,
     tf_rows: List[Tuple[str, dict]],
     hits_summary: Dict[str, Dict[str, int]],
+    used_path_by_tf: Optional[Dict[str, str]] = None,
 ):
-    mw_js = json.dumps(hits_summary.get("mw", {}), separators=(",", ":"))
+    mw_js  = json.dumps(hits_summary.get("mw",  {}), separators=(",", ":"))
     pwl_js = json.dumps(hits_summary.get("pwl", {}), separators=(",", ":"))
     pbl_js = json.dumps(hits_summary.get("pbl", {}), separators=(",", ":"))
+    upath_js = json.dumps(used_path_by_tf or {}, separators=(",", ":"))
 
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
@@ -724,9 +740,10 @@ async def _write_request_full(
                     decision_mode, oracle_version, use_bl,
                     allow, reason,
                     mw_wl_hits_by_tf, pack_wl_hits_by_tf, pack_bl_hits_by_tf,
+                    used_path_by_tf,
                     received_at, finished_at, duration_ms
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16,$17,$18)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18,$19)
                 ON CONFLICT (req_id) DO UPDATE SET
                     log_uid = EXCLUDED.log_uid,
                     strategy_id = EXCLUDED.strategy_id,
@@ -742,6 +759,7 @@ async def _write_request_full(
                     mw_wl_hits_by_tf = EXCLUDED.mw_wl_hits_by_tf,
                     pack_wl_hits_by_tf = EXCLUDED.pack_wl_hits_by_tf,
                     pack_bl_hits_by_tf = EXCLUDED.pack_bl_hits_by_tf,
+                    used_path_by_tf = EXCLUDED.used_path_by_tf,
                     received_at = EXCLUDED.received_at,
                     finished_at = EXCLUDED.finished_at,
                     duration_ms = EXCLUDED.duration_ms
@@ -751,6 +769,7 @@ async def _write_request_full(
                 decision_mode, oracle_version, bool(use_bl),
                 bool(allow), reason or "",
                 mw_js, pwl_js, pbl_js,
+                upath_js,
                 t_recv, t_fin, int(duration_ms),
             )
 
@@ -770,6 +789,7 @@ async def _write_request_full(
                         int(row.get("pack_bl_hits", 0)),
                         bool(row.get("allow", False)),
                         str(row.get("reason", "") or ""),
+                        str(row.get("path_used", "none") or "none"),
                         tf_results_js,
                         errors_js,
                     ))
@@ -779,9 +799,9 @@ async def _write_request_full(
                         req_id, tf,
                         mw_wl_rules_total, pack_wl_rules_total, pack_bl_rules_total,
                         mw_wl_hits, pack_wl_hits, pack_bl_hits,
-                        allow, reason, tf_results, errors
+                        allow, reason, path_used, tf_results, errors
                     )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb)
                     ON CONFLICT (req_id, tf) DO UPDATE SET
                         mw_wl_rules_total = EXCLUDED.mw_wl_rules_total,
                         pack_wl_rules_total = EXCLUDED.pack_wl_rules_total,
@@ -791,6 +811,7 @@ async def _write_request_full(
                         pack_bl_hits = EXCLUDED.pack_bl_hits,
                         allow = EXCLUDED.allow,
                         reason = EXCLUDED.reason,
+                        path_used = EXCLUDED.path_used,
                         tf_results = EXCLUDED.tf_results,
                         errors = EXCLUDED.errors
                     """,
