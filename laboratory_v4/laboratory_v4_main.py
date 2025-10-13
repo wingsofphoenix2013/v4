@@ -17,6 +17,8 @@ from laboratory_config import (
 
 # 🔸 импорт воркера «советчика»
 from laboratory_decision_maker import run_laboratory_decision_maker
+# 🔸 импорт воркера пост-процессинга
+from laboratory_postproc import run_laboratory_postproc
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
@@ -26,6 +28,7 @@ log = logging.getLogger("LAB_MAIN")
 INITIAL_DELAY_LISTS = 0
 INITIAL_DELAY_CONFIG = 0
 INITIAL_DELAY_DECISION = 0
+INITIAL_DELAY_POSTPROC = 0
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
 
@@ -101,6 +104,11 @@ async def main():
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_decision_maker, INITIAL_DELAY_DECISION),
             "LAB_DECISION",
+        ),
+        # пост-процессинг закрытых позиций
+        run_safe_loop(
+            lambda: _start_with_delay(run_laboratory_postproc, INITIAL_DELAY_POSTPROC),
+            "LAB_POSTPROC",
         ),
     )
 

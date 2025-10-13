@@ -1,4 +1,4 @@
-# 🔸 laboratory_decision_maker.py — воркер «советчика»: запрос из Stream → сверка с WL/BL → мгновенный ответ → запись статистики в БД
+# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов (до 16), внутри запроса — последовательная проверка TF (младший→старший)
 
 # 🔸 Импорты
 import asyncio
@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Optional
 
 import laboratory_infra as infra
 
@@ -21,13 +21,14 @@ CONSUMER_NAME = "LAB_DECISION_WORKER"
 
 # 🔸 Идемпотентность ответа (ключи в Redis)
 RESP_SENT_KEY_TMPL = "lab:decision:sent:{req_uid}"
-RESP_SENT_TTL_SEC = 24 * 60 * 60
+RESP_SENT_TTL_SEC = 24 * 60 * 60  # 24h
 
 # 🔸 Ограничитель (анти-дубликат по тикеру/направлению/клиент-стратегии)
 GATE_KEY_TMPL = "lab:gate:busy:{client_sid}:{symbol}:{direction}"
 DUP_GUARD_TTL_SEC = 20  # TTL ворот, сек (пока нет ответа по первому запросу)
 
-# 🔸 Параметры чтения
+# 🔸 Параллелизм/чтение
+MAX_CONCURRENCY = 16     # одновременно обрабатываем до 16 запросов
 READ_COUNT = 64
 READ_BLOCK_MS = 30_000
 
@@ -62,7 +63,9 @@ async def run_laboratory_decision_maker():
             log.exception("❌ LAB_DECISION: ошибка создания consumer group")
             return
 
-    log.info("🚀 LAB_DECISION: старт воркера")
+    log.info("🚀 LAB_DECISION: старт воркера (parallel=%d)", MAX_CONCURRENCY)
+
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     # основной цикл
     while True:
@@ -77,26 +80,13 @@ async def run_laboratory_decision_maker():
             if not resp:
                 continue
 
+            tasks = []
             for _, msgs in resp:
                 for msg_id, fields in msgs:
-                    try:
-                        # парсинг payload
-                        raw = fields.get("data", "{}")
-                        payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                    except Exception:
-                        log.exception("❌ LAB_DECISION: не удалось распарсить payload")
-                        # безопасный ack (чтобы не зациклиться на битом сообщении)
-                        await _ack_safe(msg_id)
-                        continue
+                    tasks.append(_process_message_guard(sem, msg_id, fields))
 
-                    # обработка одного запроса
-                    try:
-                        await _handle_request(payload)
-                    except Exception:
-                        log.exception("❌ LAB_DECISION: ошибка обработки запроса")
-                    finally:
-                        # ack после обработки (ответ уже отправлен; запись в БД сделана/или head-only)
-                        await _ack_safe(msg_id)
+            if tasks:
+                await asyncio.gather(*tasks)
 
         except asyncio.CancelledError:
             log.debug("⏹️ LAB_DECISION: остановлен по сигналу")
@@ -106,8 +96,27 @@ async def run_laboratory_decision_maker():
             await asyncio.sleep(5)
 
 
-# 🔸 Вспомогательные функции верхнего уровня
+# 🔸 Гард на обработку одного сообщения (параллельно, ACK в finally)
+async def _process_message_guard(sem: asyncio.Semaphore, msg_id: str, fields: Dict[str, str]):
+    async with sem:
+        try:
+            # парсинг payload (одно поле data с JSON)
+            raw = fields.get("data", "{}")
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:
+            log.exception("❌ LAB_DECISION: не удалось распарсить payload")
+            await _ack_safe(msg_id)
+            return
 
+        try:
+            await _handle_request(payload)
+        except Exception:
+            log.exception("❌ LAB_DECISION: ошибка обработки запроса")
+        finally:
+            await _ack_safe(msg_id)
+
+
+# 🔸 ACK безопасно
 async def _ack_safe(msg_id: str):
     try:
         await infra.redis_client.xack(REQUEST_STREAM, CONSUMER_GROUP, msg_id)
@@ -115,6 +124,7 @@ async def _ack_safe(msg_id: str):
         log.exception("⚠️ LAB_DECISION: ошибка ACK (id=%s)", msg_id)
 
 
+# 🔸 Утилиты парсинга
 def _parse_bool(s: Optional[str]) -> bool:
     if s is None:
         return False
@@ -130,7 +140,7 @@ def _now_utc_naive() -> datetime:
 
 
 def _parse_timeframes(tfs: str) -> List[str]:
-    # разбиваем, чистим, фильтруем по допустимым, сохраняем порядок
+    # разбиваем, чистим, фильтруем по допустимым, сохраняем порядок и уникальность
     seen = set()
     out: List[str] = []
     for tf in (tfs or "").split(","):
@@ -142,18 +152,18 @@ def _parse_timeframes(tfs: str) -> List[str]:
 
 
 def _indicator_from_pack_base(pack_base: str) -> Optional[str]:
-    # точные префиксы
-    if pack_base.startswith("bb"):
+    s = (pack_base or "").strip().lower()
+    if s.startswith("bb"):
         return "bb"
-    if pack_base.startswith("adx_dmi"):
+    if s.startswith("adx_dmi"):
         return "adx_dmi"
-    # остальные — по буквенной части до цифр/подчёркиваний
     for pref in ("rsi", "mfi", "ema", "atr", "lr", "macd"):
-        if pack_base.startswith(pref):
+        if s.startswith(pref):
             return pref
     return None
 
 
+# 🔸 Чтение live-данных
 async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
     # считывает текущие состояния MW-баз из ind_mw_live:{symbol}:{tf}:{kind} (JSON)
     states: Dict[str, str] = {}
@@ -167,7 +177,6 @@ async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
         except Exception:
             continue
 
-        # извлекаем «state» из пакета
         state = None
         if isinstance(obj, dict):
             state = obj.get("state") or obj.get("mw_state")
@@ -215,6 +224,7 @@ def _get_field_from_pack(obj: dict, field: str) -> Optional[str]:
     return str(val)
 
 
+# 🔸 Сбор канонических строк для сравнения
 def _build_mw_agg_state(agg_base: str, mw_states: Dict[str, str]) -> Optional[str]:
     # формирует каноническую строку agg_state для MW (или возвращает solo-state)
     bases = agg_base.split("_")
@@ -246,7 +256,6 @@ def _build_pack_agg_value(agg_key: str, pack_obj: dict) -> Optional[str]:
 
 
 # 🔸 Redis-ворота (ограничитель по тикеру/направлению/клиент-стратегии)
-
 async def _acquire_gate(req_uid: str, client_sid: Optional[int], symbol: str, direction: str) -> Tuple[bool, Optional[str]]:
     # пытается поставить ворота. Возвращает (acquired, gate_key). Если ворота уже стоят → False.
     if client_sid is None:
@@ -280,8 +289,7 @@ async def _release_gate(req_uid: str, gate_key: Optional[str]):
         log.exception("⚠️ LAB_DECISION: release_gate error (key=%s)", gate_key)
 
 
-# 🔸 Логика обработки одного запроса
-
+# 🔸 Логика обработки одного запроса (внутри запроса — последовательный проход по TF)
 async def _handle_request(payload: dict):
     # время начала
     t_recv = _now_utc_naive()
@@ -290,8 +298,8 @@ async def _handle_request(payload: dict):
     # извлекаем поля
     req_uid = str(payload.get("req_uid") or "").strip()
     log_uid = str(payload.get("log_uid") or "").strip()
-    strategy_id = int(payload.get("strategy_id") or 0)
-    client_strategy_id = payload.get("client_strategy_id")
+    strategy_id = int(payload.get("strategy_id") or 0)         # мастер
+    client_strategy_id = payload.get("client_strategy_id")     # не-мастер
     client_sid = int(client_strategy_id) if client_strategy_id not in (None, "") else None
     symbol = _normalize_symbol(payload.get("symbol") or "")
     direction = str(payload.get("direction") or "").lower()
@@ -337,14 +345,13 @@ async def _handle_request(payload: dict):
             t_fin=_now_utc_naive(),
             duration_ms=int((time.monotonic() - t0) * 1000),
             hits_summary={"mw": {}, "pwl": {}, "pbl": {}},
-            used_path_by_tf={},  # пустая сводка путей
+            used_path_by_tf={},
         )
         return
 
     # анти-дубликат: ворота на (client_sid, symbol, direction)
     acquired, gate_key = await _acquire_gate(req_uid, client_sid, symbol, direction)
     if not acquired:
-        # уже есть незавершённый запрос → ответим немедленно
         await _respond_once(req_uid, allow=False, reason="duplicated_entry")
         await _write_request_head_only(
             req_id=req_uid,
@@ -363,11 +370,11 @@ async def _handle_request(payload: dict):
             t_fin=_now_utc_naive(),
             duration_ms=int((time.monotonic() - t0) * 1000),
             hits_summary={"mw": {}, "pwl": {}, "pbl": {}},
-            used_path_by_tf={},  # пустая сводка путей
+            used_path_by_tf={},
         )
         return
 
-    # последовательная проверка TF: m5 → m15 → h1 (в том порядке, как в запросе)
+    # последовательная проверка TF: в порядке, как пришли (обычно m5 → m15 → h1)
     tf_rows: List[Tuple[str, dict]] = []
     hits_by_tf_mw: Dict[str, int] = {}
     hits_by_tf_pwl: Dict[str, int] = {}
@@ -388,26 +395,25 @@ async def _handle_request(payload: dict):
             pack_wl_total = len(pack_wl_set)
             pack_bl_total = len(pack_bl_set)
 
-            # живые состояния
+            # живые MW состояния
             mw_states = await _get_live_mw_states(symbol, tf)
 
             # MW сопоставления
             mw_hits = 0
             mw_matches: List[dict] = []
             if mw_wl_total > 0:
-                for (agg_base, agg_state_needed) in mw_wl_set:
+                for (agg_base, agg_state_need) in mw_wl_set:
                     state_live = _build_mw_agg_state(agg_base, mw_states)
                     if state_live is None:
                         continue
-                    if state_live == agg_state_needed:
+                    if state_live == agg_state_need:
                         mw_hits += 1
-                        mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_needed})
+                        mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_need})
 
-            # PACK сопоставления (подгружаем паки по каждому pack_base единожды)
+            # PACK сопоставления: читаем паки один раз на base
             by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
             for (pack_base, agg_key, agg_value) in pack_wl_set:
                 by_base_wl.setdefault(pack_base, []).append((agg_key, agg_value))
-
             by_base_bl: Dict[str, List[Tuple[str, str]]] = {}
             for (pack_base, agg_key, agg_value) in pack_bl_set:
                 by_base_bl.setdefault(pack_base, []).append((agg_key, agg_value))
@@ -417,7 +423,6 @@ async def _handle_request(payload: dict):
             pack_wl_matches: List[dict] = []
             pack_bl_matches: List[dict] = []
 
-            # набор всех pack_base, которые нужно читать
             all_pack_bases = sorted(set(list(by_base_wl.keys()) + list(by_base_bl.keys())))
             pack_cache: Dict[str, dict] = {}
             missing_live: List[str] = []
@@ -479,18 +484,14 @@ async def _handle_request(payload: dict):
             hits_by_tf_pbl[tf] = pack_bl_hits
             used_path_by_tf[tf] = path_used
 
-            # итог общий — AND по TF
+            # общий итог — AND по TF (останавливать цикл нельзя: собираем полную статистику)
             if not tf_allow and final_allow:
                 final_allow = False
                 final_reason = tf_reason or final_reason
 
-            # детальный JSON для TF
+            # детальный JSON по TF
             tf_results = {
-                "mw": {
-                    "wl_total": mw_wl_total,
-                    "wl_hits": mw_hits,
-                    "wl_matches": mw_matches,
-                },
+                "mw": {"wl_total": mw_wl_total, "wl_hits": mw_hits, "wl_matches": mw_matches},
                 "pack": {
                     "wl_total": pack_wl_total,
                     "wl_hits": pack_wl_hits,
@@ -499,13 +500,10 @@ async def _handle_request(payload: dict):
                     "bl_hits": pack_bl_hits,
                     "bl_matches": pack_bl_matches,
                 },
-                "live": {
-                    "mw_states": mw_states,
-                    "missing": missing_live,
-                },
+                "live": {"mw_states": mw_states, "missing": missing_live},
             }
 
-            # собираем строку TF для БД
+            # строка TF для БД
             tf_rows.append((tf, {
                 "mw_wl_rules_total": mw_wl_total,
                 "mw_wl_hits": mw_hits,
@@ -524,10 +522,10 @@ async def _handle_request(payload: dict):
         await _respond_once(req_uid, allow=final_allow, reason=final_reason)
 
     finally:
-        # снимаем ворота (после отправки ответа), чтобы следующий запрос мог пройти
+        # снимаем ворота (после отправки ответа)
         await _release_gate(req_uid, gate_key)
 
-    # после ответа — запись в БД (head + tf-строки)
+    # запись в БД (head + TF-строки)
     t_fin = _now_utc_naive()
     duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -548,11 +546,7 @@ async def _handle_request(payload: dict):
         t_fin=t_fin,
         duration_ms=duration_ms,
         tf_rows=tf_rows,
-        hits_summary={
-            "mw": hits_by_tf_mw,
-            "pwl": hits_by_tf_pwl,
-            "pbl": hits_by_tf_pbl,
-        },
+        hits_summary={"mw": hits_by_tf_mw, "pwl": hits_by_tf_pwl, "pbl": hits_by_tf_pbl},
         used_path_by_tf=used_path_by_tf,
     )
 
@@ -564,7 +558,7 @@ async def _handle_request(payload: dict):
     )
 
 
-# 🔸 Локальная логика решения по TF
+# 🔸 Локальная логика решения по TF (возвращает путь)
 def _decide_per_tf(
     decision_mode: str,
     use_bl: bool,
@@ -609,7 +603,6 @@ def _decide_per_tf(
             return True, "ok", "both"
         return False, ("missing_live_data" if missing else "no_mw_and_pack_match"), "none"
 
-    # fallback
     return False, "bad_decision_mode", "none"
 
 
