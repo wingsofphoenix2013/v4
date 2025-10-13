@@ -3,7 +3,8 @@
 # 🔸 Импорты
 import asyncio
 import logging
-from typing import Dict, Tuple, Optional
+import json
+from typing import Dict, Tuple
 from datetime import datetime
 
 from infra import infra
@@ -51,26 +52,41 @@ async def run_lab_response_router():
                 continue
 
             for _, records in entries:
-                for record_id, data in records:
+                for record_id, fields in records:
                     _last_id = record_id
-                    req_id = data.get("req_id")
-                    if not req_id:
+
+                    # извлекаем JSON из поля 'data'
+                    raw = fields.get("data") or fields.get(b"data")
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+
+                    if not raw:
+                        log.warning("⚠️ LAB_RESP_ROUTER: пустое поле 'data' (id=%s), пропуск", record_id)
                         continue
 
-                    status = data.get("status", "error")
-                    if status != "ok":
-                        # техническая ошибка от LAB
-                        allow = False
-                        reason = f"lab_error:{data.get('error','unknown')}"
-                    else:
-                        allow = str(data.get("allow", "false")).lower() == "true"
-                        reason = (data.get("reason") or "")
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        log.exception("❌ LAB_RESP_ROUTER: не удалось распарсить JSON ответа (id=%s)", record_id)
+                        continue
 
+                    # обязательные поля ответа
+                    req_id = obj.get("req_uid")
+                    allow = bool(obj.get("allow", False))
+                    reason = str(obj.get("reason") or "")
+
+                    if not req_id:
+                        log.warning("⚠️ LAB_RESP_ROUTER: отсутствует req_uid в ответе (id=%s), пропуск", record_id)
+                        continue
+
+                    # лог результата на уровне info
+                    log.info("📥 [LAB_RESP] req=%s allow=%s reason=%s", req_id, allow, reason)
+
+                    # доставляем ожидающему или сохраняем как «ранний» ответ
                     fut = _pending.pop(req_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result((allow, reason))
                     else:
-                        # ответ пришёл раньше регистрации ожидания — запомним
                         _early[req_id] = (allow, reason)
 
         except asyncio.CancelledError:
