@@ -77,7 +77,7 @@ class Strategy104Short:
         holder = f"{req_uid}:{symbol}:{direction}"
         acquired = await lab_sema_acquire(holder)
         if not acquired:
-            log.info(
+            log.debug(
                 "⏳ [LAB_REQ_BUSY] req=%s client_sid=%s master_sid=%s %s %s",
                 req_uid, client_sid, master_sid, symbol, direction,
             )
@@ -86,7 +86,7 @@ class Strategy104Short:
         try:
             # отправляем запрос в LAB (стрим с обёрткой data)
             await redis.xadd(LAB_REQ_STREAM, {"data": json.dumps(request, separators=(",", ":"))})
-            log.info(
+            log.debug(
                 "📤 [LAB_REQ_SENT] req=%s client_sid=%s master_sid=%s %s %s tfs=%s mode=%s ver=%s bl=%s",
                 req_uid, client_sid, master_sid, symbol, direction,
                 LAB_TIMEFRAMES, LAB_DECISION_MODE, LAB_VERSION, LAB_USE_BL,
@@ -96,7 +96,7 @@ class Strategy104Short:
             allow, reason = await wait_lab_response(req_uid, timeout_seconds=LAB_WAIT_TIMEOUT_SEC)
 
             # лог результата (стратегия, помимо роутера)
-            log.info("📥 [LAB_RESP_RECV] req=%s allow=%s reason=%s", req_uid, allow, reason or "")
+            log.debug("📥 [LAB_RESP_RECV] req=%s allow=%s reason=%s", req_uid, allow, reason or "")
 
             if allow:
                 return True
@@ -126,7 +126,7 @@ class Strategy104Short:
 
         # отправляем в конвейер открытия
         await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload)})
-        log.info(
+        log.debug(
             "📨 [OPEN_REQ_SENT] log_uid=%s strategy_id=%s %s %s",
             payload["log_uid"], payload["strategy_id"], payload["symbol"], payload["direction"]
         )

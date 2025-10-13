@@ -80,7 +80,7 @@ async def run_lab_response_router():
                         continue
 
                     # лог результата на уровне info
-                    log.info("📥 [LAB_RESP] req=%s allow=%s reason=%s", req_id, allow, reason)
+                    log.debug("📥 [LAB_RESP] req=%s allow=%s reason=%s", req_id, allow, reason)
 
                     # доставляем ожидающему или сохраняем как «ранний» ответ
                     fut = _pending.pop(req_id, None)
