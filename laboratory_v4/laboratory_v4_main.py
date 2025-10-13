@@ -15,6 +15,9 @@ from laboratory_config import (
     config_event_listener,
 )
 
+# 🔸 импорт воркера «советчика»
+from laboratory_decision_maker import run_laboratory_decision_maker
+
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
 
@@ -22,6 +25,7 @@ log = logging.getLogger("LAB_MAIN")
 # задержки перед первым стартом (сек) — можно править при необходимости
 INITIAL_DELAY_LISTS = 0
 INITIAL_DELAY_CONFIG = 0
+INITIAL_DELAY_DECISION = 0
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
 
@@ -93,7 +97,11 @@ async def main():
             lambda: _start_with_delay(config_event_listener, INITIAL_DELAY_CONFIG),
             "LAB_CONFIG_PUBSUB",
         ),
-        # при необходимости здесь же можно добавлять периодические задачи через run_periodic(...)
+        # «советчик»: запрос → решение → ответ в стрим → запись в БД
+        run_safe_loop(
+            lambda: _start_with_delay(run_laboratory_decision_maker, INITIAL_DELAY_DECISION),
+            "LAB_DECISION",
+        ),
     )
 
 

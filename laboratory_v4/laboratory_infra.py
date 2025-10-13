@@ -61,7 +61,7 @@ async def setup_pg():
         await conn.execute("SELECT 1")
 
     globals()["pg_pool"] = pool
-    log.info("🛢️ Подключение к PostgreSQL установлено")
+    log.debug("🛢️ Подключение к PostgreSQL установлено")
 
 
 # 🔸 Инициализация подключения к Redis
@@ -84,7 +84,7 @@ async def setup_redis_client():
     await client.ping()
 
     globals()["redis_client"] = client
-    log.info("📡 Подключение к Redis установлено")
+    log.debug("📡 Подключение к Redis установлено")
 
 
 # 🔸 Кэши: установки целиком
@@ -172,7 +172,7 @@ def update_mw_whitelist_for_strategy(version: str, strategy_id: int, slice_map: 
             per_tf_entries[tf] += cnt
 
     # результатирующий лог по стратегии
-    log.info(
+    log.debug(
         "LAB: MW WL updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
         sid, v, total_slices, total_entries,
         per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
@@ -215,7 +215,7 @@ def update_pack_list_for_strategy(list_tag: str, version: str, strategy_id: int,
             per_tf_entries[tf] += cnt
 
     # результатирующий лог по стратегии
-    log.info(
+    log.debug(
         "LAB: PACK %s updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
         lt.upper(), sid, v, total_slices, total_entries,
         per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
