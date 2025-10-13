@@ -23,6 +23,10 @@ CONSUMER_NAME = "LAB_DECISION_WORKER"
 RESP_SENT_KEY_TMPL = "lab:decision:sent:{req_uid}"
 RESP_SENT_TTL_SEC = 24 * 60 * 60
 
+# 🔸 Ограничитель (анти-дубликат по тикеру/направлению/клиент-стратегии)
+GATE_KEY_TMPL = "lab:gate:busy:{client_sid}:{symbol}:{direction}"
+DUP_GUARD_TTL_SEC = 20  # TTL ворот, сек (пока нет ответа по первому запросу)
+
 # 🔸 Параметры чтения
 READ_COUNT = 64
 READ_BLOCK_MS = 30_000
@@ -91,7 +95,7 @@ async def run_laboratory_decision_maker():
                     except Exception:
                         log.exception("❌ LAB_DECISION: ошибка обработки запроса")
                     finally:
-                        # ack после обработки (ответ уже отправлен; запись в БД сделана)
+                        # ack после обработки (ответ уже отправлен; запись в БД сделана/или head-only)
                         await _ack_safe(msg_id)
 
         except asyncio.CancelledError:
@@ -163,15 +167,12 @@ async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
         except Exception:
             continue
 
-        # пробуем извлечь «state» из paка (универсальные варианты)
+        # пробуем извлечь «state» из пака
         state = None
         if isinstance(obj, dict):
-            # прямое поле
             state = obj.get("state") or obj.get("mw_state")
-            # под-узел pack
             if state is None and isinstance(obj.get("pack"), dict):
                 state = obj["pack"].get("state") or obj["pack"].get("mw_state")
-            # fallback: явные поля некоторых паков
             if state is None:
                 for k in ("label", "current", "value"):
                     v = obj.get(k) or (obj.get("pack", {}) if isinstance(obj.get("pack"), dict) else {}).get(k)
@@ -199,16 +200,14 @@ async def _get_live_pack(symbol: str, tf: str, indicator: str, pack_base: str) -
 
 
 def _get_field_from_pack(obj: dict, field: str) -> Optional[str]:
-    """Достаёт строковое значение поля из пака (прямо или из obj['pack'])."""
+    """Достаёт строковое значение поля из пака (прямо или из obj['pack'] или obj['features'])."""
     if not isinstance(obj, dict):
         return None
-    # прямое поле
     val = obj.get(field)
     if val is None and isinstance(obj.get("pack"), dict):
         val = obj["pack"].get(field)
     if val is None and isinstance(obj.get("features"), dict):
         val = obj["features"].get(field)
-    # приводим к строке без модификаций
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -220,11 +219,9 @@ def _build_mw_agg_state(agg_base: str, mw_states: Dict[str, str]) -> Optional[st
     """Формирует каноническую строку agg_state для MW (или возвращает solo-state)."""
     bases = agg_base.split("_")
     if len(bases) == 1:
-        # solo — возвращаем чистое состояние этой базы
         b = bases[0]
         state = mw_states.get(b)
         return state if isinstance(state, str) and state else None
-    # combo — base:state|...
     parts: List[str] = []
     for b in bases:
         state = mw_states.get(b)
@@ -246,6 +243,42 @@ def _build_pack_agg_value(agg_key: str, pack_obj: dict) -> Optional[str]:
             return None
         parts.append(f"{f}:{val}")
     return "|".join(parts)
+
+
+# 🔸 Redis-ворота (ограничитель по тикеру/направлению/клиент-стратегии)
+
+async def _acquire_gate(req_uid: str, client_sid: Optional[int], symbol: str, direction: str) -> Tuple[bool, Optional[str]]:
+    """Пытается поставить ворота. Возвращает (acquired, gate_key). Если ворота уже стоят → False."""
+    if client_sid is None:
+        return True, None  # нет client_sid — не ограничиваем
+    key = GATE_KEY_TMPL.format(client_sid=int(client_sid), symbol=symbol, direction=direction)
+    try:
+        ok = await infra.redis_client.set(key, req_uid, ex=DUP_GUARD_TTL_SEC, nx=True)
+        if ok:
+            return True, key
+        return False, key
+    except Exception:
+        # в случае ошибки Redis — не блокируем стратегию, но логируем
+        log.exception("⚠️ LAB_DECISION: acquire_gate error (key=%s)", key)
+        return True, None
+
+
+# скрипт безопасного релиза «только если значение совпадает» (чтобы не снести ворота другого запроса)
+_RELEASE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+else
+  return 0
+end
+"""
+
+async def _release_gate(req_uid: str, gate_key: Optional[str]):
+    if not gate_key:
+        return
+    try:
+        await infra.redis_client.eval(_RELEASE_LUA, numkeys=1, keys=[gate_key], args=[req_uid])
+    except Exception:
+        log.exception("⚠️ LAB_DECISION: release_gate error (key=%s)", gate_key)
 
 
 # 🔸 Логика обработки одного запроса
@@ -287,9 +320,7 @@ async def _handle_request(payload: dict):
         bad_reasons.append("bad_timeframes")
 
     if bad_reasons:
-        # формируем отказ немедленно
         await _respond_once(req_uid, allow=False, reason="bad_request")
-        # в БД тоже зафиксируем как head без TF (errors)
         await _write_request_head_only(
             req_id=req_uid,
             log_uid=log_uid,
@@ -310,8 +341,33 @@ async def _handle_request(payload: dict):
         )
         return
 
+    # анти-дубликат: ворота на (client_sid, symbol, direction)
+    acquired, gate_key = await _acquire_gate(req_uid, client_sid, symbol, direction)
+    if not acquired:
+        # уже есть незавершённый запрос → ответим немедленно
+        await _respond_once(req_uid, allow=False, reason="duplicated_entry")
+        await _write_request_head_only(
+            req_id=req_uid,
+            log_uid=log_uid,
+            strategy_id=strategy_id,
+            client_strategy_id=client_sid,
+            direction=direction,
+            symbol=symbol,
+            tfs_requested=timeframes_raw,
+            decision_mode=decision_mode,
+            oracle_version=version,
+            use_bl=use_bl,
+            allow=False,
+            reason="duplicated_entry",
+            t_recv=t_recv,
+            t_fin=_now_utc_naive(),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            hits_summary={"mw": {}, "pwl": {}, "pbl": {}},
+        )
+        return
+
     # последовательная проверка TF: m5 → m15 → h1 (в том порядке, как в запросе)
-    tf_rows: List[Tuple[str, dict]] = []  # (tf, tf_row_data_for_db)
+    tf_rows: List[Tuple[str, dict]] = []
     hits_by_tf_mw: Dict[str, int] = {}
     hits_by_tf_pwl: Dict[str, int] = {}
     hits_by_tf_pbl: Dict[str, int] = {}
@@ -319,151 +375,152 @@ async def _handle_request(payload: dict):
     final_allow = True
     final_reason = "ok"
 
-    for tf in tfs:
-        # извлечь кэши WL/BL для ключа (sid, tf, direction, version)
-        mw_wl_set = infra.lab_mw_wl.get(version, {}).get((strategy_id, tf, direction), set())
-        pack_wl_set = infra.lab_pack_wl.get(version, {}).get((strategy_id, tf, direction), set())
-        pack_bl_set = infra.lab_pack_bl.get(version, {}).get((strategy_id, tf, direction), set())
+    try:
+        for tf in tfs:
+            # извлечь кэши WL/BL для ключа (sid, tf, direction, version)
+            mw_wl_set = infra.lab_mw_wl.get(version, {}).get((strategy_id, tf, direction), set())
+            pack_wl_set = infra.lab_pack_wl.get(version, {}).get((strategy_id, tf, direction), set())
+            pack_bl_set = infra.lab_pack_bl.get(version, {}).get((strategy_id, tf, direction), set())
 
-        mw_wl_total = len(mw_wl_set)
-        pack_wl_total = len(pack_wl_set)
-        pack_bl_total = len(pack_bl_set)
+            mw_wl_total = len(mw_wl_set)
+            pack_wl_total = len(pack_wl_set)
+            pack_bl_total = len(pack_bl_set)
 
-        # живые состояния
-        mw_states = await _get_live_mw_states(symbol, tf)
+            # живые состояния
+            mw_states = await _get_live_mw_states(symbol, tf)
 
-        # MW сопоставления
-        mw_hits = 0
-        mw_matches: List[dict] = []
-        if mw_wl_total > 0:
-            for (agg_base, agg_state_needed) in mw_wl_set:
-                state_live = _build_mw_agg_state(agg_base, mw_states)
-                if state_live is None:
+            # MW сопоставления
+            mw_hits = 0
+            mw_matches: List[dict] = []
+            if mw_wl_total > 0:
+                for (agg_base, agg_state_needed) in mw_wl_set:
+                    state_live = _build_mw_agg_state(agg_base, mw_states)
+                    if state_live is None:
+                        continue
+                    if state_live == agg_state_needed:
+                        mw_hits += 1
+                        mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_needed})
+
+            # PACK сопоставления (подгружаем паки по каждому pack_base единожды)
+            by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
+            for (pack_base, agg_key, agg_value) in pack_wl_set:
+                by_base_wl.setdefault(pack_base, []).append((agg_key, agg_value))
+
+            by_base_bl: Dict[str, List[Tuple[str, str]]] = {}
+            for (pack_base, agg_key, agg_value) in pack_bl_set:
+                by_base_bl.setdefault(pack_base, []).append((agg_key, agg_value))
+
+            pack_wl_hits = 0
+            pack_bl_hits = 0
+            pack_wl_matches: List[dict] = []
+            pack_bl_matches: List[dict] = []
+
+            # набор всех pack_base, которые нужно читать
+            all_pack_bases = sorted(set(list(by_base_wl.keys()) + list(by_base_bl.keys())))
+            pack_cache: Dict[str, dict] = {}
+            missing_live: List[str] = []
+
+            for base in all_pack_bases:
+                indicator = _indicator_from_pack_base(base)
+                if not indicator:
+                    missing_live.append(f"pack:{base}")
                     continue
-                if (agg_base.find("_") == -1 and state_live == agg_state_needed) or (
-                    agg_base.find("_") != -1 and state_live == agg_state_needed
-                ):
-                    mw_hits += 1
-                    mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_needed})
-
-        # PACK сопоставления (подгружаем паки по каждому pack_base единожды)
-        # сгруппируем правила по pack_base
-        by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
-        for (pack_base, agg_key, agg_value) in pack_wl_set:
-            by_base_wl.setdefault(pack_base, []).append((agg_key, agg_value))
-
-        by_base_bl: Dict[str, List[Tuple[str, str]]] = {}
-        for (pack_base, agg_key, agg_value) in pack_bl_set:
-            by_base_bl.setdefault(pack_base, []).append((agg_key, agg_value))
-
-        pack_wl_hits = 0
-        pack_bl_hits = 0
-        pack_wl_matches: List[dict] = []
-        pack_bl_matches: List[dict] = []
-
-        # набор всех pack_base, которые нам нужно читать
-        all_pack_bases = sorted(set(list(by_base_wl.keys()) + list(by_base_bl.keys())))
-        # читаем по одному разу каждый pack_base
-        pack_cache: Dict[str, dict] = {}
-        missing_live: List[str] = []
-
-        for base in all_pack_bases:
-            indicator = _indicator_from_pack_base(base)
-            if not indicator:
-                missing_live.append(f"pack:{base}")
-                continue
-            obj = await _get_live_pack(symbol, tf, indicator, base)
-            if obj is None:
-                missing_live.append(f"pack:{base}")
-                continue
-            pack_cache[base] = obj
-
-        # проверяем WL
-        for base, rules in by_base_wl.items():
-            obj = pack_cache.get(base)
-            if not obj:
-                continue
-            for agg_key, agg_value_need in rules:
-                val_live = _build_pack_agg_value(agg_key, obj)
-                if val_live is None:
+                obj = await _get_live_pack(symbol, tf, indicator, base)
+                if obj is None:
+                    missing_live.append(f"pack:{base}")
                     continue
-                if val_live == agg_value_need:
-                    pack_wl_hits += 1
-                    pack_wl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
+                pack_cache[base] = obj
 
-        # проверяем BL
-        for base, rules in by_base_bl.items():
-            obj = pack_cache.get(base)
-            if not obj:
-                continue
-            for agg_key, agg_value_need in rules:
-                val_live = _build_pack_agg_value(agg_key, obj)
-                if val_live is None:
+            # проверяем WL
+            for base, rules in by_base_wl.items():
+                obj = pack_cache.get(base)
+                if not obj:
                     continue
-                if val_live == agg_value_need:
-                    pack_bl_hits += 1
-                    pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
+                for agg_key, agg_value_need in rules:
+                    val_live = _build_pack_agg_value(agg_key, obj)
+                    if val_live is None:
+                        continue
+                    if val_live == agg_value_need:
+                        pack_wl_hits += 1
+                        pack_wl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
 
-        # локальный вердикт по TF
-        tf_allow, tf_reason = _decide_per_tf(
-            decision_mode=decision_mode,
-            use_bl=use_bl,
-            mw_hits=mw_hits,
-            pack_wl_hits=pack_wl_hits,
-            pack_bl_hits=pack_bl_hits,
-            mw_wl_total=mw_wl_total,
-            pack_wl_total=pack_wl_total,
-            pack_bl_total=pack_bl_total,
-            mw_states=mw_states,
-            live_missing=missing_live,
-        )
+            # проверяем BL
+            for base, rules in by_base_bl.items():
+                obj = pack_cache.get(base)
+                if not obj:
+                    continue
+                for agg_key, agg_value_need in rules:
+                    val_live = _build_pack_agg_value(agg_key, obj)
+                    if val_live is None:
+                        continue
+                    if val_live == agg_value_need:
+                        pack_bl_hits += 1
+                        pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
 
-        # аккумулируем сводки
-        hits_by_tf_mw[tf] = mw_hits
-        hits_by_tf_pwl[tf] = pack_wl_hits
-        hits_by_tf_pbl[tf] = pack_bl_hits
+            # локальный вердикт по TF
+            tf_allow, tf_reason = _decide_per_tf(
+                decision_mode=decision_mode,
+                use_bl=use_bl,
+                mw_hits=mw_hits,
+                pack_wl_hits=pack_wl_hits,
+                pack_bl_hits=pack_bl_hits,
+                mw_wl_total=mw_wl_total,
+                pack_wl_total=pack_wl_total,
+                pack_bl_total=pack_bl_total,
+                mw_states=mw_states,
+                live_missing=missing_live,
+            )
 
-        # итог общий — AND по TF
-        if not tf_allow and final_allow:
-            final_allow = False
-            final_reason = tf_reason or final_reason
+            # аккумулируем сводки
+            hits_by_tf_mw[tf] = mw_hits
+            hits_by_tf_pwl[tf] = pack_wl_hits
+            hits_by_tf_pbl[tf] = pack_bl_hits
 
-        # готовим строку для laboratory_request_tf
-        tf_results = {
-            "mw": {
-                "wl_total": mw_wl_total,
-                "wl_hits": mw_hits,
-                "wl_matches": mw_matches,
-            },
-            "pack": {
-                "wl_total": pack_wl_total,
-                "wl_hits": pack_wl_hits,
-                "wl_matches": pack_wl_matches,
-                "bl_total": pack_bl_total,
-                "bl_hits": pack_bl_hits,
-                "bl_matches": pack_bl_matches,
-            },
-            "live": {
-                "mw_states": mw_states,
-                "missing": missing_live,
-            },
-        }
+            # итог общий — AND по TF
+            if not tf_allow and final_allow:
+                final_allow = False
+                final_reason = tf_reason or final_reason
 
-        tf_rows.append((tf, {
-            "mw_wl_rules_total": mw_wl_total,
-            "mw_wl_hits": mw_hits,
-            "pack_wl_rules_total": pack_wl_total,
-            "pack_wl_hits": pack_wl_hits,
-            "pack_bl_rules_total": pack_bl_total,
-            "pack_bl_hits": pack_bl_hits,
-            "allow": tf_allow,
-            "reason": tf_reason,
-            "tf_results": tf_results,
-            "errors": None,
-        }))
+            # готовим строку для laboratory_request_tf
+            tf_results = {
+                "mw": {
+                    "wl_total": mw_wl_total,
+                    "wl_hits": mw_hits,
+                    "wl_matches": mw_matches,
+                },
+                "pack": {
+                    "wl_total": pack_wl_total,
+                    "wl_hits": pack_wl_hits,
+                    "wl_matches": pack_wl_matches,
+                    "bl_total": pack_bl_total,
+                    "bl_hits": pack_bl_hits,
+                    "bl_matches": pack_bl_matches,
+                },
+                "live": {
+                    "mw_states": mw_states,
+                    "missing": missing_live,
+                },
+            }
 
-    # сформировать и отправить ответ СРАЗУ (до записи в БД)
-    await _respond_once(req_uid, allow=final_allow, reason=final_reason)
+            tf_rows.append((tf, {
+                "mw_wl_rules_total": mw_wl_total,
+                "mw_wl_hits": mw_hits,
+                "pack_wl_rules_total": pack_wl_total,
+                "pack_wl_hits": pack_wl_hits,
+                "pack_bl_rules_total": pack_bl_total,
+                "pack_bl_hits": pack_bl_hits,
+                "allow": tf_allow,
+                "reason": tf_reason,
+                "tf_results": tf_results,
+                "errors": None,
+            }))
+
+        # сформировать и отправить ответ СРАЗУ (до записи в БД)
+        await _respond_once(req_uid, allow=final_allow, reason=final_reason)
+
+    finally:
+        # снимаем ворота (после отправки ответа), чтобы следующий запрос мог пройти
+        await _release_gate(req_uid, gate_key)
 
     # после ответа — запись в БД (head + tf-строки)
     t_fin = _now_utc_naive()
@@ -516,11 +573,9 @@ def _decide_per_tf(
     live_missing: List[str],
 ) -> Tuple[bool, str]:
     """Возвращает (allow, reason) по одному TF."""
-    # BL вето (если включён) — сразу отказ
     if use_bl and pack_bl_hits > 0:
         return False, "bl_match"
 
-    # отсутствие live-данных не даёт «auto-deny», но если нет матчей — это хорошая причина
     missing = bool(live_missing)
 
     if decision_mode == "mw_only":
@@ -545,7 +600,6 @@ def _decide_per_tf(
             return True, "ok"
         return False, "no_mw_and_pack_match" if not missing else "missing_live_data"
 
-    # fallback
     return False, "bad_decision_mode"
 
 
@@ -570,9 +624,6 @@ async def _respond_once(req_uid: str, allow: bool, reason: str):
             )
         except Exception:
             log.exception("❌ LAB_DECISION: не удалось отправить ответ в стрим")
-    else:
-        # ответ уже был отправлен ранее — ничего не делаем
-        pass
 
 
 # 🔸 Запись в БД
