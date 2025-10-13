@@ -147,19 +147,36 @@ def update_mw_whitelist_for_strategy(version: str, strategy_id: int, slice_map: 
     if v not in lab_mw_wl:
         lab_mw_wl[v] = {}
 
+    sid = int(strategy_id)
+
     # удаляем прежние ключи с этим strategy_id
-    keys_to_del = [k for k in lab_mw_wl[v].keys() if k[0] == int(strategy_id)]
+    keys_to_del = [k for k in list(lab_mw_wl[v].keys()) if k[0] == sid]
     for k in keys_to_del:
         lab_mw_wl[v].pop(k, None)
 
     # добавляем новые срезы
     for (tf, direction), states in (slice_map or {}).items():
-        lab_mw_wl[v][(int(strategy_id), str(tf), str(direction))] = set(states or set())
+        lab_mw_wl[v][(sid, str(tf), str(direction))] = set(states or set())
 
-    # лог
-    total_slices = sum(1 for k in lab_mw_wl[v].keys() if k[0] == int(strategy_id))
-    total_states = sum(len(s) for k, s in lab_mw_wl[v].items() if k[0] == int(strategy_id))
-    log.debug("MW WL[%s]: sid=%s обновлён (срезов=%d, записей=%d)", v, strategy_id, total_slices, total_states)
+    # метрики после обновления по sid
+    total_slices = 0
+    total_entries = 0
+    per_tf_entries = {"m5": 0, "m15": 0, "h1": 0}
+    for (k_sid, tf, _dir), states in lab_mw_wl[v].items():
+        if k_sid != sid:
+            continue
+        total_slices += 1
+        cnt = len(states)
+        total_entries += cnt
+        if tf in per_tf_entries:
+            per_tf_entries[tf] += cnt
+
+    # результатирующий лог по стратегии
+    log.info(
+        "LAB: MW WL updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
+        sid, v, total_slices, total_entries,
+        per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
+    )
 
 
 def update_pack_list_for_strategy(list_tag: str, version: str, strategy_id: int, slice_map: Dict[Tuple[str, str], Set[Tuple[str, str, str]]]):
@@ -173,16 +190,33 @@ def update_pack_list_for_strategy(list_tag: str, version: str, strategy_id: int,
     if v not in target:
         target[v] = {}
 
+    sid = int(strategy_id)
+
     # удаляем прежние ключи с этим strategy_id
-    keys_to_del = [k for k in target[v].keys() if k[0] == int(strategy_id)]
+    keys_to_del = [k for k in list(target[v].keys()) if k[0] == sid]
     for k in keys_to_del:
         target[v].pop(k, None)
 
     # добавляем новые срезы
     for (tf, direction), states in (slice_map or {}).items():
-        target[v][(int(strategy_id), str(tf), str(direction))] = set(states or set())
+        target[v][(sid, str(tf), str(direction))] = set(states or set())
 
-    # лог
-    total_slices = sum(1 for k in target[v].keys() if k[0] == int(strategy_id))
-    total_states = sum(len(s) for k, s in target[v].items() if k[0] == int(strategy_id))
-    log.debug("PACK %s[%s]: sid=%s обновлён (срезов=%d, записей=%d)", lt.upper(), v, strategy_id, total_slices, total_states)
+    # метрики после обновления по sid
+    total_slices = 0
+    total_entries = 0
+    per_tf_entries = {"m5": 0, "m15": 0, "h1": 0}
+    for (k_sid, tf, _dir), states in target[v].items():
+        if k_sid != sid:
+            continue
+        total_slices += 1
+        cnt = len(states)
+        total_entries += cnt
+        if tf in per_tf_entries:
+            per_tf_entries[tf] += cnt
+
+    # результатирующий лог по стратегии
+    log.info(
+        "LAB: PACK %s updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
+        lt.upper(), sid, v, total_slices, total_entries,
+        per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
+    )
