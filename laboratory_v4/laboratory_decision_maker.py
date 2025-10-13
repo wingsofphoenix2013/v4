@@ -621,8 +621,6 @@ async def _respond_once(req_uid: str, allow: bool, reason: str):
             await infra.redis_client.xadd(
                 name=RESPONSE_STREAM,
                 fields={"data": json.dumps(payload, separators=(",", ":"))},
-                maxlen=10_000,
-                approximate=True,
             )
         except Exception:
             log.exception("❌ LAB_DECISION: не удалось отправить ответ в стрим")
