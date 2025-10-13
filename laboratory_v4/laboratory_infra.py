@@ -1,11 +1,11 @@
-# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации
+# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты для WL/BL)
 
 # 🔸 Импорты
 import os
 import logging
 import asyncpg
 import redis.asyncio as aioredis
-from typing import Dict, Set, Tuple
+from typing import Dict, Set, Tuple, Optional
 
 # 🔸 Глобальные подключения
 pg_pool = None
@@ -19,12 +19,17 @@ lab_strategies: Dict[int, dict] = {}
 
 # MW whitelist: версия -> {(sid, timeframe, direction) -> {(agg_base, agg_state), ...}}
 lab_mw_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}}
+# MW WL winrates: версия -> {(sid, tf, dir) -> {(agg_base, agg_state) -> wr}}
+lab_mw_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}}
 
 # PACK lists:
-#   whitelist: версия -> {(sid, timeframe, direction) -> {(pack_base, agg_key, agg_value), ...}}
-#   blacklist: версия -> {(sid, timeframe, direction) -> {(pack_base, agg_key, agg_value), ...}}
+#   whitelist: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
+#   blacklist: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
 lab_pack_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}}
 lab_pack_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}}
+# PACK WL/BL winrates: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value) -> wr}}
+lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}}
+lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}}
 
 # 🔸 Переменные окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -61,7 +66,7 @@ async def setup_pg():
         await conn.execute("SELECT 1")
 
     globals()["pg_pool"] = pool
-    log.debug("🛢️ Подключение к PostgreSQL установлено")
+    log.info("🛢️ Подключение к PostgreSQL установлено")
 
 
 # 🔸 Инициализация подключения к Redis
@@ -84,7 +89,7 @@ async def setup_redis_client():
     await client.ping()
 
     globals()["redis_client"] = client
-    log.debug("📡 Подключение к Redis установлено")
+    log.info("📡 Подключение к Redis установлено")
 
 
 # 🔸 Кэши: установки целиком
@@ -107,56 +112,89 @@ def set_lab_strategies(new_dict: Dict[int, dict]):
     log.debug("Кэш стратегий обновлён (%d)", len(lab_strategies))
 
 
-def replace_mw_whitelist(version: str, new_map: Dict[Tuple[int, str, str], Set[Tuple[str, str]]]):
+def replace_mw_whitelist(
+    version: str,
+    new_map: Dict[Tuple[int, str, str], Set[Tuple[str, str]]],
+    wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = None,
+):
     """
-    Полная замена WL MW для указанной версии ('v1'|'v2').
+    Полная замена WL MW для указанной версии ('v1'|'v2') + (опционально) карта winrate.
     """
     v = str(version or "").lower()
     if v not in lab_mw_wl:
         lab_mw_wl[v] = {}
+    if v not in lab_mw_wl_wr:
+        lab_mw_wl_wr[v] = {}
+
     lab_mw_wl[v] = new_map or {}
+    if wr_map is not None:
+        lab_mw_wl_wr[v] = wr_map or {}
+
     log.debug("MW WL[%s] обновлён: срезов=%d", v, len(lab_mw_wl[v]))
 
 
-def replace_pack_list(list_tag: str, version: str, new_map: Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]):
+def replace_pack_list(
+    list_tag: str,
+    version: str,
+    new_map: Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]],
+    wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = None,
+):
     """
-    Полная замена PACK WL/BL для указанной версии ('v1'|'v2') и списка ('whitelist'|'blacklist').
+    Полная замена PACK WL/BL для указанной версии ('v1'|'v2') и списка ('whitelist'|'blacklist') + (опционально) карта winrate.
     """
     v = str(version or "").lower()
     lt = str(list_tag or "").lower()
-    if lt == "whitelist":
-        if v not in lab_pack_wl:
-            lab_pack_wl[v] = {}
-        lab_pack_wl[v] = new_map or {}
-        log.debug("PACK WL[%s] обновлён: срезов=%d", v, len(lab_pack_wl[v]))
-    elif lt == "blacklist":
-        if v not in lab_pack_bl:
-            lab_pack_bl[v] = {}
-        lab_pack_bl[v] = new_map or {}
-        log.debug("PACK BL[%s] обновлён: срезов=%d", v, len(lab_pack_bl[v]))
+
+    target = lab_pack_wl if lt == "whitelist" else lab_pack_bl
+    target_wr = lab_pack_wl_wr if lt == "whitelist" else lab_pack_bl_wr
+
+    if v not in target:
+        target[v] = {}
+    if v not in target_wr:
+        target_wr[v] = {}
+
+    target[v] = new_map or {}
+    if wr_map is not None:
+        target_wr[v] = wr_map or {}
+
+    log.debug("PACK %s[%s] обновлён: срезов=%d", lt.upper(), v, len(target[v]))
 
 
 # 🔸 Кэши: точечные обновления по стратегии
 
-def update_mw_whitelist_for_strategy(version: str, strategy_id: int, slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]]):
+def update_mw_whitelist_for_strategy(
+    version: str,
+    strategy_id: int,
+    slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]],
+    wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = None,
+):
     """
     Обновить MW WL для конкретной стратегии и версии:
       slice_map: {(timeframe, direction) -> {(agg_base, agg_state), ...}}
+      wr_map: {(sid, timeframe, direction) -> {(agg_base, agg_state) -> winrate}}
     """
     v = str(version or "").lower()
     if v not in lab_mw_wl:
         lab_mw_wl[v] = {}
+    if v not in lab_mw_wl_wr:
+        lab_mw_wl_wr[v] = {}
 
     sid = int(strategy_id)
 
-    # удаляем прежние ключи с этим strategy_id
-    keys_to_del = [k for k in list(lab_mw_wl[v].keys()) if k[0] == sid]
-    for k in keys_to_del:
+    # удаляем прежние ключи по sid
+    for k in [k for k in list(lab_mw_wl[v].keys()) if k[0] == sid]:
         lab_mw_wl[v].pop(k, None)
+    for k in [k for k in list(lab_mw_wl_wr[v].keys()) if k[0] == sid]:
+        lab_mw_wl_wr[v].pop(k, None)
 
     # добавляем новые срезы
     for (tf, direction), states in (slice_map or {}).items():
         lab_mw_wl[v][(sid, str(tf), str(direction))] = set(states or set())
+
+    # добавляем winrate-карты
+    if wr_map:
+        for sid_tf_dir, m in wr_map.items():
+            lab_mw_wl_wr[v][sid_tf_dir] = dict(m or {})
 
     # метрики после обновления по sid
     total_slices = 0
@@ -171,35 +209,52 @@ def update_mw_whitelist_for_strategy(version: str, strategy_id: int, slice_map: 
         if tf in per_tf_entries:
             per_tf_entries[tf] += cnt
 
-    # результатирующий лог по стратегии
-    log.debug(
+    log.info(
         "LAB: MW WL updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
         sid, v, total_slices, total_entries,
         per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
     )
 
 
-def update_pack_list_for_strategy(list_tag: str, version: str, strategy_id: int, slice_map: Dict[Tuple[str, str], Set[Tuple[str, str, str]]]):
+def update_pack_list_for_strategy(
+    list_tag: str,
+    version: str,
+    strategy_id: int,
+    slice_map: Dict[Tuple[str, str], Set[Tuple[str, str, str]]],
+    wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = None,
+):
     """
     Обновить PACK WL/BL для конкретной стратегии и версии:
       slice_map: {(timeframe, direction) -> {(pack_base, agg_key, agg_value), ...}}
+      wr_map: {(sid, timeframe, direction) -> {(pack_base, agg_key, agg_value) -> winrate}}
     """
     lt = str(list_tag or "").lower()
     v = str(version or "").lower()
+
     target = lab_pack_wl if lt == "whitelist" else lab_pack_bl
+    target_wr = lab_pack_wl_wr if lt == "whitelist" else lab_pack_bl_wr
+
     if v not in target:
         target[v] = {}
+    if v not in target_wr:
+        target_wr[v] = {}
 
     sid = int(strategy_id)
 
-    # удаляем прежние ключи с этим strategy_id
-    keys_to_del = [k for k in list(target[v].keys()) if k[0] == sid]
-    for k in keys_to_del:
+    # удаляем прежние ключи по sid
+    for k in [k for k in list(target[v].keys()) if k[0] == sid]:
         target[v].pop(k, None)
+    for k in [k for k in list(target_wr[v].keys()) if k[0] == sid]:
+        target_wr[v].pop(k, None)
 
     # добавляем новые срезы
     for (tf, direction), states in (slice_map or {}).items():
         target[v][(sid, str(tf), str(direction))] = set(states or set())
+
+    # добавляем winrate-карты
+    if wr_map:
+        for sid_tf_dir, m in wr_map.items():
+            target_wr[v][sid_tf_dir] = dict(m or {})
 
     # метрики после обновления по sid
     total_slices = 0
@@ -214,8 +269,7 @@ def update_pack_list_for_strategy(list_tag: str, version: str, strategy_id: int,
         if tf in per_tf_entries:
             per_tf_entries[tf] += cnt
 
-    # результатирующий лог по стратегии
-    log.debug(
+    log.info(
         "LAB: PACK %s updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
         lt.upper(), sid, v, total_slices, total_entries,
         per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]

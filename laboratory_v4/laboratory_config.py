@@ -1,4 +1,4 @@
-# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/WL/BL и слушатели обновлений
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/WL/BL (+winrate) и слушатели обновлений
 
 # 🔸 Импорты
 import asyncio
@@ -42,22 +42,23 @@ async def load_initial_config():
     await _load_active_tickers()
     # стратегии
     await _load_active_strategies()
-    # MW WL (v1/v2)
+    # MW WL (v1/v2) + winrate карты
     await _load_mw_whitelists_all()
-    # PACK WL/BL (v1/v2)
+    # PACK WL/BL (v1/v2) + winrate карты
     await _load_pack_lists_all()
 
     # итог
-    log.info("✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, mw_wl[v1]=%d, mw_wl[v2]=%d, pack_wl[v1]=%d, pack_wl[v2]=%d, pack_bl[v1]=%d, pack_bl[v2]=%d",
-             len(infra.lab_tickers),
-             len(infra.lab_strategies),
-             len(infra.lab_mw_wl.get('v1', {})),
-             len(infra.lab_mw_wl.get('v2', {})),
-             len(infra.lab_pack_wl.get('v1', {})),
-             len(infra.lab_pack_wl.get('v2', {})),
-             len(infra.lab_pack_bl.get('v1', {})),
-             len(infra.lab_pack_bl.get('v2', {})),
-             )
+    log.info(
+        "✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, mw_wl[v1]=%d, mw_wl[v2]=%d, pack_wl[v1]=%d, pack_wl[v2]=%d, pack_bl[v1]=%d, pack_bl[v2]=%d",
+        len(infra.lab_tickers),
+        len(infra.lab_strategies),
+        len(infra.lab_mw_wl.get('v1', {})),
+        len(infra.lab_mw_wl.get('v2', {})),
+        len(infra.lab_pack_wl.get('v1', {})),
+        len(infra.lab_pack_wl.get('v2', {})),
+        len(infra.lab_pack_bl.get('v1', {})),
+        len(infra.lab_pack_bl.get('v2', {})),
+    )
 
 
 # 🔸 Слушатель списков (Streams): обновление кэшей WL/BL oracle по сообщениям
@@ -102,7 +103,7 @@ async def lists_stream_listener():
                     try:
                         payload = json.loads(fields.get("data", "{}"))
                         if stream_name == MW_WL_READY_STREAM:
-                            # ожидаем: {strategy_id, report_id, time_frame='7d', version='v1'|'v2', ...}
+                            # ожидаем: {strategy_id, time_frame='7d', version='v1'|'v2', ...}
                             sid = int(payload.get("strategy_id", 0))
                             version = str(payload.get("version", "")).lower()
                             if sid and version in ("v1", "v2"):
@@ -112,7 +113,7 @@ async def lists_stream_listener():
                                 log.debug("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
 
                         elif stream_name == PACK_LISTS_READY_STREAM:
-                            # ожидаем: {strategy_id, report_id, time_frame='7d', version='v1'|'v2', rows_whitelist, rows_blacklist, ...}
+                            # ожидаем: {strategy_id, time_frame='7d', version='v1'|'v2', ...}
                             sid = int(payload.get("strategy_id", 0))
                             version = str(payload.get("version", "")).lower()
                             if sid and version in ("v1", "v2"):
@@ -200,8 +201,11 @@ async def _load_active_strategies():
 
 
 async def _load_mw_whitelists_all():
-    # строим карты по версиям: (sid, timeframe, direction) -> {(agg_base, agg_state)}
+    # карты по версиям:
+    #   v_maps: (sid, tf, dir) -> {(agg_base, agg_state)}
+    #   wr_maps: (sid, tf, dir) -> {(agg_base, agg_state) -> winrate}
     v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}}
+    wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}}
 
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -211,7 +215,8 @@ async def _load_mw_whitelists_all():
                    a.timeframe,
                    a.direction,
                    a.agg_base,
-                   a.agg_state
+                   a.agg_state,
+                   a.winrate
             FROM oracle_mw_whitelist w
             JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
             WHERE a.time_frame = '7d'
@@ -221,17 +226,15 @@ async def _load_mw_whitelists_all():
     for r in rows:
         ver = str(r["version"]).lower()
         sid = int(r["strategy_id"])
-        tf = str(r["timeframe"])
-        direction = str(r["direction"])
-        base = str(r["agg_base"])
-        state = str(r["agg_state"])
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        base = str(r["agg_base"]); state = str(r["agg_state"])
+        wr = float(r["winrate"] or 0.0)
         key = (sid, tf, direction)
-        bucket = v_maps.setdefault(ver, {}).setdefault(key, set())
-        bucket.add((base, state))
+        v_maps.setdefault(ver, {}).setdefault(key, set()).add((base, state))
+        wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, state)] = wr
 
-    # применяем замены кэшей
     for ver in ("v1", "v2"):
-        replace_mw_whitelist(ver, v_maps.get(ver, {}))
+        replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
     log.info("✅ LAB: MW WL загружены: v1=%d срезов, v2=%d срезов",
              len(infra.lab_mw_wl.get("v1", {})),
@@ -239,9 +242,13 @@ async def _load_mw_whitelists_all():
 
 
 async def _load_pack_lists_all():
-    # строим карты по версиям и типу списка
+    # карты по версиям и типу списка:
+    #   wl_maps/bl_maps: (sid, tf, dir) -> {(pack_base, agg_key, agg_value)}
+    #   wl_wr_maps/bl_wr_maps: (sid, tf, dir) -> {(pack_base, agg_key, agg_value) -> winrate}
     wl_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}}
     bl_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}}
+    wl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}}
+    bl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}}
 
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -253,7 +260,8 @@ async def _load_pack_lists_all():
                    a.direction,
                    a.pack_base,
                    a.agg_key,
-                   a.agg_value
+                   a.agg_value,
+                   a.winrate
             FROM oracle_pack_whitelist w
             JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
             WHERE a.time_frame = '7d'
@@ -262,22 +270,22 @@ async def _load_pack_lists_all():
 
     for r in rows:
         ver = str(r["version"]).lower()
-        list_tag = str(r["list"]).lower()  # 'whitelist'|'blacklist'
+        list_tag = str(r["list"]).lower()  # whitelist|blacklist
         sid = int(r["strategy_id"])
-        tf = str(r["timeframe"])
-        direction = str(r["direction"])
-        pack_base = str(r["pack_base"])
-        agg_key = str(r["agg_key"])
-        agg_value = str(r["agg_value"])
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        base = str(r["pack_base"]); akey = str(r["agg_key"]); aval = str(r["agg_value"])
+        wr = float(r["winrate"] or 0.0)
         key = (sid, tf, direction)
-        target = wl_maps if list_tag == "whitelist" else bl_maps
-        bucket = target.setdefault(ver, {}).setdefault(key, set())
-        bucket.add((pack_base, agg_key, agg_value))
+        if list_tag == "whitelist":
+            wl_maps.setdefault(ver, {}).setdefault(key, set()).add((base, akey, aval))
+            wl_wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, akey, aval)] = wr
+        else:
+            bl_maps.setdefault(ver, {}).setdefault(key, set()).add((base, akey, aval))
+            bl_wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, akey, aval)] = wr
 
-    # применяем замены кэшей
     for ver in ("v1", "v2"):
-        replace_pack_list("whitelist", ver, wl_maps.get(ver, {}))
-        replace_pack_list("blacklist", ver, bl_maps.get(ver, {}))
+        replace_pack_list("whitelist", ver, wl_maps.get(ver, {}), wr_map=wl_wr_maps.get(ver, {}))
+        replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
     log.info("✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, bl[v1]=%d, bl[v2]=%d",
              len(infra.lab_pack_wl.get("v1", {})),
@@ -290,31 +298,41 @@ async def _load_pack_lists_all():
 
 async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
     slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+    wr_map: Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]] = {}
+
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT a.timeframe, a.direction, a.agg_base, a.agg_state
+            SELECT a.timeframe, a.direction, a.agg_base, a.agg_state, a.winrate
             FROM oracle_mw_whitelist w
             JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
             WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2
             """,
             int(strategy_id), str(version)
         )
-    for r in rows:
-        key = (str(r["timeframe"]), str(r["direction"]))
-        slice_map.setdefault(key, set()).add((str(r["agg_base"]), str(r["agg_state"])))
 
-    update_mw_whitelist_for_strategy(version, strategy_id, slice_map)
+    for r in rows:
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        base = str(r["agg_base"]); state = str(r["agg_state"])
+        wr = float(r["winrate"] or 0.0)
+
+        key = (tf, direction)
+        slice_map.setdefault(key, set()).add((base, state))
+        wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
+
+    update_mw_whitelist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
 
 
 async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
     wl_slice: Dict[Tuple[str, str], Set[Tuple[str, str, str]]] = {}
     bl_slice: Dict[Tuple[str, str], Set[Tuple[str, str, str]]] = {}
+    wl_wr: Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]] = {}
+    bl_wr: Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]] = {}
 
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT w.list, a.timeframe, a.direction, a.pack_base, a.agg_key, a.agg_value
+            SELECT w.list, a.timeframe, a.direction, a.pack_base, a.agg_key, a.agg_value, a.winrate
             FROM oracle_pack_whitelist w
             JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
             WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2
@@ -323,12 +341,21 @@ async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
         )
 
     for r in rows:
-        key = (str(r["timeframe"]), str(r["direction"]))
-        tpl = (str(r["pack_base"]), str(r["agg_key"]), str(r["agg_value"]))
-        if str(r["list"]).lower() == "whitelist":
+        lst = str(r["list"]).lower()
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        base = str(r["pack_base"]); akey = str(r["agg_key"]); aval = str(r["agg_value"])
+        wr = float(r["winrate"] or 0.0)
+
+        key = (tf, direction)
+        fullkey = (int(strategy_id), tf, direction)
+        tpl = (base, akey, aval)
+
+        if lst == "whitelist":
             wl_slice.setdefault(key, set()).add(tpl)
+            wl_wr.setdefault(fullkey, {})[tpl] = wr
         else:
             bl_slice.setdefault(key, set()).add(tpl)
+            bl_wr.setdefault(fullkey, {})[tpl] = wr
 
-    update_pack_list_for_strategy("whitelist", version, strategy_id, wl_slice)
-    update_pack_list_for_strategy("blacklist", version, strategy_id, bl_slice)
+    update_pack_list_for_strategy("whitelist", version, strategy_id, wl_slice, wr_map=wl_wr)
+    update_pack_list_for_strategy("blacklist", version, strategy_id, bl_slice, wr_map=bl_wr)

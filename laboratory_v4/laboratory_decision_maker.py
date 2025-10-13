@@ -1,4 +1,4 @@
-# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов (до 16), внутри запроса — последовательная проверка TF (младший→старший)
+# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов (до 16), внутри запроса — последовательная проверка TF (младший→старший) + сохранение winrate в матчах
 
 # 🔸 Импорты
 import asyncio
@@ -386,10 +386,14 @@ async def _handle_request(payload: dict):
 
     try:
         for tf in tfs:
-            # извлечь кэши WL/BL для ключа (sid, tf, direction, version)
-            mw_wl_set = infra.lab_mw_wl.get(version, {}).get((strategy_id, tf, direction), set())
-            pack_wl_set = infra.lab_pack_wl.get(version, {}).get((strategy_id, tf, direction), set())
-            pack_bl_set = infra.lab_pack_bl.get(version, {}).get((strategy_id, tf, direction), set())
+            # извлечь кэши WL/BL и соответствующие winrate-карты для ключа (sid, tf, direction, version)
+            cache_key = (strategy_id, tf, direction)
+            mw_wl_set = infra.lab_mw_wl.get(version, {}).get(cache_key, set())
+            pack_wl_set = infra.lab_pack_wl.get(version, {}).get(cache_key, set())
+            pack_bl_set = infra.lab_pack_bl.get(version, {}).get(cache_key, set())
+            mw_wr_map = infra.lab_mw_wl_wr.get(version, {}).get(cache_key, {})                 # {(agg_base, agg_state)->wr}
+            pwl_wr_map = infra.lab_pack_wl_wr.get(version, {}).get(cache_key, {})              # {(base, agg_key, agg_value)->wr}
+            pbl_wr_map = infra.lab_pack_bl_wr.get(version, {}).get(cache_key, {})              # {(base, agg_key, agg_value)->wr}
 
             mw_wl_total = len(mw_wl_set)
             pack_wl_total = len(pack_wl_set)
@@ -408,7 +412,8 @@ async def _handle_request(payload: dict):
                         continue
                     if state_live == agg_state_need:
                         mw_hits += 1
-                        mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_need})
+                        wr = float(mw_wr_map.get((agg_base, agg_state_need), 0.0))
+                        mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_need, "wr": wr})
 
             # PACK сопоставления: читаем паки один раз на base
             by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
@@ -449,7 +454,8 @@ async def _handle_request(payload: dict):
                         continue
                     if val_live == agg_value_need:
                         pack_wl_hits += 1
-                        pack_wl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
+                        wr = float(pwl_wr_map.get((base, agg_key, agg_value_need), 0.0))
+                        pack_wl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
 
             # проверяем BL
             for base, rules in by_base_bl.items():
@@ -462,7 +468,8 @@ async def _handle_request(payload: dict):
                         continue
                     if val_live == agg_value_need:
                         pack_bl_hits += 1
-                        pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
+                        wr = float(pbl_wr_map.get((base, agg_key, agg_value_need), 0.0))
+                        pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
 
             # локальный вердикт по TF
             tf_allow, tf_reason, path_used = _decide_per_tf(
