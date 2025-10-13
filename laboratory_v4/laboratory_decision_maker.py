@@ -284,7 +284,8 @@ async def _release_gate(req_uid: str, gate_key: Optional[str]):
     if not gate_key:
         return
     try:
-        await infra.redis_client.eval(_RELEASE_LUA, numkeys=1, keys=[gate_key], args=[req_uid])
+        # redis-py: eval(script, numkeys, *keys_and_args)
+        await infra.redis_client.eval(_RELEASE_LUA, 1, gate_key, req_uid)
     except Exception:
         log.exception("⚠️ LAB_DECISION: release_gate error (key=%s)", gate_key)
 
