@@ -1,4 +1,4 @@
-# 🔸 laboratory_bl_analyzer.py — анализатор BL-порогов: расчёт лучшего T по ROI и поддержка in-memory кэша активных порогов
+# 🔸 laboratory_bl_analyzer.py — анализатор BL-порогов: фиксированный клиент на (master,version,mode), расчёт лучшего T по ROI, активный кэш
 
 # 🔸 Импорты
 import asyncio
@@ -14,7 +14,7 @@ log = logging.getLogger("LAB_BL_ANALYZER")
 
 # 🔸 Параметры воркера
 INITIAL_DELAY_SEC = 60                  # задержка перед первым запуском
-MAX_CONCURRENCY_CLIENTS = 8            # параллельная обработка клиентских стратегий
+MAX_CONCURRENCY_CLIENTS = 8            # параллельная обработка клиентов (мап-кейсов)
 READ_COUNT = 128
 READ_BLOCK_MS = 30_000
 
@@ -23,7 +23,7 @@ PACK_LISTS_READY_STREAM = "oracle:pack_lists:reports_ready"
 BL_CONSUMER_GROUP = "LAB_BL_ANALYZER_GROUP"
 BL_CONSUMER_NAME = "LAB_BL_ANALYZER_WORKER"
 
-# 🔸 Константы домена
+# 🔸 Доменные константы
 ALLOWED_TFS = ("m5", "m15", "h1")
 DECISION_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 DIRECTIONS = ("long", "short")
@@ -45,8 +45,12 @@ async def run_laboratory_bl_analyzer():
     # загрузка активных порогов из БД в память
     await _load_active_from_db()
 
-    # полный пересчёт по всем релевантным клиентам
-    await _recompute_all_clients()
+    # построить карту соответствий (master,version,mode) -> (client, direction, tfs, deposit)
+    mapping = await _build_master_mode_map()
+    log.info("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
+
+    # полный пересчёт по всем ключам карты
+    await _recompute_mapping(mapping)
 
     # подписка на стрим oracle:pack_lists:reports_ready
     try:
@@ -87,7 +91,9 @@ async def run_laboratory_bl_analyzer():
                         master_sid = int(payload.get("strategy_id", 0))
                         version = str(payload.get("version", "")).lower()
                         if master_sid > 0 and version in VERSIONS:
-                            await _recompute_by_master_and_version(master_sid, version)
+                            # обновляем карту (вдруг появились новые клиенты) и пересчитываем таргет
+                            mapping = await _build_master_mode_map()
+                            await _recompute_by_master_and_version(mapping, master_sid, version)
                         else:
                             log.debug("ℹ️ LAB_BL_ANALYZER: пропуск payload=%s", payload)
                         acks.append(msg_id)
@@ -135,136 +141,170 @@ async def _load_active_from_db():
     infra.set_bl_active_bulk(m)
 
 
-# 🔸 Полный пересчёт по всем клиентским стратегиям
-async def _recompute_all_clients():
+# 🔸 Построение карты: (master_sid, version, mode) -> (client_sid, direction, tfs, deposit)
+async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str, str, float]]:
+    """
+    Используем лабораторные запросы как источник истины о конфигурации клиента.
+    Берём последние записи (по finished_at) для каждой пары (master, version, mode), у которых client_strategy_id есть и клиент — BL watcher.
+    """
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id AS client_sid, COALESCE(market_mirrow,0) AS master_sid, COALESCE(deposit,0) AS deposit
-            FROM strategies_v4
-            WHERE enabled = true AND (archived IS NOT TRUE)
-              AND market_watcher = false
-              AND blacklist_watcher = true
+            WITH latest AS (
+              SELECT
+                h.strategy_id          AS master_sid,
+                h.oracle_version       AS version,
+                h.decision_mode        AS mode,
+                h.client_strategy_id   AS client_sid,
+                h.direction            AS direction,
+                h.timeframes_requested AS tfs,
+                h.finished_at
+              FROM laboratory_request_head h
+              JOIN strategies_v4 c ON c.id = h.client_strategy_id
+              WHERE h.client_strategy_id IS NOT NULL
+                AND c.market_watcher = false
+                AND c.blacklist_watcher = true
+            ),
+            picked AS (
+              SELECT DISTINCT ON (master_sid, version, mode)
+                     master_sid, version, mode, client_sid, direction, tfs, finished_at
+              FROM latest
+              ORDER BY master_sid, version, mode, finished_at DESC
+            )
+            SELECT p.master_sid, p.version, p.mode, p.client_sid, p.direction, p.tfs,
+                   COALESCE(c.deposit,0) AS deposit
+            FROM picked p
+            JOIN strategies_v4 c ON c.id = p.client_sid
             """
         )
-    if not rows:
-        log.info("ℹ️ LAB_BL_ANALYZER: подходящих клиентских стратегий не найдено")
+    mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]] = {}
+    for r in rows:
+        key = (int(r["master_sid"]), str(r["version"]), str(r["mode"]))
+        mapping[key] = (
+            int(r["client_sid"]),
+            str(r["direction"]),
+            str(r["tfs"] or "m5,m15,h1"),
+            float(r["deposit"] or 0.0),
+        )
+    return mapping
+
+
+# 🔸 Полный пересчёт по всей карте
+async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]]):
+    if not mapping:
+        log.info("ℹ️ LAB_BL_ANALYZER: карта пустая — нечего пересчитывать")
         return
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY_CLIENTS)
-    tasks = [asyncio.create_task(_recompute_for_client_guard(sem, int(r["client_sid"]), int(r["master_sid"]), float(r["deposit"] or 0.0)))
-             for r in rows]
-    await asyncio.gather(*tasks)
-    log.info("✅ LAB_BL_ANALYZER: полный пересчёт завершён (strategies=%d)", len(rows))
+
+    async def _one(key, val):
+        master_sid, version, mode = key
+        client_sid, direction, tfs, deposit = val
+        await _recompute_for_tuple(master_sid, version, mode, client_sid, direction, tfs, deposit)
+
+    await asyncio.gather(*[asyncio.create_task(_one(k, v)) for k, v in mapping.items()])
+    log.info("✅ LAB_BL_ANALYZER: полный пересчёт завершён (combos=%d)", len(mapping))
 
 
-# 🔸 Таргетный пересчёт (по событию PACK LISTS READY) — только указанный мастер и версия
-async def _recompute_by_master_and_version(master_sid: int, version: str):
-    async with infra.pg_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id AS client_sid, COALESCE(deposit,0) AS deposit
-            FROM strategies_v4
-            WHERE enabled = true AND (archived IS NOT TRUE)
-              AND market_watcher = false
-              AND blacklist_watcher = true
-              AND market_mirrow = $1
-            """,
-            int(master_sid)
-        )
-    if not rows:
-        log.debug("ℹ️ LAB_BL_ANALYZER: нет клиентов для master=%s", master_sid)
+# 🔸 Таргетный пересчёт: только (master, version)
+async def _recompute_by_master_and_version(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]],
+                                           master_sid: int, version: str):
+    candidates = [(k, v) for k, v in mapping.items() if k[0] == int(master_sid) and k[1] == version]
+    if not candidates:
+        log.debug("ℹ️ LAB_BL_ANALYZER: нет соответствий для master=%s version=%s", master_sid, version)
         return
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY_CLIENTS)
-    tasks = [asyncio.create_task(_recompute_for_client_guard(sem, int(r["client_sid"]), int(master_sid), float(r["deposit"] or 0.0), version_only=version))
-             for r in rows]
-    await asyncio.gather(*tasks)
-    log.info("🔁 LAB_BL_ANALYZER: мастер=%s версия=%s пересчитаны (clients=%d)", master_sid, version, len(rows))
+
+    async def _one(item):
+        (m_sid, ver, mode), (client_sid, direction, tfs, deposit) = item
+        await _recompute_for_tuple(m_sid, ver, mode, client_sid, direction, tfs, deposit)
+
+    await asyncio.gather(*[asyncio.create_task(_one(item)) for item in candidates])
+    log.info("🔁 LAB_BL_ANALYZER: таргетный пересчёт master=%s version=%s завершён (combos=%d)", master_sid, version, len(candidates))
 
 
-# 🔸 Гард клиента
-async def _recompute_for_client_guard(sem: asyncio.Semaphore, client_sid: int, master_sid: int, deposit: float, version_only: Optional[str] = None):
-    async with sem:
-        try:
-            await _recompute_for_client(client_sid, master_sid, deposit, version_only=version_only)
-        except Exception:
-            log.exception("❌ LAB_BL_ANALYZER: сбой пересчёта client_sid=%s master_sid=%s", client_sid, master_sid)
-
-
-# 🔸 Пересчёт для одной клиентской стратегии (внутри — последовательно по версиям/режимам/направлениям/TF)
-async def _recompute_for_client(client_sid: int, master_sid: int, deposit: float, version_only: Optional[str] = None):
-    # страхуемся от некорректного депозита
+# 🔸 Пересчёт одной комбинации (внутри — последовательно по TF; если выборка пуста — ничего не пишем и чистим актив)
+async def _recompute_for_tuple(master_sid: int, version: str, mode: str,
+                               client_sid: int, direction: str, tfs_requested: str, deposit: float):
+    # страховка от деления на 0
     dep = float(deposit or 0.0)
-    if dep <= 0:
-        dep = 1.0  # защита от деления на ноль
+    if dep <= 0.0:
+        dep = 1.0
         log.warning("⚠️ LAB_BL_ANALYZER: deposit<=0, используем 1.0 (client_sid=%s)", client_sid)
 
+    # окно 7 суток
     now = datetime.utcnow().replace(tzinfo=None)
     win_end = now
     win_start = now - timedelta(days=7)
 
-    versions = (version_only,) if version_only in VERSIONS else VERSIONS
+    tfs = _parse_tfs(tfs_requested)
 
-    for version in versions:
-        for mode in DECISION_MODES:
-            for direction in DIRECTIONS:
-                for tf in ALLOWED_TFS:
-                    # вытягиваем сделки из лабораторной статистики
-                    rows = await _load_positions_slice(client_sid, version, mode, direction, tf, win_start, win_end)
-                    positions_total = len(rows)
-                    pnl_sum_base = sum(r[1] for r in rows) if rows else 0.0
-                    roi_base = (pnl_sum_base / dep) if dep > 0 else 0.0
+    for tf in tfs:
+        # срез сделок
+        rows = await _load_positions_slice(client_sid, version, mode, direction, tf, win_start, win_end)
+        positions_total = len(rows)
 
-                    # строим множество BL-хитов
-                    bl_counts = sorted({int(r[0] or 0) for r in rows}) if rows else [0]
-                    if 0 not in bl_counts:
-                        bl_counts = [0] + bl_counts
+        if positions_total == 0:
+            # ничего не пишем в историю/актив — чистим актив и кэш
+            await _delete_active_if_exists(master_sid, version, mode, direction, tf)
+            log.debug("🧹 LAB_BL_ANALYZER: пустой срез — актив удалён (master=%s ver=%s mode=%s %s tf=%s)",
+                      master_sid, version, mode, direction, tf)
+            continue
 
-                    # кривая ROI по порогам
-                    roi_by_threshold: Dict[int, Dict[str, float | int]] = {}
-                    best_T = 0
-                    best_roi = roi_base
-                    best_n = positions_total
-                    best_pnl = pnl_sum_base
+        # базовый ROI
+        pnl_sum_base = sum(r[1] for r in rows) if rows else 0.0
+        roi_base = (pnl_sum_base / dep) if dep > 0 else 0.0
 
-                    for T in bl_counts:
-                        if T == 0:
-                            passed = rows  # без фильтра
-                        else:
-                            passed = [r for r in rows if int(r[0] or 0) < T]
-                        n_passed = len(passed)
-                        pnl_sum = sum(r[1] for r in passed) if n_passed else 0.0
-                        roi_T = (pnl_sum / dep) if (dep > 0 and n_passed > 0) else 0.0
+        # пороги (включая 0)
+        bl_counts = sorted({int(r[0] or 0) for r in rows})
+        if 0 not in bl_counts:
+            bl_counts = [0] + bl_counts
 
-                        roi_by_threshold[T] = {"n": n_passed, "pnl": float(pnl_sum), "roi": float(roi_T)}
+        roi_by_threshold: Dict[int, Dict[str, float | int]] = {}
+        best_T = 0
+        best_roi = roi_base
+        best_n = positions_total
+        best_pnl = pnl_sum_base
 
-                        # выбор лучшего: максимальный ROI, при равенстве — минимальный T
-                        if (roi_T > best_roi) or (roi_T == best_roi and T < best_T):
-                            best_T = T
-                            best_roi = roi_T
-                            best_n = n_passed
-                            best_pnl = pnl_sum
+        for T in bl_counts:
+            if T == 0:
+                passed = rows
+            else:
+                # фильтр: допускаем сделки с BL-хитами < T
+                passed = [r for r in rows if int(r[0] or 0) < T]
+            n_passed = len(passed)
+            pnl_sum = sum(r[1] for r in passed) if n_passed else 0.0
+            roi_T = (pnl_sum / dep) if (dep > 0 and n_passed > 0) else 0.0
 
-                    # записываем историю и актив, обновляем кэш
-                    await _persist_analysis_and_active(
-                        master_sid=master_sid,
-                        client_sid=client_sid,
-                        version=version,
-                        mode=mode,
-                        direction=direction,
-                        tf=tf,
-                        window=(win_start, win_end),
-                        deposit_used=dep,
-                        positions_total=positions_total,
-                        pnl_sum_base=pnl_sum_base,
-                        roi_base=roi_base,
-                        roi_curve=roi_by_threshold,
-                        best_threshold=best_T,
-                        best_positions=best_n,
-                        best_pnl_sum=best_pnl,
-                        best_roi=best_roi,
-                    )
+            roi_by_threshold[T] = {"n": n_passed, "pnl": float(pnl_sum), "roi": float(roi_T)}
+
+            # лучший ROI; tie-break: минимальный T
+            if (roi_T > best_roi) or (roi_T == best_roi and T < best_T):
+                best_T = T
+                best_roi = roi_T
+                best_n = n_passed
+                best_pnl = pnl_sum
+
+        # запись: только при наличии выборки
+        await _persist_analysis_and_active(
+            master_sid=master_sid,
+            client_sid=client_sid,
+            version=version,
+            mode=mode,
+            direction=direction,
+            tf=tf,
+            window=(win_start, win_end),
+            deposit_used=dep,
+            positions_total=positions_total,
+            pnl_sum_base=pnl_sum_base,
+            roi_base=roi_base,
+            roi_curve=roi_by_threshold,
+            best_threshold=best_T,
+            best_positions=best_n,
+            best_pnl_sum=best_pnl,
+            best_roi=best_roi,
+        )
 
 
 # 🔸 Загрузка среза сделок из laboratory_positions_stat
@@ -285,11 +325,11 @@ async def _load_positions_slice(client_sid: int, version: str, mode: str, direct
             int(client_sid), str(version), str(mode), str(direction), str(tf),
             win_start, win_end
         )
-    # вернём список (blc, pnl) как числа
     return [(int(r["blc"] or 0), float(r["pnl"] or 0.0)) for r in rows]
 
 
-# 🔸 Запись истории и активного среза + обновление in-memory кэша
+# 🔸 Вспомогательные — запись истории и актива
+
 async def _persist_analysis_and_active(
     *,
     master_sid: int,
@@ -312,7 +352,7 @@ async def _persist_analysis_and_active(
     win_start, win_end = window
     computed_at = datetime.utcnow().replace(tzinfo=None)
 
-    # история
+    # история — пишем ТОЛЬКО если есть сделки в срезе
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
@@ -326,7 +366,7 @@ async def _persist_analysis_and_active(
                   $1,$2,$3,$4,$5,$6,
                   $7,$8,
                   $9,$10,$11,$12,$13,
-                  $14::jsonb, $15,$16,$17,$18,$19
+                  $14::jsonb,$15,$16,$17,$18,$19
                 )
                 """,
                 int(master_sid), int(client_sid), version, mode, direction, tf,
@@ -337,7 +377,7 @@ async def _persist_analysis_and_active(
                 computed_at,
             )
 
-            # активный срез (UPSERT)
+            # активный срез (UPSERT без условий — т.к. для каждой комбинации единственный клиент)
             await conn.execute(
                 """
                 INSERT INTO laboratory_bl_active (
@@ -382,8 +422,39 @@ async def _persist_analysis_and_active(
         computed_at=computed_at.isoformat(),
     )
 
-    # лог
     log.debug(
         "LAB_BL_ANALYZER: master=%s ver=%s mode=%s %s tf=%s -> T*=%d ROI=%.6f (base=%.6f, n=%d)",
         master_sid, version, mode, direction, tf, best_threshold, best_roi, roi_base, positions_total
     )
+
+
+async def _delete_active_if_exists(master_sid: int, version: str, mode: str, direction: str, tf: str):
+    async with infra.pg_pool.acquire() as conn:
+        await conn.execute(
+            """
+            DELETE FROM laboratory_bl_active
+            WHERE master_strategy_id = $1
+              AND oracle_version = $2
+              AND decision_mode = $3
+              AND direction = $4
+              AND tf = $5
+            """,
+            int(master_sid), str(version), str(mode), str(direction), str(tf)
+        )
+    # чистим in-memory кэш
+    key = (int(master_sid), str(version), str(mode), str(direction), str(tf))
+    infra.lab_bl_active.pop(key, None)
+
+
+# 🔸 Утилиты
+
+def _parse_tfs(tfs: str) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for tf in (tfs or "").split(","):
+        tf = tf.strip().lower()
+        if tf in ALLOWED_TFS and tf not in seen:
+            out.append(tf)
+            seen.add(tf)
+    # если вдруг пусто — дефолт к m5
+    return out or ["m5"]
