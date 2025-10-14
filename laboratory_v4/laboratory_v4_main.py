@@ -21,6 +21,8 @@ from laboratory_decision_maker import run_laboratory_decision_maker
 from laboratory_postproc import run_laboratory_postproc
 # 🔸 импорт воркера BL-анализатора
 from laboratory_bl_analyzer import run_laboratory_bl_analyzer
+# 🔸 импорт воркера WL-анализатора
+from laboratory_wl_analyzer import run_laboratory_wl_analyzer
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_MAIN")
@@ -32,6 +34,7 @@ INITIAL_DELAY_CONFIG = 0
 INITIAL_DELAY_DECISION = 0
 INITIAL_DELAY_POSTPROC = 0
 INITIAL_DELAY_BL = 60
+INITIAL_DELAY_WL = 60
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
 
@@ -117,6 +120,11 @@ async def main():
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_bl_analyzer, INITIAL_DELAY_BL),
             "LAB_BL_ANALYZER",
+        ),
+        # WL-анализатор (MW и PACK winrate)
+        run_safe_loop(
+            lambda: _start_with_delay(run_laboratory_wl_analyzer, INITIAL_DELAY_WL),
+            "LAB_WL_ANALYZER",
         ),
     )
 
