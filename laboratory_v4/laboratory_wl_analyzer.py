@@ -50,7 +50,7 @@ async def run_laboratory_wl_analyzer():
 
     # стартовая задержка
     if INITIAL_DELAY_SEC > 0:
-        log.info("⏳ LAB_WL_ANALYZER: ожидание %d сек перед стартом", INITIAL_DELAY_SEC)
+        log.debug("⏳ LAB_WL_ANALYZER: ожидание %d сек перед стартом", INITIAL_DELAY_SEC)
         await asyncio.sleep(INITIAL_DELAY_SEC)
 
     # загрузка активных WL-порогов из БД в память
@@ -58,7 +58,7 @@ async def run_laboratory_wl_analyzer():
 
     # построить карту соответствий (master, version, mode) -> (client, direction, tfs, deposit)
     mapping = await _build_master_mode_map()
-    log.info("🔎 LAB_WL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
+    log.debug("🔎 LAB_WL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
 
     # полный пересчёт по всей карте для обоих источников (MW и PACK)
     await _recompute_mapping(mapping)
@@ -77,7 +77,7 @@ async def run_laboratory_wl_analyzer():
                 log.exception("❌ LAB_WL_ANALYZER: ошибка создания consumer group для %s", s)
                 return
 
-    log.info("🚀 LAB_WL_ANALYZER: слушаю %s и %s", MW_WL_READY_STREAM, PACK_LISTS_READY_STREAM)
+    log.debug("🚀 LAB_WL_ANALYZER: слушаю %s и %s", MW_WL_READY_STREAM, PACK_LISTS_READY_STREAM)
 
     # основной цикл (реакция на таргетные обновления WL)
     while True:
@@ -234,7 +234,7 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
 # полный пересчёт по всей карте для обоих источников
 async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]]):
     if not mapping:
-        log.info("ℹ️ LAB_WL_ANALYZER: карта пустая — нечего пересчитывать")
+        log.debug("ℹ️ LAB_WL_ANALYZER: карта пустая — нечего пересчитывать")
         return
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -246,7 +246,7 @@ async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str,
             await _recompute_for_tuple(master_sid, version, mode, client_sid, direction, tfs, deposit, src)
 
     await asyncio.gather(*[asyncio.create_task(_one(k, v)) for k, v in mapping.items()])
-    log.info("✅ LAB_WL_ANALYZER: полный пересчёт завершён (combos=%d × sources=2)", len(mapping))
+    log.debug("✅ LAB_WL_ANALYZER: полный пересчёт завершён (combos=%d × sources=2)", len(mapping))
 
 
 # таргетный пересчёт: только (master, version) и только нужный source ('mw'|'pack')
@@ -264,7 +264,7 @@ async def _recompute_by_master_version_source(mapping: Dict[Tuple[int, str, str]
         await _recompute_for_tuple(m_sid, ver, mode, client_sid, direction, tfs, deposit, source)
 
     await asyncio.gather(*[asyncio.create_task(_one(item)) for item in candidates])
-    log.info("🔁 LAB_WL_ANALYZER: таргетный пересчёт master=%s version=%s source=%s завершён (combos=%d)",
+    log.debug("🔁 LAB_WL_ANALYZER: таргетный пересчёт master=%s version=%s source=%s завершён (combos=%d)",
              master_sid, version, source, len(candidates))
 
 

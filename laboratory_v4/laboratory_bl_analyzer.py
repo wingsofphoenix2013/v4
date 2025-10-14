@@ -39,7 +39,7 @@ async def run_laboratory_bl_analyzer():
 
     # стартовая задержка
     if INITIAL_DELAY_SEC > 0:
-        log.info("⏳ LAB_BL_ANALYZER: ожидание %d сек перед стартом", INITIAL_DELAY_SEC)
+        log.debug("⏳ LAB_BL_ANALYZER: ожидание %d сек перед стартом", INITIAL_DELAY_SEC)
         await asyncio.sleep(INITIAL_DELAY_SEC)
 
     # загрузка активных порогов из БД в память
@@ -47,7 +47,7 @@ async def run_laboratory_bl_analyzer():
 
     # построить карту соответствий (master,version,mode) -> (client, direction, tfs, deposit)
     mapping = await _build_master_mode_map()
-    log.info("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
+    log.debug("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
 
     # полный пересчёт по всем ключам карты
     await _recompute_mapping(mapping)
@@ -68,7 +68,7 @@ async def run_laboratory_bl_analyzer():
             log.exception("❌ LAB_BL_ANALYZER: ошибка создания consumer group")
             return
 
-    log.info("🚀 LAB_BL_ANALYZER: слушаю %s", PACK_LISTS_READY_STREAM)
+    log.debug("🚀 LAB_BL_ANALYZER: слушаю %s", PACK_LISTS_READY_STREAM)
 
     # основной цикл (реакция на таргетные обновления)
     while True:
@@ -254,13 +254,13 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
     if missing:
         log.debug("ℹ️ LAB_BL_ANALYZER: нет данных для %d комбинаций (они будут пропущены): %s",
                   len(missing), ", ".join(f"{ms}/{v}/{m}" for ms,v,m in missing))
-    log.info("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
+    log.debug("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
     return mapping
 
 # 🔸 Полный пересчёт по всей карте
 async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]]):
     if not mapping:
-        log.info("ℹ️ LAB_BL_ANALYZER: карта пустая — нечего пересчитывать")
+        log.debug("ℹ️ LAB_BL_ANALYZER: карта пустая — нечего пересчитывать")
         return
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY_CLIENTS)
@@ -271,7 +271,7 @@ async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str,
         await _recompute_for_tuple(master_sid, version, mode, client_sid, direction, tfs, deposit)
 
     await asyncio.gather(*[asyncio.create_task(_one(k, v)) for k, v in mapping.items()])
-    log.info("✅ LAB_BL_ANALYZER: полный пересчёт завершён (combos=%d)", len(mapping))
+    log.debug("✅ LAB_BL_ANALYZER: полный пересчёт завершён (combos=%d)", len(mapping))
 
 
 # 🔸 Таргетный пересчёт: только (master, version)
@@ -289,7 +289,7 @@ async def _recompute_by_master_and_version(mapping: Dict[Tuple[int, str, str], T
         await _recompute_for_tuple(m_sid, ver, mode, client_sid, direction, tfs, deposit)
 
     await asyncio.gather(*[asyncio.create_task(_one(item)) for item in candidates])
-    log.info("🔁 LAB_BL_ANALYZER: таргетный пересчёт master=%s version=%s завершён (combos=%d)", master_sid, version, len(candidates))
+    log.debug("🔁 LAB_BL_ANALYZER: таргетный пересчёт master=%s version=%s завершён (combos=%d)", master_sid, version, len(candidates))
 
 # 🔸 Пересчёт одной комбинации (внутри — последовательно по TF; если выборка пуста — ничего не пишем и чистим актив)
 async def _recompute_for_tuple(master_sid: int, version: str, mode: str,

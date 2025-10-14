@@ -78,7 +78,7 @@ async def setup_pg():
         await conn.execute("SELECT 1")
 
     globals()["pg_pool"] = pool
-    log.info("🛢️ Подключение к PostgreSQL установлено")
+    log.debug("🛢️ Подключение к PostgreSQL установлено")
 
 
 # 🔸 Инициализация подключения к Redis
@@ -101,7 +101,7 @@ async def setup_redis_client():
     await client.ping()
 
     globals()["redis_client"] = client
-    log.info("📡 Подключение к Redis установлено")
+    log.debug("📡 Подключение к Redis установлено")
 
 
 # 🔸 Кэши: установки целиком
@@ -297,7 +297,7 @@ def set_bl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str], Dict[str, A
     """
     global lab_bl_active
     lab_bl_active = new_map or {}
-    log.info("LAB: BL active cache replaced (records=%d)", len(lab_bl_active))
+    log.debug("LAB: BL active cache replaced (records=%d)", len(lab_bl_active))
 
 
 def upsert_bl_active(
@@ -357,7 +357,7 @@ def set_wl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str, str], Dict[s
     """
     global lab_wl_active
     lab_wl_active = new_map or {}
-    log.info("LAB: WL active cache replaced (records=%d)", len(lab_wl_active))
+    log.debug("LAB: WL active cache replaced (records=%d)", len(lab_wl_active))
 
 
 def upsert_wl_active(
