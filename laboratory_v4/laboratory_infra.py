@@ -1,11 +1,11 @@
-# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты для WL/BL)
+# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты для WL/BL, активные BL-пороги)
 
 # 🔸 Импорты
 import os
 import logging
 import asyncpg
 import redis.asyncio as aioredis
-from typing import Dict, Set, Tuple, Optional
+from typing import Dict, Set, Tuple, Optional, Any
 
 # 🔸 Глобальные подключения
 pg_pool = None
@@ -30,6 +30,12 @@ lab_pack_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = 
 # PACK WL/BL winrates: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value) -> wr}}
 lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}}
 lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}}
+
+# 🔸 Активные пороги BL (для быстрого применения фильтров без БД)
+# ключ: (master_sid, version, decision_mode, direction, tf)
+# значение: {"threshold": int, "best_roi": float, "roi_base": float, "positions_total": int,
+#            "deposit_used": float, "computed_at": "ISO8601"}
+lab_bl_active: Dict[Tuple[int, str, str, str, str], Dict[str, Any]] = {}
 
 # 🔸 Переменные окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -66,7 +72,7 @@ async def setup_pg():
         await conn.execute("SELECT 1")
 
     globals()["pg_pool"] = pool
-    log.debug("🛢️ Подключение к PostgreSQL установлено")
+    log.info("🛢️ Подключение к PostgreSQL установлено")
 
 
 # 🔸 Инициализация подключения к Redis
@@ -89,7 +95,7 @@ async def setup_redis_client():
     await client.ping()
 
     globals()["redis_client"] = client
-    log.debug("📡 Подключение к Redis установлено")
+    log.info("📡 Подключение к Redis установлено")
 
 
 # 🔸 Кэши: установки целиком
@@ -274,3 +280,63 @@ def update_pack_list_for_strategy(
         lt.upper(), sid, v, total_slices, total_entries,
         per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
     )
+
+
+# 🔸 BL Active: массовая установка, точечный upsert и быстрый доступ к порогу
+
+def set_bl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str], Dict[str, Any]]):
+    """
+    Полная замена in-memory кэша активных порогов BL.
+    new_map: {(master_sid, version, decision_mode, direction, tf) -> {...см. lab_bl_active value...}}
+    """
+    global lab_bl_active
+    lab_bl_active = new_map or {}
+    log.info("LAB: BL active cache replaced (records=%d)", len(lab_bl_active))
+
+
+def upsert_bl_active(
+    master_sid: int,
+    version: str,
+    decision_mode: str,
+    direction: str,
+    tf: str,
+    threshold: int,
+    *,
+    best_roi: float = 0.0,
+    roi_base: float = 0.0,
+    positions_total: int = 0,
+    deposit_used: float = 0.0,
+    computed_at: Optional[str] = None,
+):
+    """
+    Точечное обновление записи активного порога BL в памяти (после UPSERT в БД).
+    """
+    key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf))
+    rec = {
+        "threshold": int(threshold),
+        "best_roi": float(best_roi),
+        "roi_base": float(roi_base),
+        "positions_total": int(positions_total),
+        "deposit_used": float(deposit_used),
+        "computed_at": computed_at or "",
+    }
+    lab_bl_active[key] = rec
+    log.debug("LAB: BL active upsert %s -> T=%s ROI=%.6f (base=%.6f, n=%d)", key, rec["threshold"], rec["best_roi"], rec["roi_base"], rec["positions_total"])
+
+
+def get_bl_threshold(
+    master_sid: int,
+    version: str,
+    decision_mode: str,
+    direction: str,
+    tf: str,
+    default: int = 0,
+) -> int:
+    """
+    Быстрый доступ к активному порогу BL. Если записи нет — возвращает default (по договорённости, 0).
+    """
+    key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf))
+    rec = lab_bl_active.get(key)
+    if not rec:
+        return int(default)
+    return int(rec.get("threshold", default))
