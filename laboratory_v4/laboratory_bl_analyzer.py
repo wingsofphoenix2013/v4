@@ -140,54 +140,122 @@ async def _load_active_from_db():
         }
     infra.set_bl_active_bulk(m)
 
-
 # 🔸 Построение карты: (master_sid, version, mode) -> (client_sid, direction, tfs, deposit)
 async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str, str, float]]:
     """
-    Используем лабораторные запросы как источник истины о конфигурации клиента.
-    Берём последние записи (по finished_at) для каждой пары (master, version, mode), у которых client_strategy_id есть и клиент — BL watcher.
+    Вариант B: строим фиксированную карту 12×2×4 = 96 комбинаций из истории позиций,
+    с фолбэком к laboratory_request_head. Находим единственного клиента-дублёра
+    для каждой тройки (master, version, mode), его direction и tfs (если есть в head).
     """
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            WITH latest AS (
-              SELECT
-                h.strategy_id          AS master_sid,
-                h.oracle_version       AS version,
-                h.decision_mode        AS mode,
-                h.client_strategy_id   AS client_sid,
-                h.direction            AS direction,
-                h.timeframes_requested AS tfs,
-                h.finished_at
-              FROM laboratory_request_head h
-              JOIN strategies_v4 c ON c.id = h.client_strategy_id
-              WHERE h.client_strategy_id IS NOT NULL
-                AND c.market_watcher = false
-                AND c.blacklist_watcher = true
+            WITH clients AS (
+              SELECT id AS client_sid,
+                     COALESCE(market_mirrow, 0) AS master_sid,
+                     COALESCE(deposit, 0)       AS deposit
+              FROM strategies_v4
+              WHERE enabled = true AND (archived IS NOT TRUE)
+                AND market_watcher = false
+                AND blacklist_watcher = true
+                AND market_mirrow IS NOT NULL
             ),
-            picked AS (
-              SELECT DISTINCT ON (master_sid, version, mode)
-                     master_sid, version, mode, client_sid, direction, tfs, finished_at
-              FROM latest
-              ORDER BY master_sid, version, mode, finished_at DESC
+            masters AS (
+              SELECT DISTINCT master_sid FROM clients
+            ),
+            expected AS (
+              SELECT m.master_sid, v.version, d.mode
+              FROM masters m
+              CROSS JOIN (VALUES ('v1'),('v2')) AS v(version)
+              CROSS JOIN (VALUES ('mw_only'),('mw_then_pack'),('mw_and_pack'),('pack_only')) AS d(mode)
+            ),
+
+            -- выбор по истории позиций: берём клиента с макс. кол-вом сделок (и самым свежим закрытием при равенстве)
+            pos_pick AS (
+              SELECT *
+              FROM (
+                SELECT
+                  lps.strategy_id        AS master_sid,
+                  lps.oracle_version     AS version,
+                  lps.decision_mode      AS mode,
+                  lps.client_strategy_id AS client_sid,
+                  lps.direction          AS direction,
+                  COUNT(*)               AS n,
+                  MAX(lps.closed_at)     AS last_closed,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY lps.strategy_id, lps.oracle_version, lps.decision_mode
+                    ORDER BY COUNT(*) DESC, MAX(lps.closed_at) DESC
+                  ) AS rn
+                FROM laboratory_positions_stat lps
+                JOIN clients c ON c.client_sid = lps.client_strategy_id
+                GROUP BY lps.strategy_id, lps.oracle_version, lps.decision_mode, lps.client_strategy_id, lps.direction
+              ) s
+              WHERE rn = 1
+            ),
+
+            -- фолбэк по head: последняя заявка на тройку
+            head_pick AS (
+              SELECT *
+              FROM (
+                SELECT
+                  h.strategy_id        AS master_sid,
+                  h.oracle_version     AS version,
+                  h.decision_mode      AS mode,
+                  h.client_strategy_id AS client_sid,
+                  h.direction          AS direction,
+                  h.timeframes_requested AS tfs,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY h.strategy_id, h.oracle_version, h.decision_mode
+                    ORDER BY h.finished_at DESC
+                  ) AS rn
+                FROM laboratory_request_head h
+                JOIN clients c ON c.client_sid = h.client_strategy_id
+              ) s
+              WHERE rn = 1
             )
-            SELECT p.master_sid, p.version, p.mode, p.client_sid, p.direction, p.tfs,
-                   COALESCE(c.deposit,0) AS deposit
-            FROM picked p
-            JOIN strategies_v4 c ON c.id = p.client_sid
+
+            SELECT
+              e.master_sid,
+              e.version,
+              e.mode,
+              COALESCE(pp.client_sid, hp.client_sid)                       AS client_sid,
+              COALESCE(pp.direction,  hp.direction)                        AS direction,
+              COALESCE(hp.tfs, 'm5,m15,h1')                                AS tfs,
+              COALESCE(c.deposit, 0)                                       AS deposit
+            FROM expected e
+            LEFT JOIN pos_pick pp
+              ON pp.master_sid = e.master_sid AND pp.version = e.version AND pp.mode = e.mode
+            LEFT JOIN head_pick hp
+              ON hp.master_sid = e.master_sid AND hp.version = e.version AND hp.mode = e.mode
+            LEFT JOIN strategies_v4 c
+              ON c.id = COALESCE(pp.client_sid, hp.client_sid)
+            ORDER BY e.master_sid, e.version, e.mode
             """
         )
-    mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]] = {}
-    for r in rows:
-        key = (int(r["master_sid"]), str(r["version"]), str(r["mode"]))
-        mapping[key] = (
-            int(r["client_sid"]),
-            str(r["direction"]),
-            str(r["tfs"] or "m5,m15,h1"),
-            float(r["deposit"] or 0.0),
-        )
-    return mapping
 
+    mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]] = {}
+    missing: List[Tuple[int, str, str]] = []
+
+    for r in rows:
+        master_sid = int(r["master_sid"])
+        version    = str(r["version"])
+        mode       = str(r["mode"])
+        client_sid = r["client_sid"]
+        if client_sid is None:
+            # нет ни позиций, ни head — пропускаем эту тройку, отметим как missing
+            missing.append((master_sid, version, mode))
+            continue
+        direction  = str(r["direction"])
+        tfs        = str(r["tfs"] or "m5,m15,h1")
+        deposit    = float(r["deposit"] or 0.0)
+
+        mapping[(master_sid, version, mode)] = (int(client_sid), direction, tfs, deposit)
+
+    if missing:
+        log.debug("ℹ️ LAB_BL_ANALYZER: нет данных для %d комбинаций (они будут пропущены): %s",
+                  len(missing), ", ".join(f"{ms}/{v}/{m}" for ms,v,m in missing))
+    log.info("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
+    return mapping
 
 # 🔸 Полный пересчёт по всей карте
 async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]]):
