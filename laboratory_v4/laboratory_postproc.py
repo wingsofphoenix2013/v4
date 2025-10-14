@@ -149,7 +149,7 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
     # head: req_id, master_sid, oracle_version, decision_mode, timeframes_requested, allow
     req_id, master_sid, oracle_version, decision_mode, tfs_requested, head_allow = head
 
-    # строк на каждую TF из head.timeframes_requested (если tf не в списке — не пишем)
+    # строки на каждую TF из head.timeframes_requested (если tf не в списке — не пишем)
     tfs = _parse_timeframes(tfs_requested)
 
     # подтянем TF-строки
@@ -315,6 +315,26 @@ async def _find_lab_head(log_uid: str, client_sid: int) -> Optional[Tuple[str, i
     )
 
 
+# 🔸 Универсальный парсер json/jsonb колонок из БД → dict/list (или {} при ошибке)
+def _parse_json_value(val):
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        try:
+            return json.loads(bytes(val).decode("utf-8"))
+        except Exception:
+            return {}
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            return json.loads(s)
+        except Exception:
+            return {}
+    return {}
+
+
 # загрузка TF-строк по req_id
 async def _load_lab_tf_rows(req_id: str, tfs: List[str]) -> Dict[str, Dict]:
     if not tfs:
@@ -337,12 +357,15 @@ async def _load_lab_tf_rows(req_id: str, tfs: List[str]) -> Dict[str, Dict]:
     res: Dict[str, Dict] = {}
     for r in rows:
         tf = str(r["tf"])
+        tf_results_obj = _parse_json_value(r["tf_results"])
+        if not isinstance(tf_results_obj, dict):
+            tf_results_obj = {}
         res[tf] = {
             "mw_wl_hits": int(r["mw_wl_hits"] or 0),
             "pack_wl_hits": int(r["pack_wl_hits"] or 0),
             "pack_bl_hits": int(r["pack_bl_hits"] or 0),
             "path_used": str(r["path_used"] or "none"),
-            "tf_results": (dict(r["tf_results"]) if r["tf_results"] is not None else {}),
+            "tf_results": tf_results_obj,
         }
     return res
 
