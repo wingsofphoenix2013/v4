@@ -291,7 +291,6 @@ async def _recompute_by_master_and_version(mapping: Dict[Tuple[int, str, str], T
     await asyncio.gather(*[asyncio.create_task(_one(item)) for item in candidates])
     log.info("🔁 LAB_BL_ANALYZER: таргетный пересчёт master=%s version=%s завершён (combos=%d)", master_sid, version, len(candidates))
 
-
 # 🔸 Пересчёт одной комбинации (внутри — последовательно по TF; если выборка пуста — ничего не пишем и чистим актив)
 async def _recompute_for_tuple(master_sid: int, version: str, mode: str,
                                client_sid: int, direction: str, tfs_requested: str, deposit: float):
@@ -321,13 +320,31 @@ async def _recompute_for_tuple(master_sid: int, version: str, mode: str,
             continue
 
         # базовый ROI
-        pnl_sum_base = sum(r[1] for r in rows) if rows else 0.0
+        pnl_sum_base = sum(p for _, p in rows)
         roi_base = (pnl_sum_base / dep) if dep > 0 else 0.0
 
-        # пороги (включая 0)
-        bl_counts = sorted({int(r[0] or 0) for r in rows})
-        if 0 not in bl_counts:
-            bl_counts = [0] + bl_counts
+        # —— Новый расчёт кривой ROI по ВСЕМ целым порогам 0..max(BL_count) ——
+        # гистограмма BL_count: count и pnl-сумма на каждом значении
+        hist_n: Dict[int, int] = {}
+        hist_p: Dict[int, float] = {}
+        max_c = 0
+        for blc, pnl in rows:
+            c = int(blc or 0)
+            hist_n[c] = hist_n.get(c, 0) + 1
+            hist_p[c] = hist_p.get(c, 0.0) + float(pnl or 0.0)
+            if c > max_c:
+                max_c = c
+
+        # префиксные суммы до k: sum_{c<=k} n(c), sum_{c<=k} pnl(c)
+        pref_n = [0] * (max_c + 1)
+        pref_p = [0.0] * (max_c + 1)
+        acc_n = 0
+        acc_p = 0.0
+        for c in range(0, max_c + 1):
+            acc_n += hist_n.get(c, 0)
+            acc_p += hist_p.get(c, 0.0)
+            pref_n[c] = acc_n
+            pref_p[c] = acc_p
 
         roi_by_threshold: Dict[int, Dict[str, float | int]] = {}
         best_T = 0
@@ -335,16 +352,14 @@ async def _recompute_for_tuple(master_sid: int, version: str, mode: str,
         best_n = positions_total
         best_pnl = pnl_sum_base
 
-        for T in bl_counts:
-            if T == 0:
-                passed = rows
-            else:
-                # фильтр: допускаем сделки с BL-хитами < T
-                passed = [r for r in rows if int(r[0] or 0) < T]
-            n_passed = len(passed)
-            pnl_sum = sum(r[1] for r in passed) if n_passed else 0.0
-            roi_T = (pnl_sum / dep) if (dep > 0 and n_passed > 0) else 0.0
+        # T=0 — базовый срез: пропускаем все сделки (без фильтра)
+        roi_by_threshold[0] = {"n": positions_total, "pnl": float(pnl_sum_base), "roi": float(roi_base)}
 
+        # для T >= 1 пропускаем BL_count < T → это префикс до (T-1)
+        for T in range(1, max_c + 1):
+            n_passed = pref_n[T - 1]
+            pnl_sum = pref_p[T - 1]
+            roi_T = (pnl_sum / dep) if (dep > 0 and n_passed > 0) else 0.0
             roi_by_threshold[T] = {"n": n_passed, "pnl": float(pnl_sum), "roi": float(roi_T)}
 
             # лучший ROI; tie-break: минимальный T
@@ -354,7 +369,7 @@ async def _recompute_for_tuple(master_sid: int, version: str, mode: str,
                 best_n = n_passed
                 best_pnl = pnl_sum
 
-        # запись: только при наличии выборки
+        # запись результатов (есть позиции, т.к. выше early-return при positions_total == 0)
         await _persist_analysis_and_active(
             master_sid=master_sid,
             client_sid=client_sid,
@@ -373,7 +388,6 @@ async def _recompute_for_tuple(master_sid: int, version: str, mode: str,
             best_pnl_sum=best_pnl,
             best_roi=best_roi,
         )
-
 
 # 🔸 Загрузка среза сделок из laboratory_positions_stat
 async def _load_positions_slice(client_sid: int, version: str, mode: str, direction: str, tf: str,
