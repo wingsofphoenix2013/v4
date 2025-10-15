@@ -1,5 +1,6 @@
-# bb_lastprice_watcher.py — общий WS (Bybit v5 tickers) → bb:last_price:{symbol}
-# (last-цены, округление до precision, динамическая (un)sub, тайм-гейт записи в Redis)
+# bb_lastprice_watcher.py — общий WS (Bybit v5 tickers) → три ключа в Redis
+# Публикация last/mark/index цен в отдельные ключи с округлением и тайм-гейтом записи
+# Ключи: bb:last_price:{symbol}, bb:mark_price:{symbol}, bb:index_price:{symbol}
 
 # 🔸 Импорты и зависимости
 import os
@@ -23,8 +24,9 @@ REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 # ограничение внутренней очереди клиента websockets (для контроля роста памяти)
 WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))
 
-# минимальный интервал публикации last-цены в Redis, сек (тайм-гейт per-symbol)
-LASTPRICE_MIN_UPDATE_SEC = float(os.getenv("BB_LASTPRICE_MIN_UPDATE_SEC", "1.0"))
+# минимальный интервал публикации цен в Redis, сек (тайм-гейт per-symbol)
+# поддерживаем старую переменную для обратной совместимости
+MIN_UPDATE_SEC = float(os.getenv("BB_TICKERS_MIN_UPDATE_SEC", os.getenv("BB_LASTPRICE_MIN_UPDATE_SEC", "1.0")))
 
 # TTL кэширования precision (секунды)
 PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
@@ -115,15 +117,16 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
     log.info(
         "LASTPRICE watcher (Bybit tickers) запущен — общий WS для всех символов "
         "(WS_MAX_QUEUE=%s, MIN_UPDATE=%.3fs)",
-        WS_MAX_QUEUE, LASTPRICE_MIN_UPDATE_SEC
+        WS_MAX_QUEUE, MIN_UPDATE_SEC
     )
 
     current = set()
     backoff = 1.0
 
-    # per-symbol: время последней публикации и «последний виденный» last для схлопывания
+    # per-symbol: время последней публикации и «последние виденные» цены для схлопывания
     last_pub_ts: dict[str, float] = {}
-    pending_last: dict[str, str] = {}
+    # pending_prices[sym] = {"last": "...", "mark": "...", "index": "..."}
+    pending_prices: dict[str, dict[str, str]] = {}
 
     async def keepalive(ws):
         try:
@@ -184,7 +187,7 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
                                 for s in to_unsub:
                                     current.discard(s)
                                     last_pub_ts.pop(s, None)
-                                    pending_last.pop(s, None)
+                                    pending_prices.pop(s, None)
                             if to_sub:
                                 await _send_sub(ws, to_sub)
                                 current.update(to_sub)
@@ -202,27 +205,43 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
 
                         for item in items:
                             sym = item.get("symbol") or item.get("s")
-                            lp  = item.get("lastPrice")
-                            if not sym or lp is None:
+                            if not sym:
+                                continue
+
+                            # исходные значения из сообщения
+                            lp = item.get("lastPrice")
+                            mp = item.get("markPrice")
+                            ip = item.get("indexPrice")
+
+                            if lp is None and mp is None and ip is None:
                                 continue
 
                             # округление вниз до precision_price
                             pp = await prec_price_cache.get(pg_pool, sym)
-                            lp_str = _round_down_price(lp, pp)
+                            buf = pending_prices.setdefault(sym, {})
+                            if lp is not None:
+                                buf["last"] = _round_down_price(lp, pp)
+                            if mp is not None:
+                                buf["mark"] = _round_down_price(mp, pp)
+                            if ip is not None:
+                                buf["index"] = _round_down_price(ip, pp)
 
-                            # запоминаем «самый свежий» last за интервал
-                            pending_last[sym] = lp_str
-
-                            # тайм-гейт: публикуем не чаще, чем раз в LASTPRICE_MIN_UPDATE_SEC
+                            # тайм-гейт: публикуем не чаще, чем раз в MIN_UPDATE_SEC
                             t_last = last_pub_ts.get(sym, 0.0)
                             now = loop.time()
-                            if now - t_last >= LASTPRICE_MIN_UPDATE_SEC:
-                                # берём самый свежий last на момент публикации
-                                val = pending_last.get(sym, lp_str)
-                                await redis.set(f"bb:last_price:{sym}", val)
-                                last_pub_ts[sym] = now
-                                # можно (не обязательно) очистить pending — пусть остаётся актуальным значением
-                                # pending_last.pop(sym, None)
+                            if now - t_last >= MIN_UPDATE_SEC:
+                                sets = []
+                                v = pending_prices.get(sym, {})
+                                if "last" in v:
+                                    sets.append(redis.set(f"bb:last_price:{sym}", v["last"]))
+                                if "mark" in v:
+                                    sets.append(redis.set(f"bb:mark_price:{sym}", v["mark"]))
+                                if "index" in v:
+                                    sets.append(redis.set(f"bb:index_price:{sym}", v["index"]))
+                                if sets:
+                                    await asyncio.gather(*sets)
+                                    last_pub_ts[sym] = now
+                                # (по желанию можно чистить pending_prices[sym]; оставим последние значения)
 
                 finally:
                     # корректно завершаем keepalive
