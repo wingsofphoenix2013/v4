@@ -12,7 +12,7 @@ class Strategy700Reverse:
     # 🔸 Валидация сигнала (транзитная: принимает любые направления)
     async def validate_signal(self, signal, context):
         # лог результата на уровне info
-        log.info(
+        log.debug(
             "✅ [TRANSIT_PASS] log_uid=%s strategy_id=%s %s %s",
             signal.get("log_uid"),
             signal.get("strategy_id"),
@@ -41,7 +41,7 @@ class Strategy700Reverse:
         # отправляем в конвейер открытия
         await redis.xadd("strategy_opener_stream", {"data": json.dumps(payload, separators=(",", ":"))})
         # лог результата на уровне info
-        log.info(
+        log.debug(
             "📨 [OPEN_REQ_SENT] log_uid=%s strategy_id=%s %s %s",
             payload["log_uid"], payload["strategy_id"], payload["symbol"], payload["direction"]
         )
