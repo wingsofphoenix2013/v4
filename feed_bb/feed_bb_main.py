@@ -18,6 +18,7 @@ from bb_feed_and_aggregate import (
     run_feed_and_aggregator_h1_bb,
 )
 from bb_markprice_watcher import run_markprice_watcher_bb
+from bb_lastprice_watcher import run_lastprice_watcher_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -42,6 +43,7 @@ async def main():
             run_safe_loop(lambda: run_feed_and_aggregator_m15_bb(pg_pool, redis), "BB_FEED_AGGR:M15"),
             run_safe_loop(lambda: run_feed_and_aggregator_h1_bb(pg_pool, redis),  "BB_FEED_AGGR:H1"),
             run_safe_loop(lambda: run_markprice_watcher_bb(pg_pool, redis),       "BB_MARKPRICE"),
+            run_safe_loop(lambda: run_lastprice_watcher_bb(pg_pool, redis),       "BB_LASTPRICE"),
         )
 
     # 🔸 Запуск остальных воркеров сразу (сервер считается «живым»)
