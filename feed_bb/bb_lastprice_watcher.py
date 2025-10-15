@@ -1,4 +1,5 @@
-# bb_lastprice_watcher.py — общий WS (Bybit v5 publicTrade) → bb:last_price:{symbol} (частые last-цены, округление до precision, динамическая (un)sub)
+# bb_lastprice_watcher.py — общий WS (Bybit v5 tickers) → bb:last_price:{symbol}
+# (last-цены, округление до precision, динамическая (un)sub, тайм-гейт записи в Redis)
 
 # 🔸 Импорты и зависимости
 import os
@@ -21,6 +22,9 @@ REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
 
 # ограничение внутренней очереди клиента websockets (для контроля роста памяти)
 WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))
+
+# минимальный интервал публикации last-цены в Redis, сек (тайм-гейт per-symbol)
+LASTPRICE_MIN_UPDATE_SEC = float(os.getenv("BB_LASTPRICE_MIN_UPDATE_SEC", "1.0"))
 
 # TTL кэширования precision (секунды)
 PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
@@ -94,23 +98,32 @@ async def _load_active_symbols(pg_pool):
 async def _send_sub(ws, syms):
     if not syms:
         return
-    payload = {"op": "subscribe", "args": [f"publicTrade.{s}" for s in syms]}
+    # tickers.{symbol}
+    payload = {"op": "subscribe", "args": [f"tickers.{s}" for s in syms]}
     await ws.send(json.dumps(payload))
-    log.info("LASTPRICE SUB → %d symbols", len(syms))
+    log.info("LASTPRICE SUB (tickers) → %d symbols", len(syms))
 
 async def _send_unsub(ws, syms):
     if not syms:
         return
-    payload = {"op": "unsubscribe", "args": [f"publicTrade.{s}" for s in syms]}
+    payload = {"op": "unsubscribe", "args": [f"tickers.{s}" for s in syms]}
     await ws.send(json.dumps(payload))
-    log.info("LASTPRICE UNSUB → %d symbols", len(syms))
+    log.info("LASTPRICE UNSUB (tickers) → %d symbols", len(syms))
 
-# 🔸 Менеджер одного общего WS: подписка на все активные publicTrade.{symbol}
+# 🔸 Менеджер одного общего WS: подписка на все активные tickers.{symbol}
 async def run_lastprice_watcher_bb(pg_pool, redis):
-    log.info("LASTPRICE watcher (Bybit) запущен — общий WS для всех символов (WS_MAX_QUEUE=%s)", WS_MAX_QUEUE)
+    log.info(
+        "LASTPRICE watcher (Bybit tickers) запущен — общий WS для всех символов "
+        "(WS_MAX_QUEUE=%s, MIN_UPDATE=%.3fs)",
+        WS_MAX_QUEUE, LASTPRICE_MIN_UPDATE_SEC
+    )
 
     current = set()
     backoff = 1.0
+
+    # per-symbol: время последней публикации и «последний виденный» last для схлопывания
+    last_pub_ts: dict[str, float] = {}
+    pending_last: dict[str, str] = {}
 
     async def keepalive(ws):
         try:
@@ -137,9 +150,9 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
 
             async with websockets.connect(
                 BYBIT_WS_URL,
-                ping_interval=None,
+                ping_interval=None,   # свой keepalive
                 close_timeout=5,
-                max_queue=WS_MAX_QUEUE,   # ограничиваем внутреннюю очередь клиента WS
+                max_queue=WS_MAX_QUEUE,
                 open_timeout=10,
             ) as ws:
                 # первичная подписка на все активные
@@ -149,7 +162,8 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
 
                 ka = asyncio.create_task(keepalive(ws))
                 try:
-                    last_refresh = asyncio.get_event_loop().time()
+                    loop = asyncio.get_event_loop()
+                    last_refresh = loop.time()
 
                     async for raw in ws:
                         # парсинг сообщения
@@ -159,7 +173,7 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
                             continue
 
                         # периодическая сверка активных символов
-                        now = asyncio.get_event_loop().time()
+                        now = loop.time()
                         if now - last_refresh >= REFRESH_ACTIVE_SEC:
                             last_refresh = now
                             active2 = set(await _load_active_symbols(pg_pool))
@@ -169,27 +183,46 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
                                 await _send_unsub(ws, to_unsub)
                                 for s in to_unsub:
                                     current.discard(s)
+                                    last_pub_ts.pop(s, None)
+                                    pending_last.pop(s, None)
                             if to_sub:
                                 await _send_sub(ws, to_sub)
                                 current.update(to_sub)
 
                         topic = msg.get("topic") or ""
-                        if not topic.startswith("publicTrade."):
+                        if not topic.startswith("tickers."):
                             continue
 
                         data = msg.get("data")
                         if not data:
                             continue
 
-                        # Bybit отдаёт массив трейдов — берём последнюю цену из каждого элемента
-                        for item in (data if isinstance(data, list) else [data]):
-                            sym = item.get("s") or item.get("symbol")
-                            p   = item.get("p") or item.get("price")
-                            if not sym or p is None:
+                        # По спецификации tickers для деривативов: data — объект; но на всякий случай поддержим список
+                        items = data if isinstance(data, list) else [data]
+
+                        for item in items:
+                            sym = item.get("symbol") or item.get("s")
+                            lp  = item.get("lastPrice")
+                            if not sym or lp is None:
                                 continue
+
                             # округление вниз до precision_price
                             pp = await prec_price_cache.get(pg_pool, sym)
-                            await redis.set(f"bb:last_price:{sym}", _round_down_price(p, pp))
+                            lp_str = _round_down_price(lp, pp)
+
+                            # запоминаем «самый свежий» last за интервал
+                            pending_last[sym] = lp_str
+
+                            # тайм-гейт: публикуем не чаще, чем раз в LASTPRICE_MIN_UPDATE_SEC
+                            t_last = last_pub_ts.get(sym, 0.0)
+                            now = loop.time()
+                            if now - t_last >= LASTPRICE_MIN_UPDATE_SEC:
+                                # берём самый свежий last на момент публикации
+                                val = pending_last.get(sym, lp_str)
+                                await redis.set(f"bb:last_price:{sym}", val)
+                                last_pub_ts[sym] = now
+                                # можно (не обязательно) очистить pending — пусть остаётся актуальным значением
+                                # pending_last.pop(sym, None)
 
                 finally:
                     # корректно завершаем keepalive
@@ -202,10 +235,10 @@ async def run_lastprice_watcher_bb(pg_pool, redis):
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
             # ожидаемые сетевые обрывы — плавный реконнект с джиттером и полным ресабскрайбом
             wait = max(3.0, min(30.0, backoff * (1.5 + random.random() * 0.5)))
-            log.info("LASTPRICE reconnect in %.1fs (%s)", wait, type(e).__name__)
+            log.info("LASTPRICE reconnect (tickers) in %.1fs (%s)", wait, type(e).__name__)
             await asyncio.sleep(wait)
             backoff = wait
 
         except Exception as e:
-            log.error("LASTPRICE manager error: %s", e, exc_info=True)
+            log.error("LASTPRICE manager error (tickers): %s", e, exc_info=True)
             await asyncio.sleep(3)
