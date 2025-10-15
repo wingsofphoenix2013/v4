@@ -1,4 +1,4 @@
-# live_pack_m5.py — live-PACK m5 (rsi/mfi/ema/atr/lr/adx_dmi/macd/bb) c использованием L1; публикация в pack_live:{indicator}:{symbol}:{tf}:{base}
+# live_pack_m5.py — live-PACK m5 (rsi/mfi/ema/atr/lr/adx_dmi/macd/bb) с использованием L1; публикация «минимального» JSON в pack_live:{indicator}:{symbol}:{tf}:{base}
 
 # 🔸 Импорты
 import asyncio
@@ -19,12 +19,15 @@ from packs.macd_pack import build_macd_pack
 from packs.bb_pack import build_bb_pack
 from packs.pack_utils import floor_to_bar
 
+
 # 🔸 Логгер
 log = logging.getLogger("PACK_M5")
+
 
 # 🔸 Константы
 TF = "m5"
 TTL_SEC = 90
+
 
 # 🔸 Обёртка compute_fn: сначала L1, потом фолбэк к compute_snapshot_values_async
 def make_compute_with_l1(live_cache, bar_open_ms: int, hits_misses: Dict[str, int]):
@@ -45,16 +48,21 @@ def make_compute_with_l1(live_cache, bar_open_ms: int, hits_misses: Dict[str, in
         return await compute_snapshot_values_async(inst, symbol, df, precision)
     return _compute
 
-# 🔸 Публикация PACK JSON в Redis
-async def _publish_pack(redis, indicator: str, symbol: str, tf: str, base: str, pack_obj: Dict[str, Any]) -> bool:
-    key = f"pack_live:{indicator}:{symbol}:{tf}:{base}"
-    try:
-        js = json.dumps(pack_obj, ensure_ascii=False)
-        await redis.set(key, js, ex=TTL_SEC)
-        return True
-    except Exception as e:
-        log.debug(f"PACK_M5 publish error {key}: {e}")
-        return False
+
+# 🔸 Минимальный набор полей для публикации (совместим с consumers)
+PACK_WHITELIST: Dict[str, List[str]] = {
+    "rsi":     ["bucket_low", "trend"],
+    "mfi":     ["bucket_low", "trend"],
+    "ema":     ["side", "dynamic", "dynamic_strict", "dynamic_smooth"],
+    "atr":     ["bucket", "bucket_delta"],
+    "lr":      ["bucket", "bucket_delta", "angle_trend"],
+    "adx_dmi": ["adx_bucket_low", "adx_dynamic_strict", "adx_dynamic_smooth",
+                "gap_bucket_low", "gap_dynamic_strict", "gap_dynamic_smooth"],
+    "macd":    ["mode", "cross", "zero_side", "hist_bucket_low_pct",
+                "hist_trend_strict", "hist_trend_smooth"],
+    "bb":      ["bucket", "bucket_delta", "bw_trend_strict", "bw_trend_smooth"],
+}
+
 
 # 🔸 Сбор активных баз по инстансам TF=m5
 def _collect_active_bases(instances_m5: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -80,6 +88,41 @@ def _collect_active_bases(instances_m5: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
     return r
 
+
+# 🔸 Сделать «минимальный» pack (с whitelisted полями + open_time)
+def _slim_pack(indicator: str, full_pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(full_pack, dict):
+        return None
+    base = full_pack.get("base")
+    p = full_pack.get("pack") or {}
+    if not isinstance(p, dict):
+        return None
+
+    fields = PACK_WHITELIST.get(indicator, [])
+    out_pack: Dict[str, Any] = {"open_time": p.get("open_time")}
+    for f in fields:
+        if f in p:
+            out_pack[f] = p[f]
+
+    # если в whitelisted поле ничего не попало — публикация не нужна
+    if len(out_pack) <= 1:  # только open_time
+        return None
+
+    return {"base": base, "pack": out_pack}
+
+
+# 🔸 Публикация «минимального» PACK JSON в Redis
+async def _publish_pack_min(redis, indicator: str, symbol: str, tf: str, base: str, slim: Dict[str, Any]) -> bool:
+    key = f"pack_live:{indicator}:{symbol}:{tf}:{base}"
+    try:
+        js = json.dumps(slim, ensure_ascii=False, separators=(",", ":"))
+        await redis.set(key, js, ex=TTL_SEC)
+        return True
+    except Exception as e:
+        log.debug(f"PACK_M5 publish error {key}: {e}")
+        return False
+
+
 # 🔸 Один проход PACK m5 (использовать после MW m5, чтобы L1 был тёплый)
 async def pack_m5_pass(redis,
                        get_instances_by_tf,
@@ -102,7 +145,7 @@ async def pack_m5_pass(redis,
     hits_misses = {"hits": 0, "misses": 0}
     compute_with_l1 = make_compute_with_l1(live_cache, bar_open_ms, hits_misses)
 
-    # подготовим активные базы по типам индикаторов
+    # активные базы по типам
     bases = _collect_active_bases(instances_m5)
 
     written = 0
@@ -122,81 +165,82 @@ async def pack_m5_pass(redis,
             # RSI
             for L in sorted(bases["rsi"]):
                 try:
-                    pack = await build_rsi_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "rsi", sym, TF, f"rsi{L}", pack):
-                            written += 1
+                    full = await build_rsi_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("rsi", full) if full else None
+                    if slim and await _publish_pack_min(redis, "rsi", sym, TF, f"rsi{L}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # MFI
             for L in sorted(bases["mfi"]):
                 try:
-                    pack = await build_mfi_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "mfi", sym, TF, f"mfi{L}", pack):
-                            written += 1
+                    full = await build_mfi_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("mfi", full) if full else None
+                    if slim and await _publish_pack_min(redis, "mfi", sym, TF, f"mfi{L}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # EMA
             for L in sorted(bases["ema"]):
                 try:
-                    pack = await build_ema_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "ema", sym, TF, f"ema{L}", pack):
-                            written += 1
+                    full = await build_ema_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("ema", full) if full else None
+                    if slim and await _publish_pack_min(redis, "ema", sym, TF, f"ema{L}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # ATR
             for L in sorted(bases["atr"]):
                 try:
-                    pack = await build_atr_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "atr", sym, TF, f"atr{L}", pack):
-                            written += 1
+                    full = await build_atr_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("atr", full) if full else None
+                    if slim and await _publish_pack_min(redis, "atr", sym, TF, f"atr{L}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # LR
             for L in sorted(bases["lr"]):
                 try:
-                    pack = await build_lr_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "lr", sym, TF, f"lr{L}", pack):
-                            written += 1
+                    full = await build_lr_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("lr", full) if full else None
+                    if slim and await _publish_pack_min(redis, "lr", sym, TF, f"lr{L}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # ADX_DMI
             for L in sorted(bases["adx_dmi"]):
                 try:
-                    pack = await build_adx_dmi_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "adx_dmi", sym, TF, f"adx_dmi{L}", pack):
-                            written += 1
+                    full = await build_adx_dmi_pack(sym, TF, L, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("adx_dmi", full) if full else None
+                    if slim and await _publish_pack_min(redis, "adx_dmi", sym, TF, f"adx_dmi{L}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # MACD
             for F in sorted(bases["macd"]):
                 try:
-                    pack = await build_macd_pack(sym, TF, F, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        if await _publish_pack(redis, "macd", sym, TF, f"macd{F}", pack):
-                            written += 1
+                    full = await build_macd_pack(sym, TF, F, now_ms, precision, redis, compute_with_l1)
+                    slim = _slim_pack("macd", full) if full else None
+                    if slim and await _publish_pack_min(redis, "macd", sym, TF, f"macd{F}", slim):
+                        written += 1
                 except Exception:
                     errors += 1
+
             # BB
             for (L, S) in sorted(bases["bb"]):
                 try:
-                    pack = await build_bb_pack(sym, TF, L, S, now_ms, precision, redis, compute_with_l1)
-                    if pack:
-                        pack["pack"]["ref"] = "live"
-                        # base уже вида bb{L}_{std}
-                        if await _publish_pack(redis, "bb", sym, TF, pack.get("base", f"bb{L}_{str(S).replace('.', '_')}"), pack):
+                    full = await build_bb_pack(sym, TF, L, S, now_ms, precision, redis, compute_with_l1)
+                    # base уже вида bb{L}_{std}
+                    slim = _slim_pack("bb", full) if full else None
+                    if slim:
+                        base_key = str(slim.get("base") or f"bb{L}_{str(S).replace('.', '_')}")
+                        if await _publish_pack_min(redis, "bb", sym, TF, base_key, slim):
                             written += 1
                 except Exception:
                     errors += 1
