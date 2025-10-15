@@ -1,4 +1,4 @@
-# live_mw_h1.py — live-расчёт MW h1 (trend/volatility/momentum/extremes) с использованием L1-кэша; публикация в ind_mw_live:*
+# live_mw_h1.py — live-расчёт MW h1 (trend/volatility/momentum/extremes) с использованием L1; публикация «минимального» JSON в ind_mw_live:* (только нужные поля)
 
 # 🔸 Импорты
 import asyncio
@@ -22,7 +22,6 @@ log = logging.getLogger("MW_H1")
 # 🔸 Константы
 TF = "h1"
 TTL_SEC = 90
-PAUSE_SEC = 3  # рекомендуется такая же пауза между LIVE и MW
 MW_KINDS = ("trend", "volatility", "momentum", "extremes")
 
 
@@ -44,12 +43,35 @@ def make_compute_with_l1(live_cache, bar_open_ms: int):
     return _compute
 
 
-# 🔸 Публикация состояния MW в ind_mw_live:{symbol}:{tf}:{kind}
-async def _publish_mw(redis, symbol: str, tf: str, kind: str, pack_obj: Dict[str, Any]) -> bool:
+# 🔸 Публикация «минимального» MW-пакета в ind_mw_live:{symbol}:{tf}:{kind}
+async def _publish_mw_min(redis, symbol: str, tf: str, kind: str, full_pack: Dict[str, Any]) -> bool:
     key = f"ind_mw_live:{symbol}:{tf}:{kind}"
     try:
-        # храним сам JSON пакета; потребителям удобно
-        js = json.dumps(pack_obj, ensure_ascii=False)
+        # извлечём минимум: state (+ open_time), а для trend ещё direction/strong (при наличии)
+        p = (full_pack.get("pack") or {}) if isinstance(full_pack, dict) else {}
+        state = p.get("state")
+        if state is None:
+            return False
+
+        if kind == "trend":
+            out = {
+                "pack": {
+                    "state": state,
+                    "open_time": p.get("open_time"),
+                    "direction": p.get("direction"),
+                    "strong": p.get("strong"),
+                }
+            }
+        else:
+            out = {
+                "pack": {
+                    "state": state,
+                    "open_time": p.get("open_time"),
+                }
+            }
+
+        # компактная сериализация
+        js = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
         await redis.set(key, js, ex=TTL_SEC)
         return True
     except Exception as e:
@@ -83,34 +105,34 @@ async def mw_h1_pass(redis,
     async def _wrap(sym: str):
         nonlocal written, errors
         async with sem:
+            # точность может понадобиться билдеру, оставим выборку как есть
             precision = 8
             try:
                 precision = int(get_precision(sym) or 8)
             except Exception:
                 pass
 
-            # по каждому виду MW строим pack (использует compute_with_l1)
             try:
+                # trend
                 trend = await build_trend_pack(sym, TF, now_ms, precision, redis, compute_with_l1)
-                if trend:
-                    trend["pack"]["ref"] = "live"
-                    if await _publish_mw(redis, sym, TF, "trend", trend):
-                        written += 1
+                if trend and await _publish_mw_min(redis, sym, TF, "trend", trend):
+                    written += 1
+
+                # volatility
                 vol = await build_volatility_pack(sym, TF, now_ms, precision, redis, compute_with_l1)
-                if vol:
-                    vol["pack"]["ref"] = "live"
-                    if await _publish_mw(redis, sym, TF, "volatility", vol):
-                        written += 1
+                if vol and await _publish_mw_min(redis, sym, TF, "volatility", vol):
+                    written += 1
+
+                # momentum
                 mom = await build_momentum_pack(sym, TF, now_ms, precision, redis, compute_with_l1)
-                if mom:
-                    mom["pack"]["ref"] = "live"
-                    if await _publish_mw(redis, sym, TF, "momentum", mom):
-                        written += 1
+                if mom and await _publish_mw_min(redis, sym, TF, "momentum", mom):
+                    written += 1
+
+                # extremes
                 ext = await build_extremes_pack(sym, TF, now_ms, precision, redis, compute_with_l1)
-                if ext:
-                    ext["pack"]["ref"] = "live"
-                    if await _publish_mw(redis, sym, TF, "extremes", ext):
-                        written += 1
+                if ext and await _publish_mw_min(redis, sym, TF, "extremes", ext):
+                    written += 1
+
             except Exception as e:
                 errors += 1
                 log.debug(f"MW_H1 compute error {sym}: {e}", exc_info=False)
