@@ -246,7 +246,7 @@ async def _listen_symbol_tf(symbol: str, bybit_iv: str, queue: asyncio.Queue):
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
             # ожидаемые сетевые обрывы — плавный реконнект с джиттером (минимум 3с)
             wait = max(3.0, min(30.0, backoff * (1.5 + random.random() * 0.5)))
-            log.info(f"[WS {bybit_iv}] {symbol} reconnect in {wait:.1f}s ({type(e).__name__})")
+            log.debug(f"[WS {bybit_iv}] {symbol} reconnect in {wait:.1f}s ({type(e).__name__})")
             await asyncio.sleep(wait)
             backoff = wait
 
@@ -294,7 +294,7 @@ async def _kline_worker_tf(queue: asyncio.Queue, pg_pool, redis, tf_name: str):
 async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6):
     bybit_iv = SUB_IV[interval_m]
     tf_name = interval_m
-    log.info(f"[{tf_name}] per-symbol WS mode (WS_MAX_QUEUE={WS_MAX_QUEUE}, throttle={NONCLOSED_THROTTLE_SEC}s)")
+    log.debug(f"[{tf_name}] per-symbol WS mode (WS_MAX_QUEUE={WS_MAX_QUEUE}, throttle={NONCLOSED_THROTTLE_SEC}s)")
 
     maxsize = QUEUE_MAX_M5 if interval_m == "m5" else QUEUE_MAX_OTH
     queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
@@ -313,7 +313,7 @@ async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6)
             # старт новых слушателей
             for sym in active - known:
                 tasks[sym] = asyncio.create_task(_listen_symbol_tf(sym, bybit_iv, queue))
-                log.info(f"[{tf_name}] start WS {sym}")
+                log.debug(f"[{tf_name}] start WS {sym}")
                 # лёгкий stagger, чтобы не лупить десятки подключений в одну миллисекунду
                 await asyncio.sleep(0.05)
 
@@ -324,12 +324,12 @@ async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6)
                     t.cancel()
                     try:
                         await asyncio.wait_for(t, timeout=2.0)
-                        log.info(f"[{tf_name}] stop WS {sym} — cancelled")
+                        log.debug(f"[{tf_name}] stop WS {sym} — cancelled")
                     except asyncio.TimeoutError:
-                        log.info(f"[{tf_name}] stop WS {sym} — cancel timeout")
+                        log.debug(f"[{tf_name}] stop WS {sym} — cancel timeout")
 
             # мониторим размер очереди (опционально)
-            log.info(f"[{tf_name}] qsize={queue.qsize()} max={maxsize}")
+            log.debug(f"[{tf_name}] qsize={queue.qsize()} max={maxsize}")
 
             await asyncio.sleep(ACTIVE_REFRESH_SEC)
         except Exception as e:
