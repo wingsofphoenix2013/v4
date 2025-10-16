@@ -121,7 +121,7 @@ async def run_feed_auditor_bb(pg_pool, redis):
 
                         end_ts = datetime.utcfromtimestamp(int(ts_ms) / 1000).replace(tzinfo=timezone.utc)
                         missing_count = await audit_window_bb(pg_pool, symbol, interval, end_ts)
-                        log.debug(f"AUDIT {symbol} [{interval}] @ {end_ts.isoformat()} → missing={missing_count}")
+                        log.info(f"AUDIT {symbol} [{interval}] @ {end_ts.isoformat()} → missing={missing_count}")
 
                     except Exception as e:
                         log.warning(f"BB_AUDIT ошибка {symbol}/{interval}/{ts_ms}: {e}", exc_info=True)

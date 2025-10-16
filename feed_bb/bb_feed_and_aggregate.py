@@ -329,7 +329,7 @@ async def _run_tf_manager(pg_pool, redis, interval_m: str, workers_num: int = 6)
                         log.info(f"[{tf_name}] stop WS {sym} — cancel timeout")
 
             # мониторим размер очереди (опционально)
-            log.debug(f"[{tf_name}] qsize={queue.qsize()} max={maxsize}")
+            log.info(f"[{tf_name}] qsize={queue.qsize()} max={maxsize}")
 
             await asyncio.sleep(ACTIVE_REFRESH_SEC)
         except Exception as e:

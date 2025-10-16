@@ -33,7 +33,7 @@ async def init_pg_pool() -> AsyncConnectionPool:
 def init_redis_client() -> aioredis.Redis:
     if not REDIS_URL:
         raise RuntimeError("REDIS_URL not set")
-    return aioredis.from_url(
+    return aioredis.from_url(ß
         REDIS_URL,
         decode_responses=True,
         encoding="utf-8"
@@ -44,14 +44,14 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
     log = logging.getLogger(name)
     while True:
         try:
-            log.debug("Запуск воркера")
+            log.info("Запуск воркера")
             await coro_fn()
         except asyncio.CancelledError:
-            log.debug("Воркер остановлен")
+            log.info("Воркер остановлен")
             raise
         except Exception as e:
             log.error(f"Ошибка: {e}", exc_info=True)
-            log.debug(f"Перезапуск через {retry_delay} секунд...")
+            log.info(f"Перезапуск через {retry_delay} секунд...")
             await asyncio.sleep(retry_delay)
 
 # 🔸 Централизованное логирование
