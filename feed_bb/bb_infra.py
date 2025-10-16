@@ -33,7 +33,7 @@ async def init_pg_pool() -> AsyncConnectionPool:
 def init_redis_client() -> aioredis.Redis:
     if not REDIS_URL:
         raise RuntimeError("REDIS_URL not set")
-    return aioredis.from_url(ß
+    return aioredis.from_url(
         REDIS_URL,
         decode_responses=True,
         encoding="utf-8"
