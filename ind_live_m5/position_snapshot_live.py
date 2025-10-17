@@ -483,11 +483,22 @@ async def process_position_live(redis,
         all_rows_ok.extend(ok_rows)
         all_rows_err.extend(err_rows)
 
-    # запись в БД
+    # 🔸 запись в БД: одна попытка, при FK-ошибке — пауза 5 сек и повтор
     try:
         await upsert_rows_live(pg, all_rows_ok + all_rows_err)
     except Exception as e:
-        log.warning(f"POS_SNAPSHOT_LIVE db_upsert error uid={position_uid} sym={symbol}: {e}", exc_info=True)
+        msg = str(e)
+        # короткий retry только на FK-ошибки по позициям/стратегиям
+        if ("fk_ips_position" in msg) or ("fk_ips_strategy" in msg) or ("ForeignKeyViolationError" in msg):
+            log.warning(f"[LIVE] FK missing on first write (uid={position_uid}). Retry in 5s…")
+            await asyncio.sleep(5)
+            try:
+                await upsert_rows_live(pg, all_rows_ok + all_rows_err)
+                log.info(f"[LIVE] retry write OK uid={position_uid}")
+            except Exception as e2:
+                log.warning(f"POS_SNAPSHOT_LIVE db_upsert error (retry) uid={position_uid} sym={symbol}: {e2}", exc_info=True)
+        else:
+            log.warning(f"POS_SNAPSHOT_LIVE db_upsert error uid={position_uid} sym={symbol}: {e}", exc_info=True)
 
     pos_ms = int((time.monotonic() - pos_t0) * 1000)
     log.info(
