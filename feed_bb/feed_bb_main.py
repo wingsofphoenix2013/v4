@@ -18,7 +18,7 @@ from bb_feed_and_aggregate import (
     run_feed_and_aggregator_h1_bb,
 )
 from bb_markprice_watcher import run_markprice_watcher_bb
-from bb_feed_cleaner import run_feed_cleaner_bb
+from feed_cleaner import run_feed_cleaner_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
