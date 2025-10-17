@@ -18,6 +18,7 @@ from bb_feed_and_aggregate import (
     run_feed_and_aggregator_h1_bb,
 )
 from bb_markprice_watcher import run_markprice_watcher_bb
+from bb_feed_cleaner import run_feed_cleaner_bb
 
 log = logging.getLogger("FEED_BB_MAIN")
 
@@ -52,6 +53,7 @@ async def main():
         run_safe_loop(lambda: run_feed_ts_filler_bb(pg_pool, redis),       "BB_TS_FILLER"),
         run_safe_loop(lambda: run_feed_healer_bb(pg_pool, redis),          "BB_FEED_HEALER"),
         run_safe_loop(lambda: run_tickers_precision_updater_bb(pg_pool),   "BB_PRECISION_UPDATER"),
+        run_safe_loop(lambda: run_feed_cleaner_bb(pg_pool, redis),         "BB_FEED_CLEANER"),
         delayed_ws_workers(),  # аггрегаторы и markprice стартуют спустя задержку
     )
 
