@@ -1,4 +1,4 @@
-# oracle_mw_confidence.py — воркер MW-confidence: пакетный расчёт R/P/C/S по комплекту (7d+14d+28d), батч-SQL, параллелизм (max=2), строгая идемпотентность
+# oracle_mw_confidence.py — воркер MW-confidence: пакетный расчёт R/P/C/S по комплекту (7d+14d+28d), батч-SQL, параллелизм (max=2), идемпотентность «второго шанса»
 
 # 🔸 Импорты
 import asyncio
@@ -25,7 +25,7 @@ SENSE_REPORT_READY_MAXLEN = 10_000
 # 🔸 Параллелизм
 MAX_CONCURRENT_STRATEGIES = 2  # одновременно обрабатываем до 2 стратегий (комплектов window_end)
 
-# Геометрия окна (шаг 6 часов → 4 прогона в сутки)
+# 🔸 Геометрия окна (шаг 6 часов → 4 прогона в сутки)
 WINDOW_STEPS = {"7d": 7 * 4, "14d": 14 * 4, "28d": 28 * 4}
 
 # 🔸 Параметры статистики
@@ -118,11 +118,12 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         window_end_dt = datetime.fromisoformat(window_end_iso.replace("Z", ""))
     except Exception:
         log.exception("❌ Неверный формат window_end: %r", window_end_iso)
+        # ACK всех сообщений комплекта, чтобы не зависали без шансов
         await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, *[mid for (mid, _) in items])
         return
 
     async with infra.pg_pool.acquire() as conn:
-        # 0) Ранний гейт идемпотентности — если комплект уже обработан, ACK и выходим
+        # ранний гейт идемпотентности — второй шанс, если появились строки без confidence
         already = await conn.fetchval(
             """
             SELECT 1 FROM oracle_conf_processed
@@ -131,19 +132,32 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             int(strategy_id), window_end_dt
         )
         if already:
-            await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, *[mid for (mid, _) in items])
-            log.debug("⏭️ Пропуск: комплект уже обработан (sid=%s window_end=%s)", strategy_id, window_end_iso)
-            return
+            missing = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int
+                  FROM oracle_mw_aggregated_stat a
+                  JOIN oracle_report_stat r ON r.id = a.report_id
+                 WHERE r.strategy_id = $1
+                   AND r.window_end  = $2
+                   AND (a.confidence IS NULL OR a.confidence_inputs IS NULL)
+                """,
+                int(strategy_id), window_end_dt
+            )
+            if int(missing or 0) == 0:
+                await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, *[mid for (mid, _) in items])
+                log.debug("⏭️ Пропуск комплекта: уже обработан, недостающих confidence нет (sid=%s window_end=%s)", strategy_id, window_end_iso)
+                return
+            # иначе продолжаем расчёт повторно (добиваем пропуски)
 
-        # 1) Проверяем, что комплект 7d/14d/28d готов по шапкам
+        # проверяем, что комплект 7d/14d/28d готов по шапкам (source='mw')
         rows = await conn.fetch(
             """
             SELECT id, time_frame, created_at
-            FROM oracle_report_stat
-            WHERE strategy_id = $1
-              AND window_end  = $2
-              AND time_frame IN ('7d','14d','28d')
-              AND source = 'mw'
+              FROM oracle_report_stat
+             WHERE strategy_id = $1
+               AND window_end  = $2
+               AND time_frame IN ('7d','14d','28d')
+               AND source = 'mw'
             """,
             int(strategy_id), window_end_dt
         )
@@ -154,13 +168,13 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         # три report_id по окнам
         report_ids: Dict[str, int] = {str(r["time_frame"]): int(r["id"]) for r in rows}
 
-        # 2) Проверяем, что у каждого окна есть строки в oracle_mw_aggregated_stat
+        # проверяем, что у каждого окна есть строки в oracle_mw_aggregated_stat
         cnt_rows = await conn.fetch(
             """
             SELECT report_id, COUNT(*)::int AS cnt
-            FROM oracle_mw_aggregated_stat
-            WHERE report_id = ANY($1::bigint[])
-            GROUP BY report_id
+              FROM oracle_mw_aggregated_stat
+             WHERE report_id = ANY($1::bigint[])
+             GROUP BY report_id
             """,
             list(report_ids.values())
         )
@@ -169,13 +183,13 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             log.debug("⌛ Комплект не готов (агрегаты): sid=%s window_end=%s cnts=%s", strategy_id, window_end_iso, counts)
             return
 
-        # 3) Предзагрузка активных весов (стабильны в рамках комплекта)
+        # предзагрузка активных весов (стабильны в рамках комплекта)
         weights_by_tf: Dict[str, Tuple[Dict[str, float], Dict]] = {}
         for tf in ("7d", "14d", "28d"):
             w, o = await _get_active_weights(conn, strategy_id, tf)
             weights_by_tf[tf] = (w, o)
 
-        # 4) Забираем ВСЕ агрегаты по трём отчётам одним запросом
+        # забираем ВСЕ агрегаты по трём отчётам одним запросом
         agg_rows = await conn.fetch(
             """
             SELECT
@@ -193,7 +207,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             log.debug("ℹ️ Нет агрегатов для комплекта: sid=%s window_end=%s", strategy_id, window_end_iso)
             return
 
-        # 5) Подготовим когорты: ключ = без agg_state + report_created_at
+        # подготовим когорты: ключ = без agg_state + report_created_at
         # (strategy_id, time_frame, direction, timeframe, agg_type, agg_base, report_created_at)
         cohort_keys: List[Tuple] = []
         for r in agg_rows:
@@ -203,7 +217,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             ))
         cohort_keys = list({ck for ck in cohort_keys})
 
-        # 6) Загрузим все когорты батчами через UNNEST из v_mw_aggregated_with_time
+        # загрузим когорты батчами через UNNEST из v_mw_aggregated_with_time
         cohort_cache: Dict[Tuple, List[dict]] = {}
         if cohort_keys:
             BATCH = 200
@@ -252,7 +266,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                     )
                     cohort_cache.setdefault(ck, []).append(dict(rr))
 
-        # 7) Persistence-матрицы (последние L отчётов) для каждого окна
+        # persistence-матрицы (последние L отчётов) для каждого окна
         persistence_by_tf: Dict[str, Dict[Tuple, List[Optional[int]]]] = {}
         for tf in ("7d", "14d", "28d"):
             rep_created = None
@@ -262,7 +276,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             L = int(WINDOW_STEPS.get(tf, 42))
             persistence_by_tf[tf] = await _persistence_matrix_mw(conn, strategy_id, tf, rep_created, L) if rep_created else {}
 
-        # 8) Сгруппируем строки по ключу для C (кросс-оконная согласованность)
+        # сгруппируем строки по ключу для C (кросс-оконная согласованность)
         rows_by_key: Dict[Tuple, List[dict]] = {}
         agg_list = [dict(r) for r in agg_rows]
         for r in agg_list:
@@ -272,7 +286,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             )
             rows_by_key.setdefault(kC, []).append(r)
 
-        # 9) Расчёт и запись — атомарно
+        # расчёт и запись — атомарно
         updated_per_report: Dict[int, int] = {rid: 0 for rid in report_ids.values()}
         ids, confs, inputs = [], [], []
 
@@ -282,7 +296,10 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             wr = float(r["winrate"] or 0.0)
 
             # веса на окно
-            weights, opts = weights_by_tf.get(str(r["time_frame"]), ({"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}, {"baseline_mode": "neutral"}))
+            weights, opts = weights_by_tf.get(
+                str(r["time_frame"]),
+                ({"wR": 0.4, "wP": 0.25, "wC": 0.2, "wS": 0.15}, {"baseline_mode": "neutral"})
+            )
 
             # R
             R = _wilson_lower_bound(w, n, Z) if n > 0 else 0.0
@@ -328,9 +345,14 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             abs_mass = math.sqrt(n / (n + n_med)) if (n_med > 0 and n >= 0) else 0.0
             N_effect = float(max(0.0, min(1.0, N_effect * abs_mass)))
 
-            # веса
+            # веса (безопасная нормировка)
             wR = float(weights.get("wR", 0.4)); wP = float(weights.get("wP", 0.25))
             wC = float(weights.get("wC", 0.2));  wS = float(weights.get("wS", 0.15))
+            total_w = wR + wP + wC + wS
+            if not math.isfinite(total_w) or total_w <= 0:
+                wR, wP, wC, wS = 0.4, 0.25, 0.2, 0.15
+                total_w = 1.0
+            wR, wP, wC, wS = (wR / total_w, wP / total_w, wC / total_w, wS / total_w)
 
             raw = wR * R + wP * P + wC * C + wS * S
             confidence = round(max(0.0, min(1.0, raw * N_effect)), 4)
@@ -348,10 +370,14 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
 
             ids.append(int(r["id"]))
             confs.append(float(confidence))
-            inputs.append(json.dumps(inputs_json, separators=(",", ":")))
+            try:
+                inputs.append(json.dumps(inputs_json, separators=(",", ":")))
+            except Exception:
+                inputs.append(json.dumps({"error": "encode_failed"}))
+
             updated_per_report[int(r["report_id"])] = updated_per_report.get(int(r["report_id"]), 0) + 1
 
-        # 10) Атомарная запись: UPDATE + маркер processed
+        # атомарная запись: UPDATE + маркер processed
         async with conn.transaction():
             if ids:
                 await conn.executemany(
@@ -364,7 +390,6 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                     """,
                     list(zip(ids, confs, inputs))
                 )
-
             await conn.execute(
                 """
                 INSERT INTO oracle_conf_processed (strategy_id, window_end)
@@ -374,7 +399,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
                 int(strategy_id), window_end_dt
             )
 
-        # 11) Лог
+        # лог
         log.debug(
             "✅ Обновлён confidence (MW): sid=%s window_end=%s rows_total=%d rows_7d=%d rows_14d=%d rows_28d=%d",
             strategy_id, window_end_iso, len(ids),
@@ -383,7 +408,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
             updated_per_report.get(report_ids.get("28d", -1), 0),
         )
 
-        # 12) Публикуем ТРИ события — по одному на каждый отчёт (для sense-воркера)
+        # публикация ТРЁХ событий — по одному на каждый отчёт (для sense-воркера)
         try:
             for tf in ("7d", "14d", "28d"):
                 rid = report_ids[tf]
@@ -406,7 +431,7 @@ async def _process_window_batch(items: List[Tuple[str, dict]], strategy_id: int,
         except Exception:
             log.exception("❌ Ошибка публикации событий в %s", SENSE_REPORT_READY_STREAM)
 
-        # 13) ACK всех сообщений комплекта — только после успешного commit
+        # ACK всех сообщений комплекта — только после успешного commit
         await infra.redis_client.xack(REPORT_STREAM, REPORT_CONSUMER_GROUP, *[mid for (mid, _) in items])
 
 
@@ -460,19 +485,19 @@ async def _get_active_weights(conn, strategy_id: int, time_frame: str) -> Tuple[
     else:
         weights = defaults_w; opts = defaults_o
 
+    # мягкие ограничения + нормировка
     wR = float(weights.get("wR", defaults_w["wR"]))
     wP = float(weights.get("wP", defaults_w["wP"]))
     wC = float(weights.get("wC", defaults_w["wC"]))
     wS = float(weights.get("wS", defaults_w["wS"]))
 
-    # мягкие ограничения
     wC = min(wC, 0.35)
     wR = max(wR, 0.25)
 
     total = wR + wP + wC + wS
     if not math.isfinite(total) or total <= 0:
         wR, wP, wC, wS = defaults_w["wR"], defaults_w["wP"], defaults_w["wC"], defaults_w["wS"]
-        total = wR + wP + wC + wS
+        total = 1.0
 
     wR, wP, wC, wS = (wR / total, wP / total, wC / total, wS / total)
     weights_norm = {"wR": wR, "wP": wP, "wC": wC, "wS": wS}
@@ -492,13 +517,13 @@ async def _persistence_matrix_mw(conn, strategy_id: int, time_frame: str, cutoff
     last_reports = await conn.fetch(
         """
         SELECT id, created_at
-        FROM oracle_report_stat
-        WHERE strategy_id = $1
-          AND time_frame  = $2
-          AND created_at <= $3
-          AND source = 'mw'
-        ORDER BY created_at DESC
-        LIMIT $4
+          FROM oracle_report_stat
+         WHERE strategy_id = $1
+           AND time_frame  = $2
+           AND created_at <= $3
+           AND source = 'mw'
+         ORDER BY created_at DESC
+         LIMIT $4
         """,
         int(strategy_id), str(time_frame), cutoff_created_at, int(L)
     )
