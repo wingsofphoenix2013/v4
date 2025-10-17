@@ -174,7 +174,7 @@ class IndLiveConfig:
                 "params": params_by_id.get(iid, {}),
                 "enabled_at": inst["enabled_at"],
             }
-            log_init.debug(f"Indicator ON: id={iid} {inst['indicator']} {params_by_id.get(iid, {})}")
+            log_init.debug(f"Indicator ON: id={inst['id']} {inst['indicator']} {params_by_id.get(iid, {})}")
         log_init.info(f"Loaded active indicator instances: {len(self.indicator_instances)}")
 
     # 🔸 Загрузка стратегий (enabled & not archived) с полем market_watcher
@@ -304,7 +304,7 @@ class IndLiveConfig:
             except Exception as e:
                 log_i.warning(f"Indicator event error id={iid}: {e}", exc_info=True)
 
-    # 🔸 Подписка на события стратегий (Pub/Sub: strategies_v4_events); если формат неизвестен — делаем безопасную перечитку
+    # 🔸 Подписка на события стратегий (Pub/Sub: strategies_v4_events), гибкий парсер (поддержка action:true/false)
     async def run_strategy_events(self) -> None:
         log_s = logging.getLogger("CFG_STRAT")
         pubsub = self.redis.pubsub()
@@ -317,48 +317,73 @@ class IndLiveConfig:
         async for msg in pubsub.listen():
             if msg["type"] != "message":
                 continue
+
+            # парсим JSON; при ошибке — просто игнорируем это событие (не ломаем цикл)
             try:
                 data = json.loads(msg["data"])
             except Exception:
+                log_s.debug("CFG_STRAT: bad json, ignore")
                 continue
 
             sid_raw = data.get("id")
             try:
-                sid = int(sid_raw)
+                sid = int(sid_raw) if sid_raw is not None else None
             except Exception:
                 sid = None
 
-            # возможные поля событий
-            action = str(data.get("action") or "").lower()
-            mw_val = data.get("market_watcher")
+            # допускаем разные форматы событий
+            action  = str(data.get("action") or "").lower()
+            mw_val  = data.get("market_watcher")
             enabled = data.get("enabled")
             archived = data.get("archived")
 
             try:
                 if sid is None:
-                    # формат события неизвестен — обновим всё
+                    # событие без id — мягко перечитаем все стратегии
                     await self._load_initial_strategies()
+                    log_s.debug("CFG_STRAT: fallback full reload (no id)")
                     continue
 
-                # если явно пришёл market_watcher
+                # прямое обновление market_watcher
                 if mw_val is not None:
                     self.active_strategies[int(sid)] = bool(mw_val)
-                    log_s.debug(f"Strategy MW update: id={sid} → {bool(mw_val)}")
+                    log_s.info(f"Strategy MW update: id={sid} → {bool(mw_val)}")
                     continue
 
-                # если пришли enabled/archived — перечитаем одну стратегию
-                if (enabled is not None) or (archived is not None) or (action in ("enable","enabled","disable","disabled","on","off")):
+                # включение/выключение по action: true/false или on/off/enable/disable
+                if action in ("true", "on", "enable", "enabled"):
                     async with self.pg.acquire() as conn:
                         row = await conn.fetchrow(f"""
-                            SELECT id, COALESCE(market_watcher, false) AS market_watcher
+                            SELECT id, COALESCE(market_watcher,false) AS mw
                             FROM {STRATEGIES_TABLE}
-                            WHERE id = $1 AND enabled = true AND archived = false
-                        """, sid)
+                            WHERE id=$1 AND enabled=true AND archived=false
+                        """, int(sid))
                     if row:
-                        self.active_strategies[int(row["id"])] = bool(row["market_watcher"])
-                        log_s.debug(f"Strategy ON: id={sid} market_watcher={bool(row['market_watcher'])}")
+                        self.active_strategies[int(row["id"])] = bool(row["mw"])
+                        log_s.info(f"Strategy ON: id={sid} market_watcher={bool(row['mw'])}")
                     else:
                         if self.active_strategies.pop(int(sid), None) is not None:
-                            log_s.debug(f"Strategy OFF: id={sid}")
+                            log_s.info(f"Strategy OFF (by db): id={sid}")
+                    continue
+
+                if action in ("false", "off", "disable", "disabled") or (enabled is not None) or (archived is not None):
+                    async with self.pg.acquire() as conn:
+                        row = await conn.fetchrow(f"""
+                            SELECT id, COALESCE(market_watcher,false) AS mw
+                            FROM {STRATEGIES_TABLE}
+                            WHERE id=$1 AND enabled=true AND archived=false
+                        """, int(sid))
+                    if row:
+                        self.active_strategies[int(row["id"])] = bool(row["mw"])
+                        log_s.info(f"Strategy ON: id={sid} market_watcher={bool(row['mw'])}")
+                    else:
+                        if self.active_strategies.pop(int(sid), None) is not None:
+                            log_s.info(f"Strategy OFF: id={sid}")
+                    continue
+
+                # непонятный формат — мягкая полная перечитка
+                await self._load_initial_strategies()
+                log_s.debug(f"CFG_STRAT: fallback full reload (unhandled event) data={data}")
+
             except Exception as e:
                 log_s.warning(f"Strategy event error id={sid}: {e}", exc_info=True)
