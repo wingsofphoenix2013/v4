@@ -1,4 +1,4 @@
-# position_snapshot_live.py — live-снапшоты по открытым позициям из Redis-ключей (ind_live / ind_mw_live / pack_live) с записью в indicator_position_stat
+# position_snapshot_live.py — live-снапшоты по открытым позициям: чтение ind_live / ind_mw_live / pack_live и запись в indicator_position_stat
 
 # 🔸 Импорты
 import asyncio
@@ -9,15 +9,15 @@ from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any, Set
 
 from indicators.compute_and_store import get_expected_param_names
-
+# 🔸 Общие пороги MW (для derived-флага high_vol)
+from indicator_mw_shared import vol_thresholds
 
 # 🔸 Логгер
 log = logging.getLogger("POS_SNAPSHOT_LIVE")
 
-
 # 🔸 Константы/настройки
 REQ_STREAM_POSITIONS = "positions_open_stream"   # входной стрим открытых позиций
-GROUP       = "possnap_live_group"               # отдельная consumer-group, чтобы не мешать другим потребителям
+GROUP       = "possnap_live_group"               # consumer-group
 CONSUMER    = "possnap_live_1"
 
 POS_CONCURRENCY  = 10                            # одновременно обрабатываем позиций
@@ -46,7 +46,7 @@ RAW_TYPES  = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb","kama")
 PACK_TYPES = ("rsi","mfi","ema","atr","lr","adx_dmi","macd","bb")
 MW_TYPES   = ("trend","volatility","momentum","extremes")
 
-# 🔸 Константы БД для записи (ПЕРЕКЛЮЧЕНО НА ОСНОВНУЮ ТАБЛИЦУ)
+# 🔸 Константы БД для записи
 TABLE_LIVE = "indicator_position_stat"
 DB_UPSERT_TIMEOUT_SEC = 15
 BATCH_INSERT_SIZE = 400
@@ -129,7 +129,7 @@ def collect_expectations(instances_all_tf: List[Dict[str, Any]], tf: str) -> Tup
     return raw_expect, pack_bases
 
 
-# 🔸 Формирование «потенциальной строки БД» (совместимо по полям)
+# 🔸 Формирование строки для БД
 def make_row(position_uid: str, strategy_id: int, symbol: str, tf: str,
              param_type: str, param_base: str, param_name: str,
              value: Optional[str], open_time_iso: str,
@@ -196,7 +196,7 @@ async def process_tf_live(redis,
                           created_at_ms: int) -> Tuple[List[Tuple], List[Tuple]]:
     tf_t0 = time.monotonic()
 
-    # косметика: фиксируем open_time для БД — привязка к времени открытия позиции
+    # фиксируем open_time для БД — привязка к времени открытия позиции
     bar_open_ms = floor_to_bar_ms(created_at_ms, tf)
     open_time_iso = datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
 
@@ -224,6 +224,9 @@ async def process_tf_live(redis,
                                     val, open_time_iso, status="ok"))
 
     # ----- MW (ind_mw_live) -----
+    mw_objs: Dict[str, Dict[str, Any]] = {}   # kind -> pack-dict
+    mw_states: Dict[str, str] = {}            # kind -> state
+
     for kind in MW_TYPES:
         mw_key = f"ind_mw_live:{symbol}:{tf}:{kind}"
         try:
@@ -235,28 +238,104 @@ async def process_tf_live(redis,
             rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
                                      "marketwatch", kind, "state",
                                      None, open_time_iso, status="error", error_code="missing_live"))
+            continue
+
+        try:
+            obj = json.loads(js)
+            pack = obj.get("pack") or {}
+            state = pack.get("state")
+        except Exception:
+            rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
+                                     "marketwatch", kind, "state",
+                                     None, open_time_iso, status="error", error_code="json_parse"))
+            continue
+
+        if state is None:
+            rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
+                                     "marketwatch", kind, "state",
+                                     None, open_time_iso, status="error", error_code="state_missing"))
+            continue
+
+        mw_states[kind] = str(state)
+        mw_objs[kind] = pack
+
+        # state по kind (как раньше)
+        rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
+                                "marketwatch", kind, "state",
+                                str(state), open_time_iso, status="ok"))
+
+    # ----- MW-derived: pullback_flag / mom_align / high_vol -----
+    # direction из trend.state
+    trend_state = mw_states.get("trend")
+    if trend_state:
+        if trend_state.startswith("up_"):
+            trend_dir = "up"
+        elif trend_state.startswith("down_"):
+            trend_dir = "down"
         else:
-            state = None
-            try:
-                obj = json.loads(js)
-                pack = obj.get("pack") or {}
-                state = pack.get("state")
-            except Exception:
-                rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
-                                         "marketwatch", kind, "state",
-                                         None, open_time_iso, status="error", error_code="json_parse"))
-                state = None
-            if state is not None:
-                rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
-                                        "marketwatch", kind, "state",
-                                        str(state), open_time_iso, status="ok"))
-            elif js:
-                rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
-                                         "marketwatch", kind, "state",
-                                         None, open_time_iso, status="error", error_code="state_missing"))
+            trend_dir = "sideways"
+    else:
+        trend_dir = None
+
+    # pullback_flag: сравнение направления тренда и знака смещения BB-корзины в extremes
+    pullback_flag = "none"
+    ext_pack = mw_objs.get("extremes") or {}
+    try:
+        bb_info = ext_pack.get("bb") or {}
+        bdelta_raw = bb_info.get("bucket_delta")
+        bdelta = int(bdelta_raw) if bdelta_raw is not None else None
+    except Exception:
+        bdelta = None
+
+    if trend_dir in ("up", "down") and bdelta is not None:
+        if trend_dir == "up":
+            if bdelta <= -1: pullback_flag = "against"
+            elif bdelta >= +1: pullback_flag = "with"
+        elif trend_dir == "down":
+            if bdelta >= +1: pullback_flag = "against"
+            elif bdelta <= -1: pullback_flag = "with"
+
+    rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
+                            "marketwatch", "pullback_flag", "state",
+                            pullback_flag, open_time_iso, status="ok"))
+
+    # mom_align: импульс из Momentum относительно направления тренда
+    mom_state = mw_states.get("momentum")
+    if mom_state in ("bull_impulse", "bear_impulse") and trend_dir in ("up","down"):
+        if (mom_state == "bull_impulse" and trend_dir == "up") or (mom_state == "bear_impulse" and trend_dir == "down"):
+            mom_align = "aligned"
+        else:
+            mom_align = "countertrend"
+    else:
+        mom_align = "flat"
+
+    rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
+                            "marketwatch", "mom_align", "state",
+                            mom_align, open_time_iso, status="ok"))
+
+    # high_vol: ATR% из volatility.pack против порога
+    vol_pack = mw_objs.get("volatility") or {}
+    atr_pct_str = None
+    try:
+        atr_pct_str = vol_pack.get("atr_pct") or (vol_pack.get("atr") or {}).get("pct")
+    except Exception:
+        atr_pct_str = None
+
+    atr_pct_val = None
+    try:
+        atr_pct_val = float(atr_pct_str) if atr_pct_str is not None else None
+    except Exception:
+        atr_pct_val = None
+
+    high_thr = vol_thresholds(tf)["atr_high"]
+    high_vol = "yes" if (atr_pct_val is not None and atr_pct_val >= high_thr) else "no"
+
+    rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
+                            "marketwatch", "high_vol", "state",
+                            high_vol, open_time_iso, status="ok"))
 
     # ----- PACK (pack_live) -----
-    for ind in ("rsi","mfi","ema","atr","lr","adx_dmi"):  # без 'kama' — у нас нет pack_live для KAMA
+    for ind in ("rsi","mfi","ema","atr","lr","adx_dmi"):  # без 'kama'
         for L in sorted(pack_bases.get(ind, set())):
             base = f"{ind}{int(L)}"
             pkey = f"pack_live:{ind}:{symbol}:{tf}:{base}"
@@ -404,7 +483,7 @@ async def process_position_live(redis,
         all_rows_ok.extend(ok_rows)
         all_rows_err.extend(err_rows)
 
-    # запись в ТАБЛИЦУ ОСНОВНОГО ВОРКЕРА (см. TABLE_LIVE)
+    # запись в БД
     try:
         await upsert_rows_live(pg, all_rows_ok + all_rows_err)
     except Exception as e:
@@ -423,7 +502,7 @@ async def run_position_snapshot_live(pg,
                                      get_strategy_mw):
     log.debug("POS_SNAPSHOT_LIVE: воркер запущен (чтение live-ключей → запись в indicator_position_stat)")
 
-    # создаём consumer-group (идемпотентно, не конфликтует с другими)
+    # создаём consumer-group (идемпотентно)
     try:
         await redis.xgroup_create(REQ_STREAM_POSITIONS, GROUP, id="$", mkstream=True)
     except Exception as e:
