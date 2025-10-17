@@ -26,7 +26,7 @@ SENSE_SCORE_MIN = 0.5     # v1: score_smoothed > 0.5 на оси (pack_base+agg_
 CONF_MIN = 0.5            # v1: aggregated confidence > 0.5
 WR_WL_MIN = 0.55          # в whitelist при winrate ≥ 0.55
 WR_BL_MAX = 0.5           # в blacklist при winrate < 0.5
-WL_V2_MIN_SHARE = 0.01    # v2: доля от общего числа закрытых сделок (1%)
+WL_V2_MIN_SHARE = 0.02    # v2: доля от общего числа закрытых сделок (2%)
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_pack_lists():

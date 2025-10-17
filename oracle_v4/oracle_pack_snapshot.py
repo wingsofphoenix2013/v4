@@ -41,42 +41,38 @@ PACK_COMBOS = {
     "rsi": ["bucket_low|trend"],
     "mfi": ["bucket_low|trend"],
     "atr": ["bucket|bucket_delta"],
+
     "bb": [
         "bucket|bucket_delta",
         "bucket|bw_trend_smooth",
+        "bucket_delta|bw_trend_smooth",
         "bucket|bucket_delta|bw_trend_smooth",
     ],
+
     "lr": [
         "bucket|bucket_delta",
         "bucket|angle_trend",
+        "bucket_delta|angle_trend",
         "bucket|bucket_delta|angle_trend",
     ],
+
     "adx_dmi": [
-        "adx_bucket_low|gap_bucket_low",
         "adx_bucket_low|adx_dynamic_smooth",
         "gap_bucket_low|gap_dynamic_smooth",
-        "adx_bucket_low|gap_dynamic_smooth",
-        "adx_bucket_low|gap_bucket_low|adx_dynamic_smooth",
-        "adx_bucket_low|gap_bucket_low|gap_dynamic_smooth",
+        "adx_dynamic_smooth|gap_dynamic_smooth",
     ],
+
     "ema": [
-        "side|dynamic",
         "side|dynamic_smooth",
-        "side|dynamic|dynamic_smooth",
+        "side|dynamic",
     ],
+
     "macd": [
         "mode|cross",
-        "mode|zero_side",
-        "mode|hist_bucket_low_pct",
         "mode|hist_trend_smooth",
-        "cross|zero_side",
-        "cross|hist_bucket_low_pct",
+        "mode|hist_bucket_low_pct",
         "cross|hist_trend_smooth",
-        "mode|cross|zero_side",
-        "mode|zero_side|hist_trend_smooth",
-        "mode|hist_bucket_low_pct|hist_trend_smooth",
-        "mode|cross|hist_trend_smooth",
-        "mode|cross|zero_side|hist_trend_smooth",
+        "mode|zero_side",
     ],
 }
 

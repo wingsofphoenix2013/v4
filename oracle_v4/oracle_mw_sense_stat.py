@@ -25,15 +25,28 @@ WHITELIST_READY_MAXLEN = 10_000
 TF_LIST = ("m5", "m15", "h1")
 DIRECTIONS = ("long", "short")
 
-# ⚠️ Рабочий набор осей: solo=trend и комбо только с trend
+# 🔸 Рабочий набор осей: solo=trend и комбо только с trend (+ derived-базы, записанные в indicator_position_stat)
 AGG_BASES = (
     "trend",
+
     "trend_volatility",
     "trend_extremes",
     "trend_momentum",
+
+    # derived-пары (добавлены в position_snapshot_live.py и oracle_mw_snapshot.py)
+    "trend_pullback_flag",     # pullback против/по тренду: against|with|none
+    "trend_mom_align",         # импульс согласован/против тренда: aligned|countertrend|flat
+    # "trend_high_vol",        # (опционально) high_vol: yes|no
+
     "trend_volatility_extremes",
     "trend_volatility_momentum",
     "trend_extremes_momentum",
+
+    # derived-триплеты (по необходимости и достаточной мощности)
+    "trend_volatility_mom_align",
+    "trend_volatility_pullback_flag",
+
+    # квартет — оставляем классический
     "trend_volatility_extremes_momentum",
 )
 
@@ -47,7 +60,8 @@ CONF_THRESHOLD_WL = 0.5  # строка агрегата (agg_state) — confide
 WL_WR_MIN = 0.55         # минимальный winrate для попадания строки в whitelist (>= 0.55)
 
 # 🔸 Порог для whitelist v2 (доля от общего числа закрытых сделок в окне 7d)
-WL_V2_MIN_SHARE = 0.01   # 1%
+WL_V2_MIN_SHARE = 0.02   # 2%
+
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_sense_stat():
@@ -113,6 +127,7 @@ async def run_oracle_sense_stat():
             log.exception("❌ Ошибка цикла sense-stat — пауза 5 секунд")
             await asyncio.sleep(5)
 
+
 # 🔸 Обработка одного отчёта: расчёт sense-stat + WL v1 (7d) + WL v2 (7d)
 async def _process_report(report_id: int, strategy_id: int, time_frame: str, window_end_iso: str):
     # парсинг window_end
@@ -150,10 +165,12 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
 
             for tf in TF_LIST:
                 for direction in DIRECTIONS:
-                    for base in AGG_BASES:
-                        states = data.get((tf, direction, base), [])
+                    # берём только те базы, что реально присутствуют для (tf, direction) и разрешены списком
+                    bases_present = [b for b in AGG_BASES if (tf, direction, b) in data]
+                    for base in bases_present:
+                        states = data[(tf, direction, base)]
                         if not states:
-                            continue  # только если есть хотя бы одно состояние
+                            continue
 
                         score_current, states_used, components = _compute_score(states)
 
@@ -255,21 +272,21 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
             except Exception:
                 log.exception("❌ Ошибка публикации события в %s (v2)", WHITELIST_READY_STREAM)
 
+
 # 🔸 Построение whitelist v1 для 7d: очищаем ТОЛЬКО v1 по стратегии и заполняем свежим набором
 async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window_end_dt: datetime) -> int:
-    # 1) оси (agg_base), прошедшие sense-фильтр (score_smoothed > SCORE_SENSE_MIN) на этом отчёте
+    # оси (agg_base), прошедшие sense-фильтр (score_smoothed > SCORE_SENSE_MIN) на этом отчёте
     bases_rows = await conn.fetch(
         """
         SELECT timeframe, direction, agg_base
-        FROM oracle_mw_sense_stat
-        WHERE report_id = $1
-          AND time_frame = '7d'
-          AND score_smoothed > $2
+          FROM oracle_mw_sense_stat
+         WHERE report_id = $1
+           AND time_frame = '7d'
+           AND score_smoothed > $2
         """,
         report_id, float(SCORE_SENSE_MIN)
     )
     if not bases_rows:
-        # актуализируем пустым срезом только для v1
         async with conn.transaction():
             await conn.execute(
                 "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1'",
@@ -279,7 +296,7 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
 
     selectors = {(r["timeframe"], r["direction"], r["agg_base"]) for r in bases_rows}
 
-    # 2) кандидаты из aggregated_stat по 7d с порогами confidence / winrate
+    # кандидаты из aggregated_stat по 7d с порогами confidence / winrate
     cand_rows = await conn.fetch(
         """
         SELECT
@@ -301,19 +318,18 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
         report_id, strategy_id, float(CONF_THRESHOLD_WL), float(WL_WR_MIN)
     )
 
-    # 3) фильтруем только по выбранным осям (из sense)
+    # фильтр по выбранным осям
     filtered = [
         dict(r) for r in cand_rows
         if (r["timeframe"], r["direction"], r["agg_base"]) in selectors
     ]
 
-    # 4) атомарно обновляем v1-срез для стратегии
+    # атомарно обновляем v1-срез для стратегии
     async with conn.transaction():
         await conn.execute(
             "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1'",
             strategy_id
         )
-
         if filtered:
             await conn.executemany(
                 """
@@ -341,6 +357,7 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
 
     return len(filtered)
 
+
 # 🔸 Построение whitelist v2 (7d): без sense/conf, по доле сделок и порогу winrate
 async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame: str, window_end_dt: datetime, min_share: float) -> int:
     # общий объём закрытых сделок из шапки отчёта (для текущего окна)
@@ -350,7 +367,6 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
     )
     closed_total = int(closed_total or 0)
     if closed_total <= 0:
-        # очистим v2-срез для стратегии
         async with conn.transaction():
             await conn.execute(
                 "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2'",
@@ -358,7 +374,6 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
             )
         return 0
 
-    # порог по доле (> min_share от общего числа закрытых сделок)
     threshold = float(closed_total) * float(min_share)
 
     # все агрегаты текущего отчёта 7d
@@ -372,7 +387,7 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
             a.agg_base      AS agg_base,
             a.agg_state     AS agg_state,
             a.winrate       AS winrate,
-            a.confidence    AS confidence,   -- не используем, но пишем как есть
+            a.confidence    AS confidence,
             a.trades_total  AS trades_total
         FROM oracle_mw_aggregated_stat a
         WHERE a.report_id = $1
@@ -381,20 +396,19 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
         report_id, str(time_frame)
     )
 
-    # фильтр: масса > threshold И winrate >= WL_WR_MIN (без sense/conf)
+    # фильтр по массе и WR
     filtered = [
         dict(r) for r in cand_rows
         if float(r["trades_total"] or 0.0) > threshold
            and float(r["winrate"] or 0.0) >= float(WL_WR_MIN)
     ]
 
-    # атомарно перестраиваем v2-срез для стратегии
+    # атомарно перестраиваем v2-срез
     async with conn.transaction():
         await conn.execute(
             "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2'",
             strategy_id
         )
-
         if filtered:
             await conn.executemany(
                 """
@@ -421,7 +435,8 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
             )
 
     return len(filtered)
-    
+
+
 # 🔸 Расчёт разделяющей силы (winrate по состояниям внутри базы)
 def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
     # должно быть минимум 2 состояния с n>0
@@ -442,7 +457,7 @@ def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
         if n_i <= 0:
             continue
         p_i = float(s["p"])
-        # межгрупповая дисперсия: вклад состояния
+        # межгрупповая дисперсия
         ss_between += n_i * (p_i - p_bar) ** 2
         # внутригрупповая вариативность: сумма p(1-p) как аппроксимация
         ss_within += p_i * (1.0 - p_i)
@@ -459,6 +474,7 @@ def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
         "formula": "score = SS_between / (SS_between + SS_within)",
     }
     return score, len(states), comps
+
 
 # 🔸 Сглаживание (среднее по текущему и ≤5 предыдущим)
 def _smooth_mean(current: float, history: List[float]) -> float:

@@ -1,5 +1,6 @@
-# 🔸 oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по СОСТОЯНИЯМ (solo/combos), публикация события "отчёт готов" в Redis Stream
+# oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по состояниям (solo/combos) и публикация события «отчёт готов» в Redis Stream
 
+# 🔸 Импорты
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -8,6 +9,7 @@ import json
 
 import infra
 
+# 🔸 Логгер
 log = logging.getLogger("ORACLE_MW_SNAPSHOT")
 
 # 🔸 Константы воркера / параметры исполнения
@@ -23,22 +25,41 @@ WINDOW_SIZES = {
 TF_ORDER = ("m5", "m15", "h1")            # последовательная обработка TF
 
 # 🔸 Наборы баз для MW
-# Для выборки из БД мы оставляем все 4 базы (они же — фиксированный порядок для построения combo)
-MW_BASES_FETCH = ("trend", "volatility", "extremes", "momentum")
-# Какие solo-базы реально пишем в агрегаты
+# Порядок важен для построения комбо; базовый канонический порядок: trend → volatility → extremes → momentum.
+# Дополнительно включаем derived-базы (pullback_flag, mom_align, high_vol), которые пишет position_snapshot_live.py
+MW_BASES_FETCH = (
+    "trend",
+    "volatility",
+    "extremes",
+    "momentum",
+    "pullback_flag",   # derived: against/with/none
+    "mom_align",       # derived: aligned/countertrend/flat
+    "high_vol",        # derived: yes/no
+)
+
+# Какие solo-базы реально пишем в агрегаты (соло анализ держим узким, чтобы не распылять статистику)
 SOLO_BASES = ("trend",)
-# Комбинации, которые пишем (только комбинации с 'trend')
+
+# Комбинации, которые пишем (всегда с 'trend' первым)
 COMBOS_2_ALLOWED = (
     ("trend", "volatility"),
     ("trend", "extremes"),
     ("trend", "momentum"),
+    ("trend", "pullback_flag"),   # новый информативный флаг: откат против/по тренду
+    ("trend", "mom_align"),       # новый информативный флаг: импульс согласован/против тренда
+    # при желании можно включить ("trend", "high_vol")
 )
+
 COMBOS_3_ALLOWED = (
     ("trend", "volatility", "extremes"),
     ("trend", "volatility", "momentum"),
     ("trend", "extremes", "momentum"),
+    ("trend", "volatility", "mom_align"),      # информативный триплет (направление × среда × согласованность импульса)
+    ("trend", "volatility", "pullback_flag"),  # при необходимости «сжатие/расширение × pullback»
 )
-COMBOS_4_ALLOWED = (tuple(MW_BASES_FETCH),)  # ('trend','volatility','extremes','momentum')
+
+# Квартет оставляем только в исходном виде (иначе размерность становится избыточной)
+COMBOS_4_ALLOWED = (("trend", "volatility", "extremes", "momentum"),)
 
 # 🔸 Настройки Redis Stream для сигнала «отчёт готов»
 REPORT_READY_STREAM = "oracle:mw:reports_ready"   # имя стрима с уведомлениями о готовности отчёта
@@ -132,7 +153,6 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
 
         # после завершения TF — отправляем событие «отчёт готов» в Redis Stream
         try:
-            # считаем число агрегатных строк для телеметрии
             row_count = await conn.fetchval(
                 "SELECT COUNT(*)::int FROM oracle_mw_aggregated_stat WHERE report_id = $1",
                 report_id,
@@ -156,6 +176,7 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
             strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
         )
 
+
 # 🔸 Создание черновика шапки отчёта (с указанием source='mw')
 async def _create_report_header(conn, strategy_id: int, time_frame: str, win_start: datetime, win_end: datetime) -> int:
     row = await conn.fetchrow(
@@ -167,6 +188,7 @@ async def _create_report_header(conn, strategy_id: int, time_frame: str, win_sta
         strategy_id, time_frame, win_start, win_end
     )
     return int(row["id"])
+
 
 # 🔸 Расчёт агрегатов для шапки (одним SQL)
 async def _calc_report_head_metrics(conn, strategy_id: int, win_start: datetime, win_end: datetime):
@@ -261,7 +283,6 @@ async def _process_timeframe(
         uid_meta = {p["position_uid"]: (p["direction"], float(p["pnl"] or 0.0)) for p in batch}
 
         # читаем MW (включая ошибки) → агрегируем только status='ok' на текущем TF
-        # states_tf приводим к ТЕКСТУ, чтобы предсказуемо парсить JSON далее
         rows_mw = await conn.fetch(
             """
             WITH mw AS (
@@ -286,7 +307,6 @@ async def _process_timeframe(
         if not rows_mw:
             continue
 
-        # заготовки комбо (фиксированный порядок)
         combos_2 = COMBOS_2_ALLOWED
         combos_3 = COMBOS_3_ALLOWED
         combos_4 = COMBOS_4_ALLOWED
@@ -297,15 +317,14 @@ async def _process_timeframe(
             has_error = bool(r["has_error"])
             raw_states = r["states_tf"]
 
-            # парсим JSON надёжно
+            # парсим JSON
             if not raw_states or has_error:
                 continue
             if isinstance(raw_states, dict):
                 states_tf = raw_states
             else:
                 try:
-                    # raw_states — строка вида '{"trend":"down_weak", ...}'
-                    states_tf = json.loads(raw_states)
+                    states_tf = json.loads(raw_states)  # '{"trend":"down_weak", ...}'
                 except Exception:
                     log.debug("[TF] skip uid=%s: states_tf JSON parse error: %r", uid, raw_states)
                     continue
@@ -313,16 +332,15 @@ async def _process_timeframe(
             if not isinstance(states_tf, dict) or not states_tf:
                 continue
 
-            # нормализуем только допустимые базы (все 4 — они нужны для комбо с 'trend')
+            # фильтруем только допустимые базы (включая derived)
             states_tf = {k: v for k, v in states_tf.items() if k in MW_BASES_FETCH and isinstance(v, str) and v}
-
             if not states_tf:
                 continue
 
             direction, pnl = uid_meta.get(uid, ("long", 0.0))
             is_win = pnl > 0.0
 
-            # solo: пишем только выбранные базы
+            # solo
             for base in SOLO_BASES:
                 state = states_tf.get(base)
                 if not state:
@@ -335,13 +353,12 @@ async def _process_timeframe(
                     inc["pw"] = round(inc["pw"] + pnl, 4)
                 inc["pt"] = round(inc["pt"] + pnl, 4)
 
-            # combos: формируем в фиксированном порядке с join состояния (только разрешённые комбо)
+            # combos
             def _touch_combo(combo: Tuple[str, ...]):
-                # условия достаточности
+                # проверка наличия всех баз
                 for b in combo:
                     if b not in states_tf:
                         return
-                agg_base = "_join".replace("_join", "_").join(combo)  # аккуратный join (равносильно "_".join)
                 agg_base = "_".join(combo)
                 agg_state = "|".join(f"{b}:{states_tf[b]}" for b in combo)  # 'trend:down_weak|volatility:expanding|...'
                 k = (report_id, strategy_id, time_frame, direction, timeframe, "combo", agg_base, agg_state)
@@ -359,7 +376,7 @@ async def _process_timeframe(
             for c in combos_4:
                 _touch_combo(c)
 
-        # батчевый UPSERT
+        # UPSERT батча
         if inc_map:
             await _upsert_aggregates_batch(conn, inc_map, days_in_window)
             ok_rows += sum(v["t"] for v in inc_map.values())
@@ -369,7 +386,7 @@ async def _process_timeframe(
 
 # 🔸 Батчевый UPSERT агрегатов (UNNEST + ON CONFLICT) с пересчётом метрик
 async def _upsert_aggregates_batch(conn, inc_map: Dict[Tuple, Dict[str, float]], days_in_window: float):
-    # готовим массивы полей (соответствует новому uq-ключу с agg_state)
+    # готовим массивы полей
     report_ids, strategy_ids, time_frames, directions = [], [], [], []
     timeframes, agg_types, agg_bases, agg_states = [], [], [], []
     trades_inc, wins_inc, pnl_total_inc, pnl_wins_inc = [], [], [], []
