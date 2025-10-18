@@ -117,7 +117,7 @@ class IndLiveConfig:
     async def initialize(self) -> None:
         await self._load_initial_tickers()
         await self._load_initial_indicators()
-        log.info(
+        log.debug(
             f"CONFIG INIT: symbols={len(self.active_tickers)} instances={len(self.indicator_instances)}"
         )
 
