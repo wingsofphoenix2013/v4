@@ -265,7 +265,7 @@ async def process_tf_live(redis,
                                 str(state), open_time_iso, status="ok"))
 
     # ----- MW-derived: pullback_flag / mom_align / high_vol -----
-    # direction из trend.state
+    # trend_dir из trend.state
     trend_state = mw_states.get("trend")
     if trend_state:
         if trend_state.startswith("up_"):
@@ -277,43 +277,58 @@ async def process_tf_live(redis,
     else:
         trend_dir = None
 
-    # pullback_flag: сравнение направления тренда и знака смещения BB-корзины в extremes
+    # pullback_flag: берём ТОЛЬКО из BB PACK (pack_live:bb:{symbol}:{tf}:bb20_2_0)
     pullback_flag = "none"
-    ext_pack = mw_objs.get("extremes") or {}
+    bdelta = None
     try:
-        bb_info = ext_pack.get("bb") or {}
-        bdelta_raw = bb_info.get("bucket_delta")
-        bdelta = int(bdelta_raw) if bdelta_raw is not None else None
+        bb_base = "bb20_2_0"  # фиксированный BB (20, 2.0)
+        pkey_bb = f"pack_live:bb:{symbol}:{tf}:{bb_base}"
+        pjson_bb = await redis.get(pkey_bb)
+        if pjson_bb:
+            pobj_bb = json.loads(pjson_bb)
+            pack_bb = pobj_bb.get("pack") or {}
+            bd = pack_bb.get("bucket_delta")
+            if bd is not None:
+                bdelta = int(bd)
     except Exception:
         bdelta = None
 
-    if trend_dir in ("up", "down") and bdelta is not None:
+    # финальный флаг: против/по тренду; при sideways или неизвестной дельте остаётся 'none'
+    if trend_dir in ("up", "down") and isinstance(bdelta, int):
         if trend_dir == "up":
-            if bdelta <= -1: pullback_flag = "against"
-            elif bdelta >= +1: pullback_flag = "with"
+            if bdelta <= -1:
+                pullback_flag = "against"
+            elif bdelta >= +1:
+                pullback_flag = "with"
         elif trend_dir == "down":
-            if bdelta >= +1: pullback_flag = "against"
-            elif bdelta <= -1: pullback_flag = "with"
+            if bdelta >= +1:
+                pullback_flag = "against"
+            elif bdelta <= -1:
+                pullback_flag = "with"
 
-    rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
-                            "marketwatch", "pullback_flag", "state",
-                            pullback_flag, open_time_iso, status="ok"))
+    rows_ok.append(make_row(
+        position_uid, strategy_id, symbol, tf,
+        "marketwatch", "pullback_flag", "state",
+        pullback_flag, open_time_iso, status="ok"
+    ))
 
-    # mom_align: импульс из Momentum относительно направления тренда
+    # mom_align: импульс Momentum относительно направления тренда
     mom_state = mw_states.get("momentum")
-    if mom_state in ("bull_impulse", "bear_impulse") and trend_dir in ("up","down"):
-        if (mom_state == "bull_impulse" and trend_dir == "up") or (mom_state == "bear_impulse" and trend_dir == "down"):
-            mom_align = "aligned"
-        else:
-            mom_align = "countertrend"
+    if mom_state in ("bull_impulse", "bear_impulse") and trend_dir in ("up", "down"):
+        mom_align = "aligned" if (
+            (mom_state == "bull_impulse" and trend_dir == "up") or
+            (mom_state == "bear_impulse" and trend_dir == "down")
+        ) else "countertrend"
     else:
         mom_align = "flat"
 
-    rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
-                            "marketwatch", "mom_align", "state",
-                            mom_align, open_time_iso, status="ok"))
+    rows_ok.append(make_row(
+        position_uid, strategy_id, symbol, tf,
+        "marketwatch", "mom_align", "state",
+        mom_align, open_time_iso, status="ok"
+    ))
 
-    # high_vol: ATR% из volatility.pack против порога
+    # high_vol: ATR% из volatility MW-pack (ind_mw_live), по порогу shared
     vol_pack = mw_objs.get("volatility") or {}
     atr_pct_str = None
     try:
@@ -330,9 +345,11 @@ async def process_tf_live(redis,
     high_thr = vol_thresholds(tf)["atr_high"]
     high_vol = "yes" if (atr_pct_val is not None and atr_pct_val >= high_thr) else "no"
 
-    rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
-                            "marketwatch", "high_vol", "state",
-                            high_vol, open_time_iso, status="ok"))
+    rows_ok.append(make_row(
+        position_uid, strategy_id, symbol, tf,
+        "marketwatch", "high_vol", "state",
+        high_vol, open_time_iso, status="ok"
+    ))
 
     # ----- PACK (pack_live) -----
     for ind in ("rsi","mfi","ema","atr","lr","adx_dmi"):  # без 'kama'
