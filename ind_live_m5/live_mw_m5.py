@@ -1,4 +1,4 @@
-# live_mw_m5.py — live-расчёт MW m5 (trend/volatility/momentum/extremes) с использованием L1; публикация «минимального» JSON в ind_mw_live:* (только нужные поля)
+# live_mw_m5.py — live-расчёт MW m5 (trend/volatility/momentum/extremes) с использованием L1; публикация «минимального» JSON в ind_mw_live:* (state + open_time; для trend — direction/strong; для volatility — atr_pct)
 
 # 🔸 Импорты
 import asyncio
@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Set
 
 from indicators.compute_and_store import compute_snapshot_values_async, get_expected_param_names
 from packs.trend_pack import build_trend_pack
@@ -47,31 +47,29 @@ def make_compute_with_l1(live_cache, bar_open_ms: int):
 async def _publish_mw_min(redis, symbol: str, tf: str, kind: str, full_pack: Dict[str, Any]) -> bool:
     key = f"ind_mw_live:{symbol}:{tf}:{kind}"
     try:
-        # извлечём минимум: state (+ open_time), а для trend ещё direction/strong (при наличии)
         p = (full_pack.get("pack") or {}) if isinstance(full_pack, dict) else {}
         state = p.get("state")
         if state is None:
             return False
 
-        if kind == "trend":
-            out = {
-                "pack": {
-                    "state": state,
-                    "open_time": p.get("open_time"),
-                    "direction": p.get("direction"),
-                    "strong": p.get("strong"),
-                }
-            }
-        else:
-            out = {
-                "pack": {
-                    "state": state,
-                    "open_time": p.get("open_time"),
-                }
-            }
+        # минимальный payload
+        out_pack: Dict[str, Any] = {
+            "state": state,
+            "open_time": p.get("open_time"),
+        }
 
-        # компактная сериализация
-        js = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+        # для trend добавим direction/strong (если присутствуют)
+        if kind == "trend":
+            if "direction" in p:
+                out_pack["direction"] = p["direction"]
+            if "strong" in p:
+                out_pack["strong"] = p["strong"]
+
+        # для volatility добавим atr_pct (если присутствует) — нужно снапшот-воркеру
+        if kind == "volatility" and "atr_pct" in p:
+            out_pack["atr_pct"] = p["atr_pct"]
+
+        js = json.dumps({"pack": out_pack}, ensure_ascii=False, separators=(",", ":"))
         await redis.set(key, js, ex=TTL_SEC)
         return True
     except Exception as e:
@@ -89,7 +87,7 @@ async def mw_m5_pass(redis,
     symbols = list(get_active_symbols()) or []
     if not symbols:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        log.info(f"MW_M5 PASS done: symbols=0 written=0 errors=0 elapsed_ms={elapsed_ms}")
+        log.debug(f"MW_M5 PASS done: symbols=0 written=0 errors=0 elapsed_ms={elapsed_ms}")
         return
 
     now_ms = int(datetime.utcnow().timestamp() * 1000)
@@ -105,7 +103,7 @@ async def mw_m5_pass(redis,
     async def _wrap(sym: str):
         nonlocal written, errors
         async with sem:
-            # точность может понадобиться билдеру, оставим выборку как есть
+            # точность может понадобиться билдеру, оставим выборку как есть (без жёсткой зависимости)
             precision = 8
             try:
                 precision = int(get_precision(sym) or 8)
@@ -140,6 +138,6 @@ async def mw_m5_pass(redis,
     await asyncio.gather(*[asyncio.create_task(_wrap(s)) for s in symbols])
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-    log.info(
+    log.debug(
         f"MW_M5 PASS done: symbols={len(symbols)} written={written} errors={errors} elapsed_ms={elapsed_ms}"
     )

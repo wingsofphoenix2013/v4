@@ -136,7 +136,7 @@ async def pack_m5_pass(redis,
 
     if not symbols or not instances_m5:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        log.info(f"PACK_M5 PASS done: symbols={len(symbols)} bases=0 written=0 errors=0 hits=0 misses=0 elapsed_ms={elapsed_ms}")
+        log.debug(f"PACK_M5 PASS done: symbols={len(symbols)} bases=0 written=0 errors=0 hits=0 misses=0 elapsed_ms={elapsed_ms}")
         return
 
     # текущий бар и счётчики hit/miss L1
@@ -249,7 +249,7 @@ async def pack_m5_pass(redis,
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     total_bases = sum(len(v) if isinstance(v, set) else 0 for v in bases.values())
-    log.info(
+    log.debug(
         f"PACK_M5 PASS done: symbols={len(symbols)} bases={total_bases} written={written} errors={errors} "
         f"hits={hits_misses['hits']} misses={hits_misses['misses']} elapsed_ms={elapsed_ms}"
     )

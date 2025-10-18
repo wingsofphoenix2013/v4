@@ -127,7 +127,7 @@ async def live_m5_pass(redis,
 
     if not symbols or not instances_m5:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        log.info(
+        log.debug(
             f"LIVE_M5 PASS done: symbols={len(symbols)} instances={total_instances} "
             f"computed=0 written=0 errors=0 skipped=0 elapsed_ms={elapsed_ms}"
         )
@@ -157,7 +157,7 @@ async def live_m5_pass(redis,
     agg_skipped  = sum(r["skipped"] for r in results)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-    log.info(
+    log.debug(
         f"LIVE_M5 PASS done: symbols={len(symbols)} instances={total_instances} "
         f"computed={agg_computed} written={agg_written} errors={agg_errors} skipped={agg_skipped} "
         f"elapsed_ms={elapsed_ms}"
