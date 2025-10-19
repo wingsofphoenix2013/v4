@@ -9,6 +9,7 @@ from trader_config import init_trader_config_state, config_event_listener, confi
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
 from bybit_connect_smoke import run_bybit_connectivity_probe
+from bybit_sync import run_bybit_private_ws_sync_loop
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -83,7 +84,10 @@ async def main():
         run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=65.0),
         
         # периодический smoke Bybit (старт через 10с, затем каждые 10 минут)
-        run_periodic(run_bybit_connectivity_probe, "BYBIT_SMOKE", start_delay=10.0, interval=600.0),        
+        run_periodic(run_bybit_connectivity_probe, "BYBIT_SMOKE", start_delay=10.0, interval=600.0),
+        
+        # приватный WS-синк Bybit (read-only)
+        run_with_delay(run_bybit_private_ws_sync_loop, "BYBIT_SYNC", start_delay=10.0),        
     )
 
 # 🔸 Запуск через CLI

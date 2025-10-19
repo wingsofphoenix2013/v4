@@ -85,7 +85,7 @@ async def run_bybit_connectivity_probe():
     try:
         bal = await _get_wallet_balance(ACCOUNT_TYPE)
         log.info("REST wallet-balance (%s): retCode=%s", ACCOUNT_TYPE, bal.get("retCode"))
-        log.info("REST wallet-balance result: %s", bal.get("result"))
+        log.debug("REST wallet-balance result: %s", bal.get("result"))
     except Exception:
         log.exception("REST wallet-balance FAILED")
 
