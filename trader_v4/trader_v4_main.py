@@ -8,6 +8,7 @@ from trader_infra import setup_logging, setup_pg, setup_redis_client
 from trader_config import init_trader_config_state, config_event_listener, config
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
+from bybit_connect_smoke import run_bybit_connectivity_probe
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -80,6 +81,9 @@ async def main():
 
         # последовательный слушатель закрытий (signal_log_queue: status='closed')
         run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=65.0),
+        
+        # периодический smoke Bybit (старт через 10с, затем каждые 10 минут)
+        run_periodic(run_bybit_connectivity_probe, "BYBIT_SMOKE", start_delay=10.0, interval=600.0),        
     )
 
 # 🔸 Запуск через CLI
