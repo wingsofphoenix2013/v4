@@ -57,7 +57,7 @@ async def run_laboratory_cleaner():
             log.exception("❌ LAB_CLEANER: ошибка создания consumer group")
             return
 
-    log.info(
+    log.debug(
         "🚀 LAB_CLEANER: слушаю %s (retention=%dd, stream=%dh, cooldown=%dm)",
         TRIGGER_STREAM, RETENTION_DAYS, STREAM_RETENTION_HOURS, COOLDOWN_EX_SEC // 60
     )
@@ -183,7 +183,7 @@ async def _cleanup_once():
             head_del = await _exec_delete(conn, "DELETE FROM laboratory_request_head WHERE finished_at < $1", cutoff_dt)
             pos_del  = await _exec_delete(conn, "DELETE FROM laboratory_positions_stat WHERE updated_at < $1", cutoff_dt)
 
-    log.info(
+    log.debug(
         "🧹 LAB_CLEANER: DB cleanup done (older than %s) — bl=%d wl=%d tf=%d head=%d pos=%d",
         cutoff_dt.isoformat(), bl_del, wl_del, tf_del, head_del, pos_del
     )
@@ -222,4 +222,4 @@ async def _trim_decision_response_stream():
         cnt = int(trimmed) if trimmed is not None else -1
     except Exception:
         cnt = -1
-    log.info("🧽 LAB_CLEANER: stream trimmed (stream=%s, MINID<%s, removed=%s)", stream, minid, cnt if cnt >= 0 else "unknown")
+    log.debug("🧽 LAB_CLEANER: stream trimmed (stream=%s, MINID<%s, removed=%s)", stream, minid, cnt if cnt >= 0 else "unknown")
