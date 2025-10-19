@@ -1,14 +1,13 @@
-# trader_position_filler.py — последовательная фиксация открытых позиций победителей в trader_positions
-# + микро-гейт «актуальности» перед фиксацией и TG-уведомление об открытии (с TP/SL)
+# trader_position_filler.py — последовательная фиксация открытых позиций стратегий с флагом trader_winner
+# + TG-уведомление об открытии (с TP/SL) и базовые портфельные ограничения
 
 # 🔸 Импорты
 import asyncio
 import logging
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, Optional, Set, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List
 
 from trader_infra import infra
-from trader_rating import get_current_group_winners
 from trader_tg_notifier import send_open_notification
 
 # 🔸 Логгер воркера
@@ -23,14 +22,6 @@ CONSUMER = "trader_filler_1"
 INITIAL_DELAY_SEC = 5.0      # первая пауза после события "opened"
 RETRY_DELAY_SEC = 5.0        # задержка между повторными попытками
 MAX_ATTEMPTS = 4             # всего попыток: 1 (после INITIAL_DELAY) + 3 ретрая = 4
-
-# 🔸 Пороговые константы микро-гейта (в долях, должны совпадать с trader_rating.py)
-ROI24_FLOOR = Decimal("-0.005")   # -0.5%
-MOMENTUM_MIN = Decimal("0.001")   # +0.10%
-WR_BASE = Decimal("0.50")         # базовая устойчивость
-WR_MOMENTUM = Decimal("0.55")     # порог WR при моментуме
-LAPLACE_A = Decimal("1")          # сглаживание winrate (Лаплас)
-LAPLACE_B = Decimal("1")
 
 
 # 🔸 Основной цикл воркера (строго последовательно, без параллелизма)
@@ -91,23 +82,12 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
         return
 
-    # актуальный набор победителей — сперва из in-memory, при пустоте одноразовый прогрев из БД
-    winners_map = get_current_group_winners() or await _fallback_winners_from_db()
-    winners_set: Set[int] = set(winners_map.values())
-
-    if strategy_id not in winners_set:
-        log.debug("⏭️ Не победитель (sid=%s), пропуск события opened (uid=%s)", strategy_id, position_uid)
+    # проверяем, что стратегия помечена как trader_winner (ручная отметка)
+    if not await _is_trader_winner(strategy_id):
+        log.debug("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
         return
 
-    # находим group_master_id (мастер группы) для этого победителя
-    group_master_id = _find_group_master_for_winner(winners_map, strategy_id)
-    if group_master_id is None:
-        group_master_id = await _fetch_group_master_from_db(strategy_id)
-    if group_master_id is None:
-        log.debug("⚠️ Не удалось определить group_master_id для sid=%s — пропуск uid=%s", strategy_id, position_uid)
-        return
-
-    # ждём появления записи в positions_v4 и читаем её (с доп. полями для TG: direction, entry_price)
+    # ждём появления записи в positions_v4 и читаем её (для TG: direction, entry_price)
     pos = await _fetch_position_with_retry(position_uid)
     if not pos:
         log.debug("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
@@ -118,12 +98,6 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     closed_at_db = pos.get("closed_at")
     if status_db == "closed" or closed_at_db is not None:
         log.debug("⏭️ Позиция уже закрыта к моменту фиксации, пропуск uid=%s (sid=%s)", position_uid, strategy_id)
-        return
-
-    # читаем leverage стратегии (и проверим, что >0)
-    leverage = await _fetch_leverage(strategy_id)
-    if leverage is None or leverage <= 0:
-        log.debug("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
         return
 
     # исходные данные позиции
@@ -137,6 +111,12 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ Пустой symbol или notional (symbol=%s, notional=%s) — пропуск uid=%s", symbol, notional_value, position_uid)
         return
 
+    # читаем leverage стратегии (и проверим, что >0)
+    leverage = await _fetch_leverage(strategy_id)
+    if leverage is None or leverage <= 0:
+        log.debug("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
+        return
+
     # расчёт использованной маржи
     try:
         margin_used = (notional_value / leverage)
@@ -144,13 +124,11 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
         return
 
-    # 🔹 Микро-гейт «актуальности» по этой стратегии (свежие 24h/1h)
-    gate_ok, gate_dbg = await _passes_fresh_gate(strategy_id)
-    if not gate_ok:
-        log.debug(
-            "⛔ GATE-FAIL at open time: sid=%s | roi24=%.4f wr_shr=%.2f roi1h=%.4f (uid=%s)",
-            strategy_id, gate_dbg["roi24"], gate_dbg["wr_shr"], gate_dbg["roi1h"], position_uid
-        )
+    # вычисляем group_master_id согласно правилам market_mirrow / *_long / *_short
+    group_master_id = await _resolve_group_master_id(strategy_id, direction)
+    if group_master_id is None:
+        log.debug("⚠️ Не удалось определить group_master_id для sid=%s (direction=%s) — пропуск uid=%s",
+                  strategy_id, direction, position_uid)
         return
 
     # правило 1: по этому symbol не должно быть открытых сделок
@@ -158,11 +136,11 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⛔ По символу %s уже есть открытая запись — пропуск uid=%s", symbol, position_uid)
         return
 
-    # правило 2: суммарная маржа открытых сделок ≤ 95% минимального депозита среди победителей
+    # правило 2: суммарная маржа открытых сделок ≤ 95% минимального депозита среди текущих trader_winner
     current_open_margin = await _sum_open_margin()
     min_deposit = await _min_deposit_among_winners()
     if min_deposit is None or min_deposit <= 0:
-        log.debug("⚠️ Не удалось определить min(deposit) среди победителей — пропуск uid=%s", position_uid)
+        log.debug("⚠️ Не удалось определить min(deposit) среди trader_winner — пропуск uid=%s", position_uid)
         return
 
     limit = (Decimal("0.95") * min_deposit)
@@ -188,12 +166,15 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         position_uid, symbol, strategy_id, group_master_id, margin_used
     )
 
-    # 🔹 Тянем TP/SL из position_targets_v4 для TG (если есть)
+    # тянем TP/SL из position_targets_v4 для TG (если есть)
     try:
         tp_targets, sl_targets = await _fetch_targets_for_position(position_uid)
     except Exception:
         tp_targets, sl_targets = [], []
         log.exception("⚠️ Не удалось получить TP/SL для uid=%s", position_uid)
+
+    # имя стратегии для уведомления
+    strategy_name = await _fetch_strategy_name(strategy_id) or f"strategy_{strategy_id}"
 
     # отправка уведомления в Telegram (стрелки направления; без 🟢/🔴 в заголовке; с TP/SL)
     try:
@@ -201,8 +182,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
             symbol=symbol,
             direction=direction,
             entry_price=entry_price,
-            strategy_id=strategy_id,
-            group_id=group_master_id,
+            strategy_name=strategy_name,
             created_at=created_at,
             tp_targets=tp_targets,
             sl_targets=sl_targets,
@@ -235,35 +215,52 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
     except Exception:
         return None
 
-def _find_group_master_for_winner(winners_map: Dict[int, int], winner_sid: int) -> Optional[int]:
-    # winners_map: {group_master_id -> winner_strategy_id}
-    for gm, sid in winners_map.items():
-        if sid == winner_sid:
-            return gm
-    return None
 
-
-async def _fallback_winners_from_db() -> Dict[int, int]:
-    rows = await infra.pg_pool.fetch(
-        """
-        SELECT group_master_id, current_winner_id
-        FROM public.trader_rating_active
-        WHERE current_winner_id IS NOT NULL
-        """
-    )
-    m = {int(r["group_master_id"]): int(r["current_winner_id"]) for r in rows}
-    if m:
-        log.debug("♻️ Прогрет winners из БД: групп=%d", len(m))
-    return m
-
-
-async def _fetch_group_master_from_db(strategy_id: int) -> Optional[int]:
+async def _is_trader_winner(strategy_id: int) -> bool:
     row = await infra.pg_pool.fetchrow(
-        "SELECT market_mirrow FROM public.strategies_v4 WHERE id=$1",
+        "SELECT trader_winner FROM public.strategies_v4 WHERE id = $1",
         strategy_id
     )
-    if row and row["market_mirrow"] is not None:
-        return int(row["market_mirrow"])
+    if not row or row["trader_winner"] is None:
+        return False
+    return bool(row["trader_winner"])
+
+
+async def _resolve_group_master_id(strategy_id: int, direction: Optional[str]) -> Optional[int]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT market_mirrow, market_mirrow_long, market_mirrow_short
+        FROM public.strategies_v4
+        WHERE id = $1
+        """,
+        strategy_id
+    )
+    if not row:
+        return None
+
+    mm = row["market_mirrow"]
+    mm_long = row["market_mirrow_long"]
+    mm_short = row["market_mirrow_short"]
+
+    # Вариант A: ничего не задано → мастер = сама стратегия
+    if mm is None and mm_long is None and mm_short is None:
+        return strategy_id
+
+    # Вариант B: задан единый мастер
+    if mm is not None and mm_long is None and mm_short is None:
+        return int(mm)
+
+    # Вариант C: заданы оба мастера по направлению (а единый не задан)
+    if mm is None and mm_long is not None and mm_short is not None:
+        d = (direction or "").lower()
+        if d == "long":
+            return int(mm_long)
+        if d == "short":
+            return int(mm_short)
+        # если направление неизвестно — определить нельзя
+        return None
+
+    # Иные комбинации считаем некорректными для разрешения мастера
     return None
 
 
@@ -328,12 +325,11 @@ async def _sum_open_margin() -> Decimal:
 async def _min_deposit_among_winners() -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(
         """
-        SELECT MIN(s.deposit) AS min_dep
-        FROM public.trader_rating_active tra
-        JOIN public.strategies_v4 s ON s.id = tra.current_winner_id
-        WHERE tra.current_winner_id IS NOT NULL
-          AND s.deposit IS NOT NULL
-          AND s.deposit > 0
+        SELECT MIN(deposit) AS min_dep
+        FROM public.strategies_v4
+        WHERE trader_winner = TRUE
+          AND deposit IS NOT NULL
+          AND deposit > 0
         """
     )
     if not row or row["min_dep"] is None:
@@ -397,57 +393,14 @@ async def _fetch_targets_for_position(position_uid: str) -> Tuple[List[Dict[str,
     return tp_list, sl_list
 
 
-# 🔸 Микро-гейт «актуальности» — свежая проверка приемлемости стратегии
-async def _passes_fresh_gate(strategy_id: int) -> Tuple[bool, Dict[str, float]]:
-    # агрегаты за 24 часа
-    r24 = await infra.pg_pool.fetchrow(
-        """
-        SELECT
-          COUNT(*) AS closed_24,
-          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins_24,
-          COALESCE(SUM(pnl), 0) AS pnl_24
-        FROM public.positions_v4
-        WHERE status = 'closed'
-          AND strategy_id = $1
-          AND closed_at >= ((now() at time zone 'UTC') - interval '24 hours')
-        """,
+async def _fetch_strategy_name(strategy_id: Optional[int]) -> Optional[str]:
+    if strategy_id is None:
+        return None
+    row = await infra.pg_pool.fetchrow(
+        "SELECT name FROM public.strategies_v4 WHERE id = $1",
         strategy_id
     )
-    # агрегаты за 1 час
-    r1h = await infra.pg_pool.fetchrow(
-        """
-        SELECT
-          COUNT(*) AS closed_1h,
-          COALESCE(SUM(pnl), 0) AS pnl_1h
-        FROM public.positions_v4
-        WHERE status = 'closed'
-          AND strategy_id = $1
-          AND closed_at >= ((now() at time zone 'UTC') - interval '1 hour')
-        """,
-        strategy_id
-    )
-    dep_row = await infra.pg_pool.fetchrow(
-        "SELECT deposit FROM public.strategies_v4 WHERE id = $1",
-        strategy_id
-    )
-
-    deposit = _as_decimal(dep_row["deposit"]) if dep_row and dep_row["deposit"] is not None else None
-    closed_24 = int(r24["closed_24"]) if r24 and r24["closed_24"] is not None else 0
-    wins_24 = int(r24["wins_24"]) if r24 and r24["wins_24"] is not None else 0
-    pnl_24 = _as_decimal(r24["pnl_24"]) if r24 and r24["pnl_24"] is not None else Decimal("0")
-    closed_1h = int(r1h["closed_1h"]) if r1h and r1h["closed_1h"] is not None else 0
-    pnl_1h = _as_decimal(r1h["pnl_1h"]) if r1h and r1h["pnl_1h"] is not None else Decimal("0")
-
-    if not deposit or deposit <= 0 or closed_24 <= 0:
-        return False, {"roi24": 0.0, "wr_shr": 0.0, "roi1h": 0.0}
-
-    roi24 = pnl_24 / deposit
-    roi1h = pnl_1h / deposit
-    wr_shr = (Decimal(wins_24) + LAPLACE_A) / (Decimal(closed_24) + LAPLACE_A + LAPLACE_B)
-
-    gate_ok = (roi24 > ROI24_FLOOR) and (
-        (roi24 >= 0 and wr_shr >= WR_BASE) or
-        (roi1h > MOMENTUM_MIN and wr_shr >= WR_MOMENTUM)
-    )
-
-    return bool(gate_ok), {"roi24": float(roi24), "wr_shr": float(wr_shr), "roi1h": float(roi1h)}
+    if not row:
+        return None
+    name = row["name"]
+    return str(name) if name is not None else None
