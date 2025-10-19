@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, Optional, Tuple, List
 
 from trader_infra import infra
+from trader_config import config
 from trader_tg_notifier import send_open_notification
 
 # 🔸 Логгер воркера
@@ -82,8 +83,8 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
         return
 
-    # проверяем, что стратегия помечена как trader_winner (ручная отметка)
-    if not await _is_trader_winner(strategy_id):
+    # проверяем, что стратегия помечена как trader_winner (по кэшу конфигурации)
+    if strategy_id not in config.trader_winners:
         log.debug("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
         return
 
@@ -111,8 +112,8 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ Пустой symbol или notional (symbol=%s, notional=%s) — пропуск uid=%s", symbol, notional_value, position_uid)
         return
 
-    # читаем leverage стратегии (и проверим, что >0)
-    leverage = await _fetch_leverage(strategy_id)
+    # читаем leverage стратегии из кэша (и проверим, что >0)
+    leverage = _get_leverage_from_config(strategy_id)
     if leverage is None or leverage <= 0:
         log.debug("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
         return
@@ -124,8 +125,8 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
         return
 
-    # вычисляем group_master_id согласно правилам market_mirrow / *_long / *_short
-    group_master_id = await _resolve_group_master_id(strategy_id, direction)
+    # вычисляем group_master_id согласно правилам market_mirrow / *_long / *_short (из кэша)
+    group_master_id = _resolve_group_master_id_from_config(strategy_id, direction)
     if group_master_id is None:
         log.debug("⚠️ Не удалось определить group_master_id для sid=%s (direction=%s) — пропуск uid=%s",
                   strategy_id, direction, position_uid)
@@ -136,9 +137,9 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⛔ По символу %s уже есть открытая запись — пропуск uid=%s", symbol, position_uid)
         return
 
-    # правило 2: суммарная маржа открытых сделок ≤ 95% минимального депозита среди текущих trader_winner
+    # правило 2: суммарная маржа открытых сделок ≤ 95% минимального депозита среди текущих trader_winner (из кэша)
     current_open_margin = await _sum_open_margin()
-    min_deposit = await _min_deposit_among_winners()
+    min_deposit = config.trader_winners_min_deposit
     if min_deposit is None or min_deposit <= 0:
         log.debug("⚠️ Не удалось определить min(deposit) среди trader_winner — пропуск uid=%s", position_uid)
         return
@@ -173,8 +174,13 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         tp_targets, sl_targets = [], []
         log.exception("⚠️ Не удалось получить TP/SL для uid=%s", position_uid)
 
-    # имя стратегии для уведомления
-    strategy_name = await _fetch_strategy_name(strategy_id) or f"strategy_{strategy_id}"
+    # имя стратегии для уведомления — из кэша стратегий
+    strategy_name = None
+    srow = config.strategies.get(strategy_id)
+    if srow and srow.get("name"):
+        strategy_name = str(srow.get("name"))
+    if not strategy_name:
+        strategy_name = f"strategy_{strategy_id}"
 
     # отправка уведомления в Telegram (стрелки направления; без 🟢/🔴 в заголовке; с TP/SL)
     try:
@@ -216,51 +222,45 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
         return None
 
 
-async def _is_trader_winner(strategy_id: int) -> bool:
-    row = await infra.pg_pool.fetchrow(
-        "SELECT trader_winner FROM public.strategies_v4 WHERE id = $1",
-        strategy_id
-    )
-    if not row or row["trader_winner"] is None:
-        return False
-    return bool(row["trader_winner"])
-
-
-async def _resolve_group_master_id(strategy_id: int, direction: Optional[str]) -> Optional[int]:
-    row = await infra.pg_pool.fetchrow(
-        """
-        SELECT market_mirrow, market_mirrow_long, market_mirrow_short
-        FROM public.strategies_v4
-        WHERE id = $1
-        """,
-        strategy_id
-    )
-    if not row:
+def _get_leverage_from_config(strategy_id: int) -> Optional[Decimal]:
+    meta = config.strategy_meta.get(strategy_id) or {}
+    lev = meta.get("leverage")
+    try:
+        return lev if isinstance(lev, Decimal) else (Decimal(str(lev)) if lev is not None else None)
+    except Exception:
         return None
 
-    mm = row["market_mirrow"]
-    mm_long = row["market_mirrow_long"]
-    mm_short = row["market_mirrow_short"]
 
-    # Вариант A: ничего не задано → мастер = сама стратегия
+def _resolve_group_master_id_from_config(strategy_id: int, direction: Optional[str]) -> Optional[int]:
+    meta = config.strategy_meta.get(strategy_id) or {}
+    mm = meta.get("market_mirrow")
+    mm_long = meta.get("market_mirrow_long")
+    mm_short = meta.get("market_mirrow_short")
+
+    # ничего не задано → мастер = сама стратегия
     if mm is None and mm_long is None and mm_short is None:
         return strategy_id
 
-    # Вариант B: задан единый мастер
+    # задан единый мастер
     if mm is not None and mm_long is None and mm_short is None:
-        return int(mm)
+        try:
+            return int(mm)
+        except Exception:
+            return None
 
-    # Вариант C: заданы оба мастера по направлению (а единый не задан)
+    # заданы оба мастера по направлению (а единый не задан)
     if mm is None and mm_long is not None and mm_short is not None:
         d = (direction or "").lower()
-        if d == "long":
-            return int(mm_long)
-        if d == "short":
-            return int(mm_short)
-        # если направление неизвестно — определить нельзя
-        return None
+        try:
+            if d == "long":
+                return int(mm_long)
+            if d == "short":
+                return int(mm_short)
+            return None
+        except Exception:
+            return None
 
-    # Иные комбинации считаем некорректными для разрешения мастера
+    # иные комбинации считаем некорректными
     return None
 
 
@@ -286,19 +286,6 @@ async def _fetch_position_with_retry(position_uid: str) -> Optional[Dict[str, An
     return None
 
 
-async def _fetch_leverage(strategy_id: int) -> Optional[Decimal]:
-    row = await infra.pg_pool.fetchrow(
-        "SELECT leverage FROM public.strategies_v4 WHERE id=$1",
-        strategy_id
-    )
-    if not row or row["leverage"] is None:
-        return None
-    try:
-        return Decimal(str(row["leverage"]))
-    except Exception:
-        return None
-
-
 async def _exists_open_for_symbol(symbol: str) -> bool:
     row = await infra.pg_pool.fetchrow(
         """
@@ -320,24 +307,6 @@ async def _sum_open_margin() -> Decimal:
         return Decimal(str(row["total"])) if row and row["total"] is not None else Decimal("0")
     except Exception:
         return Decimal("0")
-
-
-async def _min_deposit_among_winners() -> Optional[Decimal]:
-    row = await infra.pg_pool.fetchrow(
-        """
-        SELECT MIN(deposit) AS min_dep
-        FROM public.strategies_v4
-        WHERE trader_winner = TRUE
-          AND deposit IS NOT NULL
-          AND deposit > 0
-        """
-    )
-    if not row or row["min_dep"] is None:
-        return None
-    try:
-        return Decimal(str(row["min_dep"]))
-    except Exception:
-        return None
 
 
 async def _insert_trader_position(
@@ -391,16 +360,3 @@ async def _fetch_targets_for_position(position_uid: str) -> Tuple[List[Dict[str,
             sl_list.append(obj)
 
     return tp_list, sl_list
-
-
-async def _fetch_strategy_name(strategy_id: Optional[int]) -> Optional[str]:
-    if strategy_id is None:
-        return None
-    row = await infra.pg_pool.fetchrow(
-        "SELECT name FROM public.strategies_v4 WHERE id = $1",
-        strategy_id
-    )
-    if not row:
-        return None
-    name = row["name"]
-    return str(name) if name is not None else None

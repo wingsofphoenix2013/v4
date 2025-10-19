@@ -5,7 +5,7 @@ import asyncio
 import logging
 
 from trader_infra import setup_logging, setup_pg, setup_redis_client
-from trader_config import init_trader_config_state, config_event_listener
+from trader_config import init_trader_config_state, config_event_listener, config
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
 
@@ -72,12 +72,14 @@ async def main():
         # слушатель Pub/Sub апдейтов конфигурации
         run_with_delay(config_event_listener, "TRADER_CONFIG", start_delay=CONFIG_LISTENER_START_DELAY_SEC),
 
+        # периодическое обновление кэша trader_winner (старт через 10с, затем каждые 5 минут)
+        run_periodic(config.refresh_trader_winners_state, "TRADER_WINNERS", start_delay=10.0, interval=300.0),
+
         # последовательный слушатель открытий (signal_log_queue: status='opened')
         run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=65.0),
 
         # последовательный слушатель закрытий (signal_log_queue: status='closed')
         run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=65.0),
-        
     )
 
 # 🔸 Запуск через CLI
