@@ -18,6 +18,26 @@ log = logging.getLogger("TRADER_TG")
 _BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 _CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # для каналов иногда отрицательное число
 
+# 🔸 Режим отправки (ENV TRADER_TG_MODE: off|dry_run|on)
+def _normalize_mode(v: Optional[str]) -> str:
+    # приводим к одному из: "off" | "dry_run" | "on"
+    s = (v or "").strip().lower()
+    if s in ("off", "false", "0", "no", "disable", "disabled"):
+        return "off"
+    if s in ("dry_run", "dry-run", "dryrun", "test"):
+        return "dry_run"
+    return "on"
+
+_TG_MODE = _normalize_mode(os.getenv("TRADER_TG_MODE"))
+
+# сообщим о режиме (в dry_run/off — видно в INFO)
+if _TG_MODE == "dry_run":
+    log.info("TG notifier mode: DRY_RUN (messages will be logged, not sent)")
+elif _TG_MODE == "off":
+    log.info("TG notifier mode: OFF (messages are suppressed)")
+else:
+    log.debug("TG notifier mode: ON")
+
 # 🔸 Наборы заголовков (ротируются случайно)
 _OPEN_HEADERS = [
     "🚀 We’re in — fresh entry on the board",
@@ -45,6 +65,13 @@ _LOSS_HEADERS = [
 
 # 🔸 Базовая отправка текста (HTML)
 async def tg_send(text: str, *, disable_notification: bool = False) -> None:
+    # режим off/dry_run: вторичная страховка — не отправляем
+    if _TG_MODE != "on":
+        # в dry_run основной вывод делается выше, тут — тихий пропуск
+        log.debug("TG send skipped due to mode=%s", _TG_MODE)
+        return
+
+    # отсутствие токена/чата — пропускаем
     if not _BOT_TOKEN or not _CHAT_ID:
         log.debug("ℹ️ TG: пропуск — TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы")
         return
@@ -69,7 +96,6 @@ async def tg_send(text: str, *, disable_notification: bool = False) -> None:
         log.exception("❌ TG: ошибка отправки")
 
 # 🔸 Публичные отправители: open/close
-
 async def send_open_notification(
     *,
     symbol: str,
@@ -94,6 +120,15 @@ async def send_open_notification(
         tp_targets=tp_targets,
         sl_targets=sl_targets,
     )
+
+    # режимы: off → пропуск; dry_run → логируем текст; on → отправляем
+    if _TG_MODE == "off":
+        log.debug("TG OFF: skip OPEN for %s", symbol)
+        return
+    if _TG_MODE == "dry_run":
+        log.info("[DRY_RUN OPEN]\n%s", text)
+        return
+
     await tg_send(text, disable_notification=silent)
 
 async def send_closed_notification(
@@ -101,9 +136,9 @@ async def send_closed_notification(
     symbol: str,
     direction: Optional[str],
     pnl: Optional[Decimal],
-    strategy_name: str,          # ← ТОЛЬКО strategies_v4.name
-    created_at: Optional[datetime],  # для Held (минуты)
-    closed_at: Optional[datetime],   # для Held (минуты)
+    strategy_name: str,             # ← ТОЛЬКО strategies_v4.name
+    created_at: Optional[datetime], # для Held (минуты)
+    closed_at: Optional[datetime],  # для Held (минуты)
     roi_24h: Optional[Decimal] = None,   # портфельный 24h ROI (доля)
     roi_total: Optional[Decimal] = None, # портфельный TOTAL ROI (доля)
     wr_24h: Optional[Decimal] = None,    # портфельный 24h Winrate (доля 0..1)
@@ -131,10 +166,18 @@ async def send_closed_notification(
         wr_24h=wr_24h,
         wr_total=wr_total,
     )
+
+    # режимы: off → пропуск; dry_run → логируем текст; on → отправляем
+    if _TG_MODE == "off":
+        log.debug("TG OFF: skip CLOSE for %s", symbol)
+        return
+    if _TG_MODE == "dry_run":
+        log.info("[DRY_RUN CLOSE]\n%s", text)
+        return
+
     await tg_send(text, disable_notification=silent)
 
 # 🔸 Форматтеры
-
 def _fmt_money(x: Optional[Decimal], max_prec: int = 8) -> str:
     if x is None:
         return "—"
@@ -238,7 +281,6 @@ def _format_sl_section(sl_targets: Optional[Iterable[Any]]) -> str:
     return f"🛡️ SL: <code>{price_txt}</code>\n"
 
 # 🔸 Конструкторы сообщений
-
 def build_open_message(
     *,
     header: str,
