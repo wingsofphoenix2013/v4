@@ -33,15 +33,15 @@ async def run_trader_position_filler_loop():
 
     try:
         await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
-        log.debug("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
+        log.info("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
+            log.info("ℹ️ Consumer Group уже существует: %s", CG_NAME)
         else:
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.debug("🚦 TRADER_FILLER запущен (последовательная обработка)")
+    log.info("🚦 TRADER_FILLER запущен (последовательная обработка)")
 
     while True:
         try:
@@ -82,25 +82,25 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     symbol_hint = _as_str(data.get("symbol"))  # может быть пустым — не критично
 
     if not strategy_id or not position_uid:
-        log.debug("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
+        log.info("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
         return
 
     # проверяем, что стратегия помечена как trader_winner (по кэшу конфигурации)
     if strategy_id not in config.trader_winners:
-        log.debug("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
+        log.info("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
         return
 
     # ждём появления строки в positions_v4 и читаем её (нужны qty, direction, entry_price)
     pos = await _fetch_position_with_retry(position_uid)
     if not pos:
-        log.debug("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
+        log.info("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
         return
 
     # если позиция уже закрыта к моменту фиксации — пропускаем вставку
     status_db = _as_str(pos.get("status"))
     closed_at_db = pos.get("closed_at")
     if status_db == "closed" or closed_at_db is not None:
-        log.debug("⏭️ Позиция уже закрыта к моменту фиксации, пропуск uid=%s (sid=%s)", position_uid, strategy_id)
+        log.info("⏭️ Позиция уже закрыта к моменту фиксации, пропуск uid=%s (sid=%s)", position_uid, strategy_id)
         return
 
     # исходные данные позиции
@@ -112,45 +112,45 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     entry_price = _as_decimal(pos.get("entry_price"))
 
     if not symbol or notional_value <= 0 or quantity_internal is None or quantity_internal <= 0:
-        log.debug("⚠️ Пустые/некорректные поля (symbol=%s, notional=%s, qty=%s) — пропуск uid=%s",
+        log.info("⚠️ Пустые/некорректные поля (symbol=%s, notional=%s, qty=%s) — пропуск uid=%s",
                   symbol, notional_value, quantity_internal, position_uid)
         return
 
     # читаем leverage стратегии из кэша (и проверим, что >0)
     leverage = _get_leverage_from_config(strategy_id)
     if leverage is None or leverage <= 0:
-        log.debug("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
+        log.info("⚠️ Некорректное плечо для sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
         return
 
     # расчёт использованной маржи
     try:
         margin_used = (notional_value / leverage)
     except (InvalidOperation, ZeroDivisionError):
-        log.debug("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
+        log.info("⚠️ Ошибка расчёта маржи (N=%s / L=%s) — пропуск uid=%s", notional_value, leverage, position_uid)
         return
 
     # вычисляем group_master_id согласно правилам market_mirrow / *_long / *_short (из кэша)
     group_master_id = _resolve_group_master_id_from_config(strategy_id, direction)
     if group_master_id is None:
-        log.debug("⚠️ Не удалось определить group_master_id для sid=%s (direction=%s) — пропуск uid=%s",
+        log.info("⚠️ Не удалось определить group_master_id для sid=%s (direction=%s) — пропуск uid=%s",
                   strategy_id, direction, position_uid)
         return
 
     # правило 1: по этому symbol не должно быть открытых сделок
     if await _exists_open_for_symbol(symbol):
-        log.debug("⛔ По символу %s уже есть открытая запись — пропуск uid=%s", symbol, position_uid)
+        log.info("⛔ По символу %s уже есть открытая запись — пропуск uid=%s", symbol, position_uid)
         return
 
     # правило 2: суммарная маржа открытых сделок ≤ 95% минимального депозита среди текущих trader_winner (из кэша)
     current_open_margin = await _sum_open_margin()
     min_deposit = config.trader_winners_min_deposit
     if min_deposit is None or min_deposit <= 0:
-        log.debug("⚠️ Не удалось определить min(deposit) среди trader_winner — пропуск uid=%s", position_uid)
+        log.info("⚠️ Не удалось определить min(deposit) среди trader_winner — пропуск uid=%s", position_uid)
         return
 
     limit = (Decimal("0.95") * min_deposit)
     if (current_open_margin + margin_used) > limit:
-        log.debug(
+        log.info(
             "⛔ Лимит маржи превышен: open=%s + cand=%s > limit=%s (min_dep=%s) — uid=%s",
             current_open_margin, margin_used, limit, min_deposit, position_uid
         )
@@ -166,7 +166,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         created_at=created_at
     )
 
-    log.debug(
+    log.info(
         "✅ TRADER_FILLER: зафиксирована позиция uid=%s | symbol=%s | sid=%s | group=%s | margin=%s",
         position_uid, symbol, strategy_id, group_master_id, margin_used
     )
@@ -215,9 +215,9 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
                 ensure_leverage=False,             # one-way/isolated предполагаем заранее
             )
             await infra.redis_client.xadd(BYBIT_INTENTS_STREAM, intent.to_stream_payload())
-            log.debug("📨 BYBIT_INTENT: отправлен create_entry_tpsl uid=%s sym=%s sid=%s", position_uid, symbol, strategy_id)
+            log.info("📨 BYBIT_INTENT: отправлен create_entry_tpsl uid=%s sym=%s sid=%s", position_uid, symbol, strategy_id)
         else:
-            log.debug("ℹ️ BYBIT_INTENT: пропуск (live=%s, eligible=%s) uid=%s",
+            log.info("ℹ️ BYBIT_INTENT: пропуск (live=%s, eligible=%s) uid=%s",
                       str(config.is_live_trading()).lower(), str(strategy_id in config.eligible_for_bybit).lower(), position_uid)
     except Exception:
         log.exception("❌ Ошибка публикации Bybit intent uid=%s", position_uid)
