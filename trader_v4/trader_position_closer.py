@@ -1,5 +1,6 @@
 # trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление
 # (портфельные метрики: 24h/TOTAL ROI & Winrate, стратегия по strategies_v4.name)
+# + публикация Bybit close intent (reduceOnly Market) при наличии внешнего следа
 
 # 🔸 Импорты
 import asyncio
@@ -9,6 +10,8 @@ from typing import Any, Optional, Tuple
 
 from trader_infra import infra
 from trader_tg_notifier import send_closed_notification
+from trader_config import config
+from bybit_intents import build_close_market, STREAM_NAME as BYBIT_INTENTS_STREAM
 
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_CLOSER")
@@ -81,7 +84,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     # проверяем: позиция отслеживается нашим модулем?
     tracked = await infra.pg_pool.fetchrow(
         """
-        SELECT id, symbol
+        SELECT id, symbol, exchange
         FROM public.trader_positions
         WHERE position_uid = $1
         """,
@@ -94,7 +97,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     # берём финальные поля из positions_v4 (к этому моменту они уже записаны core_io)
     row = await infra.pg_pool.fetchrow(
         """
-        SELECT symbol, pnl, closed_at, direction, created_at
+        SELECT symbol, pnl, closed_at, direction, created_at, quantity, quantity_left
         FROM public.positions_v4
         WHERE position_uid = $1
         """,
@@ -109,6 +112,8 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     closed_at = row["closed_at"]          # UTC timestamp (как в БД)
     direction = _as_str(row.get("direction")) or None
     created_at = row.get("created_at")
+    qty_total = _as_decimal(row.get("quantity"))
+    qty_left = _as_decimal(row.get("quantity_left"))
 
     # обновляем нашу таблицу
     await infra.pg_pool.execute(
@@ -149,6 +154,25 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         )
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления о закрытии uid=%s", position_uid)
+
+    # 🔹 Публикация intent на закрытие остатка на бирже (reduceOnly Market), если есть внешний след и живой трейдинг
+    try:
+        if config.is_live_trading() and (tracked.get("exchange") == "BYBIT"):
+            # берём остаток, если он >0; иначе безопасно используем qty_total (reduceOnly ограничит)
+            qty_internal = qty_left if (qty_left and qty_left > 0) else qty_total
+            if qty_internal and qty_internal > 0:
+                intent = build_close_market(
+                    position_uid=position_uid,
+                    symbol=symbol,
+                    direction=direction or "long",
+                    qty_internal=qty_internal,
+                )
+                await infra.redis_client.xadd(BYBIT_INTENTS_STREAM, intent.to_stream_payload())
+                log.debug("📨 BYBIT_INTENT: close_market uid=%s qty=%s", position_uid, qty_internal)
+            else:
+                log.debug("ℹ️ BYBIT_INTENT: close_market не требуется (qty<=0) uid=%s", position_uid)
+    except Exception:
+        log.exception("❌ Ошибка публикации Bybit close intent uid=%s", position_uid)
 
 
 # 🔸 Портфельные метрики: 24h/TOTAL ROI & Winrate (по trader_positions)

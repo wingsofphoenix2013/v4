@@ -9,6 +9,7 @@ from trader_config import init_trader_config_state, config_event_listener, confi
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
+from bybit_order_worker import run_bybit_order_worker_loop
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -70,17 +71,23 @@ async def main():
     log.info("🚀 Запуск воркеров")
 
     await asyncio.gather(
-        # слушатель Pub/Sub апдейтов конфигурации
+        # слушатель Pub/Sub апдейтов конфигурации и настроек
         run_with_delay(config_event_listener, "TRADER_CONFIG", start_delay=CONFIG_LISTENER_START_DELAY_SEC),
 
         # периодическое обновление кэша trader_winner (старт через 10с, затем каждые 5 минут)
         run_periodic(config.refresh_trader_winners_state, "TRADER_WINNERS", start_delay=10.0, interval=300.0),
 
-        # приватный WS-синк Bybit (read-only)
+        # периодическая подкачка глобальных настроек (live_trading) на случай пропуска Pub/Sub
+        run_periodic(config.refresh_trader_settings, "TRADER_SETTINGS", start_delay=12.0, interval=300.0),
+
+        # приватный WS-синк Bybit (подписки wallet/position/order/execution)
         run_with_delay(run_bybit_private_ws_sync_loop, "BYBIT_SYNC", start_delay=10.0),
 
         # периодический REST-ресинк Bybit (баланс и позиции, каждые 10 минут)
         run_periodic(run_bybit_rest_resync_job, "BYBIT_RESYNC", start_delay=20.0, interval=600.0),
+
+        # воркер внешних ордеров (читает intents из стрима и отправляет на Bybit)
+        run_with_delay(run_bybit_order_worker_loop, "BYBIT_ORDER", start_delay=30.0),
 
         # последовательный слушатель открытий (signal_log_queue: status='opened')
         run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=65.0),

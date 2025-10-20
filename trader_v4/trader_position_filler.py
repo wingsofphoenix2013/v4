@@ -1,5 +1,6 @@
 # trader_position_filler.py — последовательная фиксация открытых позиций стратегий с флагом trader_winner
 # + TG-уведомление об открытии (с TP/SL) и базовые портфельные ограничения
+# + публикация Bybit intent (entry + TP/SL) в стрим при live_trading и допуске стратегии
 
 # 🔸 Импорты
 import asyncio
@@ -10,6 +11,7 @@ from typing import Dict, Any, Optional, Tuple, List
 from trader_infra import infra
 from trader_config import config
 from trader_tg_notifier import send_open_notification
+from bybit_intents import build_create_entry_tpsl, STREAM_NAME as BYBIT_INTENTS_STREAM
 
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_FILLER")
@@ -88,7 +90,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
         return
 
-    # ждём появления записи в positions_v4 и читаем её (для TG: direction, entry_price)
+    # ждём появления строки в positions_v4 и читаем её (нужны qty, direction, entry_price)
     pos = await _fetch_position_with_retry(position_uid)
     if not pos:
         log.debug("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
@@ -104,12 +106,14 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     # исходные данные позиции
     symbol = _as_str(pos["symbol"]) or symbol_hint
     notional_value = _as_decimal(pos["notional_value"]) or Decimal("0")
-    created_at = pos["created_at"]  # timestamp из БД (UTC)
+    quantity_internal = _as_decimal(pos.get("quantity"))  # для внешних заявок масштабируем от внутреннего объёма
+    created_at = pos["created_at"]                        # timestamp из БД (UTC)
     direction = _as_str(pos.get("direction")) or None
     entry_price = _as_decimal(pos.get("entry_price"))
 
-    if not symbol or notional_value <= 0:
-        log.debug("⚠️ Пустой symbol или notional (symbol=%s, notional=%s) — пропуск uid=%s", symbol, notional_value, position_uid)
+    if not symbol or notional_value <= 0 or quantity_internal is None or quantity_internal <= 0:
+        log.debug("⚠️ Пустые/некорректные поля (symbol=%s, notional=%s, qty=%s) — пропуск uid=%s",
+                  symbol, notional_value, quantity_internal, position_uid)
         return
 
     # читаем leverage стратегии из кэша (и проверим, что >0)
@@ -167,7 +171,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         position_uid, symbol, strategy_id, group_master_id, margin_used
     )
 
-    # тянем TP/SL из position_targets_v4 для TG (если есть)
+    # тянем TP/SL из position_targets_v4 (для TG и для внешних intent’ов)
     try:
         tp_targets, sl_targets = await _fetch_targets_for_position(position_uid)
     except Exception:
@@ -195,6 +199,28 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         )
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления об открытии uid=%s", position_uid)
+
+    # 🔹 Публикация intent в Bybit-стрим (entry + TP + SL), если live_trading и стратегия допущена к Bybit
+    try:
+        if config.is_live_trading() and (strategy_id in config.eligible_for_bybit):
+            intent = build_create_entry_tpsl(
+                position_uid=position_uid,
+                strategy_id=strategy_id,
+                symbol=symbol,
+                direction=direction or "long",
+                qty_internal=quantity_internal,    # масштабирование произойдёт в order-router/worker
+                tp_levels=tp_targets,              # [{'level','price','quantity'}, ...]
+                sl_levels=[t for t in sl_targets if t.get("price") is not None],
+                leverage=leverage,
+                ensure_leverage=False,             # one-way/isolated предполагаем заранее
+            )
+            await infra.redis_client.xadd(BYBIT_INTENTS_STREAM, intent.to_stream_payload())
+            log.debug("📨 BYBIT_INTENT: отправлен create_entry_tpsl uid=%s sym=%s sid=%s", position_uid, symbol, strategy_id)
+        else:
+            log.debug("ℹ️ BYBIT_INTENT: пропуск (live=%s, eligible=%s) uid=%s",
+                      str(config.is_live_trading()).lower(), str(strategy_id in config.eligible_for_bybit).lower(), position_uid)
+    except Exception:
+        log.exception("❌ Ошибка публикации Bybit intent uid=%s", position_uid)
 
 
 # 🔸 Вспомогательные функции
@@ -271,7 +297,7 @@ async def _fetch_position_with_retry(position_uid: str) -> Optional[Dict[str, An
     while attempts < MAX_ATTEMPTS:
         row = await infra.pg_pool.fetchrow(
             """
-            SELECT symbol, notional_value, created_at, status, closed_at, direction, entry_price
+            SELECT symbol, quantity, notional_value, created_at, status, closed_at, direction, entry_price
             FROM public.positions_v4
             WHERE position_uid = $1
             """,
@@ -330,7 +356,7 @@ async def _insert_trader_position(
     )
 
 
-# 🔸 Получение TP/SL целей для позиции (для TG)
+# 🔸 Получение TP/SL целей для позиции (для TG и внешних intent’ов)
 async def _fetch_targets_for_position(position_uid: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     rows = await infra.pg_pool.fetch(
         """
@@ -356,7 +382,7 @@ async def _fetch_targets_for_position(position_uid: str) -> Tuple[List[Dict[str,
         if r["type"] == "tp":
             tp_list.append(obj)
         elif r["type"] == "sl":
-            # берём только первый «живой» SL для уведомления, но возвращаем все — форматтер сам покажет 1-й
+            # берём только первый «живой» SL для уведомления / intents
             sl_list.append(obj)
 
     return tp_list, sl_list
