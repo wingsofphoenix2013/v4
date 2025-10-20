@@ -1,4 +1,4 @@
-# bybit_processor.py — dry-run планировщик биржевых ордеров по событиям opened (entry + TP/SL), без отправки
+# bybit_processor.py — dry-run планировщик биржевых ордеров (entry + TP/SL) и запись «плана» в БД
 
 # 🔸 Импорты
 import os
@@ -35,7 +35,6 @@ def _get_size_factor() -> Decimal:
         pct = Decimal(raw)
     except Exception:
         pct = Decimal("100")
-    # ограничим здравым диапазоном 0..1000 (на будущее)
     if pct < 0:
         pct = Decimal("0")
     if pct > 1000:
@@ -46,11 +45,12 @@ SIZE_FACTOR = _get_size_factor()
 
 # сообщим о режимах в лог
 if TRADER_ORDER_MODE == "dry_run":
-    log.info("BYBIT processor mode: DRY_RUN (формируем план ордеров, без отправки). SIZE_FACTOR=%.4f", float(SIZE_FACTOR))
+    log.info("BYBIT processor mode: DRY_RUN (формируем и сохраняем план ордеров, без отправки). SIZE_FACTOR=%.4f", float(SIZE_FACTOR))
 elif TRADER_ORDER_MODE == "off":
     log.info("BYBIT processor mode: OFF (игнорируем заявки).")
 else:
-    log.info("BYBIT processor mode: ON (реальная отправка ещё не реализована на этом этапе).")
+    log.info("BYBIT processor mode: ON (реальная отправка ещё не реализована на этом этапе; сохраняем план).")
+
 
 # 🔸 Основной цикл воркера (последовательная обработка)
 async def run_bybit_processor_loop():
@@ -94,7 +94,8 @@ async def run_bybit_processor_loop():
             log.exception("❌ Ошибка в основном цикле BYBIT_PROCESSOR")
             await asyncio.sleep(2)
 
-# 🔸 Обработка одной заявки из стрима (ожидаем минимум position_uid, strategy_id)
+
+# 🔸 Обработка одной заявки из стрима (ожидаем минимум position_uid)
 async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     # режим off: сразу выходим
     if TRADER_ORDER_MODE == "off":
@@ -103,7 +104,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
 
     position_uid = _as_str(data.get("position_uid"))
     if not position_uid:
-        log.debug("⚠️ Пропуск записи (нет position_uid) id=%s", record_id)
+        log.info("⚠️ Пропуск записи (нет position_uid) id=%s", record_id)
         return
 
     # тянем позицию из БД
@@ -115,11 +116,11 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     symbol = _as_str(pos.get("symbol"))
     direction = (_as_str(pos.get("direction")) or "").lower()
     entry_price = _as_decimal(pos.get("entry_price"))
-    qty_raw = _as_decimal(pos.get("quantity")) or Decimal("0")
+    qty_entry_raw = _as_decimal(pos.get("quantity")) or Decimal("0")
     created_at = pos.get("created_at")
 
-    if not symbol or direction not in ("long", "short") or qty_raw <= 0:
-        log.info("⚠️ Недостаточно данных позиции: uid=%s symbol=%s direction=%s qty=%s", position_uid, symbol, direction, qty_raw)
+    if not symbol or direction not in ("long", "short") or qty_entry_raw <= 0:
+        log.info("⚠️ Недостаточно данных позиции: uid=%s symbol=%s direction=%s qty=%s", position_uid, symbol, direction, qty_entry_raw)
         return
 
     # правила округлений по тикеру
@@ -133,57 +134,116 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
 
     # расчёт фактических величин
     side_word = "BUY" if direction == "long" else "SELL"
-    qty_entry_real = _round_qty(qty_raw * SIZE_FACTOR, precision_qty)
+    qty_entry_real = _round_qty(qty_entry_raw * SIZE_FACTOR, precision_qty)
+    entry_link_id = f"{position_uid}-entry"
 
-    # округление цены входа (для лога) и целей
-    entry_price_disp = _round_price(entry_price, ticksize)
-
-    # собираем строковый отчёт (DRY_RUN)
+    # DRY_RUN отчёт
     lines: List[str] = []
     lines.append(f"[ORDER_DRY_RUN OPEN] uid={position_uid} symbol={symbol} side={'LONG' if direction=='long' else 'SHORT'}")
-    lines.append(f"entry: market {side_word} qty_raw={_fmt(qty_raw)} qty_real={_fmt(qty_entry_real)} linkId={position_uid}-entry")
+    lines.append(f"entry: market {side_word} qty_raw={_fmt(qty_entry_raw)} qty_real={_fmt(qty_entry_real)} linkId={entry_link_id}")
+
+    # запись «плана» entry в БД (если не слишком мало)
+    if min_qty is None or qty_entry_real >= min_qty:
+        await _upsert_order(
+            position_uid=position_uid,
+            kind="entry",
+            level=None,
+            exchange="BYBIT",
+            symbol=symbol,
+            side=side_word,
+            otype="market",
+            tif="GTC",
+            reduce_only=False,
+            price=None,
+            trigger_price=None,
+            qty=qty_entry_real,
+            order_link_id=entry_link_id,
+            ext_status="planned",
+            qty_raw=qty_entry_raw,
+            price_raw=None,
+        )
+    else:
+        lines.append("note: entry qty_real < min_qty → SKIP (entry too small)")
 
     # TP с ценой (percent/atr) — лимитные reduce-only
     if tp_list:
         for level, price_raw, qty_tp_raw in tp_list:
             price_real = _round_price(price_raw, ticksize)
             qty_tp_real = _round_qty(qty_tp_raw * SIZE_FACTOR, precision_qty)
+            link_id = f"{position_uid}-tp-{level}"
             note = ""
             if min_qty is not None and qty_tp_real < min_qty:
                 note = "  # qty_real < min_qty → SKIP"
             lines.append(
                 f"tpL{level}: limit reduceOnly price={_fmt(price_real)} "
-                f"qty_raw={_fmt(qty_tp_raw)} qty_real={_fmt(qty_tp_real)} linkId={position_uid}-tp-{level}{note}"
+                f"qty_raw={_fmt(qty_tp_raw)} qty_real={_fmt(qty_tp_real)} linkId={link_id}{note}"
             )
+            if not note:
+                await _upsert_order(
+                    position_uid=position_uid,
+                    kind="tp",
+                    level=level,
+                    exchange="BYBIT",
+                    symbol=symbol,
+                    side=("SELL" if direction == "long" else "BUY"),
+                    otype="limit",
+                    tif="GTC",
+                    reduce_only=True,
+                    price=price_real,
+                    trigger_price=None,
+                    qty=qty_tp_real,
+                    order_link_id=link_id,
+                    ext_status="planned",
+                    qty_raw=qty_tp_raw,
+                    price_raw=price_raw,
+                )
     else:
         lines.append("tp: —  # no percent/atr TP with price")
 
     # SL (первый «живой», если есть цена) — стоп-маркет reduce-only на весь реальный объём
     if sl_one and sl_one[0] is not None:
-        sl_trigger = _round_price(sl_one[0], ticksize)
+        sl_trigger_raw = sl_one[0]
+        sl_trigger = _round_price(sl_trigger_raw, ticksize)
+        sl_link_id = f"{position_uid}-sl"
         lines.append(
-            f"sl: stop-market reduceOnly trigger={_fmt(sl_trigger)} qty={_fmt(qty_entry_real)} linkId={position_uid}-sl"
+            f"sl: stop-market reduceOnly trigger={_fmt(sl_trigger)} qty={_fmt(qty_entry_real)} linkId={sl_link_id}"
         )
+        if min_qty is None or qty_entry_real >= min_qty:
+            await _upsert_order(
+                position_uid=position_uid,
+                kind="sl",
+                level=None,
+                exchange="BYBIT",
+                symbol=symbol,
+                side=("SELL" if direction == "long" else "BUY"),
+                otype="stop_market",
+                tif="GTC",
+                reduce_only=True,
+                price=None,
+                trigger_price=sl_trigger,
+                qty=qty_entry_real,
+                order_link_id=sl_link_id,
+                ext_status="planned",
+                qty_raw=qty_entry_raw,   # сл на весь входной объём
+                price_raw=None,
+            )
     else:
         lines.append("sl: —  # WARN: no SL price")
 
     # заметки
     if tp_signal_skipped > 0:
         lines.append(f"note: skipped {tp_signal_skipped} signal-TP (no exchange order)")
-
-    if min_qty is not None and qty_entry_real < min_qty:
-        lines.append("note: entry qty_real < min_qty → SKIP (entry too small)")
-
     if created_at:
+        entry_price_disp = _round_price(entry_price, ticksize)
         lines.append(f"created_at: {created_at} (UTC naive)  entry_price≈{_fmt(entry_price_disp)}")
 
-    # вывод в лог (DRY_RUN / ON)
-    if TRADER_ORDER_MODE == "dry_run":
-        log.info("\n" + "\n".join(lines))
-        return
+    # вывод в лог
+    log.info("\n" + "\n".join(lines))
 
-    # режим ON ещё не реализован на этом этапе
-    log.info("MODE=ON: отправка ордеров не реализована, план:\n" + "\n".join(lines))
+    # режим ON пока не отправляет заказы — только сохраняет план
+    if TRADER_ORDER_MODE == "on":
+        log.info("MODE=ON: отправка ордеров ещё не реализована, сохранён только план (ext_status=planned).")
+
 
 # 🔸 Вспомогательные функции извлечения и округлений
 def _as_str(v: Any) -> str:
@@ -215,7 +275,6 @@ def _round_qty(qty: Decimal, precision_qty: Optional[int]) -> Decimal:
         return Decimal("0")
     if precision_qty is None:
         return qty
-    # шаг количества = 10^-precision_qty, округляем вниз
     step = Decimal("1").scaleb(-int(precision_qty))
     try:
         return qty.quantize(step, rounding=ROUND_DOWN)
@@ -225,7 +284,6 @@ def _round_qty(qty: Decimal, precision_qty: Optional[int]) -> Decimal:
 def _round_price(price: Optional[Decimal], ticksize: Optional[Decimal]) -> Optional[Decimal]:
     if price is None or ticksize is None:
         return price
-    # округление к ближайшему разрешённому шагу цены
     try:
         quantum = _as_decimal(ticksize) or Decimal("0")
         if quantum <= 0:
@@ -234,7 +292,8 @@ def _round_price(price: Optional[Decimal], ticksize: Optional[Decimal]) -> Optio
     except Exception:
         return price
 
-# 🔸 Доступ к БД
+
+# 🔸 Доступ к БД: чтение
 async def _fetch_position(position_uid: str) -> Optional[Dict[str, Any]]:
     row = await infra.pg_pool.fetchrow(
         """
@@ -319,3 +378,63 @@ async def _load_symbol_rules(symbol: str) -> Dict[str, Optional[Decimal]]:
     min_qty = _as_decimal(row["min_qty"]) if row["min_qty"] is not None else None
     ticksize = _as_decimal(row["ticksize"]) if row["ticksize"] is not None else None
     return {"precision_qty": precision_qty, "min_qty": min_qty, "ticksize": ticksize}
+
+
+# 🔸 Доступ к БД: запись «плана» ордера (UPSERT по order_link_id)
+async def _upsert_order(
+    *,
+    position_uid: str,
+    kind: str,                       # 'entry' | 'tp' | 'sl' | 'close'
+    level: Optional[int],
+    exchange: str,                   # 'BYBIT'
+    symbol: str,
+    side: Optional[str],             # 'BUY' | 'SELL' | None (для future close)
+    otype: Optional[str],            # 'market' | 'limit' | 'stop_market' | 'stop_limit' | None
+    tif: str,                        # 'GTC'|'IOC'|'FOK'
+    reduce_only: bool,
+    price: Optional[Decimal],        # для limit
+    trigger_price: Optional[Decimal],# для stop-*
+    qty: Decimal,                    # НЕ NULL
+    order_link_id: str,              # UNIQUE
+    ext_status: str,                 # 'planned' на этом этапе
+    qty_raw: Optional[Decimal],
+    price_raw: Optional[Decimal],
+) -> None:
+    # приводим типы к строковым ограничениям таблицы
+    side_norm = None if side is None else side.upper()
+    # типы в таблице строчные (market/limit/stop_market/stop_limit)
+    otype_norm = None if otype is None else otype.lower()
+
+    # upsert «плана»: не трогаем order_id/filled/avg_fill, только плановые поля
+    await infra.pg_pool.execute(
+        """
+        INSERT INTO public.trader_position_orders (
+            position_uid, kind, level, exchange, symbol, side, "type", tif, reduce_only,
+            price, trigger_price, qty, order_link_id, ext_status,
+            qty_raw, price_raw
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
+                $10,$11,$12,$13,$14,
+                $15,$16)
+        ON CONFLICT (order_link_id) DO UPDATE SET
+            position_uid = EXCLUDED.position_uid,
+            kind         = EXCLUDED.kind,
+            level        = EXCLUDED.level,
+            exchange     = EXCLUDED.exchange,
+            symbol       = EXCLUDED.symbol,
+            side         = EXCLUDED.side,
+            "type"       = EXCLUDED."type",
+            tif          = EXCLUDED.tif,
+            reduce_only  = EXCLUDED.reduce_only,
+            price        = EXCLUDED.price,
+            trigger_price= EXCLUDED.trigger_price,
+            qty          = EXCLUDED.qty,
+            ext_status   = 'planned',
+            qty_raw      = EXCLUDED.qty_raw,
+            price_raw    = EXCLUDED.price_raw,
+            error_last   = NULL
+        """,
+        position_uid, kind, level, exchange, symbol, side_norm, otype_norm, tif, reduce_only,
+        price, trigger_price, qty, order_link_id, ext_status,
+        qty_raw, price_raw
+    )

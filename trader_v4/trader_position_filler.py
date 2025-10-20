@@ -87,7 +87,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
 
     # проверяем, что стратегия помечена как trader_winner (по кэшу конфигурации)
     if strategy_id not in config.trader_winners:
-        log.info("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
+        log.debug("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
         return
 
     # ждём появления записи в positions_v4 и читаем её (для TG/ордера: direction, entry_price, qty и пр.)
@@ -227,7 +227,7 @@ async def _publish_order_request(
             "created_at": (created_at.isoformat() + "Z") if hasattr(created_at, "isoformat") else str(created_at or ""),
         }
         await redis.xadd(ORDER_REQUEST_STREAM, fields)
-        log.debug("📤 ORDER_REQ: отправлено в %s для uid=%s", ORDER_REQUEST_STREAM, position_uid)
+        log.info("📤 ORDER_REQ: отправлено в %s для uid=%s", ORDER_REQUEST_STREAM, position_uid)
     except Exception:
         log.exception("❌ Не удалось опубликовать заявку ордера uid=%s", position_uid)
         
