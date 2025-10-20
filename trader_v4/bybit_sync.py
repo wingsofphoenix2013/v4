@@ -393,27 +393,27 @@ async def _update_trader_positions_entry(
     vals.append(position_uid)
     await infra.pg_pool.execute(query, *vals)
 
-
 # 🔸 Маппинг статусов Bybit → наши ext_status
 def _map_order_status(s: str) -> Optional[str]:
     s = (s or "").strip().lower()
     if not s:
         return None
-    # Bybit v5: New/Created/PartiallyFilled/Filled/Cancelled/Rejected/Expired/Deactivated
+    # Bybit v5: New/Created/PartiallyFilled/Filled/Cancelled/Rejected/Expired/Deactivated/Untriggered/Triggered
     if s in ("new", "created"):
         return "accepted"
     if s in ("partiallyfilled", "partially_filled"):
         return "partially_filled"
-    if s in ("filled",):
+    if s == "filled":
         return "filled"
     if s in ("cancelled", "canceled"):
         return "canceled"
-    if s in ("rejected",):
+    if s == "rejected":
         return "rejected"
     if s in ("expired", "deactivated"):
         return "expired"
-    return s  # fallback — пишем как есть
-
+    if s in ("untriggered", "triggered"):
+        return "accepted"   # условный ордер создан/ожидает/активирован
+    return None  # вместо "как есть" — не обновляем ext_status неизвестным значением
 
 # 🔸 Периодический REST-ресинк (баланс + позиции linear)
 async def run_bybit_rest_resync_job():
