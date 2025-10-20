@@ -59,7 +59,7 @@ async def run_bybit_private_ws_sync_loop():
                         _handle_ws_message(msg_raw)
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"op": "ping"}))
-                        log.info("BYBIT_SYNC → ping")
+                        log.debug("BYBIT_SYNC → ping")
                         try:
                             pong_raw = await asyncio.wait_for(ws.recv(), timeout=5)
                             _handle_ws_message(pong_raw)

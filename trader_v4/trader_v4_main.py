@@ -9,6 +9,7 @@ from trader_config import init_trader_config_state, config_event_listener, confi
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
+from bybit_processor import run_bybit_processor_loop  # ← новый воркер (dry-run планировщик ордеров)
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -87,6 +88,9 @@ async def main():
 
         # последовательный слушатель закрытий (signal_log_queue: status='closed')
         run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=65.0),
+
+        # новый воркер: dry-run планировщик ордеров Bybit (читает trader_order_requests)
+        run_with_delay(run_bybit_processor_loop, "BYBIT_PROCESSOR", start_delay=70.0),
     )
 
 # 🔸 Запуск через CLI

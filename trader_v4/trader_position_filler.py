@@ -19,8 +19,11 @@ SIGNAL_STREAM = "signal_log_queue"
 CG_NAME = "trader_filler_group"
 CONSUMER = "trader_filler_1"
 
+# 🔸 Новый стрим для заявок на ордера
+ORDER_REQUEST_STREAM = "trader_order_requests"
+
 # 🔸 Параметры ретраев поиска позиции (последовательно)
-INITIAL_DELAY_SEC = 5.0      # первая пауза после события "opened"
+INITIAL_DELAY_SEC = 3.0      # первая пауза после события "opened"
 RETRY_DELAY_SEC = 5.0        # задержка между повторными попытками
 MAX_ATTEMPTS = 4             # всего попыток: 1 (после INITIAL_DELAY) + 3 ретрая = 4
 
@@ -67,7 +70,6 @@ async def run_trader_position_filler_loop():
             log.exception("❌ Ошибка в основном цикле TRADER_FILLER")
             await asyncio.sleep(2)
 
-
 # 🔸 Обработка одного сообщения из signal_log_queue (интересует только status='opened')
 async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     status = _as_str(data.get("status"))
@@ -88,7 +90,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         log.info("⏭️ Стратегия не помечена trader_winner (sid=%s), пропуск opened uid=%s", strategy_id, position_uid)
         return
 
-    # ждём появления записи в positions_v4 и читаем её (для TG: direction, entry_price)
+    # ждём появления записи в positions_v4 и читаем её (для TG/ордера: direction, entry_price, qty и пр.)
     pos = await _fetch_position_with_retry(position_uid)
     if not pos:
         log.info("⏭️ Не нашли позицию в positions_v4 после ретраев: uid=%s (sid=%s)", position_uid, strategy_id)
@@ -129,7 +131,7 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     group_master_id = _resolve_group_master_id_from_config(strategy_id, direction)
     if group_master_id is None:
         log.info("⚠️ Не удалось определить group_master_id для sid=%s (direction=%s) — пропуск uid=%s",
-                  strategy_id, direction, position_uid)
+                 strategy_id, direction, position_uid)
         return
 
     # правило 1: по этому symbol не должно быть открытых сделок
@@ -167,6 +169,15 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
         position_uid, symbol, strategy_id, group_master_id, margin_used
     )
 
+    # публикация LEAN-заявки на расчёт/план ордеров для bybit_processor
+    await _publish_order_request(
+        position_uid=position_uid,
+        strategy_id=strategy_id,
+        symbol=symbol,
+        direction=direction,
+        created_at=created_at,
+    )
+
     # тянем TP/SL из position_targets_v4 для TG (если есть)
     try:
         tp_targets, sl_targets = await _fetch_targets_for_position(position_uid)
@@ -196,7 +207,30 @@ async def _handle_signal_opened(record_id: str, data: Dict[str, Any]) -> None:
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления об открытии uid=%s", position_uid)
 
-
+# 🔸 Публикация заявки в шину ордеров (LEAN-пейлоад)
+async def _publish_order_request(
+    *,
+    position_uid: str,
+    strategy_id: int,
+    symbol: str,
+    direction: Optional[str],
+    created_at
+) -> None:
+    redis = infra.redis_client
+    try:
+        # все значения в строках (Redis decode_responses=True)
+        fields = {
+            "position_uid": position_uid,
+            "strategy_id": str(strategy_id),
+            "symbol": symbol or "",
+            "direction": (direction or "").lower(),
+            "created_at": (created_at.isoformat() + "Z") if hasattr(created_at, "isoformat") else str(created_at or ""),
+        }
+        await redis.xadd(ORDER_REQUEST_STREAM, fields)
+        log.debug("📤 ORDER_REQ: отправлено в %s для uid=%s", ORDER_REQUEST_STREAM, position_uid)
+    except Exception:
+        log.exception("❌ Не удалось опубликовать заявку ордера uid=%s", position_uid)
+        
 # 🔸 Вспомогательные функции
 
 def _as_str(v: Any) -> str:
