@@ -32,9 +32,9 @@ _TG_MODE = _normalize_mode(os.getenv("TRADER_TG_MODE"))
 
 # сообщим о режиме (в dry_run/off — видно в INFO)
 if _TG_MODE == "dry_run":
-    log.info("TG notifier mode: DRY_RUN (messages will be logged, not sent)")
+    log.debug("TG notifier mode: DRY_RUN (messages will be logged, not sent)")
 elif _TG_MODE == "off":
-    log.info("TG notifier mode: OFF (messages are suppressed)")
+    log.debug("TG notifier mode: OFF (messages are suppressed)")
 else:
     log.debug("TG notifier mode: ON")
 
@@ -126,7 +126,7 @@ async def send_open_notification(
         log.debug("TG OFF: skip OPEN for %s", symbol)
         return
     if _TG_MODE == "dry_run":
-        log.info("[DRY_RUN OPEN]\n%s", text)
+        log.debug("[DRY_RUN OPEN]\n%s", text)
         return
 
     await tg_send(text, disable_notification=silent)
@@ -172,7 +172,7 @@ async def send_closed_notification(
         log.debug("TG OFF: skip CLOSE for %s", symbol)
         return
     if _TG_MODE == "dry_run":
-        log.info("[DRY_RUN CLOSE]\n%s", text)
+        log.debug("[DRY_RUN CLOSE]\n%s", text)
         return
 
     await tg_send(text, disable_notification=silent)
