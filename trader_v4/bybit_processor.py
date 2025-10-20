@@ -1,13 +1,17 @@
-# bybit_processor.py — dry-run планировщик биржевых ордеров (entry + TP/SL) и запись «плана» в БД
+# bybit_processor.py — preflight (margin/position/leverage) + dry-run план ордеров (entry + TP/SL) и запись «плана» в БД
 
 # 🔸 Импорты
 import os
+import json
 import logging
 import asyncio
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+
 from trader_infra import infra
+from trader_config import config  # для чтения leverage из кэша стратегий
 
 # 🔸 Логгер ордеров
 log = logging.getLogger("TRADER_ORDERS")
@@ -43,13 +47,40 @@ def _get_size_factor() -> Decimal:
 
 SIZE_FACTOR = _get_size_factor()
 
+# 🔸 Bybit REST (ENV)
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
+RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
+CATEGORY = "linear"  # деривативы USDT-perp
+
+# 🔸 Целевые режимы (ENV): маржа и позиционный режим
+def _norm_margin_mode(v: Optional[str]) -> str:
+    s = (v or "isolated").strip().lower()
+    return "isolated" if s == "isolated" else "cross"
+
+def _norm_position_mode(v: Optional[str]) -> str:
+    s = (v or "oneway").strip().lower()
+    return "hedge" if s == "hedge" else "oneway"
+
+TARGET_MARGIN_MODE = _norm_margin_mode(os.getenv("BYBIT_MARGIN_MODE"))
+TARGET_POSITION_MODE = _norm_position_mode(os.getenv("BYBIT_POSITION_MODE"))
+
 # сообщим о режимах в лог
 if TRADER_ORDER_MODE == "dry_run":
-    log.info("BYBIT processor mode: DRY_RUN (формируем и сохраняем план ордеров, без отправки). SIZE_FACTOR=%.4f", float(SIZE_FACTOR))
+    log.info(
+        "BYBIT processor mode: DRY_RUN (preflight в логах, план в БД; без отправки ордеров). "
+        "SIZE_FACTOR=%.4f, margin=%s, position=%s",
+        float(SIZE_FACTOR), TARGET_MARGIN_MODE, TARGET_POSITION_MODE
+    )
 elif TRADER_ORDER_MODE == "off":
     log.info("BYBIT processor mode: OFF (игнорируем заявки).")
 else:
-    log.info("BYBIT processor mode: ON (реальная отправка ещё не реализована на этом этапе; сохраняем план).")
+    log.info(
+        "BYBIT processor mode: ON (выполним preflight на бирже, ордера пока не отправляем на этом этапе). "
+        "SIZE_FACTOR=%.4f, margin=%s, position=%s",
+        float(SIZE_FACTOR), TARGET_MARGIN_MODE, TARGET_POSITION_MODE
+    )
 
 
 # 🔸 Основной цикл воркера (последовательная обработка)
@@ -103,6 +134,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         return
 
     position_uid = _as_str(data.get("position_uid"))
+    sid = _as_int(data.get("strategy_id"))
     if not position_uid:
         log.info("⚠️ Пропуск записи (нет position_uid) id=%s", record_id)
         return
@@ -132,13 +164,21 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     # цели TP/SL
     tp_list, tp_signal_skipped, sl_one = await _fetch_targets_for_plan(position_uid)
 
-    # расчёт фактических величин
+    # 🔸 preflight (margin / position-mode / leverage) — сначала план, затем (в режиме on) попытка применить
+    leverage_from_strategy = _get_strategy_leverage(sid)
+    preflight_lines = await _preflight_plan_or_apply(
+        symbol=symbol,
+        leverage=leverage_from_strategy
+    )
+
+    # расчёт фактических величин для плана ордеров
     side_word = "BUY" if direction == "long" else "SELL"
     qty_entry_real = _round_qty(qty_entry_raw * SIZE_FACTOR, precision_qty)
     entry_link_id = f"{position_uid}-entry"
 
-    # DRY_RUN отчёт
+    # DRY_RUN отчёт по ордерам
     lines: List[str] = []
+    lines.extend(preflight_lines)
     lines.append(f"[ORDER_DRY_RUN OPEN] uid={position_uid} symbol={symbol} side={'LONG' if direction=='long' else 'SHORT'}")
     lines.append(f"entry: market {side_word} qty_raw={_fmt(qty_entry_raw)} qty_real={_fmt(qty_entry_real)} linkId={entry_link_id}")
 
@@ -224,7 +264,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
                 qty=qty_entry_real,
                 order_link_id=sl_link_id,
                 ext_status="planned",
-                qty_raw=qty_entry_raw,   # сл на весь входной объём
+                qty_raw=qty_entry_raw,   # SL на весь входной объём
                 price_raw=None,
             )
     else:
@@ -240,9 +280,69 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     # вывод в лог
     log.info("\n" + "\n".join(lines))
 
-    # режим ON пока не отправляет заказы — только сохраняет план
+    # режим ON: на этом этапе мы preflight уже применили (выше), но ордера ещё не отправляем
     if TRADER_ORDER_MODE == "on":
-        log.info("MODE=ON: отправка ордеров ещё не реализована, сохранён только план (ext_status=planned).")
+        log.info("MODE=ON: preflight выполнен; ордера не отправляются на этом этапе (план сохранён как 'planned').")
+
+
+# 🔸 Preflight (план/применение)
+async def _preflight_plan_or_apply(*, symbol: str, leverage: Optional[Decimal]) -> List[str]:
+    lev_str = _lev_to_str(leverage)
+    desired_margin = TARGET_MARGIN_MODE   # 'isolated' | 'cross'
+    desired_posmode = TARGET_POSITION_MODE  # 'oneway' | 'hedge'
+
+    lines: List[str] = []
+    lines.append(f"[PREFLIGHT] symbol={symbol} target: margin={desired_margin}, position={desired_posmode}, leverage={lev_str}")
+
+    # в dry_run — только лог
+    if TRADER_ORDER_MODE != "on":
+        lines.append("[PREFLIGHT] DRY_RUN: no REST calls, just planning")
+        return lines
+
+    # без ключей — не сможем выполнить preflight
+    if not API_KEY or not API_SECRET:
+        lines.append("[PREFLIGHT] SKIP: no API keys configured")
+        return lines
+
+    # применяем по шагам, логируем результат каждого
+    try:
+        # позиционный режим (0 = oneway, 3 = hedge)
+        mode_code = 0 if desired_posmode == "oneway" else 3
+        resp_mode = await _bybit_post(
+            "/v5/position/switch-mode",
+            {"category": CATEGORY, "symbol": symbol, "mode": mode_code}
+        )
+        lines.append(f"[PREFLIGHT] switch-mode → retCode={resp_mode.get('retCode')} retMsg={resp_mode.get('retMsg')}")
+
+        # маржинальный режим (tradeMode: 1=isolated, 0=cross) + требуются buy/sell leverage
+        trade_mode = 1 if desired_margin == "isolated" else 0
+        resp_iso = await _bybit_post(
+            "/v5/position/switch-isolated",
+            {
+                "category": CATEGORY,
+                "symbol": symbol,
+                "tradeMode": trade_mode,
+                "buyLeverage": lev_str,
+                "sellLeverage": lev_str,
+            }
+        )
+        lines.append(f"[PREFLIGHT] switch-isolated → retCode={resp_iso.get('retCode')} retMsg={resp_iso.get('retMsg')}")
+
+        # явная установка leverage (на всякий случай отдельно)
+        resp_lev = await _bybit_post(
+            "/v5/position/set-leverage",
+            {
+                "category": CATEGORY,
+                "symbol": symbol,
+                "buyLeverage": lev_str,
+                "sellLeverage": lev_str,
+            }
+        )
+        lines.append(f"[PREFLIGHT] set-leverage → retCode={resp_lev.get('retCode')} retMsg={resp_lev.get('retMsg')}")
+    except Exception as e:
+        lines.append(f"[PREFLIGHT] ERROR: {e}")
+
+    return lines
 
 
 # 🔸 Вспомогательные функции извлечения и округлений
@@ -250,6 +350,13 @@ def _as_str(v: Any) -> str:
     if v is None:
         return ""
     return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        s = _as_str(v)
+        return int(s) if s != "" else None
+    except Exception:
+        return None
 
 def _as_decimal(v: Any) -> Optional[Decimal]:
     try:
@@ -291,6 +398,28 @@ def _round_price(price: Optional[Decimal], ticksize: Optional[Decimal]) -> Optio
         return price.quantize(quantum, rounding=ROUND_HALF_UP)
     except Exception:
         return price
+
+def _lev_to_str(lev: Optional[Decimal]) -> str:
+    # Bybit ожидает строку; для one-way buyLeverage и sellLeverage должны совпадать
+    try:
+        if lev is None:
+            return "1"
+        # чаще всего Bybit принимает целые значения плеча
+        return str(int(lev))
+    except Exception:
+        return "1"
+
+def _get_strategy_leverage(strategy_id: Optional[int]) -> Optional[Decimal]:
+    if strategy_id is None:
+        return None
+    meta = config.strategy_meta.get(strategy_id) or {}
+    lev = meta.get("leverage")
+    try:
+        if lev is None:
+            return None
+        return lev if isinstance(lev, Decimal) else Decimal(str(lev))
+    except Exception:
+        return None
 
 
 # 🔸 Доступ к БД: чтение
@@ -400,12 +529,9 @@ async def _upsert_order(
     qty_raw: Optional[Decimal],
     price_raw: Optional[Decimal],
 ) -> None:
-    # приводим типы к строковым ограничениям таблицы
     side_norm = None if side is None else side.upper()
-    # типы в таблице строчные (market/limit/stop_market/stop_limit)
     otype_norm = None if otype is None else otype.lower()
 
-    # upsert «плана»: не трогаем order_id/filled/avg_fill, только плановые поля
     await infra.pg_pool.execute(
         """
         INSERT INTO public.trader_position_orders (
@@ -438,3 +564,37 @@ async def _upsert_order(
         price, trigger_price, qty, order_link_id, ext_status,
         qty_raw, price_raw
     )
+
+
+# 🔸 Bybit REST: подпись и вызовы (используем ту же формулу, что и в bybit_sync)
+def _rest_sign(ts_ms: int, query_or_body: str) -> str:
+    import hmac, hashlib
+    payload = f"{ts_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
+    return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+async def _bybit_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    ts = _now_ms()
+    body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    sign = _rest_sign(ts, body_str)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": str(ts),
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN": sign,
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_str.encode("utf-8"))
+        try:
+            r.raise_for_status()
+        except Exception:
+            log.warning("⚠️ Bybit POST %s %s: %s", path, r.status_code, r.text)
+        try:
+            return r.json()
+        except Exception:
+            return {"retCode": None, "retMsg": "non-json response", "raw": r.text}
+
+def _now_ms() -> int:
+    import time
+    return int(time.time() * 1000)
