@@ -1,5 +1,5 @@
 # bybit_processor.py — preflight (margin/position/leverage) + план (entry + TP/SL) и запись «плана» в БД
-# + submit ордеров на Bybit при TRADER_ORDER_MODE=on (entry → TP → SL) с апдейтом статусов
+# + submit ордеров на Bybit при TRADER_ORDER_MODE=on (entry → TP → SL) с апдейтом статусов и фиксом side/UNIFIED
 
 # 🔸 Импорты
 import os
@@ -55,6 +55,7 @@ API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
 CATEGORY = "linear"  # деривативы USDT-perp
+ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").upper()  # UNIFIED | CONTRACT | SPOT
 
 # 🔸 Целевые режимы (ENV): маржа и позиционный режим
 def _norm_margin_mode(v: Optional[str]) -> str:
@@ -72,16 +73,16 @@ TARGET_POSITION_MODE = _norm_position_mode(os.getenv("BYBIT_POSITION_MODE"))
 if TRADER_ORDER_MODE == "dry_run":
     log.info(
         "BYBIT processor mode: DRY_RUN (preflight в логах, план в БД; без отправки ордеров). "
-        "SIZE_FACTOR=%.4f, margin=%s, position=%s",
-        float(SIZE_FACTOR), TARGET_MARGIN_MODE, TARGET_POSITION_MODE
+        "SIZE_FACTOR=%.4f, margin=%s, position=%s, account_type=%s",
+        float(SIZE_FACTOR), TARGET_MARGIN_MODE, TARGET_POSITION_MODE, ACCOUNT_TYPE
     )
 elif TRADER_ORDER_MODE == "off":
     log.info("BYBIT processor mode: OFF (игнорируем заявки).")
 else:
     log.info(
         "BYBIT processor mode: ON (preflight + submit ордеров). "
-        "SIZE_FACTOR=%.4f, margin=%s, position=%s",
-        float(SIZE_FACTOR), TARGET_MARGIN_MODE, TARGET_POSITION_MODE
+        "SIZE_FACTOR=%.4f, margin=%s, position=%s, account_type=%s",
+        float(SIZE_FACTOR), TARGET_MARGIN_MODE, TARGET_POSITION_MODE, ACCOUNT_TYPE
     )
 
 
@@ -283,10 +284,9 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
 
     # 🔸 Сабмит ордеров в режиме ON
     if TRADER_ORDER_MODE == "on" and not entry_skipped and (API_KEY and API_SECRET):
-        # 1) Entry (Market)
-        ok_e, oid_e, rc_e, rm_e = await _submit_entry(symbol=symbol, side=side_word, qty=qty_entry_real, link_id=entry_link_id)
+        # 1) Entry (Market) — нормализуем side к Title-Case ("Buy"/"Sell")
+        ok_e, oid_e, rc_e, rm_e = await _submit_entry(symbol=symbol, side=_to_title_side(side_word), qty=qty_entry_real, link_id=entry_link_id)
         await _mark_order_after_submit(order_link_id=entry_link_id, ok=ok_e, order_id=oid_e, retcode=rc_e, retmsg=rm_e)
-        # витрина по позиции
         await _mirror_entry_to_trader_positions(
             position_uid=position_uid,
             order_link_id=entry_link_id,
@@ -294,25 +294,25 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             ext_status=("submitted" if ok_e else "rejected")
         )
 
-        # небольшая пауза, чтобы на бирже появилась позиция перед TP/SL
-        await asyncio.sleep(0.25)
+        # отправляем TP/SL ТОЛЬКО если entry прошёл
+        if ok_e:
+            await asyncio.sleep(0.25)  # короткая пауза, чтобы позиция появилась
 
-        # 2) Все TP (Limit reduce-only) — с лёгким ретраем
-        for level, price_real, qty_tp_real, link_id in tp_real_list:
-            ok_t, oid_t, rc_t, rm_t = await _submit_tp(symbol=symbol, side=opposite_side, price=price_real, qty=qty_tp_real, link_id=link_id)
-            if not ok_t:
-                # ещё одна попытка через короткую паузу
-                await asyncio.sleep(0.35)
-                ok_t, oid_t, rc_t, rm_t = await _submit_tp(symbol=symbol, side=opposite_side, price=price_real, qty=qty_tp_real, link_id=link_id)
-            await _mark_order_after_submit(order_link_id=link_id, ok=ok_t, order_id=oid_t, retcode=rc_t, retmsg=rm_t)
+            # 2) Все TP (Limit reduce-only) — с лёгким ретраем
+            for level, price_real, qty_tp_real, link_id in tp_real_list:
+                ok_t, oid_t, rc_t, rm_t = await _submit_tp(symbol=symbol, side=_to_title_side(opposite_side), price=price_real, qty=qty_tp_real, link_id=link_id)
+                if not ok_t:
+                    await asyncio.sleep(0.35)
+                    ok_t, oid_t, rc_t, rm_t = await _submit_tp(symbol=symbol, side=_to_title_side(opposite_side), price=price_real, qty=qty_tp_real, link_id=link_id)
+                await _mark_order_after_submit(order_link_id=link_id, ok=ok_t, order_id=oid_t, retcode=rc_t, retmsg=rm_t)
 
-        # 3) SL (stop-market reduce-only), если есть
-        if sl_trigger is not None:
-            ok_s, oid_s, rc_s, rm_s = await _submit_sl(symbol=symbol, side=opposite_side, trigger_price=sl_trigger, qty=qty_entry_real, link_id=sl_link_id)
-            if not ok_s:
-                await asyncio.sleep(0.35)
-                ok_s, oid_s, rc_s, rm_s = await _submit_sl(symbol=symbol, side=opposite_side, trigger_price=sl_trigger, qty=qty_entry_real, link_id=sl_link_id)
-            await _mark_order_after_submit(order_link_id=sl_link_id, ok=ok_s, order_id=oid_s, retcode=rc_s, retmsg=rm_s)
+            # 3) SL (stop-market reduce-only), если есть
+            if sl_trigger is not None:
+                ok_s, oid_s, rc_s, rm_s = await _submit_sl(symbol=symbol, side=_to_title_side(opposite_side), trigger_price=sl_trigger, qty=qty_entry_real, link_id=sl_link_id)
+                if not ok_s:
+                    await asyncio.sleep(0.35)
+                    ok_s, oid_s, rc_s, rm_s = await _submit_sl(symbol=symbol, side=_to_title_side(opposite_side), trigger_price=sl_trigger, qty=qty_entry_real, link_id=sl_link_id)
+                await _mark_order_after_submit(order_link_id=sl_link_id, ok=ok_s, order_id=oid_s, retcode=rc_s, retmsg=rm_s)
 
 
 # 🔸 Preflight (план/применение)
@@ -339,13 +339,16 @@ async def _preflight_plan_or_apply(*, symbol: str, leverage: Optional[Decimal]) 
         resp_mode = await _bybit_post("/v5/position/switch-mode", {"category": CATEGORY, "symbol": symbol, "mode": mode_code})
         lines.append(f"[PREFLIGHT] switch-mode → retCode={resp_mode.get('retCode')} retMsg={resp_mode.get('retMsg')}")
 
-        # маржинальный режим (1=isolated, 0=cross) + buy/sell leverage
-        trade_mode = 1 if desired_margin == "isolated" else 0
-        resp_iso = await _bybit_post(
-            "/v5/position/switch-isolated",
-            {"category": CATEGORY, "symbol": symbol, "tradeMode": trade_mode, "buyLeverage": lev_str, "sellLeverage": lev_str}
-        )
-        lines.append(f"[PREFLIGHT] switch-isolated → retCode={resp_iso.get('retCode')} retMsg={resp_iso.get('retMsg')}")
+        # маржинальный режим: для UNIFIED у Bybit v5 switch-isolated может быть запрещён — тогда пропускаем
+        if ACCOUNT_TYPE == "UNIFIED":
+            lines.append("[PREFLIGHT] switch-isolated → SKIP for UNIFIED account")
+        else:
+            trade_mode = 1 if desired_margin == "isolated" else 0
+            resp_iso = await _bybit_post(
+                "/v5/position/switch-isolated",
+                {"category": CATEGORY, "symbol": symbol, "tradeMode": trade_mode, "buyLeverage": lev_str, "sellLeverage": lev_str}
+            )
+            lines.append(f"[PREFLIGHT] switch-isolated → retCode={resp_iso.get('retCode')} retMsg={resp_iso.get('retMsg')}")
 
         # явная установка leverage (на всякий случай отдельно)
         resp_lev = await _bybit_post(
@@ -364,7 +367,7 @@ async def _submit_entry(*, symbol: str, side: str, qty: Decimal, link_id: str) -
     body = {
         "category": CATEGORY,
         "symbol": symbol,
-        "side": side,
+        "side": side,  # "Buy" | "Sell"
         "orderType": "Market",
         "qty": _str_qty(qty),
         "timeInForce": "GTC",
@@ -382,7 +385,7 @@ async def _submit_tp(*, symbol: str, side: str, price: Decimal, qty: Decimal, li
     body = {
         "category": CATEGORY,
         "symbol": symbol,
-        "side": side,
+        "side": side,  # "Buy" | "Sell"
         "orderType": "Limit",
         "price": _str_price(price),
         "qty": _str_qty(qty),
@@ -401,7 +404,7 @@ async def _submit_sl(*, symbol: str, side: str, trigger_price: Decimal, qty: Dec
     body = {
         "category": CATEGORY,
         "symbol": symbol,
-        "side": side,
+        "side": side,  # "Buy" | "Sell"
         "orderType": "Market",
         "qty": _str_qty(qty),
         "reduceOnly": True,
@@ -518,6 +521,10 @@ def _str_qty(q: Decimal) -> str:
 
 def _str_price(p: Decimal) -> str:
     return _fmt(p)
+
+def _to_title_side(side: str) -> str:
+    s = (side or "").upper()
+    return "Buy" if s == "BUY" else "Sell"
 
 def _get_strategy_leverage(strategy_id: Optional[int]) -> Optional[Decimal]:
     if strategy_id is None:
