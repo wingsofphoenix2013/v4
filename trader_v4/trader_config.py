@@ -59,7 +59,7 @@ class TraderConfigState:
             await self._load_strategy_tickers()
             await self._refresh_trader_winners_state_locked()
             # итоговый лог по результату загрузки
-            log.info(
+            log.debug(
                 "✅ Конфигурация перезагружена: тикеров=%d, стратегий=%d, winners=%d (min_dep=%s)",
                 len(self.tickers),
                 len(self.strategies),
@@ -80,16 +80,16 @@ class TraderConfigState:
             )
             if row:
                 self.tickers[symbol] = dict(row)
-                log.info("🔄 Тикер обновлён: %s", symbol)
+                log.debug("🔄 Тикер обновлён: %s", symbol)
             else:
                 self.tickers.pop(symbol, None)
-                log.info("🗑️ Тикер удалён (не активен): %s", symbol)
+                log.debug("🗑️ Тикер удалён (не активен): %s", symbol)
 
     # 🔸 Удаление тикера из состояния
     async def remove_ticker(self, symbol: str):
         async with self._lock:
             self.tickers.pop(symbol, None)
-            log.info("🗑️ Тикер удалён: %s", symbol)
+            log.debug("🗑️ Тикер удалён: %s", symbol)
 
     # 🔸 Точечная перезагрузка стратегии
     async def reload_strategy(self, strategy_id: int):
@@ -110,7 +110,7 @@ class TraderConfigState:
                 self.trader_winners.discard(strategy_id)
                 self.strategy_meta.pop(strategy_id, None)
                 await self._recalc_min_deposit_locked()
-                log.info("🗑️ Стратегия удалена: id=%d", strategy_id)
+                log.debug("🗑️ Стратегия удалена: id=%d", strategy_id)
                 return
 
             strategy = dict(row)
@@ -135,7 +135,7 @@ class TraderConfigState:
             # обновим кэш победителей инкрементально (на основе свежей строки)
             await self._touch_winner_membership_locked(strategy)
 
-            log.info(
+            log.debug(
                 "🔄 Стратегия обновлена: id=%d (tickers=%d, is_winner=%s)",
                 strategy_id,
                 len(self.strategy_tickers[strategy_id]),
@@ -150,7 +150,7 @@ class TraderConfigState:
             self.trader_winners.discard(strategy_id)
             self.strategy_meta.pop(strategy_id, None)
             await self._recalc_min_deposit_locked()
-            log.info("🗑️ Стратегия удалена: id=%d", strategy_id)
+            log.debug("🗑️ Стратегия удалена: id=%d", strategy_id)
 
     # 🔸 Загрузка активных тикеров
     async def _load_tickers(self):
@@ -163,7 +163,7 @@ class TraderConfigState:
         )
         self.tickers = {r["symbol"]: dict(r) for r in rows}
         # результат загрузки тикеров
-        log.info("📥 Загружены тикеры: %d", len(self.tickers))
+        log.debug("📥 Загружены тикеры: %d", len(self.tickers))
 
     # 🔸 Загрузка активных стратегий (только enabled=true)
     async def _load_strategies(self):
@@ -181,7 +181,7 @@ class TraderConfigState:
             strategies[s["id"]] = s
         self.strategies = strategies
         # результат загрузки стратегий
-        log.info("📥 Загружены стратегии: %d", len(self.strategies))
+        log.debug("📥 Загружены стратегии: %d", len(self.strategies))
 
     # 🔸 Загрузка связей стратегия ↔ тикеры
     async def _load_strategy_tickers(self):
@@ -200,7 +200,7 @@ class TraderConfigState:
             mapping.setdefault(r["strategy_id"], set()).add(r["symbol"])
         self.strategy_tickers = mapping
         # результат загрузки связей
-        log.info("📥 Загружены связи стратегия↔тикеры: записей=%d", len(rows))
+        log.debug("📥 Загружены связи стратегия↔тикеры: записей=%d", len(rows))
 
     # 🔸 Публичное обновление кэша победителей (батч из БД)
     async def refresh_trader_winners_state(self):
@@ -243,7 +243,7 @@ class TraderConfigState:
         self.trader_winners = winners
         self.strategy_meta = meta
         self.trader_winners_min_deposit = min_dep
-        log.info(
+        log.debug(
             "🏷️ Кэш trader_winner обновлён: winners=%d, min_dep=%s",
             len(self.trader_winners),
             self.trader_winners_min_deposit,
@@ -285,7 +285,7 @@ config = TraderConfigState()
 # 🔸 Первичная инициализация конфигурации
 async def init_trader_config_state():
     await config.reload_all()
-    log.info("✅ Конфигурация трейдера загружена")
+    log.debug("✅ Конфигурация трейдера загружена")
 
 # 🔸 Слушатель Pub/Sub для онлайновых апдейтов
 async def config_event_listener():
@@ -294,7 +294,7 @@ async def config_event_listener():
 
     # подписка на существующие каналы
     await pubsub.subscribe(TICKERS_EVENTS_CHANNEL, STRATEGIES_EVENTS_CHANNEL)
-    log.info("📡 Подписка на каналы Redis запущена: %s, %s", TICKERS_EVENTS_CHANNEL, STRATEGIES_EVENTS_CHANNEL)
+    log.debug("📡 Подписка на каналы Redis запущена: %s, %s", TICKERS_EVENTS_CHANNEL, STRATEGIES_EVENTS_CHANNEL)
 
     async for msg in pubsub.listen():
         if msg.get("type") != "message":
@@ -318,7 +318,7 @@ async def config_event_listener():
                     await config.reload_ticker(symbol)
                 elif action == "disabled":
                     await config.remove_ticker(symbol)
-                log.info("♻️ Обработано событие тикера: %s (%s)", symbol, action)
+                log.debug("♻️ Обработано событие тикера: %s (%s)", symbol, action)
 
             # обработка событий по стратегиям
             elif channel == STRATEGIES_EVENTS_CHANNEL:
@@ -330,7 +330,7 @@ async def config_event_listener():
                     await config.remove_strategy(sid)
                 # после любого изменения стратегии — освежим кэш winners
                 await config.refresh_trader_winners_state()
-                log.info("♻️ Обработано событие стратегии: id=%d (%s)", sid, action)
+                log.debug("♻️ Обработано событие стратегии: id=%d (%s)", sid, action)
 
         except Exception:
             # логируем и продолжаем слушать дальше
