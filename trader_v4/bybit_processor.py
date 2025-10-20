@@ -1,5 +1,5 @@
 # bybit_processor.py — preflight (margin/position/leverage) + план (entry + TP/SL) и запись «плана» в БД
-# + submit ордеров на Bybit при TRADER_ORDER_MODE=on (entry → TP → SL) с апдейтом статусов и фиксом side/UNIFIED
+# + submit ордеров на Bybit при TRADER_ORDER_MODE=on (entry → TP → SL), фикс side и triggerDirection для SL
 
 # 🔸 Импорты
 import os
@@ -167,12 +167,9 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     # цели TP/SL
     tp_list, tp_signal_skipped, sl_one = await _fetch_targets_for_plan(position_uid)
 
-    # 🔸 preflight (margin / position-mode / leverage)
+    # preflight (margin / position-mode / leverage)
     leverage_from_strategy = _get_strategy_leverage(sid)
-    preflight_lines = await _preflight_plan_or_apply(
-        symbol=symbol,
-        leverage=leverage_from_strategy
-    )
+    preflight_lines = await _preflight_plan_or_apply(symbol=symbol, leverage=leverage_from_strategy)
 
     # расчёт фактических величин для плана ордеров
     side_word = "BUY" if direction == "long" else "SELL"
@@ -273,7 +270,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
                 qty=qty_entry_real,
                 order_link_id=sl_link_id,
                 ext_status="planned",
-                qty_raw=qty_entry_real,   # SL на весь входной объём
+                qty_raw=qty_entry_real,
                 price_raw=None,
             )
     else:
@@ -282,23 +279,18 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     # вывод плана в лог
     log.info("\n" + "\n".join(lines))
 
-    # 🔸 Сабмит ордеров в режиме ON
+    # Сабмит ордеров в режиме ON
     if TRADER_ORDER_MODE == "on" and not entry_skipped and (API_KEY and API_SECRET):
-        # 1) Entry (Market) — нормализуем side к Title-Case ("Buy"/"Sell")
+        # entry
         ok_e, oid_e, rc_e, rm_e = await _submit_entry(symbol=symbol, side=_to_title_side(side_word), qty=qty_entry_real, link_id=entry_link_id)
         await _mark_order_after_submit(order_link_id=entry_link_id, ok=ok_e, order_id=oid_e, retcode=rc_e, retmsg=rm_e)
-        await _mirror_entry_to_trader_positions(
-            position_uid=position_uid,
-            order_link_id=entry_link_id,
-            order_id=oid_e,
-            ext_status=("submitted" if ok_e else "rejected")
-        )
+        await _mirror_entry_to_trader_positions(position_uid=position_uid, order_link_id=entry_link_id, order_id=oid_e, ext_status=("submitted" if ok_e else "rejected"))
 
-        # отправляем TP/SL ТОЛЬКО если entry прошёл
+        # только если entry успешен — TP/SL
         if ok_e:
-            await asyncio.sleep(0.25)  # короткая пауза, чтобы позиция появилась
+            await asyncio.sleep(0.25)
 
-            # 2) Все TP (Limit reduce-only) — с лёгким ретраем
+            # TP
             for level, price_real, qty_tp_real, link_id in tp_real_list:
                 ok_t, oid_t, rc_t, rm_t = await _submit_tp(symbol=symbol, side=_to_title_side(opposite_side), price=price_real, qty=qty_tp_real, link_id=link_id)
                 if not ok_t:
@@ -306,25 +298,39 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
                     ok_t, oid_t, rc_t, rm_t = await _submit_tp(symbol=symbol, side=_to_title_side(opposite_side), price=price_real, qty=qty_tp_real, link_id=link_id)
                 await _mark_order_after_submit(order_link_id=link_id, ok=ok_t, order_id=oid_t, retcode=rc_t, retmsg=rm_t)
 
-            # 3) SL (stop-market reduce-only), если есть
+            # SL
             if sl_trigger is not None:
-                ok_s, oid_s, rc_s, rm_s = await _submit_sl(symbol=symbol, side=_to_title_side(opposite_side), trigger_price=sl_trigger, qty=qty_entry_real, link_id=sl_link_id)
+                trig_dir = _calc_trigger_direction(direction)
+                ok_s, oid_s, rc_s, rm_s = await _submit_sl(
+                    symbol=symbol,
+                    side=_to_title_side(opposite_side),
+                    trigger_price=sl_trigger,
+                    qty=qty_entry_real,
+                    link_id=sl_link_id,
+                    trigger_direction=trig_dir,
+                )
                 if not ok_s:
                     await asyncio.sleep(0.35)
-                    ok_s, oid_s, rc_s, rm_s = await _submit_sl(symbol=symbol, side=_to_title_side(opposite_side), trigger_price=sl_trigger, qty=qty_entry_real, link_id=sl_link_id)
+                    ok_s, oid_s, rc_s, rm_s = await _submit_sl(
+                        symbol=symbol,
+                        side=_to_title_side(opposite_side),
+                        trigger_price=sl_trigger,
+                        qty=qty_entry_real,
+                        link_id=sl_link_id,
+                        trigger_direction=trig_dir,
+                    )
                 await _mark_order_after_submit(order_link_id=sl_link_id, ok=ok_s, order_id=oid_s, retcode=rc_s, retmsg=rm_s)
 
 
 # 🔸 Preflight (план/применение)
 async def _preflight_plan_or_apply(*, symbol: str, leverage: Optional[Decimal]) -> List[str]:
     lev_str = _lev_to_str(leverage)
-    desired_margin = TARGET_MARGIN_MODE   # 'isolated' | 'cross'
-    desired_posmode = TARGET_POSITION_MODE  # 'oneway' | 'hedge'
+    desired_margin = TARGET_MARGIN_MODE
+    desired_posmode = TARGET_POSITION_MODE
 
     lines: List[str] = []
     lines.append(f"[PREFLIGHT] symbol={symbol} target: margin={desired_margin}, position={desired_posmode}, leverage={lev_str}")
 
-    # dry_run — только лог
     if TRADER_ORDER_MODE != "on":
         lines.append("[PREFLIGHT] DRY_RUN: no REST calls, just planning")
         return lines
@@ -339,7 +345,7 @@ async def _preflight_plan_or_apply(*, symbol: str, leverage: Optional[Decimal]) 
         resp_mode = await _bybit_post("/v5/position/switch-mode", {"category": CATEGORY, "symbol": symbol, "mode": mode_code})
         lines.append(f"[PREFLIGHT] switch-mode → retCode={resp_mode.get('retCode')} retMsg={resp_mode.get('retMsg')}")
 
-        # маржинальный режим: для UNIFIED у Bybit v5 switch-isolated может быть запрещён — тогда пропускаем
+        # маржинальный режим: для UNIFIED skip
         if ACCOUNT_TYPE == "UNIFIED":
             lines.append("[PREFLIGHT] switch-isolated → SKIP for UNIFIED account")
         else:
@@ -350,7 +356,7 @@ async def _preflight_plan_or_apply(*, symbol: str, leverage: Optional[Decimal]) 
             )
             lines.append(f"[PREFLIGHT] switch-isolated → retCode={resp_iso.get('retCode')} retMsg={resp_iso.get('retMsg')}")
 
-        # явная установка leverage (на всякий случай отдельно)
+        # явная установка leverage
         resp_lev = await _bybit_post(
             "/v5/position/set-leverage",
             {"category": CATEGORY, "symbol": symbol, "buyLeverage": lev_str, "sellLeverage": lev_str}
@@ -400,15 +406,26 @@ async def _submit_tp(*, symbol: str, side: str, price: Decimal, qty: Decimal, li
     log.info("submit tp: %s %s price=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_price(price), _str_qty(qty), link_id, rc, rm, oid)
     return ok, oid, rc, rm
 
-async def _submit_sl(*, symbol: str, side: str, trigger_price: Decimal, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
+async def _submit_sl(
+    *,
+    symbol: str,
+    side: str,                     # "Buy" | "Sell"
+    trigger_price: Decimal,
+    qty: Decimal,
+    link_id: str,
+    trigger_direction: int,        # 1=rise, 2=fall
+) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
     body = {
         "category": CATEGORY,
         "symbol": symbol,
-        "side": side,  # "Buy" | "Sell"
+        "side": side,
         "orderType": "Market",
         "qty": _str_qty(qty),
         "reduceOnly": True,
         "triggerPrice": _str_price(trigger_price),
+        "triggerDirection": trigger_direction,
+        "triggerBy": "LastPrice",
+        "closeOnTrigger": True,
         "timeInForce": "GTC",
         "orderLinkId": link_id,
     }
@@ -416,7 +433,10 @@ async def _submit_sl(*, symbol: str, side: str, trigger_price: Decimal, qty: Dec
     rc, rm = resp.get("retCode"), resp.get("retMsg")
     oid = _extract_order_id(resp)
     ok = (rc == 0)
-    log.info("submit sl: %s %s trigger=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_price(trigger_price), _str_qty(qty), link_id, rc, rm, oid)
+    log.info(
+        "submit sl: %s %s trigger=%s dir=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s",
+        side, symbol, _str_price(trigger_price), trigger_direction, _str_qty(qty), link_id, rc, rm, oid
+    )
     return ok, oid, rc, rm
 
 
@@ -526,6 +546,11 @@ def _to_title_side(side: str) -> str:
     s = (side or "").upper()
     return "Buy" if s == "BUY" else "Sell"
 
+def _calc_trigger_direction(position_direction: str) -> int:
+    # long → SL ниже (ждём падение) → 2; short → SL выше (ждём рост) → 1
+    d = (position_direction or "").lower()
+    return 2 if d == "long" else 1
+
 def _get_strategy_leverage(strategy_id: Optional[int]) -> Optional[Decimal]:
     if strategy_id is None:
         return None
@@ -604,7 +629,7 @@ async def _fetch_targets_for_plan(position_uid: str) -> Tuple[List[Tuple[int, De
         """,
         position_uid
     )
-    sl_one = ( _as_decimal(sl_row["price"]), ) if sl_row and sl_row["price"] is not None else ( None, )
+    sl_one = (_as_decimal(sl_row["price"]),) if sl_row and sl_row["price"] is not None else (None,)
 
     return tps, tp_signal_skipped, sl_one
 
