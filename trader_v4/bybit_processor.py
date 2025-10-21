@@ -45,9 +45,9 @@ ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").upper()  # UNIFIED | C
 DEFAULT_TRIGGER_BY = os.getenv("BYBIT_TRIGGER_BY", "LastPrice")  # LastPrice | MarkPrice | IndexPrice
 
 # 🔸 Настройки ожиданий/ограничений
-ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "30"))   # сколько ждём фактический fill entry
-ENTRY_FILL_POLL_MS = int(os.getenv("ENTRY_FILL_POLL_MS", "250"))          # период опроса БД по entry
-TP_MIN_QTY_THRESHOLD = Decimal(os.getenv("TP_MIN_QTY_THRESHOLD", "0"))    # можно оставить 0 (используем min_qty тиков)
+ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "30"))
+ENTRY_FILL_POLL_MS = int(os.getenv("ENTRY_FILL_POLL_MS", "250"))
+TP_MIN_QTY_THRESHOLD = Decimal(os.getenv("TP_MIN_QTY_THRESHOLD", "0"))
 
 # 🔸 Сообщим о режиме
 if TRADER_ORDER_MODE == "dry_run":
@@ -57,11 +57,9 @@ elif TRADER_ORDER_MODE == "off":
 else:
     log.info("BYBIT processor v2: ON (entry→fill→TP/SL по политике). trigger_by=%s", DEFAULT_TRIGGER_BY)
 
-
-# 🔸 Основной цикл воркера (последовательная постановка задач с мягким параллелизмом)
+# 🔸 Основной цикл воркера
 async def run_bybit_processor_loop():
     redis = infra.redis_client
-
     try:
         await redis.xgroup_create(ORDER_REQUEST_STREAM, CG_NAME, id="$", mkstream=True)
         log.debug("📡 Consumer Group создана: %s → %s", ORDER_REQUEST_STREAM, CG_NAME)
@@ -100,14 +98,12 @@ async def run_bybit_processor_loop():
             log.exception("❌ Ошибка в основном цикле BYBIT_PROCESSOR")
             await asyncio.sleep(0.5)
 
-
 # 🔸 Обработка одной заявки из стрима (толстый payload)
 async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     if TRADER_ORDER_MODE == "off":
         log.debug("TRADER_ORDER_MODE=off — пропуск заявки id=%s", record_id)
         return
 
-    # извлекаем базовые поля
     position_uid = _as_str(data.get("position_uid"))
     sid = _as_int(data.get("strategy_id"))
     symbol = _as_str(data.get("symbol"))
@@ -118,7 +114,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         log.info("⚠️ Недостаточные данные заявки: id=%s uid=%s sid=%s symbol=%s dir=%s", record_id, position_uid, sid, symbol, direction)
         return
 
-    # точности из заявки (если есть) или из кэша тикеров
+    # точности
     precision_qty = _as_int(data.get("precision_qty"))
     min_qty = _as_decimal(data.get("min_qty"))
     ticksize = _as_decimal(data.get("ticksize"))
@@ -128,25 +124,23 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         ticksize = _as_decimal(t.get("ticksize")) if ticksize is None else ticksize
         min_qty = _as_decimal(t.get("min_qty")) if min_qty is None else min_qty
 
-    # политика стратегии (JSON в payload) или из кэша
-    policy = _parse_policy_json(_as_str(data.get("policy")))
-    if not policy:
-        policy = config.strategy_policy.get(sid) or {}
+    # политика стратегии
+    policy = _parse_policy_json(_as_str(data.get("policy"))) or (config.strategy_policy.get(sid) or {})
+    _normalize_policy_inplace(policy)  # <-- ключевая правка: приводим ключи уровней к int
 
-    # плечо: из payload/кэша
+    # плечо
     lev = _as_decimal(data.get("leverage"))
     if lev is None:
         meta = config.strategy_meta.get(sid) or {}
         lev = _as_decimal(meta.get("leverage"))
 
-    # из positions_v4 попробуем достать начальные калькуляционные поля (quantity/entry_price), если они уже есть
+    # сырьё из positions_v4 (quantity / entry_price mark — для dry_run)
     qty_raw, entry_price_mark = await _try_fetch_initials_from_positions_v4(position_uid)
-
     if qty_raw is None or qty_raw <= 0:
         log.info("⚠️ Нет quantity для uid=%s — пропуск", position_uid)
         return
 
-    # planned entry в БД (до отправки), чтобы BYBIT_SYNC мог апдейтить по orderLinkId
+    # planned entry (до сабмита)
     entry_link_id = f"{position_uid}-entry"
     side_title = _to_title_side("BUY" if direction == "long" else "SELL")
     await _upsert_order(
@@ -175,25 +169,24 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         supersedes_link_id=None,
     )
 
-    # сабмит entry (если on)
+    # entry (on) / dry_run
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         ok_e, oid_e, rc_e, rm_e = await _submit_entry(symbol=symbol, side=side_title, qty=_round_qty(qty_raw, precision_qty), link_id=entry_link_id)
         await _mark_order_after_submit(order_link_id=entry_link_id, ok=ok_e, order_id=oid_e, retcode=rc_e, retmsg=rm_e)
         await _mirror_entry_to_trader_positions(position_uid=position_uid, order_link_id=entry_link_id, order_id=oid_e, ext_status=("submitted" if ok_e else "rejected"))
         if not ok_e:
-            log.info("⚠️ Entry не отправлен/отвергнут (uid=%s) → прекращаем обработку", position_uid)
+            log.info("⚠️ Entry отвергнут (uid=%s) → прекращаем обработку", position_uid)
             return
     else:
         log.info("[DRY_RUN] entry planned: uid=%s %s qty=%s", position_uid, symbol, _fmt(_round_qty(qty_raw, precision_qty)))
 
-    # ждём фактический fill entry (или подставляем суррогат в dry_run)
+    # ждём фактический fill / суррогат
     avg_fill_price, filled_qty = await _wait_entry_fill_or_fallback(position_uid, entry_link_id, symbol, entry_price_mark, qty_raw, precision_qty)
-
     if avg_fill_price is None or filled_qty is None or filled_qty <= 0:
         log.info("⚠️ Не получили фактический fill для uid=%s — прекращаем обработку", position_uid)
         return
 
-    # расчёт TP/SL от avg fill
+    # расчёт TP/SL
     plan_tp, plan_tp_signal, plan_sl_primary, plan_sls_after_tp = _build_plan_from_policy(
         position_uid=position_uid,
         symbol=symbol,
@@ -206,7 +199,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         policy=policy,
     )
 
-    # запишем TP (ценовые) и виртуальный TP(signal)
+    # TP ценовые + TP(signal)
     for lvl, price, qty, link_id in plan_tp:
         await _upsert_order(
             position_uid=position_uid,
@@ -261,7 +254,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             supersedes_link_id=None,
         )
 
-    # запишем первичный SL и заготовки SL-после-TP
+    # SL первичный + SL-после-TP (заготовки)
     if plan_sl_primary is not None:
         trig, qty, link_id = plan_sl_primary
         await _upsert_order(
@@ -316,7 +309,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             supersedes_link_id=None,
         )
 
-    # сабмит реальных ордеров (TP ценовые + первичный SL) если ON
+    # Сабмит реальных ордеров (ON): первичный SL + ценовые TP
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         if plan_sl_primary is not None:
             trig, qty, link_id = plan_sl_primary
@@ -342,6 +335,25 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     else:
         log.info("[DRY_RUN] placed: primary SL and priced TPs planned (uid=%s)", position_uid)
 
+# 🔸 Нормализация политики: уровни → int (после JSON)
+def _normalize_policy_inplace(policy: Dict[str, Any]) -> None:
+    # tp_levels.level → int
+    if isinstance(policy.get("tp_levels"), list):
+        for t in policy["tp_levels"]:
+            try:
+                t["level"] = int(t.get("level"))
+            except Exception:
+                pass
+    # tp_sl_by_level keys → int
+    by_level = policy.get("tp_sl_by_level")
+    if isinstance(by_level, dict):
+        converted: Dict[int, Any] = {}
+        for k, v in by_level.items():
+            try:
+                converted[int(k)] = v
+            except Exception:
+                continue
+        policy["tp_sl_by_level"] = converted
 
 # 🔸 Вспомогательные вычисления плана TP/SL
 def _build_plan_from_policy(
