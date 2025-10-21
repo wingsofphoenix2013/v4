@@ -49,13 +49,30 @@ ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "30"))
 ENTRY_FILL_POLL_MS = int(os.getenv("ENTRY_FILL_POLL_MS", "250"))
 TP_MIN_QTY_THRESHOLD = Decimal(os.getenv("TP_MIN_QTY_THRESHOLD", "0"))
 
+# 🔸 Уменьшающий коэффициент размера реального ордера (ENV BYBIT_SIZE_PCT, проценты)
+def _get_size_factor() -> Decimal:
+    raw = os.getenv("BYBIT_SIZE_PCT", "100").strip()
+    try:
+        pct = Decimal(raw)
+    except Exception:
+        pct = Decimal("100")
+    if pct < 0:
+        pct = Decimal("0")
+    if pct > 1000:
+        pct = Decimal("1000")
+    return (pct / Decimal("100"))
+
+SIZE_FACTOR = _get_size_factor()
+log.info("BYBIT processor v2: MODE=%s, SIZE_FACTOR=%.4f (BYBIT_SIZE_PCT=%s%%), trigger_by=%s",
+         TRADER_ORDER_MODE, float(SIZE_FACTOR), os.getenv("BYBIT_SIZE_PCT", "100"), DEFAULT_TRIGGER_BY)
+
 # 🔸 Сообщим о режиме
 if TRADER_ORDER_MODE == "dry_run":
     log.info("BYBIT processor v2: DRY_RUN (entry/TP/SL в БД; REST без реальной отправки)")
 elif TRADER_ORDER_MODE == "off":
     log.info("BYBIT processor v2: OFF (игнорируем заявки)")
 else:
-    log.info("BYBIT processor v2: ON (entry→fill→TP/SL по политике). trigger_by=%s", DEFAULT_TRIGGER_BY)
+    log.info("BYBIT processor v2: ON (entry→fill→TP/SL по политике)")
 
 # 🔸 Основной цикл воркера
 async def run_bybit_processor_loop():
@@ -140,7 +157,13 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         log.info("⚠️ Нет quantity для uid=%s — пропуск", position_uid)
         return
 
-    # planned entry (до сабмита)
+    # масштабирование объёма под BYBIT_SIZE_PCT
+    qty_trade = _round_qty(qty_raw * SIZE_FACTOR, precision_qty)
+    if min_qty is not None and qty_trade < min_qty:
+        log.info("⚠️ qty_trade < min_qty (uid=%s, qty_trade=%s, min_qty=%s) — пропуск", position_uid, _fmt(qty_trade), _fmt(min_qty))
+        return
+
+    # planned entry (до сабмита) — фиксируем фактически планируемый объём (qty_trade)
     entry_link_id = f"{position_uid}-entry"
     side_title = _to_title_side("BUY" if direction == "long" else "SELL")
     await _upsert_order(
@@ -155,10 +178,10 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         reduce_only=False,
         price=None,
         trigger_price=None,
-        qty=_round_qty(qty_raw, precision_qty),
+        qty=qty_trade,
         order_link_id=entry_link_id,
         ext_status="planned",
-        qty_raw=qty_raw,
+        qty_raw=qty_trade,
         price_raw=None,
         calc_type=None,
         calc_value=None,
@@ -177,7 +200,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         ok_e, oid_e, rc_e, rm_e = await _submit_entry(
             symbol=symbol,
             side=side_title,
-            qty=_round_qty(qty_raw, precision_qty),
+            qty=qty_trade,
             link_id=entry_link_id,
         )
         await _mark_order_after_submit(
@@ -201,16 +224,18 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             "[DRY_RUN] entry planned: uid=%s %s qty=%s",
             position_uid,
             symbol,
-            _fmt(_round_qty(qty_raw, precision_qty)),
+            _fmt(qty_trade),
         )
 
-    # ждём фактический fill / суррогат
-    avg_fill_price, filled_qty = await _wait_entry_fill_or_fallback(position_uid, entry_link_id, symbol, entry_price_mark, qty_raw, precision_qty)
+    # ждём фактический fill / суррогат (в DRY_RUN вернём qty_trade)
+    avg_fill_price, filled_qty = await _wait_entry_fill_or_fallback(
+        position_uid, entry_link_id, symbol, entry_price_mark, qty_trade, precision_qty
+    )
     if avg_fill_price is None or filled_qty is None or filled_qty <= 0:
         log.info("⚠️ Не получили фактический fill для uid=%s — прекращаем обработку", position_uid)
         return
 
-    # расчёт TP/SL
+    # расчёт TP/SL от avg_fill и filled_qty
     plan_tp, plan_tp_signal, plan_sl_primary, plan_sls_after_tp = _build_plan_from_policy(
         position_uid=position_uid,
         symbol=symbol,
@@ -325,8 +350,8 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             ext_status="virtual",
             qty_raw=qty,
             price_raw=None,
-            calc_type=_calc_type_for_sl_mode(mode),                 # <-- here
-            calc_value=_sl_value(policy, lvl) if mode in ("percent", "atr") else None,  # <-- here
+            calc_type=_calc_type_for_sl_mode(mode),
+            calc_value=_sl_value(policy, lvl) if mode in ("percent", "atr") else None,
             base_price=avg_fill_price,
             base_kind="fill",
             activation_tp_level=lvl,
@@ -592,7 +617,14 @@ def _sl_value(policy: Dict[str, Any], level: int) -> Optional[Decimal]:
     return _as_decimal(v.get("sl_value")) if isinstance(v, dict) else None
 
 # 🔸 Ожидание fill entry или суррогат для DRY_RUN
-async def _wait_entry_fill_or_fallback(position_uid: str, entry_link_id: str, symbol: str, entry_price_mark: Optional[Decimal], qty_raw: Decimal, precision_qty: Optional[int]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+async def _wait_entry_fill_or_fallback(
+    position_uid: str,
+    entry_link_id: str,
+    symbol: str,
+    entry_price_mark: Optional[Decimal],
+    qty_planned: Decimal,
+    precision_qty: Optional[int]
+) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     if TRADER_ORDER_MODE == "on":
         deadline = datetime.utcnow() + timedelta(seconds=ENTRY_FILL_TIMEOUT_SEC)
         while datetime.utcnow() < deadline:
@@ -613,8 +645,7 @@ async def _wait_entry_fill_or_fallback(position_uid: str, entry_link_id: str, sy
         return None, None
     if entry_price_mark is None:
         entry_price_mark = await _fetch_mark_price(symbol)
-    return entry_price_mark, _round_qty(qty_raw, precision_qty)
-
+    return entry_price_mark, _round_qty(qty_planned, precision_qty)
 
 # 🔸 Сабмиты: entry / TP / SL
 async def _submit_entry(*, symbol: str, side: str, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
@@ -682,7 +713,6 @@ async def _submit_sl(
              symbol, _str_price(trigger_price), trigger_direction, _str_qty(qty), link_id, rc, rm, oid)
     return ok, oid, rc, rm
 
-
 # 🔸 Post-submit апдейты в БД
 async def _mark_order_after_submit(*, order_link_id: str, ok: bool, order_id: Optional[str], retcode: Optional[int], retmsg: Optional[str]) -> None:
     now = datetime.utcnow()
@@ -715,7 +745,6 @@ async def _mirror_entry_to_trader_positions(*, position_uid: str, order_link_id:
         """,
         position_uid, order_link_id, order_id, ext_status, now
     )
-
 
 # 🔸 Вспомогательные: чтение/запись в БД и утилиты
 async def _upsert_order(
@@ -812,7 +841,6 @@ async def _fetch_mark_price(symbol: str) -> Optional[Decimal]:
     except Exception:
         return None
 
-
 # 🔸 Разбор JSON политики из payload
 def _parse_policy_json(s: Optional[str]) -> Dict[str, Any]:
     if not s:
@@ -822,7 +850,6 @@ def _parse_policy_json(s: Optional[str]) -> Dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
-
 
 # 🔸 REST-хелперы
 def _rest_sign(ts_ms: int, query_or_body: str) -> str:
