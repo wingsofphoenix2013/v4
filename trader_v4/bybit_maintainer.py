@@ -44,7 +44,6 @@ log.info("BYBIT_MAINTAINER_V2: mode=%s, trigger_by=%s, scan=%.2fs", TRADER_ORDER
 # 🔸 Основной цикл воркера
 async def run_bybit_maintainer_loop():
     log.info("🚦 BYBIT_MAINTAINER_V2 запущен")
-
     while True:
         try:
             await _scan_and_maintain_positions()
@@ -71,10 +70,8 @@ async def _scan_and_maintain_positions():
         if not uid or not symbol:
             continue
 
-        got = await _with_lock(uid)
-        if not got:
+        if not await _with_lock(uid):
             continue
-
         try:
             # 0) Догрузка SL-старт и TP-1 при росте entry.filled (до наступления TP-1)
             await _reconcile_before_tp1(uid, symbol, sid)
@@ -131,48 +128,48 @@ async def _reconcile_before_tp1(position_uid: str, symbol: str, strategy_id: Opt
     target_tp1 = _round_qty(entry_filled * (tp1_vol_pct / Decimal("100")), precision_qty)
     committed_tp1 = await _tp1_committed_qty(position_uid)  # filled + активные
     need = target_tp1 - committed_tp1
-    # минимальный порог — шаг лота
-    if need is not None and need > Decimal("0") and (min_qty is None or need >= min_qty):
-        price_tp1 = await _tp1_price_or_compute(position_uid, symbol, strategy_id, ticksize)
-        if price_tp1 is None:
-            return
-        add_link = await _next_tp1_add_link(position_uid)
-        side_title = _to_title_side("SELL" if (await _get_direction(position_uid) or "") == "long" else "BUY")
+    if need is None or need <= Decimal("0") or (min_qty is not None and need < min_qty):
+        return
 
-        # planned
-        await infra.pg_pool.execute(
-            """
-            INSERT INTO public.trader_position_orders (
-              position_uid, kind, level, exchange, symbol, side, "type", tif, reduce_only,
-              price, trigger_price, qty, order_link_id, ext_status,
-              qty_raw, price_raw, calc_type, calc_value, base_price, base_kind, created_at
-            )
-            VALUES ($1,'tp',1,'BYBIT',$2,$3,'limit','GTC',true,
-                    $4,NULL,$5,$6,'planned',
-                    $5,$4,'percent',$7,$8,'fill',$9)
-            ON CONFLICT (order_link_id) DO NOTHING
-            """,
-            position_uid, symbol, _side_word(await _get_direction(position_uid)),
-            price_tp1, need, add_link, Decimal("1"),
-            await _fetch_entry_avg_fill_price(position_uid), datetime.utcnow()
+    price_tp1 = await _tp1_price_or_compute(position_uid, symbol, strategy_id, ticksize)
+    if price_tp1 is None:
+        return
+    add_link = await _next_tp1_add_link(position_uid)
+    side_title = _to_title_side("SELL" if (await _get_direction(position_uid) or "") == "long" else "BUY")
+
+    # planned
+    await infra.pg_pool.execute(
+        """
+        INSERT INTO public.trader_position_orders (
+          position_uid, kind, level, exchange, symbol, side, "type", tif, reduce_only,
+          price, trigger_price, qty, order_link_id, ext_status,
+          qty_raw, price_raw, calc_type, calc_value, base_price, base_kind, created_at
         )
+        VALUES ($1,'tp',1,'BYBIT',$2,$3,'limit','GTC',true,
+                $4,NULL,$5,$6,'planned',
+                $5,$4,'percent',$7,$8,'fill',$9)
+        ON CONFLICT (order_link_id) DO NOTHING
+        """,
+        position_uid, symbol, _side_word(await _get_direction(position_uid)),
+        price_tp1, need, add_link, Decimal("1"),
+        await _fetch_entry_avg_fill_price(position_uid), datetime.utcnow()
+    )
 
-        # submit
-        if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
-            ok, oid, rc, rm = await _submit_tp(symbol=symbol, side=side_title, price=price_tp1, qty=need, link_id=add_link)
-            await _mark_order_after_submit(order_link_id=add_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
-        else:
-            await infra.pg_pool.execute(
-                "UPDATE public.trader_position_orders SET ext_status='submitted', last_ext_event_at=$2 WHERE order_link_id=$1",
-                add_link, datetime.utcnow()
-            )
-        log.info("[MAINT] TP1 top-up: uid=%s sym=%s committed=%s → target=%s (+%s)",
-                 position_uid, symbol, _fmt(committed_tp1), _fmt(target_tp1), _fmt(need))
+    # submit
+    if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
+        ok, oid, rc, rm = await _submit_tp(symbol=symbol, side=side_title, price=price_tp1, qty=need, link_id=add_link)
+        await _mark_order_after_submit(order_link_id=add_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
+    else:
+        await infra.pg_pool.execute(
+            "UPDATE public.trader_position_orders SET ext_status='submitted', last_ext_event_at=$2 WHERE order_link_id=$1",
+            add_link, datetime.utcnow()
+        )
+    log.info("[MAINT] TP1 top-up: uid=%s sym=%s committed=%s → target=%s (+%s)",
+             position_uid, symbol, _fmt(committed_tp1), _fmt(target_tp1), _fmt(need))
 
 
 # 🔸 Активация/корректировка SL после TP1 (перенос на entry остатка)
 async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> None:
-    # активные реальные SL
     active_sls = await infra.pg_pool.fetch(
         """
         SELECT id, order_link_id, trigger_price, qty, ext_status
@@ -184,7 +181,6 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         """,
         position_uid
     )
-    # шаблон SL-after-TP1
     sl_after = await infra.pg_pool.fetchrow(
         """
         SELECT id, order_link_id, trigger_price, qty, ext_status
@@ -213,43 +209,48 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         log.info("[MAINT] skip SL@entry: qty_left(%s) < min_qty(%s) uid=%s", _fmt(target_qty), _fmt(min_qty), position_uid)
         return
 
-    log.info("[MAINT] TP1 detected → activate SL@entry: uid=%s symbol=%s left=%s → target_qty=%s",
-             position_uid, symbol, _fmt(left), _fmt(target_qty))
-
-    # отменяем текущие активные SL (если есть)
+    # отменяем текущие активные SL
     for sl in active_sls:
         link = _as_str(sl["order_link_id"])
-        if not link:
-            continue
-        await _intent_mark_cancel(link)
-        await _cancel_order_by_link(symbol, link)
+        if link:
+            await _intent_mark_cancel(link)
+            await _cancel_order_by_link(symbol, link)
 
-    # триггер и linkId
+    # триггер из шаблона или по entry, затем коррекция по текущей цене
     trig = _as_decimal(sl_after["trigger_price"])
     if trig is None:
-        entry_avg = await _fetch_entry_avg_fill_price(position_uid)
-        trig = entry_avg
+        trig = await _fetch_entry_avg_fill_price(position_uid)
 
     direction = await _get_direction(position_uid)
-    trig_dir = _calc_trigger_direction(direction)
+    current = await _fetch_current_price(symbol)
+    trig_adj = _adjust_trigger_price_for_rules(trig, direction, ticksize, current)
 
-    # берём link из шаблона, при необходимости укорачиваем и обновляем TPO
     old_link = _as_str(sl_after["order_link_id"]) or f"{position_uid}-sl-after-tp-1"
     short_link = await _ensure_short_tpo_link(position_uid, old_link, short_suffix="sla1")
 
-    log.info("[MAINT] submit SL-after-TP1: link=%s trigger=%s qty=%s",
-             short_link, _fmt(_round_price(trig, ticksize)), _fmt(target_qty))
+    log.info("[MAINT] submit SL-after-TP1: uid=%s sym=%s link=%s trigger=%s (cur=%s) qty=%s",
+             position_uid, symbol, short_link, _fmt(trig_adj), _fmt(current), _fmt(target_qty))
 
-    # submit SL-after-TP1
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         ok, oid, rc, rm = await _submit_sl(
             symbol=symbol,
             side=_to_title_side("SELL" if (direction or "").lower() == "long" else "BUY"),
-            trigger_price=_round_price(trig, ticksize),
+            trigger_price=trig_adj,
             qty=target_qty,
             link_id=short_link,
-            trigger_direction=trig_dir,
+            trigger_direction=_calc_trigger_direction(direction),
         )
+        if not ok and rc == 110092:
+            current = await _fetch_current_price(symbol)
+            trig_adj = _adjust_trigger_price_for_rules(trig_adj, direction, ticksize, current)
+            ok, oid, rc, rm = await _submit_sl(
+                symbol=symbol,
+                side=_to_title_side("SELL" if (direction or "").lower() == "long" else "BUY"),
+                trigger_price=trig_adj,
+                qty=target_qty,
+                link_id=short_link,
+                trigger_direction=_calc_trigger_direction(direction),
+            )
         await _mark_order_after_submit(order_link_id=short_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
     else:
         await infra.pg_pool.execute(
@@ -257,10 +258,9 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
             short_link, datetime.utcnow()
         )
 
-    # синхронизируем qty/trigger в TPO (на случай коррекции)
     await infra.pg_pool.execute(
-        "UPDATE public.trader_position_orders SET qty=$2, trigger_price=COALESCE(trigger_price,$3) WHERE order_link_id=$1",
-        short_link, target_qty, trig
+        "UPDATE public.trader_position_orders SET qty=$2, trigger_price=$3 WHERE order_link_id=$1",
+        short_link, target_qty, trig_adj
     )
 
 
@@ -290,34 +290,45 @@ async def _ensure_sl_start_qty(position_uid: str,
 
     current_qty = _as_decimal(row["qty"]) or Decimal("0")
     desired = _round_qty(entry_filled, precision_qty)
-    if desired <= current_qty:
-        return
-    if min_qty is not None and desired < min_qty:
+    if desired <= current_qty or (min_qty is not None and desired < min_qty):
         return
 
-    # отмена текущего SL-старта
     link = _as_str(row["order_link_id"])
     await _intent_mark_cancel(link)
     await _cancel_order_by_link(symbol, link)
 
-    # триггер
+    # триггер от существующего или вычисляем от политики; затем корректируем по текущей цене
     trig = _as_decimal(row["trigger_price"])
     if trig is None:
         entry_avg = await _fetch_entry_avg_fill_price(position_uid)
         trig = _compute_sl_from_policy(entry_avg, await _get_direction(position_uid), sl_type, sl_value, ticksize)
 
-    # сабмит нового SL-старта
+    direction = await _get_direction(position_uid)
+    current = await _fetch_current_price(symbol)
+    trig_adj = _adjust_trigger_price_for_rules(trig, direction, ticksize, current)
+
     new_link = await _next_sl_start_link(position_uid)
-    side_title = _to_title_side("SELL" if (await _get_direction(position_uid) or "") == "long" else "BUY")
+    side_title = _to_title_side("SELL" if (direction or "").lower() == "long" else "BUY")
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         ok, oid, rc, rm = await _submit_sl(
             symbol=symbol,
             side=side_title,
-            trigger_price=_round_price(trig, ticksize),
+            trigger_price=trig_adj,
             qty=desired,
             link_id=new_link,
-            trigger_direction=_calc_trigger_direction(await _get_direction(position_uid)),
+            trigger_direction=_calc_trigger_direction(direction),
         )
+        if not ok and rc == 110092:
+            current = await _fetch_current_price(symbol)
+            trig_adj = _adjust_trigger_price_for_rules(trig_adj, direction, ticksize, current)
+            ok, oid, rc, rm = await _submit_sl(
+                symbol=symbol,
+                side=side_title,
+                trigger_price=trig_adj,
+                qty=desired,
+                link_id=new_link,
+                trigger_direction=_calc_trigger_direction(direction),
+            )
         await _mark_order_after_submit(order_link_id=new_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
     else:
         await infra.pg_pool.execute(
@@ -332,20 +343,26 @@ async def _ensure_sl_start_qty(position_uid: str,
                     $5,$8,'fill',$9,$10)
             ON CONFLICT (order_link_id) DO NOTHING
             """,
-            position_uid, symbol, _side_word(await _get_direction(position_uid)),
-            trig, desired, new_link, datetime.utcnow(),
+            position_uid, symbol, _side_word(direction),
+            trig_adj, desired, new_link, datetime.utcnow(),
             await _fetch_entry_avg_fill_price(position_uid),
             'percent' if (sl_type or '').lower() == 'percent' else (sl_type or None),
             sl_value
         )
 
-    log.info("[MAINT] SL-start qty adjusted: uid=%s sym=%s %s → %s", position_uid, symbol, _fmt(current_qty), _fmt(desired))
+    await infra.pg_pool.execute(
+        "UPDATE public.trader_position_orders SET qty=$2, trigger_price=$3 WHERE order_link_id=$1",
+        new_link, desired, trig_adj
+    )
+    log.info("[MAINT] SL-start qty adjusted: uid=%s sym=%s %s → %s (trigger=%s cur=%s)",
+             position_uid, symbol, _fmt(current_qty), _fmt(desired), _fmt(trig_adj), _fmt(current))
 
 
 # 🔸 Финализация позиции: отмена остаточных TP/SL, закрытие в портфеле/БД
 async def _finalize_position(position_uid: str, symbol: str, reason: str) -> None:
     now = datetime.utcnow()
 
+    # отмена всех нефинальных TP/SL
     open_orders = await infra.pg_pool.fetch(
         """
         SELECT order_link_id, kind, "type", ext_status
@@ -357,8 +374,7 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
         position_uid
     )
     for o in open_orders:
-        link = _as_str(o["order_link_id"])
-        otype = _as_str(o["type"])
+        link = _as_str(o["order_link_id"]); otype = _as_str(o["type"])
         if not link:
             continue
         if not otype:
@@ -392,7 +408,8 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
 
     await _set_position_closed(position_uid, reason, now)
 
-# 🔸 Детект manual: отмена наших TP/SL без локального намерения
+
+# 🔸 Детект manual: отмена наших TP/SL без нашей intent-метки
 async def _detect_manual_cancel(position_uid: str, since: datetime) -> bool:
     rows = await infra.pg_pool.fetch(
         """
@@ -410,10 +427,10 @@ async def _detect_manual_cancel(position_uid: str, since: datetime) -> bool:
         return False
     for r in rows:
         link = _as_str(r["order_link_id"])
-        # если не было нашей intent-метки отмены → трактуем как manual
-        if not await _intent_check(link):
+        if not await _intent_check(link):  # отмена без нашей метки → manual
             return True
     return False
+
 
 # 🔸 Политика и базовые расчёты
 def _get_tp1_volume_percent(strategy_id: Optional[int]) -> Decimal:
@@ -467,7 +484,7 @@ def _compute_sl_from_policy(avg_fill: Optional[Decimal], direction: Optional[str
     return _round_price(price, ticksize)
 
 
-# 🔸 Хелперы работы с ордерами и расчёты
+# 🔸 Хелперы работы с ордерами и расчёты (все здесь)
 async def _tp1_filled_qty(position_uid: str) -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(
         """
@@ -509,14 +526,12 @@ async def _tp1_committed_qty(position_uid: str) -> Decimal:
     return _as_decimal(row["committed"]) or Decimal("0")
 
 async def _tp1_price_or_compute(position_uid: str, symbol: str, strategy_id: Optional[int], ticksize: Optional[Decimal]) -> Optional[Decimal]:
-    # брать из имеющегося tp-1
     row = await infra.pg_pool.fetchrow(
         "SELECT price FROM public.trader_position_orders WHERE position_uid=$1 AND kind='tp' AND \"level\"=1 AND price IS NOT NULL ORDER BY id DESC LIMIT 1",
         position_uid
     )
     if row and row["price"] is not None:
         return _round_price(_as_decimal(row["price"]), ticksize)
-    # иначе — от avg fill и политики
     avg = await _fetch_entry_avg_fill_price(position_uid)
     if avg is None:
         return None
@@ -524,9 +539,7 @@ async def _tp1_price_or_compute(position_uid: str, symbol: str, strategy_id: Opt
     tp_type, tp_value = None, None
     for t in (pol.get("tp_levels") or []):
         if int(t.get("level", 0)) == 1:
-            tp_type = t.get("tp_type")
-            tp_value = _as_decimal(t.get("tp_value"))
-            break
+            tp_type = t.get("tp_type"); tp_value = _as_decimal(t.get("tp_value")); break
     if tp_type is None:
         tp_type, tp_value = "percent", Decimal("1")
     direction = await _get_direction(position_uid)
@@ -576,12 +589,48 @@ async def _load_ticker_precisions(symbol: str) -> Dict[str, Optional[Decimal]]:
     row = await infra.pg_pool.fetchrow("SELECT precision_qty, min_qty, ticksize FROM public.tickers_bb WHERE symbol=$1", symbol)
     if not row:
         return {"precision_qty": None, "min_qty": None, "ticksize": None}
-    return {
-        "precision_qty": int(row["precision_qty"]) if row["precision_qty"] is not None else None,
-        "min_qty": _as_decimal(row["min_qty"]),
-        "ticksize": _as_decimal(row["ticksize"]),
-    }
+    return {"precision_qty": int(row["precision_qty"]) if row["precision_qty"] is not None else None,
+            "min_qty": _as_decimal(row["min_qty"]), "ticksize": _as_decimal(row["ticksize"])}
 
+# 🔸 GET-хелпер Bybit и текущая цена
+async def _bybit_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, params=params)
+        try:
+            r.raise_for_status()
+        except Exception:
+            log.warning("⚠️ Bybit GET %s %s: %s", path, r.status_code, r.text)
+        try:
+            return r.json()
+        except Exception:
+            return {"retCode": None, "retMsg": "non-json response", "raw": r.text}
+
+async def _fetch_current_price(symbol: str) -> Optional[Decimal]:
+    try:
+        if DEFAULT_TRIGGER_BY.lower() == "lastprice":
+            data = await _bybit_get("/v5/market/tickers", {"category": CATEGORY, "symbol": symbol})
+            lst = (data.get("result") or {}).get("list") or []
+            if not lst:
+                return None
+            return _as_decimal(lst[0].get("lastPrice"))
+        else:
+            v = await infra.redis_client.get(f"bb:price:{symbol}")
+            return _as_decimal(v)
+    except Exception:
+        return None
+
+def _adjust_trigger_price_for_rules(trig: Optional[Decimal], direction: Optional[str], ticksize: Optional[Decimal], current: Optional[Decimal]) -> Optional[Decimal]:
+    if trig is None:
+        return None
+    if current is None:
+        return _round_price(trig, ticksize)
+    d = (direction or "").lower()
+    if d == "long" and trig >= current:
+        trig = current - (ticksize or Decimal("0"))
+    elif d == "short" and trig <= current:
+        trig = current + (ticksize or Decimal("0"))
+    return _round_price(trig, ticksize)
 
 # 🔸 Сабмиты/отмена/статусы
 async def _submit_tp(*, symbol: str, side: str, price: Decimal, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
@@ -749,6 +798,44 @@ async def _ensure_short_tpo_link(position_uid: str, current_link: str, short_suf
     )
     log.info("TPO link renamed (too long): %s → %s (uid=%s)", current_link, new_link, position_uid)
     return new_link
+
+async def _next_sl_start_link(position_uid: str) -> str:
+    base = f"{position_uid}-sl"
+    rows = await infra.pg_pool.fetch(
+        "SELECT order_link_id FROM public.trader_position_orders WHERE position_uid=$1 AND order_link_id LIKE $2",
+        position_uid, f"{base}%"
+    )
+    max_v = 0
+    for r in rows:
+        lid = _as_str(r["order_link_id"])
+        if lid == base:
+            max_v = max(max_v, 1)
+        elif "-sl-v" in lid:
+            try:
+                n = int(lid.split("-sl-v", 1)[1]); max_v = max(max_v, n)
+            except Exception:
+                pass
+    link = base if max_v == 0 else f"{position_uid}-sl-v{max_v+1}"
+    return _make_short_link(position_uid, link.split(position_uid+"-")[1])
+
+async def _next_tp1_add_link(position_uid: str) -> str:
+    base = f"{position_uid}-tp1a"
+    rows = await infra.pg_pool.fetch(
+        "SELECT order_link_id FROM public.trader_position_orders WHERE position_uid=$1 AND order_link_id LIKE $2",
+        position_uid, f"{base}%"
+    )
+    max_v = 0
+    for r in rows:
+        lid = _as_str(r["order_link_id"])
+        if lid == base:
+            max_v = max(max_v, 1)
+        elif "-tp1a-v" in lid:
+            try:
+                n = int(lid.split("-tp1a-v", 1)[1]); max_v = max(max_v, n)
+            except Exception:
+                pass
+    link = base if max_v == 0 else f"{base}-v{max_v+1}"
+    return _make_short_link(position_uid, link.split(position_uid+"-")[1])
 
 
 # 🔸 Обновление статуса позиции (close_reason может отсутствовать)
