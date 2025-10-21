@@ -45,7 +45,6 @@ async def run_bybit_maintainer_loop():
 
     while True:
         try:
-            # обработка TP1→SL@entry, корректировка SL qty, финализация при закрытии
             await _scan_and_maintain_positions()
         except Exception:
             log.exception("❌ Ошибка в цикле BYBIT_MAINTAINER_V2")
@@ -57,13 +56,8 @@ async def _scan_and_maintain_positions():
     now = datetime.utcnow()
     recent_since = now - timedelta(seconds=RECENT_WINDOW_SEC)
 
-    # берём открытые позиции трейдера
     pos_rows = await infra.pg_pool.fetch(
-        """
-        SELECT position_uid, strategy_id, symbol
-        FROM public.trader_positions
-        WHERE status='open'
-        """
+        "SELECT position_uid, strategy_id, symbol FROM public.trader_positions WHERE status='open'"
     )
     if not pos_rows:
         return
@@ -74,26 +68,22 @@ async def _scan_and_maintain_positions():
         if not uid or not symbol:
             continue
 
-        # лок на позицию, чтобы не пересекаться между итерациями/инстансами
         got = await _with_lock(uid)
         if not got:
             continue
 
         try:
-            # 1) если SL filled или LEFT=0 → финализировать (биржа→система)
             sl_filled = await _has_sl_filled(uid)
             left_qty = await _calc_left_qty(uid)
             if sl_filled or (left_qty is not None and left_qty <= Decimal("0")):
                 reason = "sl-hit" if sl_filled else "tp-exhausted"
                 await _finalize_position(uid, symbol, reason)
-                continue  # позиция закрыта — дальше нечего делать
+                continue
 
-            # 2) TP1 partial/full → активировать/корректировать SL@entry
             tp1_filled = await _tp1_filled_qty(uid)
             if tp1_filled and tp1_filled > Decimal("0"):
                 await _activate_or_adjust_sl_after_tp1(uid, symbol)
 
-            # 3) manual признаки: отменён наш TP/SL без нашей intent-метки → финализировать
             manual = await _detect_manual_cancel(uid, since=recent_since)
             if manual:
                 await _finalize_position(uid, symbol, "manual-exchange")
@@ -107,7 +97,6 @@ async def _scan_and_maintain_positions():
 
 # 🔸 Активация/корректировка SL после TP1 (перенос на entry остатка)
 async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> None:
-    # получим текущий активный SL (реальный) и шаблон SL-after-TP1 (virtual)
     active_sls = await infra.pg_pool.fetch(
         """
         SELECT id, order_link_id, trigger_price, qty, ext_status
@@ -130,49 +119,38 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         """,
         position_uid
     )
-
-    # если шаблона нет — нечего активировать
     if not sl_after:
         return
 
-    # вычислим остаток LEFT (entry filled − Σtp filled − Σclose filled)
     left = await _calc_left_qty(position_uid)
     if left is None or left <= Decimal("0"):
-        # остатка нет — просто финализируем (остальные действия обработает главный финализатор на следующем цикле)
         return
 
-    # точности по тикеру
     tkr = await _load_ticker_precisions(symbol)
     precision_qty = tkr.get("precision_qty")
     min_qty = tkr.get("min_qty")
     ticksize = tkr.get("ticksize")
 
-    # желаемый qty SL = left (квантуем)
     target_qty = _round_qty(left, precision_qty)
     if min_qty is not None and target_qty < min_qty:
-        # слишком мало — игнор
         return
 
-    # Отменяем все текущие активные SL (если есть)
     for sl in active_sls:
         link = _as_str(sl["order_link_id"])
         if not link:
             continue
-        await _intent_mark_cancel(link)  # намерение отменить — чтобы не считать manual
+        await _intent_mark_cancel(link)
         await _cancel_order_by_link(symbol, link)
 
-    # Поднимаем шаблон: submit SL с trigger_price из шаблона, target_qty
     trig = _as_decimal(sl_after["trigger_price"])
     if trig is None:
-        # если что-то пошло не так, вычислим триггер заново как entry(avg fill)
         entry_avg = await _fetch_entry_avg_fill_price(position_uid)
         trig = entry_avg
 
-    # направленность (long→2 fall, short→1 rise)
     direction = await _get_direction(position_uid)
     trig_dir = _calc_trigger_direction(direction)
-
     new_link = _as_str(sl_after["order_link_id"]) or f"{position_uid}-sl-after-tp-1"
+
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         ok, oid, rc, rm = await _submit_sl(
             symbol=symbol,
@@ -184,19 +162,13 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         )
         await _mark_order_after_submit(order_link_id=new_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
     else:
-        # DRY_RUN — только статусы в БД
         await infra.pg_pool.execute(
             "UPDATE public.trader_position_orders SET ext_status='submitted', last_ext_event_at=$2 WHERE order_link_id=$1",
             new_link, datetime.utcnow()
         )
 
-    # обновим qty/trigger шаблона в TPO (на случай, если нужно подогнать под left)
     await infra.pg_pool.execute(
-        """
-        UPDATE public.trader_position_orders
-        SET qty=$2, trigger_price=COALESCE(trigger_price,$3)
-        WHERE order_link_id=$1
-        """,
+        "UPDATE public.trader_position_orders SET qty=$2, trigger_price=COALESCE(trigger_price,$3) WHERE order_link_id=$1",
         new_link, target_qty, trig
     )
 
@@ -205,7 +177,6 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
 async def _finalize_position(position_uid: str, symbol: str, reason: str) -> None:
     now = datetime.utcnow()
 
-    # отменяем все нефинальные TP/SL
     open_orders = await infra.pg_pool.fetch(
         """
         SELECT order_link_id, kind, "type", ext_status
@@ -219,17 +190,14 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
     for o in open_orders:
         link = _as_str(o["order_link_id"])
         otype = _as_str(o["type"])
-        status = _as_str(o["ext_status"])
         if not link:
             continue
-        # виртуальные (type IS NULL) переводим в expired без REST
         if not otype:
             await infra.pg_pool.execute(
                 "UPDATE public.trader_position_orders SET ext_status='expired', last_ext_event_at=$2 WHERE order_link_id=$1",
                 link, now
             )
             continue
-        # реальные — отменяем на бирже только в ON
         await _intent_mark_cancel(link)
         if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
             await _cancel_order_by_link(symbol, link)
@@ -239,7 +207,6 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
                 link, now
             )
 
-    # если остался нетто-остаток > 0 — рыночное закрытие reduce-only
     left = await _calc_left_qty(position_uid)
     if left is not None and left > Decimal("0"):
         direction = await _get_direction(position_uid)
@@ -254,15 +221,7 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
                 position_uid, symbol, _round_qty(left, await _precision_qty(symbol)), close_link, now
             )
 
-    # закрываем запись в портфеле
-    await infra.pg_pool.execute(
-        """
-        UPDATE public.trader_positions
-        SET status='closed', closed_at=COALESCE(closed_at,$2), close_reason=COALESCE(close_reason,$3)
-        WHERE position_uid=$1
-        """,
-        position_uid, now, reason
-    )
+    await _set_position_closed(position_uid, reason, now)
 
 
 # 🔸 Детект manual: отмена наших TP/SL без локального намерения
@@ -284,7 +243,6 @@ async def _detect_manual_cancel(position_uid: str, since: datetime) -> bool:
     for r in rows:
         link = _as_str(r["order_link_id"])
         if not await _intent_check(link):
-            # отмена без intent → трактуем как manual
             return True
     return False
 
@@ -304,12 +262,7 @@ async def _tp1_filled_qty(position_uid: str) -> Optional[Decimal]:
 
 async def _has_sl_filled(position_uid: str) -> bool:
     row = await infra.pg_pool.fetchrow(
-        """
-        SELECT 1
-        FROM public.trader_position_orders
-        WHERE position_uid=$1 AND kind='sl' AND ext_status='filled'
-        LIMIT 1
-        """,
+        "SELECT 1 FROM public.trader_position_orders WHERE position_uid=$1 AND kind='sl' AND ext_status='filled' LIMIT 1",
         position_uid
     )
     return bool(row)
@@ -318,22 +271,15 @@ async def _calc_left_qty(position_uid: str) -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(
         """
         WITH e AS (
-          SELECT COALESCE(MAX(filled_qty),0) AS fq
-          FROM public.trader_position_orders
-          WHERE position_uid=$1 AND kind='entry'
+          SELECT COALESCE(MAX(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='entry'
         ),
         t AS (
-          SELECT COALESCE(SUM(filled_qty),0) AS fq
-          FROM public.trader_position_orders
-          WHERE position_uid=$1 AND kind='tp'
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='tp'
         ),
         c AS (
-          SELECT COALESCE(SUM(filled_qty),0) AS fq
-          FROM public.trader_position_orders
-          WHERE position_uid=$1 AND kind='close'
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='close'
         )
-        SELECT e.fq - t.fq - c.fq AS left_qty
-        FROM e,t,c
+        SELECT e.fq - t.fq - c.fq AS left_qty FROM e,t,c
         """,
         position_uid
     )
@@ -341,12 +287,7 @@ async def _calc_left_qty(position_uid: str) -> Optional[Decimal]:
 
 async def _fetch_entry_avg_fill_price(position_uid: str) -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(
-        """
-        SELECT avg_fill_price
-        FROM public.trader_position_orders
-        WHERE position_uid=$1 AND kind='entry'
-        ORDER BY id DESC LIMIT 1
-        """,
+        "SELECT avg_fill_price FROM public.trader_position_orders WHERE position_uid=$1 AND kind='entry' ORDER BY id DESC LIMIT 1",
         position_uid
     )
     return _as_decimal(row["avg_fill_price"]) if row else None
@@ -359,17 +300,11 @@ async def _get_direction(position_uid: str) -> Optional[str]:
     return (_as_str(row["direction"]).lower() if row and row["direction"] else None)
 
 async def _precision_qty(symbol: str) -> Optional[int]:
-    row = await infra.pg_pool.fetchrow(
-        "SELECT precision_qty FROM public.tickers_bb WHERE symbol=$1",
-        symbol
-    )
+    row = await infra.pg_pool.fetchrow("SELECT precision_qty FROM public.tickers_bb WHERE symbol=$1", symbol)
     return int(row["precision_qty"]) if row and row["precision_qty"] is not None else None
 
 async def _load_ticker_precisions(symbol: str) -> Dict[str, Optional[Decimal]]:
-    row = await infra.pg_pool.fetchrow(
-        "SELECT precision_qty, min_qty, ticksize FROM public.tickers_bb WHERE symbol=$1",
-        symbol
-    )
+    row = await infra.pg_pool.fetchrow("SELECT precision_qty, min_qty, ticksize FROM public.tickers_bb WHERE symbol=$1", symbol)
     if not row:
         return {"precision_qty": None, "min_qty": None, "ticksize": None}
     return {
@@ -426,7 +361,6 @@ async def _submit_close_market(symbol: str, side: str, qty: Decimal, link_id: st
 
 async def _cancel_order_by_link(symbol: str, link_id: str) -> None:
     if TRADER_ORDER_MODE != "on" or not API_KEY or not API_SECRET:
-        # DRY_RUN — просто пометим canceled
         await infra.pg_pool.execute(
             "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
             link_id, datetime.utcnow()
@@ -512,6 +446,25 @@ async def _intent_check(order_link_id: str) -> bool:
         return v is not None
     except Exception:
         return False
+
+
+# 🔸 Обновление статуса позиции с фолбэком, если нет колонки close_reason
+async def _set_position_closed(position_uid: str, reason: str, ts: datetime) -> None:
+    try:
+        await infra.pg_pool.execute(
+            "UPDATE public.trader_positions SET status='closed', closed_at=COALESCE(closed_at,$2), close_reason=COALESCE(close_reason,$3) WHERE position_uid=$1",
+            position_uid, ts, reason
+        )
+    except Exception as e:
+        # если колонка отсутствует — fallback без close_reason
+        if "close_reason" in str(e):
+            await infra.pg_pool.execute(
+                "UPDATE public.trader_positions SET status='closed', closed_at=COALESCE(closed_at,$2) WHERE position_uid=$1",
+                position_uid, ts
+            )
+            log.warning("close_reason column is missing; position closed without reason (uid=%s)", position_uid)
+        else:
+            raise
 
 
 # 🔸 Утилиты приведения и форматирования
