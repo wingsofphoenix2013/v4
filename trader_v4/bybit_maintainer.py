@@ -1,623 +1,385 @@
-# bybit_maintainer.py — сопровождение ордеров на бирже под приоритет внутренней системы:
-# TP1(force) → SL на entry; SL-replace/protect; close/protect; фон-вотчер «биржа раньше системы»
+# bybit_maintainer.py — сопровождение позиции на бирже «exchange-first»: TP1→активация SL@entry, финализация при SL/size=0/manual; идемпотентные действия
 
 # 🔸 Импорты
 import os
-import json
-import logging
 import asyncio
-import contextlib
+import logging
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import httpx
 
 from trader_infra import infra
 
 # 🔸 Логгер сопровождающего воркера
-log = logging.getLogger("BYBIT_MAINTAINER")
+log = logging.getLogger("BYBIT_MAINTAINER_V2")
 
-# 🔸 Константы потоков и режимов
-POS_UPD_STREAM = "positions_update_stream"
-CG_NAME = "bybit_maintainer_group"
-CONSUMER = "bybit_maintainer_1"
-
-# 🔸 Режим работы (off|dry_run|on) — читаем как у процессора
-def _normalize_mode(v: Optional[str]) -> str:
-    s = (v or "").strip().lower()
-    if s in ("off", "false", "0", "no", "disabled"):
-        return "off"
-    if s in ("dry_run", "dry-run", "dryrun", "test"):
-        return "dry_run"
-    return "on"
-
-TRADER_ORDER_MODE = _normalize_mode(os.getenv("TRADER_ORDER_MODE"))
-
-# 🔸 Параметры Bybit API (используем те же ENV, что и в процессоре)
+# 🔸 Параметры режима/REST
+TRADER_ORDER_MODE = (os.getenv("TRADER_ORDER_MODE", "off") or "off").strip().lower()  # off|dry_run|on
 API_KEY = os.getenv("BYBIT_API_KEY", "")
 API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
-CATEGORY = "linear"  # USDT-perp
+CATEGORY = "linear"
+DEFAULT_TRIGGER_BY = os.getenv("BYBIT_TRIGGER_BY", "LastPrice")  # LastPrice | MarkPrice | IndexPrice
 
-# 🔸 Локальная политика (без ENV)
-TP1_LEVEL = 1                           # первый TP — особая логика (reverse)
-TP1_TOL = Decimal("0.98")               # доля исполнения TP1 на бирже, достаточная для «выполнено»
-MAINT_INTERVAL_SEC = 2.0                # период фон-вотчера
-LOCK_TTL_SEC = 10                       # TTL локов по позиции, сек
+# 🔸 Тайминги и поведение
+SCAN_INTERVAL_SEC = float(os.getenv("MAINT_SCAN_INTERVAL_SEC", "1.5"))       # период инспекции
+LOCK_TTL_SEC = int(os.getenv("MAINT_LOCK_TTL_SEC", "10"))                    # TTL локов по позиции
+INTENT_TTL_SEC = int(os.getenv("MAINT_INTENT_TTL_SEC", "10"))                # TTL intent-маркеров (cancel)
+RECENT_WINDOW_SEC = int(os.getenv("MAINT_RECENT_WINDOW_SEC", "120"))         # «свежие» события
 
-# 🔸 Основной цикл воркера (последовательная обработка) + фон-вотчер
+# 🔸 Статусные множества
+FINAL_TPO = {"canceled", "filled", "expired", "rejected"}
+NONFINAL_TPO = {"planned", "submitted", "accepted", "partially_filled"}
+NONFINAL_TPO_OR_NULL = {None, "planned", "submitted", "accepted", "partially_filled"}
+
+# 🔸 Сообщим о режиме
+log.info("BYBIT_MAINTAINER_V2: mode=%s, trigger_by=%s, scan=%.2fs", TRADER_ORDER_MODE, DEFAULT_TRIGGER_BY, SCAN_INTERVAL_SEC)
+
+
+# 🔸 Основной цикл воркера
 async def run_bybit_maintainer_loop():
-    redis = infra.redis_client
+    log.info("🚦 BYBIT_MAINTAINER_V2 запущен")
 
-    try:
-        await redis.xgroup_create(POS_UPD_STREAM, CG_NAME, id="$", mkstream=True)
-        log.debug("📡 Consumer Group создана: %s → %s", POS_UPD_STREAM, CG_NAME)
-    except Exception as e:
-        if "BUSYGROUP" in str(e):
-            log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
-        else:
-            log.exception("❌ Ошибка создания Consumer Group")
-            return
-
-    log.info("🚦 BYBIT_MAINTAINER запущен. MODE=%s (TP1_TOL=%s, WATCH=%.1fs)", TRADER_ORDER_MODE, TP1_TOL, MAINT_INTERVAL_SEC)
-
-    # запускаем вотчер «биржа раньше системы» параллельно
-    watcher_task = asyncio.create_task(_run_exchange_first_watcher())
-
-    try:
-        while True:
-            try:
-                entries = await redis.xreadgroup(
-                    groupname=CG_NAME,
-                    consumername=CONSUMER,
-                    streams={POS_UPD_STREAM: ">"},
-                    count=1,
-                    block=1000
-                )
-                if not entries:
-                    continue
-
-                for _, records in entries:
-                    for record_id, data in records:
-                        try:
-                            await _handle_pos_update(record_id, data)
-                        except Exception:
-                            log.exception("❌ Ошибка обработки позиции (id=%s)", record_id)
-                            await redis.xack(POS_UPD_STREAM, CG_NAME, record_id)
-                        else:
-                            await redis.xack(POS_UPD_STREAM, CG_NAME, record_id)
-
-            except Exception:
-                log.exception("❌ Ошибка в основном цикле BYBIT_MAINTAINER")
-                await asyncio.sleep(2)
-    finally:
-        watcher_task.cancel()
-        with contextlib.suppress(Exception):
-            await watcher_task
-
-# 🔸 Обработка события из positions_update_stream
-async def _handle_pos_update(record_id: str, raw: Dict[str, Any]) -> None:
-    evt = _parse_event(raw)
-    if not evt:
-        log.debug("⚠️ Пропуск (пустой/непонятный payload) id=%s raw=%s", record_id, raw)
-        return
-
-    event_type = (evt.get("event_type") or "").lower()
-    position_uid = _as_str(evt.get("position_uid"))
-    symbol = _as_str(evt.get("symbol"))
-    if not position_uid or not symbol:
-        log.debug("⚠️ Пропуск (нет position_uid/symbol). id=%s evt=%s", record_id, evt)
-        return
-
-    # позиция должна быть «open» у трейдера
-    tracked = await infra.pg_pool.fetchrow("SELECT status FROM public.trader_positions WHERE position_uid=$1", position_uid)
-    if not tracked or _as_str(tracked["status"]) != "open":
-        log.debug("ℹ️ Позиция не отслеживается/закрыта у трейдера, uid=%s", position_uid)
-        return
-
-    direction = await _get_direction(position_uid)  # 'long'|'short'
-
-    if event_type == "tp_hit":
-        level = _as_int(evt.get("tp_level")) or TP1_LEVEL
-        # интересует reverse-кейс (TP1) — приводим биржу в соответствие «система выполнила TP1»
-        if level == TP1_LEVEL:
-            await _with_lock(position_uid, _tp1_system_hit, position_uid, symbol, direction, evt)
-        else:
-            log.debug("↷ TP level=%s не требует действий на бирже (uid=%s)", level, position_uid)
-
-    elif event_type in ("sl_replaced", "protect"):
-        # перенос SL (на entry или иной уровень) по внутреннему правилу
-        await _with_lock(position_uid, _sl_replace_system, position_uid, symbol, direction, evt)
-
-    elif event_type == "closed":
-        # защитное закрытие/реверс — закрыть остаток и отменить TP/SL
-        await _with_lock(position_uid, _closed_system, position_uid, symbol, direction, evt)
-
-    else:
-        log.debug("↷ BYBIT_MAINTAINER: игнор event_type=%s uid=%s", event_type, position_uid)
-
-# 🔸 TP1: система считает TP1 выполненным → дожимаем биржу и переставляем SL на entry
-async def _tp1_system_hit(position_uid: str, symbol: str, direction: Optional[str], evt: Dict[str, Any]) -> None:
-    # план
-    lines = [f"[MAINTAINER TP1] uid={position_uid} symbol={symbol} → align exchange to SYSTEM"]
-
-    # факт исполнения TP1 на бирже
-    tp_link = f"{position_uid}-tp-{TP1_LEVEL}"
-    tpo = await _fetch_tpo(tp_link)
-    planned = _as_decimal(tpo.get("qty")) if tpo else None
-    filled = _as_decimal(tpo.get("filled_qty")) if tpo else None
-
-    # дожать недостающее
-    if planned and (filled or Decimal("0")) < planned * TP1_TOL:
-        need = (planned - (filled or Decimal("0")))
-        if need > 0:
-            lines.append(f"force-close: qty={_fmt(need)} link={tp_link}-force")
-            log.info("\n" + "\n".join(lines))
-            if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-                ok_f, oid_f, rc_f, rm_f = await _submit_close_market(
-                    symbol=symbol,
-                    side=_to_title_side(_opposite(direction)),
-                    qty=need,
-                    link_id=await _next_force_link_id(position_uid, TP1_LEVEL)
-                )
-                await _mark_order_after_submit(order_link_id=await _last_force_link_id(position_uid), ok=ok_f, order_id=oid_f, retcode=rc_f, retmsg=rm_f)
-    else:
-        log.info("\n" + "\n".join(lines))
-
-    # отмена текущих SL и постановка нового SL на entry (остаток)
-    qty_left = await _calc_real_remainder_qty(position_uid)
-    entry_price = await _fetch_entry_price(position_uid)
-    if qty_left <= 0 or entry_price is None:
-        log.info("[MAINTAINER TP1] nothing to SL-shift (qty_left=%s entry=%s) uid=%s", _fmt(qty_left), _fmt(entry_price), position_uid)
-        return
-
-    await _cancel_all_sl(position_uid)
-    trig_dir = _calc_trigger_direction(direction)
-    new_sl_link = await _next_sl_link_id(position_uid)
-    if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-        ok_s, oid_s, rc_s, rm_s = await _submit_sl(
-            symbol=symbol,
-            side=_to_title_side(_opposite(direction)),
-            trigger_price=entry_price,
-            qty=qty_left,
-            link_id=new_sl_link,
-            trigger_direction=trig_dir,
-        )
-        await _mark_order_after_submit(order_link_id=new_sl_link, ok=ok_s, order_id=oid_s, retcode=rc_s, retmsg=rm_s)
-        if ok_s:
-            await _upsert_planned_sl(position_uid, symbol, qty_left, entry_price, new_sl_link)
-
-# 🔸 SL-replace/protect из системы: перенести SL (обычно на entry) на весь остаток
-async def _sl_replace_system(position_uid: str, symbol: str, direction: Optional[str], evt: Dict[str, Any]) -> None:
-    qty_left = await _calc_real_remainder_qty(position_uid)
-    if qty_left <= 0:
-        await _cancel_all_sl(position_uid)
-        log.info("[MAINTAINER SL_REPLACE] qty_left=0 → canceled all SL (uid=%s)", position_uid)
-        return
-
-    # целевой уровень: из события или entry
-    new_sl_price = _as_decimal(evt.get("new_sl_price")) or await _fetch_entry_price(position_uid)
-    if new_sl_price is None:
-        log.info("[MAINTAINER SL_REPLACE] no target price → skip (uid=%s)", position_uid)
-        return
-
-    log.info("[MAINTAINER SL_REPLACE] uid=%s cancel SL → submit SL(trigger=%s qty=%s)", position_uid, _fmt(new_sl_price), _fmt(qty_left))
-
-    await _cancel_all_sl(position_uid)
-    trig_dir = _calc_trigger_direction(direction)
-    new_sl_link = await _next_sl_link_id(position_uid)
-    if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-        ok_s, oid_s, rc_s, rm_s = await _submit_sl(
-            symbol=symbol,
-            side=_to_title_side(_opposite(direction)),
-            trigger_price=new_sl_price,
-            qty=qty_left,
-            link_id=new_sl_link,
-            trigger_direction=trig_dir,
-        )
-        await _mark_order_after_submit(order_link_id=new_sl_link, ok=ok_s, order_id=oid_s, retcode=rc_s, retmsg=rm_s)
-        if ok_s:
-            await _upsert_planned_sl(position_uid, symbol, qty_left, new_sl_price, new_sl_link)
-
-# 🔸 Closed из системы (protect/reverse): отменить TP/SL и закрыть остаток market RO
-async def _closed_system(position_uid: str, symbol: str, direction: Optional[str], evt: Dict[str, Any]) -> None:
-    close_reason = _as_str(evt.get("close_reason")).lower()
-    await _cancel_all_tp_sl(position_uid)
-
-    qty_left = await _calc_real_remainder_qty(position_uid)
-    do_close = qty_left > 0 and any(k in close_reason for k in ("protect", "reverse", "signal-stop", "stoploss", "sl"))
-    if not do_close:
-        log.info("[MAINTAINER CLOSED] uid=%s reason=%s → nothing to close on exchange", position_uid, close_reason or "-")
-        return
-
-    close_link = f"{position_uid}-close"
-    log.info("[MAINTAINER CLOSED] uid=%s → submit CLOSE qty=%s", position_uid, _fmt(qty_left))
-    if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-        ok_c, oid_c, rc_c, rm_c = await _submit_close_market(
-            symbol=symbol,
-            side=_to_title_side(_opposite(direction)),
-            qty=qty_left,
-            link_id=close_link
-        )
-        await _mark_order_after_submit(order_link_id=close_link, ok=ok_c, order_id=oid_c, retcode=rc_c, retmsg=rm_c)
-        if ok_c:
-            await _upsert_planned_close(position_uid, symbol, qty_left, close_link)
-
-# 🔸 Вотчер «биржа раньше системы»: TP1 достигнут на бирже → SL на entry; SL filled → отменить TP
-async def _run_exchange_first_watcher():
     while True:
         try:
-            # кандидаты: позиция open, есть tp L1 в tpo
-            rows = await infra.pg_pool.fetch(
-                """
-                SELECT t.position_uid, t.symbol, t.qty, t.filled_qty
-                FROM public.trader_position_orders t
-                JOIN public.trader_positions p ON p.position_uid = t.position_uid
-                WHERE p.status='open' AND t.kind='tp' AND t.level=$1
-                """,
-                TP1_LEVEL
-            )
-            for r in rows:
-                uid = _as_str(r["position_uid"]); symbol = _as_str(r["symbol"])
-                planned = _as_decimal(r["qty"]) or Decimal("0")
-                filled = _as_decimal(r["filled_qty"]) or Decimal("0")
-                if planned <= 0:
-                    continue
+            # обработка TP1→SL@entry, корректировка SL qty, финализация при закрытии
+            await _scan_and_maintain_positions()
+        except Exception:
+            log.exception("❌ Ошибка в цикле BYBIT_MAINTAINER_V2")
+        await asyncio.sleep(SCAN_INTERVAL_SEC)
 
-                # (A) TP1 на бирже исполнен ≥ TOL → SL должен быть на entry
-                if filled >= planned * TP1_TOL:
-                    # проверим, что SL не уже на entry (по последнему активному SL)
-                    entry_price = await _fetch_entry_price(uid)
-                    if entry_price is None:
-                        continue
-                    last_sl = await infra.pg_pool.fetchrow(
-                        """
-                        SELECT trigger_price FROM public.trader_position_orders
-                        WHERE position_uid=$1 AND kind='sl'
-                          AND (ext_status IS NULL OR ext_status NOT IN ('canceled','filled','expired','rejected'))
-                        ORDER BY id DESC LIMIT 1
-                        """,
-                        uid
-                    )
-                    if last_sl and _as_decimal(last_sl["trigger_price"]) == entry_price:
-                        continue  # уже на entry
-                    # иначе переставим
-                    await _with_lock(uid, _sl_shift_to_entry_exchange_first, uid, symbol)
 
-                # (B) SL filled на бирже → отменить TP (осторожность)
-                sl_filled = await infra.pg_pool.fetchrow(
-                    """
-                    SELECT 1 FROM public.trader_position_orders
-                    WHERE position_uid=$1 AND kind='sl' AND ext_status='filled' LIMIT 1
-                    """,
-                    uid
-                )
-                if sl_filled:
-                    await _cancel_all_tp(uid)
+# 🔸 Инспекция и сопровождение всех «open» позиций
+async def _scan_and_maintain_positions():
+    now = datetime.utcnow()
+    recent_since = now - timedelta(seconds=RECENT_WINDOW_SEC)
+
+    # берём открытые позиции трейдера
+    pos_rows = await infra.pg_pool.fetch(
+        """
+        SELECT position_uid, strategy_id, symbol
+        FROM public.trader_positions
+        WHERE status='open'
+        """
+    )
+    if not pos_rows:
+        return
+
+    for r in pos_rows:
+        uid = _as_str(r["position_uid"])
+        symbol = _as_str(r["symbol"])
+        if not uid or not symbol:
+            continue
+
+        # лок на позицию, чтобы не пересекаться между итерациями/инстансами
+        got = await _with_lock(uid)
+        if not got:
+            continue
+
+        try:
+            # 1) если SL filled или LEFT=0 → финализировать (биржа→система)
+            sl_filled = await _has_sl_filled(uid)
+            left_qty = await _calc_left_qty(uid)
+            if sl_filled or (left_qty is not None and left_qty <= Decimal("0")):
+                reason = "sl-hit" if sl_filled else "tp-exhausted"
+                await _finalize_position(uid, symbol, reason)
+                continue  # позиция закрыта — дальше нечего делать
+
+            # 2) TP1 partial/full → активировать/корректировать SL@entry
+            tp1_filled = await _tp1_filled_qty(uid)
+            if tp1_filled and tp1_filled > Decimal("0"):
+                await _activate_or_adjust_sl_after_tp1(uid, symbol)
+
+            # 3) manual признаки: отменён наш TP/SL без нашей intent-метки → финализировать
+            manual = await _detect_manual_cancel(uid, since=recent_since)
+            if manual:
+                await _finalize_position(uid, symbol, "manual-exchange")
+                continue
 
         except Exception:
-            log.exception("MAINTAINER watcher: error")
+            log.exception("⚠️ Ошибка сопровождения uid=%s", uid)
+        finally:
+            await _release_lock(uid)
 
-        await asyncio.sleep(MAINT_INTERVAL_SEC)
 
-# условия достаточности
-async def _sl_shift_to_entry_exchange_first(uid: str, symbol: str) -> None:
-    direction = await _get_direction(uid)
-    qty_left = await _calc_real_remainder_qty(uid)
-    entry_price = await _fetch_entry_price(uid)
-    if qty_left <= 0 or entry_price is None:
-        return
-    await _cancel_all_sl(uid)
-    link = await _next_sl_link_id(uid)
-    if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-        ok, oid, rc, rm = await _submit_sl(
-            symbol=symbol,
-            side=_to_title_side(_opposite(direction)),
-            trigger_price=entry_price,
-            qty=qty_left,
-            link_id=link,
-            trigger_direction=_calc_trigger_direction(direction),
-        )
-        await _mark_order_after_submit(order_link_id=link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
-        if ok:
-            await _upsert_planned_sl(uid, symbol, qty_left, entry_price, link)
-
-# 🔸 Парсинг payload из XREADGROUP
-def _parse_event(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    data = raw.get("data")
-    if data is None:
-        return {k: _as_native(v) for k, v in raw.items()}
-    try:
-        if isinstance(data, (bytes, bytearray)):
-            data = data.decode("utf-8", "ignore")
-        obj = json.loads(data)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-# 🔸 Утилиты приведения/округления
-def _as_native(v: Any) -> Any:
-    if isinstance(v, (bytes, bytearray)):
-        try: return v.decode("utf-8", "ignore")
-        except Exception: return v
-    return v
-
-def _as_str(v: Any) -> str:
-    if v is None: return ""
-    return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-
-def _as_int(v: Any) -> Optional[int]:
-    try:
-        s = _as_str(v); return int(s) if s != "" else None
-    except Exception: return None
-
-def _as_decimal(v: Any) -> Optional[Decimal]:
-    try:
-        if v is None: return None
-        if isinstance(v, Decimal): return v
-        return Decimal(str(v))
-    except Exception: return None
-
-def _fmt(x: Optional[Decimal], max_prec: int = 8) -> str:
-    if x is None: return "—"
-    try:
-        s = f"{x:.{max_prec}f}".rstrip("0").rstrip("."); return s if s else "0"
-    except Exception: return str(x)
-
-def _round_qty(qty: Decimal, precision_qty: Optional[int]) -> Decimal:
-    if qty is None: return Decimal("0")
-    if precision_qty is None: return qty
-    step = Decimal("1").scaleb(-int(precision_qty))
-    try: return qty.quantize(step, rounding=ROUND_DOWN)
-    except Exception: return qty
-
-def _round_price(price: Optional[Decimal], ticksize: Optional[Decimal]) -> Optional[Decimal]:
-    if price is None or ticksize is None: return price
-    try:
-        quantum = _as_decimal(ticksize) or Decimal("0")
-        if quantum <= 0: return price
-        return price.quantize(quantum, rounding=ROUND_HALF_UP)
-    except Exception: return price
-
-def _opposite(direction: Optional[str]) -> str:
-    d = (direction or "").lower()
-    return "short" if d == "long" else "long"
-
-def _to_title_side(side: str) -> str:
-    s = (side or "").upper()
-    return "Buy" if s == "BUY" else "Sell"
-
-def _calc_trigger_direction(position_direction: Optional[str]) -> int:
-    d = (position_direction or "").lower()
-    return 2 if d == "long" else 1  # long→ждём падение (2), short→ждём рост (1)
-
-# 🔸 Лок на позицию (Redis SET NX EX)
-async def _with_lock(position_uid: str, coro, *args, **kwargs):
-    key = f"bybit:maint:lock:{position_uid}"
-    redis = infra.redis_client
-    try:
-        ok = await redis.set(key, "1", ex=LOCK_TTL_SEC, nx=True)
-        if not ok:
-            log.debug("lock busy uid=%s", position_uid); return
-        await coro(*args, **kwargs)
-    finally:
-        try: await redis.delete(key)
-        except Exception: pass
-
-# 🔸 Доступ к БД / вспомогательные выборки
-async def _get_direction(position_uid: str) -> Optional[str]:
-    row = await infra.pg_pool.fetchrow("SELECT direction FROM public.positions_v4 WHERE position_uid=$1", position_uid)
-    return (_as_str(row["direction"]).lower() if row and row["direction"] else None)
-
-async def _fetch_entry_price(position_uid: str) -> Optional[Decimal]:
-    row = await infra.pg_pool.fetchrow("SELECT entry_price FROM public.positions_v4 WHERE position_uid=$1", position_uid)
-    return _as_decimal(row["entry_price"]) if row and row["entry_price"] is not None else None
-
-async def _fetch_tpo(order_link_id: str) -> Dict[str, Any]:
-    row = await infra.pg_pool.fetchrow(
+# 🔸 Активация/корректировка SL после TP1 (перенос на entry остатка)
+async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> None:
+    # получим текущий активный SL (реальный) и шаблон SL-after-TP1 (virtual)
+    active_sls = await infra.pg_pool.fetch(
         """
-        SELECT position_uid, kind, level, qty, filled_qty, order_id, ext_status
-        FROM public.trader_position_orders WHERE order_link_id=$1
-        """,
-        order_link_id
-    )
-    return dict(row) if row else {}
-
-async def _calc_real_remainder_qty(position_uid: str) -> Decimal:
-    q_entry_row = await infra.pg_pool.fetchrow(
-        "SELECT qty FROM public.trader_position_orders WHERE position_uid=$1 AND kind='entry' ORDER BY id DESC LIMIT 1",
-        position_uid
-    )
-    entry_qty = _as_decimal(q_entry_row["qty"]) if q_entry_row and q_entry_row["qty"] is not None else Decimal("0")
-    sums = await infra.pg_pool.fetchrow(
-        """
-        SELECT
-          COALESCE(SUM(CASE WHEN kind='tp' THEN filled_qty ELSE 0 END),0) AS tp_filled,
-          COALESCE(SUM(CASE WHEN kind='close' THEN filled_qty ELSE 0 END),0) AS close_filled
-        FROM public.trader_position_orders WHERE position_uid=$1
-        """,
-        position_uid
-    )
-    tp_filled = _as_decimal(sums["tp_filled"]) or Decimal("0")
-    close_filled = _as_decimal(sums["close_filled"]) or Decimal("0")
-    left = entry_qty - tp_filled - close_filled
-    return left if left > 0 else Decimal("0")
-
-async def _cancel_all_sl(position_uid: str) -> None:
-    rows = await infra.pg_pool.fetch(
-        """
-        SELECT order_link_id, symbol
+        SELECT id, order_link_id, trigger_price, qty, ext_status
         FROM public.trader_position_orders
         WHERE position_uid=$1 AND kind='sl'
+          AND "type" IS NOT NULL
           AND (ext_status IS NULL OR ext_status NOT IN ('canceled','filled','expired','rejected'))
+        ORDER BY id DESC
         """,
         position_uid
     )
-    for r in rows:
-        link = _as_str(r["order_link_id"]); symbol = _as_str(r["symbol"])
-        if not link or not symbol: continue
-        if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-            resp = await _bybit_post("/v5/order/cancel", {"category": CATEGORY, "symbol": symbol, "orderLinkId": link})
-            rc, rm = resp.get("retCode"), resp.get("retMsg")
-            log.info("cancel SL: %s → rc=%s msg=%s", link, rc, rm)
-        if TRADER_ORDER_MODE == "on":
-            await infra.pg_pool.execute(
-                "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
-                link, datetime.utcnow()
-            )
-
-async def _cancel_all_tp(position_uid: str) -> None:
-    rows = await infra.pg_pool.fetch(
+    sl_after = await infra.pg_pool.fetchrow(
         """
-        SELECT order_link_id, symbol
+        SELECT id, order_link_id, trigger_price, qty, ext_status
         FROM public.trader_position_orders
-        WHERE position_uid=$1 AND kind='tp'
-          AND (ext_status IS NULL OR ext_status NOT IN ('canceled','filled','expired','rejected'))
+        WHERE position_uid=$1 AND kind='sl'
+          AND activation_tp_level=1
+          AND (ext_status='virtual' OR ext_status IS NULL)
+        ORDER BY id ASC LIMIT 1
         """,
         position_uid
     )
-    for r in rows:
-        link = _as_str(r["order_link_id"]); symbol = _as_str(r["symbol"])
-        if not link or not symbol: continue
-        if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-            resp = await _bybit_post("/v5/order/cancel", {"category": CATEGORY, "symbol": symbol, "orderLinkId": link})
-            rc, rm = resp.get("retCode"), resp.get("retMsg")
-            log.info("cancel TP: %s → rc=%s msg=%s", link, rc, rm)
-        if TRADER_ORDER_MODE == "on":
-            await infra.pg_pool.execute(
-                "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
-                link, datetime.utcnow()
-            )
 
-async def _cancel_all_tp_sl(position_uid: str) -> None:
-    rows = await infra.pg_pool.fetch(
-        """
-        SELECT order_link_id, symbol
-        FROM public.trader_position_orders
-        WHERE position_uid=$1 AND kind IN ('tp','sl')
-          AND (ext_status IS NULL OR ext_status NOT IN ('canceled','filled','expired','rejected'))
-        """,
-        position_uid
-    )
-    for r in rows:
-        link = _as_str(r["order_link_id"]); symbol = _as_str(r["symbol"])
-        if not link or not symbol: continue
-        if TRADER_ORDER_MODE == "on" and (API_KEY and API_SECRET):
-            resp = await _bybit_post("/v5/order/cancel", {"category": CATEGORY, "symbol": symbol, "orderLinkId": link})
-            rc, rm = resp.get("retCode"), resp.get("retMsg")
-            log.info("cancel TP/SL: %s → rc=%s msg=%s", link, rc, rm)
-        if TRADER_ORDER_MODE == "on":
-            await infra.pg_pool.execute(
-                "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
-                link, datetime.utcnow()
-            )
+    # если шаблона нет — нечего активировать
+    if not sl_after:
+        return
 
-async def _next_sl_link_id(position_uid: str) -> str:
-    rows = await infra.pg_pool.fetch(
-        "SELECT order_link_id FROM public.trader_position_orders WHERE position_uid=$1 AND kind='sl'",
-        position_uid
-    )
-    max_ver = 0
-    base = f"{position_uid}-sl"
-    for r in rows:
-        lid = _as_str(r["order_link_id"]) or ""
-        if lid == base:
-            max_ver = max(max_ver, 1)
-        elif "-sl-v" in lid:
-            try:
-                n = int(lid.split("-sl-v", 1)[1]); max_ver = max(max_ver, n)
-            except Exception:
-                pass
-    return base if max_ver == 0 else f"{position_uid}-sl-v{max_ver + 1}"
+    # вычислим остаток LEFT (entry filled − Σtp filled − Σclose filled)
+    left = await _calc_left_qty(position_uid)
+    if left is None or left <= Decimal("0"):
+        # остатка нет — просто финализируем (остальные действия обработает главный финализатор на следующем цикле)
+        return
 
-async def _next_force_link_id(position_uid: str, level: int) -> str:
-    base = f"{position_uid}-tp-{level}-force"
-    rows = await infra.pg_pool.fetch(
-        "SELECT order_link_id FROM public.trader_position_orders WHERE position_uid=$1 AND order_link_id LIKE $2",
-        position_uid, f"{base}%"
-    )
-    max_ver = 0
-    for r in rows:
-        lid = _as_str(r["order_link_id"]) or ""
-        if lid == base:
-            max_ver = max(max_ver, 1)
-        elif f"{base}-v" in lid:
-            try:
-                n = int(lid.split(f"{base}-v", 1)[1]); max_ver = max(max_ver, n)
-            except Exception:
-                pass
-    return base if max_ver == 0 else f"{base}-v{max_ver + 1}"
+    # точности по тикеру
+    tkr = await _load_ticker_precisions(symbol)
+    precision_qty = tkr.get("precision_qty")
+    min_qty = tkr.get("min_qty")
+    ticksize = tkr.get("ticksize")
 
-async def _last_force_link_id(position_uid: str) -> str:
-    # берём последний force-link по id
-    row = await infra.pg_pool.fetchrow(
-        """
-        SELECT order_link_id FROM public.trader_position_orders
-        WHERE position_uid=$1 AND order_link_id LIKE $2
-        ORDER BY id DESC LIMIT 1
-        """,
-        position_uid, f"{position_uid}-tp-{TP1_LEVEL}-force%"
-    )
-    return _as_str(row["order_link_id"]) if row else f"{position_uid}-tp-{TP1_LEVEL}-force"
+    # желаемый qty SL = left (квантуем)
+    target_qty = _round_qty(left, precision_qty)
+    if min_qty is not None and target_qty < min_qty:
+        # слишком мало — игнор
+        return
 
-async def _upsert_planned_sl(position_uid: str, symbol: str, qty: Decimal, trigger_price: Decimal, link_id: str) -> None:
-    now = datetime.utcnow()
-    await infra.pg_pool.execute(
-        """
-        INSERT INTO public.trader_position_orders (
-            position_uid, kind, level, exchange, symbol, side, "type", tif, reduce_only,
-            price, trigger_price, qty, order_link_id, ext_status,
-            qty_raw, price_raw, created_at
-        ) VALUES ($1,'sl',NULL,'BYBIT',$2,NULL,'stop_market','GTC',true,
-                  NULL,$3,$4,$5,'submitted',NULL,NULL,$6)
-        ON CONFLICT (order_link_id) DO NOTHING
-        """,
-        position_uid, symbol, trigger_price, qty, link_id, now
-    )
+    # Отменяем все текущие активные SL (если есть)
+    for sl in active_sls:
+        link = _as_str(sl["order_link_id"])
+        if not link:
+            continue
+        await _intent_mark_cancel(link)  # намерение отменить — чтобы не считать manual
+        await _cancel_order_by_link(symbol, link)
 
-async def _upsert_planned_close(position_uid: str, symbol: str, qty: Decimal, link_id: str) -> None:
-    now = datetime.utcnow()
-    await infra.pg_pool.execute(
-        """
-        INSERT INTO public.trader_position_orders (
-            position_uid, kind, level, exchange, symbol, side, "type", tif, reduce_only,
-            price, trigger_price, qty, order_link_id, ext_status,
-            qty_raw, price_raw, created_at
-        ) VALUES ($1,'close',NULL,'BYBIT',$2,NULL,'market','GTC',true,
-                  NULL,NULL,$3,$4,'submitted',NULL,NULL,$5)
-        ON CONFLICT (order_link_id) DO NOTHING
-        """,
-        position_uid, symbol, qty, link_id, now
-    )
-# 🔸 Post-submit апдейт строки ордера (по order_link_id)
-async def _mark_order_after_submit(
-    *,
-    order_link_id: str,
-    ok: bool,
-    order_id: Optional[str],
-    retcode: Optional[int],
-    retmsg: Optional[str],
-) -> None:
-    now = datetime.utcnow()
-    status = "submitted" if ok else "rejected"
+    # Поднимаем шаблон: submit SL с trigger_price из шаблона, target_qty
+    trig = _as_decimal(sl_after["trigger_price"])
+    if trig is None:
+        # если что-то пошло не так, вычислим триггер заново как entry(avg fill)
+        entry_avg = await _fetch_entry_avg_fill_price(position_uid)
+        trig = entry_avg
+
+    # направленность (long→2 fall, short→1 rise)
+    direction = await _get_direction(position_uid)
+    trig_dir = _calc_trigger_direction(direction)
+
+    new_link = _as_str(sl_after["order_link_id"]) or f"{position_uid}-sl-after-tp-1"
+    if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
+        ok, oid, rc, rm = await _submit_sl(
+            symbol=symbol,
+            side=_to_title_side("SELL" if (direction or "").lower() == "long" else "BUY"),
+            trigger_price=_round_price(trig, ticksize),
+            qty=target_qty,
+            link_id=new_link,
+            trigger_direction=trig_dir,
+        )
+        await _mark_order_after_submit(order_link_id=new_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
+    else:
+        # DRY_RUN — только статусы в БД
+        await infra.pg_pool.execute(
+            "UPDATE public.trader_position_orders SET ext_status='submitted', last_ext_event_at=$2 WHERE order_link_id=$1",
+            new_link, datetime.utcnow()
+        )
+
+    # обновим qty/trigger шаблона в TPO (на случай, если нужно подогнать под left)
     await infra.pg_pool.execute(
         """
         UPDATE public.trader_position_orders
-        SET
-            order_id = COALESCE($2, order_id),
-            ext_status = $3,
-            last_ext_event_at = $4,
-            error_last = CASE WHEN $1 THEN NULL ELSE $5 END
-        WHERE order_link_id = $6
+        SET qty=$2, trigger_price=COALESCE(trigger_price,$3)
+        WHERE order_link_id=$1
         """,
-        ok, order_id, status, now,
-        (f"retCode={retcode} retMsg={retmsg}" if not ok else None),
-        order_link_id,
+        new_link, target_qty, trig
     )
-    
-# 🔸 Сабмиты/отмена на бирже
+
+
+# 🔸 Финализация позиции: отмена остаточных TP/SL, закрытие в портфеле/БД
+async def _finalize_position(position_uid: str, symbol: str, reason: str) -> None:
+    now = datetime.utcnow()
+
+    # отменяем все нефинальные TP/SL
+    open_orders = await infra.pg_pool.fetch(
+        """
+        SELECT order_link_id, kind, "type", ext_status
+        FROM public.trader_position_orders
+        WHERE position_uid=$1
+          AND kind IN ('tp','sl')
+          AND (ext_status IS NULL OR ext_status NOT IN ('canceled','filled','expired','rejected'))
+        """,
+        position_uid
+    )
+    for o in open_orders:
+        link = _as_str(o["order_link_id"])
+        otype = _as_str(o["type"])
+        status = _as_str(o["ext_status"])
+        if not link:
+            continue
+        # виртуальные (type IS NULL) переводим в expired без REST
+        if not otype:
+            await infra.pg_pool.execute(
+                "UPDATE public.trader_position_orders SET ext_status='expired', last_ext_event_at=$2 WHERE order_link_id=$1",
+                link, now
+            )
+            continue
+        # реальные — отменяем на бирже только в ON
+        await _intent_mark_cancel(link)
+        if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
+            await _cancel_order_by_link(symbol, link)
+        else:
+            await infra.pg_pool.execute(
+                "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
+                link, now
+            )
+
+    # если остался нетто-остаток > 0 — рыночное закрытие reduce-only
+    left = await _calc_left_qty(position_uid)
+    if left is not None and left > Decimal("0"):
+        direction = await _get_direction(position_uid)
+        side_title = _to_title_side("SELL" if (direction or "").lower() == "long" else "BUY")
+        close_link = f"{position_uid}-close-final"
+        if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
+            ok_c, oid_c, rc_c, rm_c = await _submit_close_market(symbol, side_title, _round_qty(left, await _precision_qty(symbol)), close_link)
+            await _mark_order_after_submit(order_link_id=close_link, ok=ok_c, order_id=oid_c, retcode=rc_c, retmsg=rm_c)
+        else:
+            await infra.pg_pool.execute(
+                "INSERT INTO public.trader_position_orders (position_uid, kind, level, exchange, symbol, side, \"type\", tif, reduce_only, price, trigger_price, qty, order_link_id, ext_status, created_at) VALUES ($1,'close',NULL,'BYBIT',$2,NULL,'market','GTC',true,NULL,NULL,$3,$4,'submitted',$5) ON CONFLICT (order_link_id) DO NOTHING",
+                position_uid, symbol, _round_qty(left, await _precision_qty(symbol)), close_link, now
+            )
+
+    # закрываем запись в портфеле
+    await infra.pg_pool.execute(
+        """
+        UPDATE public.trader_positions
+        SET status='closed', closed_at=COALESCE(closed_at,$2), close_reason=COALESCE(close_reason,$3)
+        WHERE position_uid=$1
+        """,
+        position_uid, now, reason
+    )
+
+
+# 🔸 Детект manual: отмена наших TP/SL без локального намерения
+async def _detect_manual_cancel(position_uid: str, since: datetime) -> bool:
+    rows = await infra.pg_pool.fetch(
+        """
+        SELECT order_link_id
+        FROM public.trader_position_orders
+        WHERE position_uid=$1
+          AND kind IN ('tp','sl')
+          AND "type" IS NOT NULL
+          AND ext_status='canceled'
+          AND last_ext_event_at >= $2
+        """,
+        position_uid, since
+    )
+    if not rows:
+        return False
+    for r in rows:
+        link = _as_str(r["order_link_id"])
+        if not await _intent_check(link):
+            # отмена без intent → трактуем как manual
+            return True
+    return False
+
+
+# 🔸 Хелперы работы с ордерами и расчёты
+async def _tp1_filled_qty(position_uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT COALESCE(filled_qty,0) AS fq
+        FROM public.trader_position_orders
+        WHERE position_uid=$1 AND kind='tp' AND "level"=1
+        ORDER BY id DESC LIMIT 1
+        """,
+        position_uid
+    )
+    return _as_decimal(row["fq"]) if row else None
+
+async def _has_sl_filled(position_uid: str) -> bool:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT 1
+        FROM public.trader_position_orders
+        WHERE position_uid=$1 AND kind='sl' AND ext_status='filled'
+        LIMIT 1
+        """,
+        position_uid
+    )
+    return bool(row)
+
+async def _calc_left_qty(position_uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        WITH e AS (
+          SELECT COALESCE(MAX(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='entry'
+        ),
+        t AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='tp'
+        ),
+        c AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='close'
+        )
+        SELECT e.fq - t.fq - c.fq AS left_qty
+        FROM e,t,c
+        """,
+        position_uid
+    )
+    return _as_decimal(row["left_qty"]) if row else None
+
+async def _fetch_entry_avg_fill_price(position_uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT avg_fill_price
+        FROM public.trader_position_orders
+        WHERE position_uid=$1 AND kind='entry'
+        ORDER BY id DESC LIMIT 1
+        """,
+        position_uid
+    )
+    return _as_decimal(row["avg_fill_price"]) if row else None
+
+async def _get_direction(position_uid: str) -> Optional[str]:
+    row = await infra.pg_pool.fetchrow(
+        "SELECT direction FROM public.positions_v4 WHERE position_uid=$1",
+        position_uid
+    )
+    return (_as_str(row["direction"]).lower() if row and row["direction"] else None)
+
+async def _precision_qty(symbol: str) -> Optional[int]:
+    row = await infra.pg_pool.fetchrow(
+        "SELECT precision_qty FROM public.tickers_bb WHERE symbol=$1",
+        symbol
+    )
+    return int(row["precision_qty"]) if row and row["precision_qty"] is not None else None
+
+async def _load_ticker_precisions(symbol: str) -> Dict[str, Optional[Decimal]]:
+    row = await infra.pg_pool.fetchrow(
+        "SELECT precision_qty, min_qty, ticksize FROM public.tickers_bb WHERE symbol=$1",
+        symbol
+    )
+    if not row:
+        return {"precision_qty": None, "min_qty": None, "ticksize": None}
+    return {
+        "precision_qty": int(row["precision_qty"]) if row["precision_qty"] is not None else None,
+        "min_qty": _as_decimal(row["min_qty"]),
+        "ticksize": _as_decimal(row["ticksize"]),
+    }
+
+
+# 🔸 REST сабмиты/отмена
 async def _submit_sl(*, symbol: str, side: str, trigger_price: Decimal, qty: Decimal, link_id: str, trigger_direction: int) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
     body = {
         "category": CATEGORY,
@@ -628,36 +390,53 @@ async def _submit_sl(*, symbol: str, side: str, trigger_price: Decimal, qty: Dec
         "reduceOnly": True,
         "triggerPrice": _fmt(trigger_price),
         "triggerDirection": trigger_direction,
-        "triggerBy": "LastPrice",
+        "triggerBy": DEFAULT_TRIGGER_BY,
         "closeOnTrigger": True,
         "timeInForce": "GTC",
         "orderLinkId": link_id,
     }
+    if TRADER_ORDER_MODE != "on" or not API_KEY or not API_SECRET:
+        log.info("[DRY_RUN MAINT] submit SL: %s trigger=%s qty=%s link=%s", symbol, _fmt(trigger_price), _fmt(qty), link_id)
+        return True, None, None, None
     resp = await _bybit_post("/v5/order/create", body)
     rc, rm = resp.get("retCode"), resp.get("retMsg")
-    oid = _extract_order_id(resp); ok = (rc == 0)
-    log.info("submit SL: %s trigger=%s dir=%s qty=%s link=%s → rc=%s msg=%s oid=%s",
-             symbol, _fmt(trigger_price), trigger_direction, _fmt(qty), link_id, rc, rm, oid)
-    return ok, oid, rc, rm
+    oid = _extract_order_id(resp)
+    log.info("submit SL: %s trigger=%s qty=%s link=%s → rc=%s msg=%s oid=%s", symbol, _fmt(trigger_price), _fmt(qty), link_id, rc, rm, oid)
+    return (rc == 0), oid, rc, rm
 
-async def _submit_close_market(*, symbol: str, side: str, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
+async def _submit_close_market(symbol: str, side: str, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
     body = {
         "category": CATEGORY,
         "symbol": symbol,
         "side": side,
         "orderType": "Market",
         "qty": _fmt(qty),
-        "reduceOnly": True,
         "timeInForce": "GTC",
+        "reduceOnly": True,
         "orderLinkId": link_id,
     }
+    if TRADER_ORDER_MODE != "on" or not API_KEY or not API_SECRET:
+        log.info("[DRY_RUN MAINT] close market: %s qty=%s link=%s", symbol, _fmt(qty), link_id)
+        return True, None, None, None
     resp = await _bybit_post("/v5/order/create", body)
     rc, rm = resp.get("retCode"), resp.get("retMsg")
-    oid = _extract_order_id(resp); ok = (rc == 0)
+    oid = _extract_order_id(resp)
     log.info("submit CLOSE: %s qty=%s link=%s → rc=%s msg=%s oid=%s", symbol, _fmt(qty), link_id, rc, rm, oid)
-    return ok, oid, rc, rm
+    return (rc == 0), oid, rc, rm
 
-# 🔸 REST-хелперы
+async def _cancel_order_by_link(symbol: str, link_id: str) -> None:
+    if TRADER_ORDER_MODE != "on" or not API_KEY or not API_SECRET:
+        # DRY_RUN — просто пометим canceled
+        await infra.pg_pool.execute(
+            "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
+            link_id, datetime.utcnow()
+        )
+        log.info("[DRY_RUN MAINT] cancel: %s", link_id)
+        return
+    resp = await _bybit_post("/v5/order/cancel", {"category": CATEGORY, "symbol": symbol, "orderLinkId": link_id})
+    rc, rm = resp.get("retCode"), resp.get("retMsg")
+    log.info("cancel %s → rc=%s msg=%s", link_id, rc, rm)
+
 def _rest_sign(ts_ms: int, query_or_body: str) -> str:
     import hmac, hashlib
     payload = f"{ts_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
@@ -666,7 +445,7 @@ def _rest_sign(ts_ms: int, query_or_body: str) -> str:
 async def _bybit_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{BASE_URL}{path}"
     ts = _now_ms()
-    body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    body_str = _json_body(body)
     sign = _rest_sign(ts, body_str)
     headers = {
         "X-BAPI-API-KEY": API_KEY,
@@ -694,6 +473,98 @@ def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
     except Exception:
         return None
 
+def _json_body(obj: Dict[str, Any]) -> str:
+    import json
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
 def _now_ms() -> int:
     import time
     return int(time.time() * 1000)
+
+
+# 🔸 Локи и intent-маркеры
+async def _with_lock(position_uid: str) -> bool:
+    key = f"bybit:maint:v2:lock:{position_uid}"
+    try:
+        ok = await infra.redis_client.set(key, "1", ex=LOCK_TTL_SEC, nx=True)
+        return bool(ok)
+    except Exception:
+        return False
+
+async def _release_lock(position_uid: str) -> None:
+    key = f"bybit:maint:v2:lock:{position_uid}"
+    try:
+        await infra.redis_client.delete(key)
+    except Exception:
+        pass
+
+async def _intent_mark_cancel(order_link_id: str) -> None:
+    key = f"bybit:maint:v2:intent:cancel:{order_link_id}"
+    try:
+        await infra.redis_client.set(key, "1", ex=INTENT_TTL_SEC)
+    except Exception:
+        pass
+
+async def _intent_check(order_link_id: str) -> bool:
+    key = f"bybit:maint:v2:intent:cancel:{order_link_id}"
+    try:
+        v = await infra.redis_client.get(key)
+        return v is not None
+    except Exception:
+        return False
+
+
+# 🔸 Утилиты приведения и форматирования
+def _as_str(v: Any) -> str:
+    if v is None:
+        return ""
+    return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+
+def _as_decimal(v: Any) -> Optional[Decimal]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, Decimal):
+            return v
+        return Decimal(str(v))
+    except Exception:
+        return None
+
+def _fmt(x: Optional[Decimal], max_prec: int = 8) -> str:
+    if x is None:
+        return "—"
+    try:
+        s = f"{x:.{max_prec}f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    except Exception:
+        return str(x)
+
+def _round_qty(qty: Decimal, precision_qty: Optional[int]) -> Decimal:
+    if qty is None:
+        return Decimal("0")
+    if precision_qty is None:
+        return qty
+    step = Decimal("1").scaleb(-int(precision_qty))
+    try:
+        return qty.quantize(step, rounding=ROUND_DOWN)
+    except Exception:
+        return qty
+
+def _round_price(price: Optional[Decimal], ticksize: Optional[Decimal]) -> Optional[Decimal]:
+    if price is None or ticksize is None:
+        return price
+    try:
+        quantum = _as_decimal(ticksize) or Decimal("0")
+        if quantum <= 0:
+            return price
+        return price.quantize(quantum, rounding=ROUND_HALF_UP)
+    except Exception:
+        return price
+
+def _to_title_side(side: str) -> str:
+    s = (side or "").upper()
+    return "Buy" if s == "BUY" else "Sell"
+
+def _calc_trigger_direction(position_direction: Optional[str]) -> int:
+    d = (position_direction or "").lower()
+    return 2 if d == "long" else 1

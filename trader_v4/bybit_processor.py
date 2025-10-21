@@ -63,16 +63,16 @@ def _get_size_factor() -> Decimal:
     return (pct / Decimal("100"))
 
 SIZE_FACTOR = _get_size_factor()
-log.info("BYBIT processor v2: MODE=%s, SIZE_FACTOR=%.4f (BYBIT_SIZE_PCT=%s%%), trigger_by=%s",
+log.debug("BYBIT processor v2: MODE=%s, SIZE_FACTOR=%.4f (BYBIT_SIZE_PCT=%s%%), trigger_by=%s",
          TRADER_ORDER_MODE, float(SIZE_FACTOR), os.getenv("BYBIT_SIZE_PCT", "100"), DEFAULT_TRIGGER_BY)
 
 # 🔸 Сообщим о режиме
 if TRADER_ORDER_MODE == "dry_run":
-    log.info("BYBIT processor v2: DRY_RUN (entry/TP/SL в БД; REST без реальной отправки)")
+    log.debug("BYBIT processor v2: DRY_RUN (entry/TP/SL в БД; REST без реальной отправки)")
 elif TRADER_ORDER_MODE == "off":
-    log.info("BYBIT processor v2: OFF (игнорируем заявки)")
+    log.debug("BYBIT processor v2: OFF (игнорируем заявки)")
 else:
-    log.info("BYBIT processor v2: ON (entry→fill→TP/SL по политике)")
+    log.debug("BYBIT processor v2: ON (entry→fill→TP/SL по политике)")
 
 # 🔸 Основной цикл воркера
 async def run_bybit_processor_loop():
@@ -128,7 +128,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     created_at = _parse_dt(_as_str(data.get("created_at")))
 
     if not position_uid or not sid or not symbol or direction not in ("long", "short"):
-        log.info("⚠️ Недостаточные данные заявки: id=%s uid=%s sid=%s symbol=%s dir=%s", record_id, position_uid, sid, symbol, direction)
+        log.debug("⚠️ Недостаточные данные заявки: id=%s uid=%s sid=%s symbol=%s dir=%s", record_id, position_uid, sid, symbol, direction)
         return
 
     # точности
@@ -154,13 +154,13 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     # сырьё из positions_v4 (quantity / entry_price mark — для dry_run)
     qty_raw, entry_price_mark = await _try_fetch_initials_from_positions_v4(position_uid)
     if qty_raw is None or qty_raw <= 0:
-        log.info("⚠️ Нет quantity для uid=%s — пропуск", position_uid)
+        log.debug("⚠️ Нет quantity для uid=%s — пропуск", position_uid)
         return
 
     # масштабирование объёма под BYBIT_SIZE_PCT
     qty_trade = _round_qty(qty_raw * SIZE_FACTOR, precision_qty)
     if min_qty is not None and qty_trade < min_qty:
-        log.info("⚠️ qty_trade < min_qty (uid=%s, qty_trade=%s, min_qty=%s) — пропуск", position_uid, _fmt(qty_trade), _fmt(min_qty))
+        log.debug("⚠️ qty_trade < min_qty (uid=%s, qty_trade=%s, min_qty=%s) — пропуск", position_uid, _fmt(qty_trade), _fmt(min_qty))
         return
 
     # planned entry (до сабмита) — фиксируем фактически планируемый объём (qty_trade)
@@ -217,10 +217,10 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             ext_status=("submitted" if ok_e else "rejected"),
         )
         if not ok_e:
-            log.info("⚠️ Entry отвергнут (uid=%s) → прекращаем обработку", position_uid)
+            log.debug("⚠️ Entry отвергнут (uid=%s) → прекращаем обработку", position_uid)
             return
     else:
-        log.info(
+        log.debug(
             "[DRY_RUN] entry planned: uid=%s %s qty=%s",
             position_uid,
             symbol,
@@ -232,7 +232,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         position_uid, entry_link_id, symbol, entry_price_mark, qty_trade, precision_qty
     )
     if avg_fill_price is None or filled_qty is None or filled_qty <= 0:
-        log.info("⚠️ Не получили фактический fill для uid=%s — прекращаем обработку", position_uid)
+        log.debug("⚠️ Не получили фактический fill для uid=%s — прекращаем обработку", position_uid)
         return
 
     # расчёт TP/SL от avg_fill и filled_qty
@@ -383,7 +383,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             )
             await _mark_order_after_submit(order_link_id=link_id, ok=ok_t, order_id=oid_t, retcode=rc_t, retmsg=rm_t)
     else:
-        log.info("[DRY_RUN] placed: primary SL and priced TPs planned (uid=%s)", position_uid)
+        log.debug("[DRY_RUN] placed: primary SL and priced TPs planned (uid=%s)", position_uid)
 
 # 🔸 Нормализация политики: уровни → int (после JSON)
 def _normalize_policy_inplace(policy: Dict[str, Any]) -> None:
@@ -662,7 +662,7 @@ async def _submit_entry(*, symbol: str, side: str, qty: Decimal, link_id: str) -
     resp = await _bybit_post("/v5/order/create", body)
     rc, rm = resp.get("retCode"), resp.get("retMsg")
     oid = _extract_order_id(resp); ok = (rc == 0)
-    log.info("submit entry: %s %s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_qty(qty), link_id, rc, rm, oid)
+    log.debug("submit entry: %s %s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_qty(qty), link_id, rc, rm, oid)
     return ok, oid, rc, rm
 
 async def _submit_tp(*, symbol: str, side: str, price: Decimal, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
@@ -680,7 +680,7 @@ async def _submit_tp(*, symbol: str, side: str, price: Decimal, qty: Decimal, li
     resp = await _bybit_post("/v5/order/create", body)
     rc, rm = resp.get("retCode"), resp.get("retMsg")
     oid = _extract_order_id(resp); ok = (rc == 0)
-    log.info("submit tp: %s %s price=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_price(price), _str_qty(qty), link_id, rc, rm, oid)
+    log.debug("submit tp: %s %s price=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_price(price), _str_qty(qty), link_id, rc, rm, oid)
     return ok, oid, rc, rm
 
 async def _submit_sl(
@@ -709,7 +709,7 @@ async def _submit_sl(
     resp = await _bybit_post("/v5/order/create", body)
     rc, rm = resp.get("retCode"), resp.get("retMsg")
     oid = _extract_order_id(resp); ok = (rc == 0)
-    log.info("submit sl: %s trigger=%s dir=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s",
+    log.debug("submit sl: %s trigger=%s dir=%s qty=%s linkId=%s → rc=%s msg=%s oid=%s",
              symbol, _str_price(trigger_price), trigger_direction, _str_qty(qty), link_id, rc, rm, oid)
     return ok, oid, rc, rm
 
@@ -910,7 +910,7 @@ async def _preflight_set_leverage(symbol: str, lev: Optional[Decimal]) -> None:
         }
         resp = await _bybit_post("/v5/position/set-leverage", body)
         rc, rm = resp.get("retCode"), resp.get("retMsg")
-        log.info("[PREFLIGHT] set-leverage %s=%s → rc=%s msg=%s", symbol, lev_int, rc, rm)
+        log.debug("[PREFLIGHT] set-leverage %s=%s → rc=%s msg=%s", symbol, lev_int, rc, rm)
     except Exception:
         log.exception("[PREFLIGHT] set-leverage failed for %s", symbol)
 

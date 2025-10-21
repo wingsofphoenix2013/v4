@@ -42,10 +42,10 @@ LOG_PINGS = os.getenv("BYBIT_LOG_PINGS", "false").lower() == "true"
 # 🔸 Основной цикл воркера приватного WS (держим канал + подписки)
 async def run_bybit_private_ws_sync_loop():
     if not API_KEY or not API_SECRET:
-        log.info("BYBIT_SYNC: ключи не заданы (BYBIT_API_KEY/SECRET) — пропуск запуска")
+        log.debug("BYBIT_SYNC: ключи не заданы (BYBIT_API_KEY/SECRET) — пропуск запуска")
         return
 
-    log.info("BYBIT_SYNC: старт приватного WS-синка %s", WS_PRIVATE)
+    log.debug("BYBIT_SYNC: старт приватного WS-синка %s", WS_PRIVATE)
 
     while True:
         try:
@@ -56,12 +56,12 @@ async def run_bybit_private_ws_sync_loop():
                 signature = hmac.new(API_SECRET.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
                 await ws.send(json.dumps({"op": "auth", "args": [API_KEY, expires, signature]}))
                 auth_resp = json.loads(await ws.recv())
-                log.info("BYBIT_SYNC auth: %s", auth_resp)
+                log.debug("BYBIT_SYNC auth: %s", auth_resp)
 
                 # подписки: wallet + position + order + execution
                 await ws.send(json.dumps({"op": "subscribe", "args": ["wallet", "position", "order", "execution"]}))
                 sub_resp = json.loads(await ws.recv())
-                log.info("BYBIT_SYNC subscribe ack: %s", sub_resp)
+                log.debug("BYBIT_SYNC subscribe ack: %s", sub_resp)
 
                 # цикл чтения с таймаутом (для пингов)
                 while True:
@@ -76,7 +76,7 @@ async def run_bybit_private_ws_sync_loop():
                             pong_raw = await asyncio.wait_for(ws.recv(), timeout=5)
                             await _handle_ws_message(pong_raw)
                         except asyncio.TimeoutError:
-                            log.info("BYBIT_SYNC: нет pong — переподключение")
+                            log.debug("BYBIT_SYNC: нет pong — переподключение")
                             raise ConnectionError("pong timeout")
 
         except Exception:
@@ -110,7 +110,7 @@ async def _handle_ws_message(msg_raw: str):
 
         # auth/subscribe — остаются на INFO
         if op in ("auth", "subscribe"):
-            log.info("BYBIT_SYNC recv op: %s", msg)
+            log.debug("BYBIT_SYNC recv op: %s", msg)
             return
 
         # прочие — debug
@@ -127,12 +127,12 @@ async def _handle_ws_message(msg_raw: str):
 
     if topic == "wallet":
         head = items[0] if items else {}
-        log.info("BYBIT_SYNC wallet: items=%d head=%s ts=%s", len(items), head, ts)
+        log.debug("BYBIT_SYNC wallet: items=%d head=%s ts=%s", len(items), head, ts)
         return
 
     if topic == "position":
         head = items[0] if items else {}
-        log.info("BYBIT_SYNC position: items=%d head=%s ts=%s", len(items), head, ts)
+        log.debug("BYBIT_SYNC position: items=%d head=%s ts=%s", len(items), head, ts)
         return
 
     if topic == "order":
@@ -418,7 +418,7 @@ def _map_order_status(s: str) -> Optional[str]:
 # 🔸 Периодический REST-ресинк (баланс + позиции linear)
 async def run_bybit_rest_resync_job():
     if not API_KEY or not API_SECRET:
-        log.info("BYBIT_RESYNC: ключи не заданы (BYBIT_API_KEY/SECRET) — пропуск")
+        log.debug("BYBIT_RESYNC: ключи не заданы (BYBIT_API_KEY/SECRET) — пропуск")
         return
 
     try:
@@ -478,19 +478,19 @@ async def _get_positions_list() -> dict:
 def _log_balance_summary(bal: dict):
     acc = (bal.get("result") or {}).get("list") or []
     if not acc:
-        log.info("BYBIT_RESYNC balance: <empty>")
+        log.debug("BYBIT_RESYNC balance: <empty>")
         return
     acc0 = acc[0]
-    log.info("BYBIT_RESYNC balance: totalEquity=%s totalWallet=%s perpUPL=%s",
+    log.debug("BYBIT_RESYNC balance: totalEquity=%s totalWallet=%s perpUPL=%s",
              acc0.get("totalEquity"), acc0.get("totalWalletBalance"), acc0.get("totalPerpUPL"))
     coins = acc0.get("coin") or []
     head = coins[0] if coins else {}
-    log.info("BYBIT_RESYNC coins: items=%d head=%s", len(coins), head)
+    log.debug("BYBIT_RESYNC coins: items=%d head=%s", len(coins), head)
 
 def _log_positions_summary(pos: dict):
     lst = (pos.get("result") or {}).get("list") or []
     head = lst[0] if lst else {}
-    log.info("BYBIT_RESYNC positions: items=%d head=%s", len(lst), head)
+    log.debug("BYBIT_RESYNC positions: items=%d head=%s", len(lst), head)
 
 
 # 🔸 Утилиты
