@@ -138,7 +138,11 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
 
     target_qty = _round_qty(left, precision_qty)
     if min_qty is not None and target_qty < min_qty:
+        log.info("[MAINT] skip SL@entry: qty_left(%s) < min_qty(%s) uid=%s", _fmt(target_qty), _fmt(min_qty), position_uid)
         return
+
+    log.info("[MAINT] TP1 detected → activate SL@entry: uid=%s symbol=%s left=%s → target_qty=%s",
+             position_uid, symbol, _fmt(left), _fmt(target_qty))
 
     # отменяем текущие активные SL (если есть)
     for sl in active_sls:
@@ -148,7 +152,7 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         await _intent_mark_cancel(link)
         await _cancel_order_by_link(symbol, link)
 
-    # определяем триггер и короткий linkId для шаблона
+    # триггер и linkId
     trig = _as_decimal(sl_after["trigger_price"])
     if trig is None:
         entry_avg = await _fetch_entry_avg_fill_price(position_uid)
@@ -160,6 +164,9 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
     # берём link из шаблона, при необходимости укорачиваем и обновляем TPO
     old_link = _as_str(sl_after["order_link_id"]) or f"{position_uid}-sl-after-tp-1"
     short_link = await _ensure_short_tpo_link(position_uid, old_link, short_suffix="sla1")
+
+    log.info("[MAINT] submit SL-after-TP1: link=%s trigger=%s qty=%s",
+             short_link, _fmt(_round_price(trig, ticksize)), _fmt(target_qty))
 
     # submit SL-after-TP1
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
@@ -173,6 +180,7 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         )
         await _mark_order_after_submit(order_link_id=short_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
     else:
+        # DRY_RUN — только статусы в БД
         await infra.pg_pool.execute(
             "UPDATE public.trader_position_orders SET ext_status='submitted', last_ext_event_at=$2 WHERE order_link_id=$1",
             short_link, datetime.utcnow()
@@ -183,7 +191,6 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         "UPDATE public.trader_position_orders SET qty=$2, trigger_price=COALESCE(trigger_price,$3) WHERE order_link_id=$1",
         short_link, target_qty, trig
     )
-
 
 # 🔸 Финализация позиции: отмена остаточных TP/SL, закрытие в портфеле/БД
 async def _finalize_position(position_uid: str, symbol: str, reason: str) -> None:
@@ -376,16 +383,29 @@ async def _submit_close_market(symbol: str, side: str, qty: Decimal, link_id: st
     return (rc == 0), oid, rc, rm
 
 async def _cancel_order_by_link(symbol: str, link_id: str) -> None:
+    now = datetime.utcnow()
     if TRADER_ORDER_MODE != "on" or not API_KEY or not API_SECRET:
+        # DRY_RUN — просто пометим canceled
         await infra.pg_pool.execute(
             "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
-            link_id, datetime.utcnow()
+            link_id, now
         )
         log.info("[DRY_RUN MAINT] cancel: %s", link_id)
         return
+
     resp = await _bybit_post("/v5/order/cancel", {"category": CATEGORY, "symbol": symbol, "orderLinkId": link_id})
     rc, rm = resp.get("retCode"), resp.get("retMsg")
-    log.info("cancel %s → rc=%s msg=%s", link_id, rc, rm)
+
+    # rc==0 → отменён; rc==110001 (too late / not exists) → считаем финально отменённым
+    if rc == 0 or rc == 110001:
+        await infra.pg_pool.execute(
+            "UPDATE public.trader_position_orders SET ext_status='canceled', last_ext_event_at=$2 WHERE order_link_id=$1",
+            link_id, now
+        )
+        log.info("cancel %s → rc=%s msg=%s (marked canceled)", link_id, rc, rm)
+    else:
+        # иные коды — логируем, статус не трогаем (пересканируем на следующем цикле)
+        log.warning("cancel %s → rc=%s msg=%s (no state change)", link_id, rc, rm)
 
 async def _mark_order_after_submit(*, order_link_id: str, ok: bool, order_id: Optional[str], retcode: Optional[int], retmsg: Optional[str]) -> None:
     now = datetime.utcnow()
