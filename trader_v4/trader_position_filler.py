@@ -160,7 +160,7 @@ async def _handle_open_event(record_id: str, data: Dict[str, Any]) -> None:
 def _build_thick_order_payload(*, position_uid: str, strategy_id: int, symbol: str, direction: str, created_at: datetime) -> Dict[str, str]:
     # политика стратегии (сл/тп) из кэша
     policy = config.strategy_policy.get(strategy_id) or {}
-    policy_json = json.dumps(policy, ensure_ascii=False)
+    policy_json = json.dumps(policy, ensure_ascii=False, default=_json_default)
 
     # метаданные стратегии (leverage и mirrow уже использовали)
     meta = config.strategy_meta.get(strategy_id) or {}
@@ -248,6 +248,13 @@ def _to_iso(v: Any) -> str:
         return (v.isoformat() + "Z") if hasattr(v, "isoformat") else (str(v) if v is not None else "")
     except Exception:
         return str(v) if v is not None else ""
+
+def _json_default(obj):
+    # сериализация Decimal и прочих нетривиальных типов в JSON
+    if isinstance(obj, Decimal):
+        return str(obj)
+    # потенциально можно добавить set → list и т.п., если встретится
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 def _get_leverage_from_config(strategy_id: int) -> Optional[Decimal]:
     meta = config.strategy_meta.get(strategy_id) or {}
