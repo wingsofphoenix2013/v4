@@ -6,6 +6,7 @@ import logging
 import json
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, Optional
+from datetime import datetime
 
 from trader_infra import infra
 from trader_config import config
@@ -76,7 +77,6 @@ async def run_trader_position_filler_loop():
                 for record_id, data in records:
                     tasks.append(asyncio.create_task(_spawn_task(record_id, data)))
 
-            # не дожидаемся всех — но периодически чистим завершившиеся
             # условия достаточности: дождёмся текущей пачки
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -93,7 +93,11 @@ async def _handle_open_event(record_id: str, data: Dict[str, Any]) -> None:
     strategy_id = _as_int(data.get("strategy_id"))
     symbol = _as_str(data.get("symbol"))
     direction = (_as_str(data.get("direction")) or "").lower()
-    created_at = data.get("created_at")
+
+    # created_at может прийти строкой → парсим в datetime (UTC naive)
+    created_at_raw = data.get("created_at")
+    created_at = _parse_dt(_as_str(created_at_raw)) or datetime.utcnow()
+
     notional_value = _as_decimal(data.get("notional_value")) or Decimal("0")
 
     if not position_uid or not strategy_id or not symbol:
@@ -153,7 +157,7 @@ async def _handle_open_event(record_id: str, data: Dict[str, Any]) -> None:
 
 
 # 🔸 Построение «толстой» заявки для bybit_processor
-def _build_thick_order_payload(*, position_uid: str, strategy_id: int, symbol: str, direction: str, created_at) -> Dict[str, str]:
+def _build_thick_order_payload(*, position_uid: str, strategy_id: int, symbol: str, direction: str, created_at: datetime) -> Dict[str, str]:
     # политика стратегии (сл/тп) из кэша
     policy = config.strategy_policy.get(strategy_id) or {}
     policy_json = json.dumps(policy, ensure_ascii=False)
@@ -218,8 +222,17 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
     except Exception:
         return None
 
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    # условия достаточности: ISO8601 'YYYY-mm-ddTHH:MM:SS[.ffffff][Z]'
+    try:
+        if not s:
+            return None
+        return datetime.fromisoformat(s.replace("Z", ""))
+    except Exception:
+        return None
+
 def _dec_to_str(v: Any) -> str:
-    # условия достаточности: привести Decimal/число к «красивой» строке
+    # привести Decimal/число к «красивой» строке
     try:
         d = _as_decimal(v)
         if d is None:
@@ -230,7 +243,7 @@ def _dec_to_str(v: Any) -> str:
         return ""
 
 def _to_iso(v: Any) -> str:
-    # условия достаточности: если объект с isoformat — использовать, иначе str
+    # если объект с isoformat — использовать, иначе str
     try:
         return (v.isoformat() + "Z") if hasattr(v, "isoformat") else (str(v) if v is not None else "")
     except Exception:
@@ -282,7 +295,7 @@ async def _insert_trader_position(
     position_uid: str,
     symbol: str,
     margin_used: Decimal,
-    created_at
+    created_at: datetime
 ) -> None:
     # идемпотентная вставка (если запись уже есть — не дублируем)
     await infra.pg_pool.execute(
