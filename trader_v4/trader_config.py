@@ -1,11 +1,11 @@
-# trader_config.py — загрузка активных тикеров/стратегий, онлайн-апдейты (Pub/Sub) и кэш trader_winner
+# trader_config.py — загрузка активных тикеров/стратегий, онлайн-апдейты (Pub/Sub) и кэши: winners + полная политика SL/TP
 
 # 🔸 Импорты
 import asyncio
 import logging
 import json
 from decimal import Decimal
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, List, Any
 
 from trader_infra import infra
 
@@ -29,13 +29,16 @@ def _normalize_strategy_flags(strategy: dict) -> None:
         "market_watcher",
         "deathrow",
         "blacklist_watcher",
+        "trader_watcher",
+        "trader_winner",
+        "trader_bybit",
+        "archived",
     ):
         if key in strategy:
             val = strategy[key]
-            # приводим к bool, поддерживая как реальные bool, так и строковые значения
             strategy[key] = (str(val).lower() == "true") if not isinstance(val, bool) else val
 
-# 🔸 Состояние конфигурации трейдера (+ in-memory кэш победителей)
+# 🔸 Состояние конфигурации трейдера (+ in-memory кэши winners и политики SL/TP)
 class TraderConfigState:
     def __init__(self):
         self.tickers: Dict[str, dict] = {}
@@ -49,6 +52,18 @@ class TraderConfigState:
         # {sid: {"deposit": Decimal|None, "leverage": Decimal|None,
         #        "market_mirrow": int|None, "market_mirrow_long": int|None, "market_mirrow_short": int|None}}
 
+        # полная политика SL/TP по стратегиям (все активные, не только winners)
+        self.strategy_policy: Dict[int, dict] = {}
+        # форма:
+        # { sid: {
+        #     "sl": {"type": "percent"|"atr"|None, "value": Decimal|None},
+        #     "tp_levels": [
+        #         {"id": int, "level": int, "tp_type": "percent"|"atr"|"signal", "tp_value": Decimal|None, "volume_percent": Decimal}
+        #     ],
+        #     "tp_sl_by_level": { level: {"sl_mode": "none"|"entry"|"atr"|"percent", "sl_value": Decimal|None} }
+        #   }
+        # }
+
         self._lock = asyncio.Lock()
 
     # 🔸 Полная перезагрузка
@@ -57,14 +72,16 @@ class TraderConfigState:
             await self._load_tickers()
             await self._load_strategies()
             await self._load_strategy_tickers()
+            await self._load_all_policies()
             await self._refresh_trader_winners_state_locked()
             # итоговый лог по результату загрузки
             log.debug(
-                "✅ Конфигурация перезагружена: тикеров=%d, стратегий=%d, winners=%d (min_dep=%s)",
+                "✅ Конфигурация перезагружена: тикеров=%d, стратегий=%d, winners=%d (min_dep=%s), policies=%d",
                 len(self.tickers),
                 len(self.strategies),
                 len(self.trader_winners),
                 self.trader_winners_min_deposit,
+                len(self.strategy_policy),
             )
 
     # 🔸 Точечная перезагрузка одного тикера
@@ -91,7 +108,7 @@ class TraderConfigState:
             self.tickers.pop(symbol, None)
             log.debug("🗑️ Тикер удалён: %s", symbol)
 
-    # 🔸 Точечная перезагрузка стратегии
+    # 🔸 Точечная перезагрузка стратегии (включая политику SL/TP и связи тикеров)
     async def reload_strategy(self, strategy_id: int):
         async with self._lock:
             row = await infra.pg_pool.fetchrow(
@@ -104,11 +121,12 @@ class TraderConfigState:
             )
 
             if not row:
+                # стратегия не активна → полное удаление из in-memory
                 self.strategies.pop(strategy_id, None)
                 self.strategy_tickers.pop(strategy_id, None)
-                # при удалении стратегии она точно не может быть winner
                 self.trader_winners.discard(strategy_id)
                 self.strategy_meta.pop(strategy_id, None)
+                self.strategy_policy.pop(strategy_id, None)
                 await self._recalc_min_deposit_locked()
                 log.debug("🗑️ Стратегия удалена: id=%d", strategy_id)
                 return
@@ -132,14 +150,18 @@ class TraderConfigState:
             )
             self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers_rows}
 
-            # обновим кэш победителей инкрементально (на основе свежей строки)
+            # обновим winners-мета инкрементально
             await self._touch_winner_membership_locked(strategy)
 
+            # перезагрузим политику SL/TP для одной стратегии
+            await self._load_strategy_policy_locked(strategy_id)
+
             log.debug(
-                "🔄 Стратегия обновлена: id=%d (tickers=%d, is_winner=%s)",
+                "🔄 Стратегия обновлена: id=%d (tickers=%d, is_winner=%s, policy_tp=%d)",
                 strategy_id,
                 len(self.strategy_tickers[strategy_id]),
                 "true" if strategy.get("trader_winner") else "false",
+                len(self.strategy_policy.get(strategy_id, {}).get("tp_levels", [])),
             )
 
     # 🔸 Удаление стратегии из состояния
@@ -149,6 +171,7 @@ class TraderConfigState:
             self.strategy_tickers.pop(strategy_id, None)
             self.trader_winners.discard(strategy_id)
             self.strategy_meta.pop(strategy_id, None)
+            self.strategy_policy.pop(strategy_id, None)
             await self._recalc_min_deposit_locked()
             log.debug("🗑️ Стратегия удалена: id=%d", strategy_id)
 
@@ -207,7 +230,7 @@ class TraderConfigState:
         async with self._lock:
             await self._refresh_trader_winners_state_locked()
 
-    # Кэш победителей: батч-чтение из БД и обновление in-memory полей
+    # 🔸 Кэш победителей: батч-чтение из БД и обновление in-memory полей
     async def _refresh_trader_winners_state_locked(self):
         rows = await infra.pg_pool.fetch(
             """
@@ -249,7 +272,7 @@ class TraderConfigState:
             self.trader_winners_min_deposit,
         )
 
-    # Инкрементальная корректировка кэша winners по одной стратегии
+    # 🔸 Инкрементальная корректировка кэша winners по одной стратегии
     async def _touch_winner_membership_locked(self, strategy_row: dict):
         sid = int(strategy_row["id"])
         is_winner = bool(strategy_row.get("trader_winner"))
@@ -269,7 +292,7 @@ class TraderConfigState:
 
         await self._recalc_min_deposit_locked()
 
-    # Пересчёт min(deposit) среди текущих winners (по in-memory meta)
+    # 🔸 Пересчёт min(deposit) среди текущих winners (по in-memory meta)
     async def _recalc_min_deposit_locked(self):
         min_dep: Optional[Decimal] = None
         for sid in self.trader_winners:
@@ -278,6 +301,142 @@ class TraderConfigState:
                 min_dep = dep
         self.trader_winners_min_deposit = min_dep
 
+    # 🔸 Батч-загрузка полной политики SL/TP для всех активных стратегий
+    async def _load_all_policies(self):
+        policies: Dict[int, dict] = {}
+
+        # база SL берём из самой строки стратегии (sl_type/sl_value)
+        for sid, s in self.strategies.items():
+            policies[sid] = {
+                "sl": {
+                    "type": s.get("sl_type"),
+                    "value": _as_decimal(s.get("sl_value")),
+                },
+                "tp_levels": [],            # заполним ниже
+                "tp_sl_by_level": {},       # заполним ниже
+            }
+
+        if not self.strategies:
+            self.strategy_policy = policies
+            log.debug("📥 Политики SL/TP: стратегий нет")
+            return
+
+        sids = list(self.strategies.keys())
+
+        # загрузим уровни TP пачкой
+        tp_rows = await infra.pg_pool.fetch(
+            """
+            SELECT id, strategy_id, "level", tp_type, tp_value, volume_percent
+            FROM strategy_tp_levels_v4
+            WHERE strategy_id = ANY($1::int[])
+            """,
+            sids
+        )
+
+        # вспомогательное: map (strategy_id, tp_level_id) → level
+        level_by_id: Dict[int, Dict[int, int]] = {}
+        for r in tp_rows:
+            sid = int(r["strategy_id"])
+            lvl = int(r["level"])
+            if sid not in policies:
+                continue
+            item = {
+                "id": int(r["id"]),
+                "level": lvl,
+                "tp_type": r["tp_type"],
+                "tp_value": _as_decimal(r["tp_value"]),
+                "volume_percent": _as_decimal(r["volume_percent"]),
+            }
+            policies[sid]["tp_levels"].append(item)
+            level_by_id.setdefault(sid, {})[int(r["id"])] = lvl
+
+        # загрузим правила SL после TP пачкой
+        sl_after_rows = await infra.pg_pool.fetch(
+            """
+            SELECT strategy_id, tp_level_id, sl_mode, sl_value
+            FROM strategy_tp_sl_v4
+            WHERE strategy_id = ANY($1::int[])
+            """,
+            sids
+        )
+        for r in sl_after_rows:
+            sid = int(r["strategy_id"])
+            if sid not in policies:
+                continue
+            lvl_map = level_by_id.get(sid, {})
+            lvl = lvl_map.get(int(r["tp_level_id"]))
+            if lvl is None:
+                # нет соответствующего уровня (данные вне согласованности) — пропустим
+                continue
+            policies[sid]["tp_sl_by_level"][lvl] = {
+                "sl_mode": r["sl_mode"],
+                "sl_value": _as_decimal(r["sl_value"]),
+            }
+
+        # отсортируем tp_levels внутри каждой стратегии по level
+        for sid, pol in policies.items():
+            pol["tp_levels"].sort(key=lambda x: x["level"])
+
+        self.strategy_policy = policies
+        log.debug("📥 Политики SL/TP загружены: стратегий=%d, всего уровней=%d",
+                  len(self.strategy_policy),
+                  sum(len(p["tp_levels"]) for p in self.strategy_policy.values()))
+
+    # 🔸 Точечная загрузка политики SL/TP для одной стратегии (под замком)
+    async def _load_strategy_policy_locked(self, strategy_id: int):
+        s = self.strategies.get(strategy_id)
+        if not s:
+            self.strategy_policy.pop(strategy_id, None)
+            return
+
+        policy = {
+            "sl": {"type": s.get("sl_type"), "value": _as_decimal(s.get("sl_value"))},
+            "tp_levels": [],
+            "tp_sl_by_level": {},
+        }
+
+        # уровни TP
+        tp_rows = await infra.pg_pool.fetch(
+            """
+            SELECT id, "level", tp_type, tp_value, volume_percent
+            FROM strategy_tp_levels_v4
+            WHERE strategy_id = $1
+            ORDER BY "level"
+            """,
+            strategy_id
+        )
+        level_by_id: Dict[int, int] = {}
+        for r in tp_rows:
+            rid = int(r["id"])
+            lvl = int(r["level"])
+            policy["tp_levels"].append({
+                "id": rid,
+                "level": lvl,
+                "tp_type": r["tp_type"],
+                "tp_value": _as_decimal(r["tp_value"]),
+                "volume_percent": _as_decimal(r["volume_percent"]),
+            })
+            level_by_id[rid] = lvl
+
+        # SL после TP
+        sl_after = await infra.pg_pool.fetch(
+            """
+            SELECT tp_level_id, sl_mode, sl_value
+            FROM strategy_tp_sl_v4
+            WHERE strategy_id = $1
+            """,
+            strategy_id
+        )
+        for r in sl_after:
+            lvl = level_by_id.get(int(r["tp_level_id"]))
+            if lvl is None:
+                continue
+            policy["tp_sl_by_level"][lvl] = {
+                "sl_mode": r["sl_mode"],
+                "sl_value": _as_decimal(r["sl_value"]),
+            }
+
+        self.strategy_policy[strategy_id] = policy
 
 # 🔸 Глобальный объект конфигурации
 config = TraderConfigState()
@@ -320,7 +479,7 @@ async def config_event_listener():
                     await config.remove_ticker(symbol)
                 log.debug("♻️ Обработано событие тикера: %s (%s)", symbol, action)
 
-            # обработка событий по стратегиям
+            # обработка событий по стратегиям (включая политику)
             elif channel == STRATEGIES_EVENTS_CHANNEL:
                 sid = int(data.get("id"))
                 action = data.get("action")
@@ -336,9 +495,8 @@ async def config_event_listener():
             # логируем и продолжаем слушать дальше
             log.exception("❌ Ошибка обработки события Pub/Sub")
 
-
 # 🔸 Утилиты
-def _as_decimal(v) -> Optional[Decimal]:
+def _as_decimal(v: Any) -> Optional[Decimal]:
     try:
         if v is None:
             return None
