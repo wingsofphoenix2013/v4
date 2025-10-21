@@ -376,7 +376,12 @@ def _build_plan_from_policy(
     min_qty: Optional[Decimal],
     ticksize: Optional[Decimal],
     policy: Dict[str, Any],
-) -> Tuple[List[Tuple[int, Decimal, Decimal, str]], Optional[Tuple[int, Decimal, str]], Optional[Tuple[Decimal, Decimal, str]], List[Tuple[int, Decimal, Decimal, str]]]:
+) -> Tuple[
+    List[Tuple[int, Decimal, Decimal, str]],
+    Optional[Tuple[int, Decimal, str]],
+    Optional[Tuple[Decimal, Decimal, str]],
+    List[Tuple[int, Decimal, Decimal, str]]
+]:
     tp_levels = list(policy.get("tp_levels") or [])
     tp_levels.sort(key=lambda x: int(x.get("level", 0)))
 
@@ -384,6 +389,7 @@ def _build_plan_from_policy(
     signal_tps = [t for t in tp_levels if (t.get("tp_type") == "signal")]
     lvl_signal = int(signal_tps[0]["level"]) if signal_tps else None
 
+    # ценовые TP: формируем ПЛАН (с уже округлёнными qty/ценами)
     tp_plan: List[Tuple[int, Decimal, Decimal, str]] = []
     sum_priced_qty = Decimal("0")
 
@@ -392,17 +398,25 @@ def _build_plan_from_policy(
         vol_pct = _as_decimal(t.get("volume_percent")) or Decimal("0")
         target_qty = (filled_qty * vol_pct / Decimal("100"))
         target_qty = _round_qty(target_qty, precision_qty)
+
+        # последнему ценовому TP подправим qty, чтобы сумма не превысила filled_qty
         if i == len(priced_tps) - 1 and (sum_priced_qty + target_qty) > filled_qty:
             target_qty = filled_qty - sum_priced_qty
             target_qty = _round_qty(target_qty, precision_qty)
+
+        # порог по min_qty
         if min_qty is not None and target_qty < min_qty:
             target_qty = Decimal("0")
+
         if target_qty > 0:
-            price = _compute_tp_price_from_policy(avg_fill, direction, t.get("tp_type"), _as_decimal(t.get("tp_value")), ticksize)
+            price = _compute_tp_price_from_policy(
+                avg_fill, direction, t.get("tp_type"), _as_decimal(t.get("tp_value")), ticksize
+            )
             link_id = f"{position_uid}-tp-{lvl}"
             tp_plan.append((lvl, price, target_qty, link_id))
             sum_priced_qty += target_qty
 
+    # виртуальный TP(signal) — остаток от фактически запланированных TP
     tp_signal: Optional[Tuple[int, Decimal, str]] = None
     if lvl_signal is not None:
         qty_sig = filled_qty - sum_priced_qty
@@ -412,29 +426,46 @@ def _build_plan_from_policy(
         link_sig = f"{position_uid}-tp-{lvl_signal}-signal"
         tp_signal = (lvl_signal, qty_sig, link_sig)
 
+    # первичный SL (реальный)
     sl_base = policy.get("sl") or {}
-    sl_primary_price = _compute_sl_from_policy(avg_fill, direction, sl_base.get("type"), _as_decimal(sl_base.get("value")), ticksize)
+    sl_primary_price = _compute_sl_from_policy(
+        avg_fill, direction, sl_base.get("type"), _as_decimal(sl_base.get("value")), ticksize
+    )
     sl_primary: Optional[Tuple[Decimal, Decimal, str]] = None
     if sl_primary_price is not None:
         sl_primary = (sl_primary_price, _round_qty(filled_qty, precision_qty), f"{position_uid}-sl")
 
+    # заготовки SL-после-TP: qty считаем от фактически запланированных TP (tp_plan), а не от процентов
     sl_after: List[Tuple[int, Decimal, Decimal, str]] = []
     for t in tp_levels:
         lvl = int(t["level"])
         mode = _sl_mode(policy, lvl)
         if not mode or mode == "none":
             continue
-        qty_left = _qty_left_after_level(filled_qty, priced_tps, lvl, precision_qty)
+
+        # остаток после всех ЦЕНОВЫХ TP с уровнем <= lvl по фактическому плану
+        qty_left = _qty_left_after_level_from_plan(filled_qty, tp_plan, lvl, precision_qty)
+
+        # порог по min_qty для заготовки
         if min_qty is not None and qty_left < min_qty:
             continue
-        price = _compute_sl_after_tp(avg_fill, direction, mode, _sl_value(policy, lvl), ticksize)
+
+        price = _compute_sl_after_tp(
+            avg_fill, direction, mode, _sl_value(policy, lvl), ticksize
+        )
         link = f"{position_uid}-sl-after-tp-{lvl}"
         sl_after.append((lvl, price, qty_left, link))
 
     return tp_plan, tp_signal, sl_primary, sl_after
 
 
-def _compute_tp_price_from_policy(avg_fill: Decimal, direction: str, tp_type: Optional[str], tp_value: Optional[Decimal], ticksize: Optional[Decimal]) -> Decimal:
+def _compute_tp_price_from_policy(
+    avg_fill: Decimal,
+    direction: str,
+    tp_type: Optional[str],
+    tp_value: Optional[Decimal],
+    ticksize: Optional[Decimal],
+) -> Decimal:
     base = avg_fill
     if tp_type == "percent" and tp_value is not None:
         if direction == "long":
@@ -442,13 +473,19 @@ def _compute_tp_price_from_policy(avg_fill: Decimal, direction: str, tp_type: Op
         else:
             price = base * (Decimal("1") - tp_value / Decimal("100"))
     elif tp_type == "atr":
-        price = base
+        price = base  # заглушка для atr-цены
     else:
         price = base
     return _round_price(price, ticksize)
 
 
-def _compute_sl_from_policy(avg_fill: Decimal, direction: str, sl_type: Optional[str], sl_value: Optional[Decimal], ticksize: Optional[Decimal]) -> Optional[Decimal]:
+def _compute_sl_from_policy(
+    avg_fill: Decimal,
+    direction: str,
+    sl_type: Optional[str],
+    sl_value: Optional[Decimal],
+    ticksize: Optional[Decimal],
+) -> Optional[Decimal]:
     if sl_type is None or sl_value is None:
         return None
     base = avg_fill
@@ -458,13 +495,19 @@ def _compute_sl_from_policy(avg_fill: Decimal, direction: str, sl_type: Optional
         else:
             price = base * (Decimal("1") + sl_value / Decimal("100"))
     elif sl_type == "atr":
-        price = base
+        price = base  # заглушка для atr-цены
     else:
         return None
     return _round_price(price, ticksize)
 
 
-def _compute_sl_after_tp(avg_fill: Decimal, direction: str, sl_mode: str, sl_value: Optional[Decimal], ticksize: Optional[Decimal]) -> Decimal:
+def _compute_sl_after_tp(
+    avg_fill: Decimal,
+    direction: str,
+    sl_mode: str,
+    sl_value: Optional[Decimal],
+    ticksize: Optional[Decimal],
+) -> Decimal:
     if sl_mode == "entry" or sl_mode == "atr":
         price = avg_fill
     elif sl_mode == "percent" and sl_value is not None:
@@ -477,13 +520,17 @@ def _compute_sl_after_tp(avg_fill: Decimal, direction: str, sl_mode: str, sl_val
     return _round_price(price, ticksize)
 
 
-def _qty_left_after_level(filled_qty: Decimal, priced_tps: List[Dict[str, Any]], level: int, precision_qty: Optional[int]) -> Decimal:
+# условия достаточности: остаток после TP<=level по ФАКТИЧЕСКОМУ плану (учитывая квантование qty)
+def _qty_left_after_level_from_plan(
+    filled_qty: Decimal,
+    tp_plan: List[Tuple[int, Decimal, Decimal, str]],
+    level: int,
+    precision_qty: Optional[int],
+) -> Decimal:
     used = Decimal("0")
-    for t in priced_tps:
-        lvl = int(t["level"])
-        if lvl <= level:
-            vol_pct = _as_decimal(t.get("volume_percent")) or Decimal("0")
-            used += (filled_qty * vol_pct / Decimal("100"))
+    for lvl, _price, qty, _link in tp_plan:
+        if int(lvl) <= int(level):
+            used += qty
     left = filled_qty - used
     return _round_qty(left if left > 0 else Decimal("0"), precision_qty)
 
@@ -519,7 +566,6 @@ def _sl_value(policy: Dict[str, Any], level: int) -> Optional[Decimal]:
     by_level = policy.get("tp_sl_by_level") or {}
     v = by_level.get(level)
     return _as_decimal(v.get("sl_value")) if isinstance(v, dict) else None
-
 
 # 🔸 Ожидание fill entry или суррогат для DRY_RUN
 async def _wait_entry_fill_or_fallback(position_uid: str, entry_link_id: str, symbol: str, entry_price_mark: Optional[Decimal], qty_raw: Decimal, precision_qty: Optional[int]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
