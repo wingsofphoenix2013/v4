@@ -1,4 +1,4 @@
-# bybit_maintainer.py — сопровождение позиции на бирже «exchange-first»: TP1→активация SL@entry, финализация при SL/size=0/manual; идемпотентные действия
+# bybit_maintainer.py — сопровождение позиции на бирже «exchange-first»: TP1→SL@entry, финализация при SL/size=0/manual; идемпотентные действия
 
 # 🔸 Импорты
 import os
@@ -73,6 +73,7 @@ async def _scan_and_maintain_positions():
             continue
 
         try:
+            # 1) если SL filled или LEFT=0 → финализировать (биржа→система)
             sl_filled = await _has_sl_filled(uid)
             left_qty = await _calc_left_qty(uid)
             if sl_filled or (left_qty is not None and left_qty <= Decimal("0")):
@@ -80,10 +81,12 @@ async def _scan_and_maintain_positions():
                 await _finalize_position(uid, symbol, reason)
                 continue
 
+            # 2) TP1 partial/full → активировать/корректировать SL@entry
             tp1_filled = await _tp1_filled_qty(uid)
             if tp1_filled and tp1_filled > Decimal("0"):
                 await _activate_or_adjust_sl_after_tp1(uid, symbol)
 
+            # 3) manual признаки: отменён наш TP/SL без нашей intent-метки → финализировать
             manual = await _detect_manual_cancel(uid, since=recent_since)
             if manual:
                 await _finalize_position(uid, symbol, "manual-exchange")
@@ -97,6 +100,7 @@ async def _scan_and_maintain_positions():
 
 # 🔸 Активация/корректировка SL после TP1 (перенос на entry остатка)
 async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> None:
+    # активные реальные SL
     active_sls = await infra.pg_pool.fetch(
         """
         SELECT id, order_link_id, trigger_price, qty, ext_status
@@ -108,6 +112,7 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         """,
         position_uid
     )
+    # шаблон SL-after-TP1
     sl_after = await infra.pg_pool.fetchrow(
         """
         SELECT id, order_link_id, trigger_price, qty, ext_status
@@ -135,6 +140,7 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
     if min_qty is not None and target_qty < min_qty:
         return
 
+    # отменяем текущие активные SL (если есть)
     for sl in active_sls:
         link = _as_str(sl["order_link_id"])
         if not link:
@@ -142,6 +148,7 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
         await _intent_mark_cancel(link)
         await _cancel_order_by_link(symbol, link)
 
+    # определяем триггер и короткий linkId для шаблона
     trig = _as_decimal(sl_after["trigger_price"])
     if trig is None:
         entry_avg = await _fetch_entry_avg_fill_price(position_uid)
@@ -149,27 +156,32 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
 
     direction = await _get_direction(position_uid)
     trig_dir = _calc_trigger_direction(direction)
-    new_link = _as_str(sl_after["order_link_id"]) or f"{position_uid}-sl-after-tp-1"
 
+    # берём link из шаблона, при необходимости укорачиваем и обновляем TPO
+    old_link = _as_str(sl_after["order_link_id"]) or f"{position_uid}-sl-after-tp-1"
+    short_link = await _ensure_short_tpo_link(position_uid, old_link, short_suffix="sla1")
+
+    # submit SL-after-TP1
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         ok, oid, rc, rm = await _submit_sl(
             symbol=symbol,
             side=_to_title_side("SELL" if (direction or "").lower() == "long" else "BUY"),
             trigger_price=_round_price(trig, ticksize),
             qty=target_qty,
-            link_id=new_link,
+            link_id=short_link,
             trigger_direction=trig_dir,
         )
-        await _mark_order_after_submit(order_link_id=new_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
+        await _mark_order_after_submit(order_link_id=short_link, ok=ok, order_id=oid, retcode=rc, retmsg=rm)
     else:
         await infra.pg_pool.execute(
             "UPDATE public.trader_position_orders SET ext_status='submitted', last_ext_event_at=$2 WHERE order_link_id=$1",
-            new_link, datetime.utcnow()
+            short_link, datetime.utcnow()
         )
 
+    # синхронизируем qty/trigger в TPO (на случай коррекции)
     await infra.pg_pool.execute(
         "UPDATE public.trader_position_orders SET qty=$2, trigger_price=COALESCE(trigger_price,$3) WHERE order_link_id=$1",
-        new_link, target_qty, trig
+        short_link, target_qty, trig
     )
 
 
@@ -177,6 +189,7 @@ async def _activate_or_adjust_sl_after_tp1(position_uid: str, symbol: str) -> No
 async def _finalize_position(position_uid: str, symbol: str, reason: str) -> None:
     now = datetime.utcnow()
 
+    # отмена всех нефинальных TP/SL
     open_orders = await infra.pg_pool.fetch(
         """
         SELECT order_link_id, kind, "type", ext_status
@@ -207,11 +220,13 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
                 link, now
             )
 
+    # если остался нетто-остаток — закрываем market RO
     left = await _calc_left_qty(position_uid)
     if left is not None and left > Decimal("0"):
         direction = await _get_direction(position_uid)
         side_title = _to_title_side("SELL" if (direction or "").lower() == "long" else "BUY")
-        close_link = f"{position_uid}-close-final"
+        # короткий linkId для close
+        close_link = _make_short_link(position_uid, "cls")
         if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
             ok_c, oid_c, rc_c, rm_c = await _submit_close_market(symbol, side_title, _round_qty(left, await _precision_qty(symbol)), close_link)
             await _mark_order_after_submit(order_link_id=close_link, ok=ok_c, order_id=oid_c, retcode=rc_c, retmsg=rm_c)
@@ -221,6 +236,7 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
                 position_uid, symbol, _round_qty(left, await _precision_qty(symbol)), close_link, now
             )
 
+    # закрываем запись в портфеле
     await _set_position_closed(position_uid, reason, now)
 
 
@@ -314,7 +330,7 @@ async def _load_ticker_precisions(symbol: str) -> Dict[str, Optional[Decimal]]:
     }
 
 
-# 🔸 REST сабмиты/отмена
+# 🔸 Сабмиты/отмена и статусы
 async def _submit_sl(*, symbol: str, side: str, trigger_price: Decimal, qty: Decimal, link_id: str, trigger_direction: int) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
     body = {
         "category": CATEGORY,
@@ -371,6 +387,22 @@ async def _cancel_order_by_link(symbol: str, link_id: str) -> None:
     rc, rm = resp.get("retCode"), resp.get("retMsg")
     log.info("cancel %s → rc=%s msg=%s", link_id, rc, rm)
 
+async def _mark_order_after_submit(*, order_link_id: str, ok: bool, order_id: Optional[str], retcode: Optional[int], retmsg: Optional[str]) -> None:
+    now = datetime.utcnow()
+    status = "submitted" if ok else "rejected"
+    await infra.pg_pool.execute(
+        """
+        UPDATE public.trader_position_orders
+        SET
+            order_id = COALESCE($2, order_id),
+            ext_status = $3,
+            last_ext_event_at = $4,
+            error_last = CASE WHEN $1 THEN NULL ELSE $5 END
+        WHERE order_link_id = $6
+        """,
+        ok, order_id, status, now, (f"retCode={retcode} retMsg={retmsg}" if not ok else None), order_link_id
+    )
+
 def _rest_sign(ts_ms: int, query_or_body: str) -> str:
     import hmac, hashlib
     payload = f"{ts_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
@@ -416,7 +448,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# 🔸 Локи и intent-маркеры
+# 🔸 Локи, intent-маркеры и linkId helpers
 async def _with_lock(position_uid: str) -> bool:
     key = f"bybit:maint:v2:lock:{position_uid}"
     try:
@@ -447,6 +479,25 @@ async def _intent_check(order_link_id: str) -> bool:
     except Exception:
         return False
 
+def _make_short_link(position_uid: str, suffix: str, maxlen: int = 45) -> str:
+    base = f"{position_uid}-{suffix}"
+    if len(base) <= maxlen:
+        return base
+    keep = maxlen - (len(suffix) + 1)
+    return f"{position_uid[:keep]}-{suffix}"
+
+async def _ensure_short_tpo_link(position_uid: str, current_link: str, short_suffix: str) -> str:
+    if len(current_link) <= 45:
+        return current_link
+    new_link = _make_short_link(position_uid, short_suffix, 45)
+    # переименуем order_link_id в TPO, чтобы WS-события были маппабельны
+    await infra.pg_pool.execute(
+        "UPDATE public.trader_position_orders SET order_link_id=$3 WHERE position_uid=$1 AND order_link_id=$2",
+        position_uid, current_link, new_link
+    )
+    log.info("TPO link renamed (too long): %s → %s (uid=%s)", current_link, new_link, position_uid)
+    return new_link
+
 
 # 🔸 Обновление статуса позиции с фолбэком, если нет колонки close_reason
 async def _set_position_closed(position_uid: str, reason: str, ts: datetime) -> None:
@@ -456,7 +507,6 @@ async def _set_position_closed(position_uid: str, reason: str, ts: datetime) -> 
             position_uid, ts, reason
         )
     except Exception as e:
-        # если колонка отсутствует — fallback без close_reason
         if "close_reason" in str(e):
             await infra.pg_pool.execute(
                 "UPDATE public.trader_positions SET status='closed', closed_at=COALESCE(closed_at,$2) WHERE position_uid=$1",
