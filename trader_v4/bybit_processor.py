@@ -171,14 +171,38 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
 
     # entry (on) / dry_run
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
-        ok_e, oid_e, rc_e, rm_e = await _submit_entry(symbol=symbol, side=side_title, qty=_round_qty(qty_raw, precision_qty), link_id=entry_link_id)
-        await _mark_order_after_submit(order_link_id=entry_link_id, ok=ok_e, order_id=oid_e, retcode=rc_e, retmsg=rm_e)
-        await _mirror_entry_to_trader_positions(position_uid=position_uid, order_link_id=entry_link_id, order_id=oid_e, ext_status=("submitted" if ok_e else "rejected"))
+        # preflight: выставляем плечо на бирже (fail-open)
+        await _preflight_set_leverage(symbol, lev)
+
+        ok_e, oid_e, rc_e, rm_e = await _submit_entry(
+            symbol=symbol,
+            side=side_title,
+            qty=_round_qty(qty_raw, precision_qty),
+            link_id=entry_link_id,
+        )
+        await _mark_order_after_submit(
+            order_link_id=entry_link_id,
+            ok=ok_e,
+            order_id=oid_e,
+            retcode=rc_e,
+            retmsg=rm_e,
+        )
+        await _mirror_entry_to_trader_positions(
+            position_uid=position_uid,
+            order_link_id=entry_link_id,
+            order_id=oid_e,
+            ext_status=("submitted" if ok_e else "rejected"),
+        )
         if not ok_e:
             log.info("⚠️ Entry отвергнут (uid=%s) → прекращаем обработку", position_uid)
             return
     else:
-        log.info("[DRY_RUN] entry planned: uid=%s %s qty=%s", position_uid, symbol, _fmt(_round_qty(qty_raw, precision_qty)))
+        log.info(
+            "[DRY_RUN] entry planned: uid=%s %s qty=%s",
+            position_uid,
+            symbol,
+            _fmt(_round_qty(qty_raw, precision_qty)),
+        )
 
     # ждём фактический fill / суррогат
     avg_fill_price, filled_qty = await _wait_entry_fill_or_fallback(position_uid, entry_link_id, symbol, entry_price_mark, qty_raw, precision_qty)
@@ -841,6 +865,27 @@ def _now_ms() -> int:
     import time
     return int(time.time() * 1000)
 
+# 🔸 Preflight: установка плеча на бирже перед entry (ON-режим)
+async def _preflight_set_leverage(symbol: str, lev: Optional[Decimal]) -> None:
+    if TRADER_ORDER_MODE != "on" or not API_KEY or not API_SECRET:
+        return
+    try:
+        if lev is None:
+            return
+        lev_int = int(lev) if not isinstance(lev, int) else lev
+        if lev_int <= 0:
+            return
+        body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "buyLeverage": str(lev_int),
+            "sellLeverage": str(lev_int),
+        }
+        resp = await _bybit_post("/v5/position/set-leverage", body)
+        rc, rm = resp.get("retCode"), resp.get("retMsg")
+        log.info("[PREFLIGHT] set-leverage %s=%s → rc=%s msg=%s", symbol, lev_int, rc, rm)
+    except Exception:
+        log.exception("[PREFLIGHT] set-leverage failed for %s", symbol)
 
 # 🔸 Утилиты форматирования/арифметики/направлений
 def _as_str(v: Any) -> str:
