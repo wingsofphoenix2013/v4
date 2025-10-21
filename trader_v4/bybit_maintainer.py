@@ -392,6 +392,28 @@ async def _finalize_position(position_uid: str, symbol: str, reason: str) -> Non
 
     await _set_position_closed(position_uid, reason, now)
 
+# 🔸 Детект manual: отмена наших TP/SL без локального намерения
+async def _detect_manual_cancel(position_uid: str, since: datetime) -> bool:
+    rows = await infra.pg_pool.fetch(
+        """
+        SELECT order_link_id
+        FROM public.trader_position_orders
+        WHERE position_uid=$1
+          AND kind IN ('tp','sl')
+          AND "type" IS NOT NULL
+          AND ext_status='canceled'
+          AND last_ext_event_at >= $2
+        """,
+        position_uid, since
+    )
+    if not rows:
+        return False
+    for r in rows:
+        link = _as_str(r["order_link_id"])
+        # если не было нашей intent-метки отмены → трактуем как manual
+        if not await _intent_check(link):
+            return True
+    return False
 
 # 🔸 Политика и базовые расчёты
 def _get_tp1_volume_percent(strategy_id: Optional[int]) -> Decimal:
