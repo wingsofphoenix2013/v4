@@ -745,6 +745,30 @@ async def _next_tp1_add_link(position_uid: str) -> str:
     link = base if max_v == 0 else f"{base}-v{max_v+1}"
     return _make_short_link(position_uid, link.split(position_uid+"-")[1])
 
+# 🔸 Хелперы работы с ордерами и расчёты (добавь, если отсутствуют)
+
+async def _tp1_filled_qty(position_uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT COALESCE(filled_qty,0) AS fq
+        FROM public.trader_position_orders
+        WHERE position_uid=$1 AND kind='tp' AND "level"=1
+        ORDER BY id DESC LIMIT 1
+        """,
+        position_uid
+    )
+    return _as_decimal(row["fq"]) if row else None
+
+async def _entry_filled_qty(position_uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT COALESCE(MAX(filled_qty),0) AS fq
+        FROM public.trader_position_orders
+        WHERE position_uid=$1 AND kind='entry'
+        """,
+        position_uid
+    )
+    return _as_decimal(row["fq"]) if row else None
 
 # 🔸 Обновление статуса позиции с фолбэком, если нет колонки close_reason
 async def _set_position_closed(position_uid: str, reason: str, ts: datetime) -> None:
