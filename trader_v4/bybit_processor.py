@@ -1,4 +1,4 @@
-# bybit_processor.py — entry → ожидание fill → расчёт TP/SL от avg fill → отправка TP/SL (ценовые), виртуальные TP(signal) и шаблоны SL-после-TP → фиксация в БД
+# bybit_processor.py — entry → reverse-guard (wait old flat) → ожидание fill → расчёт TP/SL от avg fill → отправка TP/SL (ценовые), виртуальные TP(signal) и шаблоны SL-после-TP → фиксация в БД
 
 # 🔸 Импорты
 import os
@@ -63,8 +63,10 @@ def _get_size_factor() -> Decimal:
     return (pct / Decimal("100"))
 
 SIZE_FACTOR = _get_size_factor()
-log.debug("BYBIT processor v2: MODE=%s, SIZE_FACTOR=%.4f (BYBIT_SIZE_PCT=%s%%), trigger_by=%s",
-         TRADER_ORDER_MODE, float(SIZE_FACTOR), os.getenv("BYBIT_SIZE_PCT", "100"), DEFAULT_TRIGGER_BY)
+
+# 🔸 Защита реверса: ждём flat по символу (зашито в коде)
+REVERSE_WAIT_TIMEOUT_SEC = 5       # максимальное время ожидания нулевого остатка по символу
+REVERSE_WAIT_POLL_MS = 150         # период опроса в ожидании
 
 # 🔸 Сообщим о режиме
 if TRADER_ORDER_MODE == "dry_run":
@@ -72,7 +74,8 @@ if TRADER_ORDER_MODE == "dry_run":
 elif TRADER_ORDER_MODE == "off":
     log.debug("BYBIT processor v2: OFF (игнорируем заявки)")
 else:
-    log.debug("BYBIT processor v2: ON (entry→fill→TP/SL по политике)")
+    log.debug("BYBIT processor v2: ON (entry→fill→TP/SL по политике); SIZE_FACTOR=%.4f; trigger_by=%s",
+              float(SIZE_FACTOR), DEFAULT_TRIGGER_BY)
 
 # 🔸 Основной цикл воркера
 async def run_bybit_processor_loop():
@@ -163,6 +166,15 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ qty_trade < min_qty (uid=%s, qty_trade=%s, min_qty=%s) — пропуск", position_uid, _fmt(qty_trade), _fmt(min_qty))
         return
 
+    # 🔸 Reverse-guard: дождаться нулевого остатка по этому символу (старая позиция полностью закрыта)
+    ok_flat = await _wait_until_symbol_flat(symbol=symbol, exclude_uid=position_uid,
+                                            timeout_sec=REVERSE_WAIT_TIMEOUT_SEC,
+                                            poll_ms=REVERSE_WAIT_POLL_MS)
+    if not ok_flat:
+        # политика A (безопасная): не открываем новый entry
+        log.warning("[REVERSE-GUARD] timeout waiting flat for symbol=%s (uid=%s) → skip opening", symbol, position_uid)
+        return
+
     # planned entry (до сабмита) — фиксируем фактически планируемый объём (qty_trade)
     entry_link_id = f"{position_uid}-entry"
     side_title = _to_title_side("BUY" if direction == "long" else "SELL")
@@ -220,12 +232,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             log.debug("⚠️ Entry отвергнут (uid=%s) → прекращаем обработку", position_uid)
             return
     else:
-        log.debug(
-            "[DRY_RUN] entry planned: uid=%s %s qty=%s",
-            position_uid,
-            symbol,
-            _fmt(qty_trade),
-        )
+        log.debug("[DRY_RUN] entry planned: uid=%s %s qty=%s", position_uid, symbol, _fmt(qty_trade))
 
     # ждём фактический fill / суррогат (в DRY_RUN вернём qty_trade)
     avg_fill_price, filled_qty = await _wait_entry_fill_or_fallback(
@@ -438,7 +445,6 @@ def _build_plan_from_policy(
     signal_tps = [t for t in tp_levels if (t.get("tp_type") == "signal")]
     lvl_signal = int(signal_tps[0]["level"]) if signal_tps else None
 
-    # ценовые TP: формируем ПЛАН (с уже округлёнными qty/ценами)
     tp_plan: List[Tuple[int, Decimal, Decimal, str]] = []
     sum_priced_qty = Decimal("0")
 
@@ -447,25 +453,17 @@ def _build_plan_from_policy(
         vol_pct = _as_decimal(t.get("volume_percent")) or Decimal("0")
         target_qty = (filled_qty * vol_pct / Decimal("100"))
         target_qty = _round_qty(target_qty, precision_qty)
-
-        # последнему ценовому TP подправим qty, чтобы сумма не превысила filled_qty
         if i == len(priced_tps) - 1 and (sum_priced_qty + target_qty) > filled_qty:
             target_qty = filled_qty - sum_priced_qty
             target_qty = _round_qty(target_qty, precision_qty)
-
-        # порог по min_qty
         if min_qty is not None and target_qty < min_qty:
             target_qty = Decimal("0")
-
         if target_qty > 0:
-            price = _compute_tp_price_from_policy(
-                avg_fill, direction, t.get("tp_type"), _as_decimal(t.get("tp_value")), ticksize
-            )
+            price = _compute_tp_price_from_policy(avg_fill, direction, t.get("tp_type"), _as_decimal(t.get("tp_value")), ticksize)
             link_id = f"{position_uid}-tp-{lvl}"
             tp_plan.append((lvl, price, target_qty, link_id))
             sum_priced_qty += target_qty
 
-    # виртуальный TP(signal) — остаток от фактически запланированных TP
     tp_signal: Optional[Tuple[int, Decimal, str]] = None
     if lvl_signal is not None:
         qty_sig = filled_qty - sum_priced_qty
@@ -475,33 +473,22 @@ def _build_plan_from_policy(
         link_sig = f"{position_uid}-tp-{lvl_signal}-signal"
         tp_signal = (lvl_signal, qty_sig, link_sig)
 
-    # первичный SL (реальный)
     sl_base = policy.get("sl") or {}
-    sl_primary_price = _compute_sl_from_policy(
-        avg_fill, direction, sl_base.get("type"), _as_decimal(sl_base.get("value")), ticksize
-    )
+    sl_primary_price = _compute_sl_from_policy(avg_fill, direction, sl_base.get("type"), _as_decimal(sl_base.get("value")), ticksize)
     sl_primary: Optional[Tuple[Decimal, Decimal, str]] = None
     if sl_primary_price is not None:
         sl_primary = (sl_primary_price, _round_qty(filled_qty, precision_qty), f"{position_uid}-sl")
 
-    # заготовки SL-после-TP: qty считаем от фактически запланированных TP (tp_plan), а не от процентов
     sl_after: List[Tuple[int, Decimal, Decimal, str]] = []
     for t in tp_levels:
         lvl = int(t["level"])
         mode = _sl_mode(policy, lvl)
         if not mode or mode == "none":
             continue
-
-        # остаток после всех ЦЕНОВЫХ TP с уровнем <= lvl по фактическому плану
         qty_left = _qty_left_after_level_from_plan(filled_qty, tp_plan, lvl, precision_qty)
-
-        # порог по min_qty для заготовки
         if min_qty is not None and qty_left < min_qty:
             continue
-
-        price = _compute_sl_after_tp(
-            avg_fill, direction, mode, _sl_value(policy, lvl), ticksize
-        )
+        price = _compute_sl_after_tp(avg_fill, direction, mode, _sl_value(policy, lvl), ticksize)
         link = f"{position_uid}-sl-after-tp-{lvl}"
         sl_after.append((lvl, price, qty_left, link))
 
@@ -750,19 +737,19 @@ async def _mirror_entry_to_trader_positions(*, position_uid: str, order_link_id:
 async def _upsert_order(
     *,
     position_uid: str,
-    kind: str,                       # 'entry' | 'tp' | 'sl' | 'close'
+    kind: str,
     level: Optional[int],
-    exchange: str,                   # 'BYBIT'
+    exchange: str,
     symbol: str,
-    side: Optional[str],             # 'BUY' | 'SELL' | None
-    otype: Optional[str],            # 'market' | 'limit' | 'stop_market' | 'stop_limit' | None
-    tif: str,                        # 'GTC'|'IOC'|'FOK'
+    side: Optional[str],
+    otype: Optional[str],
+    tif: str,
     reduce_only: bool,
-    price: Optional[Decimal],        # для limit
-    trigger_price: Optional[Decimal],# для stop-*
-    qty: Decimal,                    # НЕ NULL
-    order_link_id: str,              # UNIQUE
-    ext_status: str,                 # 'planned'|'virtual'|...
+    price: Optional[Decimal],
+    trigger_price: Optional[Decimal],
+    qty: Decimal,
+    order_link_id: str,
+    ext_status: str,
     qty_raw: Optional[Decimal],
     price_raw: Optional[Decimal],
     calc_type: Optional[str],
@@ -819,20 +806,14 @@ async def _upsert_order(
         calc_type, calc_value, base_price, base_kind, activation_tp_level, trigger_by, supersedes_link_id
     )
 
-
 async def _try_fetch_initials_from_positions_v4(position_uid: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     row = await infra.pg_pool.fetchrow(
-        """
-        SELECT quantity, entry_price
-        FROM public.positions_v4
-        WHERE position_uid = $1
-        """,
+        "SELECT quantity, entry_price FROM public.positions_v4 WHERE position_uid = $1",
         position_uid
     )
     if not row:
         return None, None
     return _as_decimal(row["quantity"]), _as_decimal(row["entry_price"])
-
 
 async def _fetch_mark_price(symbol: str) -> Optional[Decimal]:
     try:
@@ -841,7 +822,6 @@ async def _fetch_mark_price(symbol: str) -> Optional[Decimal]:
     except Exception:
         return None
 
-# 🔸 Разбор JSON политики из payload
 def _parse_policy_json(s: Optional[str]) -> Dict[str, Any]:
     if not s:
         return {}
@@ -851,7 +831,6 @@ def _parse_policy_json(s: Optional[str]) -> Dict[str, Any]:
     except Exception:
         return {}
 
-# 🔸 REST-хелперы
 def _rest_sign(ts_ms: int, query_or_body: str) -> str:
     import hmac, hashlib
     payload = f"{ts_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
@@ -913,6 +892,49 @@ async def _preflight_set_leverage(symbol: str, lev: Optional[Decimal]) -> None:
         log.debug("[PREFLIGHT] set-leverage %s=%s → rc=%s msg=%s", symbol, lev_int, rc, rm)
     except Exception:
         log.exception("[PREFLIGHT] set-leverage failed for %s", symbol)
+
+# 🔸 Reverse-guard helpers
+async def _find_open_uid_for_symbol(symbol: str, exclude_uid: str) -> Optional[str]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT position_uid
+        FROM public.trader_positions
+        WHERE status='open' AND symbol=$1 AND position_uid <> $2
+        ORDER BY id DESC LIMIT 1
+        """,
+        symbol, exclude_uid
+    )
+    return _as_str(row["position_uid"]) if row else None
+
+async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        WITH e AS (
+          SELECT COALESCE(MAX(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='entry'
+        ),
+        t AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='tp'
+        ),
+        c AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='close'
+        )
+        SELECT e.fq - t.fq - c.fq AS left_qty FROM e,t,c
+        """,
+        uid
+    )
+    return _as_decimal(row["left_qty"]) if row else None
+
+async def _wait_until_symbol_flat(symbol: str, exclude_uid: str, timeout_sec: int, poll_ms: int) -> bool:
+    deadline = datetime.utcnow() + timedelta(seconds=timeout_sec)
+    while datetime.utcnow() < deadline:
+        other_uid = await _find_open_uid_for_symbol(symbol, exclude_uid)
+        if not other_uid:
+            return True  # нет другой открытой позиции по символу
+        left = await _calc_left_qty_for_uid(other_uid)
+        if left is None or left <= Decimal("0"):
+            return True
+        await asyncio.sleep(max(poll_ms, 50) / 1000.0)
+    return False
 
 # 🔸 Утилиты форматирования/арифметики/направлений
 def _as_str(v: Any) -> str:
