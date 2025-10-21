@@ -126,7 +126,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
 
     # политика стратегии
     policy = _parse_policy_json(_as_str(data.get("policy"))) or (config.strategy_policy.get(sid) or {})
-    _normalize_policy_inplace(policy)  # <-- ключевая правка: приводим ключи уровней к int
+    _normalize_policy_inplace(policy)  # приведение уровней к int
 
     # плечо
     lev = _as_decimal(data.get("leverage"))
@@ -283,6 +283,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             supersedes_link_id=None,
         )
     for lvl, trig, qty, link_id in plan_sls_after_tp:
+        mode = _sl_mode(policy, lvl)
         await _upsert_order(
             position_uid=position_uid,
             kind="sl",
@@ -300,8 +301,8 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             ext_status="virtual",
             qty_raw=qty,
             price_raw=None,
-            calc_type=_sl_mode(policy, lvl),
-            calc_value=_sl_value(policy, lvl),
+            calc_type=_calc_type_for_sl_mode(mode),                 # <-- here
+            calc_value=_sl_value(policy, lvl) if mode in ("percent", "atr") else None,  # <-- here
             base_price=avg_fill_price,
             base_kind="fill",
             activation_tp_level=lvl,
@@ -337,14 +338,12 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
 
 # 🔸 Нормализация политики: уровни → int (после JSON)
 def _normalize_policy_inplace(policy: Dict[str, Any]) -> None:
-    # tp_levels.level → int
     if isinstance(policy.get("tp_levels"), list):
         for t in policy["tp_levels"]:
             try:
                 t["level"] = int(t.get("level"))
             except Exception:
                 pass
-    # tp_sl_by_level keys → int
     by_level = policy.get("tp_sl_by_level")
     if isinstance(by_level, dict):
         converted: Dict[int, Any] = {}
@@ -354,6 +353,16 @@ def _normalize_policy_inplace(policy: Dict[str, Any]) -> None:
             except Exception:
                 continue
         policy["tp_sl_by_level"] = converted
+
+# 🔸 Маппер calc_type для SL-после-TP
+def _calc_type_for_sl_mode(mode: Optional[str]) -> Optional[str]:
+    if mode == "percent":
+        return "percent"
+    if mode == "atr":
+        return "atr"
+    if mode == "entry":
+        return "manual"
+    return None
 
 # 🔸 Вспомогательные вычисления плана TP/SL
 def _build_plan_from_policy(
@@ -740,7 +749,6 @@ def _parse_policy_json(s: Optional[str]) -> Dict[str, Any]:
         return {}
     try:
         obj = json.loads(s)
-        # ничего дополнительно не приводим: числа могли прийти строками (Decimal в расчётах берём через _as_decimal)
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
@@ -868,6 +876,5 @@ def _opposite(direction: Optional[str]) -> str:
     return "short" if d == "long" else "long"
 
 def _calc_trigger_direction(position_direction: str) -> int:
-    # long → SL ниже (ждём падение) → 2; short → SL выше (ждём рост) → 1
     d = (position_direction or "").lower()
     return 2 if d == "long" else 1
