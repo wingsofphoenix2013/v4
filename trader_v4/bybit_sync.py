@@ -1,7 +1,7 @@
 # bybit_sync.py — приватный WS-синк Bybit (read-only + обновление статусов ордеров): auth + wallet/position/order/execution + авто-reconnect
 # + периодический REST-ресинк баланса и позиций (linear)
 # + фильтрация шумных pong/ping логов и запись статусов в БД (trader_position_orders, агрегаты в trader_positions)
-# + публикация событий для maintainer (гармонизация TP, post-TP SL) в Redis Stream
+# + публикация событий для maintainer (гармонизация TP, post-TP SL, cleanup-after-flat) в Redis Stream
 
 # 🔸 Импорты
 import os
@@ -13,7 +13,7 @@ import asyncio
 import logging
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import websockets
 import httpx
@@ -33,8 +33,8 @@ RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")          # мс
 ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")     # UNIFIED | CONTRACT | SPOT
 CATEGORY = "linear"                                           # деривативы USDT-perp
 
-PING_INTERVAL_SEC = 20.0      # отправляем ping, если нет сообщений дольше этого интервала
-RECONNECT_DELAY_SEC = 3.0     # пауза между переподключениями
+PING_INTERVAL_SEC = 20.0
+RECONNECT_DELAY_SEC = 3.0
 
 # 🔸 Настройка шумных логов (по умолчанию пинги/понги тихо)
 LOG_PONGS = os.getenv("BYBIT_LOG_PONGS", "false").lower() == "true"
@@ -105,28 +105,20 @@ async def _handle_ws_message(msg_raw: str):
         log.debug("BYBIT_SYNC recv (raw): %s", msg_raw)
         return
 
-    # служебные op-сообщения (без topic)
+    # служебные op без topic
     if "op" in msg and "topic" not in msg:
         op = str(msg.get("op") or "").lower()
-
-        # pong — по умолчанию тихо
         if op == "pong":
             if LOG_PONGS:
                 log.debug("BYBIT_SYNC recv pong")
             return
-
-        # ping — по умолчанию тихо
         if op == "ping":
             if LOG_PINGS:
                 log.debug("BYBIT_SYNC recv ping")
             return
-
-        # auth/subscribe — остаются на INFO
         if op in ("auth", "subscribe"):
             log.debug("BYBIT_SYNC recv op: %s", msg)
             return
-
-        # прочие — debug
         log.debug("BYBIT_SYNC recv op: %s", msg)
         return
 
@@ -135,7 +127,6 @@ async def _handle_ws_message(msg_raw: str):
     data = msg.get("data")
     ts = msg.get("ts")
 
-    # нормализуем список событий
     items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
 
     if topic == "wallet":
@@ -156,11 +147,10 @@ async def _handle_ws_message(msg_raw: str):
         await _handle_execution_topic(items, ts)
         return
 
-    # прочее
     log.debug("BYBIT_SYNC recv topic=%s: %s", topic, msg)
 
 
-# 🔸 Обработка топика 'order' — статусы ордеров (accepted/partially_filled/filled/…)
+# 🔸 Обработка топика 'order' — статусы ордеров
 async def _handle_order_topic(items: list, ts: Any):
     head = items[0] if items else {}
     log.debug("BYBIT_SYNC order: items=%d head_keys=%s ts=%s", len(items), list(head.keys()) if head else [], ts)
@@ -169,25 +159,20 @@ async def _handle_order_topic(items: list, ts: Any):
         try:
             order_link_id = _as_str(it.get("orderLinkId"))
             order_id = _as_str(it.get("orderId"))
-            symbol = _as_str(it.get("symbol"))
-            side = (_as_str(it.get("side")) or "").upper() or None
-            otype = (_as_str(it.get("orderType")) or "").lower() or None
-            tif = (_as_str(it.get("timeInForce")) or "GTC").upper()
-            reduce_only = str(it.get("reduceOnly")).lower() == "true" if it.get("reduceOnly") is not None else None
-            order_status_raw = _as_str(it.get("orderStatus"))  # e.g. New/Created/PartiallyFilled/Filled/Cancelled/Rejected/Expired
+            symbol_ws = _as_str(it.get("symbol"))
+            order_status_raw = _as_str(it.get("orderStatus"))
             ext_status = _map_order_status(order_status_raw)
 
-            price_ws = _as_decimal(it.get("price"))  # заявленная цена лимита (если есть)
-            qty_ws = _as_decimal(it.get("qty"))      # размер ордера (если есть в payload)
+            price_ws = _as_decimal(it.get("price"))  # лимитная цена (если есть)
+            qty_ws = _as_decimal(it.get("qty"))      # размер ордера (если есть)
 
-            # агрегированные поля из order-события (могут быть пустыми)
+            # агрегаты (могут отсутствовать)
             cum_exec_qty = _as_decimal(it.get("cumExecQty"))
             avg_price = _as_decimal(it.get("avgPrice"))
-            exec_fee = _as_decimal(it.get("cumExecFee"))  # обычно кумулятивная комиссия
             updated_ms = _as_int(it.get("updatedTime")) or _as_int(it.get("updatedTimeNs"))
             updated_at = _ts_from_ms(updated_ms) if updated_ms else None
 
-            # найдём строку ордера в нашей таблице по order_link_id, иначе по order_id
+            # найдём нашу запись ордера
             tpo = await _find_tpo(order_link_id, order_id)
             if not tpo:
                 log.debug("BYBIT_SYNC order: неизвестный ордер (linkId=%s orderId=%s) — пропуск", order_link_id, order_id)
@@ -197,18 +182,18 @@ async def _handle_order_topic(items: list, ts: Any):
             position_uid = tpo["position_uid"]
             kind = _as_str(tpo["kind"])
 
-            # обновление tpo: order_id, ext_status, filled_qty/avg_fill_price (если пришли), last_ext_event_at
+            # обновим tpo
             await _update_tpo_on_order_event(
                 tpo_id=tpo_id,
                 order_id=order_id or None,
                 ext_status=ext_status,
                 filled_qty=cum_exec_qty,
                 avg_fill_price=avg_price,
-                exec_fee=None,  # комиссию аккумулируем из execution-событий
+                exec_fee=None,
                 last_ts=updated_at
             )
 
-            # если это entry — обновим агрегаты в trader_positions
+            # entry → зеркалим агрегаты в trader_positions
             if kind == "entry":
                 await _update_trader_positions_entry(
                     position_uid=position_uid,
@@ -222,18 +207,17 @@ async def _handle_order_topic(items: list, ts: Any):
                     last_ts=updated_at
                 )
 
-            # детект «гармонизация TP нужна»: только для kind='tp' с ценовым типом (по нашим данным есть price/qty)
+            # гармонизация TP: kind='tp' и у нас в TPO есть целевые price/qty
             if kind == "tp":
-                # наши целевые из TPO
                 tpo_price = _as_decimal(tpo.get("price"))
                 tpo_qty = _as_decimal(tpo.get("qty"))
                 level = _as_int(tpo.get("level"))
-                sym_tpo = _as_str(tpo.get("symbol") or symbol)
+                symbol = _as_str(tpo.get("symbol") or symbol_ws)
 
-                if sym_tpo and tpo_price is not None and tpo_qty is not None:
-                    # округления к точностям
-                    ticksize = _as_decimal((config.tickers.get(sym_tpo) or {}).get("ticksize"))
-                    precision_qty = (config.tickers.get(sym_tpo) or {}).get("precision_qty")
+                if symbol and tpo_price is not None and tpo_qty is not None:
+                    ticksize = _as_decimal((config.tickers.get(symbol) or {}).get("ticksize"))
+                    precision_qty = (config.tickers.get(symbol) or {}).get("precision_qty")
+
                     need_price = _round_price(tpo_price, ticksize)
                     need_qty = _round_qty(tpo_qty, precision_qty)
 
@@ -305,7 +289,7 @@ async def _handle_execution_topic(items: list, ts: Any):
             new_avg = exec_price if not prev_avg or prev_filled == 0 else ((prev_avg * prev_filled) + (exec_price * exec_qty)) / new_filled
             new_fee = prev_fee + exec_fee
 
-            # обновим tpo: filled_qty, avg_fill_price, exec_fee, last_ext_event_at
+            # обновим tpo
             await _update_tpo_on_execution(
                 tpo_id=tpo_id,
                 filled_qty=new_filled,
@@ -314,28 +298,24 @@ async def _handle_execution_topic(items: list, ts: Any):
                 last_ts=exec_at
             )
 
-            # если это entry — протащим агрегаты в trader_positions
+            # entry → зеркалим агрегаты
             if kind == "entry":
                 await _update_trader_positions_entry(
                     position_uid=position_uid,
                     exchange="BYBIT",
                     order_link_id=order_link_id or None,
                     order_id=order_id or None,
-                    ext_status=None,  # статус оставляем как есть (будет обновлён order-событием)
+                    ext_status=None,
                     filled_qty=new_filled,
                     avg_fill_price=new_avg,
                     exec_fee=new_fee,
                     last_ts=exec_at
                 )
 
-            # если это TP и он стал filled — эмитим триггер на post-TP SL
+            # TP filled → post-TP SL
             if kind == "tp":
                 tpo_row = await infra.pg_pool.fetchrow(
-                    """
-                    SELECT qty, "level"
-                    FROM public.trader_position_orders
-                    WHERE id = $1
-                    """,
+                    "SELECT qty, \"level\" FROM public.trader_position_orders WHERE id = $1",
                     tpo_id
                 )
                 if tpo_row:
@@ -360,11 +340,28 @@ async def _handle_execution_topic(items: list, ts: Any):
                                     "dedupe": f"{position_uid}:sl:after_tp:{level}",
                                 })
 
+            # После любой сделки: если остаток стал 0 → просим maintainer снять TP/SL
+            left_qty_now = await _calc_left_qty_for_uid(position_uid)
+            if left_qty_now is not None and left_qty_now <= 0:
+                sid_row = await infra.pg_pool.fetchrow(
+                    "SELECT strategy_id FROM public.trader_positions WHERE position_uid = $1",
+                    position_uid
+                )
+                sid_val = int(sid_row["strategy_id"]) if sid_row and sid_row["strategy_id"] is not None else None
+                if sid_val is not None:
+                    await _emit_maintainer_event({
+                        "type": "cleanup_after_flat",
+                        "position_uid": position_uid,
+                        "strategy_id": str(sid_val),
+                        "ts": datetime.utcnow().isoformat(timespec="milliseconds"),
+                        "dedupe": f"{position_uid}:cleanup",
+                    })
+
         except Exception:
             log.exception("BYBIT_SYNC execution: ошибка обработки элемента: %s", it)
 
 
-# 🔸 Поиск ордера в БД по order_link_id либо order_id
+# 🔸 Поиск ордера в БД по order_link_id либо order_id (расширенная версия)
 async def _find_tpo(order_link_id: Optional[str], order_id: Optional[str]) -> Optional[Dict[str, Any]]:
     if order_link_id:
         row = await infra.pg_pool.fetchrow(
@@ -414,7 +411,6 @@ async def _update_tpo_on_order_event(
             ext_status = COALESCE($3, ext_status),
             filled_qty = COALESCE($4, filled_qty),
             avg_fill_price = COALESCE($5, avg_fill_price),
-            -- комиссию из order-событий не суммируем (копим в execution)
             last_ext_event_at = COALESCE($6, last_ext_event_at)
         WHERE id = $1
         """,
@@ -458,8 +454,7 @@ async def _update_trader_positions_entry(
     exec_fee: Optional[Decimal],
     last_ts: Optional[datetime],
 ) -> None:
-    sets = []
-    vals = []
+    sets, vals = [], []
     if exchange is not None:
         sets.append("exchange = $%d" % (len(vals) + 1)); vals.append(exchange)
     if order_link_id is not None:
@@ -494,7 +489,6 @@ def _map_order_status(s: str) -> Optional[str]:
     s = (s or "").strip().lower()
     if not s:
         return None
-    # Bybit v5: New/Created/PartiallyFilled/Filled/Cancelled/Rejected/Expired/Deactivated/Untriggered/Triggered
     if s in ("new", "created"):
         return "accepted"
     if s in ("partiallyfilled", "partially_filled"):
@@ -508,8 +502,8 @@ def _map_order_status(s: str) -> Optional[str]:
     if s in ("expired", "deactivated"):
         return "expired"
     if s in ("untriggered", "triggered"):
-        return "accepted"   # условный ордер создан/ожидает/активирован
-    return None  # вместо "как есть" — не обновляем ext_status неизвестным значением
+        return "accepted"
+    return None
 
 
 # 🔸 Периодический REST-ресинк (баланс + позиции linear)
@@ -590,7 +584,7 @@ def _log_positions_summary(pos: dict):
     log.debug("BYBIT_RESYNC positions: items=%d head=%s", len(lst), head)
 
 
-# 🔸 Утилиты
+# 🔸 Утилиты форматирования/арифметики/точностей
 def _as_str(v: Any) -> str:
     if v is None:
         return ""
@@ -617,7 +611,7 @@ def _ts_from_ms(ms: Optional[int]) -> Optional[datetime]:
     if ms is None:
         return None
     try:
-        return datetime.utcfromtimestamp(ms / 1000.0)  # наивное UTC-время (как в БД)
+        return datetime.utcfromtimestamp(ms / 1000.0)
     except Exception:
         return None
 
@@ -651,6 +645,7 @@ def _fmt(x: Optional[Decimal], max_prec: int = 8) -> str:
         return s if s else "0"
     except Exception:
         return str(x)
+
 
 # 🔸 Утилита: расчёт остатка позиции по uid (entry − tp − close)
 async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:

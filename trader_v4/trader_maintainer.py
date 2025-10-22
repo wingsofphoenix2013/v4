@@ -52,7 +52,6 @@ elif TRADER_ORDER_MODE == "off":
 else:
     log.debug("MAINTAINER v1: ON (гармонизация TP, post-TP SL, принудительный flatten)")
 
-
 # 🔸 Главный воркер: потребитель событий из стрима maintainer’а
 async def run_trader_maintainer_loop():
     redis = infra.redis_client
@@ -102,6 +101,8 @@ async def run_trader_maintainer_loop():
                             await _handle_post_tp_sl(evt)
                         elif etype == "final_flatten_force":
                             await _handle_final_flatten_force(evt)
+                        elif etype == "cleanup_after_flat":
+                            await _handle_cleanup_after_flat(evt)
                         else:
                             log.debug("ℹ️ Пропуск неизвестного type=%s evt=%s", etype, evt)
 
@@ -115,7 +116,6 @@ async def run_trader_maintainer_loop():
         except Exception:
             log.exception("❌ Ошибка в цикле TRADER_MAINTAINER")
             await asyncio.sleep(1.0)
-
 
 # 🔸 Маршруты действий
 
@@ -328,6 +328,38 @@ async def _handle_final_flatten_force(evt: Dict[str, Any]) -> None:
     await _mark_order_after_submit(order_link_id=link_id, ok=ok_c, order_id=oid_c, retcode=rc_c, retmsg=rm_c)
     log.info("flatten_force: submit reduceOnly close %s qty=%s ok=%s", symbol, _fmt(qty), ok_c)
 
+# 🔸 Снятие всех активных TP/SL после фактического flat на бирже
+async def _handle_cleanup_after_flat(evt: Dict[str, Any]) -> None:
+    position_uid = evt["position_uid"]
+
+    # найдём symbol для uid (любой ордер этой позиции подойдёт)
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT symbol
+        FROM public.trader_position_orders
+        WHERE position_uid = $1
+        ORDER BY id DESC LIMIT 1
+        """,
+        position_uid
+    )
+    if not row or not row["symbol"]:
+        log.debug("cleanup_after_flat: symbol not found for uid=%s", position_uid)
+        return
+    symbol = str(row["symbol"])
+
+    # если по данным БД остаток > 0 — ничего не делаем (этим займётся flatten_force)
+    left_qty = await _calc_left_qty_for_uid(position_uid)
+    if left_qty and left_qty > 0:
+        log.debug("cleanup_after_flat: left_qty=%s > 0 — skip (uid=%s)", _fmt(left_qty), position_uid)
+        return
+
+    if TRADER_ORDER_MODE == "dry_run":
+        log.info("[DRY_RUN] cleanup_after_flat: cancel active TP/SL uid=%s", position_uid)
+        return
+
+    # отмена всех активных TP/SL
+    await _cancel_active_orders_for_uid(position_uid=position_uid, symbol=symbol, kinds=("tp", "sl"))
+    log.info("cleanup_after_flat: TP/SL canceled for uid=%s", position_uid)
 
 # 🔸 Bybit REST helpers
 
