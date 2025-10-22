@@ -1,5 +1,4 @@
-# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление
-# (портфельные метрики: 24h/TOTAL ROI & Winrate, стратегия по strategies_v4.name)
+# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление (чтение из positions_bybit_status)
 
 # 🔸 Импорты
 import asyncio
@@ -14,9 +13,9 @@ from trader_tg_notifier import send_closed_notification
 log = logging.getLogger("TRADER_CLOSER")
 
 # 🔸 Константы стрима и Consumer Group (только новые сообщения)
-SIGNAL_STREAM = "signal_log_queue"
-CG_NAME = "trader_closer_group"
-CONSUMER = "trader_closer_1"
+STATUS_STREAM = "positions_bybit_status"
+CG_NAME = "trader_closer_status_group"
+CONSUMER = "trader_closer_status_1"
 
 
 # 🔸 Основной цикл воркера (строго последовательно)
@@ -24,8 +23,8 @@ async def run_trader_position_closer_loop():
     redis = infra.redis_client
 
     try:
-        await redis.xgroup_create(SIGNAL_STREAM, CG_NAME, id="$", mkstream=True)
-        log.debug("📡 Consumer Group создана: %s → %s", SIGNAL_STREAM, CG_NAME)
+        await redis.xgroup_create(STATUS_STREAM, CG_NAME, id="$", mkstream=True)
+        log.debug("📡 Consumer Group создана: %s → %s", STATUS_STREAM, CG_NAME)
     except Exception as e:
         if "BUSYGROUP" in str(e):
             log.debug("ℹ️ Consumer Group уже существует: %s", CG_NAME)
@@ -33,7 +32,7 @@ async def run_trader_position_closer_loop():
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.debug("🚦 TRADER_CLOSER запущен (последовательная обработка)")
+    log.debug("🚦 TRADER_CLOSER запущен (последовательная обработка, источник=%s)", STATUS_STREAM)
 
     while True:
         try:
@@ -41,7 +40,7 @@ async def run_trader_position_closer_loop():
             entries = await redis.xreadgroup(
                 groupname=CG_NAME,
                 consumername=CONSUMER,
-                streams={SIGNAL_STREAM: ">"},
+                streams={STATUS_STREAM: ">"},
                 count=1,
                 block=1000
             )
@@ -51,28 +50,28 @@ async def run_trader_position_closer_loop():
             for _, records in entries:
                 for record_id, data in records:
                     try:
-                        await _handle_signal_closed(record_id, data)
+                        await _handle_status_closed(record_id, data)
                     except Exception:
                         log.exception("❌ Ошибка обработки записи (id=%s)", record_id)
                         # ack даже при ошибке, чтобы не зависало в pending
-                        await redis.xack(SIGNAL_STREAM, CG_NAME, record_id)
+                        await redis.xack(STATUS_STREAM, CG_NAME, record_id)
                     else:
-                        await redis.xack(SIGNAL_STREAM, CG_NAME, record_id)
+                        await redis.xack(STATUS_STREAM, CG_NAME, record_id)
 
         except Exception:
             log.exception("❌ Ошибка в основном цикле TRADER_CLOSER")
             await asyncio.sleep(2)
 
 
-# 🔸 Обработка одного сообщения (интересует только status='closed')
-async def _handle_signal_closed(record_id: str, data: dict) -> None:
-    status = _as_str(data.get("status"))
-    if status != "closed":
+# 🔸 Обработка одного сообщения (интересуют только event, начинающиеся с 'closed.')
+async def _handle_status_closed(record_id: str, data: dict) -> None:
+    event = _as_str(data.get("event"))
+    if not event or not event.startswith("closed."):
         return  # слушаем только закрытия
 
     position_uid = _as_str(data.get("position_uid"))
     strategy_id = _as_int(data.get("strategy_id"))
-    symbol_hint = _as_str(data.get("symbol"))
+    direction_hint = _as_str(data.get("direction")) or None  # подсказка, финально возьмём из БД
 
     if not position_uid:
         log.debug("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
@@ -104,13 +103,13 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
         log.debug("⚠️ TRADER_CLOSER: не нашли позицию в positions_v4, пропуск uid=%s", position_uid)
         return
 
-    symbol = row["symbol"] or tracked["symbol"] or symbol_hint
+    symbol = row["symbol"] or tracked["symbol"]
     pnl = _as_decimal(row["pnl"])
     closed_at = row["closed_at"]          # UTC timestamp (как в БД)
-    direction = _as_str(row.get("direction")) or None
+    direction = _as_str(row.get("direction")) or direction_hint
     created_at = row.get("created_at")
 
-    # обновляем нашу таблицу
+    # обновляем нашу таблицу (без проставления close_reason — маппинг event→reason опционален)
     await infra.pg_pool.execute(
         """
         UPDATE public.trader_positions
@@ -129,8 +128,8 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
     roi_24h, roi_total, wr_24h, wr_total = await _compute_portfolio_metrics()
 
     log.debug(
-        "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s",
-        position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl
+        "✅ TRADER_CLOSER: закрыта позиция uid=%s | symbol=%s | sid=%s | pnl=%s | event=%s",
+        position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl, event
     )
 
     # уведомление в Telegram (win/loss header + стрелки направления + портфельные метрики + стратегия)
@@ -139,7 +138,7 @@ async def _handle_signal_closed(record_id: str, data: dict) -> None:
             symbol=symbol,
             direction=direction,
             pnl=pnl,
-            strategy_name=strategy_name or f"strategy_{strategy_id}" if strategy_id is not None else "strategy",
+            strategy_name=strategy_name or (f"strategy_{strategy_id}" if strategy_id is not None else "strategy"),
             created_at=created_at,
             closed_at=closed_at,
             roi_24h=roi_24h,

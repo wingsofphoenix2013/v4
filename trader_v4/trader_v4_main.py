@@ -10,7 +10,7 @@ from trader_position_filler import run_trader_position_filler_loop          # li
 from trader_position_closer import run_trader_position_closer_loop          # слушатель закрытий (signal_log_queue: status='closed')
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
 from bybit_processor import run_bybit_processor_loop                        # v2: entry → fill → TP/SL (priced) + virtuals
-from bybit_maintainer import run_bybit_maintainer_loop                      # v2: exchange-first сопровождение (TP1→SL@entry, финализация)
+from trader_maintainer import run_trader_maintainer_loop
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -92,9 +92,9 @@ async def main():
 
         # воркер: план/submit ордеров Bybit (читает trader_order_requests)
         run_with_delay(run_bybit_processor_loop, "BYBIT_PROCESSOR", start_delay=60.0),
-
-        # воркер сопровождения биржи: TP1→SL@entry, финализация при SL/size=0/manual
-        run_with_delay(run_bybit_maintainer_loop, "BYBIT_MAINTAINER", start_delay=60.0),
+        
+        # синхронизатор
+        run_with_delay(run_trader_maintainer_loop, "TRADER_MAINTAINER", start_delay=60.0),
     )
 
 # 🔸 Запуск через CLI

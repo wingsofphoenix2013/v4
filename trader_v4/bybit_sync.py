@@ -1,6 +1,7 @@
 # bybit_sync.py — приватный WS-синк Bybit (read-only + обновление статусов ордеров): auth + wallet/position/order/execution + авто-reconnect
 # + периодический REST-ресинк баланса и позиций (linear)
 # + фильтрация шумных pong/ping логов и запись статусов в БД (trader_position_orders, агрегаты в trader_positions)
+# + публикация событий для maintainer (гармонизация TP, post-TP SL) в Redis Stream
 
 # 🔸 Импорты
 import os
@@ -10,7 +11,7 @@ import json
 import hashlib
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,6 +19,7 @@ import websockets
 import httpx
 
 from trader_infra import infra
+from trader_config import config
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_SYNC")
@@ -37,6 +39,17 @@ RECONNECT_DELAY_SEC = 3.0     # пауза между переподключен
 # 🔸 Настройка шумных логов (по умолчанию пинги/понги тихо)
 LOG_PONGS = os.getenv("BYBIT_LOG_PONGS", "false").lower() == "true"
 LOG_PINGS = os.getenv("BYBIT_LOG_PINGS", "false").lower() == "true"
+
+# 🔸 Stream для maintainer’а
+MAINTAINER_STREAM = "trader_maintainer_events"
+
+# 🔸 Публикация события для maintainer’а
+async def _emit_maintainer_event(fields: Dict[str, str]) -> None:
+    try:
+        await infra.redis_client.xadd(MAINTAINER_STREAM, fields)
+        log.debug("MAINT_EVT → %s: %s", MAINTAINER_STREAM, fields)
+    except Exception:
+        log.exception("❌ Не удалось опубликовать событие maintainer")
 
 
 # 🔸 Основной цикл воркера приватного WS (держим канал + подписки)
@@ -149,7 +162,6 @@ async def _handle_ws_message(msg_raw: str):
 
 # 🔸 Обработка топика 'order' — статусы ордеров (accepted/partially_filled/filled/…)
 async def _handle_order_topic(items: list, ts: Any):
-    # минимальный лог головы
     head = items[0] if items else {}
     log.debug("BYBIT_SYNC order: items=%d head_keys=%s ts=%s", len(items), list(head.keys()) if head else [], ts)
 
@@ -165,7 +177,9 @@ async def _handle_order_topic(items: list, ts: Any):
             order_status_raw = _as_str(it.get("orderStatus"))  # e.g. New/Created/PartiallyFilled/Filled/Cancelled/Rejected/Expired
             ext_status = _map_order_status(order_status_raw)
 
-            price = _as_decimal(it.get("price"))  # заявленная цена для limit
+            price_ws = _as_decimal(it.get("price"))  # заявленная цена лимита (если есть)
+            qty_ws = _as_decimal(it.get("qty"))      # размер ордера (если есть в payload)
+
             # агрегированные поля из order-события (могут быть пустыми)
             cum_exec_qty = _as_decimal(it.get("cumExecQty"))
             avg_price = _as_decimal(it.get("avgPrice"))
@@ -176,11 +190,12 @@ async def _handle_order_topic(items: list, ts: Any):
             # найдём строку ордера в нашей таблице по order_link_id, иначе по order_id
             tpo = await _find_tpo(order_link_id, order_id)
             if not tpo:
-                # не нашли — лог и дальше
                 log.debug("BYBIT_SYNC order: неизвестный ордер (linkId=%s orderId=%s) — пропуск", order_link_id, order_id)
                 continue
 
-            tpo_id, position_uid, kind = tpo["id"], tpo["position_uid"], _as_str(tpo["kind"])
+            tpo_id = tpo["id"]
+            position_uid = tpo["position_uid"]
+            kind = _as_str(tpo["kind"])
 
             # обновление tpo: order_id, ext_status, filled_qty/avg_fill_price (если пришли), last_ext_event_at
             await _update_tpo_on_order_event(
@@ -206,6 +221,49 @@ async def _handle_order_topic(items: list, ts: Any):
                     exec_fee=None,
                     last_ts=updated_at
                 )
+
+            # детект «гармонизация TP нужна»: только для kind='tp' с ценовым типом (по нашим данным есть price/qty)
+            if kind == "tp":
+                # наши целевые из TPO
+                tpo_price = _as_decimal(tpo.get("price"))
+                tpo_qty = _as_decimal(tpo.get("qty"))
+                level = _as_int(tpo.get("level"))
+                sym_tpo = _as_str(tpo.get("symbol") or symbol)
+
+                if sym_tpo and tpo_price is not None and tpo_qty is not None:
+                    # округления к точностям
+                    ticksize = _as_decimal((config.tickers.get(sym_tpo) or {}).get("ticksize"))
+                    precision_qty = (config.tickers.get(sym_tpo) or {}).get("precision_qty")
+                    need_price = _round_price(tpo_price, ticksize)
+                    need_qty = _round_qty(tpo_qty, precision_qty)
+
+                    ex_price = _round_price(price_ws, ticksize) if price_ws is not None else None
+                    ex_qty = _round_qty(qty_ws, precision_qty) if qty_ws is not None else None
+
+                    bad_status = (ext_status in ("rejected", "expired", "canceled"))
+                    mismatch = (
+                        (ex_price is not None and need_price is not None and ex_price != need_price) or
+                        (ex_qty is not None and need_qty is not None and ex_qty != need_qty)
+                    )
+
+                    if bad_status or mismatch:
+                        sid_row = await infra.pg_pool.fetchrow(
+                            "SELECT strategy_id FROM public.trader_positions WHERE position_uid = $1",
+                            position_uid
+                        )
+                        sid_val = int(sid_row["strategy_id"]) if sid_row and sid_row["strategy_id"] is not None else None
+                        if sid_val is not None:
+                            await _emit_maintainer_event({
+                                "type": "tp_harmonize_needed",
+                                "position_uid": position_uid,
+                                "strategy_id": str(sid_val),
+                                "order_link_id": order_link_id or (tpo.get("order_link_id") or ""),
+                                "level": str(level if level is not None else ""),
+                                "ex_price": str(ex_price) if ex_price is not None else "",
+                                "ex_qty": str(ex_qty) if ex_qty is not None else "",
+                                "ts": datetime.utcnow().isoformat(timespec="milliseconds"),
+                                "dedupe": f"{position_uid}:tp:{level}:harmonize",
+                            })
 
         except Exception:
             log.exception("BYBIT_SYNC order: ошибка обработки элемента: %s", it)
@@ -235,7 +293,9 @@ async def _handle_execution_topic(items: list, ts: Any):
                 log.debug("BYBIT_SYNC execution: неизвестный ордер (linkId=%s orderId=%s) — пропуск", order_link_id, order_id)
                 continue
 
-            tpo_id, position_uid, kind = tpo["id"], tpo["position_uid"], _as_str(tpo["kind"])
+            tpo_id = tpo["id"]
+            position_uid = tpo["position_uid"]
+            kind = _as_str(tpo["kind"])
             prev_filled = _as_decimal(tpo.get("filled_qty")) or Decimal("0")
             prev_avg = _as_decimal(tpo.get("avg_fill_price")) or None
             prev_fee = _as_decimal(tpo.get("exec_fee")) or Decimal("0")
@@ -268,6 +328,38 @@ async def _handle_execution_topic(items: list, ts: Any):
                     last_ts=exec_at
                 )
 
+            # если это TP и он стал filled — эмитим триггер на post-TP SL
+            if kind == "tp":
+                tpo_row = await infra.pg_pool.fetchrow(
+                    """
+                    SELECT qty, "level"
+                    FROM public.trader_position_orders
+                    WHERE id = $1
+                    """,
+                    tpo_id
+                )
+                if tpo_row:
+                    level = _as_int(tpo_row["level"])
+                    qty_target = _as_decimal(tpo_row["qty"]) or Decimal("0")
+                    if new_filled >= qty_target and qty_target > 0:
+                        left_qty = await _calc_left_qty_for_uid(position_uid)
+                        if left_qty and left_qty > 0:
+                            sid_row = await infra.pg_pool.fetchrow(
+                                "SELECT strategy_id FROM public.trader_positions WHERE position_uid = $1",
+                                position_uid
+                            )
+                            sid_val = int(sid_row["strategy_id"]) if sid_row and sid_row["strategy_id"] is not None else None
+                            if sid_val is not None:
+                                await _emit_maintainer_event({
+                                    "type": "post_tp_sl_apply",
+                                    "position_uid": position_uid,
+                                    "strategy_id": str(sid_val),
+                                    "level": str(level if level is not None else ""),
+                                    "left_qty": str(left_qty),
+                                    "ts": datetime.utcnow().isoformat(timespec="milliseconds"),
+                                    "dedupe": f"{position_uid}:sl:after_tp:{level}",
+                                })
+
         except Exception:
             log.exception("BYBIT_SYNC execution: ошибка обработки элемента: %s", it)
 
@@ -277,7 +369,9 @@ async def _find_tpo(order_link_id: Optional[str], order_id: Optional[str]) -> Op
     if order_link_id:
         row = await infra.pg_pool.fetchrow(
             """
-            SELECT id, position_uid, kind, order_link_id, order_id, filled_qty, avg_fill_price, exec_fee
+            SELECT id, position_uid, kind, order_link_id, order_id,
+                   filled_qty, avg_fill_price, exec_fee,
+                   price, qty, "level", symbol, side
             FROM public.trader_position_orders
             WHERE order_link_id = $1
             """,
@@ -288,7 +382,9 @@ async def _find_tpo(order_link_id: Optional[str], order_id: Optional[str]) -> Op
     if order_id:
         row = await infra.pg_pool.fetchrow(
             """
-            SELECT id, position_uid, kind, order_link_id, order_id, filled_qty, avg_fill_price, exec_fee
+            SELECT id, position_uid, kind, order_link_id, order_id,
+                   filled_qty, avg_fill_price, exec_fee,
+                   price, qty, "level", symbol, side
             FROM public.trader_position_orders
             WHERE order_id = $1
             """,
@@ -362,7 +458,6 @@ async def _update_trader_positions_entry(
     exec_fee: Optional[Decimal],
     last_ts: Optional[datetime],
 ) -> None:
-    # строим динамически части SET только по переданным значениям
     sets = []
     vals = []
     if exchange is not None:
@@ -393,6 +488,7 @@ async def _update_trader_positions_entry(
     vals.append(position_uid)
     await infra.pg_pool.execute(query, *vals)
 
+
 # 🔸 Маппинг статусов Bybit → наши ext_status
 def _map_order_status(s: str) -> Optional[str]:
     s = (s or "").strip().lower()
@@ -415,6 +511,7 @@ def _map_order_status(s: str) -> Optional[str]:
         return "accepted"   # условный ордер создан/ожидает/активирован
     return None  # вместо "как есть" — не обновляем ext_status неизвестным значением
 
+
 # 🔸 Периодический REST-ресинк (баланс + позиции linear)
 async def run_bybit_rest_resync_job():
     if not API_KEY or not API_SECRET:
@@ -436,7 +533,6 @@ async def run_bybit_rest_resync_job():
 
 # 🔸 REST-помощники
 def _rest_sign(timestamp_ms: int, query_or_body: str) -> str:
-    # timestamp + api_key + recv_window + (queryString|jsonBodyString)
     payload = f"{timestamp_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
     return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
@@ -457,7 +553,6 @@ async def _get_wallet_balance(account_type: str) -> dict:
         return r.json()
 
 async def _get_positions_list() -> dict:
-    # символ не обязателен — вернёт все позиции по категории
     query = f"category={CATEGORY}"
     url = f"{BASE_URL}/v5/position/list?{query}"
     ts = int(time.time() * 1000)
@@ -481,8 +576,10 @@ def _log_balance_summary(bal: dict):
         log.debug("BYBIT_RESYNC balance: <empty>")
         return
     acc0 = acc[0]
-    log.debug("BYBIT_RESYNC balance: totalEquity=%s totalWallet=%s perpUPL=%s",
-             acc0.get("totalEquity"), acc0.get("totalWalletBalance"), acc0.get("totalPerpUPL"))
+    log.debug(
+        "BYBIT_RESYNC balance: totalEquity=%s totalWallet=%s perpUPL=%s",
+        acc0.get("totalEquity"), acc0.get("totalWalletBalance"), acc0.get("totalPerpUPL")
+    )
     coins = acc0.get("coin") or []
     head = coins[0] if coins else {}
     log.debug("BYBIT_RESYNC coins: items=%d head=%s", len(coins), head)
@@ -520,7 +617,59 @@ def _ts_from_ms(ms: Optional[int]) -> Optional[datetime]:
     if ms is None:
         return None
     try:
-        # наивное UTC-время (как в БД)
-        return datetime.utcfromtimestamp(ms / 1000.0)
+        return datetime.utcfromtimestamp(ms / 1000.0)  # наивное UTC-время (как в БД)
+    except Exception:
+        return None
+
+def _round_qty(qty: Optional[Decimal], precision_qty: Optional[int]) -> Optional[Decimal]:
+    if qty is None:
+        return None
+    if precision_qty is None:
+        return qty
+    step = Decimal("1").scaleb(-int(precision_qty))
+    try:
+        return qty.quantize(step, rounding=ROUND_DOWN)
+    except Exception:
+        return qty
+
+def _round_price(price: Optional[Decimal], ticksize: Optional[Decimal]) -> Optional[Decimal]:
+    if price is None or ticksize is None:
+        return price
+    try:
+        quantum = _as_decimal(ticksize) or Decimal("0")
+        if quantum <= 0:
+            return price
+        return price.quantize(quantum, rounding=ROUND_HALF_UP)
+    except Exception:
+        return price
+
+def _fmt(x: Optional[Decimal], max_prec: int = 8) -> str:
+    if x is None:
+        return "—"
+    try:
+        s = f"{x:.{max_prec}f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    except Exception:
+        return str(x)
+
+# 🔸 Утилита: расчёт остатка позиции по uid (entry − tp − close)
+async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
+    row = await infra.pg_pool.fetchrow(
+        """
+        WITH e AS (
+          SELECT COALESCE(MAX(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='entry'
+        ),
+        t AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='tp'
+        ),
+        c AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='close'
+        )
+        SELECT e.fq - t.fq - c.fq AS left_qty FROM e,t,c
+        """,
+        uid
+    )
+    try:
+        return Decimal(str(row["left_qty"])) if row and row["left_qty"] is not None else None
     except Exception:
         return None

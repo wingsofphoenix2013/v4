@@ -1,4 +1,4 @@
-# bybit_processor.py — entry → reverse-guard (wait old flat) → ожидание fill → расчёт TP/SL от avg fill → отправка TP/SL (ценовые), виртуальные TP(signal) и шаблоны SL-после-TP → фиксация в БД
+# bybit_processor.py — entry → ожидание стабильного fill → расчёт TP/SL от финального avg fill → сабмит TP/SL (ценовые), виртуальные TP(signal) и шаблоны SL-после-TP → фиксация в БД
 
 # 🔸 Импорты
 import os
@@ -44,29 +44,20 @@ ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").upper()  # UNIFIED | C
 # 🔸 Поведение стопов
 DEFAULT_TRIGGER_BY = os.getenv("BYBIT_TRIGGER_BY", "LastPrice")  # LastPrice | MarkPrice | IndexPrice
 
-# 🔸 Настройки ожиданий/ограничений
-ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "30"))
-ENTRY_FILL_POLL_MS = int(os.getenv("ENTRY_FILL_POLL_MS", "250"))
+# 🔸 Настройки ожиданий/ограничений (часть — из ENV для окружения)
 TP_MIN_QTY_THRESHOLD = Decimal(os.getenv("TP_MIN_QTY_THRESHOLD", "0"))
+SIZE_FACTOR = (lambda raw: (Decimal(raw) if raw.replace(".", "", 1).isdigit() else Decimal("100")))(
+    os.getenv("BYBIT_SIZE_PCT", "100").strip()
+) / Decimal("100")
 
-# 🔸 Уменьшающий коэффициент размера реального ордера (ENV BYBIT_SIZE_PCT, проценты)
-def _get_size_factor() -> Decimal:
-    raw = os.getenv("BYBIT_SIZE_PCT", "100").strip()
-    try:
-        pct = Decimal(raw)
-    except Exception:
-        pct = Decimal("100")
-    if pct < 0:
-        pct = Decimal("0")
-    if pct > 1000:
-        pct = Decimal("1000")
-    return (pct / Decimal("100"))
+# 🔸 Единая модель ожидания fill (константы в коде)
+ENTRY_FILL_COMPLETENESS = Decimal("0.98")  # доля от планового объёма, при достижении которой считаем fill завершённым
+ENTRY_FILL_STABLE_MS    = 2000            # окно стабильности filled_qty (мс)
+ENTRY_FILL_MAX_WAIT_SEC = 60              # общий предел ожидания (сек)
 
-SIZE_FACTOR = _get_size_factor()
-
-# 🔸 Защита реверса: ждём flat по символу (зашито в коде)
-REVERSE_WAIT_TIMEOUT_SEC = 5       # максимальное время ожидания нулевого остатка по символу
-REVERSE_WAIT_POLL_MS = 150         # период опроса в ожидании
+# 🔸 Reverse-guard (ожидание «flat» по символу)
+REVERSE_WAIT_TIMEOUT_SEC = 10
+REVERSE_WAIT_POLL_MS     = 150
 
 # 🔸 Сообщим о режиме
 if TRADER_ORDER_MODE == "dry_run":
@@ -74,8 +65,10 @@ if TRADER_ORDER_MODE == "dry_run":
 elif TRADER_ORDER_MODE == "off":
     log.debug("BYBIT processor v2: OFF (игнорируем заявки)")
 else:
-    log.debug("BYBIT processor v2: ON (entry→fill→TP/SL по политике); SIZE_FACTOR=%.4f; trigger_by=%s",
-              float(SIZE_FACTOR), DEFAULT_TRIGGER_BY)
+    log.debug(
+        "BYBIT processor v2: ON (entry→stable fill→TP/SL от fill); SIZE_FACTOR=%.4f; trigger_by=%s; fill_gate: comp=%.2f, stable=%dms, max_wait=%ds",
+        float(SIZE_FACTOR), DEFAULT_TRIGGER_BY, float(ENTRY_FILL_COMPLETENESS), ENTRY_FILL_STABLE_MS, ENTRY_FILL_MAX_WAIT_SEC
+    )
 
 # 🔸 Основной цикл воркера
 async def run_bybit_processor_loop():
@@ -154,7 +147,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         meta = config.strategy_meta.get(sid) or {}
         lev = _as_decimal(meta.get("leverage"))
 
-    # сырьё из positions_v4 (quantity / entry_price mark — для dry_run)
+    # сырьё из positions_v4 (quantity / entry_price mark — для DRY_RUN ориентира)
     qty_raw, entry_price_mark = await _try_fetch_initials_from_positions_v4(position_uid)
     if qty_raw is None or qty_raw <= 0:
         log.debug("⚠️ Нет quantity для uid=%s — пропуск", position_uid)
@@ -166,13 +159,18 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         log.debug("⚠️ qty_trade < min_qty (uid=%s, qty_trade=%s, min_qty=%s) — пропуск", position_uid, _fmt(qty_trade), _fmt(min_qty))
         return
 
-    # 🔸 Reverse-guard: дождаться нулевого остатка по этому символу (старая позиция полностью закрыта)
-    ok_flat = await _wait_until_symbol_flat(symbol=symbol, exclude_uid=position_uid,
-                                            timeout_sec=REVERSE_WAIT_TIMEOUT_SEC,
-                                            poll_ms=REVERSE_WAIT_POLL_MS)
+    # Reverse-guard: дождаться нулевого остатка по этому символу (старая позиция полностью закрыта)
+    ok_flat = await _wait_until_symbol_flat(
+        symbol=symbol,
+        exclude_uid=position_uid,
+        timeout_sec=REVERSE_WAIT_TIMEOUT_SEC,
+        poll_ms=REVERSE_WAIT_POLL_MS,
+    )
     if not ok_flat:
-        # политика A (безопасная): не открываем новый entry
-        log.warning("[REVERSE-GUARD] timeout waiting flat for symbol=%s (uid=%s) → skip opening", symbol, position_uid)
+        log.warning(
+            "[REVERSE-GUARD] timeout waiting flat for symbol=%s (uid=%s) → skip opening",
+            symbol, position_uid
+        )
         return
 
     # planned entry (до сабмита) — фиксируем фактически планируемый объём (qty_trade)
@@ -192,7 +190,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         trigger_price=None,
         qty=qty_trade,
         order_link_id=entry_link_id,
-        ext_status="planned",
+        ext_status="planned" if TRADER_ORDER_MODE == "on" else "virtual",
         qty_raw=qty_trade,
         price_raw=None,
         calc_type=None,
@@ -204,7 +202,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
         supersedes_link_id=None,
     )
 
-    # entry (on) / dry_run
+    # entry (ON) / dry_run (без REST)
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         # preflight: выставляем плечо на бирже (fail-open)
         await _preflight_set_leverage(symbol, lev)
@@ -234,15 +232,20 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
     else:
         log.debug("[DRY_RUN] entry planned: uid=%s %s qty=%s", position_uid, symbol, _fmt(qty_trade))
 
-    # ждём фактический fill / суррогат (в DRY_RUN вернём qty_trade)
+    # 🔸 Ждём завершённость/стабильность fill (единый гейт) — возвращает финальные avg_fill и filled_qty
     avg_fill_price, filled_qty = await _wait_entry_fill_or_fallback(
-        position_uid, entry_link_id, symbol, entry_price_mark, qty_trade, precision_qty
+        position_uid=position_uid,
+        entry_link_id=entry_link_id,
+        symbol=symbol,
+        entry_price_mark=entry_price_mark,
+        qty_planned=qty_trade,
+        precision_qty=precision_qty,
     )
     if avg_fill_price is None or filled_qty is None or filled_qty <= 0:
-        log.debug("⚠️ Не получили фактический fill для uid=%s — прекращаем обработку", position_uid)
+        log.debug("⚠️ Не получили достаточный fill для uid=%s — прекращаем обработку", position_uid)
         return
 
-    # расчёт TP/SL от avg_fill и filled_qty
+    # 🔸 расчёт TP/SL от финального avg_fill и filled_qty (после гейта)
     plan_tp, plan_tp_signal, plan_sl_primary, plan_sls_after_tp = _build_plan_from_policy(
         position_uid=position_uid,
         symbol=symbol,
@@ -271,7 +274,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             trigger_price=None,
             qty=qty,
             order_link_id=link_id,
-            ext_status=("planned" if TRADER_ORDER_MODE != "off" else "virtual"),
+            ext_status=("planned" if TRADER_ORDER_MODE == "on" else "virtual"),
             qty_raw=qty,
             price_raw=price,
             calc_type="percent" if _tp_is_percent(policy, lvl) else ("atr" if _tp_is_atr(policy, lvl) else None),
@@ -327,7 +330,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             trigger_price=trig,
             qty=qty,
             order_link_id=link_id,
-            ext_status="planned" if TRADER_ORDER_MODE != "off" else "virtual",
+            ext_status=("planned" if TRADER_ORDER_MODE == "on" else "virtual"),
             qty_raw=qty,
             price_raw=None,
             calc_type=policy.get("sl", {}).get("type"),
@@ -366,7 +369,7 @@ async def _handle_order_request(record_id: str, data: Dict[str, Any]) -> None:
             supersedes_link_id=None,
         )
 
-    # Сабмит реальных ордеров (ON): первичный SL + ценовые TP
+    # 🔸 Сабмит реальных ордеров (ON): первичный SL + ценовые TP (после гейта)
     if TRADER_ORDER_MODE == "on" and API_KEY and API_SECRET:
         if plan_sl_primary is not None:
             trig, qty, link_id = plan_sl_primary
@@ -603,7 +606,7 @@ def _sl_value(policy: Dict[str, Any], level: int) -> Optional[Decimal]:
     v = by_level.get(level)
     return _as_decimal(v.get("sl_value")) if isinstance(v, dict) else None
 
-# 🔸 Ожидание fill entry или суррогат для DRY_RUN
+# 🔸 Ожидание стабильного/завершённого fill для entry (единый гейт)
 async def _wait_entry_fill_or_fallback(
     position_uid: str,
     entry_link_id: str,
@@ -612,24 +615,58 @@ async def _wait_entry_fill_or_fallback(
     qty_planned: Decimal,
     precision_qty: Optional[int]
 ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    # ON: ждём по правилам гейта; DRY_RUN: возвращаем mark + план
     if TRADER_ORDER_MODE == "on":
-        deadline = datetime.utcnow() + timedelta(seconds=ENTRY_FILL_TIMEOUT_SEC)
+        deadline = datetime.utcnow() + timedelta(seconds=ENTRY_FILL_MAX_WAIT_SEC)
+        first_seen = False
+        last_filled = Decimal("0")
+        stable_since: Optional[datetime] = None
+
         while datetime.utcnow() < deadline:
             row = await infra.pg_pool.fetchrow(
                 """
-                SELECT filled_qty, avg_fill_price
+                SELECT filled_qty, avg_fill_price, ext_status
                 FROM public.trader_position_orders
                 WHERE order_link_id = $1
                 """,
                 entry_link_id
             )
             if row:
-                fq = _as_decimal(row["filled_qty"])
+                fq = _as_decimal(row["filled_qty"]) or Decimal("0")
                 ap = _as_decimal(row["avg_fill_price"])
-                if fq and fq > 0 and ap and ap > 0:
+                st = (row["ext_status"] or "").strip().lower() if row["ext_status"] is not None else ""
+
+                # признак «первый fill увидели»
+                if fq > 0 and not first_seen:
+                    first_seen = True
+                    stable_since = datetime.utcnow()
+                    last_filled = fq
+
+                # обновление «окна стабильности»
+                if fq != last_filled:
+                    last_filled = fq
+                    stable_since = datetime.utcnow()
+
+                # условия завершённости
+                if st == "filled":
                     return ap, _round_qty(fq, precision_qty)
-            await asyncio.sleep(ENTRY_FILL_POLL_MS / 1000.0)
+                if fq >= (qty_planned * ENTRY_FILL_COMPLETENESS):
+                    return ap, _round_qty(fq, precision_qty)
+                if first_seen and stable_since and (datetime.utcnow() - stable_since).total_seconds() * 1000 >= ENTRY_FILL_STABLE_MS and fq > 0:
+                    return ap, _round_qty(fq, precision_qty)
+
+            await asyncio.sleep(0.25)  # короткий poll
+
+        # дедлайн: если набрали хоть что-то — работаем с тем, что есть
+        if row:
+            fq = _as_decimal(row["filled_qty"]) or Decimal("0")
+            ap = _as_decimal(row["avg_fill_price"])
+            if fq > 0 and ap and ap > 0:
+                return ap, _round_qty(fq, precision_qty)
+        # совсем ничего нет — прерываем
         return None, None
+
+    # DRY_RUN: ориентируемся на mark и плановый объём
     if entry_price_mark is None:
         entry_price_mark = await _fetch_mark_price(symbol)
     return entry_price_mark, _round_qty(qty_planned, precision_qty)
