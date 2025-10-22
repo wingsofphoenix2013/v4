@@ -1,10 +1,11 @@
-# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление (чтение из positions_bybit_status)
+# trader_position_closer.py — последовательное закрытие зафиксированных позиций + TG-уведомление + команда maintainer'у на принудительный flatten
 
 # 🔸 Импорты
 import asyncio
 import logging
 from decimal import Decimal
 from typing import Any, Optional, Tuple
+from datetime import datetime
 
 from trader_infra import infra
 from trader_tg_notifier import send_closed_notification
@@ -12,10 +13,13 @@ from trader_tg_notifier import send_closed_notification
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_CLOSER")
 
-# 🔸 Константы стрима и Consumer Group (только новые сообщения)
-STATUS_STREAM = "positions_bybit_status"
+# 🔸 Константы стримов и Consumer Group
+STATUS_STREAM = "positions_bybit_status"           # слушаем закрытия из конвейера стратегий
 CG_NAME = "trader_closer_status_group"
 CONSUMER = "trader_closer_status_1"
+
+# 🔸 Stream для maintainer'а (команда на безусловный flatten)
+MAINTAINER_STREAM = "trader_maintainer_events"
 
 
 # 🔸 Основной цикл воркера (строго последовательно)
@@ -36,7 +40,6 @@ async def run_trader_position_closer_loop():
 
     while True:
         try:
-            # читаем по одной записи, чтобы исключить гонки
             entries = await redis.xreadgroup(
                 groupname=CG_NAME,
                 consumername=CONSUMER,
@@ -53,7 +56,6 @@ async def run_trader_position_closer_loop():
                         await _handle_status_closed(record_id, data)
                     except Exception:
                         log.exception("❌ Ошибка обработки записи (id=%s)", record_id)
-                        # ack даже при ошибке, чтобы не зависало в pending
                         await redis.xack(STATUS_STREAM, CG_NAME, record_id)
                     else:
                         await redis.xack(STATUS_STREAM, CG_NAME, record_id)
@@ -71,7 +73,7 @@ async def _handle_status_closed(record_id: str, data: dict) -> None:
 
     position_uid = _as_str(data.get("position_uid"))
     strategy_id = _as_int(data.get("strategy_id"))
-    direction_hint = _as_str(data.get("direction")) or None  # подсказка, финально возьмём из БД
+    direction_hint = _as_str(data.get("direction")) or None
 
     if not position_uid:
         log.debug("⚠️ TRADER_CLOSER: пропуск (нет position_uid) id=%s", record_id)
@@ -109,7 +111,7 @@ async def _handle_status_closed(record_id: str, data: dict) -> None:
     direction = _as_str(row.get("direction")) or direction_hint
     created_at = row.get("created_at")
 
-    # обновляем нашу таблицу (без проставления close_reason — маппинг event→reason опционален)
+    # обновляем нашу таблицу
     await infra.pg_pool.execute(
         """
         UPDATE public.trader_positions
@@ -132,7 +134,7 @@ async def _handle_status_closed(record_id: str, data: dict) -> None:
         position_uid, symbol, strategy_id if strategy_id is not None else "-", pnl, event
     )
 
-    # уведомление в Telegram (win/loss header + стрелки направления + портфельные метрики + стратегия)
+    # Telegram-уведомление (win/loss header + стрелки направления + портфельные метрики + стратегия)
     try:
         await send_closed_notification(
             symbol=symbol,
@@ -149,10 +151,23 @@ async def _handle_status_closed(record_id: str, data: dict) -> None:
     except Exception:
         log.exception("❌ TG: ошибка отправки уведомления о закрытии uid=%s", position_uid)
 
+    # 🔸 Безусловная команда maintainer'у: довести биржу до нуля (cancel TP/SL + reduceOnly market остатка)
+    try:
+        await infra.redis_client.xadd(MAINTAINER_STREAM, {
+            "type": "final_flatten_force",
+            "position_uid": position_uid,
+            "strategy_id": str(strategy_id) if strategy_id is not None else "",
+            "reason": event,
+            "ts": datetime.utcnow().isoformat(timespec="milliseconds"),
+            "dedupe": f"{position_uid}:flatten",
+        })
+        log.debug("📤 MAINT_CMD: final_flatten_force sent for uid=%s", position_uid)
+    except Exception:
+        log.exception("❌ Не удалось отправить final_flatten_force для uid=%s", position_uid)
+
 
 # 🔸 Портфельные метрики: 24h/TOTAL ROI & Winrate (по trader_positions)
 async def _compute_portfolio_metrics() -> Tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
-    # сумма pnl за 24ч и количество/победы
     r24 = await infra.pg_pool.fetchrow(
         """
         SELECT
@@ -168,7 +183,6 @@ async def _compute_portfolio_metrics() -> Tuple[Optional[Decimal], Optional[Deci
     cnt_24 = int(r24["cnt"]) if r24 and r24["cnt"] is not None else 0
     wins_24 = int(r24["wins"]) if r24 and r24["wins"] is not None else 0
 
-    # сумма pnl за всё время и количество/победы
     r_total = await infra.pg_pool.fetchrow(
         """
         SELECT
@@ -183,7 +197,6 @@ async def _compute_portfolio_metrics() -> Tuple[Optional[Decimal], Optional[Deci
     cnt_total = int(r_total["cnt"]) if r_total and r_total["cnt"] is not None else 0
     wins_total = int(r_total["wins"]) if r_total and r_total["wins"] is not None else 0
 
-    # средний депозит по стратегиям, присутствующим в trader_positions
     r_dep = await infra.pg_pool.fetchrow(
         """
         SELECT AVG(s.deposit) AS avg_dep
