@@ -1,8 +1,12 @@
-# trader_sl_handler.py — обработчик SL-protect: ловит sl_replaced из positions_bybit_status и инициирует перестановку биржевого SL на entry
+# trader_sl_handler.py — обработчик SL-protect:
+# слушает СИСТЕМНЫЕ события из positions_bybit_status и при необходимости инициирует перестановку биржевого SL на entry.
+# FIX #2: не переносить SL на бирже из-за системного tp_hit — добавлены двойные гейты:
+#   (1) недавний system tp_hit (TTL), (2) есть активные priced TP на бирже.
 
 # 🔸 Импорты
 import asyncio
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional, Dict, Tuple
@@ -26,6 +30,19 @@ MAINTAINER_STREAM = "trader_maintainer_events"    # куда отправляе�
 BYBIT_PUBLIC_BASE = "https://api.bybit.com"
 BYBIT_CATEGORY = "linear"  # USDT-perp
 
+# 🔸 FIX #2: кэш недавних системных tp_hit по uid (для гейта №1)
+_RECENT_TP_HIT: Dict[str, int] = {}   # uid -> ts (epoch sec)
+_TP_HIT_TTL_SEC = 10
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _gc_recent_tp() -> None:
+    now = _now_ts()
+    for k, ts in list(_RECENT_TP_HIT.items()):
+        if now - ts > _TP_HIT_TTL_SEC:
+            _RECENT_TP_HIT.pop(k, None)
+
 # 🔸 Основной воркер
 async def run_trader_sl_handler_loop():
     redis = infra.redis_client
@@ -41,7 +58,7 @@ async def run_trader_sl_handler_loop():
             log.exception("❌ Ошибка создания CG для %s", STATUS_STREAM)
             return
 
-    log.info("🚦 TRADER_SL_HANDLER запущен (слушаем sl_replaced из %s)", STATUS_STREAM)
+    log.info("🚦 TRADER_SL_HANDLER запущен (слушаем tp_hit и sl_replaced из %s)", STATUS_STREAM)
 
     while True:
         try:
@@ -60,7 +77,7 @@ async def run_trader_sl_handler_loop():
                     try:
                         await _handle_status_event(raw)
                     except Exception:
-                        log.exception("❌ Ошибка обработки записи sl_replaced")
+                        log.exception("❌ Ошибка обработки записи sl_handler")
                     finally:
                         try:
                             await redis.xack(STATUS_STREAM, CG_NAME, record_id)
@@ -73,8 +90,18 @@ async def run_trader_sl_handler_loop():
 # 🔸 Обработка одного события из positions_bybit_status
 async def _handle_status_event(raw: Dict[str, Any]) -> None:
     event = _g(raw, "event")
+
+    # FIX #2 — часть 1: отмечаем system tp_hit в кэше и выходим
+    if event == "tp_hit":
+        uid = _g(raw, "position_uid")
+        if uid:
+            _gc_recent_tp()
+            _RECENT_TP_HIT[uid] = _now_ts()
+            log.debug("SL_HANDLER: noted system tp_hit (uid=%s)", uid)
+        return
+
     if event != "sl_replaced":
-        return  # интересует только sl_replaced
+        return  # интересует только sl_replaced (tp_hit обработан выше для гейта)
 
     uid = _g(raw, "position_uid")
     sid = _to_int(_g(raw, "strategy_id"))
@@ -87,6 +114,12 @@ async def _handle_status_event(raw: Dict[str, Any]) -> None:
     # фильтр winners (не шумим по не-торгуемым стратегиям)
     if sid not in config.trader_winners:
         log.debug("⏭️ SL_HANDLER: sid=%s не в trader_winner, пропуск uid=%s", sid, uid)
+        return
+
+    # FIX #2 — гейт 1: если совсем недавно был системный tp_hit по этому uid — не двигаем SL на бирже
+    _gc_recent_tp()
+    if _RECENT_TP_HIT.get(uid):
+        log.debug("SL_HANDLER: skip sl_move_to_entry — recent system tp_hit (uid=%s)", uid)
         return
 
     # проверим, что позиция у трейдера ещё «живая»
@@ -108,6 +141,11 @@ async def _handle_status_event(raw: Dict[str, Any]) -> None:
     left_qty = await _calc_left_qty(uid)
     if not left_qty or left_qty <= Decimal("0"):
         log.debug("ℹ️ SL_HANDLER: остаток по uid=%s уже 0", uid)
+        return
+
+    # FIX #2 — гейт 2: если есть активные priced TP на бирже — не двигаем SL (ждём фактического биржевого fill'а)
+    if await _has_active_priced_tp_on_exchange(uid):
+        log.debug("SL_HANDLER: skip sl_move_to_entry — active priced TP on exchange (uid=%s)", uid)
         return
 
     # возьмём avg_fill входа (биржевая «цена входа»)
@@ -144,7 +182,6 @@ async def _handle_status_event(raw: Dict[str, Any]) -> None:
     trigger_price = _round_price(entry_avg, ticksize)
 
     # публикация команды в maintainer: переставить SL на entry с тем же объёмом
-    # новый тип: sl_move_to_entry — maintainer должен отменить активный SL и создать новый reduceOnly на trigger_price
     try:
         await infra.redis_client.xadd(MAINTAINER_STREAM, {
             "type": "sl_move_to_entry",
@@ -245,6 +282,21 @@ async def _fetch_active_sl_qty(uid: str) -> Optional[Decimal]:
         uid
     )
     return _to_dec(row["qty"]) if row and row["qty"] is not None else None
+
+async def _has_active_priced_tp_on_exchange(uid: str) -> bool:
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT 1
+        FROM public.trader_position_orders
+        WHERE position_uid = $1
+          AND kind = 'tp'
+          AND "type" = 'limit'
+          AND ext_status IN ('submitted','accepted','partially_filled')
+        LIMIT 1
+        """,
+        uid
+    )
+    return bool(row)
 
 async def _fetch_bybit_last_price(symbol: str) -> Optional[Decimal]:
     try:

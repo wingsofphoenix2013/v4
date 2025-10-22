@@ -94,7 +94,7 @@ async def main():
         # воркер: план/submit ордеров Bybit (читает trader_order_requests)
         run_with_delay(run_bybit_processor_loop, "BYBIT_PROCESSOR", start_delay=60.0),
         
-        # синхронизатор
+        # синхронизатор Система-Биржа
         run_with_delay(run_trader_maintainer_loop, "TRADER_MAINTAINER", start_delay=60.0),
         
         # обработчик SL-protect
