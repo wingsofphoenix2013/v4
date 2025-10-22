@@ -647,20 +647,31 @@ def _fmt(x: Optional[Decimal], max_prec: int = 8) -> str:
         return str(x)
 
 
-# 🔸 Утилита: расчёт остатка позиции по uid (entry − tp − close)
+# 🔸 Утилита: расчёт остатка позиции по uid (entry − tp − sl − close)
 async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(
         """
         WITH e AS (
-          SELECT COALESCE(MAX(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='entry'
+          SELECT COALESCE(MAX(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='entry'
         ),
         t AS (
-          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='tp'
+          SELECT COALESCE(SUM(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='tp'
+        ),
+        s AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='sl'
         ),
         c AS (
-          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='close'
+          SELECT COALESCE(SUM(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='close'
         )
-        SELECT e.fq - t.fq - c.fq AS left_qty FROM e,t,c
+        SELECT e.fq - t.fq - s.fq - c.fq AS left_qty FROM e,t,s,c
         """,
         uid
     )

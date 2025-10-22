@@ -142,6 +142,7 @@ async def run_trader_maintainer_loop():
             log.exception("❌ Ошибка в цикле TRADER_MAINTAINER")
             await asyncio.sleep(1.0)
 
+
 # 🔸 Периодический аудит «гигиены» (опционально)
 async def run_trader_maintainer_audit_loop(force: bool = False):
     # условия достаточности: включён ли аудит (ENV или форс) и есть ли ключи
@@ -235,6 +236,7 @@ async def run_trader_maintainer_audit_loop(force: bool = False):
 
         # интервал аудита
         await asyncio.sleep(MAINT_AUDIT_INTERVAL_SEC)
+
 
 # 🔸 Гармонизация TP (cancel + recreate)
 async def _handle_tp_harmonize(evt: Dict[str, Any]) -> None:
@@ -527,7 +529,8 @@ async def _handle_sl_move_to_entry(evt: Dict[str, Any]) -> None:
         await _cancel_active_orders_for_uid(position_uid=uid, symbol=symbol, kinds=("sl",))
 
     # сабмит нового SL reduceOnly на entry (FIX #1 — предварительный upsert)
-    new_link = f"{uid}-sl-to-entry"
+    compact_uid = uid.replace("-", "")
+    new_link = f"{compact_uid}-slt"  # короткий link id (<45)
     if TRADER_ORDER_MODE == "dry_run":
         log.info("[DRY_RUN] sl_move_to_entry submit: %s trigger=%s qty=%s link=%s",
                  symbol, _fmt(trig_norm), _fmt(qty_norm), new_link)
@@ -662,7 +665,9 @@ async def _rearm_sl(uid: str, sid: int) -> bool:
         # отменяем активные SL (если есть хвосты)
         await _cancel_active_orders_for_uid(position_uid=uid, symbol=symbol, kinds=("sl",))
 
-        link = f"{uid}-sl-audit-rearm"
+        compact_uid = uid.replace("-", "")
+        link = f"{compact_uid}-slr"  # короткий link id (<45)
+
         if TRADER_ORDER_MODE == "dry_run":
             log.info("[DRY_RUN] rearm_sl: %s trigger=%s qty=%s link=%s", symbol, _fmt(trigger), _fmt(qty), link)
             return True
@@ -1119,7 +1124,7 @@ def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
     except Exception:
         return None
 
-# 🔸 Остаток позиции по uid (entry − tp − close)
+# 🔸 Остаток позиции по uid (entry − tp − sl − close)
 async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(
         """
@@ -1133,12 +1138,17 @@ async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
           FROM public.trader_position_orders
           WHERE position_uid=$1 AND kind='tp'
         ),
+        s AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq
+          FROM public.trader_position_orders
+          WHERE position_uid=$1 AND kind='sl'
+        ),
         c AS (
           SELECT COALESCE(SUM(filled_qty),0) AS fq
           FROM public.trader_position_orders
           WHERE position_uid=$1 AND kind='close'
         )
-        SELECT e.fq - t.fq - c.fq AS left_qty FROM e,t,c
+        SELECT e.fq - t.fq - s.fq - c.fq AS left_qty FROM e,t,s,c
         """,
         uid
     )

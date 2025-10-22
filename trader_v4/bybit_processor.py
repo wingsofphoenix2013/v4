@@ -59,7 +59,7 @@ ENTRY_FILL_MAX_WAIT_SEC = 60              # общий предел ожидан
 REVERSE_WAIT_TIMEOUT_SEC = 10
 REVERSE_WAIT_POLL_MS     = 150
 
-# 🔸 Сообщим о режиме
+# условия достаточности: лог о режиме
 if TRADER_ORDER_MODE == "dry_run":
     log.debug("BYBIT processor v2: DRY_RUN (entry/TP/SL в БД; REST без реальной отправки)")
 elif TRADER_ORDER_MODE == "off":
@@ -952,10 +952,13 @@ async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
         t AS (
           SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='tp'
         ),
+        s AS (
+          SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='sl'
+        ),
         c AS (
           SELECT COALESCE(SUM(filled_qty),0) AS fq FROM public.trader_position_orders WHERE position_uid=$1 AND kind='close'
         )
-        SELECT e.fq - t.fq - c.fq AS left_qty FROM e,t,c
+        SELECT e.fq - t.fq - s.fq - c.fq AS left_qty FROM e,t,s,c
         """,
         uid
     )
