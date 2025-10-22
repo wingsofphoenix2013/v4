@@ -103,6 +103,8 @@ async def run_trader_maintainer_loop():
                             await _handle_final_flatten_force(evt)
                         elif etype == "cleanup_after_flat":
                             await _handle_cleanup_after_flat(evt)
+                        elif etype == "sl_move_to_entry":
+                            await _handle_sl_move_to_entry(evt)
                         else:
                             log.debug("ℹ️ Пропуск неизвестного type=%s evt=%s", etype, evt)
 
@@ -328,6 +330,98 @@ async def _handle_final_flatten_force(evt: Dict[str, Any]) -> None:
     await _mark_order_after_submit(order_link_id=link_id, ok=ok_c, order_id=oid_c, retcode=rc_c, retmsg=rm_c)
     log.info("flatten_force: submit reduceOnly close %s qty=%s ok=%s", symbol, _fmt(qty), ok_c)
 
+# 🔸 Перестановка SL на цену входа (по команде sl_move_to_entry от sl_handler)
+async def _handle_sl_move_to_entry(evt: Dict[str, Any]) -> None:
+    if TRADER_ORDER_MODE == "off":
+        return
+
+    uid = evt["position_uid"]
+    sid = evt["strategy_id"]
+    direction = (evt.get("direction") or "").lower()
+    trigger_price = _as_decimal(evt.get("trigger_price"))
+    qty_req = _as_decimal(evt.get("qty"))
+
+    if direction not in ("long", "short") or trigger_price is None or qty_req is None or qty_req <= 0:
+        log.debug("⚠️ sl_move_to_entry: некорректный evt=%s", evt)
+        return
+
+    # symbol можно прислать в событии; если нет — найдём по entry
+    symbol = evt.get("symbol")
+    if not symbol:
+        row = await infra.pg_pool.fetchrow(
+            """
+            SELECT symbol
+            FROM public.trader_position_orders
+            WHERE position_uid = $1
+            ORDER BY id DESC LIMIT 1
+            """,
+            uid
+        )
+        if not row or not row["symbol"]:
+            log.debug("⚠️ sl_move_to_entry: не найден symbol для uid=%s", uid)
+            return
+        symbol = str(row["symbol"])
+
+    # Если после событий позиция уже flat — ничего не делаем
+    left_qty = await _calc_left_qty_for_uid(uid)
+    if not left_qty or left_qty <= 0:
+        log.debug("ℹ️ sl_move_to_entry: uid=%s уже flat", uid)
+        return
+
+    # Нормализация цены/кол-ва к точностям
+    t = config.tickers.get(symbol) or {}
+    ticksize = _as_decimal(t.get("ticksize"))
+    precision_qty = t.get("precision_qty")
+    trig_norm = _round_price(trigger_price, ticksize)
+    qty_norm = _round_qty(min(qty_req, left_qty), precision_qty)
+
+    if not qty_norm or qty_norm <= 0:
+        log.debug("ℹ️ sl_move_to_entry: qty_norm<=0 (uid=%s)", uid)
+        return
+
+    # Если уже стоит активный SL с теми же параметрами — выходим
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT trigger_price, qty
+        FROM public.trader_position_orders
+        WHERE position_uid = $1 AND kind='sl'
+          AND ext_status IN ('submitted','accepted','partially_filled')
+        ORDER BY id DESC LIMIT 1
+        """,
+        uid
+    )
+    if row:
+        cur_trig = _round_price(_as_decimal(row["trigger_price"]), ticksize)
+        cur_qty = _round_qty(_as_decimal(row["qty"]) or Decimal("0"), precision_qty)
+        if cur_trig == trig_norm and cur_qty == qty_norm:
+            log.info("sl_move_to_entry: активный SL уже соответствует (uid=%s)", uid)
+            return
+
+    # Отменяем все активные SL
+    if TRADER_ORDER_MODE == "dry_run":
+        log.info("[DRY_RUN] sl_move_to_entry: cancel active SL uid=%s", uid)
+    else:
+        await _cancel_active_orders_for_uid(position_uid=uid, symbol=symbol, kinds=("sl",))
+
+    # Сабмит нового SL reduceOnly на entry
+    new_link = f"{uid}-sl-to-entry"
+    if TRADER_ORDER_MODE == "dry_run":
+        log.info("[DRY_RUN] sl_move_to_entry submit: %s trigger=%s qty=%s link=%s",
+                 symbol, _fmt(trig_norm), _fmt(qty_norm), new_link)
+        return
+
+    ok_s, oid_s, rc_s, rm_s = await _submit_sl(
+        symbol=symbol,
+        side=_to_title_side(_side_word(_opposite(direction))),   # стоп против направления позиции
+        trigger_price=trig_norm,
+        qty=qty_norm,
+        link_id=new_link,
+        trigger_direction=_calc_trigger_direction(direction),
+    )
+    await _mark_order_after_submit(order_link_id=new_link, ok=ok_s, order_id=oid_s, retcode=rc_s, retmsg=rm_s)
+    log.info("sl_move_to_entry: %s → trigger=%s qty=%s ok=%s (uid=%s)",
+             symbol, _fmt(trig_norm), _fmt(qty_norm), ok_s, uid)
+             
 # 🔸 Снятие всех активных TP/SL после фактического flat на бирже
 async def _handle_cleanup_after_flat(evt: Dict[str, Any]) -> None:
     position_uid = evt["position_uid"]
@@ -705,6 +799,14 @@ def _str_qty(q: Decimal) -> str:
 def _str_price(p: Decimal) -> str:
     return _fmt(p)
 
+def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
+    try:
+        res = resp.get("result") or {}
+        oid = res.get("orderId")
+        return str(oid) if oid is not None else None
+    except Exception:
+        return None
+        
 # 🔸 Расчёт остатка позиции по uid (entry − tp − close)
 async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
     row = await infra.pg_pool.fetchrow(

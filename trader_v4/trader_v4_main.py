@@ -11,6 +11,7 @@ from trader_position_closer import run_trader_position_closer_loop          # с
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
 from bybit_processor import run_bybit_processor_loop                        # v2: entry → fill → TP/SL (priced) + virtuals
 from trader_maintainer import run_trader_maintainer_loop
+from trader_sl_handler import run_trader_sl_handler_loop
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -95,6 +96,9 @@ async def main():
         
         # синхронизатор
         run_with_delay(run_trader_maintainer_loop, "TRADER_MAINTAINER", start_delay=60.0),
+        
+        # обработчик SL-protect
+        run_with_delay(run_trader_sl_handler_loop, "TRADER_SL_HANDLER", start_delay=60.0),
     )
 
 # 🔸 Запуск через CLI
