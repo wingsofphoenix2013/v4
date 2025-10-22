@@ -667,6 +667,11 @@ def _compute_sl_after_tp(
         price = avg_fill
     return _round_price(price, ticksize)
 
+def _str_qty(q: Decimal) -> str:
+    return _fmt(q)
+
+def _str_price(p: Decimal) -> str:
+    return _fmt(p)
 
 # 🔸 Расчёт остатка позиции по uid (entry − tp − close)
 async def _calc_left_qty_for_uid(uid: str) -> Optional[Decimal]:
