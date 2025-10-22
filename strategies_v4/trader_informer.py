@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from dataclasses import dataclass
 from typing import Optional, Dict, Set
 
 from infra import infra
@@ -30,10 +32,16 @@ XREAD_COUNT = 100
 
 PUBSUB_CHANNEL_STRATEGIES = "strategies_v4_events"
 
-# 🔸 Кэш направлений: position_uid → direction
-_dir_cache: Dict[str, str] = {}
+# 🔸 Кэш позиции по uid (для быстрых публикаций без БД)
+@dataclass
+class _PosSnap:
+    entry_price: Optional[Decimal] = None
+    quantity: Optional[Decimal] = None
+    quantity_left: Optional[Decimal] = None
+    direction: Optional[str] = None
 
-# 🔸 Watchlist: набор strategy_id с trader_winner=true
+# 🔸 In-memory кэши
+_pos_cache: Dict[str, _PosSnap] = {}
 _watch_ids: Set[int] = set()
 
 
@@ -47,6 +55,13 @@ def _get(d: dict, key: str):
 def _now_iso() -> str:
     # время публикации воркером (UTC, naive, ISO8601)
     return datetime.utcnow().isoformat(timespec="milliseconds")
+
+def _rebuild_watch_ids() -> Set[int]:
+    # пересобираем watchlist из живой конфигурации
+    return {sid for sid, s in (config.strategies or {}).items() if s.get("trader_winner", False)}
+
+def _is_watched(strategy_id: int) -> bool:
+    return strategy_id in _watch_ids
 
 def _strategy_type(strategy_id: int) -> str:
     s = config.strategies.get(strategy_id) or {}
@@ -84,30 +99,51 @@ def _message_for_event(event: str, tp_level: Optional[int] = None) -> str:
         return "closed by sl-protect"
     return "position event"
 
-def _is_watched(strategy_id: int) -> bool:
-    return strategy_id in _watch_ids
+def _to_dec(val: Optional[str]) -> Optional[Decimal]:
+    if val is None:
+        return None
+    try:
+        return Decimal(str(val))
+    except (InvalidOperation, ValueError):
+        return None
 
-def _find_direction_from_registry(position_uid: str) -> Optional[str]:
-    # быстрый поиск направления по рантайм-реестру (если кэша нет)
+def _get_leverage(strategy_id: int) -> Optional[Decimal]:
+    s = config.strategies.get(strategy_id) or {}
+    return _to_dec(s.get("leverage"))
+
+def _fill_cache_from_registry(position_uid: str) -> Optional[_PosSnap]:
+    # попытка восстановить из рантайм-реестра (при холодном старте/гонках)
     for st in position_registry.values():
         if st.uid == position_uid:
-            return str(st.direction)
+            snap = _PosSnap(
+                entry_price=_to_dec(st.entry_price),
+                quantity=_to_dec(st.quantity),
+                quantity_left=_to_dec(st.quantity_left),
+                direction=str(st.direction) if st.direction else None,
+            )
+            _pos_cache[position_uid] = snap
+            return snap
     return None
 
-def _remember_direction(uid: str, direction: str):
-    _dir_cache[uid] = direction
+def _get_snap(uid: str) -> Optional[_PosSnap]:
+    snap = _pos_cache.get(uid)
+    if snap:
+        return snap
+    return _fill_cache_from_registry(uid)
 
-def _forget_direction(uid: str):
-    if uid in _dir_cache:
-        del _dir_cache[uid]
+def _compute_margin_used(entry_price: Optional[Decimal], qty_left: Optional[Decimal], leverage: Optional[Decimal]) -> Optional[str]:
+    # margin_used = (quantity_left * entry_price) / leverage ; квантование до 4 знаков
+    if entry_price is None or qty_left is None or leverage in (None, Decimal("0")):
+        return None
+    val = (qty_left * entry_price) / leverage
+    try:
+        return str(val.quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+    except Exception:
+        return str(val)
 
-def _rebuild_watch_ids() -> Set[int]:
-    # пересобираем watchlist из живой конфигурации
-    return {sid for sid, s in (config.strategies or {}).items() if s.get("trader_winner", False)}
 
-
-# 🔸 Публикация события в выходной стрим
-async def _publish(strategy_id: int, position_uid: str, direction: str, event: str, *, tp_level: Optional[int] = None):
+# 🔸 Публикация события в выходной стрим (минимум + опциональные поля)
+async def _publish(strategy_id: int, position_uid: str, direction: str, event: str, *, tp_level: Optional[int] = None, extras: Optional[Dict[str, str]] = None):
     payload = {
         "strategy_id": str(strategy_id),
         "position_uid": str(position_uid),
@@ -118,8 +154,10 @@ async def _publish(strategy_id: int, position_uid: str, direction: str, event: s
         "side": "system",
         "ts": _now_iso(),
     }
-    if event == "tp_hit" and tp_level is not None:
+    if tp_level is not None and event == "tp_hit":
         payload["tp_level"] = str(int(tp_level))
+    if extras:
+        payload.update(extras)
 
     await infra.redis_client.xadd(STREAM_OUT, payload)
     log.info(
@@ -151,8 +189,26 @@ async def _handle_open_records(records):
                 await infra.redis_client.xack(STREAM_OPEN, CG_OPEN, record_id)
                 continue
 
-            _remember_direction(position_uid, direction)
-            await _publish(strategy_id, position_uid, direction, "opened")
+            # читаем размеры из события открытия
+            entry_price = _to_dec(_get(data, "entry_price"))
+            quantity = _to_dec(_get(data, "quantity"))
+            quantity_left = _to_dec(_get(data, "quantity_left"))
+
+            # кэшируем снапшот
+            _pos_cache[position_uid] = _PosSnap(entry_price=entry_price, quantity=quantity, quantity_left=quantity_left, direction=direction)
+
+            # extras для opened
+            lev = _get_leverage(strategy_id)
+            margin_used = _compute_margin_used(entry_price, quantity_left, lev)
+            extras = {
+                "leverage": str(lev) if lev is not None else "",
+                "quantity": str(quantity) if quantity is not None else "",
+                "quantity_left": str(quantity_left) if quantity_left is not None else "",
+            }
+            if margin_used is not None:
+                extras["margin_used"] = margin_used
+
+            await _publish(strategy_id, position_uid, direction, "opened", extras=extras)
 
         except Exception:
             log.exception("❌ Ошибка обработки записи OPENED (id=%s)", record_id)
@@ -191,30 +247,67 @@ async def _handle_update_records(records):
                 await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
                 continue
 
-            direction = _dir_cache.get(position_uid)
+            # определяем направление позиции
+            snap = _get_snap(position_uid)
+            direction: Optional[str] = snap.direction if snap else None
             if direction is None:
+                # для reverse-события есть original_direction
                 if event_type == "closed" and evt.get("original_direction"):
                     direction = str(evt.get("original_direction"))
                 else:
-                    direction = _find_direction_from_registry(position_uid)
+                    direction = None  # оставим попытку ниже
+            if direction is None:
+                # fallback на реестр (на случай гонки)
+                for st in position_registry.values():
+                    if st.uid == position_uid and st.direction:
+                        direction = str(st.direction)
+                        break
 
             if direction is None:
                 log.warning("[SKIP] direction unknown for uid=%s sid=%s event_type=%s", position_uid, strategy_id, event_type)
                 await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
                 continue
 
+            # публикация по типам
             if event_type == "tp_hit":
                 tp_level = int(evt.get("tp_level"))
-                await _publish(strategy_id, position_uid, direction, "tp_hit", tp_level=tp_level)
+                # обновляем qty_left в кэше
+                new_left = _to_dec(evt.get("quantity_left"))
+                if snap and new_left is not None:
+                    snap.quantity_left = new_left
+                # вычисляем extras (включаем размеры)
+                lev = _get_leverage(strategy_id)
+                entry = snap.entry_price if snap else None
+                extras = {
+                    "leverage": str(lev) if lev is not None else "",
+                    "quantity": str(snap.quantity) if snap and snap.quantity is not None else "",
+                    "quantity_left": str(new_left) if new_left is not None else "",
+                }
+                margin_used = _compute_margin_used(entry, new_left, lev)
+                if margin_used is not None:
+                    extras["margin_used"] = margin_used
+
+                await _publish(strategy_id, position_uid, direction, "tp_hit", tp_level=tp_level, extras=extras)
 
             elif event_type == "sl_replaced":
+                # без доп. полей (размер позиции не меняется)
                 await _publish(strategy_id, position_uid, direction, "sl_replaced")
 
             elif event_type == "closed":
                 reason = str(evt.get("close_reason") or "")
                 event = _map_closed_event(reason)
-                await _publish(strategy_id, position_uid, direction, event)
-                _forget_direction(position_uid)
+                # extras для закрытия: leverage, quantity, quantity_left=0, margin_used=0
+                lev = _get_leverage(strategy_id)
+                extras = {
+                    "leverage": str(lev) if lev is not None else "",
+                    "quantity": str(snap.quantity) if snap and snap.quantity is not None else "",
+                    "quantity_left": "0",
+                    "margin_used": "0",
+                }
+                await _publish(strategy_id, position_uid, direction, event, extras=extras)
+                # позиция закрыта — очищаем кэш
+                if position_uid in _pos_cache:
+                    del _pos_cache[position_uid]
 
             else:
                 # неизвестные/нерелевантные типы — просто ACK
@@ -312,11 +405,11 @@ async def _watchlist_pubsub_loop():
         if msg["type"] != "message":
             continue
         try:
-            data = json.loads(_b2s(msg["data"]))
+            _ = json.loads(_b2s(msg["data"]))  # формат не важен — берём актуальное состояние из config
         except Exception:
             continue
 
-        # при любом событии стратегий — пересобираем watchlist и логируем добавления
+        # при любом событии стратегий — пересобираем watchlist и логируем добавления/удаления
         new_ids = _rebuild_watch_ids()
         added = new_ids - _watch_ids
         removed = _watch_ids - new_ids
