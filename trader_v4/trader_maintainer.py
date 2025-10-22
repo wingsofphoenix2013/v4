@@ -237,7 +237,39 @@ async def run_trader_maintainer_audit_loop(force: bool = False):
         # интервал аудита
         await asyncio.sleep(MAINT_AUDIT_INTERVAL_SEC)
 
+# 🔸 Снятие всех активных TP/SL после фактического flat на бирже
+async def _handle_cleanup_after_flat(evt: Dict[str, Any]) -> None:
+    position_uid = evt["position_uid"]
 
+    # найдём symbol для uid (любой ордер этой позиции подойдёт)
+    row = await infra.pg_pool.fetchrow(
+        """
+        SELECT symbol
+        FROM public.trader_position_orders
+        WHERE position_uid = $1
+        ORDER BY id DESC LIMIT 1
+        """,
+        position_uid
+    )
+    if not row or not row["symbol"]:
+        log.debug("cleanup_after_flat: symbol not found for uid=%s", position_uid)
+        return
+    symbol = str(row["symbol"])
+
+    # если по данным БД остаток > 0 — ничего не делаем (этим займётся flatten_force)
+    left_qty = await _calc_left_qty_for_uid(position_uid)
+    if left_qty and left_qty > 0:
+        log.debug("cleanup_after_flat: left_qty=%s > 0 — skip (uid=%s)", _fmt(left_qty), position_uid)
+        return
+
+    if TRADER_ORDER_MODE == "dry_run":
+        log.info("[DRY_RUN] cleanup_after_flat: cancel active TP/SL uid=%s", position_uid)
+        return
+
+    # отмена всех активных TP/SL
+    await _cancel_active_orders_for_uid(position_uid=position_uid, symbol=symbol, kinds=("tp", "sl"))
+    log.info("cleanup_after_flat: TP/SL canceled for uid=%s", position_uid)
+    
 # 🔸 Гармонизация TP (cancel + recreate)
 async def _handle_tp_harmonize(evt: Dict[str, Any]) -> None:
     if TRADER_ORDER_MODE == "off":
