@@ -386,7 +386,8 @@ async def _handle_post_tp_sl(evt: Dict[str, Any]) -> None:
     # отменяем активные SL и ставим новый
     await _cancel_active_orders_for_uid(position_uid=position_uid, symbol=symbol, kinds=("sl",))
 
-    new_link = f"{position_uid}-sl-after-tp-{level}"
+    compact_uid = position_uid.replace("-", "")
+    new_link = f"{compact_uid}-sltp{level}"
     ok_s, oid_s, rc_s, rm_s = await _submit_sl(
         symbol=symbol,
         side=_to_title_side(_side_word(_opposite(direction))),
@@ -441,7 +442,8 @@ async def _handle_final_flatten_force(evt: Dict[str, Any]) -> None:
         return
 
     # сабмит reduceOnly market
-    link_id = f"{position_uid}-flatten"
+    compact_uid = position_uid.replace("-", "")
+    link_id = f"{compact_uid}-fl"
     qty = left_qty
 
     # dry-run ветка

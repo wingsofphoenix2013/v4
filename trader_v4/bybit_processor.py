@@ -441,6 +441,9 @@ def _build_plan_from_policy(
     Optional[Tuple[Decimal, Decimal, str]],
     List[Tuple[int, Decimal, Decimal, str]]
 ]:
+    # компактный uid для коротких link id (биржевой лимит 45 символов)
+    compact_uid = position_uid.replace("-", "")
+
     tp_levels = list(policy.get("tp_levels") or [])
     tp_levels.sort(key=lambda x: int(x.get("level", 0)))
 
@@ -456,17 +459,21 @@ def _build_plan_from_policy(
         vol_pct = _as_decimal(t.get("volume_percent")) or Decimal("0")
         target_qty = (filled_qty * vol_pct / Decimal("100"))
         target_qty = _round_qty(target_qty, precision_qty)
+        # последний уровень не должен превышать остаток после предыдущих
         if i == len(priced_tps) - 1 and (sum_priced_qty + target_qty) > filled_qty:
             target_qty = filled_qty - sum_priced_qty
             target_qty = _round_qty(target_qty, precision_qty)
+        # отбрасываем слишком маленькие объёмы
         if min_qty is not None and target_qty < min_qty:
             target_qty = Decimal("0")
         if target_qty > 0:
             price = _compute_tp_price_from_policy(avg_fill, direction, t.get("tp_type"), _as_decimal(t.get("tp_value")), ticksize)
+            # TP(limit) остаётся в прежнем формате — он короче 45
             link_id = f"{position_uid}-tp-{lvl}"
             tp_plan.append((lvl, price, target_qty, link_id))
             sum_priced_qty += target_qty
 
+    # виртуальный TP(signal) — не уходит на биржу (link длина не критична), оставляем как было
     tp_signal: Optional[Tuple[int, Decimal, str]] = None
     if lvl_signal is not None:
         qty_sig = filled_qty - sum_priced_qty
@@ -476,12 +483,15 @@ def _build_plan_from_policy(
         link_sig = f"{position_uid}-tp-{lvl_signal}-signal"
         tp_signal = (lvl_signal, qty_sig, link_sig)
 
+    # первичный SL от политики
     sl_base = policy.get("sl") or {}
     sl_primary_price = _compute_sl_from_policy(avg_fill, direction, sl_base.get("type"), _as_decimal(sl_base.get("value")), ticksize)
     sl_primary: Optional[Tuple[Decimal, Decimal, str]] = None
     if sl_primary_price is not None:
+        # link короче 45 — формат оставляем
         sl_primary = (sl_primary_price, _round_qty(filled_qty, precision_qty), f"{position_uid}-sl")
 
+    # SL после TP-уровней — для биржи делаем короткие link id (sltp<L>)
     sl_after: List[Tuple[int, Decimal, Decimal, str]] = []
     for t in tp_levels:
         lvl = int(t["level"])
@@ -492,11 +502,10 @@ def _build_plan_from_policy(
         if min_qty is not None and qty_left < min_qty:
             continue
         price = _compute_sl_after_tp(avg_fill, direction, mode, _sl_value(policy, lvl), ticksize)
-        link = f"{position_uid}-sl-after-tp-{lvl}"
+        link = f"{compact_uid}-sltp{lvl}"  # короткий link для биржи
         sl_after.append((lvl, price, qty_left, link))
 
     return tp_plan, tp_signal, sl_primary, sl_after
-
 
 def _compute_tp_price_from_policy(
     avg_fill: Decimal,
