@@ -142,11 +142,10 @@ async def run_trader_maintainer_loop():
             log.exception("❌ Ошибка в цикле TRADER_MAINTAINER")
             await asyncio.sleep(1.0)
 
-
 # 🔸 Периодический аудит «гигиены» (опционально)
-async def run_trader_maintainer_audit_loop():
-    # условия достаточности: включён ли аудит и есть ли ключи
-    if not MAINT_AUDIT:
+async def run_trader_maintainer_audit_loop(force: bool = False):
+    # условия достаточности: включён ли аудит (ENV или форс) и есть ли ключи
+    if not (MAINT_AUDIT or force):
         return
     if TRADER_ORDER_MODE == "off" or not API_KEY or not API_SECRET:
         log.debug("MAINT_AUDIT: пропуск — OFF-режим или нет API-ключей")
@@ -193,7 +192,7 @@ async def run_trader_maintainer_audit_loop():
 
                 # stale: submitted без order_id дольше порога
                 for ao in active_orders:
-                    # условия достаточности: лимит обработки за тик
+                    # лимит обработки за тик
                     if checked >= MAINT_AUDIT_MAX_ORDERS_PER_TICK:
                         break
                     if (ao["ext_status"] == "submitted") and (not ao["order_id"]):
@@ -227,7 +226,7 @@ async def run_trader_maintainer_audit_loop():
                     has_priced_tp = any((o["kind"] == "tp" and (o["type"] or "").lower() == "limit") for o in active_orders)
                     if not has_sl and not has_priced_tp:
                         ok_rearm = await _rearm_sl(uid, sid)
-                        # условия достаточности: если SL поставить не удалось — паникуем
+                        # если SL поставить не удалось — паникуем
                         if not ok_rearm:
                             await _panic_close(uid)
 
@@ -236,7 +235,6 @@ async def run_trader_maintainer_audit_loop():
 
         # интервал аудита
         await asyncio.sleep(MAINT_AUDIT_INTERVAL_SEC)
-
 
 # 🔸 Гармонизация TP (cancel + recreate)
 async def _handle_tp_harmonize(evt: Dict[str, Any]) -> None:
