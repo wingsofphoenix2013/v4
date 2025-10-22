@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 
 # 🔸 Логгер модуля
@@ -94,4 +94,7 @@ async def get_closed_rsi(redis, symbol: str, tf: str, length: int) -> float | No
 
 # 🔸 Вспомогательное: ISO-время открытия бара по ms
 def bar_open_iso(bar_open_ms: int) -> str:
-    return datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+    # создаём aware-UTC, затем снимаем tzinfo, чтобы сохранить прежний формат ISO
+    return datetime.fromtimestamp(bar_open_ms / 1000, tz=timezone.utc) \
+                   .replace(tzinfo=None) \
+                   .isoformat()
