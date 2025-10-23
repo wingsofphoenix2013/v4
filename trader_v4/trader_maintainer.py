@@ -270,7 +270,7 @@ async def _handle_cleanup_after_flat(evt: Dict[str, Any]) -> None:
     await _cancel_active_orders_for_uid(position_uid=position_uid, symbol=symbol, kinds=("tp", "sl"))
     log.info("cleanup_after_flat: TP/SL canceled for uid=%s", position_uid)
     
-# 🔸 Гармонизация TP (cancel + recreate)
+# 🔸 Гармонизация TP (cancel + recreate с fallback на дубликат linkId)
 async def _handle_tp_harmonize(evt: Dict[str, Any]) -> None:
     if TRADER_ORDER_MODE == "off":
         return
@@ -284,9 +284,11 @@ async def _handle_tp_harmonize(evt: Dict[str, Any]) -> None:
         log.debug("⚠️ tp_harmonize: некорректное событие %s", evt)
         return
 
+    # тянем максимум полей, чтобы уметь upsert-ить новый TPO при смене linkId
     tpo = await infra.pg_pool.fetchrow(
         """
-        SELECT position_uid, symbol, side, price, qty, ext_status
+        SELECT position_uid, symbol, side, price, qty, ext_status,
+               calc_type, calc_value, base_price, base_kind, activation_tp_level, trigger_by
         FROM public.trader_position_orders
         WHERE order_link_id = $1 AND kind='tp' AND "level" = $2
         """,
@@ -297,30 +299,90 @@ async def _handle_tp_harmonize(evt: Dict[str, Any]) -> None:
         return
 
     symbol = str(tpo["symbol"])
-    side = _to_title_side(str(tpo["side"] or "").upper())  # "Buy"/"Sell"
+    side_title = _to_title_side(str(tpo["side"] or "").upper())  # "Buy"/"Sell"
+    side_word  = str(tpo["side"] or "").upper() or None          # "BUY"/"SELL" для upsert
     price_need = _as_decimal(tpo["price"])
-    qty_need = _as_decimal(tpo["qty"])
+    qty_need   = _as_decimal(tpo["qty"])
 
     # точности
     ticksize = _as_decimal((config.tickers.get(symbol) or {}).get("ticksize"))
     precision_qty = (config.tickers.get(symbol) or {}).get("precision_qty")
     price_need = _round_price(price_need, ticksize)
-    qty_need = _round_qty(qty_need or Decimal("0"), precision_qty)
+    qty_need   = _round_qty(qty_need or Decimal("0"), precision_qty)
 
-    # dry-run ветка
+    # dry-run
     if TRADER_ORDER_MODE == "dry_run":
         log.info("[DRY_RUN] tp_harmonize: cancel+recreate %s L=%s → price=%s qty=%s",
                  symbol, level, _fmt(price_need), _fmt(qty_need))
         return
 
+    # 1) cancel старого link
     ok_c, rc_c, rm_c = await _cancel_by_link(symbol=symbol, link_id=order_link_id)
     log.debug("tp_harmonize: cancel link=%s → ok=%s rc=%s msg=%s", order_link_id, ok_c, rc_c, rm_c)
 
+    # 2) попытка recreate с тем же link
     ok_t, oid_t, rc_t, rm_t = await _submit_tp(
-        symbol=symbol, side=side, price=price_need, qty=qty_need, link_id=order_link_id
+        symbol=symbol, side=side_title, price=price_need, qty=qty_need, link_id=order_link_id
     )
     await _mark_order_after_submit(order_link_id=order_link_id, ok=ok_t, order_id=oid_t, retcode=rc_t, retmsg=rm_t)
+    if ok_t or rc_t not in (110072,):  # 110072 = OrderLinkedID is duplicate
+        return
 
+    # 3) fallback: новый linkId (обрезаем до лимита 45)
+    def _derive_link(base: str, suffix: str) -> str:
+        max_len = 45
+        keep = max_len - len(suffix)
+        return (base[:keep] + suffix) if keep > 0 else suffix[-max_len:]
+
+    # пробуем до 3 вариантов
+    for i in (1, 2, 3):
+        new_link = _derive_link(order_link_id, f"-r{i}")
+
+        # upsert нового TPO с новым link (чтобы _mark_order_after_submit было куда писать)
+        await _upsert_order(
+            position_uid=position_uid,
+            kind="tp",
+            level=level,
+            exchange="BYBIT",
+            symbol=symbol,
+            side=side_word,
+            otype="limit",
+            tif="GTC",
+            reduce_only=True,
+            price=price_need,
+            trigger_price=None,
+            qty=qty_need,
+            order_link_id=new_link,
+            ext_status="planned",
+            qty_raw=qty_need,
+            price_raw=price_need,
+            calc_type=(tpo["calc_type"] if tpo["calc_type"] else None),
+            calc_value=_as_decimal(tpo["calc_value"]),
+            base_price=_as_decimal(tpo["base_price"]),
+            base_kind=(tpo["base_kind"] if tpo["base_kind"] else None),
+            activation_tp_level=_as_int(tpo["activation_tp_level"]),
+            trigger_by=(tpo["trigger_by"] if tpo["trigger_by"] else None),
+            supersedes_link_id=order_link_id,
+        )
+
+        ok_n, oid_n, rc_n, rm_n = await _submit_tp(
+            symbol=symbol, side=side_title, price=price_need, qty=qty_need, link_id=new_link
+        )
+        await _mark_order_after_submit(order_link_id=new_link, ok=ok_n, order_id=oid_n, retcode=rc_n, retmsg=rm_n)
+        log.debug("tp_harmonize: fallback link=%s → ok=%s rc=%s msg=%s", new_link, ok_n, rc_n, rm_n)
+
+        if ok_n:
+            # пометим старый TPO как superseded/expired для чистоты (не обязательно, но полезно)
+            try:
+                await infra.pg_pool.execute(
+                    "UPDATE public.trader_position_orders SET ext_status='expired', last_ext_event_at=now() WHERE order_link_id=$1 AND kind='tp'",
+                    order_link_id
+                )
+            except Exception:
+                log.exception("tp_harmonize: mark old link expired failed (%s)", order_link_id)
+            return
+
+    log.warning("tp_harmonize: all fallback attempts failed for %s L=%s", symbol, level)
 
 # 🔸 Применение SL после биржевого TP (policy)
 async def _handle_post_tp_sl(evt: Dict[str, Any]) -> None:
