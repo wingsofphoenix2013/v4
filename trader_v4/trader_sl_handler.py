@@ -1,7 +1,6 @@
 # trader_sl_handler.py — обработчик SL-protect:
 # слушает СИСТЕМНЫЕ события из positions_bybit_status и при необходимости инициирует перестановку биржевого SL на entry.
-# FIX #2: не переносить SL на бирже из-за системного tp_hit — двойные гейты:
-#   (1) недавний system tp_hit (TTL), (2) есть активные priced TP на бирже.
+# FIX #2: не переносить SL на бирже из-за системного tp_hit — одинарный гейт.
 
 # 🔸 Импорты
 import asyncio
@@ -168,14 +167,10 @@ async def _handle_status_event(raw: Dict[str, Any]) -> None:
         log.debug("ℹ️ SL_HANDLER: last=%s не лучше entry=%s для dir=%s (uid=%s)", _fmt(last_price), _fmt(entry_avg), direction, uid)
         return
 
-    # берём текущий активный SL (для объёма)
+    # объём для SL: активный SL, иначе — весь остаток
     sl_qty = await _fetch_active_sl_qty(uid)
-    if sl_qty is None:
-        log.debug("ℹ️ SL_HANDLER: активный SL не найден для uid=%s — пропуск", uid)
-        return
-    if sl_qty <= Decimal("0"):
-        log.debug("ℹ️ SL_HANDLER: активный SL имеет нулевой объём (uid=%s)", uid)
-        return
+    if sl_qty is None or sl_qty <= Decimal("0"):
+        sl_qty = left_qty  # fallback: прикрываем весь фактический остаток
 
     # нормализуем цену entry к ticksize
     ticksize = _to_dec((config.tickers.get(symbol) or {}).get("ticksize"))

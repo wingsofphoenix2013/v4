@@ -630,11 +630,12 @@ async def _wait_entry_fill_or_fallback(
         first_seen = False
         last_filled = Decimal("0")
         stable_since: Optional[datetime] = None
+        row = None  # для использования после цикла
 
         while datetime.utcnow() < deadline:
             row = await infra.pg_pool.fetchrow(
                 """
-                SELECT filled_qty, avg_fill_price, ext_status
+                SELECT filled_qty, avg_fill_price, ext_status, side
                 FROM public.trader_position_orders
                 WHERE order_link_id = $1
                 """,
@@ -672,14 +673,88 @@ async def _wait_entry_fill_or_fallback(
             ap = _as_decimal(row["avg_fill_price"])
             if fq > 0 and ap and ap > 0:
                 return ap, _round_qty(fq, precision_qty)
-        # совсем ничего нет — прерываем
+
+        # 🔸 Таймаут: отказываемся от дальнейшего открытия
+        # 1) Отменяем висевший entry на бирже (fail-open)
+        try:
+            await _cancel_by_link(symbol=symbol, link_id=entry_link_id)
+        except Exception:
+            log.exception("timeout: cancel entry failed (link=%s)", entry_link_id)
+
+        # 2) Если был частичный fill — закрываем набранный объём reduceOnly Market
+        try:
+            # перечитаем минимально необходимые поля (на случай, если row пуст)
+            row2 = row or await infra.pg_pool.fetchrow(
+                """
+                SELECT filled_qty, side
+                FROM public.trader_position_orders
+                WHERE order_link_id = $1
+                """,
+                entry_link_id
+            )
+            fq2 = _as_decimal(row2["filled_qty"]) if row2 and row2["filled_qty"] is not None else None
+            side_entry = (row2["side"] or "").upper() if row2 and row2["side"] is not None else None
+
+            if fq2 and fq2 > 0 and side_entry in ("BUY", "SELL"):
+                close_qty = _round_qty(fq2, precision_qty)
+                # Направление закрытия — противоположное входу
+                # BUY (long entry) → SELL;  SELL (short entry) → BUY
+                direction = "long" if side_entry == "BUY" else "short"
+                close_side_title = _to_title_side(_side_word(_opposite(direction)))
+                close_side_word = _side_word(_opposite(direction))
+                close_link = f"{position_uid}-fl-timeout"
+
+                # фиксируем close в БД (идемпотентно)
+                await _upsert_order(
+                    position_uid=position_uid,
+                    kind="close",
+                    level=None,
+                    exchange="BYBIT",
+                    symbol=symbol,
+                    side=close_side_word,
+                    otype="market",
+                    tif="GTC",
+                    reduce_only=True,
+                    price=None,
+                    trigger_price=None,
+                    qty=close_qty,
+                    order_link_id=close_link,
+                    ext_status="planned",
+                    qty_raw=close_qty,
+                    price_raw=None,
+                    calc_type=None,
+                    calc_value=None,
+                    base_price=None,
+                    base_kind="fill",
+                    activation_tp_level=None,
+                    trigger_by=None,
+                    supersedes_link_id=None,
+                )
+
+                ok_c, oid_c, rc_c, rm_c = await _submit_close_reduce_only(
+                    symbol=symbol,
+                    side=close_side_title,
+                    qty=close_qty,
+                    link_id=close_link,
+                )
+                await _mark_order_after_submit(
+                    order_link_id=close_link,
+                    ok=ok_c,
+                    order_id=oid_c,
+                    retcode=rc_c,
+                    retmsg=rm_c,
+                )
+        except Exception:
+            log.exception("timeout: reduceOnly close failed (uid=%s)", position_uid)
+
+        # 3) Сообщаем вызывающему: плана строить не надо
         return None, None
 
     # DRY_RUN: ориентируемся на mark и плановый объём
     if entry_price_mark is None:
         entry_price_mark = await _fetch_mark_price(symbol)
     return entry_price_mark, _round_qty(qty_planned, precision_qty)
-
+    
 # 🔸 Сабмиты: entry / TP / SL
 async def _submit_entry(*, symbol: str, side: str, qty: Decimal, link_id: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
     body = {
@@ -746,6 +821,43 @@ async def _submit_sl(
              symbol, _str_price(trigger_price), trigger_direction, _str_qty(qty), link_id, rc, rm, oid)
     return ok, oid, rc, rm
 
+# 🔸 Cancel by linkId (рядом с сабмит-хелперами)
+async def _cancel_by_link(*, symbol: str, link_id: str) -> Tuple[bool, Optional[int], Optional[str]]:
+    body = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "orderLinkId": link_id,
+    }
+    resp = await _bybit_post("/v5/order/cancel", body)
+    rc, rm = resp.get("retCode"), resp.get("retMsg")
+    ok = (rc == 0)
+    log.debug("cancel by link: %s %s → ok=%s rc=%s msg=%s", symbol, link_id, ok, rc, rm)
+    return ok, rc, rm
+    
+# 🔸 ReduceOnly market close (рядом с _submit_entry/_submit_tp/_submit_sl)
+async def _submit_close_reduce_only(
+    *,
+    symbol: str,
+    side: str,               # "Buy" | "Sell" (ОППОЗИТ входу)
+    qty: Decimal,
+    link_id: str,
+) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
+    body = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "side": side,
+        "orderType": "Market",
+        "qty": _str_qty(qty),
+        "timeInForce": "GTC",
+        "reduceOnly": True,
+        "orderLinkId": link_id,
+    }
+    resp = await _bybit_post("/v5/order/create", body)
+    rc, rm = resp.get("retCode"), resp.get("retMsg")
+    oid = _extract_order_id(resp); ok = (rc == 0)
+    log.debug("submit close(ro): %s %s qty=%s linkId=%s → rc=%s msg=%s oid=%s", side, symbol, _str_qty(qty), link_id, rc, rm, oid)
+    return ok, oid, rc, rm
+    
 # 🔸 Post-submit апдейты в БД
 async def _mark_order_after_submit(*, order_link_id: str, ok: bool, order_id: Optional[str], retcode: Optional[int], retmsg: Optional[str]) -> None:
     now = datetime.utcnow()
