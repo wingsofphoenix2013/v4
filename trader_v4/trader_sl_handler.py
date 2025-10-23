@@ -91,7 +91,6 @@ async def run_trader_sl_handler_loop():
             log.exception("❌ Ошибка в цикле TRADER_SL_HANDLER")
             await asyncio.sleep(1.0)
 
-
 # 🔸 Обработка одного события из positions_bybit_status
 async def _handle_status_event(raw: Dict[str, Any]) -> None:
     event = _g(raw, "event")
@@ -149,10 +148,7 @@ async def _handle_status_event(raw: Dict[str, Any]) -> None:
         log.debug("ℹ️ SL_HANDLER: остаток по uid=%s уже 0", uid)
         return
 
-    # гейт №2: если есть активные priced TP на бирже — не двигаем SL (ждём фактического биржевого TP)
-    if await _has_active_priced_tp_on_exchange(uid):
-        log.debug("SL_HANDLER: skip sl_move_to_entry — active priced TP on exchange (uid=%s)", uid)
-        return
+    # FIX: гейт №2 удалён — переносим SL на entry при цене лучше входа, даже если TP(limit) активны на бирже
 
     # биржевая «цена входа»
     entry_avg = await _fetch_entry_avg_fill(uid)
@@ -201,7 +197,6 @@ async def _handle_status_event(raw: Dict[str, Any]) -> None:
         log.info("📤 SL_HANDLER → sl_move_to_entry: uid=%s %s trigger=%s qty=%s", uid, symbol, _fmt(trigger_price), _fmt(sl_qty))
     except Exception:
         log.exception("❌ Не удалось отправить sl_move_to_entry для uid=%s", uid)
-
 
 # 🔸 Вспомогательные
 def _g(d: Dict[str, Any], key: str) -> Optional[str]:
