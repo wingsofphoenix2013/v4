@@ -111,10 +111,19 @@ async def process_signal(data: dict):
         # 🔸 Проверка позиции
         position = position_registry.get((strategy_id, symbol))
         if position:
-            log.debug(f"[REVERSE-CHECK] strategy_id={strategy_id}, symbol={symbol}, direction={direction}, position.direction={position.direction}")
-            
+            # контекст для подробных логов
+            ctx = (
+                f"[sid={strategy_id} sym={symbol} uid={position.uid} "
+                f"pos_dir={position.direction} sig_dir={direction} log_uid={log_uid}]"
+            )
+
+            log.debug(
+                f"[REVERSE-CHECK] strategy_id={strategy_id}, symbol={symbol}, "
+                f"direction={direction}, position.direction={position.direction}"
+            )
+
             if position.direction == direction:
-                log.debug(f"[REVERSE-CHECK] Повтор сигнала в ту же сторону → ignore")
+                log.debug(f"[REVERSE-CHECK] Повтор сигнала в ту же сторону → ignore {ctx}")
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "повтор сигнала в ту же сторону"
@@ -122,12 +131,12 @@ async def process_signal(data: dict):
 
             log.debug(
                 f"[REVERSE-CHECK] reverse={strategy.get('reverse')} ({type(strategy.get('reverse'))}), "
-                f"sl_protection={strategy.get('sl_protection')} ({type(strategy.get('sl_protection'))})"
+                f"sl_protection={strategy.get('sl_protection')} ({type(strategy.get('sl_protection'))}) {ctx}"
             )
 
             # ✅ reverse + sl_protection = True → решение по mark vs entry
             if strategy.get("reverse", False) and strategy.get("sl_protection", True):
-                log.info("[REVERSE-CHECK] reverse + sl_protection активны → выбор по цене относительно entry и наличию активного TP")
+                log.info("[REVERSE-CHECK] reverse + sl_protection активны → выбор по цене относительно entry и наличию активного TP %s", ctx)
 
                 # берём ближайший активный TP (минимальный level, не hit и не canceled)
                 tp = next((
@@ -136,7 +145,7 @@ async def process_signal(data: dict):
                 ), None)
 
                 if not tp:
-                    log.info("[REVERSE] Нет активных TP целей → ignore")
+                    log.debug("[REVERSE] Нет активных TP целей → ignore %s", ctx)
                     return await route_ignore(
                         strategy_id, symbol, direction, log_uid,
                         "нет активных TP целей"
@@ -145,32 +154,29 @@ async def process_signal(data: dict):
                 # нужна текущая цена
                 price = await get_price(symbol)
                 if price is None:
-                    log.warning(f"⚠️ REVERSE/PROTECT: нет цены для {symbol}, сигнал пропущен")
+                    log.warning("⚠️ REVERSE/PROTECT: нет цены для %s, сигнал пропущен %s", symbol, ctx)
                     return
 
                 entry = position.entry_price
-                price_is_worse = (
-                    price < entry if position.direction == "long"
-                    else price > entry
-                )
+                price_is_worse = (price < entry) if position.direction == "long" else (price > entry)
+                log.info("[REVERSE-CHECK] entry=%s mark=%s worse=%s %s", entry, price, price_is_worse, ctx)
 
                 if price_is_worse:
                     # хуже входа → немедленное закрытие reverse-signal-stop
-                    log.info("[REVERSE] Цена хуже входа → full_reverse_stop()")
-                    signal_id = data["signal_id"]
+                    log.info("[REVERSE] Цена хуже входа → full_reverse_stop %s", ctx)
+                    signal_id = data.get("signal_id")
                     time_value = data.get("time")
-                    log_uid = data["log_uid"]
                     await full_reverse_stop(position, signal_id, direction, time_value, log_uid)
                     return
                 else:
                     # не хуже входа → перестановка SL на entry (risk → 0)
-                    log.info("[REVERSE] Цена не хуже входа → SL-replacement до entry")
+                    log.info("[REVERSE] Цена не хуже входа → SL-replacement до entry %s", ctx)
                     await apply_sl_replacement(position, log_uid, strategy_id, symbol)
                     return
 
             # ✅ reverse = True, sl_protection = False → reverse не реализован
             if strategy.get("reverse", False):
-                log.debug(f"[REVERSE-CHECK] reverse включён, но sl_protection = False → reverse не реализован")
+                log.debug(f"[REVERSE-CHECK] reverse включён, но sl_protection = False → reverse не реализован {ctx}")
                 return await route_ignore(
                     strategy_id, symbol, direction, log_uid,
                     "маршрут reverse не реализован"
@@ -178,20 +184,17 @@ async def process_signal(data: dict):
 
             # ✅ reverse = False, sl_protection = True → SL-protect
             if strategy.get("sl_protection", True):
-                log.debug(f"[REVERSE-CHECK] Активирован SL-protect без reverse")
+                log.debug(f"[REVERSE-CHECK] Активирован SL-protect без reverse {ctx}")
                 price = await get_price(symbol)
                 if price is None:
-                    log.warning(f"⚠️ PROTECT: нет цены для {symbol}, сигнал пропущен")
+                    log.warning("⚠️ PROTECT: нет цены для %s, сигнал пропущен %s", symbol, ctx)
                     return
 
                 entry = position.entry_price
-                price_is_worse = (
-                    price < entry if position.direction == "long"
-                    else price > entry
-                )
+                price_is_worse = (price < entry) if position.direction == "long" else (price > entry)
 
                 if price_is_worse:
-                    log.debug(f"[PROTECT] Текущая цена хуже входа → полное закрытие по SL")
+                    log.debug(f"[PROTECT] Текущая цена хуже входа → полное закрытие по SL {ctx}")
                     await full_protect_stop(position)
                     await route_protect(
                         strategy_id, symbol, log_uid,
@@ -199,12 +202,12 @@ async def process_signal(data: dict):
                         position.uid
                     )
                 else:
-                    log.debug(f"[PROTECT] Цена лучше входа → SL-replacement")
+                    log.debug(f"[PROTECT] Цена лучше входа → SL-replacement {ctx}")
                     await apply_sl_replacement(position, log_uid, strategy_id, symbol)
                 return
 
             # ✅ Ни reverse, ни sl_protection не включены
-            log.debug(f"[REVERSE-CHECK] Реверс и SL защита отключены → ignore")
+            log.debug(f"[REVERSE-CHECK] Реверс и SL защита отключены → ignore {ctx}")
             return await route_ignore(
                 strategy_id, symbol, direction, log_uid,
                 "реверс и SL защита отключены"
@@ -251,7 +254,7 @@ async def _run_with_sem_acquired(payload: dict):
         log.exception("❌ Ошибка process_signal")
     finally:
         _signals_sem.release()
-        
+
 # 🔸 Маршрут ignore: логируем отказ
 async def route_ignore(strategy_id, symbol, direction, log_uid, reason: str):
     log.debug(f"⚠️ [IGNORE] {symbol} (strategy {strategy_id}, {direction}): {reason}")
