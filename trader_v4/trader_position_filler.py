@@ -1,10 +1,11 @@
-# trader_position_filler.py — быстрый якорь позиции и публикация «толстой» заявки в bybit_processor (чтение из positions_bybit_status)
+# trader_position_filler.py — якорение позиции и публикация «толстой» заявки (opened v2, без чтения positions_v4)
 
 # 🔸 Импорты
+import os
 import asyncio
 import logging
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -15,18 +16,21 @@ from trader_config import config
 log = logging.getLogger("TRADER_FILLER")
 
 # 🔸 Потоки/группы
-POSITIONS_STATUS_STREAM = "positions_bybit_status"   # читаем события жизни позиции (в т.ч. opened)
-ORDER_REQUEST_STREAM = "trader_order_requests"       # публикуем «толстую» заявку для bybit_processor
+POSITIONS_STATUS_STREAM = "positions_bybit_status"   # источник: informer v1.2 (opened, schema="v2")
+ORDER_REQUEST_STREAM = "trader_order_requests"       # получатель: bybit_processor
 CG_NAME = "trader_filler_status_group"
 CONSUMER = "trader_filler_status_1"
 
-# 🔸 Параллелизм чтения из стрима
+# 🔸 Параметры чтения/параллелизма
 READ_BLOCK_MS = 1000
 READ_COUNT = 10
 CONCURRENCY = 8
 
+# 🔸 Настройки исполнителя
+SIZE_PCT_ENV = "BYBIT_SIZE_PCT"  # обязателен: % реального размера от виртуального (0 < pct ≤ 100)
 
-# 🔸 Основной цикл воркера (параллельная обработка без дополнительных проверок)
+
+# 🔸 Основной цикл воркера
 async def run_trader_position_filler_loop():
     redis = infra.redis_client
 
@@ -41,25 +45,32 @@ async def run_trader_position_filler_loop():
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info("🚦 TRADER_FILLER v2 запущен (источник=%s, параллелизм=%d)", POSITIONS_STATUS_STREAM, CONCURRENCY)
+    # проверим доступность коэффициента размера
+    size_pct = _get_size_pct()
+    if size_pct is None:
+        log.error("❌ %s не задан или некорректен — воркер не стартует", SIZE_PCT_ENV)
+        return
+
+    log.info("🚦 TRADER_FILLER v3 запущен (источник=%s, параллелизм=%d, size_pct=%s)",
+             POSITIONS_STATUS_STREAM, CONCURRENCY, _dec_to_str(size_pct))
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def _spawn_task(record_id: str, data: Dict[str, Any]):
-        # ограничиваем число одновременных задач
+        # ack только при успехе — at-least-once до ORDER_REQUEST_STREAM
         async with sem:
+            ack_ok = False
             try:
-                await _handle_status_event(record_id, data)
+                ack_ok = await _handle_opened_v2(record_id, data, size_pct)
             except Exception:
                 log.exception("❌ Ошибка обработки записи (id=%s)", record_id)
             finally:
-                # ack в любом случае (идемпотентность ниже обеспечена ON CONFLICT)
-                try:
-                    await redis.xack(POSITIONS_STATUS_STREAM, CG_NAME, record_id)
-                except Exception:
-                    log.exception("⚠️ Не удалось ACK запись (id=%s)", record_id)
+                if ack_ok:
+                    try:
+                        await redis.xack(POSITIONS_STATUS_STREAM, CG_NAME, record_id)
+                    except Exception:
+                        log.exception("⚠️ Не удалось ACK запись (id=%s)", record_id)
 
-    # основной цикл чтения
     while True:
         try:
             entries = await redis.xreadgroup(
@@ -77,7 +88,6 @@ async def run_trader_position_filler_loop():
                 for record_id, data in records:
                     tasks.append(asyncio.create_task(_spawn_task(record_id, data)))
 
-            # условия достаточности: дождёмся текущей пачки
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -86,138 +96,147 @@ async def run_trader_position_filler_loop():
             await asyncio.sleep(0.5)
 
 
-# 🔸 Обработка одного события из positions_bybit_status (интересует только event='opened')
-async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> None:
-    # извлекаем минимально нужные поля
+# 🔸 Обработка события opened v2 (schema="v2")
+async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Decimal) -> bool:
+    # условия достаточности: opened + v2
     event = (_as_str(data.get("event")) or "").lower()
     if event != "opened":
-        return  # слушаем только открытия
+        log.info("⏭️ FILLER: пропуск id=%s (event=%s)", record_id, event or "—")
+        return True
 
+    schema = _as_str(data.get("schema"))
+    if schema != "v2":
+        log.info("⏭️ FILLER: пропуск id=%s (schema=%s, ожидаем 'v2')", record_id, schema or "—")
+        return True
+
+    # базовые поля
     position_uid = _as_str(data.get("position_uid"))
     strategy_id = _as_int(data.get("strategy_id"))
+    symbol = _as_str(data.get("symbol"))
     direction = (_as_str(data.get("direction")) or "").lower()
-    created_at = _parse_dt(_as_str(data.get("ts"))) or datetime.utcnow()  # ts из информера — как created_at
+    ts_ms_str = _as_str(data.get("ts_ms"))
+    ts_iso = _as_str(data.get("ts"))
+    created_at = _parse_ts(ts_ms_str, ts_iso) or datetime.utcnow()
 
-    if not position_uid or not strategy_id:
-        log.debug("⚠️ Пропуск записи (неполные данные): id=%s sid=%s uid=%s", record_id, strategy_id, position_uid)
-        return
+    if not position_uid or not strategy_id or not symbol or direction not in ("long", "short"):
+        log.debug("⚠️ opened v2: неполные базовые поля (id=%s, sid=%s, uid=%s, symbol=%s, dir=%s)",
+                  record_id, strategy_id, position_uid, symbol, direction)
+        return False
 
-    # фильтр: обрабатываем только winner-стратегии
-    if strategy_id not in config.trader_winners:
-        log.debug("⏭️ Стратегия не в trader_winner (sid=%s), пропуск uid=%s", strategy_id, position_uid)
-        return
-
-    # плечо: из события или из кэша
+    # размеры/плечо из события (обязательны в v1.2)
     leverage = _as_decimal(data.get("leverage"))
-    if leverage is None:
-        leverage = _get_leverage_from_config(strategy_id)
-    if leverage is None or leverage <= 0:
-        log.debug("⚠️ Некорректное плечо sid=%s (leverage=%s) — пропуск uid=%s", strategy_id, leverage, position_uid)
-        return
+    virt_qty = _as_decimal(data.get("quantity"))
+    virt_qty_left = _as_decimal(data.get("quantity_left")) or virt_qty
+    virt_margin = _as_decimal(data.get("margin_used"))
 
-    # margin_used из события (опционально)
-    margin_used = _as_decimal(data.get("margin_used"))
+    if leverage is None or leverage <= 0 or virt_qty is None or virt_qty_left is None or virt_margin is None:
+        log.debug("⚠️ opened v2: нет валидных размеров/плеча (sid=%s uid=%s lev=%s qty=%s ql=%s mu=%s)",
+                  strategy_id, position_uid, leverage, virt_qty, virt_qty_left, virt_margin)
+        return False
 
-    # символ берём из positions_v4 (в этом стриме symbol не передаётся)
-    symbol, entry_price_db, qty_left_db, created_at_db = await _fetch_symbol_and_initials_from_positions_v4(position_uid)
+    # вычисление реальных величин по size_pct
+    real_qty = (virt_qty * size_pct) / Decimal("100")
+    real_margin = (virt_margin * size_pct) / Decimal("100")
 
-    # если margin_used нет в событии — считаем из БД: (quantity_left * entry_price) / leverage
-    if margin_used is None and entry_price_db is not None and qty_left_db is not None:
-        try:
-            margin_used = (qty_left_db * entry_price_db) / leverage
-        except (InvalidOperation, ZeroDivisionError):
-            margin_used = None
-
-    # created_at: если в БД есть и мы его не получили из ts — можно схлопнуть на БД
-    if created_at is None and created_at_db is not None:
-        created_at = created_at_db
-    if created_at is None:
-        created_at = datetime.utcnow()
-
-    if not symbol:
-        log.debug("⚠️ Нет symbol по uid=%s (positions_v4 не успела/нет записи) — пропуск", position_uid)
-        return
-    if margin_used is None:
-        log.debug("⚠️ Не удалось рассчитать margin_used (uid=%s) — пропуск", position_uid)
-        return
-
-    # мастер-группа (mirrow) по направлению
-    group_master_id = _resolve_group_master_id_from_config(strategy_id, direction)
-    if group_master_id is None:
-        log.debug("⚠️ Не удалось определить group_master_id sid=%s (direction=%s) — пропуск uid=%s", strategy_id, direction, position_uid)
-        return
-
-    # идемпотентная вставка якоря позиции у трейдера (FK нужен для последующих ордеров)
-    await _insert_trader_position(
-        group_strategy_id=group_master_id,
-        strategy_id=strategy_id,
-        position_uid=position_uid,
-        symbol=symbol,
-        margin_used=margin_used,
-        created_at=created_at
-    )
-
-    # собираем «толстую» заявку для bybit_processor
-    payload = _build_thick_order_payload(
-        position_uid=position_uid,
-        strategy_id=strategy_id,
-        symbol=symbol,
-        direction=direction,
-        created_at=created_at,
-    )
-
-    # публикуем заявку
-    await _publish_order_request(fields=payload)
-
-    log.debug(
-        "✅ FILLER: зафиксирована позиция и отправлена заявка | uid=%s | sid=%s | symbol=%s | group=%s | margin=%s",
-        position_uid, strategy_id, symbol, group_master_id, _dec_to_str(margin_used)
-    )
-
-
-# 🔸 Построение «толстой» заявки для bybit_processor
-def _build_thick_order_payload(*, position_uid: str, strategy_id: int, symbol: str, direction: str, created_at: datetime) -> Dict[str, str]:
-    # политика стратегии (SL/TP) из кэша
+    # точности тикера и политика стратегии (для заявки)
+    tmeta = config.tickers.get(symbol) or {}
     policy = config.strategy_policy.get(strategy_id) or {}
     policy_json = json.dumps(policy, ensure_ascii=False, default=_json_default)
 
-    # метаданные стратегии
-    meta = config.strategy_meta.get(strategy_id) or {}
-    leverage = meta.get("leverage")
+    precision_qty = tmeta.get("precision_qty")
+    min_qty = tmeta.get("min_qty")
+    ticksize = tmeta.get("ticksize")
 
-    # точности по тикеру (если есть)
-    t = config.tickers.get(symbol) or {}
-    precision_qty = t.get("precision_qty")
-    min_qty = t.get("min_qty")
-    ticksize = t.get("ticksize")
+    # 1) якорим позицию в trader_positions_v4 (идемпотентно)
+    try:
+        await infra.pg_pool.execute(
+            """
+            INSERT INTO public.trader_positions_v4 (
+                position_uid, strategy_id, symbol, direction, log_uid,
+                leverage, size_pct,
+                virt_quantity, virt_quantity_left, virt_margin_used,
+                real_quantity, real_margin_used,
+                exchange, entry_status, entry_order_link_id, entry_order_id, last_ext_event_at,
+                status, created_at, entry_filled_at, closed_at, close_reason,
+                pnl_real, exec_fee_total, avg_entry_price, avg_close_price,
+                error_last, extras
+            ) VALUES (
+                $1, $2, $3, $4, NULL,
+                $5, $6,
+                $7, $8, $9,
+                $10, $11,
+                'bybit', 'planned', NULL, NULL, NULL,
+                'open', $12, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL
+            )
+            ON CONFLICT (position_uid) DO NOTHING
+            """,
+            position_uid, strategy_id, symbol, direction,
+            leverage, size_pct,
+            virt_qty, virt_qty_left, virt_margin,
+            real_qty, real_margin,
+            created_at
+        )
+    except Exception:
+        log.exception("❌ Не удалось вставить якорь позиции (uid=%s)", position_uid)
+        return False
 
-    # все значения — строки (Redis Streams)
-    fields = {
+    # 2) собираем «толстую» заявку для bybit_processor
+    order_fields = {
         "position_uid": position_uid,
         "strategy_id": str(strategy_id),
         "symbol": symbol,
-        "direction": (direction or "").lower(),
+        "direction": direction,
         "created_at": _to_iso(created_at),
-        "leverage": _dec_to_str(leverage),
+        "ts_ms": ts_ms_str or "",
+        "ts": ts_iso or "",
+
+        # политика и точности
+        "policy": policy_json,
         "precision_qty": str(precision_qty) if precision_qty is not None else "",
         "min_qty": _dec_to_str(min_qty),
         "ticksize": _dec_to_str(ticksize),
-        "policy": policy_json,   # сериализованный JSON политики
+
+        # плечо и размеры
+        "leverage": _dec_to_str(leverage),
+        "size_pct": _dec_to_str(size_pct),
+        "virt_quantity": _dec_to_str(virt_qty),
+        "virt_quantity_left": _dec_to_str(virt_qty_left),
+        "virt_margin_used": _dec_to_str(virt_margin),
+        "real_quantity": _dec_to_str(real_qty),
+        "real_margin_used": _dec_to_str(real_margin),
     }
-    return fields
 
-
-# 🔸 Публикация заявки в шину ордеров
-async def _publish_order_request(*, fields: Dict[str, str]) -> None:
-    redis = infra.redis_client
+    # 3) публикация заявки
     try:
-        await redis.xadd(ORDER_REQUEST_STREAM, fields)
-        log.debug("📤 ORDER_REQ: отправлено в %s для uid=%s", ORDER_REQUEST_STREAM, fields.get("position_uid", ""))
+        await infra.redis_client.xadd(ORDER_REQUEST_STREAM, order_fields)
     except Exception:
-        log.exception("❌ Не удалось опубликовать заявку uid=%s", fields.get("position_uid", ""))
+        log.exception("❌ Не удалось опубликовать заявку uid=%s", position_uid)
+        return False
+
+    # лог результата (информативный)
+    log.info(
+        "✅ FILLER: anchored+sent | uid=%s | sid=%s | sym=%s | dir=%s | lev=%s | virt_qty=%s | real_qty=%s | size_pct=%s | margin=%s",
+        position_uid, strategy_id, symbol, direction,
+        _dec_to_str(leverage), _dec_to_str(virt_qty), _dec_to_str(real_qty), _dec_to_str(size_pct),
+        _dec_to_str(virt_margin),
+    )
+    return True
 
 
 # 🔸 Вспомогательные функции
+
+def _get_size_pct() -> Optional[Decimal]:
+    # условия достаточности: env задан и 0 < pct ≤ 100
+    raw = os.getenv(SIZE_PCT_ENV, "").strip()
+    try:
+        pct = Decimal(raw)
+        if pct <= 0 or pct > 100:
+            return None
+        return pct
+    except Exception:
+        return None
 
 def _as_str(v: Any) -> str:
     if v is None:
@@ -241,17 +260,23 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
     except Exception:
         return None
 
-def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-    # условия достаточности: ISO8601 'YYYY-mm-ddTHH:MM:SS[.ffffff]'
+def _parse_ts(ts_ms_str: Optional[str], ts_iso: Optional[str]) -> Optional[datetime]:
+    # условия достаточности: ts_ms приоритетнее; ts_iso в формате ...Z, но допускаем отсутствие Z
     try:
-        if not s:
-            return None
-        return datetime.fromisoformat(s.replace("Z", ""))
+        if ts_ms_str:
+            # epoch ms → UTC-naive
+            ms = int(ts_ms_str)
+            return datetime.utcfromtimestamp(ms / 1000.0)
     except Exception:
-        return None
+        pass
+    try:
+        if ts_iso:
+            return datetime.fromisoformat(ts_iso.replace("Z", ""))
+    except Exception:
+        pass
+    return None
 
 def _dec_to_str(v: Any) -> str:
-    # привести Decimal/число к «красивой» строке
     try:
         d = _as_decimal(v)
         if d is None:
@@ -262,93 +287,12 @@ def _dec_to_str(v: Any) -> str:
         return ""
 
 def _to_iso(v: Any) -> str:
-    # если объект с isoformat — использовать, иначе str
     try:
         return (v.isoformat() + "Z") if hasattr(v, "isoformat") else (str(v) if v is not None else "")
     except Exception:
         return str(v) if v is not None else ""
 
 def _json_default(obj):
-    # сериализация Decimal и прочих нетривиальных типов в JSON
     if isinstance(obj, Decimal):
         return str(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
-
-def _get_leverage_from_config(strategy_id: int) -> Optional[Decimal]:
-    meta = config.strategy_meta.get(strategy_id) or {}
-    lev = meta.get("leverage")
-    try:
-        return lev if isinstance(lev, Decimal) else (Decimal(str(lev)) if lev is not None else None)
-    except Exception:
-        return None
-
-def _resolve_group_master_id_from_config(strategy_id: int, direction: Optional[str]) -> Optional[int]:
-    meta = config.strategy_meta.get(strategy_id) or {}
-    mm = meta.get("market_mirrow")
-    mm_long = meta.get("market_mirrow_long")
-    mm_short = meta.get("market_mirrow_short")
-
-    # ничего не задано → мастер = сама стратегия
-    if mm is None and mm_long is None and mm_short is None:
-        return strategy_id
-
-    # задан единый мастер
-    if mm is not None and mm_long is None and mm_short is None:
-        try:
-            return int(mm)
-        except Exception:
-            return None
-
-    # заданы мастера по направлению
-    if mm is None and mm_long is not None and mm_short is not None:
-        d = (direction or "").lower()
-        try:
-            if d == "long":
-                return int(mm_long)
-            if d == "short":
-                return int(mm_short)
-            return None
-        except Exception:
-            return None
-
-    # иные комбинации считаем некорректными
-    return None
-
-async def _fetch_symbol_and_initials_from_positions_v4(position_uid: str) -> tuple[Optional[str], Optional[Decimal], Optional[Decimal], Optional[datetime]]:
-    row = await infra.pg_pool.fetchrow(
-        """
-        SELECT symbol, entry_price, quantity_left, created_at
-        FROM public.positions_v4
-        WHERE position_uid = $1
-        """,
-        position_uid
-    )
-    if not row:
-        return None, None, None, None
-    symbol = row["symbol"]
-    return (
-        str(symbol) if symbol is not None else None,
-        _as_decimal(row["entry_price"]),
-        _as_decimal(row["quantity_left"]),
-        row.get("created_at") if hasattr(row, "get") else row["created_at"],
-    )
-
-async def _insert_trader_position(
-    group_strategy_id: int,
-    strategy_id: int,
-    position_uid: str,
-    symbol: str,
-    margin_used: Decimal,
-    created_at: datetime
-) -> None:
-    # идемпотентная вставка (если запись уже есть — не дублируем)
-    await infra.pg_pool.execute(
-        """
-        INSERT INTO public.trader_positions (
-          group_strategy_id, strategy_id, position_uid, symbol,
-          margin_used, status, pnl, created_at, closed_at
-        ) VALUES ($1, $2, $3, $4, $5, 'open', NULL, $6, NULL)
-        ON CONFLICT (position_uid) DO NOTHING
-        """,
-        group_strategy_id, strategy_id, position_uid, symbol, margin_used, created_at
-    )
