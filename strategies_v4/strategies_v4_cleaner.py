@@ -118,6 +118,35 @@ async def _delete_positions_batch(strategy_id: int, uids: List[str]) -> int:
     return deleted
 
 
+# 🔹 Очистка зависимых данных стратегии перед финальным удалением
+async def _purge_strategy_related_data(conn, strategy_id: int) -> Tuple[int, int, int]:
+    # удаляем processed-таблицы (не имеют FK, но содержат следы вычислений)
+    cp_pack_status = await conn.execute(
+        "DELETE FROM public.oracle_pack_conf_processed WHERE strategy_id = $1",
+        strategy_id,
+    )
+    cp_plain_status = await conn.execute(
+        "DELETE FROM public.oracle_conf_processed WHERE strategy_id = $1",
+        strategy_id,
+    )
+
+    # удаляем отчёты по стратегии — каскадом удалит *mw/*pack aggregated/sense и их whitelists
+    reports_status = await conn.execute(
+        "DELETE FROM public.oracle_report_stat WHERE strategy_id = $1",
+        strategy_id,
+    )
+
+    cp_pack = _rows_affected(cp_pack_status)
+    cp_plain = _rows_affected(cp_plain_status)
+    reports = _rows_affected(reports_status)
+
+    log.info(
+        "🗂️ Очистка зависимостей (sid=%s): report_stat=%d, conf_processed(pack)=%d, conf_processed=%d",
+        strategy_id, reports, cp_pack, cp_plain
+    )
+    return reports, cp_pack, cp_plain
+
+
 # 🔹 Выключить стратегию, оповестить системы и удалить её
 async def _disable_and_drop_strategy(strategy_id: int):
     # 1) выключить стратегию в БД
@@ -137,15 +166,23 @@ async def _disable_and_drop_strategy(strategy_id: int):
     log.info("📨 [PubSub] Отключение стратегии id=%s", strategy_id)
 
     # 3) Пауза — даём слушателям (LAB/филлеру) «додренить» in-flight операции
-    log.info("⏳ Пауза перед удалением стратегии id=%s: %ds", strategy_id, DELETE_GRACE_SEC)
+    log.info("⏳ Пауза перед удалением стратегии id=%s: %ss", strategy_id, DELETE_GRACE_SEC)
     await asyncio.sleep(DELETE_GRACE_SEC)
 
-    # 4) удалить саму стратегию (каскады снесут связанные сущности стратегии)
-    await infra.pg_pool.execute(
-        "DELETE FROM strategies_v4 WHERE id = $1",
-        strategy_id,
-    )
-    log.info("🗑️ Стратегия удалена из БД: id=%s", strategy_id)
+    # 4) Очистка зависимостей и финальный DELETE стратегии — в одной транзакции
+    async with infra.pg_pool.acquire() as conn:
+        async with conn.transaction():
+            # очищаем зависимые данные (reports → каскад на aggregated/sense/whitelists; + processed-таблицы)
+            await _purge_strategy_related_data(conn, strategy_id)
+
+            # финально удаляем запись стратегии (FK больше не мешают)
+            del_status = await conn.execute(
+                "DELETE FROM public.strategies_v4 WHERE id = $1",
+                strategy_id,
+            )
+            deleted = _rows_affected(del_status)
+
+    log.info("🗑️ Стратегия удалена из БД: id=%s (rows=%d)", strategy_id, deleted)
 
 
 # 🔹 Обработка одной стратегии в deathrow

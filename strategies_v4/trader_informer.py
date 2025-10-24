@@ -1,4 +1,4 @@
-# trader_informer.py — воркер мгновенных уведомлений о жизненных событиях позиций (только для trader_winner=true)
+# trader_informer.py — воркер мгновенных уведомлений о жизненных событиях позиций (watchlist по strategy_state_stream: action=applied)
 
 # 🔸 Импорты
 import asyncio
@@ -21,16 +21,19 @@ STREAM_OPEN = "positions_open_stream"
 STREAM_UPD = "positions_update_stream"
 STREAM_OUT = "positions_bybit_status"
 
+STRATEGY_STATE_STREAM = "strategy_state_stream"  # подтверждения применённых изменений (action="applied")
+
 CG_OPEN = "pos_status_open_cg"
 CG_OPEN_CONSUMER = "pos_status_open_1"
 
 CG_UPD = "pos_status_update_cg"
 CG_UPD_CONSUMER = "pos_status_update_1"
 
+CG_STATE = "pos_status_state_cg"
+CG_STATE_CONSUMER = "pos_status_state_1"
+
 XREAD_BLOCK_MS = 1000
 XREAD_COUNT = 100
-
-PUBSUB_CHANNEL_STRATEGIES = "strategies_v4_events"
 
 # 🔸 Кэш позиции по uid (для быстрых публикаций без БД)
 @dataclass
@@ -43,7 +46,6 @@ class _PosSnap:
 # 🔸 In-memory кэши
 _pos_cache: Dict[str, _PosSnap] = {}
 _watch_ids: Set[int] = set()
-
 
 # 🔸 Хелперы
 def _b2s(x):
@@ -141,7 +143,6 @@ def _compute_margin_used(entry_price: Optional[Decimal], qty_left: Optional[Deci
     except Exception:
         return str(val)
 
-
 # 🔸 Публикация события в выходной стрим (минимум + опциональные поля)
 async def _publish(strategy_id: int, position_uid: str, direction: str, event: str, *, tp_level: Optional[int] = None, extras: Optional[Dict[str, str]] = None):
     payload = {
@@ -169,7 +170,6 @@ async def _publish(strategy_id: int, position_uid: str, direction: str, event: s
         event,
         payload["ts"],
     )
-
 
 # 🔸 Обработка OPENED (из positions_open_stream)
 async def _handle_open_records(records):
@@ -217,7 +217,6 @@ async def _handle_open_records(records):
                 await infra.redis_client.xack(STREAM_OPEN, CG_OPEN, record_id)
             except Exception:
                 log.exception("❌ XACK OPENED (id=%s) не удался", record_id)
-
 
 # 🔸 Обработка UPDATE (из positions_update_stream)
 async def _handle_update_records(records):
@@ -321,8 +320,7 @@ async def _handle_update_records(records):
             except Exception:
                 log.exception("❌ XACK UPDATE (id=%s) не удался", record_id)
 
-
-# 🔸 Циклы чтения стримов
+# 🔸 Цикл чтения OPEN
 async def _read_open_loop():
     redis = infra.redis_client
     # создаём CG
@@ -343,7 +341,7 @@ async def _read_open_loop():
                 consumername=CG_OPEN_CONSUMER,
                 streams={STREAM_OPEN: ">"},
                 count=XREAD_COUNT,
-                block=XREAD_BLOCK_MS
+                block=XREAD_BLOCK_MS,
             )
             if not entries:
                 continue
@@ -355,6 +353,7 @@ async def _read_open_loop():
             log.exception("❌ Ошибка в цикле чтения OPEN")
             await asyncio.sleep(1.0)
 
+# 🔸 Цикл чтения UPDATE
 async def _read_update_loop():
     redis = infra.redis_client
     # создаём CG
@@ -375,7 +374,7 @@ async def _read_update_loop():
                 consumername=CG_UPD_CONSUMER,
                 streams={STREAM_UPD: ">"},
                 count=XREAD_COUNT,
-                block=XREAD_BLOCK_MS
+                block=XREAD_BLOCK_MS,
             )
             if not entries:
                 continue
@@ -387,40 +386,59 @@ async def _read_update_loop():
             log.exception("❌ Ошибка в цикле чтения UPDATE")
             await asyncio.sleep(1.0)
 
+# 🔸 Слежение за применёнными изменениями стратегий (Streams)
+async def _read_state_loop():
+    redis = infra.redis_client
+    # создаём CG
+    try:
+        await redis.xgroup_create(STRATEGY_STATE_STREAM, CG_STATE, id="$", mkstream=True)
+        log.info("📡 CG создана: %s → %s", STRATEGY_STATE_STREAM, CG_STATE)
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            log.info("ℹ️ CG уже существует: %s", CG_STATE)
+        else:
+            log.exception("❌ Ошибка создания CG для %s", STRATEGY_STATE_STREAM)
+            return
 
-# 🔸 Слежение за изменениями watchlist (через Pub/Sub стратегий)
-async def _watchlist_pubsub_loop():
-    # один раз при старте — собрать и залогировать размер watchlist
+    # инициализация watchlist на старте
     global _watch_ids
     _watch_ids = _rebuild_watch_ids()
     log.info("🔎 TRADER_INFORMER: watchlist initialized — %d strategies", len(_watch_ids))
 
-    # подписка на изменения стратегий
-    redis = infra.redis_client
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(PUBSUB_CHANNEL_STRATEGIES)
-    log.info("📡 Подписка на %s (для обновления watchlist)", PUBSUB_CHANNEL_STRATEGIES)
-
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
+    while True:
         try:
-            _ = json.loads(_b2s(msg["data"]))  # формат не важен — берём актуальное состояние из config
+            entries = await redis.xreadgroup(
+                groupname=CG_STATE,
+                consumername=CG_STATE_CONSUMER,
+                streams={STRATEGY_STATE_STREAM: ">"},
+                count=XREAD_COUNT,
+                block=XREAD_BLOCK_MS,
+            )
+            if not entries:
+                continue
+
+            for _, records in entries:
+                for record_id, data in records:
+                    try:
+                        if data.get("type") == "strategy" and data.get("action") == "applied":
+                            # при каждом 'applied' пересобираем watchlist из config
+                            new_ids = _rebuild_watch_ids()
+                            added = new_ids - _watch_ids
+                            removed = _watch_ids - new_ids
+
+                            if added:
+                                log.info("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
+                            if removed:
+                                log.info("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
+
+                            _watch_ids = new_ids
+
+                        await redis.xack(STRATEGY_STATE_STREAM, CG_STATE, record_id)
+                    except Exception:
+                        log.exception("❌ Ошибка обработки записи state/applied")
         except Exception:
-            continue
-
-        # при любом событии стратегий — пересобираем watchlist и логируем добавления/удаления
-        new_ids = _rebuild_watch_ids()
-        added = new_ids - _watch_ids
-        removed = _watch_ids - new_ids
-
-        if added:
-            log.info("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
-        if removed:
-            log.info("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
-
-        _watch_ids = new_ids
-
+            log.exception("❌ Ошибка чтения из state-stream")
+            await asyncio.sleep(1.0)
 
 # 🔸 Публичная точка запуска воркера
 async def run_trader_informer():
@@ -428,5 +446,5 @@ async def run_trader_informer():
     await asyncio.gather(
         _read_open_loop(),
         _read_update_loop(),
-        _watchlist_pubsub_loop(),  # только сообщения об изменениях; без heartbeat
+        _read_state_loop(),  # обновление watchlist по двухфазному протоколу (Streams)
     )
