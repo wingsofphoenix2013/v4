@@ -16,6 +16,7 @@ def init_dependencies(pg, redis, templates: Jinja2Templates):
 
     # для trades
     trades.pg_pool = pg
+    trades.redis_client = redis
     trades.templates = templates
 
     # для strategies

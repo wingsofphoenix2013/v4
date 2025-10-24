@@ -2,12 +2,13 @@
 
 import logging
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from collections import defaultdict
 from decimal import Decimal
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+from starlette.status import HTTP_303_SEE_OTHER
 
 from main import KYIV_TZ, get_kyiv_day_bounds, get_kyiv_range_backwards
 
@@ -16,6 +17,7 @@ log = logging.getLogger("TRADES")
 
 # 🔸 Внешние зависимости (инициализируются из init_dependencies)
 pg_pool = None
+redis_client = None
 templates = Jinja2Templates(directory="templates")
 
 
@@ -34,6 +36,26 @@ async def trades_page(request: Request, filter: str = "24h", series: str = None)
         "filter": filter,
         "series": series,
     })
+    
+# 🔸 POST: включить торговлю (trader_winner = true)
+@router.post("/strategies/{strategy_id}/enable_trader_winner")
+async def enable_trader_winner(strategy_id: int):
+    name = await _set_trader_winner(strategy_id, True)
+    return RedirectResponse(url=f"/trades/details/{name}", status_code=HTTP_303_SEE_OTHER)
+
+
+# 🔸 POST: выключить торговлю (trader_winner = false)
+@router.post("/strategies/{strategy_id}/disable_trader_winner")
+async def disable_trader_winner(strategy_id: int):
+    name = await _set_trader_winner(strategy_id, False)
+    return RedirectResponse(url=f"/trades/details/{name}", status_code=HTTP_303_SEE_OTHER)
+
+
+# 🔸 POST: пометить стратегию как DEATHROW
+@router.post("/strategies/{strategy_id}/deathrow")
+async def set_deathrow(strategy_id: int):
+    name = await _mark_deathrow(strategy_id)
+    return RedirectResponse(url=f"/trades/details/{name}", status_code=HTTP_303_SEE_OTHER)
 
 # 🔸 Расчёт статистики стратегий под /trades (без метрик и king)
 async def get_trading_summary(filter: str) -> list[dict]:
@@ -837,7 +859,7 @@ async def strategy_mfi_stats(
         positions = await conn.fetch("""
             SELECT position_uid, pnl, direction
             FROM positions_v4
-            WHERE strategy_id = $1 AND статус = 'closed'
+            WHERE strategy_id = $1 AND status = 'closed'
         """, strategy["id"])
 
         position_map = {
@@ -1135,3 +1157,40 @@ async def strategy_macd_stats(
         "macd_distribution": result,
         "macd_categories_ext": MACD_CATEGORIES_EXT
     })
+# 🔸 Обновить trader_winner и оповестить рантайм (Stream)
+async def _set_trader_winner(strategy_id: int, value: bool) -> str:
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE strategies_v4 SET trader_winner = $1 WHERE id = $2 RETURNING name",
+            value, strategy_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+        name = row["name"]
+
+    # двухфазный протокол: запрос на обновление
+    await redis_client.xadd("strategy_update_stream", {
+        "type": "strategy",
+        "action": "update",
+        "id": str(strategy_id),
+    })
+    return name
+
+
+# 🔸 Пометить стратегию как DEATHROW и оповестить рантайм (Stream)
+async def _mark_deathrow(strategy_id: int) -> str:
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE strategies_v4 SET signal_id = 1, deathrow = TRUE WHERE id = $1 RETURNING name",
+            strategy_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Стратегия не найдена")
+        name = row["name"]
+
+    await redis_client.xadd("strategy_update_stream", {
+        "type": "strategy",
+        "action": "update",
+        "id": str(strategy_id),
+    })
+    return name

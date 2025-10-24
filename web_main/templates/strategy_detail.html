@@ -67,25 +67,30 @@
     </a>
   </div>
 
-  <!-- Правая группа -->
+  <!-- Правая группа: управление торговлей по trader_winner + DEATHROW -->
   <div class="flex gap-2 items-center">
-    <button
-      class="px-4 py-1.5 text-sm rounded-lg font-medium
-             {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if not strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
-      Пауза
-    </button>
+    {% if strategy.trader_winner %}
+    <form method="post" action="/strategies/{{ strategy.id }}/disable_trader_winner">
+      <button type="submit"
+        class="px-4 py-1.5 text-sm rounded-lg font-medium bg-red-600 hover:bg-red-700 text-white">
+        Выключить торговлю
+      </button>
+    </form>
+    {% else %}
+    <form method="post" action="/strategies/{{ strategy.id }}/enable_trader_winner">
+      <button type="submit"
+        class="px-4 py-1.5 text-sm rounded-lg font-medium bg-green-600 hover:bg-green-700 text-white">
+        Включить торговлю
+      </button>
+    </form>
+    {% endif %}
 
-    <button
-      class="px-4 py-1.5 text-sm rounded-lg font-medium
-             bg-blue-600 hover:bg-blue-700 text-white">
-      {{ 'Выключить' if strategy.enabled else 'Включить' }}
-    </button>
-
-    <button
-      class="px-4 py-1.5 text-sm rounded-lg font-medium
-             {{ 'bg-slate-300 text-slate-500 cursor-not-allowed' if strategy.enabled else 'bg-blue-600 hover:bg-blue-700 text-white' }}">
-      Архивировать
-    </button>
+    <form method="post" action="/strategies/{{ strategy.id }}/deathrow">
+      <button type="submit"
+        class="px-4 py-1.5 text-sm rounded-lg font-medium bg-black hover:bg-gray-900 text-white">
+        DEATHROW
+      </button>
+    </form>
   </div>
 </div>
 </div>
