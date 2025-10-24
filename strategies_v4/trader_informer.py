@@ -143,8 +143,54 @@ def _compute_margin_used(entry_price: Optional[Decimal], qty_left: Optional[Deci
     except Exception:
         return str(val)
 
-# 🔸 Публикация события в выходной стрим (минимум + опциональные поля)
+# 🔸 Запись события в БД (таблица trader_signals)
+async def _persist_signal(
+    *,
+    strategy_id: int,
+    position_uid: str,
+    direction: str,
+    event: str,
+    message: str,
+    strategy_type: str,
+    emitted_ts_dt: datetime,
+    tp_level: Optional[int] = None,
+    extras: Optional[Dict[str, str]] = None,
+) -> None:
+    # подготавливаем числовые поля из extras
+    lev = _to_dec((extras or {}).get("leverage")) if extras else None
+    qty = _to_dec((extras or {}).get("quantity")) if extras else None
+    qty_left = _to_dec((extras or {}).get("quantity_left")) if extras else None
+    margin = _to_dec((extras or {}).get("margin_used")) if extras else None
+    extras_json = json.dumps(extras or {})
+
+    try:
+        async with infra.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.trader_signals (
+                    strategy_id, position_uid, direction, event, tp_level,
+                    message, strategy_type,
+                    leverage, quantity, quantity_left, margin_used,
+                    side, emitted_ts, received_at, extras
+                )
+                VALUES ($1,$2,$3,$4,$5,
+                        $6,$7,
+                        $8,$9,$10,$11,
+                        'system',$12, NOW(), $13)
+                """,
+                strategy_id, position_uid, direction, event, tp_level,
+                message, strategy_type,
+                lev, qty, qty_left, margin,
+                emitted_ts_dt, extras_json,
+            )
+    except Exception:
+        # не ломаем основное выполнение: публикация уже произошла
+        log.exception("⚠️ Не удалось записать сигнал в trader_signals (sid=%s uid=%s event=%s)", strategy_id, position_uid, event)
+
+# 🔸 Публикация события в выходной стрим (минимум + опциональные поля) + запись в БД
 async def _publish(strategy_id: int, position_uid: str, direction: str, event: str, *, tp_level: Optional[int] = None, extras: Optional[Dict[str, str]] = None):
+    # вычисляем момент один раз — используем и в стриме (ISO), и в БД (timestamp)
+    emitted_dt = datetime.utcnow()
     payload = {
         "strategy_id": str(strategy_id),
         "position_uid": str(position_uid),
@@ -153,14 +199,29 @@ async def _publish(strategy_id: int, position_uid: str, direction: str, event: s
         "message": _message_for_event(event, tp_level),
         "strategy_type": _strategy_type(strategy_id),
         "side": "system",
-        "ts": _now_iso(),
+        "ts": emitted_dt.isoformat(timespec="milliseconds"),
     }
     if tp_level is not None and event == "tp_hit":
         payload["tp_level"] = str(int(tp_level))
     if extras:
         payload.update(extras)
 
+    # сначала — отправка в стрим (минимальная задержка)
     await infra.redis_client.xadd(STREAM_OUT, payload)
+
+    # затем — запись в БД (best-effort)
+    await _persist_signal(
+        strategy_id=strategy_id,
+        position_uid=position_uid,
+        direction=direction,
+        event=event,
+        message=payload["message"],
+        strategy_type=payload["strategy_type"],
+        emitted_ts_dt=emitted_dt,
+        tp_level=tp_level,
+        extras=extras,
+    )
+
     log.info(
         "[PUB] sid=%s uid=%s dir=%s type=%s event=%s ts=%s",
         strategy_id,
