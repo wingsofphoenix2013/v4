@@ -82,7 +82,6 @@ async def run_trader_position_closer_loop():
             log.exception("❌ Ошибка в основном цикле TRADER_CLOSER")
             await asyncio.sleep(0.5)
 
-
 # 🔸 Обработка одного события closed.*
 async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     # базовые поля
@@ -94,13 +93,8 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     ts_ms_str    = _as_str(data.get("ts_ms"))
     ts_iso       = _as_str(data.get("ts"))
 
-    # не наш тип — зафиксируем и ACK
+    # чужие события — просто лог и ACK, без апдейта trader_signals
     if not event.startswith("closed"):
-        await _update_trader_signal_status(
-            stream_id=record_id, position_uid=position_uid, event=event or "",
-            ts_iso=ts_iso, status="skipped_not_relevant_event",
-            note=f"event={event or ''}"
-        )
         log.info("⏭️ CLOSER: пропуск id=%s (event=%s)", record_id, event or "—")
         return True
 
@@ -178,7 +172,6 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
         position_uid, strategy_id, (symbol or "—"), event, reason, "yes" if anchor_exists else "no"
     )
     return True
-
 
 # 🔸 Вспомогательные функции — обновление trader_signals
 async def _update_trader_signal_status(
