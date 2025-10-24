@@ -8,6 +8,7 @@ from trader_infra import setup_logging, setup_pg, setup_redis_client
 from trader_config import init_trader_config_state, config_event_listener
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
+from trader_sl_handler import run_trader_sl_handler_loop
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -16,6 +17,7 @@ log = logging.getLogger("TRADER_MAIN")
 CONFIG_LISTENER_START_DELAY_SEC = 1.0
 FILLER_START_DELAY_SEC = 60.0
 CLOSER_START_DELAY_SEC = 60.0
+SL_START_DELAY_SEC = 60.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -56,7 +58,7 @@ async def main():
         log.exception("❌ Ошибка инициализации конфигурации")
         return
 
-    log.info("🚀 Старт воркеров: CONFIG_LISTENER + TRADER_FILLER + TRADER_CLOSER")
+    log.info("🚀 Старт воркеров: CONFIG_LISTENER + TRADER_FILLER + TRADER_CLOSER + TRADER_SL")
     await asyncio.gather(
         # слушатель Pub/Sub апдейтов конфигурации
         run_with_delay(config_event_listener, "TRADER_CONFIG", start_delay=CONFIG_LISTENER_START_DELAY_SEC),
@@ -66,6 +68,9 @@ async def main():
         
         # слушатель закрытий (positions_bybit_status: event='closed.*') → ensure_closed + апдейт агрегата
         run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=CLOSER_START_DELAY_SEC),
+        
+        # слушатель sl_replaced (SL-protect) → ensure_sl_at_entry
+        run_with_delay(run_trader_sl_handler_loop, "TRADER_SL", start_delay=SL_START_DELAY_SEC),
     )
 
 # 🔸 Запуск через CLI
