@@ -1,4 +1,4 @@
-# trader_position_filler.py — якорение позиции и публикация «толстой» заявки (opened v2, без чтения positions_v4)
+# trader_position_filler.py — якорение позиции и «толстая» заявка (opened v2) + обновление public.trader_signals
 
 # 🔸 Импорты
 import os
@@ -7,7 +7,7 @@ import logging
 import json
 from decimal import Decimal
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from trader_infra import infra
 from trader_config import config
@@ -16,19 +16,18 @@ from trader_config import config
 log = logging.getLogger("TRADER_FILLER")
 
 # 🔸 Потоки/группы
-POSITIONS_STATUS_STREAM = "positions_bybit_status"   # источник: informer v1.2 (opened, schema="v2")
-ORDER_REQUEST_STREAM = "trader_order_requests"       # получатель: bybit_processor
-CG_NAME = "trader_filler_status_group"
-CONSUMER = "trader_filler_status_1"
+POSITIONS_STATUS_STREAM = "positions_bybit_status"   # источник: informer v1.2+ (opened, schema="v2")
+ORDER_REQUEST_STREAM    = "trader_order_requests"    # получатель: bybit_processor
+CG_NAME   = "trader_filler_status_group"
+CONSUMER  = "trader_filler_status_1"
 
 # 🔸 Параметры чтения/параллелизма
 READ_BLOCK_MS = 1000
-READ_COUNT = 10
-CONCURRENCY = 8
+READ_COUNT    = 10
+CONCURRENCY   = 8
 
 # 🔸 Настройки исполнителя
-SIZE_PCT_ENV = "BYBIT_SIZE_PCT"  # обязателен: % реального размера от виртуального (0 < pct ≤ 100)
-
+SIZE_PCT_ENV = "BYBIT_SIZE_PCT"  # % реального размера от виртуального (0 < pct ≤ 100)
 
 # 🔸 Основной цикл воркера
 async def run_trader_position_filler_loop():
@@ -95,48 +94,57 @@ async def run_trader_position_filler_loop():
             log.exception("❌ Ошибка в основном цикле TRADER_FILLER")
             await asyncio.sleep(0.5)
 
-
 # 🔸 Обработка события opened v2 (schema="v2")
 async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Decimal) -> bool:
     # условия достаточности: opened + v2
     event = (_as_str(data.get("event")) or "").lower()
     if event != "opened":
+        # FILLER обновляет trader_signals только для opened; прочее пропускаем тихо
         log.info("⏭️ FILLER: пропуск id=%s (event=%s)", record_id, event or "—")
         return True
 
     schema = _as_str(data.get("schema"))
+    position_uid = _as_str(data.get("position_uid"))
+    strategy_id  = _as_int(data.get("strategy_id"))
+    symbol       = _as_str(data.get("symbol"))
+    direction    = (_as_str(data.get("direction")) or "").lower()
+    ts_ms_str    = _as_str(data.get("ts_ms"))
+    ts_iso       = _as_str(data.get("ts"))
+    created_at   = _parse_ts(ts_ms_str, ts_iso) or datetime.utcnow()
+
+    # базовая отметка «принято к обработке»
+    await _update_trader_signal_status(
+        stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
+        status="accepted_by_filler", note="accepted opened v2" if schema == "v2" else "accepted opened (non-v2)"
+    )
+
     if schema != "v2":
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
+            status="skipped_opened_non_v2", note=f"schema={schema or ''}"
+        )
         log.info("⏭️ FILLER: пропуск id=%s (schema=%s, ожидаем 'v2')", record_id, schema or "—")
         return True
 
-    # базовые поля
-    position_uid = _as_str(data.get("position_uid"))
-    strategy_id = _as_int(data.get("strategy_id"))
-    symbol = _as_str(data.get("symbol"))
-    direction = (_as_str(data.get("direction")) or "").lower()
-    ts_ms_str = _as_str(data.get("ts_ms"))
-    ts_iso = _as_str(data.get("ts"))
-    created_at = _parse_ts(ts_ms_str, ts_iso) or datetime.utcnow()
+    # размеры/плечо из события (обязательны в v1.2+)
+    leverage       = _as_decimal(data.get("leverage"))
+    virt_qty       = _as_decimal(data.get("quantity"))
+    virt_qty_left  = _as_decimal(data.get("quantity_left")) or virt_qty
+    virt_margin    = _as_decimal(data.get("margin_used"))
 
-    if not position_uid or not strategy_id or not symbol or direction not in ("long", "short"):
-        log.debug("⚠️ opened v2: неполные базовые поля (id=%s, sid=%s, uid=%s, symbol=%s, dir=%s)",
-                  record_id, strategy_id, position_uid, symbol, direction)
-        return False
-
-    # размеры/плечо из события (обязательны в v1.2)
-    leverage = _as_decimal(data.get("leverage"))
-    virt_qty = _as_decimal(data.get("quantity"))
-    virt_qty_left = _as_decimal(data.get("quantity_left")) or virt_qty
-    virt_margin = _as_decimal(data.get("margin_used"))
-
-    if leverage is None or leverage <= 0 or virt_qty is None or virt_qty_left is None or virt_margin is None:
-        log.debug("⚠️ opened v2: нет валидных размеров/плеча (sid=%s uid=%s lev=%s qty=%s ql=%s mu=%s)",
-                  strategy_id, position_uid, leverage, virt_qty, virt_qty_left, virt_margin)
-        return False
+    if not position_uid or not strategy_id or not symbol or direction not in ("long", "short") \
+       or leverage is None or leverage <= 0 or virt_qty is None or virt_qty_left is None or virt_margin is None:
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
+            status="skipped_opened_incomplete", note="missing/invalid fields"
+        )
+        log.debug("⚠️ opened v2: неполные/некорректные поля (id=%s, sid=%s, uid=%s, sym=%s, dir=%s, lev=%s, qty=%s, ql=%s, mu=%s)",
+                  record_id, strategy_id, position_uid, symbol, direction, leverage, virt_qty, virt_qty_left, virt_margin)
+        return False  # не ACK → повторная доставка
 
     # вычисление реальных величин по size_pct
-    real_qty = (virt_qty * size_pct) / Decimal("100")
-    real_margin = (virt_margin * size_pct) / Decimal("100")
+    real_qty   = (virt_qty * size_pct) / Decimal("100")
+    real_margin= (virt_margin * size_pct) / Decimal("100")
 
     # точности тикера и политика стратегии (для заявки)
     tmeta = config.tickers.get(symbol) or {}
@@ -178,9 +186,13 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
             real_qty, real_margin,
             created_at
         )
-    except Exception:
+    except Exception as e:
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
+            status="failed_db_update", note=f"anchor insert error: {e.__class__.__name__}"
+        )
         log.exception("❌ Не удалось вставить якорь позиции (uid=%s)", position_uid)
-        return False
+        return False  # не ACK → повтор
 
     # 2) собираем «толстую» заявку для bybit_processor
     order_fields = {
@@ -211,9 +223,20 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     # 3) публикация заявки
     try:
         await infra.redis_client.xadd(ORDER_REQUEST_STREAM, order_fields)
-    except Exception:
+    except Exception as e:
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
+            status="failed_publish_order_request", note=f"redis xadd error: {e.__class__.__name__}"
+        )
         log.exception("❌ Не удалось опубликовать заявку uid=%s", position_uid)
         return False
+
+    # финальный статус для opened
+    await _update_trader_signal_status(
+        stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
+        status="filler_thick_order_published",
+        note=f"published thick order; real_qty={_dec_to_str(real_qty)}; size_pct={_dec_to_str(size_pct)}"
+    )
 
     # лог результата (информативный)
     log.info(
@@ -224,6 +247,61 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     )
     return True
 
+# 🔸 Апдейты public.trader_signals (stream_id → fallback по uid/event/ts)
+async def _update_trader_signal_status(
+    *,
+    stream_id: Optional[str],
+    position_uid: Optional[str],
+    event: Optional[str],
+    ts_iso: Optional[str],
+    status: str,
+    note: Optional[str] = None
+) -> None:
+    try:
+        # попытка 1: по stream_id
+        if stream_id:
+            res = await infra.pg_pool.execute(
+                """
+                UPDATE public.trader_signals
+                   SET processing_status = $1,
+                       processing_note   = $2,
+                       processed_at      = now()
+                 WHERE stream_id = $3
+                """,
+                status, (note or ""), stream_id
+            )
+            if res.startswith("UPDATE") and res.split()[-1] != "0":
+                return  # обновили успешно
+
+        # попытка 2: по (uid, event, emitted_ts ~ ts_iso ± 2s)
+        if position_uid and event and ts_iso:
+            dt = _parse_ts(None, ts_iso)
+            if dt is not None:
+                t_from = dt - timedelta(seconds=2)
+                t_to   = dt + timedelta(seconds=2)
+                res2 = await infra.pg_pool.execute(
+                    """
+                    WITH cand AS (
+                        SELECT id
+                          FROM public.trader_signals
+                         WHERE position_uid = $1
+                           AND event = $2
+                           AND emitted_ts BETWEEN $3 AND $4
+                         ORDER BY id DESC
+                         LIMIT 1
+                    )
+                    UPDATE public.trader_signals s
+                       SET processing_status = $5,
+                           processing_note   = $6,
+                           processed_at      = now()
+                      FROM cand
+                     WHERE s.id = cand.id
+                    """,
+                    position_uid, event, t_from, t_to, status, (note or "")
+                )
+                # даже если 0 строк — молча выходим; это не должно ломать бизнес-поток
+    except Exception:
+        log.exception("⚠️ trader_signals update failed (status=%s, uid=%s, ev=%s)", status, position_uid or "—", event or "—")
 
 # 🔸 Вспомогательные функции
 
@@ -261,10 +339,9 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
         return None
 
 def _parse_ts(ts_ms_str: Optional[str], ts_iso: Optional[str]) -> Optional[datetime]:
-    # условия достаточности: ts_ms приоритетнее; ts_iso в формате ...Z, но допускаем отсутствие Z
+    # ts_ms приоритетнее; ts_iso допускаем без 'Z'
     try:
         if ts_ms_str:
-            # epoch ms → UTC-naive
             ms = int(ts_ms_str)
             return datetime.utcfromtimestamp(ms / 1000.0)
     except Exception:

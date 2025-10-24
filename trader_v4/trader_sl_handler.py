@@ -1,4 +1,4 @@
-# trader_sl_handler.py — синхронизация SL-protect: по sl_replaced (без TP) отправить команду ensure_sl_at_entry в шлюз
+# trader_sl_handler.py — синхронизация SL-protect: по sl_replaced (без TP) отправить команду ensure_sl_at_entry + обновление trader_signals
 
 # 🔸 Импорты
 import asyncio
@@ -32,6 +32,7 @@ class _SLState:
         self._lock = asyncio.Lock()
 
     async def upsert_opened(self, uid: str, *, symbol: str, direction: str, ts: Optional[datetime]):
+        # сохранить/обновить базовый снимок позиции
         async with self._lock:
             s = self._by_uid.get(uid) or {}
             s.update({
@@ -44,6 +45,7 @@ class _SLState:
             self._by_uid[uid] = s
 
     async def mark_tp(self, uid: str):
+        # отметить, что после open был tp_hit (значит sl_replaced будет «после-TP»)
         async with self._lock:
             s = self._by_uid.get(uid)
             if s:
@@ -113,7 +115,7 @@ async def run_trader_sl_handler_loop():
                 block=READ_BLOCK_MS
             )
             if not entries:
-                # фоновый GC состояния (раз в ~READ_BLOCK_MS-пустой тик)
+                # фоновый GC состояния (раз в пустой тик)
                 await _sl_state.gc(ttl_hours=24)
                 continue
 
@@ -133,8 +135,6 @@ async def run_trader_sl_handler_loop():
 # 🔸 Обработка события из positions_bybit_status
 async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
     event = (_as_str(data.get("event")) or "").lower()
-    if not event:
-        return True  # мусор → ack
 
     # базовые поля для всех типов
     position_uid = _as_str(data.get("position_uid"))
@@ -145,33 +145,35 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
     ts_iso       = _as_str(data.get("ts"))
     ts_dt        = _parse_ts(ts_ms_str, ts_iso)
 
-    if not position_uid or not strategy_id or direction not in ("long", "short"):
-        log.info("⏭️ SL_SYNC: skip (invalid base fields) id=%s ev=%s uid=%s sid=%s dir=%s",
-                 record_id, event, position_uid or "—", strategy_id, direction or "—")
-        return True
-
     # opened v2 → создаём снепшот
     if event == "opened":
         await _sl_state.upsert_opened(position_uid, symbol=symbol, direction=direction, ts=ts_dt)
-        log.info("ℹ️ SL_SYNC: opened snapshot stored | uid=%s | sym=%s | dir=%s", position_uid, symbol or "—", direction)
+        log.info("ℹ️ SL_SYNC: opened snapshot stored | uid=%s | sym=%s | dir=%s", position_uid or "—", symbol or "—", direction or "—")
         return True
 
     # tp_hit → помечаем, что после open был TP (значит sl_replaced будет «после-TP», биржу не трогаем)
     if event == "tp_hit":
         await _sl_state.mark_tp(position_uid)
-        log.info("ℹ️ SL_SYNC: tp marker set | uid=%s", position_uid)
+        log.info("ℹ️ SL_SYNC: tp marker set | uid=%s", position_uid or "—")
         return True
 
     # closed.* → очищаем снепшот (позиция виртуально финализирована)
     if event.startswith("closed"):
         await _sl_state.drop(position_uid)
-        log.info("ℹ️ SL_SYNC: closed snapshot dropped | uid=%s | ev=%s", position_uid, event)
+        log.info("ℹ️ SL_SYNC: closed snapshot dropped | uid=%s | ev=%s", position_uid or "—", event)
         return True
 
     # интересует только sl_replaced
     if event != "sl_replaced":
-        log.info("⏭️ SL_SYNC: skip (event=%s)", event)
+        # не наш тип — статус события обновлять не будем, просто ACK
+        log.info("⏭️ SL_SYNC: skip (event=%s)", event or "—")
         return True
+
+    # помечаем принятие sl_replaced
+    await _update_trader_signal_status(
+        stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
+        status="accepted_by_sl_handler", note="accepted"
+    )
 
     # debounce: подождём чуть-чуть, вдруг почти одновременно прилетит tp_hit
     if SL_DEBOUNCE_MS > 0:
@@ -179,21 +181,29 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
 
     snap = await _sl_state.get_snapshot(position_uid)
     if not snap:
-        log.info("⏭️ SL_SYNC: skip (no snapshot) | uid=%s", position_uid)
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
+            status="skipped_no_snapshot", note="no opened snapshot"
+        )
+        log.info("⏭️ SL_SYNC: skip (no snapshot) | uid=%s", position_uid or "—")
         return True
 
     # если был TP после open — это SL-после-TP, биржу не трогаем
     if snap.get("had_tp"):
-        log.info("⏭️ SL_SYNC: skip (tp_policy) | uid=%s", position_uid)
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
+            status="skipped_tp_policy", note="had_tp=true"
+        )
+        log.info("⏭️ SL_SYNC: skip (tp_policy) | uid=%s", position_uid or "—")
         return True
 
-    # это SL-protect → отправляем команду ensure_sl_at_entry
+    # это SL-protect → отправляем команду ensure_sl_at_entry (без цен/объёмов; решит шлюз)
     order_fields = {
         "cmd": "ensure_sl_at_entry",
         "position_uid": position_uid,
-        "strategy_id": str(strategy_id),
+        "strategy_id": str(strategy_id) if strategy_id is not None else "",
         "symbol": snap.get("symbol") or symbol or "",
-        "direction": direction,
+        "direction": direction or "",
         "order_link_suffix": "sl_entry",
         "ts": ts_iso or "",
         "ts_ms": ts_ms_str or "",
@@ -201,15 +211,81 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
 
     try:
         await infra.redis_client.xadd(ORDER_REQUEST_STREAM, order_fields)
-    except Exception:
-        log.exception("❌ SL_SYNC: публикация ensure_sl_at_entry не удалась | uid=%s", position_uid)
+    except Exception as e:
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
+            status="failed_publish_order_request", note=f"redis xadd error: {e.__class__.__name__}"
+        )
+        log.exception("❌ SL_SYNC: публикация ensure_sl_at_entry не удалась | uid=%s", position_uid or "—")
         return False  # не ACK → повтор
 
+    # успех
+    await _update_trader_signal_status(
+        stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
+        status="sl_ensure_sl_at_entry_published", note=f"debounce_ms={SL_DEBOUNCE_MS}"
+    )
     log.info(
         "✅ SL_SYNC: ensure_sl_at_entry → sent | uid=%s | sid=%s | sym=%s | dir=%s",
-        position_uid, strategy_id, order_fields["symbol"] or "—", direction
+        position_uid or "—", (strategy_id if strategy_id is not None else "—"),
+        (order_fields['symbol'] or "—"), (direction or "—")
     )
     return True
+
+
+# 🔸 Апдейты public.trader_signals (stream_id → fallback по uid/event/ts)
+async def _update_trader_signal_status(
+    *,
+    stream_id: Optional[str],
+    position_uid: Optional[str],
+    event: Optional[str],
+    ts_iso: Optional[str],
+    status: str,
+    note: Optional[str] = None
+) -> None:
+    try:
+        # попытка 1: по stream_id
+        if stream_id:
+            res = await infra.pg_pool.execute(
+                """
+                UPDATE public.trader_signals
+                   SET processing_status = $1,
+                       processing_note   = $2,
+                       processed_at      = now()
+                 WHERE stream_id = $3
+                """,
+                status, (note or ""), stream_id
+            )
+            if res.startswith("UPDATE") and res.split()[-1] != "0":
+                return  # обновили успешно
+
+        # попытка 2: по (uid, event, emitted_ts ~ ts_iso ± 2s)
+        if position_uid and event and ts_iso:
+            dt = _parse_ts(None, ts_iso)
+            if dt is not None:
+                t_from = dt - timedelta(seconds=2)
+                t_to   = dt + timedelta(seconds=2)
+                await infra.pg_pool.execute(
+                    """
+                    WITH cand AS (
+                        SELECT id
+                          FROM public.trader_signals
+                         WHERE position_uid = $1
+                           AND event = $2
+                           AND emitted_ts BETWEEN $3 AND $4
+                         ORDER BY id DESC
+                         LIMIT 1
+                    )
+                    UPDATE public.trader_signals s
+                       SET processing_status = $5,
+                           processing_note   = $6,
+                           processed_at      = now()
+                      FROM cand
+                     WHERE s.id = cand.id
+                    """,
+                    position_uid, event, t_from, t_to, status, (note or "")
+                )
+    except Exception:
+        log.exception("⚠️ trader_signals update failed (status=%s, uid=%s, ev=%s)", status, position_uid or "—", event or "—")
 
 
 # 🔸 Вспомогательные функции
