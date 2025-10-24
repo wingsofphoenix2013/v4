@@ -1,4 +1,4 @@
-# trader_position_closer.py — обработчик закрытий: ensure_closed → trader_order_requests + апдейт trader_positions_v4 + обновление trader_signals
+# trader_position_closer.py — обработчик закрытий: ensure_closed → trader_order_requests + апдейт trader_positions_v4 + обновление trader_signals + POS_RUNTIME (config)
 
 # 🔸 Импорты
 import asyncio
@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from trader_infra import infra
+from trader_config import config
 
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_CLOSER")
@@ -82,6 +83,7 @@ async def run_trader_position_closer_loop():
             log.exception("❌ Ошибка в основном цикле TRADER_CLOSER")
             await asyncio.sleep(0.5)
 
+
 # 🔸 Обработка одного события closed.*
 async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     # базовые поля
@@ -92,6 +94,7 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     symbol_ev    = _as_str(data.get("symbol"))
     ts_ms_str    = _as_str(data.get("ts_ms"))
     ts_iso       = _as_str(data.get("ts"))
+    ts_dt        = _parse_ts(ts_ms_str, ts_iso)
 
     # чужие события — просто лог и ACK, без апдейта trader_signals
     if not event.startswith("closed"):
@@ -119,7 +122,7 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     # символ из якоря (если не пришёл в событии)
     symbol = symbol_ev or await _fetch_symbol_from_anchor(position_uid)
 
-    # подтянем виртуальные итоги из positions_v4 (не критично, если не найдём)
+    # подтянем «виртуальные» итоги из positions_v4 (не критично, если не найдём)
     virt_pnl, virt_exit_price, virt_closed_at, virt_close_reason = await _fetch_virtual_close_snapshot(position_uid)
 
     # апдейт агрегата (не создаём запись, только обновляем, если якорь есть)
@@ -161,17 +164,24 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
         log.exception("❌ Не удалось опубликовать ensure_closed uid=%s", position_uid)
         return False  # без ACK → повтор
 
-    # успех
+    # успех: обновляем журнал и POS_RUNTIME (конфиг)
     note = f"ensure_closed published; reason={reason}; anchor={'present' if anchor_exists else 'absent'}"
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
         status="closer_ensure_closed_published", note=note
     )
+
+    try:
+        await config.note_closed(position_uid, ts_dt)
+    except Exception:
+        log.exception("⚠️ POS_RUNTIME: note_closed не удалось (uid=%s)", position_uid)
+
     log.info(
         "✅ CLOSER: ensure_closed → sent | uid=%s | sid=%s | sym=%s | event=%s | reason=%s | anchor=%s",
         position_uid, strategy_id, (symbol or "—"), event, reason, "yes" if anchor_exists else "no"
     )
     return True
+
 
 # 🔸 Вспомогательные функции — обновление trader_signals
 async def _update_trader_signal_status(

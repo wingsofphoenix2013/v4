@@ -1,4 +1,4 @@
-# trader_position_filler.py — якорение позиции и «толстая» заявка (opened v2) + обновление public.trader_signals
+# trader_position_filler.py — якорение позиции и «толстая» заявка (opened v2) + обновление trader_signals + POS_RUNTIME (config)
 
 # 🔸 Импорты
 import os
@@ -28,6 +28,7 @@ CONCURRENCY   = 8
 
 # 🔸 Настройки исполнителя
 SIZE_PCT_ENV = "BYBIT_SIZE_PCT"  # % реального размера от виртуального (0 < pct ≤ 100)
+
 
 # 🔸 Основной цикл воркера
 async def run_trader_position_filler_loop():
@@ -94,12 +95,13 @@ async def run_trader_position_filler_loop():
             log.exception("❌ Ошибка в основном цикле TRADER_FILLER")
             await asyncio.sleep(0.5)
 
+
 # 🔸 Обработка события opened v2 (schema="v2")
 async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Decimal) -> bool:
     # условия достаточности: opened + v2
     event = (_as_str(data.get("event")) or "").lower()
     if event != "opened":
-        # FILLER обновляет trader_signals только для opened; прочее пропускаем тихо
+        # FILLER ведёт статус только по opened; прочие события — просто пропуск
         log.info("⏭️ FILLER: пропуск id=%s (event=%s)", record_id, event or "—")
         return True
 
@@ -112,7 +114,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     ts_iso       = _as_str(data.get("ts"))
     created_at   = _parse_ts(ts_ms_str, ts_iso) or datetime.utcnow()
 
-    # базовая отметка «принято к обработке»
+    # отметка «принято к обработке»
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
         status="accepted_by_filler", note="accepted opened v2" if schema == "v2" else "accepted opened (non-v2)"
@@ -132,6 +134,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     virt_qty_left  = _as_decimal(data.get("quantity_left")) or virt_qty
     virt_margin    = _as_decimal(data.get("margin_used"))
 
+    # валидация минимального набора
     if not position_uid or not strategy_id or not symbol or direction not in ("long", "short") \
        or leverage is None or leverage <= 0 or virt_qty is None or virt_qty_left is None or virt_margin is None:
         await _update_trader_signal_status(
@@ -143,8 +146,8 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
         return False  # не ACK → повторная доставка
 
     # вычисление реальных величин по size_pct
-    real_qty   = (virt_qty * size_pct) / Decimal("100")
-    real_margin= (virt_margin * size_pct) / Decimal("100")
+    real_qty    = (virt_qty * size_pct) / Decimal("100")
+    real_margin = (virt_margin * size_pct) / Decimal("100")
 
     # точности тикера и политика стратегии (для заявки)
     tmeta = config.tickers.get(symbol) or {}
@@ -155,7 +158,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     min_qty = tmeta.get("min_qty")
     ticksize = tmeta.get("ticksize")
 
-    # 1) якорим позицию в trader_positions_v4 (идемпотентно)
+    # 1) идемпотентно якорим позицию в trader_positions_v4
     try:
         await infra.pg_pool.execute(
             """
@@ -231,6 +234,13 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
         log.exception("❌ Не удалось опубликовать заявку uid=%s", position_uid)
         return False
 
+    # 4) обновляем централизованный POS_RUNTIME (после успешной публикации)
+    try:
+        await config.note_opened(position_uid, strategy_id, symbol, direction, created_at)
+    except Exception:
+        # это не критично для бизнес-потока, но залогируем
+        log.exception("⚠️ POS_RUNTIME: note_opened не удалось (uid=%s)", position_uid)
+
     # финальный статус для opened
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
@@ -246,6 +256,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
         _dec_to_str(virt_margin),
     )
     return True
+
 
 # 🔸 Апдейты public.trader_signals (stream_id → fallback по uid/event/ts)
 async def _update_trader_signal_status(
@@ -279,7 +290,7 @@ async def _update_trader_signal_status(
             if dt is not None:
                 t_from = dt - timedelta(seconds=2)
                 t_to   = dt + timedelta(seconds=2)
-                res2 = await infra.pg_pool.execute(
+                await infra.pg_pool.execute(
                     """
                     WITH cand AS (
                         SELECT id
@@ -299,9 +310,9 @@ async def _update_trader_signal_status(
                     """,
                     position_uid, event, t_from, t_to, status, (note or "")
                 )
-                # даже если 0 строк — молча выходим; это не должно ломать бизнес-поток
     except Exception:
         log.exception("⚠️ trader_signals update failed (status=%s, uid=%s, ev=%s)", status, position_uid or "—", event or "—")
+
 
 # 🔸 Вспомогательные функции
 

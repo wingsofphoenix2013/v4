@@ -1,4 +1,4 @@
-# trader_sl_handler.py — синхронизация SL-protect: по sl_replaced (без TP) отправить команду ensure_sl_at_entry + обновление trader_signals
+# trader_sl_handler.py — синхронизация SL-protect: по sl_replaced (без TP) отправить команду ensure_sl_at_entry + обновление trader_signals (через централизованный POS_RUNTIME в config)
 
 # 🔸 Импорты
 import asyncio
@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 
 from trader_infra import infra
+from trader_config import config
 
 # 🔸 Логгер воркера
 log = logging.getLogger("TRADER_SL")
@@ -24,52 +25,6 @@ CONCURRENCY   = 8
 
 # 🔸 Настройки гейта (debounce)
 SL_DEBOUNCE_MS = 300  # короткая задержка, чтобы «догнаться» возможному tp_hit
-
-# 🔸 In-memory состояние по позиции
-class _SLState:
-    def __init__(self):
-        self._by_uid: Dict[str, Dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def upsert_opened(self, uid: str, *, symbol: str, direction: str, ts: Optional[datetime]):
-        # сохранить/обновить базовый снимок позиции
-        async with self._lock:
-            s = self._by_uid.get(uid) or {}
-            s.update({
-                "symbol": symbol,
-                "direction": direction,
-                "had_tp": s.get("had_tp", False),
-                "opened_at": ts or datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
-            })
-            self._by_uid[uid] = s
-
-    async def mark_tp(self, uid: str):
-        # отметить, что после open был tp_hit (значит sl_replaced будет «после-TP»)
-        async with self._lock:
-            s = self._by_uid.get(uid)
-            if s:
-                s["had_tp"] = True
-                s["updated_at"] = datetime.utcnow()
-
-    async def get_snapshot(self, uid: str) -> Optional[Dict[str, Any]]:
-        async with self._lock:
-            s = self._by_uid.get(uid)
-            return dict(s) if s else None
-
-    async def drop(self, uid: str):
-        async with self._lock:
-            self._by_uid.pop(uid, None)
-
-    async def gc(self, ttl_hours: int = 24):
-        # условия достаточности: чистим старые снепшоты
-        cutoff = datetime.utcnow() - timedelta(hours=ttl_hours)
-        async with self._lock:
-            stale = [k for k, v in self._by_uid.items() if v.get("updated_at") and v["updated_at"] < cutoff]
-            for k in stale:
-                self._by_uid.pop(k, None)
-
-_sl_state = _SLState()
 
 
 # 🔸 Основной цикл воркера
@@ -115,8 +70,6 @@ async def run_trader_sl_handler_loop():
                 block=READ_BLOCK_MS
             )
             if not entries:
-                # фоновый GC состояния (раз в пустой тик)
-                await _sl_state.gc(ttl_hours=24)
                 continue
 
             tasks = []
@@ -139,37 +92,42 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
     # базовые поля для всех типов
     position_uid = _as_str(data.get("position_uid"))
     strategy_id  = _as_int(data.get("strategy_id"))
-    symbol       = _as_str(data.get("symbol"))
+    symbol_ev    = _as_str(data.get("symbol"))
     direction    = (_as_str(data.get("direction")) or "").lower()
     ts_ms_str    = _as_str(data.get("ts_ms"))
     ts_iso       = _as_str(data.get("ts"))
     ts_dt        = _parse_ts(ts_ms_str, ts_iso)
 
-    # opened v2 → создаём снепшот
+    # opened v2 → обновляем централизованный POS_RUNTIME
     if event == "opened":
-        await _sl_state.upsert_opened(position_uid, symbol=symbol, direction=direction, ts=ts_dt)
-        log.info("ℹ️ SL_SYNC: opened snapshot stored | uid=%s | sym=%s | dir=%s", position_uid or "—", symbol or "—", direction or "—")
+        if position_uid and strategy_id and direction in ("long", "short"):
+            await config.note_opened(position_uid, strategy_id, symbol_ev or "", direction, ts_dt)
+            log.info("ℹ️ SL_SYNC: opened runtime updated | uid=%s | sym=%s | dir=%s", position_uid or "—", symbol_ev or "—", direction or "—")
+        else:
+            log.info("⏭️ SL_SYNC: opened skip (invalid base fields) | uid=%s | sid=%s | dir=%s",
+                     position_uid or "—", strategy_id, direction or "—")
         return True
 
-    # tp_hit → помечаем, что после open был TP (значит sl_replaced будет «после-TP», биржу не трогаем)
+    # tp_hit → отмечаем факт TP после open (для гейта)
     if event == "tp_hit":
-        await _sl_state.mark_tp(position_uid)
-        log.info("ℹ️ SL_SYNC: tp marker set | uid=%s", position_uid or "—")
+        if position_uid:
+            await config.note_tp_hit(position_uid, ts_dt)
+            log.info("ℹ️ SL_SYNC: tp marker set | uid=%s", position_uid or "—")
         return True
 
-    # closed.* → очищаем снепшот (позиция виртуально финализирована)
+    # closed.* → удаляем из POS_RUNTIME
     if event.startswith("closed"):
-        await _sl_state.drop(position_uid)
-        log.info("ℹ️ SL_SYNC: closed snapshot dropped | uid=%s | ev=%s", position_uid or "—", event)
+        if position_uid:
+            await config.note_closed(position_uid, ts_dt)
+            log.info("ℹ️ SL_SYNC: closed runtime cleared | uid=%s", position_uid or "—")
         return True
 
     # интересует только sl_replaced
     if event != "sl_replaced":
-        # не наш тип — статус события обновлять не будем, просто ACK
         log.info("⏭️ SL_SYNC: skip (event=%s)", event or "—")
         return True
 
-    # помечаем принятие sl_replaced
+    # помечаем принятие sl_replaced (только это событие SL-воркер отражает в trader_signals)
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
         status="accepted_by_sl_handler", note="accepted"
@@ -179,17 +137,9 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
     if SL_DEBOUNCE_MS > 0:
         await asyncio.sleep(SL_DEBOUNCE_MS / 1000.0)
 
-    snap = await _sl_state.get_snapshot(position_uid)
-    if not snap:
-        await _update_trader_signal_status(
-            stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
-            status="skipped_no_snapshot", note="no opened snapshot"
-        )
-        log.info("⏭️ SL_SYNC: skip (no snapshot) | uid=%s", position_uid or "—")
-        return True
-
-    # если был TP после open — это SL-после-TP, биржу не трогаем
-    if snap.get("had_tp"):
+    # решаем по централизованному состоянию: был ли TP после open
+    had_tp = await config.had_tp_since_open(position_uid) if position_uid else False
+    if had_tp:
         await _update_trader_signal_status(
             stream_id=record_id, position_uid=position_uid, event="sl_replaced", ts_iso=ts_iso,
             status="skipped_tp_policy", note="had_tp=true"
@@ -198,11 +148,15 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
         return True
 
     # это SL-protect → отправляем команду ensure_sl_at_entry (без цен/объёмов; решит шлюз)
+    # для символа приоритет: POS_RUNTIME → событие → пусто
+    snap = await config.get_position(position_uid) if position_uid else None
+    symbol = (snap.symbol if snap else None) or symbol_ev or ""
+
     order_fields = {
         "cmd": "ensure_sl_at_entry",
-        "position_uid": position_uid,
+        "position_uid": position_uid or "",
         "strategy_id": str(strategy_id) if strategy_id is not None else "",
-        "symbol": snap.get("symbol") or symbol or "",
+        "symbol": symbol,
         "direction": direction or "",
         "order_link_suffix": "sl_entry",
         "ts": ts_iso or "",
@@ -227,7 +181,7 @@ async def _handle_status_event(record_id: str, data: Dict[str, Any]) -> bool:
     log.info(
         "✅ SL_SYNC: ensure_sl_at_entry → sent | uid=%s | sid=%s | sym=%s | dir=%s",
         position_uid or "—", (strategy_id if strategy_id is not None else "—"),
-        (order_fields['symbol'] or "—"), (direction or "—")
+        (symbol or "—"), (direction or "—")
     )
     return True
 

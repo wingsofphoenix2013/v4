@@ -1,11 +1,13 @@
-# trader_config.py — загрузка активных тикеров/стратегий, онлайн-апдейты (Pub/Sub) и кэши: winners + полная политика SL/TP
+# trader_config.py — загрузка активных тикеров/стратегий, онлайн-апдейты (Pub/Sub) и кэши: winners + полная политика SL/TP + RUNTIME позиций
 
 # 🔸 Импорты
 import asyncio
 import logging
 import json
 from decimal import Decimal
-from typing import Dict, Set, Optional, List, Any
+from typing import Dict, Set, Optional, List, Any, Tuple
+from dataclasses import dataclass
+from datetime import datetime
 
 from trader_infra import infra
 
@@ -38,7 +40,18 @@ def _normalize_strategy_flags(strategy: dict) -> None:
             val = strategy[key]
             strategy[key] = (str(val).lower() == "true") if not isinstance(val, bool) else val
 
-# 🔸 Состояние конфигурации трейдера (+ in-memory кэши winners и политики SL/TP)
+# 🔸 Runtime-снимок позиции (для централизованного состояния)
+@dataclass
+class PositionSnap:
+    position_uid: str
+    strategy_id: int
+    symbol: str
+    direction: str           # 'long' | 'short'
+    opened_at: datetime
+    had_tp: bool = False
+    last_seen_at: Optional[datetime] = None
+
+# 🔸 Состояние конфигурации трейдера (+ in-memory кэши winners и политики SL/TP + позиции)
 class TraderConfigState:
     def __init__(self):
         self.tickers: Dict[str, dict] = {}
@@ -48,21 +61,14 @@ class TraderConfigState:
         # кэш победителей и их метаданных
         self.trader_winners: Set[int] = set()  # множество strategy_id
         self.trader_winners_min_deposit: Optional[Decimal] = None
-        self.strategy_meta: Dict[int, dict] = {}  # только для текущих winners:
-        # {sid: {"deposit": Decimal|None, "leverage": Decimal|None,
-        #        "market_mirrow": int|None, "market_mirrow_long": int|None, "market_mirrow_short": int|None}}
+        self.strategy_meta: Dict[int, dict] = {}  # только для текущих winners
 
         # полная политика SL/TP по стратегиям (все активные, не только winners)
         self.strategy_policy: Dict[int, dict] = {}
-        # форма:
-        # { sid: {
-        #     "sl": {"type": "percent"|"atr"|None, "value": Decimal|None},
-        #     "tp_levels": [
-        #         {"id": int, "level": int, "tp_type": "percent"|"atr"|"signal", "tp_value": Decimal|None, "volume_percent": Decimal}
-        #     ],
-        #     "tp_sl_by_level": { level: {"sl_mode": "none"|"entry"|"atr"|"percent", "sl_value": Decimal|None} }
-        #   }
-        # }
+
+        # runtime-позиции (единый для всех воркеров)
+        self.positions_runtime: Dict[str, PositionSnap] = {}          # {position_uid -> PositionSnap}
+        self.positions_by_sid_symbol: Dict[Tuple[int, str], str] = {} # {(strategy_id, symbol) -> position_uid}
 
         self._lock = asyncio.Lock()
 
@@ -437,6 +443,117 @@ class TraderConfigState:
             }
 
         self.strategy_policy[strategy_id] = policy
+
+    # 🔸 Bootstrap runtime-позиций (вызывать после init_trader_config_state)
+    async def init_positions_runtime_state(self):
+        # читаем активные позиции в системе
+        rows = await infra.pg_pool.fetch(
+            """
+            SELECT position_uid, strategy_id, symbol, direction, created_at
+            FROM public.trader_positions_v4
+            WHERE status IN ('open','closing')
+            """
+        )
+
+        if not rows:
+            async with self._lock:
+                self.positions_runtime = {}
+                self.positions_by_sid_symbol = {}
+            log.info("🔎 POS_RUNTIME: loaded active positions — 0 items")
+            return
+
+        # список uid для вычисления had_tp (после последнего opened)
+        uids: List[str] = [str(r["position_uid"]) for r in rows if r.get("position_uid")]
+
+        # вычислим had_tp с привязкой к последнему opened (одним запросом через join к агрегации opened)
+        tp_after_open_rows = await infra.pg_pool.fetch(
+            """
+            WITH last_open AS (
+                SELECT position_uid, max(emitted_ts) AS opened_at
+                FROM public.trader_signals
+                WHERE event = 'opened' AND position_uid = ANY($1::text[])
+                GROUP BY position_uid
+            )
+            SELECT DISTINCT s.position_uid
+            FROM public.trader_signals s
+            JOIN last_open o ON o.position_uid = s.position_uid
+            WHERE s.event = 'tp_hit'
+              AND s.emitted_ts > o.opened_at
+            """,
+            uids
+        )
+        had_tp_set = {str(r["position_uid"]) for r in tp_after_open_rows}
+
+        # собираем новые словари
+        new_runtime: Dict[str, PositionSnap] = {}
+        new_index: Dict[Tuple[int, str], str] = {}
+        now = datetime.utcnow()
+
+        for r in rows:
+            uid = str(r["position_uid"])
+            sid = int(r["strategy_id"])
+            sym = str(r["symbol"])
+            direc = (str(r["direction"]) or "").lower()
+            opened_at = r["created_at"] or now
+            had_tp = uid in had_tp_set
+
+            snap = PositionSnap(
+                position_uid=uid,
+                strategy_id=sid,
+                symbol=sym,
+                direction=direc,
+                opened_at=opened_at,
+                had_tp=had_tp,
+                last_seen_at=now,
+            )
+            new_runtime[uid] = snap
+            new_index[(sid, sym)] = uid
+
+        async with self._lock:
+            self.positions_runtime = new_runtime
+            self.positions_by_sid_symbol = new_index
+
+        log.info("🔎 POS_RUNTIME: loaded active positions — %d items", len(new_runtime))
+
+    # 🔸 Публичное API runtime-позиций для воркеров
+
+    async def note_opened(self, position_uid: str, strategy_id: int, symbol: str, direction: str, opened_at: Optional[datetime] = None):
+        # создать/обновить запись о позиции (после opened v2)
+        snap = PositionSnap(
+            position_uid=position_uid,
+            strategy_id=strategy_id,
+            symbol=symbol,
+            direction=(direction or "").lower(),
+            opened_at=opened_at or datetime.utcnow(),
+            had_tp=False,
+            last_seen_at=datetime.utcnow(),
+        )
+        async with self._lock:
+            self.positions_runtime[position_uid] = snap
+            self.positions_by_sid_symbol[(strategy_id, symbol)] = position_uid
+
+    async def note_tp_hit(self, position_uid: str, _ts: Optional[datetime] = None):
+        async with self._lock:
+            snap = self.positions_runtime.get(position_uid)
+            if snap:
+                snap.had_tp = True
+                snap.last_seen_at = _ts or datetime.utcnow()
+
+    async def note_closed(self, position_uid: str, _ts: Optional[datetime] = None):
+        async with self._lock:
+            snap = self.positions_runtime.pop(position_uid, None)
+            if snap:
+                self.positions_by_sid_symbol.pop((snap.strategy_id, snap.symbol), None)
+
+    async def had_tp_since_open(self, position_uid: str) -> bool:
+        async with self._lock:
+            snap = self.positions_runtime.get(position_uid)
+            return bool(snap and snap.had_tp)
+
+    async def get_position(self, position_uid: str) -> Optional[PositionSnap]:
+        async with self._lock:
+            snap = self.positions_runtime.get(position_uid)
+            return PositionSnap(**snap.__dict__) if snap else None
 
 # 🔸 Глобальный объект конфигурации
 config = TraderConfigState()

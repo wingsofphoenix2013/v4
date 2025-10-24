@@ -1,11 +1,11 @@
-# trader_v4_main.py — оркестратор Trader v4 (МИНИМАЛЬНЫЙ режим: инфраструктура + конфиг + TRADER_FILLER)
+# trader_v4_main.py — оркестратор Trader v4 (инфраструктура + конфиг + POS_RUNTIME + FILLER/CLOSER/SL)
 
 # 🔸 Импорты
 import asyncio
 import logging
 
 from trader_infra import setup_logging, setup_pg, setup_redis_client
-from trader_config import init_trader_config_state, config_event_listener
+from trader_config import init_trader_config_state, config_event_listener, config
 from trader_position_filler import run_trader_position_filler_loop
 from trader_position_closer import run_trader_position_closer_loop
 from trader_sl_handler import run_trader_sl_handler_loop
@@ -36,10 +36,10 @@ async def run_with_delay(coro_factory, label: str, start_delay: float = 0.0):
         await asyncio.sleep(start_delay)
     await run_safe_loop(coro_factory, label)
 
-# 🔸 Главная точка входа (минимальный режим)
+# 🔸 Главная точка входа
 async def main():
     setup_logging()
-    log.info("📦 Запуск Trader v4 (минимальный режим)")
+    log.info("📦 Запуск Trader v4")
 
     # инициализация инфраструктуры
     try:
@@ -58,18 +58,26 @@ async def main():
         log.exception("❌ Ошибка инициализации конфигурации")
         return
 
+    # инициализация централизованного runtime-состояния позиций
+    try:
+        await config.init_positions_runtime_state()
+        log.info("✅ POS_RUNTIME инициализирован (активные позиции загружены)")
+    except Exception:
+        log.exception("❌ Ошибка инициализации POS_RUNTIME")
+        return
+
     log.info("🚀 Старт воркеров: CONFIG_LISTENER + TRADER_FILLER + TRADER_CLOSER + TRADER_SL")
     await asyncio.gather(
         # слушатель Pub/Sub апдейтов конфигурации
         run_with_delay(config_event_listener, "TRADER_CONFIG", start_delay=CONFIG_LISTENER_START_DELAY_SEC),
 
-        # подписчик открытий (positions_bybit_status: event='opened' v2) → якорение + «толстая» заявка
+        # подписчик открытий (positions_bybit_status: event='opened' v2) → якорение + «толстая» заявка + обновление POS_RUNTIME
         run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=FILLER_START_DELAY_SEC),
-        
-        # слушатель закрытий (positions_bybit_status: event='closed.*') → ensure_closed + апдейт агрегата
+
+        # слушатель закрытий (positions_bybit_status: event='closed.*') → ensure_closed + апдейт агрегата + обновление POS_RUNTIME
         run_with_delay(run_trader_position_closer_loop, "TRADER_CLOSER", start_delay=CLOSER_START_DELAY_SEC),
-        
-        # слушатель sl_replaced (SL-protect) → ensure_sl_at_entry
+
+        # слушатель sl_replaced (SL-protect) → ensure_sl_at_entry (использует POS_RUNTIME из config)
         run_with_delay(run_trader_sl_handler_loop, "TRADER_SL", start_delay=SL_START_DELAY_SEC),
     )
 
