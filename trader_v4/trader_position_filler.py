@@ -27,7 +27,8 @@ READ_COUNT    = 10
 CONCURRENCY   = 8
 
 # 🔸 Настройки исполнителя
-SIZE_PCT_ENV = "BYBIT_SIZE_PCT"  # % реального размера от виртуального (0 < pct ≤ 100)
+SIZE_PCT_ENV = "BYBIT_SIZE_PCT"        # % реального размера от виртуального (0 < pct ≤ 100)
+ORDER_MODE   = os.getenv("TRADER_ORDER_MODE", "on").strip().lower()  # on | off | dry_run
 
 
 # 🔸 Основной цикл воркера
@@ -51,8 +52,9 @@ async def run_trader_position_filler_loop():
         log.error("❌ %s не задан или некорректен — воркер не стартует", SIZE_PCT_ENV)
         return
 
-    log.info("🚦 TRADER_FILLER v3 запущен (источник=%s, параллелизм=%d, size_pct=%s)",
-             POSITIONS_STATUS_STREAM, CONCURRENCY, _dec_to_str(size_pct))
+    ex_status_on_insert = "pending_entry" if ORDER_MODE == "on" else "none"
+    log.info("🚦 TRADER_FILLER v3 запущен (источник=%s, параллелизм=%d, size_pct=%s, order_mode=%s, exchange_status=%s)",
+             POSITIONS_STATUS_STREAM, CONCURRENCY, _dec_to_str(size_pct), ORDER_MODE, ex_status_on_insert)
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
@@ -61,7 +63,7 @@ async def run_trader_position_filler_loop():
         async with sem:
             ack_ok = False
             try:
-                ack_ok = await _handle_opened_v2(record_id, data, size_pct)
+                ack_ok = await _handle_opened_v2(record_id, data, size_pct, ex_status_on_insert)
             except Exception:
                 log.exception("❌ Ошибка обработки записи (id=%s)", record_id)
             finally:
@@ -97,11 +99,10 @@ async def run_trader_position_filler_loop():
 
 
 # 🔸 Обработка события opened v2 (schema="v2")
-async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Decimal) -> bool:
+async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Decimal, ex_status_on_insert: str) -> bool:
     # условия достаточности: opened + v2
     event = (_as_str(data.get("event")) or "").lower()
     if event != "opened":
-        # FILLER ведёт статус только по opened; прочие события — просто пропуск
         log.info("⏭️ FILLER: пропуск id=%s (event=%s)", record_id, event or "—")
         return True
 
@@ -117,7 +118,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     # отметка «принято к обработке»
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
-        status="accepted_by_filler", note="accepted opened v2" if schema == "v2" else "accepted opened (non-v2)"
+        status="accepted_by_filler", note=f"accepted opened v2; order_mode={ORDER_MODE}"
     )
 
     if schema != "v2":
@@ -128,13 +129,12 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
         log.info("⏭️ FILLER: пропуск id=%s (schema=%s, ожидаем 'v2')", record_id, schema or "—")
         return True
 
-    # размеры/плечо из события (обязательны в v1.2+)
+    # размеры/плечо
     leverage       = _as_decimal(data.get("leverage"))
     virt_qty       = _as_decimal(data.get("quantity"))
     virt_qty_left  = _as_decimal(data.get("quantity_left")) or virt_qty
     virt_margin    = _as_decimal(data.get("margin_used"))
 
-    # валидация минимального набора
     if not position_uid or not strategy_id or not symbol or direction not in ("long", "short") \
        or leverage is None or leverage <= 0 or virt_qty is None or virt_qty_left is None or virt_margin is None:
         await _update_trader_signal_status(
@@ -158,7 +158,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
     min_qty = tmeta.get("min_qty")
     ticksize = tmeta.get("ticksize")
 
-    # 1) идемпотентно якорим позицию в trader_positions_v4
+    # 1) идемпотентно якорим позицию в trader_positions_v4, с учётом order_mode → exchange_status
     try:
         await infra.pg_pool.execute(
             """
@@ -167,7 +167,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
                 leverage, size_pct,
                 virt_quantity, virt_quantity_left, virt_margin_used,
                 real_quantity, real_margin_used,
-                exchange, entry_status, entry_order_link_id, entry_order_id, last_ext_event_at,
+                exchange, exchange_status, entry_status, entry_order_link_id, entry_order_id, last_ext_event_at,
                 status, created_at, entry_filled_at, closed_at, close_reason,
                 pnl_real, exec_fee_total, avg_entry_price, avg_close_price,
                 error_last, extras
@@ -176,8 +176,8 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
                 $5, $6,
                 $7, $8, $9,
                 $10, $11,
-                'bybit', 'planned', NULL, NULL, NULL,
-                'open', $12, NULL, NULL, NULL,
+                'bybit', $12, 'planned', NULL, NULL, NULL,
+                'open', $13, NULL, NULL, NULL,
                 NULL, NULL, NULL, NULL,
                 NULL, NULL
             )
@@ -187,6 +187,7 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
             leverage, size_pct,
             virt_qty, virt_qty_left, virt_margin,
             real_qty, real_margin,
+            ex_status_on_insert,
             created_at
         )
     except Exception as e:
@@ -234,26 +235,24 @@ async def _handle_opened_v2(record_id: str, data: Dict[str, Any], size_pct: Deci
         log.exception("❌ Не удалось опубликовать заявку uid=%s", position_uid)
         return False
 
-    # 4) обновляем централизованный POS_RUNTIME (после успешной публикации)
+    # 4) POS_RUNTIME (после успеха)
     try:
         await config.note_opened(position_uid, strategy_id, symbol, direction, created_at)
     except Exception:
-        # это не критично для бизнес-потока, но залогируем
         log.exception("⚠️ POS_RUNTIME: note_opened не удалось (uid=%s)", position_uid)
 
     # финальный статус для opened
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event="opened", ts_iso=ts_iso,
         status="filler_thick_order_published",
-        note=f"published thick order; real_qty={_dec_to_str(real_qty)}; size_pct={_dec_to_str(size_pct)}"
+        note=f"published thick order; real_qty={_dec_to_str(real_qty)}; size_pct={_dec_to_str(size_pct)}; order_mode={ORDER_MODE}"
     )
 
-    # лог результата (информативный)
     log.info(
-        "✅ FILLER: anchored+sent | uid=%s | sid=%s | sym=%s | dir=%s | lev=%s | virt_qty=%s | real_qty=%s | size_pct=%s | margin=%s",
+        "✅ FILLER: anchored+sent | uid=%s | sid=%s | sym=%s | dir=%s | lev=%s | virt_qty=%s | real_qty=%s | size_pct=%s | margin=%s | order_mode=%s",
         position_uid, strategy_id, symbol, direction,
         _dec_to_str(leverage), _dec_to_str(virt_qty), _dec_to_str(real_qty), _dec_to_str(size_pct),
-        _dec_to_str(virt_margin),
+        _dec_to_str(virt_margin), ORDER_MODE,
     )
     return True
 
@@ -269,7 +268,6 @@ async def _update_trader_signal_status(
     note: Optional[str] = None
 ) -> None:
     try:
-        # попытка 1: по stream_id
         if stream_id:
             res = await infra.pg_pool.execute(
                 """
@@ -282,9 +280,7 @@ async def _update_trader_signal_status(
                 status, (note or ""), stream_id
             )
             if res.startswith("UPDATE") and res.split()[-1] != "0":
-                return  # обновили успешно
-
-        # попытка 2: по (uid, event, emitted_ts ~ ts_iso ± 2s)
+                return
         if position_uid and event and ts_iso:
             dt = _parse_ts(None, ts_iso)
             if dt is not None:
@@ -315,9 +311,7 @@ async def _update_trader_signal_status(
 
 
 # 🔸 Вспомогательные функции
-
 def _get_size_pct() -> Optional[Decimal]:
-    # условия достаточности: env задан и 0 < pct ≤ 100
     raw = os.getenv(SIZE_PCT_ENV, "").strip()
     try:
         pct = Decimal(raw)
@@ -350,7 +344,6 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
         return None
 
 def _parse_ts(ts_ms_str: Optional[str], ts_iso: Optional[str]) -> Optional[datetime]:
-    # ts_ms приоритетнее; ts_iso допускаем без 'Z'
     try:
         if ts_ms_str:
             ms = int(ts_ms_str)

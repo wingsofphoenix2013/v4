@@ -1,6 +1,7 @@
-# trader_position_closer.py — обработчик закрытий: ensure_closed → trader_order_requests + апдейт trader_positions_v4 + обновление trader_signals + POS_RUNTIME (config)
+# trader_position_closer.py — обработчик закрытий: ensure_closed → trader_order_requests + апдейт trader_positions_v4 + обновление trader_signals + POS_RUNTIME (config) + поддержка TRADER_ORDER_MODE
 
 # 🔸 Импорты
+import os
 import asyncio
 import logging
 from typing import Dict, Any, Optional
@@ -24,6 +25,9 @@ READ_BLOCK_MS = 1000
 READ_COUNT    = 10
 CONCURRENCY   = 8
 
+# 🔸 Режим исполнения
+ORDER_MODE = os.getenv("TRADER_ORDER_MODE", "on").strip().lower()  # on | off | dry_run
+
 
 # 🔸 Основной цикл воркера
 async def run_trader_position_closer_loop():
@@ -40,7 +44,7 @@ async def run_trader_position_closer_loop():
             log.exception("❌ Ошибка создания Consumer Group")
             return
 
-    log.info("🚦 TRADER_CLOSER v1 запущен (источник=%s, параллелизм=%d)", POSITIONS_STATUS_STREAM, CONCURRENCY)
+    log.info("🚦 TRADER_CLOSER v1 запущен (источник=%s, параллелизм=%d, order_mode=%s)", POSITIONS_STATUS_STREAM, CONCURRENCY, ORDER_MODE)
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
@@ -104,7 +108,7 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     # принятый к обработке
     await _update_trader_signal_status(
         stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
-        status="accepted_by_closer", note="accepted"
+        status="accepted_by_closer", note=f"accepted; order_mode={ORDER_MODE}"
     )
 
     # валидация минимума
@@ -125,60 +129,83 @@ async def _handle_closed_event(record_id: str, data: Dict[str, Any]) -> bool:
     # подтянем «виртуальные» итоги из positions_v4 (не критично, если не найдём)
     virt_pnl, virt_exit_price, virt_closed_at, virt_close_reason = await _fetch_virtual_close_snapshot(position_uid)
 
-    # апдейт агрегата (не создаём запись, только обновляем, если якорь есть)
-    anchor_exists, db_ok = await _update_trader_position_closing(
-        position_uid=position_uid,
-        reason=reason,
-        virt_pnl=virt_pnl,
-        virt_exit_price=virt_exit_price,
-        virt_closed_at=virt_closed_at,
-        virt_close_reason=virt_close_reason
-    )
-    if not db_ok:
+    # режимы:
+    # - on      → status='closing', exchange_status='pending_close'
+    # - off/dry → status='closed',  closed_at=virt_closed_at|ts|now(), exchange_status='none', exchange_closed_at=closed_at
+    try:
+        if ORDER_MODE == "on":
+            await _update_trader_position_closing_on(
+                position_uid=position_uid,
+                reason=reason,
+                virt_pnl=virt_pnl,
+                virt_exit_price=virt_exit_price,
+                virt_closed_at=virt_closed_at,
+                virt_close_reason=virt_close_reason
+            )
+        else:
+            closed_at_effective = virt_closed_at or ts_dt or datetime.utcnow()
+            await _update_trader_position_closing_off(
+                position_uid=position_uid,
+                reason=reason,
+                closed_at=closed_at_effective,
+                virt_pnl=virt_pnl,
+                virt_exit_price=virt_exit_price,
+                virt_closed_at=virt_closed_at,
+                virt_close_reason=virt_close_reason
+            )
+    except Exception:
         await _update_trader_signal_status(
             stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
             status="failed_db_update", note="update trader_positions_v4 failed"
         )
-        log.info("⚠️ CLOSER: db update failed (uid=%s) — продолжим с публикацией ensure_closed", position_uid)
+        log.exception("⚠️ CLOSER: db update failed (uid=%s)", position_uid)
 
-    # формируем и публикуем команду ensure_closed (идемпотентно)
-    order_fields = {
-        "cmd": "ensure_closed",
-        "position_uid": position_uid,
-        "strategy_id": str(strategy_id),
-        "symbol": symbol or "",
-        "direction": direction,
-        "reason": reason,
-        "order_link_suffix": "close",
-        "ts": ts_iso or "",
-        "ts_ms": ts_ms_str or "",
-    }
+    # формируем и публикуем команду ensure_closed (идемпотентно) — только в режиме on
+    if ORDER_MODE == "on":
+        order_fields = {
+            "cmd": "ensure_closed",
+            "position_uid": position_uid,
+            "strategy_id": str(strategy_id),
+            "symbol": symbol or "",
+            "direction": direction,
+            "reason": reason,
+            "order_link_suffix": "close",
+            "ts": ts_iso or "",
+            "ts_ms": ts_ms_str or "",
+        }
+        try:
+            await infra.redis_client.xadd(ORDER_REQUEST_STREAM, order_fields)
+        except Exception as e:
+            await _update_trader_signal_status(
+                stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
+                status="failed_publish_order_request", note=f"redis xadd error: {e.__class__.__name__}"
+            )
+            log.exception("❌ Не удалось опубликовать ensure_closed uid=%s", position_uid)
+            return False  # без ACK → повтор
 
-    try:
-        await infra.redis_client.xadd(ORDER_REQUEST_STREAM, order_fields)
-    except Exception as e:
+        note = f"ensure_closed published; reason={reason}; mode=on"
         await _update_trader_signal_status(
             stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
-            status="failed_publish_order_request", note=f"redis xadd error: {e.__class__.__name__}"
+            status="closer_ensure_closed_published", note=note
         )
-        log.exception("❌ Не удалось опубликовать ensure_closed uid=%s", position_uid)
-        return False  # без ACK → повтор
+    else:
+        # в off/dry_run публикации нет — фиксируем финализацию
+        note = f"closed virtually; reason={reason}; mode={ORDER_MODE}"
+        await _update_trader_signal_status(
+            stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
+            status="closer_ensure_closed_published", note=note
+        )
 
-    # успех: обновляем журнал и POS_RUNTIME (конфиг)
-    note = f"ensure_closed published; reason={reason}; anchor={'present' if anchor_exists else 'absent'}"
-    await _update_trader_signal_status(
-        stream_id=record_id, position_uid=position_uid, event=event, ts_iso=ts_iso,
-        status="closer_ensure_closed_published", note=note
-    )
-
+    # POS_RUNTIME: убираем позицию
     try:
         await config.note_closed(position_uid, ts_dt)
     except Exception:
         log.exception("⚠️ POS_RUNTIME: note_closed не удалось (uid=%s)", position_uid)
 
     log.info(
-        "✅ CLOSER: ensure_closed → sent | uid=%s | sid=%s | sym=%s | event=%s | reason=%s | anchor=%s",
-        position_uid, strategy_id, (symbol or "—"), event, reason, "yes" if anchor_exists else "no"
+        "✅ CLOSER: %s | uid=%s | sid=%s | sym=%s | event=%s | reason=%s",
+        ("ensure_closed → sent" if ORDER_MODE == "on" else "virtually closed"),
+        position_uid, strategy_id, (symbol or "—"), event, reason
     )
     return True
 
@@ -194,7 +221,6 @@ async def _update_trader_signal_status(
     note: Optional[str] = None
 ) -> None:
     try:
-        # попытка 1: по stream_id
         if stream_id:
             res = await infra.pg_pool.execute(
                 """
@@ -208,8 +234,6 @@ async def _update_trader_signal_status(
             )
             if res.startswith("UPDATE") and res.split()[-1] != "0":
                 return
-
-        # попытка 2: по (uid, event, emitted_ts ~ ts_iso ± 2s)
         if position_uid and event and ts_iso:
             dt = _parse_ts(None, ts_iso)
             if dt is not None:
@@ -263,7 +287,6 @@ def _as_decimal(v: Any) -> Optional[Decimal]:
         return None
 
 def _parse_ts(ts_ms_str: Optional[str], ts_iso: Optional[str]) -> Optional[datetime]:
-    # ts_ms приоритетнее; ts_iso допускаем без 'Z'
     try:
         if ts_ms_str:
             ms = int(ts_ms_str)
@@ -278,7 +301,6 @@ def _parse_ts(ts_ms_str: Optional[str], ts_iso: Optional[str]) -> Optional[datet
     return None
 
 def _map_close_reason(event: str) -> str:
-    # event: 'closed.tp_full_hit' | 'closed.full_sl_hit' | 'closed.sl_tp_hit' | 'closed.reverse_signal_stop' | 'closed.sl_protect_stop'
     if event == "closed.tp_full_hit":
         return "tp_full_hit"
     if event == "closed.full_sl_hit":
@@ -316,7 +338,8 @@ async def _fetch_virtual_close_snapshot(position_uid: str) -> tuple[Optional[Dec
         (row["close_reason"] if row["close_reason"] else None),
     )
 
-async def _update_trader_position_closing(
+# режим on → системный 'closing', биржа 'pending_close' (плюс патч extras)
+async def _update_trader_position_closing_on(
     *,
     position_uid: str,
     reason: str,
@@ -324,12 +347,7 @@ async def _update_trader_position_closing(
     virt_exit_price: Optional[Decimal],
     virt_closed_at: Optional[datetime],
     virt_close_reason: Optional[str]
-) -> tuple[bool, bool]:
-    """
-    Возврат: (anchor_exists, db_ok)
-    anchor_exists = True, если строка найдена; db_ok = True, если апдейт прошёл без ошибок
-    """
-    # собрать jsonb-патч «виртуального» снимка
+) -> None:
     parts = []
     if virt_pnl is not None:
         parts.append(f'"virt_pnl": "{virt_pnl}"')
@@ -341,19 +359,50 @@ async def _update_trader_position_closing(
         parts.append(f'"virt_close_reason": "{virt_close_reason}"')
     virt_patch = "{%s}" % (", ".join(parts)) if parts else "{}"
 
-    try:
-        res = await infra.pg_pool.execute(
-            """
-            UPDATE public.trader_positions_v4
-               SET status = CASE WHEN status <> 'closed' THEN 'closing' ELSE status END,
-                   close_reason = COALESCE(close_reason, $2),
-                   extras = COALESCE(extras, '{}'::jsonb) || $3::jsonb
-             WHERE position_uid = $1
-            """,
-            position_uid, reason, virt_patch
-        )
-        updated = res.startswith("UPDATE") and (res.split()[-1] != "0")
-        return updated, True
-    except Exception:
-        log.exception("⚠️ db update error on trader_positions_v4 (uid=%s)", position_uid)
-        return False, False
+    await infra.pg_pool.execute(
+        """
+        UPDATE public.trader_positions_v4
+           SET status = CASE WHEN status <> 'closed' THEN 'closing' ELSE status END,
+               exchange_status = 'pending_close',
+               close_reason = COALESCE(close_reason, $2),
+               extras = COALESCE(extras, '{}'::jsonb) || $3::jsonb
+         WHERE position_uid = $1
+        """,
+        position_uid, reason, virt_patch
+    )
+
+# режим off/dry_run → системный 'closed' сразу, биржа 'none'
+async def _update_trader_position_closing_off(
+    *,
+    position_uid: str,
+    reason: str,
+    closed_at: datetime,
+    virt_pnl: Optional[Decimal],
+    virt_exit_price: Optional[Decimal],
+    virt_closed_at: Optional[datetime],
+    virt_close_reason: Optional[str]
+) -> None:
+    parts = []
+    if virt_pnl is not None:
+        parts.append(f'"virt_pnl": "{virt_pnl}"')
+    if virt_exit_price is not None:
+        parts.append(f'"virt_exit_price": "{virt_exit_price}"')
+    if virt_closed_at is not None:
+        parts.append(f'"virt_closed_at": "{virt_closed_at.isoformat()}"')
+    if virt_close_reason is not None:
+        parts.append(f'"virt_close_reason": "{virt_close_reason}"')
+    virt_patch = "{%s}" % (", ".join(parts)) if parts else "{}"
+
+    await infra.pg_pool.execute(
+        """
+        UPDATE public.trader_positions_v4
+           SET status = 'closed',
+               closed_at = $2,
+               exchange_status = 'none',
+               exchange_closed_at = $2,
+               close_reason = COALESCE(close_reason, $3),
+               extras = COALESCE(extras, '{}'::jsonb) || $4::jsonb
+         WHERE position_uid = $1
+        """,
+        position_uid, closed_at, reason, virt_patch
+    )
