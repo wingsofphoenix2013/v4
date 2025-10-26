@@ -34,9 +34,7 @@ AGG_BASES = (
     "trend_momentum",
 
     # derived-пары (добавлены в position_snapshot_live.py и oracle_mw_snapshot.py)
-    "trend_pullback_flag",     # pullback против/по тренду: against|with|none
     "trend_mom_align",         # импульс согласован/против тренда: aligned|countertrend|flat
-    # "trend_high_vol",        # (опционально) high_vol: yes|no
 
     "trend_volatility_extremes",
     "trend_volatility_momentum",
@@ -44,7 +42,6 @@ AGG_BASES = (
 
     # derived-триплеты (по необходимости и достаточной мощности)
     "trend_volatility_mom_align",
-    "trend_volatility_pullback_flag",
 
     # квартет — оставляем классический
     "trend_volatility_extremes_momentum",

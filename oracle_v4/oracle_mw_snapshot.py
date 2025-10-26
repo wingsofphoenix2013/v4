@@ -32,9 +32,7 @@ MW_BASES_FETCH = (
     "volatility",
     "extremes",
     "momentum",
-    "pullback_flag",   # derived: against/with/none
     "mom_align",       # derived: aligned/countertrend/flat
-    "high_vol",        # derived: yes/no
 )
 
 # Какие solo-базы реально пишем в агрегаты (соло анализ держим узким, чтобы не распылять статистику)
@@ -45,9 +43,7 @@ COMBOS_2_ALLOWED = (
     ("trend", "volatility"),
     ("trend", "extremes"),
     ("trend", "momentum"),
-    ("trend", "pullback_flag"),   # новый информативный флаг: откат против/по тренду
     ("trend", "mom_align"),       # новый информативный флаг: импульс согласован/против тренда
-    # при желании можно включить ("trend", "high_vol")
 )
 
 COMBOS_3_ALLOWED = (
@@ -55,7 +51,6 @@ COMBOS_3_ALLOWED = (
     ("trend", "volatility", "momentum"),
     ("trend", "extremes", "momentum"),
     ("trend", "volatility", "mom_align"),      # информативный триплет (направление × среда × согласованность импульса)
-    ("trend", "volatility", "pullback_flag"),  # при необходимости «сжатие/расширение × pullback»
 )
 
 # Квартет оставляем только в исходном виде (иначе размерность становится избыточной)
