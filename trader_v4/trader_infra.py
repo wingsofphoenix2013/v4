@@ -38,7 +38,7 @@ async def setup_pg():
     # проверка соединения
     await pool.execute("SELECT 1")
     infra.pg_pool = pool
-    log.debug("🛢️ Подключение к PostgreSQL установлено")
+    log.info("🛢️ Подключение к PostgreSQL установлено")
 
 # 🔸 Redis: инициализация клиента
 async def setup_redis_client():
@@ -59,4 +59,4 @@ async def setup_redis_client():
     # проверка соединения
     await client.ping()
     infra.redis_client = client
-    log.debug("📡 Подключение к Redis установлено")
+    log.info("📡 Подключение к Redis установлено")
