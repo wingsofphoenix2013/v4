@@ -6,7 +6,6 @@ import logging
 
 from trader_infra import setup_logging, setup_pg, setup_redis_client
 from trader_config import init_trader_config_state, config_event_listener, config
-from trader_position_filler import run_trader_position_filler_loop
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
 
 # 🔸 Логгер для главного процесса
@@ -80,9 +79,6 @@ async def main():
 
         # периодический REST-ресинк Bybit (баланс и позиции, каждые 10 минут)
         run_periodic(run_bybit_rest_resync_job, "BYBIT_RESYNC", start_delay=20.0, interval=600.0),
-
-        # последовательный слушатель открытий (signal_log_queue: status='opened')
-        run_with_delay(run_trader_position_filler_loop, "TRADER_FILLER", start_delay=60.0),
 
     )
 
