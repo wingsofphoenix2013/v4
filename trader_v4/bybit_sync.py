@@ -1,5 +1,4 @@
-# bybit_sync.py — приватный WS-синк Bybit (read-only): auth + wallet/position/order/execution + авто-reconnect
-# + периодический REST-ресинк баланса и позиций (linear), без записи в БД
+# bybit_sync.py — приватный WS-синк Bybit (read-only) с авто-reconnect + REST-ресинк; тише логируем ping/pong
 
 # 🔸 Импорты
 import os
@@ -44,13 +43,13 @@ async def run_bybit_private_ws_sync_loop():
                 sign_payload = f"GET/realtime{expires}"
                 signature = hmac.new(API_SECRET.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
                 await ws.send(json.dumps({"op": "auth", "args": [API_KEY, expires, signature]}))
-                auth_resp = json.loads(await ws.recv())
-                log.info("BYBIT_SYNC auth: %s", auth_resp)
+                auth_resp_raw = await ws.recv()
+                _handle_ws_message(auth_resp_raw)
 
                 # подписки: wallet + position + order + execution
                 await ws.send(json.dumps({"op": "subscribe", "args": ["wallet", "position", "order", "execution"]}))
-                sub_resp = json.loads(await ws.recv())
-                log.info("BYBIT_SYNC subscribe ack: %s", sub_resp)
+                sub_resp_raw = await ws.recv()
+                _handle_ws_message(sub_resp_raw)
 
                 # цикл чтения с таймаутом (для пингов)
                 while True:
@@ -59,7 +58,8 @@ async def run_bybit_private_ws_sync_loop():
                         _handle_ws_message(msg_raw)
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"op": "ping"}))
-                        log.info("BYBIT_SYNC → ping")
+                        # пинг-понги уводим в DEBUG, чтобы не мусорили INFO
+                        log.debug("BYBIT_SYNC → ping")
                         try:
                             pong_raw = await asyncio.wait_for(ws.recv(), timeout=5)
                             _handle_ws_message(pong_raw)
@@ -72,7 +72,7 @@ async def run_bybit_private_ws_sync_loop():
             await asyncio.sleep(RECONNECT_DELAY_SEC)
 
 
-# 🔸 Обработка входящих WS-сообщений (логирование кратко)
+# 🔸 Обработка входящих WS-сообщений (логирование с приглушением ping/pong)
 def _handle_ws_message(msg_raw: str):
     try:
         msg = json.loads(msg_raw)
@@ -80,8 +80,19 @@ def _handle_ws_message(msg_raw: str):
         log.info("BYBIT_SYNC recv (raw): %s", msg_raw)
         return
 
-    # служебные op-сообщения
+    # служебные op-сообщения (auth/subscribe/ping/pong/и т. п.)
     if "op" in msg and "topic" not in msg:
+        op = msg.get("op")
+        # пинг/понг — это «шум»: логируем на DEBUG
+        if op in ("ping", "pong"):
+            args = msg.get("args")
+            log.debug("BYBIT_SYNC recv %s: %s", op, args)
+            return
+        # важные служебные подтверждения — на INFO
+        if op in ("auth", "subscribe"):
+            log.info("BYBIT_SYNC recv %s: %s", op, msg)
+            return
+        # прочие служебные — оставим на INFO для видимости
         log.info("BYBIT_SYNC recv op: %s", msg)
         return
 
@@ -138,7 +149,6 @@ async def run_bybit_rest_resync_job():
 
 
 # 🔸 REST-помощники
-
 def _rest_sign(timestamp_ms: int, query_or_body: str) -> str:
     # timestamp + api_key + recv_window + (queryString|jsonBodyString)
     payload = f"{timestamp_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
@@ -179,15 +189,18 @@ async def _get_positions_list() -> dict:
 
 
 # 🔸 Форматтеры сводок в лог
-
 def _log_balance_summary(bal: dict):
     acc = (bal.get("result") or {}).get("list") or []
     if not acc:
         log.info("BYBIT_RESYNC balance: <empty>")
         return
     acc0 = acc[0]
-    log.info("BYBIT_RESYNC balance: totalEquity=%s totalWallet=%s perpUPL=%s",
-             acc0.get("totalEquity"), acc0.get("totalWalletBalance"), acc0.get("totalPerpUPL"))
+    log.info(
+        "BYBIT_RESYNC balance: totalEquity=%s totalWallet=%s perpUPL=%s",
+        acc0.get("totalEquity"),
+        acc0.get("totalWalletBalance"),
+        acc0.get("totalPerpUPL"),
+    )
     coins = acc0.get("coin") or []
     head = coins[0] if coins else {}
     log.info("BYBIT_RESYNC coins: items=%d head=%s", len(coins), head)
