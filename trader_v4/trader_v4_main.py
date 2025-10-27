@@ -12,6 +12,7 @@ from trader_config import (
     config,
 )
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
+from trader_position_opener import run_trader_position_opener
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -22,6 +23,7 @@ STRATEGY_STATE_START_DELAY_SEC = 1.0
 BYBIT_WS_START_DELAY_SEC = 10.0
 BYBIT_RESYNC_START_DELAY_SEC = 20.0
 BYBIT_RESYNC_INTERVAL_SEC = 600.0
+POS_OPENER_START_DELAY_SEC = 30.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -99,6 +101,13 @@ async def main():
             strategy_state_listener,
             "TRADER_STRATEGY_STATE",
             start_delay=STRATEGY_STATE_START_DELAY_SEC,
+        ),
+
+        # планирование ордеров по событиям opened из positions_bybit_status
+        run_with_delay(
+            run_trader_position_opener,
+            "TRADER_POS_OPENER",
+            start_delay=30.0,
         ),
 
         # приватный WS-синк Bybit (read-only)
