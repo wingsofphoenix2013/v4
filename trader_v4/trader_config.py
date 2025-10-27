@@ -1,11 +1,11 @@
-# trader_config.py — загрузка активных тикеров/стратегий, онлайн-апдейты (Pub/Sub) и кэш trader_winner
+# trader_config.py — загрузка активных тикеров/стратегий, онлайн-апдейты (Pub/Sub/Stream) и кэш политик (TP/SL) для trader_winner
 
 # 🔸 Импорты
 import asyncio
 import logging
 import json
 from decimal import Decimal
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, List, Tuple
 
 from trader_infra import infra
 
@@ -15,6 +15,12 @@ log = logging.getLogger("TRADER_CONFIG")
 # 🔸 Константы каналов Pub/Sub (жёстко в коде)
 TICKERS_EVENTS_CHANNEL = "bb:tickers_events"
 STRATEGIES_EVENTS_CHANNEL = "strategies_v4_events"
+
+# 🔸 Константы стрима состояния стратегий (двухфазный протокол applied)
+STRATEGY_STATE_STREAM = "strategy_state_stream"
+STATE_CG = "trader_v4_state_cg"
+STATE_CONSUMER = "state-worker-1"
+
 
 # 🔸 Нормализация логических флагов стратегии
 def _normalize_strategy_flags(strategy: dict) -> None:
@@ -29,13 +35,15 @@ def _normalize_strategy_flags(strategy: dict) -> None:
         "market_watcher",
         "deathrow",
         "blacklist_watcher",
+        "trader_winner",
     ):
         if key in strategy:
             val = strategy[key]
             # приводим к bool, поддерживая как реальные bool, так и строковые значения
             strategy[key] = (str(val).lower() == "true") if not isinstance(val, bool) else val
 
-# 🔸 Состояние конфигурации трейдера (+ in-memory кэш победителей)
+
+# 🔸 Состояние конфигурации трейдера (+ in-memory кэш победителей и их политик)
 class TraderConfigState:
     def __init__(self):
         self.tickers: Dict[str, dict] = {}
@@ -49,9 +57,20 @@ class TraderConfigState:
         # {sid: {"deposit": Decimal|None, "leverage": Decimal|None,
         #        "market_mirrow": int|None, "market_mirrow_long": int|None, "market_mirrow_short": int|None}}
 
+        # кэш полной политики по стратегиям-победителям
+        self.strategy_policies: Dict[int, dict] = {}
+        # структура policy:
+        # {
+        #   "strategy": {…копия строки из strategies_v4…},
+        #   "tickers": set[str],
+        #   "initial_sl": {"mode": "percent"|"atr", "value": Decimal} | None,
+        #   "tp_levels": [{"level": int, "tp_type": str, "tp_value": Decimal|None,
+        #                  "volume_percent": Decimal|None, "sl_mode": str|None, "sl_value": Decimal|None}, ...]
+        # }
+
         self._lock = asyncio.Lock()
 
-    # 🔸 Полная перезагрузка
+    # 🔸 Полная перезагрузка базовой конфигурации
     async def reload_all(self):
         async with self._lock:
             await self._load_tickers()
@@ -67,33 +86,61 @@ class TraderConfigState:
                 self.trader_winners_min_deposit,
             )
 
-    # 🔸 Точечная перезагрузка одного тикера
-    async def reload_ticker(self, symbol: str):
+    # 🔸 Пакетная загрузка политик для всех текущих winners
+    async def reload_all_policies_for_winners(self):
         async with self._lock:
-            row = await infra.pg_pool.fetchrow(
-                """
-                SELECT *
-                FROM tickers_bb
-                WHERE symbol = $1 AND status = 'enabled' AND tradepermission = 'enabled'
-                """,
-                symbol,
+            # подготовка набора id победителей
+            winner_ids: List[int] = list(self.trader_winners)
+            if not winner_ids:
+                self.strategy_policies.clear()
+                log.info("🏷️ Кэш политик: winners=0 → policies=0 (очищено)")
+                return
+
+            # загрузка политик для набора winners
+            policies, total_levels = await self._load_policies_for_sids_locked(winner_ids)
+            self.strategy_policies = policies
+
+            # сводный лог
+            log.info(
+                "🏷️ Кэш политик перезагружен: winners=%d, policies=%d, tp_levels_total=%d",
+                len(self.trader_winners),
+                len(self.strategy_policies),
+                total_levels,
             )
-            if row:
-                self.tickers[symbol] = dict(row)
-                log.info("🔄 Тикер обновлён: %s", symbol)
-            else:
-                self.tickers.pop(symbol, None)
-                log.info("🗑️ Тикер удалён (не активен): %s", symbol)
 
-    # 🔸 Удаление тикера из состояния
-    async def remove_ticker(self, symbol: str):
+    # 🔸 Точечная загрузка/пересборка политики по одной стратегии (если она winner)
+    async def reload_strategy_policy(self, strategy_id: int):
         async with self._lock:
-            self.tickers.pop(symbol, None)
-            log.info("🗑️ Тикер удалён: %s", symbol)
+            # стратегия должна быть winner и присутствовать в базовом кэше
+            if strategy_id not in self.trader_winners or strategy_id not in self.strategies:
+                self.strategy_policies.pop(strategy_id, None)
+                log.info("🏷️ Политика НЕ загружена: id=%d (не winner/нет стратегии)", strategy_id)
+                return
 
-    # 🔸 Точечная перезагрузка стратегии
-    async def reload_strategy(self, strategy_id: int):
+            # загрузка политики по одному sid
+            policies, total_levels = await self._load_policies_for_sids_locked([strategy_id])
+            self.strategy_policies.update(policies)
+
+            # логи результата
+            tp_count = len(policies.get(strategy_id, {}).get("tp_levels", []))
+            log.info(
+                "🏷️ Политика обновлена: id=%d, tp_levels=%d (total_levels=%d)",
+                strategy_id,
+                tp_count,
+                total_levels,
+            )
+
+    # 🔸 Удаление политики из кэша (напр., при потере статуса winner)
+    async def remove_strategy_policy(self, strategy_id: int):
         async with self._lock:
+            existed = strategy_id in self.strategy_policies
+            self.strategy_policies.pop(strategy_id, None)
+            log.info("🗑️ Политика удалена: id=%d (was=%s)", strategy_id, "true" if existed else "false")
+
+    # 🔸 Единая реакция на изменение стратегии (Pub/Sub applied/true/false, Stream applied)
+    async def on_strategy_changed(self, strategy_id: int):
+        async with self._lock:
+            # перечитать строку стратегии
             row = await infra.pg_pool.fetchrow(
                 """
                 SELECT *
@@ -104,20 +151,24 @@ class TraderConfigState:
             )
 
             if not row:
+                # удалить стратегию из кэша, связки и winners
                 self.strategies.pop(strategy_id, None)
                 self.strategy_tickers.pop(strategy_id, None)
-                # при удалении стратегии она точно не может быть winner
                 self.trader_winners.discard(strategy_id)
                 self.strategy_meta.pop(strategy_id, None)
                 await self._recalc_min_deposit_locked()
-                log.info("🗑️ Стратегия удалена: id=%d", strategy_id)
+                # удалить политику, если была
+                self.strategy_policies.pop(strategy_id, None)
+                log.info("🗑️ Стратегия удалена из состояния: id=%d (winner=%s, policy_dropped=true)",
+                         strategy_id, "true" if strategy_id in self.trader_winners else "false")
                 return
 
+            # обновить стратегию и флаги
             strategy = dict(row)
             _normalize_strategy_flags(strategy)
             self.strategies[strategy_id] = strategy
 
-            # загрузка разрешённых тикеров для этой стратегии
+            # загрузить разрешённые тикеры для этой стратегии
             tickers_rows = await infra.pg_pool.fetch(
                 """
                 SELECT t.symbol
@@ -132,25 +183,31 @@ class TraderConfigState:
             )
             self.strategy_tickers[strategy_id] = {r["symbol"] for r in tickers_rows}
 
-            # обновим кэш победителей инкрементально (на основе свежей строки)
+            # обновить кэш winners/мета инкрементально
             await self._touch_winner_membership_locked(strategy)
 
-            log.info(
-                "🔄 Стратегия обновлена: id=%d (tickers=%d, is_winner=%s)",
-                strategy_id,
-                len(self.strategy_tickers[strategy_id]),
-                "true" if strategy.get("trader_winner") else "false",
-            )
-
-    # 🔸 Удаление стратегии из состояния
-    async def remove_strategy(self, strategy_id: int):
-        async with self._lock:
-            self.strategies.pop(strategy_id, None)
-            self.strategy_tickers.pop(strategy_id, None)
-            self.trader_winners.discard(strategy_id)
-            self.strategy_meta.pop(strategy_id, None)
+            # пересобрать min(deposit) среди winners
             await self._recalc_min_deposit_locked()
-            log.info("🗑️ Стратегия удалена: id=%d", strategy_id)
+
+            # если теперь winner — пересобрать политику, иначе удалить
+            if strategy_id in self.trader_winners:
+                policies, _ = await self._load_policies_for_sids_locked([strategy_id])
+                self.strategy_policies.update(policies)
+                tp_count = len(self.strategy_policies.get(strategy_id, {}).get("tp_levels", []))
+                log.info(
+                    "🔄 Стратегия обновлена: id=%d (tickers=%d, is_winner=true, tp_levels=%d)",
+                    strategy_id,
+                    len(self.strategy_tickers[strategy_id]),
+                    tp_count,
+                )
+            else:
+                had_policy = self.strategy_policies.pop(strategy_id, None) is not None
+                log.info(
+                    "🔄 Стратегия обновлена: id=%d (tickers=%d, is_winner=false, policy_dropped=%s)",
+                    strategy_id,
+                    len(self.strategy_tickers[strategy_id]),
+                    "true" if had_policy else "false",
+                )
 
     # 🔸 Загрузка активных тикеров
     async def _load_tickers(self):
@@ -207,7 +264,7 @@ class TraderConfigState:
         async with self._lock:
             await self._refresh_trader_winners_state_locked()
 
-    # Кэш победителей: батч-чтение из БД и обновление in-memory полей
+    # 🔸 Кэш победителей: батч-чтение из БД и обновление in-memory полей
     async def _refresh_trader_winners_state_locked(self):
         rows = await infra.pg_pool.fetch(
             """
@@ -249,7 +306,7 @@ class TraderConfigState:
             self.trader_winners_min_deposit,
         )
 
-    # Инкрементальная корректировка кэша winners по одной стратегии
+    # 🔸 Инкрементальная корректировка кэша winners по одной стратегии
     async def _touch_winner_membership_locked(self, strategy_row: dict):
         sid = int(strategy_row["id"])
         is_winner = bool(strategy_row.get("trader_winner"))
@@ -267,9 +324,7 @@ class TraderConfigState:
             self.trader_winners.discard(sid)
             self.strategy_meta.pop(sid, None)
 
-        await self._recalc_min_deposit_locked()
-
-    # Пересчёт min(deposit) среди текущих winners (по in-memory meta)
+    # 🔸 Пересчёт min(deposit) среди текущих winners (по in-memory meta)
     async def _recalc_min_deposit_locked(self):
         min_dep: Optional[Decimal] = None
         for sid in self.trader_winners:
@@ -278,16 +333,109 @@ class TraderConfigState:
                 min_dep = dep
         self.trader_winners_min_deposit = min_dep
 
+    # 🔸 Внутренний загрузчик политик для набора стратегий (держать self._lock)
+    async def _load_policies_for_sids_locked(self, sids: List[int]) -> Tuple[Dict[int, dict], int]:
+        # начальная инициализация
+        policies: Dict[int, dict] = {}
+        total_levels = 0
+
+        # подготовка «скелетов» политик из уже загруженных стратегий/тикеров
+        for sid in sids:
+            srow = self.strategies.get(sid, {})
+            initial_sl = None
+            # условия достаточности начального SL
+            if srow and srow.get("use_stoploss") and srow.get("sl_type") in ("percent", "atr"):
+                sl_val = _as_decimal(srow.get("sl_value"))
+                if sl_val is not None and sl_val > 0:
+                    initial_sl = {"mode": srow.get("sl_type"), "value": sl_val}
+            policies[sid] = {
+                "strategy": dict(srow) if srow else {},
+                "tickers": set(self.strategy_tickers.get(sid, set())),
+                "initial_sl": initial_sl,
+                "tp_levels": [],
+            }
+
+        # если нечего грузить — вернуть пустой результат
+        if not sids:
+            return policies, total_levels
+
+        # загрузить TP-линейки
+        tp_rows = await infra.pg_pool.fetch(
+            """
+            SELECT id AS tp_level_id, strategy_id, level, tp_type, tp_value, volume_percent
+            FROM strategy_tp_levels_v4
+            WHERE strategy_id = ANY($1::int[])
+            ORDER BY strategy_id, level
+            """,
+            sids,
+        )
+
+        # загрузить SL-политику по TP
+        sl_rows = await infra.pg_pool.fetch(
+            """
+            SELECT strategy_id, tp_level_id, sl_mode, sl_value
+            FROM strategy_tp_sl_v4
+            WHERE strategy_id = ANY($1::int[])
+            """,
+            sids,
+        )
+
+        # построить быстрый маппер (sid, tp_level_id) -> (sl_mode, sl_value)
+        sl_map: Dict[Tuple[int, int], Tuple[Optional[str], Optional[Decimal]]] = {}
+        for r in sl_rows:
+            key = (int(r["strategy_id"]), int(r["tp_level_id"]))
+            sl_map[key] = (r["sl_mode"], _as_decimal(r["sl_value"]))
+
+        # собрать уровни по стратегиям
+        for r in tp_rows:
+            sid = int(r["strategy_id"])
+            lvl_id = int(r["tp_level_id"])
+            # подтянуть sl_mode/sl_value, если есть
+            sl_mode, sl_value = sl_map.get((sid, lvl_id), (None, None))
+            # сформировать элемент уровня
+            level_item = {
+                "level": int(r["level"]),
+                "tp_type": r["tp_type"],
+                "tp_value": _as_decimal(r["tp_value"]),
+                "volume_percent": _as_decimal(r["volume_percent"]),
+                "sl_mode": sl_mode,
+                "sl_value": sl_value,
+            }
+            # добавить к политике
+            policies.setdefault(sid, {
+                "strategy": dict(self.strategies.get(sid, {})),
+                "tickers": set(self.strategy_tickers.get(sid, set())),
+                "initial_sl": policies.get(sid, {}).get("initial_sl"),
+                "tp_levels": [],
+            })
+            policies[sid]["tp_levels"].append(level_item)
+            total_levels += 1
+
+        # финальный лог по одному sid (при точечной загрузке)
+        if len(sids) == 1:
+            sid = sids[0]
+            log.info(
+                "📥 Загрузка политики: id=%d, levels=%d, tickers=%d, initial_sl=%s",
+                sid,
+                len(policies.get(sid, {}).get("tp_levels", [])),
+                len(policies.get(sid, {}).get("tickers", set())),
+                "yes" if policies.get(sid, {}).get("initial_sl") else "no",
+            )
+
+        return policies, total_levels
+
 
 # 🔸 Глобальный объект конфигурации
 config = TraderConfigState()
 
-# 🔸 Первичная инициализация конфигурации
+
+# 🔸 Первичная инициализация конфигурации (без загрузки политик)
 async def init_trader_config_state():
     await config.reload_all()
-    log.info("✅ Конфигурация трейдера загружена")
+    log.info("✅ Конфигурация трейдера загружена (без политик TP/SL)")
 
-# 🔸 Слушатель Pub/Sub для онлайновых апдейтов
+
+# 🔸 Слушатель Pub/Sub для онлайновых апдейтов (тикеры/стратегии)
 async def config_event_listener():
     redis = infra.redis_client
     pubsub = redis.pubsub()
@@ -322,19 +470,64 @@ async def config_event_listener():
 
             # обработка событий по стратегиям
             elif channel == STRATEGIES_EVENTS_CHANNEL:
-                sid = int(data.get("id"))
+                sid_raw = data.get("id")
+                sid = int(sid_raw) if sid_raw is not None else None
                 action = data.get("action")
-                if action == "true":
-                    await config.reload_strategy(sid)
-                elif action == "false":
-                    await config.remove_strategy(sid)
-                # после любого изменения стратегии — освежим кэш winners
-                await config.refresh_trader_winners_state()
-                log.info("♻️ Обработано событие стратегии: id=%d (%s)", sid, action)
+                # единая точка реакции — перечитать стратегию, winners и политику
+                if sid is not None:
+                    await config.on_strategy_changed(sid)
+                log.info("♻️ Обработано событие стратегии: id=%s (%s)", sid_raw, action)
 
         except Exception:
             # логируем и продолжаем слушать дальше
             log.exception("❌ Ошибка обработки события Pub/Sub")
+
+
+# 🔸 Слушатель стрима состояния стратегий (двухфазный applied)
+async def strategy_state_listener():
+    redis = infra.redis_client
+
+    # создание CG (id="$" — только новые записи)
+    try:
+        await redis.xgroup_create(STRATEGY_STATE_STREAM, STATE_CG, id="$", mkstream=True)
+        log.info("📡 Создана группа %s для стрима %s", STATE_CG, STRATEGY_STATE_STREAM)
+    except Exception:
+        # группа уже существует
+        pass
+
+    # чтение из стрима в вечном цикле
+    while True:
+        try:
+            entries = await redis.xreadgroup(
+                groupname=STATE_CG,
+                consumername=STATE_CONSUMER,
+                streams={STRATEGY_STATE_STREAM: ">"},
+                count=200,
+                block=1000,  # мс
+            )
+            # обработка пакета записей
+            if not entries:
+                continue
+
+            for _, records in entries:
+                for entry_id, fields in records:
+                    try:
+                        # ожидаемый формат: {'type': 'strategy', 'action': 'applied', 'id': '<sid>'}
+                        if fields.get("type") == "strategy" and fields.get("action") == "applied":
+                            sid_raw = fields.get("id")
+                            sid = int(sid_raw) if sid_raw is not None else None
+                            if sid is not None:
+                                await config.on_strategy_changed(sid)
+                                log.info("✅ Обработан applied из state-stream: id=%s", sid_raw)
+                        # ack после успешной обработки
+                        await redis.xack(STRATEGY_STATE_STREAM, STATE_CG, entry_id)
+                    except Exception:
+                        # оставим запись в pending — будет повтор
+                        log.exception("❌ Ошибка обработки записи state-stream (id=%s)", entry_id)
+        except Exception:
+            log.exception("❌ Ошибка чтения из state-stream")
+            # короткая пауза перед повтором
+            await asyncio.sleep(1)
 
 
 # 🔸 Утилиты
