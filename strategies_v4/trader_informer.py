@@ -75,6 +75,9 @@ def _get_leverage_from_config(strategy_id: int) -> Optional[Decimal]:
     s = config.strategies.get(strategy_id) or {}
     return _to_dec(s.get("leverage"))
 
+def _is_watched(strategy_id: int) -> bool:
+    return strategy_id in _watch_ids
+    
 def _is_reverse_strategy(strategy_id: int) -> bool:
     s = config.strategies.get(strategy_id) or {}
     return bool(s.get("reverse")) and bool(s.get("sl_protection"))
