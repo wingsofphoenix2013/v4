@@ -482,7 +482,6 @@ async def config_event_listener():
             # логируем и продолжаем слушать дальше
             log.exception("❌ Ошибка обработки события Pub/Sub")
 
-
 # 🔸 Слушатель стрима состояния стратегий (двухфазный applied)
 async def strategy_state_listener():
     redis = infra.redis_client
@@ -494,6 +493,13 @@ async def strategy_state_listener():
     except Exception:
         # группа уже существует
         pass
+
+    # сброс offset CG на '$' — читать строго только новые записи после старта
+    try:
+        await redis.execute_command("XGROUP", "SETID", STRATEGY_STATE_STREAM, STATE_CG, "$")
+        log.info("⏩ Группа %s для %s сброшена на $ (только новые)", STATE_CG, STRATEGY_STATE_STREAM)
+    except Exception:
+        log.exception("❌ Не удалось сбросить CG %s для %s на $", STATE_CG, STRATEGY_STATE_STREAM)
 
     # чтение из стрима в вечном цикле
     while True:
@@ -528,7 +534,6 @@ async def strategy_state_listener():
             log.exception("❌ Ошибка чтения из state-stream")
             # короткая пауза перед повтором
             await asyncio.sleep(1)
-
 
 # 🔸 Утилиты
 def _as_decimal(v) -> Optional[Decimal]:

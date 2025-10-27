@@ -31,18 +31,24 @@ TRADER_ORDER_MODE = os.getenv("TRADER_ORDER_MODE", "dry_run")  # dry_run | live
 # 🔸 Локальные мьютексы по ключу (strategy_id, symbol)
 _local_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
 
-
 # 🔸 Основной запуск воркера
 async def run_trader_position_opener():
     redis = infra.redis_client
 
-    # создание CG для чтения позиций
+    # создание CG для чтения позиций (id="$" — только новые записи)
     try:
         await redis.xgroup_create(POS_STATUS_STREAM, POS_OPEN_CG, id="$", mkstream=True)
         log.info("📡 Создана CG %s для стрима %s", POS_OPEN_CG, POS_STATUS_STREAM)
     except Exception:
         # группа уже существует
         pass
+
+    # сброс offset CG на '$' — читаем строго только новые записи после старта
+    try:
+        await redis.execute_command("XGROUP", "SETID", POS_STATUS_STREAM, POS_OPEN_CG, "$")
+        log.info("⏩ CG %s для %s сброшена на $ (только новые)", POS_OPEN_CG, POS_STATUS_STREAM)
+    except Exception:
+        log.exception("❌ Не удалось сбросить CG %s для %s на $", POS_OPEN_CG, POS_STATUS_STREAM)
 
     sem = asyncio.Semaphore(MAX_PARALLEL_TASKS)
 
@@ -75,7 +81,6 @@ async def run_trader_position_opener():
         except Exception:
             log.exception("❌ Ошибка чтения/обработки из стрима %s", POS_STATUS_STREAM)
             await asyncio.sleep(1)
-
 
 # 🔸 Обработка одной записи из positions_bybit_status
 async def _handle_status_entry(sem: asyncio.Semaphore, entry_id: str, fields: dict):
