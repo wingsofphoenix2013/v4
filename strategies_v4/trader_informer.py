@@ -77,7 +77,7 @@ def _get_leverage_from_config(strategy_id: int) -> Optional[Decimal]:
 
 def _is_watched(strategy_id: int) -> bool:
     return strategy_id in _watch_ids
-    
+
 def _is_reverse_strategy(strategy_id: int) -> bool:
     s = config.strategies.get(strategy_id) or {}
     return bool(s.get("reverse")) and bool(s.get("sl_protection"))
@@ -149,7 +149,7 @@ def _message_for_event(event: str, tp_level: Optional[int] = None) -> str:
         return "closed by sl-protect"
     return "position event"
 
-# 🔸 Запись события в БД (таблица trader_signals)
+# 🔸 Запись события в БД (таблица trader_signals) — с сохранением stream_id
 async def _persist_signal(
     *,
     strategy_id: int,
@@ -159,10 +159,11 @@ async def _persist_signal(
     message: str,
     strategy_type: str,
     emitted_ts_dt: datetime,
+    stream_id: Optional[str] = None,
     tp_level: Optional[int] = None,
     extras: Optional[Dict[str, str]] = None,
 ):
-    # подготавливаем числовые поля из extras
+    # подготовить числовые поля из extras
     lev = _to_dec((extras or {}).get("leverage")) if extras else None
     qty = _to_dec((extras or {}).get("quantity")) if extras else None
     qty_left = _to_dec((extras or {}).get("quantity_left")) if extras else None
@@ -177,25 +178,27 @@ async def _persist_signal(
                     strategy_id, position_uid, direction, event, tp_level,
                     message, strategy_type,
                     leverage, quantity, quantity_left, margin_used,
-                    side, emitted_ts, received_at, extras
+                    side, emitted_ts, received_at, extras, stream_id
                 )
                 VALUES ($1,$2,$3,$4,$5,
                         $6,$7,
                         $8,$9,$10,$11,
-                        'system',$12, NOW(), $13)
+                        'system',$12, NOW(), $13, $14)
                 """,
                 strategy_id, position_uid, direction, event, tp_level,
                 message, strategy_type,
                 lev, qty, qty_left, margin,
-                emitted_ts_dt, extras_json,
+                emitted_ts_dt, extras_json, stream_id,
             )
     except Exception:
         # не ломаем основное выполнение: публикация уже произошла
-        log.exception("⚠️ Не удалось записать сигнал в trader_signals (sid=%s uid=%s event=%s)", strategy_id, position_uid, event)
+        log.exception("⚠️ Не удалось записать сигнал в trader_signals (sid=%s uid=%s event=%s stream_id=%s)",
+                      strategy_id, position_uid, event, stream_id)
 
-# 🔸 Публикация события в выходной стрим (общая)
-async def _publish(strategy_id: int, payload: Dict[str, str]):
-    await infra.redis_client.xadd(STREAM_OUT, payload)
+# 🔸 Публикация события в выходной стрим (общая) — вернуть stream_id
+async def _publish(strategy_id: int, payload: Dict[str, str]) -> str:
+    stream_id = await infra.redis_client.xadd(STREAM_OUT, payload)
+    return str(stream_id)
 
 # 🔸 Проверка: публиковать ли sl_replaced (reverse-ветка, стартовый SL на entry на весь объём)
 def _should_publish_sl_replaced_reverse(strategy_id: int, position_uid: str, evt: Dict[str, Any]) -> bool:
@@ -324,10 +327,8 @@ async def _handle_open_records(records):
                 "margin_used": str(margin_used),
             }
 
-            # публикация → ACK → запись в БД
-            await _publish(strategy_id, payload)
-            await infra.redis_client.xack(STREAM_OPEN, CG_OPEN, record_id)
-
+            # публикация → запись в БД → ACK
+            stream_id = await _publish(strategy_id, payload)
             extras = {
                 "leverage": payload["leverage"],
                 "quantity": payload["quantity"],
@@ -345,13 +346,15 @@ async def _handle_open_records(records):
                 message=payload["message"],
                 strategy_type=payload["strategy_type"],
                 emitted_ts_dt=emitted_dt,
+                stream_id=stream_id,
                 extras=extras,
             )
+            await infra.redis_client.xack(STREAM_OPEN, CG_OPEN, record_id)
 
             log.info(
-                "[PUB] opened v2 sid=%s uid=%s sym=%s dir=%s type=%s qty=%s lev=%s margin=%s ts=%s",
+                "[PUB] opened v2 sid=%s uid=%s sym=%s dir=%s type=%s qty=%s lev=%s margin=%s ts=%s stream_id=%s",
                 strategy_id, position_uid, symbol, direction, payload["strategy_type"],
-                payload["quantity"], payload["leverage"], payload["margin_used"], payload["ts"],
+                payload["quantity"], payload["leverage"], payload["margin_used"], payload["ts"], stream_id,
             )
 
         except Exception:
@@ -435,9 +438,7 @@ async def _handle_update_records(records):
                     if symbol:
                         payload["symbol"] = symbol
 
-                    await _publish(strategy_id, payload)
-                    await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
-
+                    stream_id = await _publish(strategy_id, payload)
                     # журналируем только опубликованное
                     extras_db: Dict[str, str] = {"ts_ms": ts_ms}
                     if symbol:
@@ -450,8 +451,10 @@ async def _handle_update_records(records):
                         message=payload["message"],
                         strategy_type=payload["strategy_type"],
                         emitted_ts_dt=emitted_dt,
+                        stream_id=stream_id,
                         extras=extras_db,
                     )
+                    await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
                 else:
                     # не соответствует критериям — ACK без публикации и без записи в БД
                     await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
@@ -482,8 +485,7 @@ async def _handle_update_records(records):
                 }
                 payload.update(extras_pub)
 
-                await _publish(strategy_id, payload)
-                await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
+                stream_id = await _publish(strategy_id, payload)
 
                 # позиция закрыта — очищаем кэш
                 if position_uid in _pos_cache:
@@ -500,8 +502,11 @@ async def _handle_update_records(records):
                     message=payload["message"],
                     strategy_type=payload["strategy_type"],
                     emitted_ts_dt=emitted_dt,
+                    stream_id=stream_id,
                     extras=extras_db,
                 )
+
+                await infra.redis_client.xack(STREAM_UPD, CG_UPD, record_id)
                 continue
 
             else:
@@ -553,7 +558,6 @@ async def _read_update_loop():
     redis = infra.redis_client
     try:
         await redis.xgroup_create(STREAM_UPD, CG_UPD, id="$", mkstream=True)
-        log.info("📡 CG создана: %s → %s", STREAM_UPD, CG_UPD)
     except Exception as e:
         if "BUSYGROUP" in str(e):
             log.info("ℹ️ CG уже существует: %s", CG_UPD)
