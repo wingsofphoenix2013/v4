@@ -1,4 +1,4 @@
-# bybit_processor.py — воркер исполнения: читает positions_bybit_orders (только новые), pre-flight (live), dry-run заполнение entry по last price, строит карту TP/SL и пишет в БД
+# bybit_processor.py — воркер исполнения: читает positions_bybit_orders (только новые), dry_run: entry по last price (100% fill), строит карту TP/SL и пишет в БД
 
 # 🔸 Импорты
 import os
@@ -12,7 +12,7 @@ from typing import Dict, Tuple, Optional, Any, List
 import httpx
 
 from trader_infra import infra
-from trader_config import config  # берём политики стратегий из in-memory кэша
+from trader_config import config  # политики стратегий из in-memory кэша
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_PROCESSOR")
@@ -23,22 +23,22 @@ BYBIT_PROC_CG = "bybit_processor_cg"
 BYBIT_PROC_CONSUMER = os.getenv("BYBIT_PROC_CONSUMER", "bybit-proc-1")
 AUDIT_STREAM = "positions_bybit_audit"
 
-# 🔸 Параллелизм
+# 🔸 Параллелизм и замки
 MAX_PARALLEL_TASKS = int(os.getenv("BYBIT_PROC_MAX_TASKS", "200"))
 LOCK_TTL_SEC = int(os.getenv("BYBIT_PROC_LOCK_TTL", "30"))
 
-# 🔸 BYBIT ENV
+# 🔸 BYBIT ENV (часть нужна позже для live)
 API_KEY = os.getenv("BYBIT_API_KEY", "")
 API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
-ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")        # не используется здесь, но оставим для будущего
+ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 CATEGORY = "linear"
-MARGIN_MODE = os.getenv("BYBIT_MARGIN_MODE", "isolated")         # always isolated по ТЗ
+MARGIN_MODE = os.getenv("BYBIT_MARGIN_MODE", "isolated")
 POSITION_MODE = os.getenv("BYBIT_POSITION_MODE", "oneway")
 
 # 🔸 Режим исполнения
-TRADER_ORDER_MODE = os.getenv("TRADER_ORDER_MODE", "dry_run")    # dry_run | live
+TRADER_ORDER_MODE = os.getenv("TRADER_ORDER_MODE", "dry_run")  # dry_run | live
 
 # 🔸 Локальные мьютексы по ключу (strategy_id, symbol)
 _local_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
@@ -110,22 +110,30 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             return
 
         # ключевые поля
-        order_link_id = payload.get("order_link_id")
-        position_uid = payload.get("position_uid")
-        sid = int(payload.get("strategy_id"))
-        stype = payload.get("strategy_type")  # plain|reverse
-        symbol = payload.get("symbol")
-        direction = payload.get("direction")  # long|short
-        side = payload.get("side")            # Buy|Sell
-        leverage = Decimal(str(payload.get("leverage", "0")))
-        qty = Decimal(str(payload.get("qty", "0")))
-        size_mode = payload.get("size_mode")  # 'pct_of_virtual'
-        size_pct = Decimal(str(payload.get("size_pct", "0")))
-        margin_plan = Decimal(str(payload.get("margin_plan", "0")))
-        order_mode = payload.get("order_mode", TRADER_ORDER_MODE)
-        source_stream_id = payload.get("source_stream_id")
-        ts = payload.get("ts")
-        ts_ms = payload.get("ts_ms")
+        try:
+            order_link_id = payload.get("order_link_id")
+            position_uid = payload.get("position_uid")
+            sid = int(payload.get("strategy_id"))
+            strategy_type = payload.get("strategy_type")  # plain|reverse
+            symbol = payload.get("symbol")
+            direction = payload.get("direction")  # long|short
+            side = payload.get("side")            # Buy|Sell
+            leverage = _as_decimal(payload.get("leverage")) or Decimal("0")
+            qty = _as_decimal(payload.get("qty")) or Decimal("0")
+            size_mode = payload.get("size_mode")  # 'pct_of_virtual'
+            size_pct = _as_decimal(payload.get("size_pct")) or Decimal("0")
+            margin_plan = _as_decimal(payload.get("margin_plan")) or Decimal("0")
+            order_mode = payload.get("order_mode", TRADER_ORDER_MODE)
+            source_stream_id = payload.get("source_stream_id")
+            ts = payload.get("ts")
+            ts_ms = payload.get("ts_ms")
+        except Exception:
+            log.exception("❌ Ошибка парсинга полей payload (id=%s) — ACK", entry_id)
+            try:
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+            except Exception:
+                pass
+            return
 
         # сериализация по ключу (strategy_id, symbol)
         key = (sid, symbol)
@@ -150,7 +158,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 await _insert_entry_order_card(
                     position_uid=position_uid,
                     strategy_id=sid,
-                    strategy_type=stype,
+                    strategy_type=strategy_type,
                     symbol=symbol,
                     direction=direction,
                     side=side,
@@ -166,10 +174,8 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 if order_mode == "dry_run":
                     last_price = await _get_last_price_linear(symbol)
                     if last_price is None or last_price <= 0:
-                        # фолбэк: попробуем взять цену из Redis bb:price:{symbol}
                         last_price = await _get_price_from_redis(symbol)
                     if last_price is None or last_price <= 0:
-                        # в крайнем случае считаем "1", но это только чтобы не падать
                         last_price = Decimal("1")
 
                     filled_qty = qty
@@ -203,11 +209,11 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         },
                     )
 
-                    # сформировать и записать карту TP/SL (без ATR, только percent)
+                    # сформировать и записать карту TP/SL (percent-only, без ATR)
                     await _build_tp_sl_cards_after_entry(
                         position_uid=position_uid,
                         strategy_id=sid,
-                        strategy_type=stype,
+                        strategy_type=strategy_type,
                         symbol=symbol,
                         direction=direction,
                         filled_qty=filled_qty,
@@ -217,7 +223,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         base_link=order_link_id,
                     )
 
-                    # можно скорректировать журналы (опционально): статус в trader_positions_log/trader_signals
+                    # обновить журналы
                     await _touch_journals_after_entry(
                         source_stream_id=source_stream_id,
                         note=f"entry dry-run filled @ {avg_price}",
@@ -226,19 +232,23 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
 
                     # ACK записи очереди
                     await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
-                    log.info("✅ ENTRY dry-run filled & TP/SL planned (sid=%s %s %s qty=%s @ %s) [id=%s]",
-                             sid, symbol, direction, filled_qty, avg_price, entry_id)
+                    log.info(
+                        "✅ ENTRY dry-run filled & TP/SL planned (sid=%s %s %s qty=%s @ %s) [id=%s]",
+                        sid, symbol, direction, filled_qty, avg_price, entry_id
+                    )
                     return
 
-                # live-режим (пока только pre-flight; правила fill обсудим и включим позже)
+                # live-режим (позже добавим реальную отправку/вочер критериев)
                 await _preflight_symbol_settings(symbol=symbol, leverage=leverage)
 
                 # TODO: LIVE create-order + watcher условий 95%/5s и 75%/60s — реализуем на следующем шаге
 
                 # ACK даже в live-прототипе, пока без реальной отправки
                 await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
-                log.info("🟡 LIVE preflight done (sid=%s %s %s qty=%s) [id=%s] — отправка/ожидание fill будет добавлено",
-                         sid, symbol, direction, qty, entry_id)
+                log.info(
+                    "🟡 LIVE preflight done (sid=%s %s %s qty=%s) [id=%s] — отправка/ожидание fill будет добавлено",
+                    sid, symbol, direction, qty, entry_id
+                )
 
             except Exception:
                 log.exception("❌ Ошибка обработки задачи bybit_processor (sid=%s %s id=%s)", sid, symbol, entry_id)
@@ -278,7 +288,7 @@ async def _insert_entry_order_card(
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
                 $8, $9,
-                'entry', NULL, 'immediate', NULL, false,
+                'entry', NULL, 'immediate', NULL, true,
                 false, 'IOC', $10, NULL,
                 $11, NULL, 'planned', 0, NULL, $12,
                 NULL, NULL, NULL,
@@ -339,6 +349,7 @@ async def _update_entry_filled_and_commit(
         )
         log.info("✅ entry filled & committed: uid=%s qty=%s @ %s", position_uid, filled_qty, avg_price)
 
+
 # 🔸 Построение карты TP/SL (percent-only) и запись в БД (в dry-run — без реального размещения на бирже)
 async def _build_tp_sl_cards_after_entry(
     *,
@@ -364,21 +375,31 @@ async def _build_tp_sl_cards_after_entry(
     min_qty = t_rules["min_qty"]
     step_price = t_rules["step_price"]
 
-    # распределяем qty по TP-уровням (percent, volume_percent)
-    placed_tp = 0
-    level_num = 0
+    # общий доступный объём в кратных шага количества
+    q_total = _quant_down(filled_qty, step_qty) or Decimal("0")
+
+    # подготовить массив ценовых TP (percent) в исходном порядке
+    percent_levels: List[dict] = []
     for lvl in tp_levels:
         if (lvl.get("tp_type") or "").lower() != "percent":
-            continue  # ATR/другое не используем
-        level_num += 1
+            continue
         vol_pct = _as_decimal(lvl.get("volume_percent")) or Decimal("0")
         if vol_pct <= 0:
             continue
+        percent_levels.append(lvl)
 
-        # объём на уровень
-        q_raw = (filled_qty * (vol_pct / Decimal("100")))
-        q_plan = _quant_down(q_raw, step_qty)
-        if q_plan is None or q_plan <= 0 or q_plan < min_qty:
+    # распределение объёмов: первые n-1 по процентам (квант вниз), последний — остаток
+    tp_qtys, last_idx = _allocate_tp_quantities(q_total, step_qty, percent_levels)
+
+    placed_tp = 0
+    cum_qty = Decimal("0")
+    level_num = 0
+
+    for i, lvl in enumerate(percent_levels):
+        level_num += 1
+        q_plan = tp_qtys[i] if i < len(tp_qtys) else Decimal("0")
+        if q_plan <= 0:
+            # запишем «нулевой» уровень только если нужно для карты — но по договорённости qty всегда осмыслен → пропускаем
             continue
 
         # цена уровня
@@ -403,20 +424,26 @@ async def _build_tp_sl_cards_after_entry(
             qty=q_plan,
             price=p_plan,
             order_link_id=link,
-            is_active=True,  # «активный» в нашей карте
-            status="sent" if order_mode == "dry_run" else "planned",  # dry_run считаем «локально отправленным»
+            is_active=True,  # релевантен
+            status="sent" if order_mode == "dry_run" else "planned",
             note="tp planned (percent)",
         )
         placed_tp += 1
+        cum_qty += q_plan
 
         # SL-после-TP (переносы) — только карточки, без размещения
         sl_mode = (lvl.get("sl_mode") or "").lower()
         sl_val = _as_decimal(lvl.get("sl_value"))
         if sl_mode in ("entry", "percent"):
+            # цена SL-замены
             sl_price = entry_price if sl_mode == "entry" else _price_percent(
                 entry_price, sl_val or Decimal("0"), direction, is_tp=False
             )
             sl_price = _quant_down(sl_price, step_price)
+
+            # объём SL после срабатывания TP-k — остаток после кумулятивных TP
+            qty_sl_after_k = _quant_down(q_total - cum_qty, step_qty) or Decimal("0")
+
             await _insert_sl_card(
                 position_uid=position_uid,
                 strategy_id=strategy_id,
@@ -429,18 +456,18 @@ async def _build_tp_sl_cards_after_entry(
                 level=level_num,
                 activation="on_tp",
                 activation_tp_level=level_num,
-                qty=None,  # будет рассчитываться по остаткам при активации
+                qty=qty_sl_after_k,
                 price=sl_price if sl_price and sl_price > 0 else None,
                 order_link_id=_suffix_link(base_link, f"sl{level_num}"),
-                is_active=False,
+                is_active=True,  # релевантен
                 status="planned_offchain",
                 note="sl replacement planned (on TP)",
             )
 
-    # стартовый SL (если включён)
+    # стартовый SL (если включён): на всю позицию
     if initial_sl and (initial_sl.get("mode") or "").lower() == "percent":
         slp = _as_decimal(initial_sl.get("value")) or Decimal("0")
-        if slp > 0:
+        if slp > 0 and q_total > 0:
             sl_price0 = _price_percent(entry=entry_price, pct=slp, direction=direction, is_tp=False)
             sl_price0 = _quant_down(sl_price0, step_price)
             await _insert_sl_card(
@@ -455,7 +482,7 @@ async def _build_tp_sl_cards_after_entry(
                 level=0,
                 activation="immediate",
                 activation_tp_level=None,
-                qty=filled_qty,  # на всю позицию
+                qty=q_total,          # вся позиция
                 price=sl_price0,
                 order_link_id=_suffix_link(base_link, "sl0"),
                 is_active=True,
@@ -465,6 +492,13 @@ async def _build_tp_sl_cards_after_entry(
 
     # reverse: TP signal (виртуальный) + sl_protect_entry (виртуальный)
     if (strategy_type or "").lower() == "reverse":
+        # последний числовой TP-уровень (если есть)
+        max_level = len(percent_levels)
+
+        # остаток после всей лестницы TP (может быть 0)
+        qty_after_all_tp = _quant_down(q_total - (sum(tp_qtys) if tp_qtys else Decimal("0")), step_qty) or Decimal("0")
+
+        # TP signal — привязан к последнему ценовому TP, qty = остаток после всей лестницы
         await _insert_virtual_tp_signal(
             position_uid=position_uid,
             strategy_id=strategy_id,
@@ -474,9 +508,12 @@ async def _build_tp_sl_cards_after_entry(
             order_mode=order_mode,
             source_stream_id=source_stream_id,
             order_link_id=_suffix_link(base_link, "tsig"),
-            note="tp_signal (virtual, no price)",
+            activation_tp_level=max_level if max_level > 0 else None,
+            qty=qty_after_all_tp,
+            note="tp_signal (virtual, on_tp)",
         )
 
+        # карточка sl_protect_entry (ранний перенос SL на entry ДО TP) — qty = вся позиция
         await _insert_sl_protect_entry(
             position_uid=position_uid,
             strategy_id=strategy_id,
@@ -486,10 +523,39 @@ async def _build_tp_sl_cards_after_entry(
             order_mode=order_mode,
             source_stream_id=source_stream_id,
             order_link_id=_suffix_link(base_link, "slprot"),
+            qty=q_total,
             note="sl_protect_entry (virtual)",
         )
 
     log.info("🧩 TP/SL карта создана: sid=%s %s placed_tp=%s", strategy_id, symbol, placed_tp)
+
+
+# 🔸 Распределение количества по TP: первые n-1 по процентам (вниз к шагу), последний — остаток
+def _allocate_tp_quantities(q_total: Decimal, step_qty: Decimal, percent_levels: List[dict]) -> Tuple[List[Decimal], int]:
+    # условия достаточности
+    if q_total is None or q_total <= 0 or step_qty is None or step_qty <= 0:
+        return [], 0
+    n = len(percent_levels)
+    if n == 0:
+        return [], 0
+
+    qtys: List[Decimal] = []
+    sum_prev = Decimal("0")
+
+    # первые n-1 по процентам
+    for i in range(n - 1):
+        vol_pct = _as_decimal(percent_levels[i].get("volume_percent")) or Decimal("0")
+        q_i = _quant_down(q_total * (vol_pct / Decimal("100")), step_qty) or Decimal("0")
+        qtys.append(q_i)
+        sum_prev += q_i
+
+    # последний — остаток
+    q_last = q_total - sum_prev
+    q_last = _quant_down(q_last, step_qty) or Decimal("0")
+    qtys.append(q_last)
+
+    return qtys, n  # n — индекс/номер последнего уровня (человеческий счёт)
+
 
 # 🔸 Запись TP карточки
 async def _insert_tp_card(
@@ -538,7 +604,8 @@ async def _insert_tp_card(
         log.info("📝 TP planned: uid=%s sid=%s %s L#%s qty=%s price=%s",
                  position_uid, strategy_id, symbol, level, qty, price)
 
-# 🔸 Запись SL карточки (immediate или on_tp), без реального размещения в dry-run
+
+# 🔸 Запись SL карточки (immediate или on_tp)
 async def _insert_sl_card(
     *,
     position_uid: str,
@@ -581,11 +648,11 @@ async def _insert_sl_card(
             position_uid, strategy_id, strategy_type, symbol, direction, order_mode,
             source_stream_id,
             kind, level, activation, activation_tp_level, is_active,
-            str(qty) if qty is not None else "0", str(price) if price is not None else None,
+            str(qty or Decimal("0")), str(price) if price is not None else None,
             order_link_id, status, note,
         )
-        log.info("📝 SL planned: uid=%s sid=%s %s mode=%s L#%s price=%s",
-                 position_uid, strategy_id, symbol, activation, level, price)
+        log.info("📝 SL planned: uid=%s sid=%s %s mode=%s L#%s qty=%s price=%s",
+                 position_uid, strategy_id, symbol, activation, level, qty, price)
 
 
 # 🔸 Виртуальный TP signal (никогда не уходит на биржу)
@@ -599,6 +666,8 @@ async def _insert_virtual_tp_signal(
     order_mode: str,
     source_stream_id: str,
     order_link_id: str,
+    activation_tp_level: Optional[int],
+    qty: Decimal,
     note: str,
 ):
     async with infra.pg_pool.acquire() as conn:
@@ -612,19 +681,22 @@ async def _insert_virtual_tp_signal(
                 order_link_id, status, note, created_at, updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, CASE WHEN $5='long' THEN 'Buy' ELSE 'Sell' END, $6,
+                $1, $2, $3, $4, $5,
+                CASE WHEN $5='long' THEN 'Buy' ELSE 'Sell' END, $6,
                 $7,
-                'tp_signal', NULL, 'immediate', NULL, false,
-                true, NULL, 0, NULL,
-                $8, 'virtual', $9, now(), now()
+                'tp_signal', NULL, 'on_tp', $8, true,
+                true, NULL, $9, NULL,
+                $10, 'virtual', $11, now(), now()
             )
             ON CONFLICT (order_link_id) DO NOTHING
             """,
             position_uid, strategy_id, strategy_type, symbol, direction, order_mode,
             source_stream_id,
+            activation_tp_level, str(qty),
             order_link_id, note,
         )
-        log.info("📝 TP signal (virtual): uid=%s sid=%s %s", position_uid, strategy_id, symbol)
+        log.info("📝 TP signal (virtual): uid=%s sid=%s %s qty=%s level=%s",
+                 position_uid, strategy_id, symbol, qty, activation_tp_level)
 
 
 # 🔸 Виртуальная карточка sl_protect_entry (ранний перенос SL на entry до TP)
@@ -638,6 +710,7 @@ async def _insert_sl_protect_entry(
     order_mode: str,
     source_stream_id: str,
     order_link_id: str,
+    qty: Decimal,
     note: str,
 ):
     async with infra.pg_pool.acquire() as conn:
@@ -651,22 +724,25 @@ async def _insert_sl_protect_entry(
                 order_link_id, status, note, created_at, updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, CASE WHEN $5='long' THEN 'Sell' ELSE 'Buy' END, $6,
+                $1, $2, $3, $4, $5,
+                CASE WHEN $5='long' THEN 'Sell' ELSE 'Buy' END, $6,
                 $7,
-                'sl_protect_entry', NULL, 'on_protect', NULL, false,
-                true, NULL, 0, NULL,
-                $8, 'planned_offchain', $9, now(), now()
+                'sl_protect_entry', NULL, 'on_protect', NULL, true,
+                true, NULL, $8, NULL,
+                $9, 'planned_offchain', $10, now(), now()
             )
             ON CONFLICT (order_link_id) DO NOTHING
             """,
             position_uid, strategy_id, strategy_type, symbol, direction, order_mode,
             source_stream_id,
+            str(qty),
             order_link_id, note,
         )
-        log.info("📝 SL protect-entry (virtual): uid=%s sid=%s %s", position_uid, strategy_id, symbol)
+        log.info("📝 SL protect-entry (virtual): uid=%s sid=%s %s qty=%s",
+                 position_uid, strategy_id, symbol, qty)
 
 
-# 🔸 Обновления журналов (необязательная косметика)
+# 🔸 Обновления журналов (косметика)
 async def _touch_journals_after_entry(*, source_stream_id: str, note: str, processing_status: str):
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
@@ -702,7 +778,7 @@ async def _preflight_symbol_settings(*, symbol: str, leverage: Decimal):
     try:
         cached = await infra.redis_client.get(key)
         if cached:
-            # условия достаточности: если тот же левередж и зафиксированные режимы — пропуск
+            # если запись уже есть — пропускаем (дальше добавим проверки на изменение плеча)
             return
     except Exception:
         pass
@@ -769,6 +845,7 @@ async def _fetch_ticker_rules(symbol: str) -> dict:
     min_qty = _as_decimal(row["min_qty"]) if row else Decimal("0")
     ticksize = _as_decimal(row["ticksize"]) if row else Decimal("0")
 
+    # шаги
     step_qty = Decimal("1").scaleb(-pqty) if pqty > 0 else Decimal("1")
     step_price = ticksize if (ticksize and ticksize > 0) else (Decimal("1").scaleb(-pprice) if pprice > 0 else Decimal("0.00000001"))
 
@@ -797,8 +874,9 @@ def _suffix_link(base: str, suffix: str) -> str:
     core = f"{base}-{suffix}"
     if len(core) <= 36:
         return core
-    h = hashlib.sha1(core.encode("utf-8")).hexdigest()[:36 - 4]  # учтём 'tv4-' ниже не нужно, base уже с 'tv4-'
-    return h  # уже ограничен
+    # если длинно — берём sha1 и обрезаем под лимит
+    h = hashlib.sha1(core.encode("utf-8")).hexdigest()[:36]
+    return h
 
 
 # 🔸 Распределённый замок (SET NX EX)
