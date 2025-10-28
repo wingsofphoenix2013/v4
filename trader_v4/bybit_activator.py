@@ -187,7 +187,7 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 await _release_dist_lock(gate_key, owner)
 
 
-# условия достаточности: ACK helper
+# 🔸 ACK helper
 async def _ack_ok(entry_id: str):
     try:
         await infra.redis_client.xack(ORDER_STREAM, ACTIVATOR_CG, entry_id)
@@ -237,8 +237,89 @@ async def _fetch_sl_on_tp(position_uid: str, level: int) -> Optional[dict]:
         )
         return dict(row) if row else None
 
+# 🔸 Позиционный стоп-лосс (live) — /v5/position/trading-stop
+async def _set_position_stop_loss_live(
+    *,
+    symbol: str,
+    trigger_price: Decimal,
+    trigger_by: str = "LastPrice",
+    position_idx: int = 0
+) -> dict:
+    # условия достаточности и квант цены
+    async with infra.pg_pool.acquire() as conn:
+        tr = await conn.fetchrow(
+            """
+            SELECT COALESCE(ticksize,0) AS ticksize,
+                   COALESCE(precision_price,0) AS pprice
+            FROM tickers_bb
+            WHERE symbol = $1
+            """,
+            symbol,
+        )
 
-# 🔸 Активация SL on_tp: в dry_run — статус 'sent'; в live — (будет) фактическая отправка
+    from decimal import Decimal, ROUND_DOWN
+
+    # локальные утилиты
+    def _quant_down_local(value: Decimal, step: Decimal):
+        try:
+            if value is None or step is None or step <= 0:
+                return None
+            return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+        except Exception:
+            return None
+
+    def _to_fixed_str_local(d: Decimal) -> str:
+        s = format(d, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s or "0"
+
+    ticksize = Decimal(str(tr["ticksize"])) if tr and tr["ticksize"] is not None else Decimal("0")
+    pprice   = int(tr["pprice"]) if tr else 0
+    step_price = ticksize if (ticksize and ticksize > 0) else (Decimal("1").scaleb(-pprice) if pprice > 0 else Decimal("0.00000001"))
+
+    p = _quant_down_local(trigger_price, step_price)
+    if p is None or p <= 0:
+        raise ValueError("invalid SL trigger price")
+
+    # подготовка и подпись запроса
+    import os, time, hmac, hashlib, json, httpx
+
+    API_KEY     = os.getenv("BYBIT_API_KEY", "")
+    API_SECRET  = os.getenv("BYBIT_API_SECRET", "")
+    BASE_URL    = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
+    RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
+
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("missing Bybit API credentials")
+
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "positionIdx": position_idx,          # oneway → 0
+        "stopLoss": _to_fixed_str_local(p),
+        "slTriggerBy": trigger_by,            # 'LastPrice'
+    }
+
+    url = f"{BASE_URL}/v5/position/trading-stop"
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    payload = f"{ts}{API_KEY}{RECV_WINDOW}{body_json}"
+    sign = hmac.new(API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": str(ts),
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN": sign,
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+        
+# 🔸 Активация SL on_tp: в dry_run — статус 'sent'; в live — позиционный стоп через /v5/position/trading-stop
 async def _activate_sl_on_tp(sl_row_id: int, order_mode: str):
     async with infra.pg_pool.acquire() as conn:
         if order_mode == "dry_run":
@@ -252,20 +333,105 @@ async def _activate_sl_on_tp(sl_row_id: int, order_mode: str):
                 """,
                 sl_row_id,
             )
+            return
+
+    # live: подтягиваем данные SL-карточки и символ
+    try:
+        async with infra.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT position_uid, symbol, direction, level, qty, price
+                FROM trader_position_orders
+                WHERE id = $1
+                """,
+                sl_row_id,
+            )
+        if not row:
+            return  # не нашли карточку — тихо выходим
+
+        # базовые поля
+        position_uid = row["position_uid"]
+        symbol       = row["symbol"]
+        level        = int(row["level"]) if row["level"] is not None else None
+        qty          = _as_decimal(row["qty"])
+        price_raw    = _as_decimal(row["price"])
+
+        # условия достаточности
+        if price_raw is None or price_raw <= 0:
+            raise ValueError("invalid SL trigger price")
+
+        # устанавливаем позиционный стоп через общий хелпер
+        resp = await _set_position_stop_loss_live(
+            symbol=symbol,
+            trigger_price=price_raw,    # квантование и отправка внутри хелпера
+            trigger_by="LastPrice",
+            position_idx=0,
+        )
+        ret_code = (resp or {}).get("retCode", 0)
+        ret_msg  = (resp or {}).get("retMsg")
+
+        if ret_code == 0:
+            # успех — помечаем карточку SL on_tp как 'sent' и логируем аудит
+            async with infra.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE trader_position_orders
+                    SET status = 'sent',
+                        updated_at = now(),
+                        note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'activated by TP (position stop set)'
+                    WHERE id = $1
+                    """,
+                    sl_row_id,
+                )
+            await _publish_audit(
+                event="sl_position_updated",
+                data={
+                    "position_uid": position_uid,
+                    "symbol": symbol,
+                    "level": level,
+                    "qty": str(qty) if qty is not None else None,
+                    "price": str(price_raw),
+                },
+            )
+            log.info("📤 position stop updated on TP: uid=%s %s L#%s price=%s",
+                     position_uid, symbol, level, price_raw)
         else:
-            # TODO: live — создать ордер на бирже (reduceOnly GTC), сохранить exchange_order_id и статус 'sent'
+            # ошибка — оставим карточку как planned_offchain и зааудитим фейл
+            await _publish_audit(
+                event="sl_position_update_failed",
+                data={
+                    "position_uid": position_uid,
+                    "symbol": symbol,
+                    "level": level,
+                    "qty": str(qty) if qty is not None else None,
+                    "price": str(price_raw),
+                    "retCode": ret_code,
+                    "retMsg": ret_msg,
+                },
+            )
+            log.info("❗ position stop update failed on TP: uid=%s %s L#%s ret=%s %s",
+                     position_uid, symbol, level, ret_code, ret_msg)
+
+    except Exception as e:
+        # мягкий фолбэк: помечаем как 'planned' (как было), чтобы можно было повторить
+        async with infra.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE trader_position_orders
                 SET status = 'planned',
                     updated_at = now(),
-                    note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'activation planned (live)'
+                    note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                           ('activation planned (live): ' || $2)
                 WHERE id = $1
                 """,
-                sl_row_id,
+                sl_row_id, str(e),
             )
-
-
+        await _publish_audit(
+            event="sl_position_update_failed",
+            data={"row_id": sl_row_id, "reason": "exception", "error": str(e)},
+        )
+        log.exception("❌ exception while updating position stop on TP (id=%s)", sl_row_id)
+        
 # 🔸 Деактивация стартового SL (level=0) при замене на SL on_tp
 async def _deactivate_initial_sl(position_uid: str, level_triggered: int, reason: str):
     async with infra.pg_pool.acquire() as conn:

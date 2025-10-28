@@ -1069,6 +1069,42 @@ async def _create_stop_ro_order(symbol: str, side: str, qty: Decimal, trigger_pr
         r.raise_for_status()
         return r.json()
 
+# 🔸 Позиционный стоп-лосс для позиции (Bybit v5 /v5/position/trading-stop)
+async def _set_position_stop_loss(
+    symbol: str,
+    trigger_price: Decimal,
+    *,
+    trigger_by: str = "LastPrice",
+    position_idx: int = 0
+) -> dict:
+    # условия достаточности
+    rules = await _fetch_ticker_rules(symbol)
+    step_price = rules["step_price"]
+    p = _quant_down(trigger_price, step_price) if trigger_price is not None else None
+    if p is None or p <= 0:
+        raise ValueError("invalid SL trigger price")
+
+    # формирование тела запроса
+    body = {
+        "category": CATEGORY,       # 'linear'
+        "symbol": symbol,
+        "positionIdx": position_idx,  # oneway → 0
+        "stopLoss": _to_fixed_str(p),
+        "slTriggerBy": trigger_by,    # 'LastPrice'
+    }
+
+    # подпись и отправка
+    url = f"{BASE_URL}/v5/position/trading-stop"
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    signed = _rest_sign(ts, body_json)
+    headers = _private_headers(ts, signed)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+
 # 🔸 Постановка live-ордеров по «немедленным» карточкам (tp/sl level=0) из БД
 async def _place_immediate_orders_for_position(position_uid: str, symbol: str, direction: str):
     async with infra.pg_pool.acquire() as conn:
@@ -1097,75 +1133,160 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
 
         try:
             if kind == "tp":
+                # лимитный TP reduceOnly (как было)
                 resp = await _create_limit_ro_order(symbol, side, qty, price, link)
-            else:
-                # SL стартовый — стоп-маркет по triggerPrice=price
-                resp = await _create_stop_ro_order(symbol, side, qty, price, link)
 
-            ret_code = (resp or {}).get("retCode", 0)
-            ret_msg  = (resp or {}).get("retMsg")
-            exch_id  = ((resp or {}).get("result") or {}).get("orderId")
+                ret_code = (resp or {}).get("retCode", 0)
+                ret_msg  = (resp or {}).get("retMsg")
+                exch_id  = ((resp or {}).get("result") or {}).get("orderId")
 
-            if ret_code == 0 and exch_id:
-                # успех
-                async with infra.pg_pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE trader_position_orders
-                        SET status = 'sent',
-                            exchange_order_id = COALESCE($2, exchange_order_id),
-                            updated_at = now(),
-                            note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'live placed'
-                        WHERE id = $1
-                        """,
-                        rid, exch_id,
+                if ret_code == 0 and exch_id:
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'sent',
+                                exchange_order_id = COALESCE($2, exchange_order_id),
+                                updated_at = now(),
+                                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'live placed'
+                            WHERE id = $1
+                            """,
+                            rid, exch_id,
+                        )
+                    await _publish_audit(
+                        event="tp_placed",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "level": level,
+                            "qty": _to_fixed_str(qty),
+                            "price": _to_fixed_str(price) if price is not None else None,
+                            "order_link_id": link,
+                            "exchange_order_id": exch_id,
+                        },
                     )
-                await _publish_audit(
-                    event="tp_placed" if kind == "tp" else "sl_placed",
-                    data={
-                        "position_uid": position_uid,
-                        "symbol": symbol,
-                        "level": level,
-                        "qty": _to_fixed_str(qty),
-                        "price": _to_fixed_str(price) if price is not None else None,
-                        "order_link_id": link,
-                        "exchange_order_id": exch_id,
-                    },
-                )
-                log.info("📤 live placed: %s L#%s link=%s exch_id=%s qty=%s price=%s",
-                         kind, level, link, exch_id, qty, price)
+                    log.info("📤 live placed: tp L#%s link=%s exch_id=%s qty=%s price=%s",
+                             level, link, exch_id, qty, price)
+                else:
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'error',
+                                updated_at = now(),
+                                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                       ('live place failed: retCode=' || $2::text || ' msg=' || COALESCE($3,''))
+                            WHERE id = $1
+                            """,
+                            rid, str(ret_code), ret_msg,
+                        )
+                    await _publish_audit(
+                        event="tp_place_failed",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "level": level,
+                            "qty": _to_fixed_str(qty),
+                            "price": _to_fixed_str(price) if price is not None else None,
+                            "order_link_id": link,
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                        },
+                    )
+                    log.info("❗ live place failed: tp L#%s link=%s ret=%s %s",
+                             level, link, ret_code, ret_msg)
+
             else:
-                # ошибка от API → пометить карточку и аудит
-                async with infra.pg_pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE trader_position_orders
-                        SET status = 'error',
-                            updated_at = now(),
-                            note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
-                                   ('live place failed: retCode=' || $2::text || ' msg=' || COALESCE($3,''))
-                        WHERE id = $1
-                        """,
-                        rid, str(ret_code), ret_msg,   # ← ret_code строкой
+                # стартовый SL (level=0) — позиционный стоп через /v5/position/trading-stop
+                # цена должна быть; квантируем к шагу цены на всякий случай
+                rules = await _fetch_ticker_rules(symbol)
+                p_plan = _quant_down(price, rules["step_price"]) if price is not None else None
+
+                # условия достаточности
+                if p_plan is None or p_plan <= 0:
+                    raise ValueError("invalid SL trigger price")
+
+                # подготовка запроса trading-stop
+                # body: category=linear, positionIdx=0 (oneway), stopLoss, slTriggerBy=LastPrice
+                body = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "positionIdx": 0,
+                    "stopLoss": _to_fixed_str(p_plan),
+                    "slTriggerBy": "LastPrice",
+                }
+                url = f"{BASE_URL}/v5/position/trading-stop"
+                ts = int(time.time() * 1000)
+                body_json = json.dumps(body, separators=(",", ":"))
+                sign = _rest_sign(ts, body_json)
+                headers = _private_headers(ts, sign)
+
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(url, headers=headers, content=body_json)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                ret_code = (data or {}).get("retCode", 0)
+                ret_msg  = (data or {}).get("retMsg")
+
+                if ret_code == 0:
+                    # успех позиционного SL — помечаем карточку как отправленную (exchange_order_id отсутствует)
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'sent',
+                                updated_at = now(),
+                                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'live position stop set'
+                            WHERE id = $1
+                            """,
+                            rid,
+                        )
+                    await _publish_audit(
+                        event="sl_position_set",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "level": level,
+                            "qty": _to_fixed_str(qty),
+                            "price": _to_fixed_str(p_plan),
+                            "order_link_id": link,
+                        },
                     )
-                await _publish_audit(
-                    event="tp_place_failed" if kind == "tp" else "sl_place_failed",
-                    data={
-                        "position_uid": position_uid,
-                        "symbol": symbol,
-                        "level": level,
-                        "qty": _to_fixed_str(qty),
-                        "price": _to_fixed_str(price) if price is not None else None,
-                        "order_link_id": link,
-                        "retCode": ret_code,
-                        "retMsg": ret_msg,
-                    },
-                )
-                log.info("❗ live place failed: %s L#%s link=%s ret=%s %s",
-                         kind, level, link, ret_code, ret_msg)
+                    log.info("📤 live position stop set: sl L#%s link=%s qty=%s price=%s",
+                             level, link, qty, p_plan)
+                else:
+                    # ошибка установки позиционного SL
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'error',
+                                updated_at = now(),
+                                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                       ('live position stop failed: retCode=' || $2::text || ' msg=' || COALESCE($3,''))
+                            WHERE id = $1
+                            """,
+                            rid, str(ret_code), ret_msg,
+                        )
+                    await _publish_audit(
+                        event="sl_position_set_failed",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "level": level,
+                            "qty": _to_fixed_str(qty),
+                            "price": _to_fixed_str(p_plan),
+                            "order_link_id": link,
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                        },
+                    )
+                    log.info("❗ live position stop failed: sl L#%s link=%s ret=%s %s",
+                             level, link, ret_code, ret_msg)
 
         except ValueError as ve:
-            # ниже min_qty / некорректные параметры — помечаем как пропущено
+            # ниже min_qty / некорректные параметры — помечаем как офчейн/ошибка
             async with infra.pg_pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -1206,7 +1327,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
                     rid,
                 )
             await _publish_audit(
-                event="tp_place_failed" if kind == "tp" else "sl_place_failed",
+                event="tp_place_failed" if kind == "tp" else "sl_position_set_failed",
                 data={
                     "position_uid": position_uid,
                     "symbol": symbol,
