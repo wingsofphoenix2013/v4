@@ -935,13 +935,22 @@ def _private_headers(ts_ms: int, signed: str) -> dict:
 
 # 🔸 Создание market IOC ордера (reduceOnly=false)
 async def _create_market_order(symbol: str, side: str, qty: Decimal, order_link_id: str) -> dict:
+    # квантуем qty к шагу символа
+    rules = await _fetch_ticker_rules(symbol)
+    step_qty = rules["step_qty"]
+    q = _quant_down(qty, step_qty) or Decimal("0")
+    if q <= 0:
+        raise ValueError(f"qty too small after quantization: {qty}")
+
+    qty_str = _to_fixed_str(q)  # ← без экспоненты
+
     url = f"{BASE_URL}/v5/order/create"
     body = {
         "category": "linear",
         "symbol": symbol,
         "side": side,                       # Buy | Sell
         "orderType": "Market",
-        "qty": str(qty),
+        "qty": qty_str,                     # ← фиксированный вид
         "timeInForce": "IOC",
         "reduceOnly": False,
         "orderLinkId": order_link_id,
@@ -967,6 +976,13 @@ async def _get_order_realtime_by_link(order_link_id: str) -> dict:
         r.raise_for_status()
         return r.json()
 
+# 🔸 Строка без экспоненты, с обрезкой хвостовых нулей
+def _to_fixed_str(d: Decimal) -> str:
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+    
 # 🔸 Квантование вниз к шагу
 def _quant_down(value: Decimal, step: Decimal) -> Optional[Decimal]:
     try:
