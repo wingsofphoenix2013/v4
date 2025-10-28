@@ -322,7 +322,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     fill_pct   = (filled_qty / qty_plan) if (qty_plan and qty_plan > 0) else Decimal("0")
 
                     # fast-accept: ≥95% и стабильность ≥5с
-                    if fill_pct >= ENTRY_FAST_ACCEPT_PCT and (time.time() - last_change_ts) >= ENTRY_FAST_STABLE_SEC
+                    if fill_pct >= ENTRY_FAST_ACCEPT_PCT and (time.time() - last_change_ts) >= ENTRY_FAST_STABLE_SEC:
                         criterion = "live_95_5"
                         decided   = True
                         break
