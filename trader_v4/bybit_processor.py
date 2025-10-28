@@ -295,7 +295,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 last_renew_ts    = t_start
 
                 # опрос до 60с по 1с с проверкой стабильности 5с
-                while time.time() - t_start < ENTRY_SLOW_TIMEOUT_SEC
+                while time.time() - t_start < ENTRY_SLOW_TIMEOUT_SEC:
                     await asyncio.sleep(ENTRY_POLL_INTERVAL_SEC)
 
                     # продлить TTL распределённого замка на (sid,symbol), чтобы не истёк в долгом watcher
