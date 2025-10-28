@@ -393,15 +393,18 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
 
                     await _place_immediate_orders_for_position(position_uid, symbol, direction)
 
-                    # отследить поздние fill'ы и при необходимости закрыть хвост reduce-only Market
-                    await _watch_and_close_late_tail(
-                        position_uid=position_uid,
-                        symbol=symbol,
-                        side=side,
-                        order_link_id=link_e,          # entry link с суффиксом "-e"
-                        committed_qty=filled_qty,
-                        source_stream_id=source_stream_id,
-                    )
+                    # запуск tail-watcher только при неполном fill
+                    if qty_plan and filled_qty < qty_plan:
+                        await _watch_and_close_late_tail(
+                            position_uid=position_uid,
+                            symbol=symbol,
+                            side=side,
+                            order_link_id=link_e,          # entry link с суффиксом "-e"
+                            committed_qty=filled_qty,
+                            source_stream_id=source_stream_id,
+                        )
+                    else:
+                        log.debug("tail-watch skipped: full fill (qty_plan=%s, filled=%s)", qty_plan, filled_qty)
 
                 else:
                     # abort: <75% к 60с — закрываем исполненную часть reduceOnly Market и фиксируем abort
@@ -1034,7 +1037,7 @@ async def _touch_journals_after_entry(
                  processing_status,
                  f", ext_status={ext_status}" if ext_status else "")
 
-# 🔸 Pre-flight для символа (live): set-leverage + кэш (12ч)
+# 🔸 Pre-flight для символа (live): set-leverage + кэш (12ч, 110043=OK)
 async def _preflight_symbol_settings(*, symbol: str, leverage: Decimal):
     # условия достаточности
     if leverage is None or leverage <= 0:
@@ -1066,22 +1069,26 @@ async def _preflight_symbol_settings(*, symbol: str, leverage: Decimal):
         ret_code = (resp or {}).get("retCode", 0)
         ret_msg  = (resp or {}).get("retMsg")
 
-        if ret_code == 0:
-            # записываем кэш (12 часов)
+        # 110043 = "leverage not modified" — считаем ОК
+        ok_codes = (0, 110043)
+        if ret_code in ok_codes:
             entry = {"leverage": _to_fixed_str(leverage), "ts": int(time.time() * 1000)}
             try:
                 await redis.set(key, json.dumps(entry), ex=12 * 60 * 60)
             except Exception:
                 pass
 
-            # аудит и лог
+            evt = "leverage_set" if ret_code == 0 else "leverage_ok"
             await _publish_audit(
-                event="leverage_set",
-                data={"symbol": symbol, "leverage": _to_fixed_str(leverage)},
+                event=evt,
+                data={"symbol": symbol, "leverage": _to_fixed_str(leverage), "retCode": ret_code, "retMsg": ret_msg},
             )
-            log.info("🛫 preflight leverage set: %s → %s", symbol, _to_fixed_str(leverage))
+            log.info(
+                "🛫 preflight leverage %s: %s → %s (ret=%s %s)",
+                "set" if ret_code == 0 else "unchanged",
+                symbol, _to_fixed_str(leverage), ret_code, ret_msg,
+            )
         else:
-            # аудит ошибки; вход не блокируем
             await _publish_audit(
                 event="leverage_set_failed",
                 data={"symbol": symbol, "leverage": _to_fixed_str(leverage), "retCode": ret_code, "retMsg": ret_msg},
@@ -1095,7 +1102,7 @@ async def _preflight_symbol_settings(*, symbol: str, leverage: Decimal):
             data={"symbol": symbol, "leverage": _to_fixed_str(leverage), "reason": "exception", "error": str(e)},
         )
         log.exception("❌ preflight leverage exception: %s", symbol)
-
+        
 # 🔸 Аудит-событие
 async def _publish_audit(event: str, data: dict):
     payload = {"event": event, **(data or {})}
