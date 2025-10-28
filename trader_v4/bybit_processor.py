@@ -26,9 +26,17 @@ BYBIT_PROC_CG = "bybit_processor_cg"
 BYBIT_PROC_CONSUMER = os.getenv("BYBIT_PROC_CONSUMER", "bybit-proc-1")
 AUDIT_STREAM = "positions_bybit_audit"
 
-# 🔸 Параметры ожидания entry в live
-ENTRY_POLL_INTERVAL_SEC = 1.0
-ENTRY_POLL_TIMEOUT_SEC = 10.0
+# 🔸 Параметры сторожа live-entry
+ENTRY_POLL_INTERVAL_SEC = 1.0            # период опроса /v5/order/realtime
+ENTRY_FAST_ACCEPT_PCT   = Decimal("0.95") # порог быстрого приёма (95%)
+ENTRY_FAST_STABLE_SEC   = 5               # стабильность без прироста (сек)
+ENTRY_SLOW_ACCEPT_PCT   = Decimal("0.75") # порог медленного приёма (75%)
+ENTRY_SLOW_TIMEOUT_SEC  = 60              # общий таймаут наблюдения (сек)
+
+# 🔸 Параметры отслеживания поздних fill'ов (tail)
+TAIL_WATCH_INTERVAL_SEC = 1.0   # период опроса ордера
+TAIL_WATCH_TIMEOUT_SEC  = 30    # окно наблюдения после commit (сек)
+TAIL_GUARD_TTL_SEC      = 90    # TTL «карантина» в Redis (чтобы не дублировать хвост)
 
 # 🔸 TIF для live-ордеров
 TP_TIF = "GTC"
@@ -36,7 +44,7 @@ SL_TIF = "GTC"
 
 # 🔸 Параллелизм и замки
 MAX_PARALLEL_TASKS = int(os.getenv("BYBIT_PROC_MAX_TASKS", "200"))
-LOCK_TTL_SEC = int(os.getenv("BYBIT_PROC_LOCK_TTL", "30"))
+LOCK_TTL_SEC = int(os.getenv("BYBIT_PROC_LOCK_TTL", "75"))  # было 30
 
 # 🔸 BYBIT ENV (часть нужна позже для live)
 API_KEY = os.getenv("BYBIT_API_KEY", "")
@@ -252,51 +260,124 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     return
 
                 # ─────────────────────────────────────────────────────────────
-                # LIVE ВЕТКА: preflight → market IOC → короткий watcher → commit
+                # LIVE ВЕТКА: preflight → market IOC → watcher (95/5, 75/60) → commit|abort
                 # ─────────────────────────────────────────────────────────────
+
+                # короткий id для entry
+                link_e = _suffix_link(order_link_id, "e")
+
+                # идемпотентный guard: если entry уже финализирован → ACK и выходим
+                if await _is_entry_finalized(position_uid, link_e):
+                    await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                    log.info("↷ duplicate: entry already finalized (link=%s) — ACK", link_e)
+                    return
+
+                # preflight (live)
                 await _preflight_symbol_settings(symbol=symbol, leverage=leverage)
 
                 # создать market IOC
-                link_e = _suffix_link(order_link_id, "e")
                 create_resp = await _create_market_order(symbol, side, qty, link_e)
                 log.info("🟢 LIVE entry create sent: link=%s resp=%s", link_e, (create_resp or {}).get("retMsg"))
 
-                # короткий опрос состояния (до 10с)
-                filled_qty = Decimal("0")
-                avg_price  = None
-                t0 = time.time()
-                while time.time() - t0 < ENTRY_POLL_TIMEOUT_SEC:
+                # watcher параметризация
+                qty_plan     = qty or Decimal("0")
+                filled_qty   = Decimal("0")
+                avg_price    = None
+                decided      = False
+                criterion    = None
+
+                t_start          = time.time()
+                last_change_ts   = t_start
+                last_filled_seen = Decimal("0")
+
+                # периодическое продление замка на время watcher (если он длиннее TTL)
+                renew_period_sec = max(10, min(LOCK_TTL_SEC // 2, 20))
+                last_renew_ts    = t_start
+
+                # опрос до 60с по 1с с проверкой стабильности 5с
+                while time.time() - t_start < ENTRY_SLOW_TIMEOUT_SEC
                     await asyncio.sleep(ENTRY_POLL_INTERVAL_SEC)
+
+                    # продлить TTL распределённого замка на (sid,symbol), чтобы не истёк в долгом watcher
+                    if time.time() - last_renew_ts >= renew_period_sec:
+                        try:
+                            await infra.redis_client.expire(gate_key, LOCK_TTL_SEC)
+                        except Exception:
+                            pass
+                        last_renew_ts = time.time()
+
                     state = await _get_order_realtime_by_link(link_e)
-                    lst = (state.get("result") or {}).get("list") or []
-                    head = lst[0] if lst else {}
-                    fq  = _as_decimal(head.get("cumExecQty")) or Decimal("0")
-                    ap  = _as_decimal(head.get("avgPrice"))
+                    lst   = (state.get("result") or {}).get("list") or []
+                    head  = lst[0] if lst else {}
+                    fq    = _as_decimal(head.get("cumExecQty")) or Decimal("0")
+                    ap    = _as_decimal(head.get("avgPrice"))
+
+                    # трекинг изменений fill
+                    if fq != last_filled_seen:
+                        last_filled_seen = fq
+                        last_change_ts   = time.time()
+
                     filled_qty = fq
                     avg_price  = ap
-                    # если есть хоть что-то — выходим (минимальный watcher)
-                    if filled_qty > 0:
+                    fill_pct   = (filled_qty / qty_plan) if (qty_plan and qty_plan > 0) else Decimal("0")
+
+                    # fast-accept: ≥95% и стабильность ≥5с
+                    if fill_pct >= ENTRY_FAST_ACCEPT_PCT and (time.time() - last_change_ts) >= ENTRY_FAST_STABLE_SEC
+                        criterion = "live_95_5"
+                        decided   = True
                         break
 
-                if filled_qty > 0 and avg_price:
-                    # зафиксировать commit входа
+                # если не решили в цикле, принимаем по 75/60 или откатываем
+                if not decided:
+                    # финальный снимок перед решением
+                    if avg_price is None:
+                        state = await _get_order_realtime_by_link(link_e)
+                        lst   = (state.get("result") or {}).get("list") or []
+                        head  = lst[0] if lst else {}
+                        filled_qty = _as_decimal(head.get("cumExecQty")) or Decimal("0")
+                        avg_price  = _as_decimal(head.get("avgPrice"))
+                    fill_pct = (filled_qty / qty_plan) if (qty_plan and qty_plan > 0) else Decimal("0")
+
+                    if fill_pct >= ENTRY_SLOW_ACCEPT_PCT and avg_price:
+                        criterion = "live_75_60"
+                        decided   = True
+                    else:
+                        criterion = "abort_<75_60"
+                        decided   = False  # явный флаг на abort
+
+                if decided and filled_qty > 0 and avg_price:
+                    # коммит входа с критерием (95/5 или 75/60)
                     await _update_entry_filled_and_commit(
                         position_uid=position_uid,
                         order_link_id=link_e,
                         filled_qty=filled_qty,
                         avg_price=avg_price,
-                        commit_criterion="live_minimal",
+                        commit_criterion=criterion,
                         late_tail_delta=None,
                     )
                     await _touch_journals_after_entry(
                         source_stream_id=source_stream_id,
-                        note=f"entry live filled (minimal) qty={filled_qty} @ {avg_price}",
+                        note=f"entry live filled ({criterion}) qty={filled_qty} @ {avg_price}",
                         processing_status="processing",
                         ext_status="open",
                     )
-                    log.info("✅ LIVE entry filled (minimal): %s qty=%s @ %s", link_e, filled_qty, avg_price)
+                    await _publish_audit(
+                        event="entry_filled",
+                        data={
+                            "criterion": criterion,
+                            "order_link_id": link_e,
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "filled_qty": _to_fixed_str(filled_qty),
+                            "filled_pct": _to_fixed_str((filled_qty / qty_plan) * 100) if (qty_plan and qty_plan > 0) else "0",
+                            "avg_price": _to_fixed_str(avg_price),
+                            "source_stream_id": source_stream_id,
+                            "mode": order_mode,
+                        },
+                    )
+                    log.info("✅ LIVE entry filled (%s): %s qty=%s @ %s", criterion, link_e, filled_qty, avg_price)
 
-                    # построить карту TP/SL в БД (как в dry-run, но с order_mode='live')
+                    # построить карту TP/SL и выставить «немедленные» заявки (TP + SL0 позиционный)
                     await _build_tp_sl_cards_after_entry(
                         position_uid=position_uid,
                         strategy_id=sid,
@@ -310,24 +391,91 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         base_link=order_link_id,
                     )
 
-                    # выставить «немедленные» TP/SL на биржу по карточкам (tp price + sl level=0)
                     await _place_immediate_orders_for_position(position_uid, symbol, direction)
 
-                else:
-                    # ничего не успело исполниться за окно — считаем 'sent'
-                    async with infra.pg_pool.acquire() as conn:
-                        await conn.execute(
-                            """
-                            UPDATE trader_position_orders
-                            SET status = 'sent', updated_at = now(),
-                                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'live entry sent (no fill yet)'
-                            WHERE position_uid = $1 AND order_link_id = $2 AND kind = 'entry'
-                            """,
-                            position_uid, link_e,
-                        )
-                    log.info("🟡 LIVE entry sent (no fill yet): %s", link_e)
+                    # отследить поздние fill'ы и при необходимости закрыть хвост reduce-only Market
+                    await _watch_and_close_late_tail(
+                        position_uid=position_uid,
+                        symbol=symbol,
+                        side=side,
+                        order_link_id=link_e,          # entry link с суффиксом "-e"
+                        committed_qty=filled_qty,
+                        source_stream_id=source_stream_id,
+                    )
 
-                # ACK — завершаем обработку записи (в live TP/SL уже поставлены/или пока нет fill)
+                else:
+                    # abort: <75% к 60с — закрываем исполненную часть reduceOnly Market и фиксируем abort
+                    partial = filled_qty if filled_qty > 0 else Decimal("0")
+                    note_abort = f"entry abort: fill_pct={_to_fixed_str((filled_qty/qty_plan)*100) if (qty_plan and qty_plan>0) else '0'}% @60s"
+
+                    try:
+                        if partial > 0:
+                            # закрывающая сторона
+                            close_side = "Sell" if side == "Buy" else "Buy"
+                            link_abort = _suffix_link(order_link_id, "abort")
+                            resp_abort = await _close_reduce_only_market(symbol, close_side, partial, link_abort)
+                            log.info("🛑 abort close sent: link=%s resp=%s", link_abort, (resp_abort or {}).get("retMsg"))
+
+                        # пометить карточку entry как fill_abort_closed
+                        async with infra.pg_pool.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE trader_position_orders
+                                SET status = 'fill_abort_closed',
+                                    updated_at = now(),
+                                    note = COALESCE(note,'') ||
+                                           CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || $2
+                                WHERE position_uid = $1
+                                  AND order_link_id = $3
+                                  AND kind = 'entry'
+                                """,
+                                position_uid, note_abort, link_e,
+                            )
+
+                        # дописать заметку в журналы (trader_positions_log) по source_stream_id
+                        async with infra.pg_pool.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE trader_positions_log
+                                SET updated_at = now(),
+                                    note = COALESCE(note,'') ||
+                                           CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                           $2
+                                WHERE source_stream_id = $1
+                                """,
+                                source_stream_id,
+                                f"{note_abort}; closed_tail={_to_fixed_str(partial)}",
+                            )
+
+                        # аудит
+                        await _publish_audit(
+                            event="entry_aborted",
+                            data={
+                                "order_link_id": link_e,
+                                "position_uid": position_uid,
+                                "symbol": symbol,
+                                "filled_qty": _to_fixed_str(partial),
+                                "filled_pct": _to_fixed_str((partial / qty_plan) * 100) if (qty_plan and qty_plan > 0) else "0",
+                                "avg_price": _to_fixed_str(avg_price) if avg_price is not None else None,
+                                "reason": "<75% at 60s",
+                                "mode": order_mode,
+                            },
+                        )
+                        log.info("🟡 LIVE entry aborted: %s partial=%s", link_e, partial)
+
+                    except Exception as ae:
+                        await _publish_audit(
+                            event="entry_abort_close_failed",
+                            data={
+                                "order_link_id": link_e,
+                                "position_uid": position_uid,
+                                "symbol": symbol,
+                                "reason": str(ae),
+                            },
+                        )
+                        log.exception("❌ abort close failed: %s", link_e)
+
+                # ACK — завершаем обработку записи
                 await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
                 return
 
@@ -886,27 +1034,67 @@ async def _touch_journals_after_entry(
                  processing_status,
                  f", ext_status={ext_status}" if ext_status else "")
 
-# 🔸 Pre-flight для символа (live): плечо/режимы — с кэшированием, чтобы не дёргать лишний раз
+# 🔸 Pre-flight для символа (live): set-leverage + кэш (12ч)
 async def _preflight_symbol_settings(*, symbol: str, leverage: Decimal):
-    # кэш в Redis: bybit:preflight:linear:{symbol} = json {leverage, margin_mode, position_mode}
-    key = f"bybit:preflight:linear:{symbol}"
+    # условия достаточности
+    if leverage is None or leverage <= 0:
+        log.info("🛈 preflight skipped: leverage not provided/invalid for %s", symbol)
+        return
+
+    redis = infra.redis_client
+    key = f"bybit:leverage:applied:{symbol}"
+
+    # читаем кэш применённого плеча
     try:
-        cached = await infra.redis_client.get(key)
-        if cached:
-            # если запись уже есть — пропускаем (дальше добавим проверки на изменение плеча)
-            return
+        cached_raw = await redis.get(key)
+        if cached_raw:
+            try:
+                cached = json.loads(cached_raw)
+            except Exception:
+                cached = {}
+            if (cached or {}).get("leverage") == _to_fixed_str(leverage):
+                # уже применено — выходим
+                log.info("🛫 preflight cached (leverage ok): %s=%s", symbol, cached.get("leverage"))
+                return
     except Exception:
+        # мягкий пропуск ошибок чтения кэша
         pass
 
-    # здесь будет реальный вызов в live (set-leverage / switch-isolated / position-mode),
-    # сейчас — просто лог и отметка в кэше
-    await infra.redis_client.set(key, json.dumps({
-        "leverage": str(leverage),
-        "margin_mode": MARGIN_MODE,
-        "position_mode": POSITION_MODE,
-    }), ex=12 * 60 * 60)
-    log.info("🛫 preflight cached: %s leverage=%s margin=%s posmode=%s", symbol, leverage, MARGIN_MODE, POSITION_MODE)
+    # попытка установить плечо
+    try:
+        resp = await _set_leverage_live(symbol, leverage)
+        ret_code = (resp or {}).get("retCode", 0)
+        ret_msg  = (resp or {}).get("retMsg")
 
+        if ret_code == 0:
+            # записываем кэш (12 часов)
+            entry = {"leverage": _to_fixed_str(leverage), "ts": int(time.time() * 1000)}
+            try:
+                await redis.set(key, json.dumps(entry), ex=12 * 60 * 60)
+            except Exception:
+                pass
+
+            # аудит и лог
+            await _publish_audit(
+                event="leverage_set",
+                data={"symbol": symbol, "leverage": _to_fixed_str(leverage)},
+            )
+            log.info("🛫 preflight leverage set: %s → %s", symbol, _to_fixed_str(leverage))
+        else:
+            # аудит ошибки; вход не блокируем
+            await _publish_audit(
+                event="leverage_set_failed",
+                data={"symbol": symbol, "leverage": _to_fixed_str(leverage), "retCode": ret_code, "retMsg": ret_msg},
+            )
+            log.info("⚠️ preflight leverage failed: %s ret=%s %s", symbol, ret_code, ret_msg)
+
+    except Exception as e:
+        # сетевые/прочие ошибки — мягко логируем и продолжаем
+        await _publish_audit(
+            event="leverage_set_failed",
+            data={"symbol": symbol, "leverage": _to_fixed_str(leverage), "reason": "exception", "error": str(e)},
+        )
+        log.exception("❌ preflight leverage exception: %s", symbol)
 
 # 🔸 Аудит-событие
 async def _publish_audit(event: str, data: dict):
@@ -980,6 +1168,23 @@ def _private_headers(ts_ms: int, signed: str) -> dict:
         "Content-Type": "application/json",
     }
 
+# 🔸 Проверка финализации entry по position_uid и order_link_id
+async def _is_entry_finalized(position_uid: str, order_link_id: str) -> bool:
+    async with infra.pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status
+            FROM trader_position_orders
+            WHERE position_uid = $1
+              AND order_link_id = $2
+              AND kind = 'entry'
+            LIMIT 1
+            """,
+            position_uid, order_link_id,
+        )
+    # финальные статусы, при которых повторная обработка не нужна
+    return bool(row and row["status"] in ("filled", "fill_abort_closed"))
+    
 # 🔸 Создание market IOC ордера (reduceOnly=false)
 async def _create_market_order(symbol: str, side: str, qty: Decimal, order_link_id: str) -> dict:
     # квантование и проверка min_qty
@@ -1105,6 +1310,178 @@ async def _set_position_stop_loss(
         r.raise_for_status()
         return r.json()
 
+# 🔸 Reduce-only Market для закрытия (abort/хвост) — /v5/order/create
+async def _close_reduce_only_market(symbol: str, side: str, qty: Decimal, order_link_id: str) -> dict:
+    # условия достаточности: квантование и min_qty
+    rules = await _fetch_ticker_rules(symbol)
+    q = _quant_down(qty, rules["step_qty"]) or Decimal("0")
+    if q <= 0 or q < (rules["min_qty"] or Decimal("0")):
+        raise ValueError(f"qty below min_qty after quantization: q={q}, min={rules['min_qty']}")
+
+    # тело запроса: Market IOC, reduceOnly=true
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side,                 # закрывающая сторона
+        "orderType": "Market",
+        "qty": _to_fixed_str(q),
+        "timeInForce": "IOC",
+        "reduceOnly": True,
+        "orderLinkId": order_link_id,
+    }
+
+    # подпись и отправка
+    url = f"{BASE_URL}/v5/order/create"
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    signed = _rest_sign(ts, body_json)
+    headers = _private_headers(ts, signed)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+
+# 🔸 Установка плеча для символа (live) — /v5/position/set-leverage
+async def _set_leverage_live(symbol: str, leverage: Decimal) -> dict:
+    # условия достаточности
+    if leverage is None or leverage <= 0:
+        raise ValueError("invalid leverage")
+
+    # тело запроса (oneway: одинаковое плечо для обеих сторон)
+    body = {
+        "category": CATEGORY,                 # 'linear'
+        "symbol": symbol,
+        "buyLeverage": _to_fixed_str(leverage),
+        "sellLeverage": _to_fixed_str(leverage),
+    }
+
+    # подпись и отправка
+    url = f"{BASE_URL}/v5/position/set-leverage"
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    signed = _rest_sign(ts, body_json)
+    headers = _private_headers(ts, signed)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+
+# 🔸 Отлов поздних fill'ов после commit и авто-докрытие reduce-only Market
+async def _watch_and_close_late_tail(
+    *,
+    position_uid: str,
+    symbol: str,
+    side: str,                # Buy|Sell (сторона entry)
+    order_link_id: str,       # link_e
+    committed_qty: Decimal,   # qty, зафиксированный в commit
+    source_stream_id: str,
+):
+    redis = infra.redis_client
+
+    # «Карантин» на этот ордер, чтобы не дублировать хвост
+    guard_key = f"tv4:tail:{order_link_id}"
+    try:
+        ok = await redis.set(guard_key, "1", nx=True, ex=TAIL_GUARD_TTL_SEC)
+    except Exception:
+        ok = True  # если Redis недоступен — всё равно попробуем, но без защиты
+
+    if not ok:
+        return  # уже обрабатывается другим воркером/итерацией
+
+    try:
+        closed_total = Decimal("0")     # сколько хвоста уже закрыли
+        t0 = time.time()
+        tail_idx = 0
+
+        while time.time() - t0 < TAIL_WATCH_TIMEOUT_SEC:
+            await asyncio.sleep(TAIL_WATCH_INTERVAL_SEC)
+
+            # опрос состояния ордера
+            state = await _get_order_realtime_by_link(order_link_id)
+            lst   = (state.get("result") or {}).get("list") or []
+            head  = lst[0] if lst else {}
+            cum   = _as_decimal(head.get("cumExecQty")) or Decimal("0")
+
+            # если появилось дополнительное исполнение после commit+закрытых хвостов
+            target = committed_qty + closed_total
+            if cum > target:
+                delta = cum - target
+                # закрывающая сторона для reduce-only
+                close_side = "Sell" if side == "Buy" else "Buy"
+                tail_idx += 1
+                tail_link = _suffix_link(order_link_id, f"tail{tail_idx}")
+
+                try:
+                    # отправляем reduce-only Market на дельту
+                    resp = await _close_reduce_only_market(symbol, close_side, delta, tail_link)
+                    closed_total += ( _as_decimal(delta) or Decimal("0") )
+
+                    # учесть late_tail_qty_total в карточке entry
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET late_tail_qty_total = COALESCE(late_tail_qty_total, 0) + $3,
+                                updated_at = now(),
+                                note = COALESCE(note,'') ||
+                                       CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                       ('late tail closed=' || $3::text)
+                            WHERE position_uid = $1
+                              AND order_link_id = $2
+                              AND kind = 'entry'
+                            """,
+                            position_uid, order_link_id, str(delta),
+                        )
+
+                    # пометка в журналы
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_positions_log
+                            SET updated_at = now(),
+                                note = COALESCE(note,'') ||
+                                       CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                       ('late tail closed=' || $2::text)
+                            WHERE source_stream_id = $1
+                            """,
+                            source_stream_id, str(delta),
+                        )
+
+                    # аудит
+                    await _publish_audit(
+                        event="entry_late_tail_closed",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "qty": _to_fixed_str(delta),
+                            "order_link_id": tail_link,
+                            "base_order_link_id": order_link_id,
+                        },
+                    )
+                    log.info("🧵 late tail closed: base=%s tail=%s qty=%s", order_link_id, tail_link, delta)
+
+                except Exception as te:
+                    await _publish_audit(
+                        event="entry_late_tail_close_failed",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "qty": _to_fixed_str(delta),
+                            "base_order_link_id": order_link_id,
+                            "reason": str(te),
+                        },
+                    )
+                    log.exception("❌ late tail close failed: base=%s delta=%s", order_link_id, delta)
+
+    finally:
+        # снимаем «карантин»
+        try:
+            await redis.delete(guard_key)
+        except Exception:
+            pass
+            
 # 🔸 Постановка live-ордеров по «немедленным» карточкам (tp/sl level=0) из БД
 async def _place_immediate_orders_for_position(position_uid: str, symbol: str, direction: str):
     async with infra.pg_pool.acquire() as conn:
