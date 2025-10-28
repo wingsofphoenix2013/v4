@@ -7,6 +7,8 @@ import json
 import asyncio
 import logging
 import hashlib
+import time
+import hmac
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Optional, Any, List
 
@@ -23,6 +25,10 @@ ORDERS_STREAM = "positions_bybit_orders"
 BYBIT_PROC_CG = "bybit_processor_cg"
 BYBIT_PROC_CONSUMER = os.getenv("BYBIT_PROC_CONSUMER", "bybit-proc-1")
 AUDIT_STREAM = "positions_bybit_audit"
+
+# 🔸 Параметры ожидания entry в live
+ENTRY_POLL_INTERVAL_SEC = 1.0
+ENTRY_POLL_TIMEOUT_SEC = 10.0
 
 # 🔸 Параллелизм и замки
 MAX_PARALLEL_TASKS = int(os.getenv("BYBIT_PROC_MAX_TASKS", "200"))
@@ -239,17 +245,64 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     )
                     return
 
-                # live-режим (позже добавим реальную отправку/вочер критериев)
+                # live-режим: preflight + market IOC + короткий watcher (без TP/SL)
                 await _preflight_symbol_settings(symbol=symbol, leverage=leverage)
 
-                # TODO: LIVE create-order + watcher условий 95%/5s и 75%/60s — реализуем на следующем шаге
+                # создать market IOC
+                link_e = _suffix_link(order_link_id, "e")
+                create_resp = await _create_market_order(symbol, side, qty, link_e)
+                log.info("🟢 LIVE entry create sent: link=%s resp=%s", link_e, (create_resp or {}).get("retMsg"))
 
-                # ACK даже в live-прототипе, пока без реальной отправки
+                # короткий опрос состояния (до 10с)
+                filled_qty = Decimal("0")
+                avg_price  = None
+                t0 = time.time()
+                while time.time() - t0 < ENTRY_POLL_TIMEOUT_SEC:
+                    await asyncio.sleep(ENTRY_POLL_INTERVAL_SEC)
+                    state = await _get_order_realtime_by_link(link_e)
+                    lst = (state.get("result") or {}).get("list") or []
+                    head = lst[0] if lst else {}
+                    fq  = _as_decimal(head.get("cumExecQty")) or Decimal("0")
+                    ap  = _as_decimal(head.get("avgPrice"))
+                    filled_qty = fq
+                    avg_price  = ap
+                    # если есть хоть что-то — выходим (минимальный watcher)
+                    if filled_qty > 0:
+                        break
+
+                # зафиксировать факт (что есть) и НЕ строить TP/SL
+                if filled_qty > 0 and avg_price:
+                    await _update_entry_filled_and_commit(
+                        position_uid=position_uid,
+                        order_link_id=link_e,
+                        filled_qty=filled_qty,
+                        avg_price=avg_price,
+                        commit_criterion="live_minimal",
+                        late_tail_delta=None,
+                    )
+                    await _touch_journals_after_entry(
+                        source_stream_id=source_stream_id,
+                        note=f"entry live filled (minimal) qty={filled_qty} @ {avg_price}",
+                        processing_status="processing",
+                    )
+                    log.info("✅ LIVE entry filled (minimal): %s qty=%s @ %s", link_e, filled_qty, avg_price)
+                else:
+                    # ничего не успело исполниться за окно — считаем 'sent'
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'sent', updated_at = now(),
+                                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'live entry sent (no fill yet)'
+                            WHERE position_uid = $1 AND order_link_id = $2 AND kind = 'entry'
+                            """,
+                            position_uid, link_e,
+                        )
+                    log.info("🟡 LIVE entry sent (no fill yet): %s", link_e)
+
+                # ACK — TP/SL НЕ строим
                 await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
-                log.info(
-                    "🟡 LIVE preflight done (sid=%s %s %s qty=%s) [id=%s] — отправка/ожидание fill будет добавлено",
-                    sid, symbol, direction, qty, entry_id
-                )
+                return
 
             except Exception:
                 log.exception("❌ Ошибка обработки задачи bybit_processor (sid=%s %s id=%s)", sid, symbol, entry_id)
@@ -866,6 +919,53 @@ async def _fetch_ticker_rules(symbol: str) -> dict:
 
     return {"step_qty": step_qty, "min_qty": min_qty, "step_price": step_price}
 
+# 🔸 Подпись приватных запросов Bybit v5
+def _rest_sign(timestamp_ms: int, query_or_body: str) -> str:
+    payload = f"{timestamp_ms}{API_KEY}{RECV_WINDOW}{query_or_body}"
+    return hmac.new(API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _private_headers(ts_ms: int, signed: str) -> dict:
+    return {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": str(ts_ms),
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN": signed,
+        "Content-Type": "application/json",
+    }
+
+# 🔸 Создание market IOC ордера (reduceOnly=false)
+async def _create_market_order(symbol: str, side: str, qty: Decimal, order_link_id: str) -> dict:
+    url = f"{BASE_URL}/v5/order/create"
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side,                       # Buy | Sell
+        "orderType": "Market",
+        "qty": str(qty),
+        "timeInForce": "IOC",
+        "reduceOnly": False,
+        "orderLinkId": order_link_id,
+    }
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    sign = _rest_sign(ts, body_json)
+    headers = _private_headers(ts, sign)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+
+# 🔸 Получить актуальное состояние ордера по orderLinkId
+async def _get_order_realtime_by_link(order_link_id: str) -> dict:
+    query = f"category=linear&orderLinkId={order_link_id}"
+    url = f"{BASE_URL}/v5/order/realtime?{query}"
+    ts = int(time.time() * 1000)
+    sign = _rest_sign(ts, query)
+    headers = _private_headers(ts, sign)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
 # 🔸 Квантование вниз к шагу
 def _quant_down(value: Decimal, step: Decimal) -> Optional[Decimal]:

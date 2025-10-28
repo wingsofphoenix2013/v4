@@ -1,4 +1,4 @@
-# bybit_sync.py — приватный WS-синк Bybit (read-only) с авто-reconnect + REST-ресинк; тише логируем ping/pong
+# bybit_sync.py — приватный WS-синк Bybit (read-only) с авто-reconnect + REST-ресинк; публикация order/execution в Redis Streams
 
 # 🔸 Импорты
 import os
@@ -10,6 +10,8 @@ import asyncio
 import logging
 import websockets
 import httpx
+
+from trader_infra import infra
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_SYNC")
@@ -25,6 +27,11 @@ CATEGORY = "linear"                                           # деривати
 
 PING_INTERVAL_SEC = 20.0      # отправляем ping, если нет сообщений дольше этого интервала
 RECONNECT_DELAY_SEC = 3.0     # пауза между переподключениями
+
+# 🔸 Целевые Redis Streams для нормализованных событий Bybit (приватный канал)
+ORDER_STREAM = "bybit_order_stream"
+EXECUTION_STREAM = "bybit_execution_stream"
+POSITION_STREAM = "bybit_position_stream"  # опционально: публикуем сводки позиций
 
 
 # 🔸 Основной цикл воркера приватного WS (держим канал + подписки)
@@ -44,25 +51,25 @@ async def run_bybit_private_ws_sync_loop():
                 signature = hmac.new(API_SECRET.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
                 await ws.send(json.dumps({"op": "auth", "args": [API_KEY, expires, signature]}))
                 auth_resp_raw = await ws.recv()
-                _handle_ws_message(auth_resp_raw)
+                await _handle_ws_message(auth_resp_raw)
 
                 # подписки: wallet + position + order + execution
                 await ws.send(json.dumps({"op": "subscribe", "args": ["wallet", "position", "order", "execution"]}))
                 sub_resp_raw = await ws.recv()
-                _handle_ws_message(sub_resp_raw)
+                await _handle_ws_message(sub_resp_raw)
 
                 # цикл чтения с таймаутом (для пингов)
                 while True:
                     try:
                         msg_raw = await asyncio.wait_for(ws.recv(), timeout=PING_INTERVAL_SEC)
-                        _handle_ws_message(msg_raw)
+                        await _handle_ws_message(msg_raw)
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"op": "ping"}))
                         # пинг-понги уводим в DEBUG, чтобы не мусорили INFO
                         log.debug("BYBIT_SYNC → ping")
                         try:
                             pong_raw = await asyncio.wait_for(ws.recv(), timeout=5)
-                            _handle_ws_message(pong_raw)
+                            await _handle_ws_message(pong_raw)
                         except asyncio.TimeoutError:
                             log.info("BYBIT_SYNC: нет pong — переподключение")
                             raise ConnectionError("pong timeout")
@@ -72,8 +79,8 @@ async def run_bybit_private_ws_sync_loop():
             await asyncio.sleep(RECONNECT_DELAY_SEC)
 
 
-# 🔸 Обработка входящих WS-сообщений (логирование с приглушением ping/pong)
-def _handle_ws_message(msg_raw: str):
+# 🔸 Обработка входящих WS-сообщений (логирование + публикация нормализованных событий в Redis Streams)
+async def _handle_ws_message(msg_raw: str):
     try:
         msg = json.loads(msg_raw)
     except Exception:
@@ -101,28 +108,98 @@ def _handle_ws_message(msg_raw: str):
     data = msg.get("data")
     ts = msg.get("ts")
 
+    # нормализуем data в список
+    items = data if isinstance(data, list) else (data if data is not None else [])
+    items = items if isinstance(items, list) else [items]
+
+    # wallet — просто сводка в логах (как было)
     if topic == "wallet":
-        items = data if isinstance(data, list) else []
         head = items[0] if items else {}
         log.info("BYBIT_SYNC wallet: items=%d head=%s ts=%s", len(items), head, ts)
         return
 
+    # position — сводка + публикация в POSITION_STREAM (по одному payload на запись)
     if topic == "position":
-        items = data if isinstance(data, list) else []
+        published = 0
+        for it in items:
+            payload = {
+                "event": "position",
+                "category": it.get("category"),
+                "symbol": it.get("symbol"),
+                "side": it.get("side"),                # Buy | Sell
+                "size": it.get("size"),
+                "avgPrice": it.get("avgPrice"),
+                "positionValue": it.get("positionValue"),
+                "positionStatus": it.get("positionStatus"),
+                "positionIdx": it.get("positionIdx"),
+                "ts": ts,
+            }
+            try:
+                await infra.redis_client.xadd(POSITION_STREAM, {"data": json.dumps(payload)})
+                published += 1
+            except Exception:
+                log.exception("BYBIT_SYNC: publish position failed: %s", payload)
         head = items[0] if items else {}
-        log.info("BYBIT_SYNC position: items=%d head=%s ts=%s", len(items), head, ts)
+        log.info("BYBIT_SYNC position: items=%d pub=%d head=%s ts=%s", len(items), published, head, ts)
         return
 
+    # order — публикация нормализованных статусов ордеров в ORDER_STREAM
     if topic == "order":
-        items = data if isinstance(data, list) else []
+        published = 0
+        for it in items:
+            payload = {
+                "event": "order",
+                "category": it.get("category"),
+                "symbol": it.get("symbol"),
+                "orderId": it.get("orderId"),
+                "orderLinkId": it.get("orderLinkId"),
+                "side": it.get("side"),                    # Buy|Sell
+                "orderType": it.get("orderType"),          # Market|Limit|...
+                "timeInForce": it.get("timeInForce"),
+                "orderStatus": it.get("orderStatus"),      # New|PartiallyFilled|Filled|Cancelled|Rejected|...
+                "reduceOnly": it.get("reduceOnly"),
+                "qty": it.get("qty"),
+                "cumExecQty": it.get("cumExecQty"),
+                "leavesQty": it.get("leavesQty"),
+                "avgPrice": it.get("avgPrice"),
+                "price": it.get("price"),
+                "ts": ts,
+            }
+            try:
+                await infra.redis_client.xadd(ORDER_STREAM, {"data": json.dumps(payload)})
+                published += 1
+            except Exception:
+                log.exception("BYBIT_SYNC: publish order failed: %s", payload)
         head = items[0] if items else {}
-        log.info("BYBIT_SYNC order: items=%d head=%s ts=%s", len(items), head, ts)
+        log.info("BYBIT_SYNC order: items=%d pub=%d head=%s ts=%s", len(items), published, head, ts)
         return
 
+    # execution — публикация трейдов/исполнений в EXECUTION_STREAM
     if topic == "execution":
-        items = data if isinstance(data, list) else []
+        published = 0
+        for it in items:
+            payload = {
+                "event": "execution",
+                "category": it.get("category"),
+                "symbol": it.get("symbol"),
+                "orderId": it.get("orderId"),
+                "orderLinkId": it.get("orderLinkId"),
+                "execId": it.get("execId"),
+                "execType": it.get("execType"),           # Trade|AdlTrade|Funding|...
+                "isMaker": it.get("isMaker"),
+                "execQty": it.get("execQty"),
+                "execPrice": it.get("execPrice"),
+                "execValue": it.get("execValue"),
+                "tradeTime": it.get("tradeTime"),         # ms
+                "ts": ts,
+            }
+            try:
+                await infra.redis_client.xadd(EXECUTION_STREAM, {"data": json.dumps(payload)})
+                published += 1
+            except Exception:
+                log.exception("BYBIT_SYNC: publish execution failed: %s", payload)
         head = items[0] if items else {}
-        log.info("BYBIT_SYNC execution: items=%d head=%s ts=%s", len(items), head, ts)
+        log.info("BYBIT_SYNC execution: items=%d pub=%d head=%s ts=%s", len(items), published, head, ts)
         return
 
     # прочее
