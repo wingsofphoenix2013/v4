@@ -1,4 +1,5 @@
-# bybit_processor.py — воркер исполнения: читает positions_bybit_orders (только новые), dry_run: entry по last price (100% fill), строит карту TP/SL и пишет в БД
+# bybit_processor.py — воркер исполнения: читает positions_bybit_orders (только новые),
+# dry_run: entry по last price (100% fill), строит карту TP/SL (percent-only) и пишет в БД
 
 # 🔸 Импорты
 import os
@@ -114,7 +115,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             order_link_id = payload.get("order_link_id")
             position_uid = payload.get("position_uid")
             sid = int(payload.get("strategy_id"))
-            strategy_type = payload.get("strategy_type")  # plain|reverse
+            strategy_type = (payload.get("strategy_type") or "").lower()  # plain|reverse
             symbol = payload.get("symbol")
             direction = payload.get("direction")  # long|short
             side = payload.get("side")            # Buy|Sell
@@ -355,9 +356,9 @@ async def _build_tp_sl_cards_after_entry(
     *,
     position_uid: str,
     strategy_id: int,
-    strategy_type: str,
+    strategy_type: str,  # 'plain' | 'reverse'
     symbol: str,
-    direction: str,
+    direction: str,      # 'long' | 'short'
     filled_qty: Decimal,
     entry_price: Decimal,
     order_mode: str,
@@ -377,6 +378,9 @@ async def _build_tp_sl_cards_after_entry(
 
     # общий доступный объём в кратных шага количества
     q_total = _quant_down(filled_qty, step_qty) or Decimal("0")
+    if q_total <= 0:
+        log.info("ℹ️ q_total=0 — TP/SL карта не строится (uid=%s)", position_uid)
+        return
 
     # подготовить массив ценовых TP (percent) в исходном порядке
     percent_levels: List[dict] = []
@@ -388,19 +392,20 @@ async def _build_tp_sl_cards_after_entry(
             continue
         percent_levels.append(lvl)
 
-    # распределение объёмов: первые n-1 по процентам (квант вниз), последний — остаток
-    tp_qtys, last_idx = _allocate_tp_quantities(q_total, step_qty, percent_levels)
+    # распределение TP: для plain — остаток в последний ценовой TP; для reverse — остаток в tp_signal
+    assign_residual_to = "last_price_tp" if strategy_type == "plain" else "tp_signal"
+    tp_qtys = _allocate_tp_quantities(q_total, step_qty, percent_levels, assign_residual_to)
 
     placed_tp = 0
     cum_qty = Decimal("0")
     level_num = 0
 
+    # цикл по ценовым TP
     for i, lvl in enumerate(percent_levels):
         level_num += 1
         q_plan = tp_qtys[i] if i < len(tp_qtys) else Decimal("0")
         if q_plan <= 0:
-            # запишем «нулевой» уровень только если нужно для карты — но по договорённости qty всегда осмыслен → пропускаем
-            continue
+            continue  # не создаём «нулевые» уровни
 
         # цена уровня
         p_pct = _as_decimal(lvl.get("tp_value")) or Decimal("0")
@@ -410,7 +415,7 @@ async def _build_tp_sl_cards_after_entry(
         # orderLinkId для TP
         link = _suffix_link(base_link, f"t{level_num}")
 
-        # запись в БД (как «поставленный» локально; на live — здесь же будет реальная отправка)
+        # запись TP (side противоположная направлению позиции, reduce_only=true)
         await _insert_tp_card(
             position_uid=position_uid,
             strategy_id=strategy_id,
@@ -443,29 +448,30 @@ async def _build_tp_sl_cards_after_entry(
 
             # объём SL после срабатывания TP-k — остаток после кумулятивных TP
             qty_sl_after_k = _quant_down(q_total - cum_qty, step_qty) or Decimal("0")
+            if qty_sl_after_k > 0:
+                await _insert_sl_card(
+                    position_uid=position_uid,
+                    strategy_id=strategy_id,
+                    strategy_type=strategy_type,
+                    symbol=symbol,
+                    direction=direction,
+                    order_mode=order_mode,
+                    source_stream_id=source_stream_id,
+                    kind="sl",
+                    level=level_num,
+                    activation="on_tp",
+                    activation_tp_level=level_num,
+                    qty=qty_sl_after_k,
+                    price=sl_price if sl_price and sl_price > 0 else None,
+                    order_link_id=_suffix_link(base_link, f"sl{level_num}"),
+                    is_active=True,  # релевантен
+                    status="planned_offchain",
+                    note="sl replacement planned (on TP)",
+                )
 
-            await _insert_sl_card(
-                position_uid=position_uid,
-                strategy_id=strategy_id,
-                strategy_type=strategy_type,
-                symbol=symbol,
-                direction=direction,
-                order_mode=order_mode,
-                source_stream_id=source_stream_id,
-                kind="sl",
-                level=level_num,
-                activation="on_tp",
-                activation_tp_level=level_num,
-                qty=qty_sl_after_k,
-                price=sl_price if sl_price and sl_price > 0 else None,
-                order_link_id=_suffix_link(base_link, f"sl{level_num}"),
-                is_active=True,  # релевантен
-                status="planned_offchain",
-                note="sl replacement planned (on TP)",
-            )
-
-    # стартовый SL (если включён): на всю позицию
-    if initial_sl and (initial_sl.get("mode") or "").lower() == "percent":
+    # стартовый SL (всегда на весь q_total)
+    slp_ok = initial_sl and (initial_sl.get("mode") or "").lower() == "percent"
+    if slp_ok:
         slp = _as_decimal(initial_sl.get("value")) or Decimal("0")
         if slp > 0 and q_total > 0:
             sl_price0 = _price_percent(entry=entry_price, pct=slp, direction=direction, is_tp=False)
@@ -491,27 +497,26 @@ async def _build_tp_sl_cards_after_entry(
             )
 
     # reverse: TP signal (виртуальный) + sl_protect_entry (виртуальный)
-    if (strategy_type or "").lower() == "reverse":
+    if strategy_type == "reverse":
         # последний числовой TP-уровень (если есть)
         max_level = len(percent_levels)
 
-        # остаток после всей лестницы TP (может быть 0)
+        # остаток после всей лестницы TP (идёт в tp_signal)
         qty_after_all_tp = _quant_down(q_total - (sum(tp_qtys) if tp_qtys else Decimal("0")), step_qty) or Decimal("0")
-
-        # TP signal — привязан к последнему ценовому TP, qty = остаток после всей лестницы
-        await _insert_virtual_tp_signal(
-            position_uid=position_uid,
-            strategy_id=strategy_id,
-            strategy_type=strategy_type,
-            symbol=symbol,
-            direction=direction,
-            order_mode=order_mode,
-            source_stream_id=source_stream_id,
-            order_link_id=_suffix_link(base_link, "tsig"),
-            activation_tp_level=max_level if max_level > 0 else None,
-            qty=qty_after_all_tp,
-            note="tp_signal (virtual, on_tp)",
-        )
+        if qty_after_all_tp > 0 and max_level > 0:
+            await _insert_virtual_tp_signal(
+                position_uid=position_uid,
+                strategy_id=strategy_id,
+                strategy_type=strategy_type,
+                symbol=symbol,
+                direction=direction,
+                order_mode=order_mode,
+                source_stream_id=source_stream_id,
+                order_link_id=_suffix_link(base_link, "tsig"),
+                activation_tp_level=max_level,
+                qty=qty_after_all_tp,
+                note="tp_signal (virtual, on_tp)",
+            )
 
         # карточка sl_protect_entry (ранний перенос SL на entry ДО TP) — qty = вся позиция
         await _insert_sl_protect_entry(
@@ -530,31 +535,44 @@ async def _build_tp_sl_cards_after_entry(
     log.info("🧩 TP/SL карта создана: sid=%s %s placed_tp=%s", strategy_id, symbol, placed_tp)
 
 
-# 🔸 Распределение количества по TP: первые n-1 по процентам (вниз к шагу), последний — остаток
-def _allocate_tp_quantities(q_total: Decimal, step_qty: Decimal, percent_levels: List[dict]) -> Tuple[List[Decimal], int]:
+# 🔸 Распределение количества по TP
+# режим:
+#   assign_residual_to='last_price_tp'  → для plain: первые n−1 по процентам, n-й = остаток
+#   assign_residual_to='tp_signal'      → для reverse: все n по процентам, остаток уходит в tp_signal
+def _allocate_tp_quantities(
+    q_total: Decimal,
+    step_qty: Decimal,
+    percent_levels: List[dict],
+    assign_residual_to: str,
+) -> List[Decimal]:
     # условия достаточности
     if q_total is None or q_total <= 0 or step_qty is None or step_qty <= 0:
-        return [], 0
+        return []
     n = len(percent_levels)
     if n == 0:
-        return [], 0
+        return []
 
     qtys: List[Decimal] = []
     sum_prev = Decimal("0")
 
-    # первые n-1 по процентам
-    for i in range(n - 1):
-        vol_pct = _as_decimal(percent_levels[i].get("volume_percent")) or Decimal("0")
-        q_i = _quant_down(q_total * (vol_pct / Decimal("100")), step_qty) or Decimal("0")
-        qtys.append(q_i)
-        sum_prev += q_i
+    if assign_residual_to == "last_price_tp":
+        # первые n−1 по процентам
+        for i in range(n - 1):
+            vol_pct = _as_decimal(percent_levels[i].get("volume_percent")) or Decimal("0")
+            q_i = _quant_down(q_total * (vol_pct / Decimal("100")), step_qty) or Decimal("0")
+            qtys.append(q_i)
+            sum_prev += q_i
+        # последний — остаток
+        q_last = _quant_down(q_total - sum_prev, step_qty) or Decimal("0")
+        qtys.append(q_last)
+    else:
+        # все n по процентам; остаток пойдёт в tp_signal (считается снаружи)
+        for i in range(n):
+            vol_pct = _as_decimal(percent_levels[i].get("volume_percent")) or Decimal("0")
+            q_i = _quant_down(q_total * (vol_pct / Decimal("100")), step_qty) or Decimal("0")
+            qtys.append(q_i)
 
-    # последний — остаток
-    q_last = q_total - sum_prev
-    q_last = _quant_down(q_last, step_qty) or Decimal("0")
-    qtys.append(q_last)
-
-    return qtys, n  # n — индекс/номер последнего уровня (человеческий счёт)
+    return qtys
 
 
 # 🔸 Запись TP карточки
@@ -619,7 +637,7 @@ async def _insert_sl_card(
     level: int,
     activation: str,
     activation_tp_level: Optional[int],
-    qty: Optional[Decimal],
+    qty: Decimal,
     price: Optional[Decimal],
     order_link_id: str,
     is_active: bool,
@@ -648,7 +666,7 @@ async def _insert_sl_card(
             position_uid, strategy_id, strategy_type, symbol, direction, order_mode,
             source_stream_id,
             kind, level, activation, activation_tp_level, is_active,
-            str(qty or Decimal("0")), str(price) if price is not None else None,
+            str(qty), str(price) if price is not None else None,
             order_link_id, status, note,
         )
         log.info("📝 SL planned: uid=%s sid=%s %s mode=%s L#%s qty=%s price=%s",
