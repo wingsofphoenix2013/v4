@@ -672,7 +672,6 @@ async def _insert_sl_card(
         log.info("📝 SL planned: uid=%s sid=%s %s mode=%s L#%s qty=%s price=%s",
                  position_uid, strategy_id, symbol, activation, level, qty, price)
 
-
 # 🔸 Виртуальный TP signal (никогда не уходит на биржу)
 async def _insert_virtual_tp_signal(
     *,
@@ -700,7 +699,7 @@ async def _insert_virtual_tp_signal(
             )
             VALUES (
                 $1, $2, $3, $4, $5,
-                CASE WHEN $5='long' THEN 'Buy' ELSE 'Sell' END, $6,
+                CASE WHEN $5='long' THEN 'Sell' ELSE 'Buy' END, $6,
                 $7,
                 'tp_signal', NULL, 'on_tp', $8, true,
                 true, NULL, $9, NULL,
@@ -715,7 +714,6 @@ async def _insert_virtual_tp_signal(
         )
         log.info("📝 TP signal (virtual): uid=%s sid=%s %s qty=%s level=%s",
                  position_uid, strategy_id, symbol, qty, activation_tp_level)
-
 
 # 🔸 Виртуальная карточка sl_protect_entry (ранний перенос SL на entry до TP)
 async def _insert_sl_protect_entry(
@@ -746,7 +744,7 @@ async def _insert_sl_protect_entry(
                 CASE WHEN $5='long' THEN 'Sell' ELSE 'Buy' END, $6,
                 $7,
                 'sl_protect_entry', NULL, 'on_protect', NULL, true,
-                true, NULL, $8, NULL,
+                true, 'GTC', $8, NULL,
                 $9, 'planned_offchain', $10, now(), now()
             )
             ON CONFLICT (order_link_id) DO NOTHING
@@ -758,7 +756,6 @@ async def _insert_sl_protect_entry(
         )
         log.info("📝 SL protect-entry (virtual): uid=%s sid=%s %s qty=%s",
                  position_uid, strategy_id, symbol, qty)
-
 
 # 🔸 Обновления журналов (косметика)
 async def _touch_journals_after_entry(*, source_stream_id: str, note: str, processing_status: str):
