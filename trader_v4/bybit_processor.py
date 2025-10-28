@@ -30,6 +30,10 @@ AUDIT_STREAM = "positions_bybit_audit"
 ENTRY_POLL_INTERVAL_SEC = 1.0
 ENTRY_POLL_TIMEOUT_SEC = 10.0
 
+# 🔸 TIF для live-ордеров
+TP_TIF = "GTC"
+SL_TIF = "GTC"
+
 # 🔸 Параллелизм и замки
 MAX_PARALLEL_TASKS = int(os.getenv("BYBIT_PROC_MAX_TASKS", "200"))
 LOCK_TTL_SEC = int(os.getenv("BYBIT_PROC_LOCK_TTL", "30"))
@@ -96,7 +100,6 @@ async def run_bybit_processor():
             log.exception("❌ Ошибка чтения/обработки из стрима %s", ORDERS_STREAM)
             await asyncio.sleep(1)
 
-
 # 🔸 Обработка одной записи из positions_bybit_orders
 async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dict[str, Any]):
     async with sem:
@@ -118,22 +121,22 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
 
         # ключевые поля
         try:
-            order_link_id = payload.get("order_link_id")
-            position_uid = payload.get("position_uid")
-            sid = int(payload.get("strategy_id"))
-            strategy_type = (payload.get("strategy_type") or "").lower()  # plain|reverse
-            symbol = payload.get("symbol")
-            direction = payload.get("direction")  # long|short
-            side = payload.get("side")            # Buy|Sell
-            leverage = _as_decimal(payload.get("leverage")) or Decimal("0")
-            qty = _as_decimal(payload.get("qty")) or Decimal("0")
-            size_mode = payload.get("size_mode")  # 'pct_of_virtual'
-            size_pct = _as_decimal(payload.get("size_pct")) or Decimal("0")
-            margin_plan = _as_decimal(payload.get("margin_plan")) or Decimal("0")
-            order_mode = payload.get("order_mode", TRADER_ORDER_MODE)
-            source_stream_id = payload.get("source_stream_id")
-            ts = payload.get("ts")
-            ts_ms = payload.get("ts_ms")
+            order_link_id   = payload.get("order_link_id")
+            position_uid    = payload.get("position_uid")
+            sid             = int(payload.get("strategy_id"))
+            strategy_type   = (payload.get("strategy_type") or "").lower()  # plain|reverse
+            symbol          = payload.get("symbol")
+            direction       = payload.get("direction")  # long|short
+            side            = payload.get("side")       # Buy|Sell
+            leverage        = _as_decimal(payload.get("leverage")) or Decimal("0")
+            qty             = _as_decimal(payload.get("qty")) or Decimal("0")
+            size_mode       = payload.get("size_mode")  # 'pct_of_virtual'
+            size_pct        = _as_decimal(payload.get("size_pct")) or Decimal("0")
+            margin_plan     = _as_decimal(payload.get("margin_plan")) or Decimal("0")
+            order_mode      = payload.get("order_mode", TRADER_ORDER_MODE)
+            source_stream_id= payload.get("source_stream_id")
+            ts              = payload.get("ts")
+            ts_ms           = payload.get("ts_ms")
         except Exception:
             log.exception("❌ Ошибка парсинга полей payload (id=%s) — ACK", entry_id)
             try:
@@ -177,8 +180,11 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     leverage=leverage,
                 )
 
-                # dry_run: запрашиваем last price и считаем полное исполнение
+                # ─────────────────────────────────────────────────────────────
+                # DRY-RUN ВЕТКА
+                # ─────────────────────────────────────────────────────────────
                 if order_mode == "dry_run":
+                    # last price → 100% fill (бумажный)
                     last_price = await _get_last_price_linear(symbol)
                     if last_price is None or last_price <= 0:
                         last_price = await _get_price_from_redis(symbol)
@@ -186,9 +192,9 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         last_price = Decimal("1")
 
                     filled_qty = qty
-                    avg_price = last_price
+                    avg_price  = last_price
 
-                    # апдейт карточки entry фактами fill + commit
+                    # зафиксировать fill + commit
                     await _update_entry_filled_and_commit(
                         position_uid=position_uid,
                         order_link_id=_suffix_link(order_link_id, "e"),
@@ -198,7 +204,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         late_tail_delta=None,
                     )
 
-                    # аудит: entry_filled (dry_run)
+                    # аудит
                     await _publish_audit(
                         event="entry_filled",
                         data={
@@ -216,7 +222,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         },
                     )
 
-                    # сформировать и записать карту TP/SL (percent-only, без ATR)
+                    # построить карту TP/SL (в БД) — percent-only
                     await _build_tp_sl_cards_after_entry(
                         position_uid=position_uid,
                         strategy_id=sid,
@@ -230,14 +236,14 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         base_link=order_link_id,
                     )
 
-                    # обновить журналы
+                    # журналы
                     await _touch_journals_after_entry(
                         source_stream_id=source_stream_id,
                         note=f"entry dry-run filled @ {avg_price}",
                         processing_status="processing",
                     )
 
-                    # ACK записи очереди
+                    # ACK и выход
                     await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
                     log.info(
                         "✅ ENTRY dry-run filled & TP/SL planned (sid=%s %s %s qty=%s @ %s) [id=%s]",
@@ -245,7 +251,9 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     )
                     return
 
-                # live-режим: preflight + market IOC + короткий watcher (без TP/SL)
+                # ─────────────────────────────────────────────────────────────
+                # LIVE ВЕТКА: preflight → market IOC → короткий watcher → commit
+                # ─────────────────────────────────────────────────────────────
                 await _preflight_symbol_settings(symbol=symbol, leverage=leverage)
 
                 # создать market IOC
@@ -270,8 +278,8 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     if filled_qty > 0:
                         break
 
-                # зафиксировать факт (что есть) и НЕ строить TP/SL
                 if filled_qty > 0 and avg_price:
+                    # зафиксировать commit входа
                     await _update_entry_filled_and_commit(
                         position_uid=position_uid,
                         order_link_id=link_e,
@@ -284,8 +292,27 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         source_stream_id=source_stream_id,
                         note=f"entry live filled (minimal) qty={filled_qty} @ {avg_price}",
                         processing_status="processing",
+                        ext_status="open",
                     )
                     log.info("✅ LIVE entry filled (minimal): %s qty=%s @ %s", link_e, filled_qty, avg_price)
+
+                    # построить карту TP/SL в БД (как в dry-run, но с order_mode='live')
+                    await _build_tp_sl_cards_after_entry(
+                        position_uid=position_uid,
+                        strategy_id=sid,
+                        strategy_type=strategy_type,
+                        symbol=symbol,
+                        direction=direction,
+                        filled_qty=filled_qty,
+                        entry_price=avg_price,
+                        order_mode="live",
+                        source_stream_id=source_stream_id,
+                        base_link=order_link_id,
+                    )
+
+                    # выставить «немедленные» TP/SL на биржу по карточкам (tp price + sl level=0)
+                    await _place_immediate_orders_for_position(position_uid, symbol, direction)
+
                 else:
                     # ничего не успело исполниться за окно — считаем 'sent'
                     async with infra.pg_pool.acquire() as conn:
@@ -300,7 +327,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         )
                     log.info("🟡 LIVE entry sent (no fill yet): %s", link_e)
 
-                # ACK — TP/SL НЕ строим
+                # ACK — завершаем обработку записи (в live TP/SL уже поставлены/или пока нет fill)
                 await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
                 return
 
@@ -309,7 +336,6 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 # не ACK — вернёмся ретраем
             finally:
                 await _release_dist_lock(gate_key, owner)
-
 
 # 🔸 Вставка карточки entry в trader_position_orders
 async def _insert_entry_order_card(
@@ -811,19 +837,38 @@ async def _insert_sl_protect_entry(
                  position_uid, strategy_id, symbol, qty)
 
 # 🔸 Обновления журналов (косметика)
-async def _touch_journals_after_entry(*, source_stream_id: str, note: str, processing_status: str):
+async def _touch_journals_after_entry(
+    *,
+    source_stream_id: str,
+    note: str,
+    processing_status: str,
+    ext_status: Optional[str] = None,
+):
     async with infra.pg_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE trader_positions_log
-            SET status = 'processing',
-                updated_at = now(),
-                note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || $2
-            WHERE source_stream_id = $1
-            """,
-            source_stream_id,
-            note,
-        )
+        if ext_status:
+            await conn.execute(
+                """
+                UPDATE trader_positions_log
+                SET status = 'processing',
+                    ext_status = $2,
+                    updated_at = now(),
+                    note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || $3
+                WHERE source_stream_id = $1
+                """,
+                source_stream_id, ext_status, note,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE trader_positions_log
+                SET status = 'processing',
+                    updated_at = now(),
+                    note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || $2
+                WHERE source_stream_id = $1
+                """,
+                source_stream_id, note,
+            )
+
         await conn.execute(
             """
             UPDATE trader_signals
@@ -836,8 +881,10 @@ async def _touch_journals_after_entry(*, source_stream_id: str, note: str, proce
             processing_status,
             note,
         )
-        log.info("🧾 journals updated: stream_id=%s → %s", source_stream_id, processing_status)
-
+        log.info("🧾 journals updated: stream_id=%s → %s%s",
+                 source_stream_id,
+                 processing_status,
+                 f", ext_status={ext_status}" if ext_status else "")
 
 # 🔸 Pre-flight для символа (live): плечо/режимы — с кэшированием, чтобы не дёргать лишний раз
 async def _preflight_symbol_settings(*, symbol: str, leverage: Decimal):
@@ -935,26 +982,23 @@ def _private_headers(ts_ms: int, signed: str) -> dict:
 
 # 🔸 Создание market IOC ордера (reduceOnly=false)
 async def _create_market_order(symbol: str, side: str, qty: Decimal, order_link_id: str) -> dict:
-    # квантуем qty к шагу символа
+    # квантование и проверка min_qty
     rules = await _fetch_ticker_rules(symbol)
-    step_qty = rules["step_qty"]
-    q = _quant_down(qty, step_qty) or Decimal("0")
-    if q <= 0:
-        raise ValueError(f"qty too small after quantization: {qty}")
+    q = _quant_down(qty, rules["step_qty"]) or Decimal("0")
+    if q <= 0 or q < (rules["min_qty"] or Decimal("0")):
+        raise ValueError(f"qty below min_qty after quantization: q={q}, min={rules['min_qty']}")
 
-    qty_str = _to_fixed_str(q)  # ← без экспоненты
-
-    url = f"{BASE_URL}/v5/order/create"
     body = {
         "category": "linear",
         "symbol": symbol,
         "side": side,                       # Buy | Sell
         "orderType": "Market",
-        "qty": qty_str,                     # ← фиксированный вид
+        "qty": _to_fixed_str(q),            # фиксированный вид
         "timeInForce": "IOC",
         "reduceOnly": False,
         "orderLinkId": order_link_id,
     }
+    url = f"{BASE_URL}/v5/order/create"
     ts = int(time.time() * 1000)
     body_json = json.dumps(body, separators=(",", ":"))
     sign = _rest_sign(ts, body_json)
@@ -964,6 +1008,215 @@ async def _create_market_order(symbol: str, side: str, qty: Decimal, order_link_
         r.raise_for_status()
         return r.json()
 
+# 🔸 Создание LIMIT reduceOnly GTC (TP)
+async def _create_limit_ro_order(symbol: str, side: str, qty: Decimal, price: Decimal, order_link_id: str) -> dict:
+    rules = await _fetch_ticker_rules(symbol)
+    q = _quant_down(qty, rules["step_qty"]) or Decimal("0")
+    p = _quant_down(price, rules["step_price"]) or Decimal("0")
+    if q <= 0 or q < (rules["min_qty"] or Decimal("0")) or p <= 0:
+        raise ValueError(f"invalid TP qty/price: q={q} (min={rules['min_qty']}), p={p}")
+
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side,                           # закрывающая сторона
+        "orderType": "Limit",
+        "qty": _to_fixed_str(q),
+        "price": _to_fixed_str(p),
+        "timeInForce": TP_TIF,                  # GTC
+        "reduceOnly": True,
+        "orderLinkId": order_link_id,
+    }
+    url = f"{BASE_URL}/v5/order/create"
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    sign = _rest_sign(ts, body_json)
+    headers = _private_headers(ts, sign)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+
+# 🔸 Создание STOP-MARKET reduceOnly GTC (SL)
+async def _create_stop_ro_order(symbol: str, side: str, qty: Decimal, trigger_price: Decimal, order_link_id: str) -> dict:
+    rules = await _fetch_ticker_rules(symbol)
+    q  = _quant_down(qty, rules["step_qty"]) or Decimal("0")
+    tr = _quant_down(trigger_price, rules["step_price"]) or Decimal("0")
+    if q <= 0 or q < (rules["min_qty"] or Decimal("0")) or tr <= 0:
+        raise ValueError(f"invalid SL qty/trigger: q={q} (min={rules['min_qty']}), trigger={tr}")
+
+    # Bybit v5: стоп-маркет через order/create с triggerPrice + stopOrderType/triggerBy
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side,                               # закрывающая сторона
+        "orderType": "Market",
+        "qty": _to_fixed_str(q),
+        "timeInForce": SL_TIF,                      # GTC
+        "reduceOnly": True,
+        "triggerPrice": _to_fixed_str(tr),
+        "stopOrderType": "Stop",
+        "triggerBy": "LastPrice",
+        "orderLinkId": order_link_id,
+    }
+    url = f"{BASE_URL}/v5/order/create"
+    ts = int(time.time() * 1000)
+    body_json = json.dumps(body, separators=(",", ":"))
+    sign = _rest_sign(ts, body_json)
+    headers = _private_headers(ts, sign)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, content=body_json)
+        r.raise_for_status()
+        return r.json()
+
+# 🔸 Постановка live-ордеров по «немедленным» карточкам (tp/sl level=0) из БД
+async def _place_immediate_orders_for_position(position_uid: str, symbol: str, direction: str):
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, kind, level, side, qty, price, order_link_id
+            FROM trader_position_orders
+            WHERE position_uid = $1
+              AND activation = 'immediate'
+              AND is_active = true
+              AND status = 'planned'
+              AND kind IN ('tp','sl')
+            ORDER BY kind, level
+            """,
+            position_uid,
+        )
+
+    for r in rows:
+        rid   = int(r["id"])
+        kind  = r["kind"]
+        level = r["level"]
+        side  = r["side"]
+        qty   = _as_decimal(r["qty"]) or Decimal("0")
+        price = _as_decimal(r["price"]) if r["price"] is not None else None
+        link  = r["order_link_id"]
+
+        try:
+            if kind == "tp":
+                resp = await _create_limit_ro_order(symbol, side, qty, price, link)
+            else:
+                resp = await _create_stop_ro_order(symbol, side, qty, price, link)
+
+            ret_code = (resp or {}).get("retCode", 0)
+            ret_msg  = (resp or {}).get("retMsg")
+            exch_id  = ((resp or {}).get("result") or {}).get("orderId")
+
+            if ret_code == 0 and exch_id:
+                # успех
+                async with infra.pg_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE trader_position_orders
+                        SET status = 'sent',
+                            exchange_order_id = COALESCE($2, exchange_order_id),
+                            updated_at = now(),
+                            note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'live placed'
+                        WHERE id = $1
+                        """,
+                        rid, exch_id,
+                    )
+                await _publish_audit(
+                    event="tp_placed" if kind == "tp" else "sl_placed",
+                    data={
+                        "position_uid": position_uid,
+                        "symbol": symbol,
+                        "level": level,
+                        "qty": _to_fixed_str(qty),
+                        "price": _to_fixed_str(price) if price is not None else None,
+                        "order_link_id": link,
+                        "exchange_order_id": exch_id,
+                    },
+                )
+                log.info("📤 live placed: %s L#%s link=%s exch_id=%s qty=%s price=%s",
+                         kind, level, link, exch_id, qty, price)
+            else:
+                # ошибка от API
+                async with infra.pg_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE trader_position_orders
+                        SET status = 'error',
+                            updated_at = now(),
+                            note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                   ('live place failed: retCode=' || $2::text || ' msg=' || COALESCE($3,''))
+                        WHERE id = $1
+                        """,
+                        rid, ret_code, ret_msg,
+                    )
+                await _publish_audit(
+                    event="tp_place_failed" if kind == "tp" else "sl_place_failed",
+                    data={
+                        "position_uid": position_uid,
+                        "symbol": symbol,
+                        "level": level,
+                        "qty": _to_fixed_str(qty),
+                        "price": _to_fixed_str(price) if price is not None else None,
+                        "order_link_id": link,
+                        "retCode": ret_code,
+                        "retMsg": ret_msg,
+                    },
+                )
+                log.info("❗ live place failed: %s L#%s link=%s ret=%s %s",
+                         kind, level, link, ret_code, ret_msg)
+
+        except ValueError as ve:
+            # ниже min_qty / некорректные параметры — помечаем как пропущено
+            async with infra.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE trader_position_orders
+                    SET status = 'planned_offchain',
+                        updated_at = now(),
+                        note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                               ('skipped: ' || $2)
+                    WHERE id = $1
+                    """,
+                    rid, str(ve),
+                )
+            await _publish_audit(
+                event="tp_skipped_below_min_qty" if kind == "tp" else "sl_skipped_below_min_qty",
+                data={
+                    "position_uid": position_uid,
+                    "symbol": symbol,
+                    "level": level,
+                    "qty": _to_fixed_str(qty),
+                    "price": _to_fixed_str(price) if price is not None else None,
+                    "order_link_id": link,
+                    "reason": str(ve),
+                },
+            )
+            log.info("ℹ️ skipped %s L#%s (reason: %s)", kind, level, ve)
+
+        except Exception:
+            # прочие ошибки — карточку в error и аудит
+            async with infra.pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE trader_position_orders
+                    SET status = 'error',
+                        updated_at = now(),
+                        note = COALESCE(note,'') || CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END || 'exception on place'
+                    WHERE id = $1
+                    """,
+                    rid,
+                )
+            await _publish_audit(
+                event="tp_place_failed" if kind == "tp" else "sl_place_failed",
+                data={
+                    "position_uid": position_uid,
+                    "symbol": symbol,
+                    "level": level,
+                    "qty": _to_fixed_str(qty),
+                    "price": _to_fixed_str(price) if price is not None else None,
+                    "order_link_id": link,
+                    "reason": "exception",
+                },
+            )
+            log.exception("❌ live place failed (exception): %s L#%s link=%s", kind, level, link)
 # 🔸 Получить актуальное состояние ордера по orderLinkId
 async def _get_order_realtime_by_link(order_link_id: str) -> dict:
     query = f"category=linear&orderLinkId={order_link_id}"
