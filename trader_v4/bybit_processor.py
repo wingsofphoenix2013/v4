@@ -339,7 +339,6 @@ async def _update_entry_filled_and_commit(
         )
         log.info("✅ entry filled & committed: uid=%s qty=%s @ %s", position_uid, filled_qty, avg_price)
 
-
 # 🔸 Построение карты TP/SL (percent-only) и запись в БД (в dry-run — без реального размещения на бирже)
 async def _build_tp_sl_cards_after_entry(
     *,
@@ -404,7 +403,7 @@ async def _build_tp_sl_cards_after_entry(
             qty=q_plan,
             price=p_plan,
             order_link_id=link,
-            is_active=True,           # «активный» в нашей карте
+            is_active=True,  # «активный» в нашей карте
             status="sent" if order_mode == "dry_run" else "planned",  # dry_run считаем «локально отправленным»
             note="tp planned (percent)",
         )
@@ -414,7 +413,9 @@ async def _build_tp_sl_cards_after_entry(
         sl_mode = (lvl.get("sl_mode") or "").lower()
         sl_val = _as_decimal(lvl.get("sl_value"))
         if sl_mode in ("entry", "percent"):
-            sl_price = entry_price if sl_mode == "entry" else _price_percent(entry_price, sl_val or Decimal("0"), direction, is_tp=False)
+            sl_price = entry_price if sl_mode == "entry" else _price_percent(
+                entry_price, sl_val or Decimal("0"), direction, is_tp=False
+            )
             sl_price = _quant_down(sl_price, step_price)
             await _insert_sl_card(
                 position_uid=position_uid,
@@ -428,7 +429,7 @@ async def _build_tp_sl_cards_after_entry(
                 level=level_num,
                 activation="on_tp",
                 activation_tp_level=level_num,
-                qty=None,                # будет рассчитываться по остаткам при активации
+                qty=None,  # будет рассчитываться по остаткам при активации
                 price=sl_price if sl_price and sl_price > 0 else None,
                 order_link_id=_suffix_link(base_link, f"sl{level_num}"),
                 is_active=False,
@@ -454,7 +455,7 @@ async def _build_tp_sl_cards_after_entry(
                 level=0,
                 activation="immediate",
                 activation_tp_level=None,
-                qty=filled_qty,          # на всю позицию
+                qty=filled_qty,  # на всю позицию
                 price=sl_price0,
                 order_link_id=_suffix_link(base_link, "sl0"),
                 is_active=True,
@@ -462,8 +463,8 @@ async def _build_tp_sl_cards_after_entry(
                 note="initial SL planned",
             )
 
-    # reverse: TP signal (виртуальный)
-    if (stype or "").lower() == "reverse":
+    # reverse: TP signal (виртуальный) + sl_protect_entry (виртуальный)
+    if (strategy_type or "").lower() == "reverse":
         await _insert_virtual_tp_signal(
             position_uid=position_uid,
             strategy_id=strategy_id,
@@ -476,7 +477,6 @@ async def _build_tp_sl_cards_after_entry(
             note="tp_signal (virtual, no price)",
         )
 
-        # карточка sl_protect_entry (ранний перенос SL на entry ДО TP) — виртуальная
         await _insert_sl_protect_entry(
             position_uid=position_uid,
             strategy_id=strategy_id,
@@ -490,7 +490,6 @@ async def _build_tp_sl_cards_after_entry(
         )
 
     log.info("🧩 TP/SL карта создана: sid=%s %s placed_tp=%s", strategy_id, symbol, placed_tp)
-
 
 # 🔸 Запись TP карточки
 async def _insert_tp_card(
@@ -522,7 +521,7 @@ async def _insert_tp_card(
                 order_link_id, status, note, created_at, updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, CASE WHEN $5='long' THEN 'Buy' ELSE 'Sell' END, $6,
+                $1, $2, $3, $4, $5, CASE WHEN $5='long' THEN 'Sell' ELSE 'Buy' END, $6,
                 $7,
                 $8, $9, 'immediate', NULL, $10,
                 true, 'GTC', $11, $12,
@@ -538,7 +537,6 @@ async def _insert_tp_card(
         )
         log.info("📝 TP planned: uid=%s sid=%s %s L#%s qty=%s price=%s",
                  position_uid, strategy_id, symbol, level, qty, price)
-
 
 # 🔸 Запись SL карточки (immediate или on_tp), без реального размещения в dry-run
 async def _insert_sl_card(
