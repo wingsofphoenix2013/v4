@@ -1090,7 +1090,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
         rid   = int(r["id"])
         kind  = r["kind"]
         level = r["level"]
-        side  = r["side"]
+        side  = r["side"]                          # уже «закрывающая» сторона
         qty   = _as_decimal(r["qty"]) or Decimal("0")
         price = _as_decimal(r["price"]) if r["price"] is not None else None
         link  = r["order_link_id"]
@@ -1099,6 +1099,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
             if kind == "tp":
                 resp = await _create_limit_ro_order(symbol, side, qty, price, link)
             else:
+                # SL стартовый — стоп-маркет по triggerPrice=price
                 resp = await _create_stop_ro_order(symbol, side, qty, price, link)
 
             ret_code = (resp or {}).get("retCode", 0)
@@ -1134,7 +1135,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
                 log.info("📤 live placed: %s L#%s link=%s exch_id=%s qty=%s price=%s",
                          kind, level, link, exch_id, qty, price)
             else:
-                # ошибка от API
+                # ошибка от API → пометить карточку и аудит
                 async with infra.pg_pool.acquire() as conn:
                     await conn.execute(
                         """
@@ -1145,7 +1146,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
                                    ('live place failed: retCode=' || $2::text || ' msg=' || COALESCE($3,''))
                         WHERE id = $1
                         """,
-                        rid, ret_code, ret_msg,
+                        rid, str(ret_code), ret_msg,   # ← ret_code строкой
                     )
                 await _publish_audit(
                     event="tp_place_failed" if kind == "tp" else "sl_place_failed",
@@ -1217,6 +1218,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
                 },
             )
             log.exception("❌ live place failed (exception): %s L#%s link=%s", kind, level, link)
+            
 # 🔸 Получить актуальное состояние ордера по orderLinkId
 async def _get_order_realtime_by_link(order_link_id: str) -> dict:
     query = f"category=linear&orderLinkId={order_link_id}"
