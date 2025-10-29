@@ -113,7 +113,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
     async with sem:
         redis = infra.redis_client
 
-        # парсим payload
+        # парсинг payload
         try:
             data_raw = fields.get("data")
             if isinstance(data_raw, bytes):
@@ -127,26 +127,63 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 pass
             return
 
-        # ключевые поля
+        # ранний гейт по типу операции
         try:
-            order_link_id   = payload.get("order_link_id")
-            position_uid    = payload.get("position_uid")
-            sid             = int(payload.get("strategy_id"))
-            strategy_type   = (payload.get("strategy_type") or "").lower()  # plain|reverse
-            symbol          = payload.get("symbol")
-            direction       = payload.get("direction")  # long|short
-            side            = payload.get("side")       # Buy|Sell
-            leverage        = _as_decimal(payload.get("leverage")) or Decimal("0")
-            qty             = _as_decimal(payload.get("qty")) or Decimal("0")
-            size_mode       = payload.get("size_mode")  # 'pct_of_virtual'
-            size_pct        = _as_decimal(payload.get("size_pct")) or Decimal("0")
-            margin_plan     = _as_decimal(payload.get("margin_plan")) or Decimal("0")
-            order_mode      = payload.get("order_mode", TRADER_ORDER_MODE)
-            source_stream_id= payload.get("source_stream_id")
-            ts              = payload.get("ts")
-            ts_ms           = payload.get("ts_ms")
+            op = (payload.get("op") or "").strip().lower()
+            if op and op not in ("entry",):  # non-entry задачи обслуживают bybit_closer / bybit_protect
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                log.info("↷ non-entry task op=%s — routed to dedicated worker, ACK (id=%s)", op, entry_id)
+                return
+        except Exception:
+            # в спорной ситуации не блокируем поток
+            pass
+
+        # извлечение ключевых полей (entry)
+        try:
+            order_link_id    = payload.get("order_link_id")
+            position_uid     = payload.get("position_uid")
+            sid              = int(payload.get("strategy_id"))
+            strategy_type    = (payload.get("strategy_type") or "").lower()  # plain|reverse
+            symbol           = payload.get("symbol")
+            direction        = (payload.get("direction") or "").lower()      # long|short
+            side             = payload.get("side")                           # Buy|Sell
+            leverage         = _as_decimal(payload.get("leverage")) or Decimal("0")
+            qty              = _as_decimal(payload.get("qty")) or Decimal("0")
+            size_mode        = payload.get("size_mode")                      # 'pct_of_virtual'
+            size_pct         = _as_decimal(payload.get("size_pct")) or Decimal("0")
+            margin_plan      = _as_decimal(payload.get("margin_plan")) or Decimal("0")
+            order_mode       = (payload.get("order_mode") or TRADER_ORDER_MODE)
+            source_stream_id = payload.get("source_stream_id")
+            ts               = payload.get("ts")
+            ts_ms            = payload.get("ts_ms")
         except Exception:
             log.exception("❌ Ошибка парсинга полей payload (id=%s) — ACK", entry_id)
+            try:
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+            except Exception:
+                pass
+            return
+
+        # валидация обязательных полей для entry
+        # условия достаточности: uid/sid/symbol, корректные direction/side, qty > 0
+        try:
+            if not position_uid or not symbol or not sid:
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                log.info("ℹ️ skip entry: missing uid/symbol/sid — ACK (id=%s)", entry_id)
+                return
+            if direction not in ("long", "short"):
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                log.info("ℹ️ skip entry: invalid direction=%s — ACK (id=%s)", direction, entry_id)
+                return
+            if side not in ("Buy", "Sell"):
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                log.info("ℹ️ skip entry: invalid side=%s — ACK (id=%s)", side, entry_id)
+                return
+            if qty is None or qty <= 0:
+                await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                log.info("ℹ️ skip entry: non-positive qty=%s — ACK (id=%s)", qty, entry_id)
+                return
+        except Exception:
             try:
                 await redis.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
             except Exception:
@@ -275,9 +312,77 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 # preflight (live)
                 await _preflight_symbol_settings(symbol=symbol, leverage=leverage)
 
-                # создать market IOC
-                create_resp = await _create_market_order(symbol, side, qty, link_e)
-                log.info("🟢 LIVE entry create sent: link=%s resp=%s", link_e, (create_resp or {}).get("retMsg"))
+                # создать market IOC (обработать валидации qty<min_qty)
+                try:
+                    create_resp = await _create_market_order(symbol, side, qty, link_e)
+                except ValueError as ve:
+                    # условия достаточности: отметить карточку как офчейн/скип и закрыть задачу
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'planned_offchain',
+                                updated_at = now(),
+                                note = COALESCE(note,'') ||
+                                       CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                       ('entry skipped: ' || $3)
+                            WHERE position_uid = $1
+                              AND order_link_id = $2
+                              AND kind = 'entry'
+                            """,
+                            position_uid, link_e, str(ve),
+                        )
+                    await _publish_audit(
+                        event="entry_skipped_below_min_qty",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "qty": _to_fixed_str(qty),
+                            "reason": str(ve),
+                            "order_link_id": link_e,
+                        },
+                    )
+                    await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                    log.info("ℹ️ entry skipped (min_qty): link=%s reason=%s — ACK", link_e, ve)
+                    return
+
+                # ранний отказ, если биржа не приняла ордер
+                ret_code = (create_resp or {}).get("retCode", 0)
+                ret_msg  = (create_resp or {}).get("retMsg")
+                exch_id  = ((create_resp or {}).get("result") or {}).get("orderId")
+                if ret_code != 0 or not exch_id:
+                    # быстрый abort без watcher
+                    async with infra.pg_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE trader_position_orders
+                            SET status = 'error',
+                                updated_at = now(),
+                                note = COALESCE(note,'') ||
+                                       CASE WHEN COALESCE(note,'')='' THEN '' ELSE '; ' END ||
+                                       ('live create failed: retCode=' || $3::text || ' msg=' || COALESCE($4,''))
+                            WHERE position_uid = $1
+                              AND order_link_id = $2
+                              AND kind = 'entry'
+                            """,
+                            position_uid, link_e, str(ret_code), ret_msg,
+                        )
+                    await _publish_audit(
+                        event="entry_create_failed",
+                        data={
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "qty": _to_fixed_str(qty),
+                            "order_link_id": link_e,
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                        },
+                    )
+                    await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                    log.info("❗ LIVE entry create failed: link=%s ret=%s %s — ACK", link_e, ret_code, ret_msg)
+                    return
+
+                log.info("🟢 LIVE entry create sent: link=%s resp=%s", link_e, ret_msg)
 
                 # watcher параметризация
                 qty_plan     = qty or Decimal("0")
@@ -298,7 +403,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 while time.time() - t_start < ENTRY_SLOW_TIMEOUT_SEC:
                     await asyncio.sleep(ENTRY_POLL_INTERVAL_SEC)
 
-                    # продлить TTL распределённого замка на (sid,symbol), чтобы не истёк в долгом watcher
+                    # продлить TTL распределённого замка
                     if time.time() - last_renew_ts >= renew_period_sec:
                         try:
                             await infra.redis_client.expire(gate_key, LOCK_TTL_SEC)
@@ -487,7 +592,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 # не ACK — вернёмся ретраем
             finally:
                 await _release_dist_lock(gate_key, owner)
-
+                
 # 🔸 Вставка карточки entry в trader_position_orders
 async def _insert_entry_order_card(
     *,

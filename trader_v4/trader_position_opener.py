@@ -144,11 +144,6 @@ async def _handle_status_entry(sem: asyncio.Semaphore, entry_id: str, fields: di
                     return
 
             try:
-                # проверка «занятости» по базе (ext_status / статусы обработки)
-                if await _is_busy_in_db(sid, symbol):
-                    log.info("🚧 Ключ (sid=%s,symbol=%s) занят по БД — откладываю (id=%s)", sid, symbol, entry_id)
-                    return  # замок останется с TTL, запись не ACK — вернёмся позже
-
                 # расчёт размера: pct от виртуального количества → квантование вниз → проверка min_qty
                 q_plan, q_raw, size_pct = await _plan_quantity(symbol, qty_left)
 
@@ -221,7 +216,6 @@ async def _handle_status_entry(sem: asyncio.Semaphore, entry_id: str, fields: di
                 # освобождение распределённого замка
                 await _release_dist_lock(gate_key, owner)
 
-
 # 🔸 Подготовка размера: масштабирование и квантование вниз
 async def _plan_quantity(symbol: str, qty_virt: Decimal):
     # условия достаточности
@@ -260,28 +254,6 @@ async def _plan_quantity(symbol: str, qty_virt: Decimal):
 
     return q_plan, q_raw, size_pct
 
-
-# 🔸 Проверка «занятости» по базе для (sid, symbol)
-async def _is_busy_in_db(strategy_id: int, symbol: str) -> bool:
-    # условия занятости: ext_status='open' ИЛИ статус в одном из рабочих этапов
-    row = await infra.pg_pool.fetchrow(
-        """
-        SELECT 1
-        FROM trader_positions_log
-        WHERE strategy_id = $1
-          AND symbol = $2
-          AND (
-                ext_status = 'open'
-             OR status IN ('queued','processing','sent')
-          )
-        LIMIT 1
-        """,
-        strategy_id,
-        symbol,
-    )
-    return bool(row)
-
-
 # 🔸 Формирование короткого order_link_id (<=36) на основе stream_id
 def _make_order_link_id(stream_id: str) -> str:
     base = f"tv4-{stream_id}"
@@ -291,6 +263,15 @@ def _make_order_link_id(stream_id: str) -> str:
     short = hashlib.sha1(stream_id.encode("utf-8")).hexdigest()[:32]
     return f"tv4-{short}"  # длина 36
 
+# 🔸 Формирование короткого order_link_id с безопасным суффиксом (<=36)
+def _make_order_link_id_with_suffix(stream_id: str, suffix: str) -> str:
+    # пробуем аккуратно добавить суффикс
+    base_with_suffix = f"{_make_order_link_id(stream_id)}-{suffix}"
+    if len(base_with_suffix) <= 36:
+        return base_with_suffix
+    # если длинно — хэшируем пару (stream_id, suffix)
+    short = hashlib.sha1(f"{stream_id}-{suffix}".encode("utf-8")).hexdigest()[:32]
+    return f"tv4-{short}"
 
 # 🔸 Вставка/апдейт planned в trader_positions_log
 async def _upsert_trader_positions_log_planned(
@@ -351,7 +332,6 @@ async def _upsert_trader_positions_log_planned(
         log.info("📝 trader_positions_log planned: uid=%s sid=%s %s qty=%s",
                  position_uid, strategy_id, symbol, quantity_plan)
 
-
 # 🔸 Публикация задачи исполнителю в positions_bybit_orders
 async def _publish_order_task(
     *,
@@ -396,7 +376,6 @@ async def _publish_order_task(
     log.info("📤 Поставлено в %s: %s", ORDERS_STREAM, payload)
     return orders_stream_id
 
-
 # 🔸 Обновление статуса queued и апдейт trader_signals
 async def _mark_queued_and_update_signal(
     *,
@@ -436,7 +415,6 @@ async def _mark_queued_and_update_signal(
         )
         log.info("✅ queued & journal updated: stream_id=%s", source_stream_id)
 
-
 # 🔸 Завершение бракованного события (нет margin_used или qty<=0) → статус invalid_event + ACK
 async def _finalize_invalid_event(entry_id, sid, position_uid, symbol, direction, strategy_type, stream_id, fields, note="invalid_event"):
     try:
@@ -455,7 +433,6 @@ async def _finalize_invalid_event(entry_id, sid, position_uid, symbol, direction
         log.info("❎ invalid_event ACK (sid=%s %s %s id=%s)", sid, symbol, direction, entry_id)
     except Exception:
         log.exception("❌ Ошибка фиксации invalid_event (id=%s)", entry_id)
-
 
 # 🔸 Вставка/апдейт invalid_event в лог
 async def _upsert_invalid_event(
@@ -484,7 +461,7 @@ async def _upsert_invalid_event(
                 'open', 'closed', $6, $7,
                 0, 0,
                 0, 0,
-                'tv4-invalid', 'invalid_event', $8, now(), now(), $9
+                $8, 'invalid_event', $9, now(), now(), $10
             )
             ON CONFLICT (source_stream_id) DO UPDATE
             SET status     = 'invalid_event',
@@ -499,11 +476,11 @@ async def _upsert_invalid_event(
             symbol,
             direction,
             TRADER_ORDER_MODE,
+            _make_order_link_id_with_suffix(source_stream_id, "invalid"),
             note,
             json.dumps(extras or {}),
         )
         log.info("📝 trader_positions_log invalid_event: uid=%s sid=%s %s", position_uid, strategy_id, symbol)
-
 
 # 🔸 Обработка planned_skip (ниже min_qty) → лог и ACK
 async def _finalize_planned_skip(
@@ -538,7 +515,7 @@ async def _finalize_planned_skip(
                     'open', 'closed', $6, $7,
                     $8, 0,
                     $9, 0,
-                    'tv4-skip', 'planned_skip', $10, now(), now(), $11
+                    $10, 'planned_skip', $11, now(), now(), $12
                 )
                 ON CONFLICT (source_stream_id) DO UPDATE
                 SET status     = 'planned_skip',
@@ -555,6 +532,7 @@ async def _finalize_planned_skip(
                 TRADER_ORDER_MODE,
                 str(qty_left),
                 str(margin_used_virt),
+                _make_order_link_id_with_suffix(stream_id, "skip"),
                 note,
                 json.dumps(fields or {}),
             )
@@ -568,7 +546,6 @@ async def _finalize_planned_skip(
 
     except Exception:
         log.exception("❌ Ошибка фиксации planned_skip (id=%s)", entry_id)
-
 
 # 🔸 Апдейт статуса в trader_signals по stream_id
 async def _update_signal_status(stream_id: str, processing_status: str, note: str):
@@ -586,7 +563,6 @@ async def _update_signal_status(stream_id: str, processing_status: str, note: st
             note,
         )
 
-
 # 🔸 Распределённый замок (SET NX EX)
 async def _acquire_dist_lock(key: str, value: str, ttl: int) -> bool:
     try:
@@ -595,7 +571,6 @@ async def _acquire_dist_lock(key: str, value: str, ttl: int) -> bool:
     except Exception:
         log.exception("❌ Ошибка acquire lock %s", key)
         return False
-
 
 # 🔸 Освобождение замка по владельцу (Lua check-and-del)
 async def _release_dist_lock(key: str, value: str):
@@ -614,7 +589,6 @@ async def _release_dist_lock(key: str, value: str):
     except Exception:
         # мягко логируем, замок всё равно истечёт по TTL
         log.debug("lock release fallback (key=%s)", key)
-
 
 # 🔸 Утилиты
 def _as_decimal(v) -> Optional[Decimal]:
