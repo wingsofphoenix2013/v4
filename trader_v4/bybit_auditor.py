@@ -36,6 +36,16 @@ BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
 CATEGORY = "linear"  # USDT-perp
 
+# 🔸 Стримы/CG (читаем факты из приватного канала)
+ORDER_STREAM = "bybit_order_stream"        # topic=order (есть stopOrderType/OrderStatus)
+POSITION_STREAM = "bybit_position_stream"  # topic=position (есть size)
+AUDITOR_CG_ORDER = "bybit_auditor_order_cg"
+AUDITOR_CG_POS = "bybit_auditor_pos_cg"
+AUDITOR_CONSUMER = os.getenv("BYBIT_AUDITOR_CONSUMER", "bybit-auditor-1")
+
+# 🔸 Аудит
+AUDIT_STREAM = "positions_bybit_audit"
+
 # 🔸 Запуск воркера: два консюмера (order/position) параллельно
 async def run_bybit_auditor():
     redis = infra.redis_client
@@ -372,6 +382,12 @@ async def _resolve_open_position_by_symbol(symbol: str) -> Optional[dict]:
         )
     return dict(row) if row else None
 
+# 🔸 Аудит-событие
+async def _publish_audit(event: str, data: dict):
+    payload = {"event": event, **(data or {})}
+    sid = await infra.redis_client.xadd(AUDIT_STREAM, {"data": json.dumps(payload)})
+    log.info("📜 audit %s → %s: %s", event, AUDIT_STREAM, payload)
+    return sid
 
 # 🔸 Получить текущий размер позиции по символу (REST /v5/position/list?category=linear&symbol=..)
 async def _get_position_size_linear(symbol: str) -> Optional[Decimal]:
