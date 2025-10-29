@@ -16,6 +16,7 @@ from trader_position_opener import run_trader_position_opener
 from bybit_processor import run_bybit_processor
 from bybit_activator import run_bybit_activator
 from bybit_auditor import run_bybit_auditor
+from trader_position_closer import run_trader_position_closer
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -30,6 +31,7 @@ POS_OPENER_START_DELAY_SEC = 30.0
 BYBIT_PROC_START_DELAY_SEC = 30.0
 BYBIT_ACTIVATOR_START_DELAY_SEC = 45.0
 BYBIT_AUDITOR_START_DELAY_SEC = 45.0
+POS_CLOSER_START_DELAY_SEC = 45.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -112,6 +114,12 @@ async def main():
             run_trader_position_opener,
             "TRADER_POS_OPENER",
             start_delay=POS_OPENER_START_DELAY_SEC,
+        ),
+        # постановка close-заказов по событиям closed.*
+        run_with_delay(
+            run_trader_position_closer,
+            "TRADER_POS_CLOSER",
+            start_delay=POS_CLOSER_START_DELAY_SEC,
         ),
         # обработка очереди ордеров для биржи
         run_with_delay(
