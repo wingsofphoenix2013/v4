@@ -15,6 +15,7 @@ from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
 from trader_position_opener import run_trader_position_opener
 from bybit_processor import run_bybit_processor
 from bybit_activator import run_bybit_activator
+from bybit_auditor import run_bybit_auditor
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -28,6 +29,7 @@ BYBIT_RESYNC_INTERVAL_SEC = 600.0
 POS_OPENER_START_DELAY_SEC = 30.0
 BYBIT_PROC_START_DELAY_SEC = 30.0
 BYBIT_ACTIVATOR_START_DELAY_SEC = 45.0
+BYBIT_AUDITOR_START_DELAY_SEC = 45.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -99,42 +101,42 @@ async def main():
             "TRADER_CONFIG_PUBSUB",
             start_delay=CONFIG_LISTENER_START_DELAY_SEC,
         ),
-
-        # слушатель стрима состояния стратегий (двухфазный applied → on_strategy_changed)
+        # слушатель стрима состояния стратегий
         run_with_delay(
             strategy_state_listener,
             "TRADER_STRATEGY_STATE",
             start_delay=STRATEGY_STATE_START_DELAY_SEC,
         ),
-
-        # планирование ордеров по событиям opened из positions_bybit_status
+        # планирование ордеров по событиям opened
         run_with_delay(
             run_trader_position_opener,
             "TRADER_POS_OPENER",
-            start_delay=POS_OPENER_START_DELAY_SEC,  # у тебя уже 30.0
+            start_delay=POS_OPENER_START_DELAY_SEC,
         ),
-
         # обработка очереди ордеров для биржи
         run_with_delay(
             run_bybit_processor,
             "BYBIT_PROCESSOR",
             start_delay=BYBIT_PROC_START_DELAY_SEC,
         ),
-
-        # приватный WS-синк Bybit (read-only) → публикует order/execution в Redis Streams
+        # приватный WS-синк Bybit (read-only)
         run_with_delay(
             run_bybit_private_ws_sync_loop,
             "BYBIT_SYNC",
             start_delay=BYBIT_WS_START_DELAY_SEC,
         ),
-
         # активатор офчейн-уровней (SL on TP, SL protect)
         run_with_delay(
             run_bybit_activator,
             "BYBIT_ACTIVATOR",
             start_delay=BYBIT_ACTIVATOR_START_DELAY_SEC,
         ),
-
+        # аудитор конвергенции по SL (order/position)
+        run_with_delay(
+            run_bybit_auditor,
+            "BYBIT_AUDITOR",
+            start_delay=BYBIT_AUDITOR_START_DELAY_SEC,
+        ),
         # периодический REST-ресинк Bybit (баланс и позиции)
         run_periodic(
             run_bybit_rest_resync_job,
