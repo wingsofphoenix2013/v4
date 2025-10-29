@@ -161,11 +161,6 @@ async def _handle_status_entry(sem: asyncio.Semaphore, entry_id: str, fields: di
                     log.info("🟢 already_closed ACK (sid=%s %s %s id=%s)", sid, symbol, direction, entry_id)
                     return
 
-                # проверка «занятости» по БД (рабочие статусы)
-                if await _is_busy_in_db(sid, symbol):
-                    log.info("🚧 Ключ (sid=%s,symbol=%s) занят по БД — откладываю (id=%s)", sid, symbol, entry_id)
-                    return  # замок останется с TTL, запись не ACK — вернёмся позже
-
                 # формируем order_link_id (<=36 симв), на основе stream_id
                 order_link_id = _make_order_link_id(stream_id)
 
@@ -206,25 +201,6 @@ async def _handle_status_entry(sem: asyncio.Semaphore, entry_id: str, fields: di
             finally:
                 # освобождение распределённого замка
                 await _release_dist_lock(gate_key, owner)
-
-
-# 🔸 Проверка «занятости» по базе для (sid, symbol)
-async def _is_busy_in_db(strategy_id: int, symbol: str) -> bool:
-    # занятость: статус в одном из рабочих этапов (очередь/отправка/обработка)
-    row = await infra.pg_pool.fetchrow(
-        """
-        SELECT 1
-        FROM trader_positions_log
-        WHERE strategy_id = $1
-          AND symbol = $2
-          AND status IN ('queued','processing','sent')
-        LIMIT 1
-        """,
-        strategy_id,
-        symbol,
-    )
-    return bool(row)
-
 
 # 🔸 Формирование короткого order_link_id (<=36) на основе stream_id
 def _make_order_link_id(stream_id: str) -> str:

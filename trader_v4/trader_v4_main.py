@@ -11,12 +11,16 @@ from trader_config import (
     strategy_state_listener,
     config,
 )
-from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
+
 from trader_position_opener import run_trader_position_opener
+from trader_position_closer import run_trader_position_closer
+from trader_position_protector import run_trader_position_protector
+
+from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
+
 from bybit_processor import run_bybit_processor
 from bybit_activator import run_bybit_activator
 from bybit_auditor import run_bybit_auditor
-from trader_position_closer import run_trader_position_closer
 from bybit_closer import run_bybit_closer
 from bybit_protect import run_bybit_protect
 
@@ -36,6 +40,7 @@ BYBIT_AUDITOR_START_DELAY_SEC = 45.0
 POS_CLOSER_START_DELAY_SEC = 45.0
 BYBIT_CLOSER_START_DELAY_SEC = 45.0
 BYBIT_PROTECT_START_DELAY_SEC = 45.0
+POS_PROTECTOR_START_DELAY_SEC = 45.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -124,6 +129,11 @@ async def main():
             run_trader_position_closer,
             "TRADER_POS_CLOSER",
             start_delay=POS_CLOSER_START_DELAY_SEC,
+        ),
+        run_with_delay(
+            run_trader_position_protector,
+            "TRADER_POS_PROTECTOR",
+            start_delay=POS_PROTECTOR_START_DELAY_SEC,
         ),
         # обработка очереди ордеров для биржи
         run_with_delay(
