@@ -28,6 +28,9 @@ LOCK_TTL_SEC = int(os.getenv("POS_OPEN_LOCK_TTL", "30"))
 BYBIT_SIZE_PCT = Decimal(str(os.getenv("BYBIT_SIZE_PCT", "10"))).quantize(Decimal("0.0001"))
 TRADER_ORDER_MODE = os.getenv("TRADER_ORDER_MODE", "dry_run")  # dry_run | live
 
+# 🔸 Параметры ожидания gate (для реверсов)
+POS_OPEN_WAIT_LOCK_MAX_SEC = int(os.getenv("POS_OPEN_WAIT_LOCK_MAX_SEC", "45"))  # ждём блоками по 45с
+
 # 🔸 Локальные мьютексы по ключу (strategy_id, symbol)
 _local_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
 
@@ -133,16 +136,24 @@ async def _handle_status_entry(sem: asyncio.Semaphore, entry_id: str, fields: di
             # распределённый замок в Redis
             gate_key = f"tv4:gate:{sid}:{symbol}"
             owner = f"{POS_OPEN_CONSUMER}-{entry_id}"
-            if not await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
-                # не удалось взять замок — подождём и повторим локально, без ACK
-                for _ in range(10):
-                    await asyncio.sleep(0.2)
-                    if await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
-                        break
-                else:
-                    log.info("⏳ Не взят замок %s — отложено (id=%s)", gate_key, entry_id)
-                    return
 
+            # ждём gate блоками по POS_OPEN_WAIT_LOCK_MAX_SEC, чтобы не терять opened в PEL CG
+            start_wait_logged = False
+            deadline = asyncio.get_running_loop().time() + POS_OPEN_WAIT_LOCK_MAX_SEC
+            acquired = await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC)
+
+            while not acquired:
+                if not start_wait_logged:
+                    log.debug("⏳ Жду gate %s (до %ss) [id=%s]", gate_key, POS_OPEN_WAIT_LOCK_MAX_SEC, entry_id)
+                    start_wait_logged = True
+
+                await asyncio.sleep(0.2)
+                acquired = await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC)
+
+                if not acquired and asyncio.get_running_loop().time() >= deadline:
+                    log.info("⏳ Всё ещё жду gate %s — продлеваю окно ещё на %ss (id=%s)",
+                             gate_key, POS_OPEN_WAIT_LOCK_MAX_SEC, entry_id)
+                    deadline = asyncio.get_running_loop().time() + POS_OPEN_WAIT_LOCK_MAX_SEC
             try:
                 # расчёт размера: pct от виртуального количества → квантование вниз → проверка min_qty
                 q_plan, q_raw, size_pct = await _plan_quantity(symbol, qty_left)
