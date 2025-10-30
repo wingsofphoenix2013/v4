@@ -45,6 +45,10 @@ TRADER_ORDER_MODE = os.getenv("TRADER_ORDER_MODE", "dry_run")  # dry_run | live
 # 🔸 Локальные мьютексы по ключу (strategy_id, symbol)
 _local_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
 
+# 🔸 Трейлинг: ключи состояния (для разоружения при закрытии)
+TRAIL_ACTIVE_SET = "tv4:trail:active"
+TRAIL_KEY_FMT = "tv4:trail:{uid}"
+
 
 # 🔸 Основной запуск воркера
 async def run_bybit_closer():
@@ -185,6 +189,10 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 # dry-run — без реальных вызовов
                 if order_mode == "dry_run":
                     await _reconcile_db_after_close(position_uid=position_uid, symbol=symbol, source_stream_id=source_stream_id)
+
+                    # разоружить трейл (если был)
+                    await _disarm_trailing(position_uid)
+
                     await _publish_audit("position_closed_by_closer", {
                         "position_uid": position_uid,
                         "symbol": symbol,
@@ -250,6 +258,10 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     log.info("⚠️ position not zero after close attempts: %s size=%s", symbol, size_final)
 
                 await _reconcile_db_after_close(position_uid=position_uid, symbol=symbol, source_stream_id=source_stream_id)
+
+                # разоружить трейл (если был)
+                await _disarm_trailing(position_uid)
+
                 await _publish_audit("position_closed_by_closer", {
                     "position_uid": position_uid,
                     "symbol": symbol,
@@ -454,6 +466,17 @@ def _private_headers(ts_ms: int, signed: str) -> dict:
         "X-BAPI-SIGN": signed,
         "Content-Type": "application/json",
     }
+
+
+# 🔸 Разоружение трейлинга для позиции
+async def _disarm_trailing(position_uid: str):
+    try:
+        await infra.redis_client.srem(TRAIL_ACTIVE_SET, position_uid)
+        await infra.redis_client.delete(TRAIL_KEY_FMT.format(uid=position_uid))
+        log.info("🧹 trailing disarmed: uid=%s", position_uid)
+    except Exception:
+        # мягкий фолбэк — не мешаем основному потоку
+        log.debug("trailing disarm failed silently uid=%s", position_uid)
 
 
 # 🔸 Распределённый замок (SET NX EX)

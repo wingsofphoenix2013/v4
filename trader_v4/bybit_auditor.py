@@ -36,15 +36,13 @@ BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
 CATEGORY = "linear"  # USDT-perp
 
-# 🔸 Стримы/CG (читаем факты из приватного канала)
-ORDER_STREAM = "bybit_order_stream"        # topic=order (есть stopOrderType/OrderStatus)
-POSITION_STREAM = "bybit_position_stream"  # topic=position (есть size)
-AUDITOR_CG_ORDER = "bybit_auditor_order_cg"
-AUDITOR_CG_POS = "bybit_auditor_pos_cg"
-AUDITOR_CONSUMER = os.getenv("BYBIT_AUDITOR_CONSUMER", "bybit-auditor-1")
-
 # 🔸 Аудит
 AUDIT_STREAM = "positions_bybit_audit"
+
+# 🔸 Трейлинг: ключи состояния (разоружаем при закрытии)
+TRAIL_ACTIVE_SET = "tv4:trail:active"
+TRAIL_KEY_FMT = "tv4:trail:{uid}"
+
 
 # 🔸 Запуск воркера: два консюмера (order/position) параллельно
 async def run_bybit_auditor():
@@ -212,6 +210,10 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
 
             # конвергенция БД → закрыто
             await _reconcile_db_after_sl(position_uid=position_uid, symbol=symbol, source_stream_id=source_stream_id)
+
+            # разоружить трейл (если был)
+            await _disarm_trailing(position_uid)
+
             # аудит и ACK
             await _publish_audit("position_closed_by_sl", {
                 "position_uid": position_uid,
@@ -302,6 +304,10 @@ async def _handle_position_event(sem: asyncio.Semaphore, entry_id: str, fields: 
 
             # конвергенция БД → закрыто
             await _reconcile_db_after_sl(position_uid=position_uid, symbol=symbol, source_stream_id=source_stream_id)
+
+            # разоружить трейл (если был)
+            await _disarm_trailing(position_uid)
+
             await _publish_audit("position_closed_by_sl", {
                 "position_uid": position_uid,
                 "strategy_id": strategy_id,
@@ -382,12 +388,14 @@ async def _resolve_open_position_by_symbol(symbol: str) -> Optional[dict]:
         )
     return dict(row) if row else None
 
+
 # 🔸 Аудит-событие
 async def _publish_audit(event: str, data: dict):
     payload = {"event": event, **(data or {})}
     sid = await infra.redis_client.xadd(AUDIT_STREAM, {"data": json.dumps(payload)})
     log.info("📜 audit %s → %s: %s", event, AUDIT_STREAM, payload)
     return sid
+
 
 # 🔸 Получить текущий размер позиции по символу (REST /v5/position/list?category=linear&symbol=..)
 async def _get_position_size_linear(symbol: str) -> Optional[Decimal]:
@@ -486,6 +494,16 @@ async def _ack_ok(stream: str, cg: str, entry_id: str):
         pass
 
 
+# 🔸 Разоружение трейлинга для позиции
+async def _disarm_trailing(position_uid: str):
+    try:
+        await infra.redis_client.srem(TRAIL_ACTIVE_SET, position_uid)
+        await infra.redis_client.delete(TRAIL_KEY_FMT.format(uid=position_uid))
+        log.info("🧹 trailing disarmed: uid=%s", position_uid)
+    except Exception:
+        log.debug("trailing disarm failed silently uid=%s", position_uid)
+
+
 # 🔸 Распределённый замок (SET NX EX)
 async def _acquire_dist_lock(key: str, value: str, ttl: int) -> bool:
     try:
@@ -494,6 +512,7 @@ async def _acquire_dist_lock(key: str, value: str, ttl: int) -> bool:
     except Exception:
         log.exception("❌ Ошибка acquire lock %s", key)
         return False
+
 
 # 🔸 Освобождение замка по владельцу (Lua check-and-del)
 async def _release_dist_lock(key: str, value: str):
