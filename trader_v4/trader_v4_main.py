@@ -23,6 +23,7 @@ from bybit_activator import run_bybit_activator
 from bybit_auditor import run_bybit_auditor
 from bybit_closer import run_bybit_closer
 from bybit_protect import run_bybit_protect
+from bybit_trailer import run_bybit_trailer
 
 # 🔸 Логгер для главного процесса
 log = logging.getLogger("TRADER_MAIN")
@@ -41,6 +42,7 @@ POS_CLOSER_START_DELAY_SEC = 45.0
 BYBIT_CLOSER_START_DELAY_SEC = 45.0
 BYBIT_PROTECT_START_DELAY_SEC = 45.0
 POS_PROTECTOR_START_DELAY_SEC = 45.0
+BYBIT_TRAILER_START_DELAY_SEC = 45.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -170,6 +172,12 @@ async def main():
             run_bybit_closer,
             "BYBIT_CLOSER",
             start_delay=BYBIT_CLOSER_START_DELAY_SEC,
+        ),
+        # офчейн-трейлинг (подтягивание позиционного SL после TP-1)
+        run_with_delay(
+            run_bybit_trailer,
+            "BYBIT_TRAILER",
+            start_delay=BYBIT_TRAILER_START_DELAY_SEC,
         ),
         # периодический REST-ресинк Bybit (баланс и позиции)
         run_periodic(

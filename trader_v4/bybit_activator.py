@@ -79,6 +79,7 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
     async with sem:
         redis = infra.redis_client
 
+        # парсинг payload
         try:
             data_raw = fields.get("data")
             if isinstance(data_raw, bytes):
@@ -161,6 +162,78 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 # «заменяем» стартовый SL (level=0): деактивируем его
                 await _deactivate_initial_sl(position_uid, level, reason=f"replaced by SL on TP L#{level}")
 
+                # «вооружаем» трейлинг только для TP-1 при успешной активации SL on TP
+                try:
+                    # проверяем, что карточка SL действительно стала 'sent'
+                    async with infra.pg_pool.acquire() as conn:
+                        sl_status_row = await conn.fetchrow(
+                            """
+                            SELECT status, price
+                            FROM trader_position_orders
+                            WHERE id = $1
+                            """,
+                            sl_row["id"],
+                        )
+                    sl_ok = bool(sl_status_row and (sl_status_row["status"] or "").strip() == "sent")
+                    sl_applied_price = _as_decimal(sl_status_row["price"]) if sl_status_row else None
+
+                    # фильтр на первый TP-уровень
+                    if sl_ok and level == 1:
+                        # грузим entry avg_price (точка входа)
+                        async with infra.pg_pool.acquire() as conn:
+                            entry_row = await conn.fetchrow(
+                                """
+                                SELECT avg_price
+                                FROM trader_position_orders
+                                WHERE position_uid = $1
+                                  AND kind IN ('entry','sl_protect_entry')
+                                  AND avg_price IS NOT NULL
+                                ORDER BY updated_at DESC
+                                LIMIT 1
+                                """,
+                                position_uid,
+                            )
+                        entry_price = _as_decimal(entry_row["avg_price"]) if entry_row else None
+
+                        if entry_price is not None:
+                            # сохраняем состояние трейла в Redis (идемпотентно)
+                            import time
+                            await redis.sadd("tv4:trail:active", position_uid)
+                            trail_key = f"tv4:trail:{position_uid}"
+                            await redis.hset(
+                                trail_key,
+                                mapping={
+                                    "sid": str(strategy_id),
+                                    "symbol": symbol,
+                                    "direction": direction,
+                                    "entry": str(entry_price),
+                                    "sl_last": str(sl_applied_price) if sl_applied_price is not None else (str(price) if price is not None else ""),
+                                    "trail_pct": "1.5",
+                                    "trigger": "last",
+                                    "order_mode": order_mode,
+                                    "last_update_ts": str(int(time.time() * 1000)),
+                                },
+                            )
+                            # аудит «вооружён трейл»
+                            await _publish_audit(
+                                event="trailing_armed",
+                                data={
+                                    "position_uid": position_uid,
+                                    "strategy_id": strategy_id,
+                                    "symbol": symbol,
+                                    "direction": direction,
+                                    "entry": str(entry_price),
+                                    "sl_last": str(sl_applied_price) if sl_applied_price is not None else (str(price) if price is not None else None),
+                                    "trail_pct": "1.5",
+                                },
+                            )
+                        else:
+                            # нет entry — тихо пропускаем армирование
+                            log.debug("trailing arm skipped: no entry avg_price (uid=%s)", position_uid)
+                except Exception:
+                    # не ломаем основной поток из-за трейлинга
+                    log.exception("❕ trailing arm failed (uid=%s L#%s)", position_uid, level)
+
                 # аудит
                 await _publish_audit(
                     event="sl_on_tp_activated",
@@ -185,7 +258,6 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 log.exception("❌ Ошибка активации SL on_tp (uid=%s L#%s)", position_uid, level)
             finally:
                 await _release_dist_lock(gate_key, owner)
-
 
 # 🔸 ACK helper
 async def _ack_ok(entry_id: str):
