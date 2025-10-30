@@ -105,7 +105,7 @@ async def _process_trailing_for_position(sem: asyncio.Semaphore, position_uid: s
                 return
 
             try:
-                # проверяем, что позиция ещё открыта (по БД)
+                # проверяем, что позиция ещё открыта
                 is_open, order_mode_db = await _is_position_open_and_mode(position_uid)
                 if not is_open:
                     await _disarm_trailing(position_uid, reason="position_closed")
@@ -121,13 +121,6 @@ async def _process_trailing_for_position(sem: asyncio.Semaphore, position_uid: s
                     last_update_ms = 0
                 if int(time.time() * 1000) - last_update_ms < TRAIL_COOLDOWN_SEC * 1000:
                     log.debug("trailing cooldown uid=%s", position_uid)
-                    return
-
-                # биржевой pre-check размера: если позиция уже нулевая — разоружаем
-                size_now = await _get_position_size_linear(symbol)
-                if size_now is not None and size_now <= 0:
-                    await _disarm_trailing(position_uid, reason="zero_size_exchange")
-                    log.info("🧹 trailing disarmed (zero size on exchange): uid=%s %s", position_uid, symbol)
                     return
 
                 # берём LastPrice и правила тикера
@@ -154,7 +147,7 @@ async def _process_trailing_for_position(sem: asyncio.Semaphore, position_uid: s
                 else:
                     gap = (entry / last_price) - Decimal("1")
 
-                # если gap не превысил порог — ничего не делаем
+                # если gap не превысил 1.5% — ничего не делаем
                 if gap <= trail_frac:
                     log.debug("uid=%s gap<=trail (gap=%.5f)", position_uid, float(gap))
                     return
@@ -204,9 +197,6 @@ async def _process_trailing_for_position(sem: asyncio.Semaphore, position_uid: s
                         ret_msg  = (resp or {}).get("retMsg")
                         ok = (ret_code == 0)
                         if not ok:
-                            # если нулевая позиция — сразу разоружаем, чтобы не повторять
-                            if ret_code == 10001 or (ret_msg and "zero position" in str(ret_msg).lower()):
-                                await _disarm_trailing(position_uid, reason="zero_position_retcode")
                             await _publish_audit("trailing_failed", {
                                 "position_uid": position_uid, "symbol": symbol,
                                 "new": _to_fixed_str(sl_new), "retCode": ret_code, "retMsg": ret_msg
@@ -294,40 +284,6 @@ async def _get_last_price_linear(symbol: str) -> Optional[Decimal]:
             return _as_decimal(lp)
     except Exception:
         log.debug("get last price failed for %s", symbol)
-        return None
-
-
-# 🔸 Текущий размер позиции (REST /v5/position/list)
-async def _get_position_size_linear(symbol: str) -> Optional[Decimal]:
-    API_KEY     = os.getenv("BYBIT_API_KEY", "")
-    API_SECRET  = os.getenv("BYBIT_API_SECRET", "")
-    RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
-    if not API_KEY or not API_SECRET:
-        return None
-    query = f"category={CATEGORY}&symbol={symbol}"
-    url = f"{BYBIT_BASE_URL}/v5/position/list?{query}"
-    ts = int(time.time() * 1000)
-    # импортировать локально, чтобы не тащить в глобальные импорты
-    import hmac as _h, hashlib as _hl
-    payload = f"{ts}{API_KEY}{RECV_WINDOW}{query}"
-    sign = _h.new(API_SECRET.encode("utf-8"), payload.encode("utf-8"), _hl.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": str(ts),
-        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
-        "X-BAPI-SIGN": sign,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-            lst = (data.get("result") or {}).get("list") or []
-            head = lst[0] if lst else {}
-            sz = head.get("size")
-            return _as_decimal(sz) or Decimal("0")
-    except Exception:
-        log.debug("get position size failed (trailer) for %s", symbol)
         return None
 
 
