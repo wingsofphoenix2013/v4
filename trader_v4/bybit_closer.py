@@ -94,13 +94,12 @@ async def run_bybit_closer():
             log.exception("❌ Ошибка чтения/обработки из стрима %s", ORDERS_STREAM)
             await asyncio.sleep(1)
 
-
 # 🔸 Обработка одной записи из positions_bybit_orders (op="close")
 async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dict[str, Any]):
     async with sem:
         redis = infra.redis_client
 
-        # парсим payload
+        # парсинг payload
         try:
             data_raw = fields.get("data")
             if isinstance(data_raw, bytes):
@@ -210,6 +209,52 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     return
 
                 # фактическое закрытие на бирже
+                # перед попытками reduce-only выясняем текущее нетто-состояние на бирже (size и side)
+                try:
+                    query = f"category={CATEGORY}&symbol={symbol}"
+                    url   = f"{BASE_URL}/v5/position/list?{query}"
+                    ts    = int(time.time() * 1000)
+                    signed = _rest_sign(ts, query)
+                    headers = _private_headers(ts, signed)
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        r = await client.get(url, headers=headers)
+                        r.raise_for_status()
+                        data = r.json()
+                    lst  = (data.get("result") or {}).get("list") or []
+                    head = lst[0] if lst else {}
+                    exch_size = _as_decimal(head.get("size")) or Decimal("0")
+                    exch_side = (head.get("side") or "").strip().lower()  # 'buy'|'sell'|'' (oneway)
+                except Exception:
+                    # если не смогли опросить — мягко считаем размер неизвестным
+                    exch_size = None
+                    exch_side = ""
+
+                # reverse-guard: если причина reverse и на бирже уже противоположная сторона или size=0 — считаем хвоста старой позиции нет
+                if close_reason == "closed.reverse_signal_stop":
+                    # сопоставляем «сторона биржи» с направлением старой позиции
+                    def _is_opposite(old_dir: str, side_str: str) -> bool:
+                        # long ↔ sell, short ↔ buy
+                        if old_dir == "long" and side_str == "sell":
+                            return True
+                        if old_dir == "short" and side_str == "buy":
+                            return True
+                        return False
+
+                    if exch_size is not None and (exch_size <= 0 or _is_opposite(direction, exch_side)):
+                        # хвоста старой позиции нет — идем напрямую в reconcile БД и не трогаем ордера/стоп новой позиции
+                        await _reconcile_db_after_close(position_uid=position_uid, symbol=symbol, source_stream_id=source_stream_id)
+                        await _disarm_trailing(position_uid)
+                        await _publish_audit("position_closed_by_closer", {
+                            "position_uid": position_uid,
+                            "symbol": symbol,
+                            "sid": sid,
+                            "mode": "live",
+                            "note": "reverse-guard: no RO, direct reconcile",
+                        })
+                        await _ack_ok(entry_id)
+                        log.info("✅ LIVE closed (reverse-guard, reconcile only): sid=%s %s", sid, symbol)
+                        return
+
                 # шаг 1 — закрыть весь остаток reduce-only Market (до 3 попыток)
                 close_side = "sell" if direction == "long" else "buy"
                 for attempt in range(CLOSE_MAX_ATTEMPTS):
@@ -283,7 +328,6 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             finally:
                 # освобождение распределённого замка
                 await _release_dist_lock(gate_key, owner)
-
 
 # 🔸 ACK helper (для ORDERS_STREAM)
 async def _ack_ok(entry_id: str):
