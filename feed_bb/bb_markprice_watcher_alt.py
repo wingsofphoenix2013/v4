@@ -1,4 +1,4 @@
-# bb_markprice_watcher_alt.py — WS publicTrade (Bybit v5 linear) для всех активных → Redis: bb_last_alt:price:{symbol}, запись раз в секунду
+# bb_markprice_watcher_alt.py — WS publicTrade (Bybit v5 linear) → Redis: bb_last_alt:price:{symbol}, запись 1 Гц; в батчах берём САМУЮ СВЕЖУЮ сделку по метке времени
 
 # 🔸 Импорты и зависимости
 import os
@@ -17,7 +17,7 @@ log = logging.getLogger("BB_MARKPRICE_ALT")
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
 KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "20"))
 REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
-WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))  # ограничение внутренней очереди клиента WS
+WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))  # ограничение очереди клиента WS
 PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))  # TTL кэша precision (сек)
 WRITE_INTERVAL_SEC = int(os.getenv("BB_LAST_ALT_WRITE_SEC", "1"))  # период записи в Redis (сек)
 
@@ -85,6 +85,27 @@ def _round_down_price(v, digits: int) -> str:
     except (InvalidOperation, ValueError, TypeError):
         return str(v)
 
+# выбираем самую свежую сделку из массива data по таймстемпу
+def _pick_latest_trade(trades, topic_sym: str | None):
+    latest = None
+    latest_ts = -1
+    for item in trades:
+        # символ берём из топика (надёжнее), но на всякий случай поддерживаем s/symbol в item
+        sym = topic_sym or item.get("s") or item.get("symbol")
+        price = item.get("p") or item.get("price")
+        if sym is None or price is None:
+            continue
+        # Bybit publicTrade обычно даёт 'T' (ms); поддержим варианты 'ts'/'time'
+        ts = item.get("T") or item.get("ts") or item.get("time")
+        try:
+            ts_val = int(ts) if ts is not None else 0
+        except Exception:
+            ts_val = 0
+        if ts_val >= latest_ts:
+            latest_ts = ts_val
+            latest = (sym, price)
+    return latest  # (symbol, price) | None
+
 # 🔸 Формирование/отправка подписок (publicTrade)
 async def _send_sub_trades(ws, syms):
     if not syms:
@@ -124,11 +145,10 @@ async def run_markprice_watcher_alt_bb(pg_pool, redis):
     async def writer_loop():
         try:
             while True:
-                # запись цен для всех текущих активных символов
                 for sym in sorted(current):
                     p = last_trade_price.get(sym)
                     if p is None:
-                        # если ещё не приходили сделки по символу — пропускаем
+                        # цены по символу ещё не было — ждём первого трейда
                         continue
                     pp = await prec_price_cache.get(pg_pool, sym)
                     await redis.set(f"bb_last_alt:price:{sym}", _round_down_price(p, pp))
@@ -190,22 +210,23 @@ async def run_markprice_watcher_alt_bb(pg_pool, redis):
                         topic = msg.get("topic") or ""
                         if not topic.startswith("publicTrade."):
                             continue
+                        topic_sym = topic.split(".", 1)[1] if "." in topic else None
 
                         data = msg.get("data")
 
-                        # Bybit шлёт массив сделок; на всякий случай поддерживаем и одиночный объект
-                        if isinstance(data, list):
-                            for item in data:
-                                sym2 = item.get("s") or item.get("symbol")
-                                price2 = item.get("p") or item.get("price")
-                                if sym2 and price2 is not None:
-                                    last_trade_price[sym2] = price2
+                        # массив сделок: берём САМУЮ СВЕЖУЮ по таймстемпу
+                        if isinstance(data, list) and data:
+                            pick = _pick_latest_trade(data, topic_sym)
+                            if pick is not None:
+                                sym2, price2 = pick
+                                last_trade_price[sym2] = price2
                             continue
 
+                        # одиночный объект (редко, но поддержим)
                         if isinstance(data, dict):
-                            sym = data.get("s") or data.get("symbol")
+                            sym = (data.get("s") or data.get("symbol") or topic_sym)
                             price = data.get("p") or data.get("price")
-                            if sym and price is not None:
+                            if sym is not None and price is not None:
                                 last_trade_price[sym] = price
                             continue
 
