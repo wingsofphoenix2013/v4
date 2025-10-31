@@ -65,7 +65,7 @@ async def run_bybit_private_ws_sync_loop():
                         await _handle_ws_message(msg_raw)
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({"op": "ping"}))
-                        # пинг-понги уводим в DEBUG, чтобы не мусорили INFO
+                        # пинг/понги в DEBUG, чтобы не мусорили INFO
                         log.debug("BYBIT_SYNC → ping")
                         try:
                             pong_raw = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -90,16 +90,16 @@ async def _handle_ws_message(msg_raw: str):
     # служебные op-сообщения (auth/subscribe/ping/pong/и т. п.)
     if "op" in msg and "topic" not in msg:
         op = msg.get("op")
-        # пинг/понг — это «шум»: логируем на DEBUG
+        # пинг/понг — «шум»: логируем на DEBUG
         if op in ("ping", "pong"):
             args = msg.get("args")
             log.debug("BYBIT_SYNC recv %s: %s", op, args)
             return
-        # важные служебные подтверждения — на INFO
+        # подтверждения — тоже в DEBUG
         if op in ("auth", "subscribe"):
             log.debug("BYBIT_SYNC recv %s: %s", op, msg)
             return
-        # прочие служебные — оставим на INFO для видимости
+        # прочие служебные
         log.debug("BYBIT_SYNC recv op: %s", msg)
         return
 
@@ -147,6 +147,7 @@ async def _handle_ws_message(msg_raw: str):
     if topic == "order":
         published = 0
         for it in items:
+            # дополняем маппинг полями стоп-ордера (для аудитора)
             payload = {
                 "event": "order",
                 "category": it.get("category"),
@@ -163,6 +164,9 @@ async def _handle_ws_message(msg_raw: str):
                 "leavesQty": it.get("leavesQty"),
                 "avgPrice": it.get("avgPrice"),
                 "price": it.get("price"),
+                "stopOrderType": it.get("stopOrderType"),  # 'Stop' | 'StopLoss' | None
+                "triggerPrice": it.get("triggerPrice"),    # строка цены триггера (если есть)
+                "triggerBy": it.get("triggerBy"),          # 'LastPrice' | 'MarkPrice' | ...
                 "ts": ts,
             }
             try:
