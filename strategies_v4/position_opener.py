@@ -251,7 +251,7 @@ async def open_position(calc_result: PositionCalculation, signal_data: dict):
     factor_price = Decimal(f"1e-{precision_price}")
 
     notional_value = (calc_result.entry_price * calc_result.quantity).quantize(factor_price, rounding=ROUND_DOWN)
-    pnl = (-notional_value * Decimal("0.001")).quantize(factor_price, rounding=ROUND_DOWN)
+    pnl = (-notional_value * Decimal("0.0015")).quantize(factor_price, rounding=ROUND_DOWN)
 
     # Создание позиции в оперативной памяти
     state = PositionState(
