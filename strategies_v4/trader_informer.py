@@ -351,7 +351,7 @@ async def _handle_open_records(records):
             )
             await infra.redis_client.xack(STREAM_OPEN, CG_OPEN, record_id)
 
-            log.info(
+            log.debug(
                 "[PUB] opened v2 sid=%s uid=%s sym=%s dir=%s type=%s qty=%s lev=%s margin=%s ts=%s stream_id=%s",
                 strategy_id, position_uid, symbol, direction, payload["strategy_type"],
                 payload["quantity"], payload["leverage"], payload["margin_used"], payload["ts"], stream_id,
@@ -526,10 +526,10 @@ async def _read_open_loop():
     redis = infra.redis_client
     try:
         await redis.xgroup_create(STREAM_OPEN, CG_OPEN, id="$", mkstream=True)
-        log.info("📡 CG создана: %s → %s", STREAM_OPEN, CG_OPEN)
+        log.debug("📡 CG создана: %s → %s", STREAM_OPEN, CG_OPEN)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ CG уже существует: %s", CG_OPEN)
+            log.debug("ℹ️ CG уже существует: %s", CG_OPEN)
         else:
             log.exception("❌ Ошибка создания CG для %s", STREAM_OPEN)
             return
@@ -560,7 +560,7 @@ async def _read_update_loop():
         await redis.xgroup_create(STREAM_UPD, CG_UPD, id="$", mkstream=True)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ CG уже существует: %s", CG_UPD)
+            log.debug("ℹ️ CG уже существует: %s", CG_UPD)
         else:
             log.exception("❌ Ошибка создания CG для %s", STREAM_UPD)
             return
@@ -589,10 +589,10 @@ async def _read_state_loop():
     redis = infra.redis_client
     try:
         await redis.xgroup_create(STRATEGY_STATE_STREAM, CG_STATE, id="$", mkstream=True)
-        log.info("📡 CG создана: %s → %s", STRATEGY_STATE_STREAM, CG_STATE)
+        log.debug("📡 CG создана: %s → %s", STRATEGY_STATE_STREAM, CG_STATE)
     except Exception as e:
         if "BUSYGROUP" in str(e):
-            log.info("ℹ️ CG уже существует: %s", CG_STATE)
+            log.debug("ℹ️ CG уже существует: %s", CG_STATE)
         else:
             log.exception("❌ Ошибка создания CG для %s", STRATEGY_STATE_STREAM)
             return
@@ -600,7 +600,7 @@ async def _read_state_loop():
     # один раз при старте — собрать и залогировать размер watchlist
     global _watch_ids
     _watch_ids = {sid for sid, s in (config.strategies or {}).items() if s.get("trader_winner", False)}
-    log.info("🔎 TRADER_INFORMER: watchlist initialized — %d strategies", len(_watch_ids))
+    log.debug("🔎 TRADER_INFORMER: watchlist initialized — %d strategies", len(_watch_ids))
 
     while True:
         try:
@@ -624,9 +624,9 @@ async def _read_state_loop():
                             removed = _watch_ids - new_ids
 
                             if added:
-                                log.info("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
+                                log.debug("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
                             if removed:
-                                log.info("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
+                                log.debug("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
 
                             _watch_ids = new_ids
 
@@ -639,7 +639,7 @@ async def _read_state_loop():
 
 # 🔸 Публичная точка запуска воркера
 async def run_trader_informer():
-    log.info("🚀 Запуск воркера TRADER_INFORMER → %s", STREAM_OUT)
+    log.debug("🚀 Запуск воркера TRADER_INFORMER → %s", STREAM_OUT)
     await asyncio.gather(
         _read_open_loop(),
         _read_update_loop(),
