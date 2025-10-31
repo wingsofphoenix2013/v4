@@ -30,7 +30,7 @@ WINDOW_STEPS = {"7d": 7 * 4, "14d": 14 * 4, "28d": 28 * 4}
 
 # 🔸 Параметры статистики
 Z = 1.96
-BASELINE_WR = 0.55
+BASELINE_WR = 0.60
 
 # 🔸 Кэш весов модели (strategy_id,time_frame) → (weights, opts, ts)
 _weights_cache: Dict[Tuple[Optional[int], Optional[str]], Tuple[Dict[str, float], Dict, float]] = {}
