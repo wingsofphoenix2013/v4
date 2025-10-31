@@ -1,4 +1,4 @@
-# bb_markprice_watcher.py — общий WS для всех tickers.{symbol} (Bybit v5 linear) → bb:price:{symbol} (ограничение очереди WS, TTL-кэш precision, корректная отмена keepalive)
+# bb_markprice_watcher.py — общий WS Bybit v5 (linear) для markPrice и lastPrice → Redis (bb:price:{symbol}, bb_last:price:{symbol})
 
 # 🔸 Импорты и зависимости
 import os
@@ -17,12 +17,8 @@ log = logging.getLogger("BB_MARKPRICE")
 BYBIT_WS_URL = os.getenv("BYBIT_WS_PUBLIC_LINEAR", "wss://stream.bybit.com/v5/public/linear")
 KEEPALIVE_SEC = int(os.getenv("BB_WS_KEEPALIVE_SEC", "20"))
 REFRESH_ACTIVE_SEC = int(os.getenv("BB_ACTIVE_REFRESH_SEC", "60"))
-
-# ограничение внутренней очереди клиента websockets (для контроля роста памяти)
-WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))
-
-# TTL кэширования precision (секунды)
-PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))
+WS_MAX_QUEUE = int(os.getenv("BB_WS_MAX_QUEUE", "1000"))                 # ограничение очереди клиента WS
+PRECISION_CACHE_TTL_SEC = int(os.getenv("BB_PRECISION_CACHE_TTL_SEC", "3600"))  # TTL кэша precision (сек)
 
 # 🔸 TTL-кэш (для precision)
 class _TTLCache:
@@ -65,10 +61,10 @@ class PricePrecisionCache:
 
 prec_price_cache = PricePrecisionCache()
 
-# 🔸 fire-and-forget helper (поглощает исключение, чтоб не было "Future exception was never retrieved")
+# 🔸 fire-and-forget helper (поглощает исключение, чтобы не было warn про Future)
 def _ff(coro):
     t = asyncio.create_task(coro)
-    t.add_done_callback(lambda fut: fut.exception())  # читаем исключение, чтобы подавить warn
+    t.add_done_callback(lambda fut: fut.exception())
     return t
 
 # 🔸 Утилиты
@@ -116,11 +112,12 @@ async def run_markprice_watcher_bb(pg_pool, redis):
     current = set()
     backoff = 1.0
 
+    # keepalive-пинг Bybit WS
     async def keepalive(ws):
         try:
             while True:
                 try:
-                    await ws.send(json.dumps({"op": "ping"}))  # Bybit ping раз в KEEPALIVE_SEC
+                    await ws.send(json.dumps({"op": "ping"}))
                 except Exception:
                     return
                 await asyncio.sleep(KEEPALIVE_SEC)
@@ -143,7 +140,7 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                 BYBIT_WS_URL,
                 ping_interval=None,
                 close_timeout=5,
-                max_queue=WS_MAX_QUEUE,  # ограничиваем внутреннюю очередь клиента WS
+                max_queue=WS_MAX_QUEUE,
                 open_timeout=10,
             ) as ws:
                 # первичная подписка на все активные
@@ -156,19 +153,19 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                     last_refresh = asyncio.get_event_loop().time()
 
                     async for raw in ws:
-                        # служебные контрол-сообщения пропускаем
+                        # разбираем JSON; игнорируем мусор
                         try:
                             msg = json.loads(raw)
                         except Exception:
                             continue
 
-                        # Периодическая сверка набора символов
+                        # периодическая сверка набора символов
                         now = asyncio.get_event_loop().time()
                         if now - last_refresh >= REFRESH_ACTIVE_SEC:
                             last_refresh = now
                             active2 = set(await _load_active_symbols(pg_pool))
                             to_unsub = sorted(current - active2)
-                            to_sub   = sorted(active2 - current)
+                            to_sub = sorted(active2 - current)
                             if to_unsub:
                                 await _send_unsub(ws, to_unsub)
                                 for s in to_unsub:
@@ -181,26 +178,48 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                         if not topic.startswith("tickers."):
                             continue
 
-                        data = msg.get("data") or {}
+                        data = msg.get("data")
+
+                        # Bybit иногда шлёт массив объектов в data
+                        if isinstance(data, list) and data:
+                            for item in data:
+                                sym2 = item.get("symbol")
+                                if not sym2:
+                                    continue
+
+                                # markPrice
+                                mp2 = item.get("markPrice")
+                                if mp2 is not None:
+                                    pp2 = await prec_price_cache.get(pg_pool, sym2)
+                                    await redis.set(f"bb:price:{sym2}", _round_down_price(mp2, pp2))
+
+                                # lastPrice
+                                lp2 = item.get("lastPrice")
+                                if lp2 is not None:
+                                    pp2 = await prec_price_cache.get(pg_pool, sym2)
+                                    await redis.set(f"bb_last:price:{sym2}", _round_down_price(lp2, pp2))
+
+                            continue
+
+                        # обычный объект в data
+                        if not isinstance(data, dict):
+                            continue
+
                         sym = data.get("symbol")
                         if not sym:
-                            # Bybit иногда шлёт массив data; нормализуем
-                            arr = msg.get("data")
-                            if isinstance(arr, list) and arr:
-                                for item in arr:
-                                    sym2 = item.get("symbol")
-                                    mp2 = item.get("markPrice")
-                                    if sym2 and mp2 is not None:
-                                        pp = await prec_price_cache.get(pg_pool, sym2)
-                                        await redis.set(f"bb:price:{sym2}", _round_down_price(mp2, pp))
                             continue
 
-                        price = data.get("markPrice")
-                        if price is None:
-                            continue
+                        # markPrice (пишем независимо от наличия lastPrice)
+                        mp = data.get("markPrice")
+                        if mp is not None:
+                            pp = await prec_price_cache.get(pg_pool, sym)
+                            await redis.set(f"bb:price:{sym}", _round_down_price(mp, pp))
 
-                        pp = await prec_price_cache.get(pg_pool, sym)
-                        await redis.set(f"bb:price:{sym}", _round_down_price(price, pp))
+                        # lastPrice (пишем независимо от наличия markPrice)
+                        lp = data.get("lastPrice")
+                        if lp is not None:
+                            pp = await prec_price_cache.get(pg_pool, sym)
+                            await redis.set(f"bb_last:price:{sym}", _round_down_price(lp, pp))
 
                 finally:
                     # корректно завершаем keepalive
@@ -211,7 +230,7 @@ async def run_markprice_watcher_bb(pg_pool, redis):
                         pass
 
         except (ConnectionClosedError, asyncio.IncompleteReadError, OSError) as e:
-            # ожидаемые сетевые обрывы — плавный реконнект с джиттером и полным ресабскрайбом
+            # ожидаемые сетевые обрывы — реконнект с джиттером и полным ресабскрайбом
             wait = max(3.0, min(30.0, backoff * (1.5 + random.random() * 0.5)))
             log.info(f"MARKPRICE reconnect in {wait:.1f}s ({type(e).__name__})")
             await asyncio.sleep(wait)
