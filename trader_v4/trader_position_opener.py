@@ -63,7 +63,7 @@ async def run_trader_position_opener():
                 consumername=POS_OPEN_CONSUMER,
                 streams={POS_STATUS_STREAM: ">"},
                 count=100,
-                block=1000,  # мс
+                block=200,  # мс
             )
             if not batch:
                 continue

@@ -92,7 +92,7 @@ async def run_bybit_processor():
                 consumername=BYBIT_PROC_CONSUMER,
                 streams={ORDERS_STREAM: ">"},
                 count=100,
-                block=1000,  # мс
+                block=200,  # мс
             )
             if not entries:
                 continue
@@ -201,7 +201,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             if not await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
                 # короткий локальный ретрай; если не взяли — requeue + ACK (не оставляем в PEL)
                 for _ in range(10):
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.1)
                     if await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
                         break
                 else:
