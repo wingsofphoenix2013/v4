@@ -136,7 +136,13 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     if await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
                         break
                 else:
-                    log.info("⏳ Не взят замок %s — отложено (id=%s)", gate_key, entry_id)
+                    # requeue вместо возврата без ACK, чтобы не оставлять запись в PEL
+                    try:
+                        new_id = await redis.xadd(ORDERS_STREAM, {"data": data_raw})
+                        await redis.xack(ORDERS_STREAM, BYBIT_PROTECT_CG, entry_id)
+                        log.info("🔁 requeue due to busy gate %s (old_id=%s new_id=%s)", gate_key, entry_id, new_id)
+                    except Exception:
+                        log.exception("❌ requeue failed (id=%s)", entry_id)
                     return
 
             try:
@@ -172,7 +178,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     log.info("✅ DRY-RUN sl_protect applied (DB only): sid=%s %s", sid, symbol)
                     return
 
-                # live — перенос слот-лосса через /v5/position/trading-stop
+                # live — перенос стоп-лосса через /v5/position/trading-stop
                 # квантуем цену к шагу
                 rules = await _fetch_ticker_rules(symbol)
                 step_price = rules["step_price"]
@@ -201,6 +207,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 log.exception("❌ Ошибка обработки sl_protect для sid=%s symbol=%s (id=%s)", sid, symbol, entry_id)
                 # не ACK — вернёмся ретраем
             finally:
+                # освобождение распределённого замка
                 await _release_dist_lock(gate_key, owner)
 
 
@@ -333,6 +340,7 @@ async def _acquire_dist_lock(key: str, value: str, ttl: int) -> bool:
 
 # 🔸 Освобождение замка по владельцу (Lua check-and-del)
 async def _release_dist_lock(key: str, value: str):
+    # условия достаточности
     if not key:
         return
     try:

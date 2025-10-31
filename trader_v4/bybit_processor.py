@@ -199,13 +199,19 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             gate_key = f"tv4:gate:{sid}:{symbol}"
             owner = f"{BYBIT_PROC_CONSUMER}-{entry_id}"
             if not await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
-                # короткий локальный ретрай без ACK — вернёмся позже
+                # короткий локальный ретрай; если не взяли — requeue + ACK (не оставляем в PEL)
                 for _ in range(10):
                     await asyncio.sleep(0.2)
                     if await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
                         break
                 else:
-                    log.info("⏳ Не взят замок %s — отложено (id=%s)", gate_key, entry_id)
+                    try:
+                        # переочередить исходный payload в хвост стрима и ACK старый id
+                        new_id = await infra.redis_client.xadd(ORDERS_STREAM, {"data": data_raw})
+                        await infra.redis_client.xack(ORDERS_STREAM, BYBIT_PROC_CG, entry_id)
+                        log.info("🔁 requeue due to busy gate %s (old_id=%s new_id=%s)", gate_key, entry_id, new_id)
+                    except Exception:
+                        log.exception("❌ requeue failed (id=%s)", entry_id)
                     return
 
             try:

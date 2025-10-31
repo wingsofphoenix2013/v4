@@ -117,13 +117,14 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             return
 
         # ключевые поля
-        position_uid    = payload.get("position_uid")
-        sid             = int(payload.get("strategy_id"))
-        symbol          = payload.get("symbol")
-        order_mode      = payload.get("order_mode", TRADER_ORDER_MODE)
-        source_stream_id= payload.get("source_stream_id")
-        close_reason    = payload.get("close_reason") or "close_signal"
+        position_uid     = payload.get("position_uid")
+        sid              = int(payload.get("strategy_id"))
+        symbol           = payload.get("symbol")
+        order_mode       = payload.get("order_mode", TRADER_ORDER_MODE)
+        source_stream_id = payload.get("source_stream_id")
+        close_reason     = payload.get("close_reason") or "close_signal"
 
+        # условия достаточности
         if not (position_uid and symbol and sid and source_stream_id):
             log.info("❎ close payload incomplete — ACK (id=%s)", entry_id)
             await _ack_ok(entry_id)
@@ -143,7 +144,13 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     if await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
                         break
                 else:
-                    log.info("⏳ Не взят замок %s — отложено (id=%s)", gate_key, entry_id)
+                    # requeue вместо возврата без ACK, чтобы не оставлять запись в PEL
+                    try:
+                        new_id = await redis.xadd(ORDERS_STREAM, {"data": data_raw})
+                        await redis.xack(ORDERS_STREAM, BYBIT_CLOSER_CG, entry_id)
+                        log.info("🔁 requeue due to busy gate %s (old_id=%s new_id=%s)", gate_key, entry_id, new_id)
+                    except Exception:
+                        log.exception("❌ requeue failed (id=%s)", entry_id)
                     return
 
             try:
@@ -156,8 +163,9 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     """,
                     position_uid,
                 )
+
+                # если позиции нет — идемпотентный ACK
                 if not pos_row:
-                    # позиции нет — идемпотентный ACK
                     await _publish_audit("close_position_not_found", {
                         "position_uid": position_uid,
                         "symbol": symbol,
@@ -189,10 +197,8 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 # dry-run — без реальных вызовов
                 if order_mode == "dry_run":
                     await _reconcile_db_after_close(position_uid=position_uid, symbol=symbol, source_stream_id=source_stream_id)
-
                     # разоружить трейл (если был)
                     await _disarm_trailing(position_uid)
-
                     await _publish_audit("position_closed_by_closer", {
                         "position_uid": position_uid,
                         "symbol": symbol,
@@ -232,7 +238,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                         log.exception("❌ close market failed attempt=%s", attempt + 1)
 
                     # подождать чуть и проверить
-                    await asyncio.sleep(CLOSE_BACKOFF_SEQ[min(attempt, len(CLOSE_BACKOFF_SEQ)-1)])
+                    await asyncio.sleep(CLOSE_BACKOFF_SEQ[min(attempt, len(CLOSE_BACKOFF_SEQ) - 1)])
 
                 # шаг 2 — отменить все висящие ордера по символу
                 try:
@@ -275,6 +281,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 log.exception("❌ Ошибка обработки close для sid=%s symbol=%s (id=%s)", sid, symbol, entry_id)
                 # не ACK — вернёмся ретраем
             finally:
+                # освобождение распределённого замка
                 await _release_dist_lock(gate_key, owner)
 
 
@@ -490,6 +497,7 @@ async def _acquire_dist_lock(key: str, value: str, ttl: int) -> bool:
 
 # 🔸 Освобождение замка по владельцу (Lua check-and-del)
 async def _release_dist_lock(key: str, value: str):
+    # условия достаточности
     if not key:
         return
     try:

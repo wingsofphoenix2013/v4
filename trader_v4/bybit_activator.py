@@ -73,7 +73,6 @@ async def run_bybit_activator():
             log.exception("❌ Ошибка чтения/обработки из стрима %s", ORDER_STREAM)
             await asyncio.sleep(1)
 
-
 # 🔸 Обработка одной записи bybit_order_stream
 async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dict[str, Any]):
     async with sem:
@@ -130,13 +129,18 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
             gate_key = f"tv4:gate:{strategy_id}:{symbol}"
             owner = f"{ACTIVATOR_CONSUMER}-{entry_id}"
             if not await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
-                # короткий локальный ретрай без ACK
+                # короткий локальный ретрай; если не взяли — requeue + ACK (не оставляем в PEL)
                 for _ in range(10):
                     await asyncio.sleep(0.2)
                     if await _acquire_dist_lock(gate_key, owner, LOCK_TTL_SEC):
                         break
                 else:
-                    log.info("⏳ Не взят замок %s — отложено (id=%s)", gate_key, entry_id)
+                    try:
+                        new_id = await redis.xadd(ORDER_STREAM, {"data": data_raw})
+                        await redis.xack(ORDER_STREAM, ACTIVATOR_CG, entry_id)
+                        log.info("🔁 requeue due to busy gate %s (old_id=%s new_id=%s)", gate_key, entry_id, new_id)
+                    except Exception:
+                        log.exception("❌ requeue failed (id=%s)", entry_id)
                     return
 
             try:
@@ -258,7 +262,7 @@ async def _handle_order_event(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                 log.exception("❌ Ошибка активации SL on_tp (uid=%s L#%s)", position_uid, level)
             finally:
                 await _release_dist_lock(gate_key, owner)
-
+                
 # 🔸 ACK helper
 async def _ack_ok(entry_id: str):
     try:
