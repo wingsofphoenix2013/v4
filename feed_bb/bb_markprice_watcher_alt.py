@@ -1,4 +1,4 @@
-# bb_markprice_watcher_alt.py — WS publicTrade (Bybit v5 linear) → Redis: bb_last_alt:price:{symbol}, запись 1 Гц; в батчах берём САМУЮ СВЕЖУЮ сделку по метке времени
+# feed_bb/bb_markprice_watcher_alt.py — WS publicTrade (Bybit v5 linear) → Redis: bb:price:{symbol}, запись 1 Гц; в батчах берём САМУЮ СВЕЖУЮ сделку по таймстемпу
 
 # 🔸 Импорты и зависимости
 import os
@@ -90,12 +90,10 @@ def _pick_latest_trade(trades, topic_sym: str | None):
     latest = None
     latest_ts = -1
     for item in trades:
-        # символ берём из топика (надёжнее), но на всякий случай поддерживаем s/symbol в item
         sym = topic_sym or item.get("s") or item.get("symbol")
         price = item.get("p") or item.get("price")
         if sym is None or price is None:
             continue
-        # Bybit publicTrade обычно даёт 'T' (ms); поддержим варианты 'ts'/'time'
         ts = item.get("T") or item.get("ts") or item.get("time")
         try:
             ts_val = int(ts) if ts is not None else 0
@@ -148,10 +146,9 @@ async def run_markprice_watcher_alt_bb(pg_pool, redis):
                 for sym in sorted(current):
                     p = last_trade_price.get(sym)
                     if p is None:
-                        # цены по символу ещё не было — ждём первого трейда
                         continue
                     pp = await prec_price_cache.get(pg_pool, sym)
-                    await redis.set(f"bb_last_alt:price:{sym}", _round_down_price(p, pp))
+                    await redis.set(f"bb:price:{sym}", _round_down_price(p, pp))
                 await asyncio.sleep(WRITE_INTERVAL_SEC)
         except asyncio.CancelledError:
             return

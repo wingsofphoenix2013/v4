@@ -1,4 +1,4 @@
-# feed_bb_main.py — управляющий модуль feed_bb: запуск воркеров, 90с пауза для аггрегаторов и markprice
+# feed_bb/feed_bb_main.py — управляющий модуль feed_bb: запуск воркеров, 90с пауза для аггрегаторов и цены
 
 # 🔸 Импорты и зависимости
 import os
@@ -17,7 +17,7 @@ from bb_feed_and_aggregate import (
     run_feed_and_aggregator_m15_bb,
     run_feed_and_aggregator_h1_bb,
 )
-from bb_markprice_watcher import run_markprice_watcher_bb
+# from bb_markprice_watcher import run_markprice_watcher_bb  # 🔸 заглушено
 from bb_markprice_watcher_alt import run_markprice_watcher_alt_bb
 from feed_cleaner import run_feed_cleaner_bb
 
@@ -32,18 +32,18 @@ async def main():
     redis = init_redis_client()
     log.info("PG/Redis подключены (feed_bb)")
 
-    # 🔸 Пауза перед стартом WS-воркеров (аггрегаторы + markprice)
+    # 🔸 Пауза перед стартом WS-воркеров (аггрегаторы + цена)
     aggr_delay_sec = int(os.getenv("BB_AGGR_START_DELAY_SEC", "90"))
 
     async def delayed_ws_workers():
         if aggr_delay_sec > 0:
-            log.info(f"⏸ Пауза {aggr_delay_sec}s перед запуском агрегаторов и markprice (bb)")
+            log.info(f"⏸ Пауза {aggr_delay_sec}s перед запуском агрегаторов и цены (bb)")
             await asyncio.sleep(aggr_delay_sec)
         await asyncio.gather(
             run_safe_loop(lambda: run_feed_and_aggregator_m5_bb(pg_pool, redis),  "BB_FEED_AGGR:M5"),
             run_safe_loop(lambda: run_feed_and_aggregator_m15_bb(pg_pool, redis), "BB_FEED_AGGR:M15"),
             run_safe_loop(lambda: run_feed_and_aggregator_h1_bb(pg_pool, redis),  "BB_FEED_AGGR:H1"),
-            run_safe_loop(lambda: run_markprice_watcher_bb(pg_pool, redis),       "BB_MARKPRICE"),
+            # run_safe_loop(lambda: run_markprice_watcher_bb(pg_pool, redis),       "BB_MARKPRICE"),  # 🔸 заглушено
             run_safe_loop(lambda: run_markprice_watcher_alt_bb(pg_pool, redis),   "BB_MARKPRICE_ALT"),
         )
 
@@ -56,7 +56,7 @@ async def main():
         run_safe_loop(lambda: run_feed_healer_bb(pg_pool, redis),          "BB_FEED_HEALER"),
         run_safe_loop(lambda: run_tickers_precision_updater_bb(pg_pool),   "BB_PRECISION_UPDATER"),
         run_safe_loop(lambda: run_feed_cleaner_bb(pg_pool, redis),         "BB_FEED_CLEANER"),
-        delayed_ws_workers(),  # аггрегаторы и markprice стартуют спустя задержку
+        delayed_ws_workers(),  # агрегаторы и цена стартуют спустя задержку
     )
 
 if __name__ == "__main__":
