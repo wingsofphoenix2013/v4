@@ -90,7 +90,7 @@ async def mw_m15_pass(redis,
         log.debug(f"MW_M15 PASS done: symbols=0 written=0 errors=0 elapsed_ms={elapsed_ms}")
         return
 
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    now_ms = time.time_ns() // 1_000_000
     bar_open_ms = floor_to_bar(now_ms, TF)
     compute_with_l1 = make_compute_with_l1(live_cache, bar_open_ms)
 

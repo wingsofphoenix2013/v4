@@ -140,7 +140,7 @@ async def pack_m15_pass(redis,
         return
 
     # текущий бар и счётчики hit/miss L1
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    now_ms = time.time_ns() // 1_000_000
     bar_open_ms = floor_to_bar(now_ms, TF)
     hits_misses = {"hits": 0, "misses": 0}
     compute_with_l1 = make_compute_with_l1(live_cache, bar_open_ms, hits_misses)
