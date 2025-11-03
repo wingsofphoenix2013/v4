@@ -1,9 +1,10 @@
-# oracle_mw_backtest.py — воркер MW-backtest: подбор порогов (winrate/confidence) по 7d-отчёту на сетке фактических значений, запись поверхности (grid) и победителей (winner)
+# oracle_mw_backtest.py — воркер MW-backtest: 7d-подбор порогов (winrate/confidence) по кварталам/комбо/solo, защита от гонок, ограничение по confidence и массе
 
 # 🔸 Импорты
 import asyncio
 import logging
-from typing import Dict, List, Tuple, Iterable
+import json
+from typing import Dict, List, Tuple
 from datetime import datetime
 
 import infra
@@ -11,7 +12,7 @@ import infra
 # 🔸 Логгер
 log = logging.getLogger("ORACLE_MW_BACKTEST")
 
-# 🔸 Константы стрима-триггера (берём готовность отчётов для SENSE → confidence уже посчитан)
+# 🔸 Константы стрима-триггера (берём сообщения о готовности отчётов для SENSE → confidence уже посчитан)
 SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
 BT_CONSUMER_GROUP = "oracle_mw_backtest_group"
 BT_CONSUMER_NAME  = "oracle_mw_backtest_worker"
@@ -22,6 +23,12 @@ MAX_CONCURRENT_RUNS = 2
 # 🔸 Размер батча для вставки grid
 GRID_INSERT_BATCH = 1000
 
+# 🔸 Пороговые ограничения BT
+CONF_BT_MIN = 0.25          # глобальный пол для порога confidence (в сетке и у победителя)
+WINNER_MIN_ABS = 20         # минимум сделок у победителя в абсолюте
+WINNER_MIN_FRAC = 0.10      # минимум сделок у победителя как доля от baseline_trades (10%)
+ROW_MIN_SHARE = 0.03        # минимум массы для агрегатной строки (3% от всех сделок стратегии за 7d)
+
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_mw_backtest():
@@ -30,7 +37,7 @@ async def run_oracle_mw_backtest():
         log.debug("❌ Пропуск BACKTEST: PG/Redis не инициализированы")
         return
 
-    # создаём consumer-group (идемпотентно)
+    # создание группы потребителей (идемпотентно)
     try:
         await infra.redis_client.xgroup_create(
             name=SENSE_REPORT_READY_STREAM,
@@ -45,7 +52,8 @@ async def run_oracle_mw_backtest():
             return
 
     sem = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
-    log.debug("🚀 Старт воркера MW-backtest (max_parallel_runs=%d)", MAX_CONCURRENT_RUNS)
+    log.debug("🚀 Старт воркера MW-backtest (max_parallel_runs=%d, conf_min>=%.2f, winner_mass≥max(%d, %d%% baseline), row_min_share=%.1f%%)",
+              MAX_CONCURRENT_RUNS, CONF_BT_MIN, WINNER_MIN_ABS, int(WINNER_MIN_FRAC*100), ROW_MIN_SHARE*100)
 
     # основной цикл
     while True:
@@ -60,40 +68,51 @@ async def run_oracle_mw_backtest():
             if not resp:
                 continue
 
-            tasks = []
-            to_ack: List[Tuple[str, str]] = []  # (stream, msg_id)
-            for stream_name, msgs in resp:
-                for msg_id, fields in msgs:
-                    to_ack.append((stream_name, msg_id))
-                    try:
-                        payload = _safe_load_json(fields.get("data"))
-                        # берем только 7d
-                        tf = str(payload.get("time_frame", "")).strip()
-                        if tf != "7d":
-                            continue
-                        strategy_id = int(payload.get("strategy_id", 0))
-                        report_id   = int(payload.get("report_id", 0))
-                        window_end  = payload.get("window_end")
-                        if not (strategy_id and report_id and window_end):
-                            continue
-                        # запускаем guarded-задачу
-                        tasks.append(asyncio.create_task(
-                            _guarded_run(sem, strategy_id, report_id, window_end)
-                        ))
-                    except Exception:
-                        log.exception("❌ Ошибка парсинга сообщения BACKTEST")
+            tasks: List[asyncio.Task] = []
+            to_ack: List[str] = []
+            seen: set[Tuple[int, int]] = set()  # (strategy_id, report_id) — дедуп внутри батча
 
-            # ждём завершения задач по этому чтению
+            # разбор сообщений
+            for _stream, msgs in resp:
+                for msg_id, fields in msgs:
+                    to_ack.append(msg_id)
+                    try:
+                        payload = json.loads(fields.get("data", "{}") or "{}")
+                    except Exception:
+                        payload = {}
+
+                    # берём только 7d
+                    tf = str(payload.get("time_frame", "")).strip()
+                    if tf != "7d":
+                        continue
+
+                    # ключи
+                    try:
+                        strategy_id = int(payload.get("strategy_id", 0) or 0)
+                        report_id   = int(payload.get("report_id", 0) or 0)
+                        window_end  = payload.get("window_end")
+                    except Exception:
+                        strategy_id = 0; report_id = 0; window_end = None
+
+                    if not (strategy_id and report_id and window_end):
+                        continue
+
+                    k = (strategy_id, report_id)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+
+                    tasks.append(asyncio.create_task(_guarded_run(sem, strategy_id, report_id, window_end)))
+
+            # ждём завершения задач
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=False)
 
-            # ACK сообщений (после успешных задач — они сами не ACKают, ACK тут батчом)
+            # ACK сообщений
             if to_ack:
                 try:
                     await infra.redis_client.xack(
-                        SENSE_REPORT_READY_STREAM,
-                        BT_CONSUMER_GROUP,
-                        *[mid for (_s, mid) in to_ack]
+                        SENSE_REPORT_READY_STREAM, BT_CONSUMER_GROUP, *to_ack
                     )
                 except Exception:
                     log.exception("⚠️ Ошибка ACK для BACKTEST")
@@ -125,170 +144,220 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
         return
 
     async with infra.pg_pool.acquire() as conn:
-        # читаем депозит стратегии
-        deposit = await conn.fetchval("SELECT deposit FROM strategies_v4 WHERE id=$1", int(strategy_id))
-        try:
-            deposit_used = float(deposit) if (deposit is not None and float(deposit) > 0) else 1.0
-        except Exception:
-            deposit_used = 1.0
-
-        # идемпотентный bt_run (уникален на report_id)
-        row = await conn.fetchrow(
-            """
-            INSERT INTO oracle_mw_bt_run (strategy_id, report_id, time_frame, window_end, deposit_used)
-            VALUES ($1,$2,'7d',$3,$4)
-            ON CONFLICT (report_id) DO UPDATE
-              SET deposit_used = EXCLUDED.deposit_used
-            RETURNING id
-            """,
-            int(strategy_id), int(report_id), window_end_dt, float(deposit_used)
-        )
-        bt_run_id = int(row["id"])
-
-        # тянем все агрегаты по этому report_id
-        rows = await conn.fetch(
-            """
-            SELECT direction, timeframe, agg_type, agg_base,
-                   winrate::float8 AS wr,
-                   confidence::float8 AS conf,
-                   trades_total::int4 AS n,
-                   pnl_sum_total::float8 AS pnl
-            FROM oracle_mw_aggregated_stat
-            WHERE report_id = $1
-            """,
-            int(report_id)
-        )
-        if not rows:
-            log.info("ℹ️ BACKTEST: пустые агрегаты report_id=%s sid=%s — пропуск", report_id, strategy_id)
+        # берём advisory lock на report_id (сериализация расчёта)
+        locked = await conn.fetchval("SELECT pg_try_advisory_lock($1)", int(report_id))
+        if not locked:
+            log.debug("⏭️ BACKTEST: пропуск (уже идёт расчёт) sid=%s report_id=%s", strategy_id, report_id)
             return
+        try:
+            # депозит стратегии (знаменатель ROI)
+            deposit = await conn.fetchval("SELECT deposit FROM strategies_v4 WHERE id=$1", int(strategy_id))
+            try:
+                deposit_used = float(deposit) if (deposit is not None and float(deposit) > 0) else 1.0
+            except Exception:
+                deposit_used = 1.0
 
-        # группируем по блоку
-        blocks: Dict[Tuple[str, str, str, str], List[dict]] = {}
-        for r in rows:
-            key = (str(r["direction"]), str(r["timeframe"]), str(r["agg_type"]), str(r["agg_base"]))
-            blocks.setdefault(key, []).append({
-                "wr":   _r4(r["wr"]),
-                "conf": _r4(r["conf"]),
-                "n":    int(r["n"] or 0),
-                "pnl":  _r4f(r["pnl"]),
-            })
+            # идемпотентный bt_run (уникален на report_id)
+            row = await conn.fetchrow(
+                """
+                INSERT INTO oracle_mw_bt_run (strategy_id, report_id, time_frame, window_end, deposit_used)
+                VALUES ($1,$2,'7d',$3,$4)
+                ON CONFLICT (report_id) DO UPDATE
+                  SET deposit_used = EXCLUDED.deposit_used
+                RETURNING id
+                """,
+                int(strategy_id), int(report_id), window_end_dt, float(deposit_used)
+            )
+            bt_run_id = int(row["id"])
 
-        # чистим прошлые результаты этого bt_run (пересчёт идемпотентно)
-        async with conn.transaction():
-            await conn.execute("DELETE FROM oracle_mw_bt_grid   WHERE bt_run_id = $1", bt_run_id)
-            await conn.execute("DELETE FROM oracle_mw_bt_winner WHERE bt_run_id = $1", bt_run_id)
+            # общий объём закрытых сделок стратегии за 7d (для порога по строке)
+            closed_total = await conn.fetchval(
+                "SELECT closed_total FROM oracle_report_stat WHERE id = $1",
+                int(report_id)
+            )
+            closed_total = int(closed_total or 0)
+            row_min_trades = max(1, int(round(ROW_MIN_SHARE * closed_total)))
 
-        total_blocks = 0
-        total_cells  = 0
-        winners_written = 0
+            # тянем все агрегаты по этому report_id
+            rows = await conn.fetch(
+                """
+                SELECT direction, timeframe, agg_type, agg_base,
+                       winrate::float8 AS wr,
+                       confidence::float8 AS conf,
+                       trades_total::int4 AS n,
+                       pnl_sum_total::float8 AS pnl
+                FROM oracle_mw_aggregated_stat
+                WHERE report_id = $1
+                """,
+                int(report_id)
+            )
+            if not rows:
+                log.info("ℹ️ BACKTEST: пустые агрегаты report_id=%s sid=%s — пропуск", report_id, strategy_id)
+                return
 
-        # обрабатываем каждый блок
-        for (direction, timeframe, agg_type, agg_base), items in blocks.items():
-            # baseline по блоку
-            base_pnl = sum(x["pnl"] for x in items)
-            base_trd = sum(x["n"]   for x in items)
-            base_roi = base_pnl / deposit_used if deposit_used != 0 else 0.0
+            # аккумулируем baseline по блоку и формируем элементы для сетки с учётом порога на строку
+            baseline_acc: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+            blocks: Dict[Tuple[str, str, str, str], List[dict]] = {}
 
-            # дискретная сетка порогов
-            w_vals = sorted({_r4(x["wr"]) for x in items} | {0.0})
-            c_vals = sorted({_r4(x["conf"]) for x in items} | {0.0})
-            wi = {w: i for i, w in enumerate(w_vals)}
-            ci = {c: j for j, c in enumerate(c_vals)}
-            nw, nc = len(w_vals), len(c_vals)
+            for r in rows:
+                key = (str(r["direction"]), str(r["timeframe"]), str(r["agg_type"]), str(r["agg_base"]))
+                n = int(r["n"] or 0)
+                pnl = _r4f(r["pnl"])
 
-            # матрицы масс
-            P = [[0.0 for _ in range(nc)] for _ in range(nw)]
-            T = [[0   for _ in range(nc)] for _ in range(nw)]
+                # baseline накапливаем ВСЕГДА (без фильтра)
+                acc = baseline_acc.setdefault(key, {"trd": 0, "pnl": 0.0})
+                acc["trd"] += n
+                acc["pnl"] += pnl
 
-            for x in items:
-                i = wi[_r4(x["wr"])]
-                j = ci[_r4(x["conf"])]
-                P[i][j] += x["pnl"]
-                T[i][j] += x["n"]
+                # строки с малой массой (< 3% от всех сделок стратегии за 7d) в сетку не пускаем
+                if n < row_min_trades:
+                    continue
 
-            # суффиксные суммы (u ≥ i, v ≥ j)
-            PS = [[0.0 for _ in range(nc)] for _ in range(nw)]
-            TS = [[0   for _ in range(nc)] for _ in range(nw)]
-            for i in range(nw - 1, -1, -1):
-                for j in range(nc - 1, -1, -1):
-                    sP = P[i][j]
-                    sT = T[i][j]
-                    if i + 1 < nw:
-                        sP += PS[i + 1][j]
-                        sT += TS[i + 1][j]
-                    if j + 1 < nc:
-                        sP += PS[i][j + 1]
-                        sT += TS[i][j + 1]
-                    if (i + 1 < nw) and (j + 1 < nc):
-                        sP -= PS[i + 1][j + 1]
-                        sT -= TS[i + 1][j + 1]
-                    PS[i][j] = sP
-                    TS[i][j] = sT
+                blocks.setdefault(key, []).append({
+                    "wr":   _r4(r["wr"]),
+                    "conf": _r4(r["conf"]),
+                    "n":    n,
+                    "pnl":  pnl,
+                })
 
-            # сбор сетки для вставки + поиск победителя
-            grid_rows = []
-            best = None  # (roi, trades_kept, conf_min, wr_min, pnl)
-            for i, wmin in enumerate(w_vals):
-                for j, cmin in enumerate(c_vals):
-                    pnl_kept = _r4f(PS[i][j])
-                    trd_kept = int(TS[i][j])
-                    roi = pnl_kept / deposit_used if deposit_used != 0 else 0.0
+            # чистим прошлые результаты этого bt_run (пересчёт идемпотентно)
+            async with conn.transaction():
+                await conn.execute("DELETE FROM oracle_mw_bt_grid   WHERE bt_run_id = $1", bt_run_id)
+                await conn.execute("DELETE FROM oracle_mw_bt_winner WHERE bt_run_id = $1", bt_run_id)
 
-                    grid_rows.append((
-                        int(bt_run_id), str(direction), str(timeframe), str(agg_type), str(agg_base),
-                        _r4(wmin), _r4(cmin),
-                        int(trd_kept), _r4f(pnl_kept), _r6f(roi),
-                        int(base_trd), _r4f(base_pnl), _r6f(base_roi),
-                    ))
+            total_blocks = 0
+            total_cells  = 0
+            winners_written = 0
 
-                    cand = (roi, trd_kept, cmin, wmin, pnl_kept)
-                    if (best is None) or _better(cand, best):
-                        best = cand
+            # обработка каждого блока
+            for (direction, timeframe, agg_type, agg_base), items in blocks.items():
+                base_trd = int(baseline_acc.get((direction, timeframe, agg_type, agg_base), {}).get("trd", 0))
+                base_pnl = float(baseline_acc.get((direction, timeframe, agg_type, agg_base), {}).get("pnl", 0.0))
+                base_roi = base_pnl / deposit_used if deposit_used != 0 else 0.0
 
-            # вставка grid батчами
-            total_cells += len(grid_rows)
-            await _insert_grid_rows(conn, grid_rows)
+                # если baseline пуст (все строки блока отсеялись порогом по строке) — всё равно считаем блок по пустому набору
+                # сетка: дискретные значения порогов из данных блока + 0.0
+                w_vals = sorted(({_r4(x["wr"]) for x in items} | {0.0})) if items else [0.0]
+                c_vals = sorted(({_r4(x["conf"]) for x in items} | {0.0})) if items else [0.0]
 
-            # запись победителя
-            if best is not None:
-                roi, trd_kept, cmin, wmin, pnl_kept = best
-                uplift = roi - base_roi
-                await conn.execute(
-                    """
-                    INSERT INTO oracle_mw_bt_winner (
-                      bt_run_id, direction, timeframe, agg_type, agg_base,
-                      wr_min, conf_min, trades_kept, pnl_sum_total, roi,
-                      baseline_trades, baseline_pnl_sum, baseline_roi, uplift_roi
-                    ) VALUES (
-                      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+                # индексы
+                wi = {w: i for i, w in enumerate(w_vals)}
+                ci = {c: j for j, c in enumerate(c_vals)}
+                nw, nc = len(w_vals), len(c_vals)
+
+                # матрицы масс (по очищенным строкам)
+                P = [[0.0 for _ in range(nc)] for _ in range(nw)]
+                T = [[0   for _ in range(nc)] for _ in range(nw)]
+
+                for x in items:
+                    i = wi[_r4(x["wr"])]
+                    j = ci[_r4(x["conf"])]
+                    P[i][j] += x["pnl"]
+                    T[i][j] += x["n"]
+
+                # суффиксные суммы (u ≥ i, v ≥ j)
+                PS = [[0.0 for _ in range(nc)] for _ in range(nw)]
+                TS = [[0   for _ in range(nc)] for _ in range(nw)]
+                for i in range(nw - 1, -1, -1):
+                    for j in range(nc - 1, -1, -1):
+                        sP = P[i][j]
+                        sT = T[i][j]
+                        if i + 1 < nw:
+                            sP += PS[i + 1][j]
+                            sT += TS[i + 1][j]
+                        if j + 1 < nc:
+                            sP += PS[i][j + 1]
+                            sT += TS[i][j + 1]
+                        if (i + 1 < nw) and (j + 1 < nc):
+                            sP -= PS[i + 1][j + 1]
+                            sT -= TS[i + 1][j + 1]
+                        PS[i][j] = sP
+                        TS[i][j] = sT
+
+                # сбор сетки + поиск победителя (учитываем conf_min >= CONF_BT_MIN и массу победителя)
+                grid_rows = []
+                best = None  # (roi, trades_kept, conf_min, wr_min, pnl)
+
+                # минимальная масса у победителя
+                min_trades_winner = max(WINNER_MIN_ABS, int(round(WINNER_MIN_FRAC * base_trd)))
+
+                for i, wmin in enumerate(w_vals):
+                    for j, cmin in enumerate(c_vals):
+                        # глобальный пол по confidence для сетки и победителя
+                        if cmin < CONF_BT_MIN:
+                            continue
+
+                        pnl_kept = _r4f(PS[i][j])
+                        trd_kept = int(TS[i][j])
+                        roi = pnl_kept / deposit_used if deposit_used != 0 else 0.0
+
+                        # строка для grid
+                        grid_rows.append((
+                            int(bt_run_id), str(direction), str(timeframe), str(agg_type), str(agg_base),
+                            _r4(wmin), _r4(cmin),
+                            int(trd_kept), _r4f(pnl_kept), _r6f(roi),
+                            int(base_trd), _r4f(base_pnl), _r6f(base_roi),
+                        ))
+
+                        # кандидат в победители — только если масса достаточна
+                        if trd_kept < min_trades_winner:
+                            continue
+                        cand = (roi, trd_kept, cmin, wmin, pnl_kept)
+                        if (best is None) or _better(cand, best):
+                            best = cand
+
+                # вставка grid батчами (UPSERT — на случай повторов)
+                total_cells += len(grid_rows)
+                await _insert_grid_rows(conn, grid_rows)
+
+                # запись победителя
+                if best is not None:
+                    roi, trd_kept, cmin, wmin, pnl_kept = best
+                    uplift = roi - base_roi
+                    await conn.execute(
+                        """
+                        INSERT INTO oracle_mw_bt_winner (
+                          bt_run_id, strategy_id, direction, timeframe, agg_type, agg_base,
+                          wr_min, conf_min, trades_kept, pnl_sum_total, roi,
+                          baseline_trades, baseline_pnl_sum, baseline_roi, uplift_roi
+                        ) VALUES (
+                          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
+                        )
+                        ON CONFLICT (bt_run_id, direction, timeframe, agg_type, agg_base)
+                        DO UPDATE SET
+                          strategy_id       = EXCLUDED.strategy_id,
+                          wr_min            = EXCLUDED.wr_min,
+                          conf_min          = EXCLUDED.conf_min,
+                          trades_kept       = EXCLUDED.trades_kept,
+                          pnl_sum_total     = EXCLUDED.pnl_sum_total,
+                          roi               = EXCLUDED.roi,
+                          baseline_trades   = EXCLUDED.baseline_trades,
+                          baseline_pnl_sum  = EXCLUDED.baseline_pnl_sum,
+                          baseline_roi      = EXCLUDED.baseline_roi,
+                          uplift_roi        = EXCLUDED.uplift_roi
+                        """,
+                        int(bt_run_id), int(strategy_id),
+                        str(direction), str(timeframe), str(agg_type), str(agg_base),
+                        _r4(wmin), _r4(cmin), int(trd_kept), _r4f(pnl_kept), _r6f(roi),
+                        int(base_trd), _r4f(base_pnl), _r6f(base_roi), _r6f(uplift)
                     )
-                    ON CONFLICT (bt_run_id, direction, timeframe, agg_type, agg_base)
-                    DO UPDATE SET
-                      wr_min=$6, conf_min=$7, trades_kept=$8, pnl_sum_total=$9, roi=$10,
-                      baseline_trades=$11, baseline_pnl_sum=$12, baseline_roi=$13, uplift_roi=$14
-                    """,
-                    int(bt_run_id), str(direction), str(timeframe), str(agg_type), str(agg_base),
-                    _r4(wmin), _r4(cmin), int(trd_kept), _r4f(pnl_kept), _r6f(roi),
-                    int(base_trd), _r4f(base_pnl), _r6f(base_roi), _r6f(uplift)
-                )
-                winners_written += 1
+                    winners_written += 1
 
-            total_blocks += 1
+                total_blocks += 1
 
-        # итоговый лог
-        log.info(
-            "✅ MW_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d deposit=%.4f",
-            strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written, deposit_used
-        )
+            # итоговый лог
+            log.info(
+                "✅ MW_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d deposit=%.4f row_min=%d conf_min>=%.2f",
+                strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written, deposit_used, row_min_trades, CONF_BT_MIN
+            )
 
+        finally:
+            # снимаем advisory lock
+            try:
+                await conn.execute("SELECT pg_advisory_unlock($1)", int(report_id))
+            except Exception:
+                pass
 
-# 🔸 Безопасный JSON loader (строки из Redis Stream)
-def _safe_load_json(s):
-    try:
-        import json
-        return json.loads(s or "{}")
-    except Exception:
-        return {}
 
 # 🔸 Округления под числовые поля БД
 def _r4(x) -> float:
@@ -309,6 +378,7 @@ def _r6f(x) -> float:
     except Exception:
         return 0.0
 
+
 # 🔸 Сравнение кандидатов победителя (tie-breakers)
 def _better(a: Tuple[float, int, float, float, float],
             b: Tuple[float, int, float, float, float]) -> bool:
@@ -321,7 +391,8 @@ def _better(a: Tuple[float, int, float, float, float],
     if aw != bw: return aw > bw
     return False
 
-# 🔸 Вставка grid батчами
+
+# 🔸 Вставка grid батчами (UPSERT по уникальному ключу клетки)
 async def _insert_grid_rows(conn, rows: List[Tuple]):
     if not rows:
         return
@@ -333,6 +404,14 @@ async def _insert_grid_rows(conn, rows: List[Tuple]):
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
     )
+    ON CONFLICT (bt_run_id, direction, timeframe, agg_type, agg_base, wr_min, conf_min)
+    DO UPDATE SET
+      trades_kept      = EXCLUDED.trades_kept,
+      pnl_sum_total    = EXCLUDED.pnl_sum_total,
+      roi              = EXCLUDED.roi,
+      baseline_trades  = EXCLUDED.baseline_trades,
+      baseline_pnl_sum = EXCLUDED.baseline_pnl_sum,
+      baseline_roi     = EXCLUDED.baseline_roi
     """
     i = 0
     total = len(rows)
