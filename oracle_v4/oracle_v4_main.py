@@ -26,6 +26,7 @@ from oracle_pack_sense_stat import run_oracle_pack_sense
 from oracle_pack_lists import run_oracle_pack_lists
 # 🔸 импорт воркера backtest
 from oracle_mw_backtest import run_oracle_mw_backtest
+from oracle_pack_backtest import run_oracle_pack_backtest
 # 🔸 импорт воркера уборщика
 from oracle_cleaner import run_oracle_cleaner
 
@@ -100,6 +101,7 @@ async def main():
         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
         run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
         run_safe_loop(run_oracle_mw_backtest, "ORACLE_MW_BACKTEST"),
+        run_safe_loop(run_oracle_pack_backtest, "ORACLE_PACK_BACKTEST"),
     )
 
 if __name__ == "__main__":
