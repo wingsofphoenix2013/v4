@@ -147,7 +147,7 @@ async def _audit_mw(strategy_id: int, report_id: int, window_end_iso: str):
         # winners по report_id
         bt_run_ids = [int(r["id"]) for r in await conn.fetch("SELECT id FROM oracle_mw_bt_run WHERE report_id=$1", int(report_id))]
         if not bt_run_ids:
-            log.info("ℹ️ BT_AUDIT MW: нет bt_run для sid=%s rid=%s — пропуск", strategy_id, report_id)
+            log.debug("ℹ️ BT_AUDIT MW: нет bt_run для sid=%s rid=%s — пропуск", strategy_id, report_id)
             return
         winners = await conn.fetch(
             """
@@ -158,7 +158,7 @@ async def _audit_mw(strategy_id: int, report_id: int, window_end_iso: str):
             bt_run_ids, int(strategy_id)
         )
         if not winners:
-            log.info("ℹ️ BT_AUDIT MW: winners=0 (sid=%s rid=%s) — WL v3 должен быть пуст по всем блокам", strategy_id, report_id)
+            log.debug("ℹ️ BT_AUDIT MW: winners=0 (sid=%s rid=%s) — WL v3 должен быть пуст по всем блокам", strategy_id, report_id)
             return
 
         total_blocks = 0
@@ -222,14 +222,14 @@ async def _audit_mw(strategy_id: int, report_id: int, window_end_iso: str):
                     wr_min, conf_min, len(expected_ids), len(actual_ids), missing_ids, extra_ids, row_min_trades
                 )
             else:
-                log.info(
+                log.debug(
                     "✅ BT_AUDIT OK (MW): sid=%s rid=%s dir=%s tf=%s base=%s type=%s items=%d",
                     strategy_id, report_id, direction, timeframe, agg_base, agg_type, len(expected_ids)
                 )
 
             total_blocks += 1
 
-        log.info(
+        log.debug(
             "📊 BT_AUDIT SUMMARY (MW): sid=%s rid=%s blocks=%d missing=%d extra=%d row_min=%d",
             strategy_id, report_id, total_blocks, total_missing, total_extra, row_min_trades
         )
@@ -246,7 +246,7 @@ async def _audit_pack(strategy_id: int, report_id: int, window_end_iso: str):
         # winners по report_id
         bt_run_ids = [int(r["id"]) for r in await conn.fetch("SELECT id FROM oracle_pack_bt_run WHERE report_id=$1", int(report_id))]
         if not bt_run_ids:
-            log.info("ℹ️ BT_AUDIT PACK: нет bt_run для sid=%s rid=%s — пропуск", strategy_id, report_id)
+            log.debug("ℹ️ BT_AUDIT PACK: нет bt_run для sid=%s rid=%s — пропуск", strategy_id, report_id)
             return
         winners = await conn.fetch(
             """
@@ -257,7 +257,7 @@ async def _audit_pack(strategy_id: int, report_id: int, window_end_iso: str):
             bt_run_ids, int(strategy_id)
         )
         if not winners:
-            log.info("ℹ️ BT_AUDIT PACK: winners=0 (sid=%s rid=%s) — WL/BL v3 должен быть пуст по всем блокам", strategy_id, report_id)
+            log.debug("ℹ️ BT_AUDIT PACK: winners=0 (sid=%s rid=%s) — WL/BL v3 должен быть пуст по всем блокам", strategy_id, report_id)
             return
 
         total_blocks = 0
@@ -318,7 +318,7 @@ async def _audit_pack(strategy_id: int, report_id: int, window_end_iso: str):
                     wr_min, conf_min, len(wl_expected_ids), len(wl_actual_ids), wl_missing, wl_extra, row_min_trades
                 )
             else:
-                log.info(
+                log.debug(
                     "✅ BT_AUDIT OK (PACK WL): sid=%s rid=%s dir=%s tf=%s base=%s type=%s key=%s items=%d",
                     strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, len(wl_expected_ids)
                 )
@@ -368,14 +368,14 @@ async def _audit_pack(strategy_id: int, report_id: int, window_end_iso: str):
                     wr_min, conf_min, len(bl_expected_ids), len(bl_actual_ids), bl_missing, bl_extra, row_min_trades
                 )
             else:
-                log.info(
+                log.debug(
                     "✅ BT_AUDIT OK (PACK BL): sid=%s rid=%s dir=%s tf=%s base=%s type=%s key=%s items=%d",
                     strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, len(bl_expected_ids)
                 )
 
             total_blocks += 1
 
-        log.info(
+        log.debug(
             "📊 BT_AUDIT SUMMARY (PACK): sid=%s rid=%s blocks=%d wl_missing=%d wl_extra=%d bl_missing=%d bl_extra=%d row_min=%d",
             strategy_id, report_id, total_blocks,
             total_wl_missing, total_wl_extra, total_bl_missing, total_bl_extra, row_min_trades

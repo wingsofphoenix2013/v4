@@ -1,4 +1,4 @@
-# 🔸 oracle_cleaner.py — воркер очистки: ретеншн по БД (7 суток) и Redis Streams (24 часа)
+# 🔸 oracle_cleaner.py — воркер очистки: ретеншн по БД (28 суток) и Redis Streams (24 часа) + ранняя очистка backtest-таблиц
 
 # 🔸 Импорты
 import asyncio
@@ -12,13 +12,17 @@ import infra
 log = logging.getLogger("ORACLE_CLEANER")
 
 # 🔸 Константы воркера / параметры очистки
-# глубина хранения БД (скользящее окно)
+# глубина хранения БД (скользящее окно по отчетам; всё привязанное уезжает каскадом)
 DB_RETENTION_DAYS = 28
 # глубина хранения сообщений в Redis Streams (часы, скользящее окно)
 STREAM_RETENTION_HOURS = 24
 # параметры чтения стримов-триггеров
 READ_COUNT = 128
 READ_BLOCK_MS = 30_000
+
+# 🔸 Ранний ретеншн для артефактов backtest (чистим чаще, чем отчеты)
+BT_GRID_RETENTION_HOURS = 6     # oracle_*_bt_grid держим не дольше 6 часов
+BT_WINNER_RETENTION_HOURS = 24  # oracle_*_bt_winner держим не дольше 24 часов
 
 # 🔸 Стримы для триггера (по сообщениям этих стримов запускаем уборку)
 CLEAN_TRIGGER_STREAMS: Tuple[str, str] = (
@@ -52,7 +56,10 @@ async def run_oracle_cleaner():
     # создаём consumer group для обоих триггер-стримов (идемпотентно)
     await _ensure_consumer_groups()
 
-    log.debug("🚀 Старт воркера CLEANER (db_retention=%sd, stream_retention=%sh)", DB_RETENTION_DAYS, STREAM_RETENTION_HOURS)
+    log.debug(
+        "🚀 Старт воркера CLEANER (db_retention=%sd, stream_retention=%sh, bt_grid≤%sh, bt_winner≤%sh)",
+        DB_RETENTION_DAYS, STREAM_RETENTION_HOURS, BT_GRID_RETENTION_HOURS, BT_WINNER_RETENTION_HOURS
+    )
 
     # основной цикл чтения сообщений из двух стримов
     while True:
@@ -98,7 +105,9 @@ async def _ensure_consumer_groups():
     # создаём группу для каждого триггер-стрима (идемпотентно)
     for s in CLEAN_TRIGGER_STREAMS:
         try:
-            await infra.redis_client.xgroup_create(name=s, groupname=CLEANER_CONSUMER_GROUP, id="$", mkstream=True)
+            await infra.redis_client.xgroup_create(
+                name=s, groupname=CLEANER_CONSUMER_GROUP, id="$", mkstream=True
+            )
             log.debug("📡 Создана consumer group для стрима: %s", s)
         except Exception as e:
             # если группа уже существует — это норм
@@ -115,11 +124,14 @@ async def _cleanup_once():
     await _cleanup_db()
     # механическая чистка всех стримов oracle_v4
     await _trim_streams()
-
     # финальный лог-итог прохода
-    log.debug("🧹 Уборка завершена: cutoff_db=%s, stream_retention=%sh", cutoff_db, STREAM_RETENTION_HOURS)
+    log.debug(
+        "🧹 Уборка завершена: cutoff_db=%s, stream_retention=%sh, bt_grid≤%sh, bt_winner≤%sh",
+        cutoff_db, STREAM_RETENTION_HOURS, BT_GRID_RETENTION_HOURS, BT_WINNER_RETENTION_HOURS
+    )
 
-# 🔸 Уборка БД (исправлено: передаём cutoff_ts как timestamp, без арифметики в SQL)
+
+# 🔸 Уборка БД (retention для отчетов + ранняя чистка backtest-таблиц)
 async def _cleanup_db():
     # вычисляем «срез» как UTC-naive timestamp и передаём его параметром
     cutoff_ts = datetime.utcnow().replace(tzinfo=None) - timedelta(days=DB_RETENTION_DAYS)
@@ -152,7 +164,7 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
-            # удаляем шапки отчётов (каскадом удалит агрегаты/sense/WL/BL)
+            # удаляем шапки отчётов (каскадом удалит агрегаты/sense/WL/BL и bt_run + всё, что от него зависит)
             reports_deleted = await conn.fetchval(
                 """
                 WITH del AS (
@@ -165,14 +177,69 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
+            # ранний (короткий) ретеншн для артефактов backtest
+            mw_grid_deleted = await conn.fetchval(
+                """
+                WITH del AS (
+                  DELETE FROM oracle_mw_bt_grid
+                   WHERE created_at < now() - ($1::interval)
+                   RETURNING 1
+                )
+                SELECT COUNT(*)::int FROM del
+                """,
+                f"{BT_GRID_RETENTION_HOURS} hours",
+            )
+            pack_grid_deleted = await conn.fetchval(
+                """
+                WITH del AS (
+                  DELETE FROM oracle_pack_bt_grid
+                   WHERE created_at < now() - ($1::interval)
+                   RETURNING 1
+                )
+                SELECT COUNT(*)::int FROM del
+                """,
+                f"{BT_GRID_RETENTION_HOURS} hours",
+            )
+            mw_win_deleted = await conn.fetchval(
+                """
+                WITH del AS (
+                  DELETE FROM oracle_mw_bt_winner
+                   WHERE created_at < now() - ($1::interval)
+                   RETURNING 1
+                )
+                SELECT COUNT(*)::int FROM del
+                """,
+                f"{BT_WINNER_RETENTION_HOURS} hours",
+            )
+            pack_win_deleted = await conn.fetchval(
+                """
+                WITH del AS (
+                  DELETE FROM oracle_pack_bt_winner
+                   WHERE created_at < now() - ($1::interval)
+                   RETURNING 1
+                )
+                SELECT COUNT(*)::int FROM del
+                """,
+                f"{BT_WINNER_RETENTION_HOURS} hours",
+            )
+
     log.debug(
-        "🗄️ DB cleanup: reports_deleted=%d, conf_mw_deleted=%d, conf_pack_deleted=%d (retention=%sd)",
+        "🗄️ DB cleanup: reports_deleted=%d, conf_mw_deleted=%d, conf_pack_deleted=%d, "
+        "bt_grid_mw=%d, bt_grid_pack=%d, bt_win_mw=%d, bt_win_pack=%d (retention=%sd; bt_grid≤%sh; bt_winner≤%sh)",
         int(reports_deleted or 0),
         int(conf_mw_deleted or 0),
         int(conf_pack_deleted or 0),
+        int(mw_grid_deleted or 0),
+        int(pack_grid_deleted or 0),
+        int(mw_win_deleted or 0),
+        int(pack_win_deleted or 0),
         DB_RETENTION_DAYS,
+        BT_GRID_RETENTION_HOURS,
+        BT_WINNER_RETENTION_HOURS,
     )
-    
+
+
+# 🔸 Очистка Redis Streams (XTRIM MINID по всем стримам oracle_v4)
 async def _trim_streams():
     # узнаём серверное время Redis (секунды, микросекунды) и считаем minid для XTRIM MINID
     try:
@@ -192,8 +259,7 @@ async def _trim_streams():
         try:
             # XTRIM MINID ~ <minid>
             deleted = await infra.redis_client.xtrim(name=stream, minid=minid, approximate=True)
-            # redis-py возвращает число удалённых, приведём к int
-            d = int(deleted or 0)
+            d = int(deleted or 0)  # redis-py возвращает число удалённых
             total_deleted += d
             if d > 0:
                 log.debug("🧽 Redis trim: stream=%s minid=%s deleted=%d", stream, minid, d)
