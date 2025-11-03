@@ -117,7 +117,7 @@ async def _cleanup_once():
     await _trim_streams()
 
     # финальный лог-итог прохода
-    log.info("🧹 Уборка завершена: cutoff_db=%s, stream_retention=%sh", cutoff_db, STREAM_RETENTION_HOURS)
+    log.debug("🧹 Уборка завершена: cutoff_db=%s, stream_retention=%sh", cutoff_db, STREAM_RETENTION_HOURS)
 
 # 🔸 Уборка БД (исправлено: передаём cutoff_ts как timestamp, без арифметики в SQL)
 async def _cleanup_db():
@@ -165,7 +165,7 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
-    log.info(
+    log.debug(
         "🗄️ DB cleanup: reports_deleted=%d, conf_mw_deleted=%d, conf_pack_deleted=%d (retention=%sd)",
         int(reports_deleted or 0),
         int(conf_mw_deleted or 0),
@@ -196,9 +196,9 @@ async def _trim_streams():
             d = int(deleted or 0)
             total_deleted += d
             if d > 0:
-                log.info("🧽 Redis trim: stream=%s minid=%s deleted=%d", stream, minid, d)
+                log.debug("🧽 Redis trim: stream=%s minid=%s deleted=%d", stream, minid, d)
         except Exception:
             log.exception("⚠️ Ошибка XTRIM MINID для стрима %s (minid=%s)", stream, minid)
 
     # сводка по стримам
-    log.info("📬 Redis streams cleanup: total_deleted=%d, retention=%sh (minid=%s)", total_deleted, STREAM_RETENTION_HOURS, minid)
+    log.debug("📬 Redis streams cleanup: total_deleted=%d, retention=%sh (minid=%s)", total_deleted, STREAM_RETENTION_HOURS, minid)
