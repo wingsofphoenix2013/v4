@@ -132,106 +132,100 @@ async def _cleanup_once():
 
 # 🔸 Уборка БД (retention для отчетов + ранняя чистка backtest-таблиц)
 async def _cleanup_db():
-    # вычисляем «срез» как UTC-naive timestamp и передаём его параметром
+    # срез по отчетам (удаляет каскадом всё старше DB_RETENTION_DAYS)
     cutoff_ts = datetime.utcnow().replace(tzinfo=None) - timedelta(days=DB_RETENTION_DAYS)
 
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # маркеры processed (MW)
+            # processed-маркеры
             conf_mw_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_conf_processed
-                   WHERE window_end < $1
-                   RETURNING 1
+                  WHERE window_end < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
                 cutoff_ts,
             )
-
-            # маркеры processed (PACK)
             conf_pack_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_conf_processed
-                   WHERE window_end < $1
-                   RETURNING 1
+                  WHERE window_end < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
                 cutoff_ts,
             )
 
-            # отчёты (каскадом удалит агрегаты/sense/WL/BL и bt_run + зависимые)
+            # отчеты (каскадом уедет всё привязанное)
             reports_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_report_stat
-                   WHERE window_end < $1
-                   RETURNING 1
+                  WHERE window_end < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
                 cutoff_ts,
             )
 
-            # ранний ретеншн для backtest-таблиц
-            grid_iv   = timedelta(hours=BT_GRID_RETENTION_HOURS)
-            winner_iv = timedelta(hours=BT_WINNER_RETENTION_HOURS)
+            # 🔸 ранняя чистка backtest-таблиц по «готовым» timestamp-срезам
+            grid_cutoff_ts   = datetime.utcnow().replace(tzinfo=None) - timedelta(hours=BT_GRID_RETENTION_HOURS)
+            winner_cutoff_ts = datetime.utcnow().replace(tzinfo=None) - timedelta(hours=BT_WINNER_RETENTION_HOURS)
 
             mw_grid_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_mw_bt_grid
-                   -- created_at TIMESTAMP WITHOUT TIME ZONE; приводим now() к беззонному
-                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
-                   RETURNING 1
+                  WHERE created_at < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                grid_iv,
+                grid_cutoff_ts,
             )
-
             pack_grid_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_bt_grid
-                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
-                   RETURNING 1
+                  WHERE created_at < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                grid_iv,
+                grid_cutoff_ts,
             )
-
             mw_win_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_mw_bt_winner
-                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
-                   RETURNING 1
+                  WHERE created_at < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                winner_iv,
+                winner_cutoff_ts,
             )
-
             pack_win_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_bt_winner
-                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
-                   RETURNING 1
+                  WHERE created_at < $1
+                  RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
                 """,
-                winner_iv,
+                winner_cutoff_ts,
             )
 
     log.debug(
         "🗄️ DB cleanup: reports_deleted=%d, conf_mw_deleted=%d, conf_pack_deleted=%d, "
-        "bt_grid_mw=%d, bt_grid_pack=%d, bt_win_mw=%d, bt_win_pack=%d (retention=%sd; bt_grid≤%sh; bt_winner≤%sh)",
+        "bt_grid_mw=%d, bt_grid_pack=%d, bt_win_mw=%d, bt_win_pack=%d (reports≤%sd; grid≤%sh; winner≤%sh)",
         int(reports_deleted or 0),
         int(conf_mw_deleted or 0),
         int(conf_pack_deleted or 0),
