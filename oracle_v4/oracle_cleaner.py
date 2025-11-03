@@ -137,7 +137,7 @@ async def _cleanup_db():
 
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # удаляем маркеры processed (MW)
+            # маркеры processed (MW)
             conf_mw_deleted = await conn.fetchval(
                 """
                 WITH del AS (
@@ -150,7 +150,7 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
-            # удаляем маркеры processed (PACK)
+            # маркеры processed (PACK)
             conf_pack_deleted = await conn.fetchval(
                 """
                 WITH del AS (
@@ -163,7 +163,7 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
-            # удаляем шапки отчётов (каскадом удалит агрегаты/sense/WL/BL и bt_run + всё, что от него зависит)
+            # отчёты (каскадом удалит агрегаты/sense/WL/BL и bt_run + зависимые)
             reports_deleted = await conn.fetchval(
                 """
                 WITH del AS (
@@ -176,17 +176,16 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
-            # 🔸 Ранний (короткий) ретеншн для артефактов backtest — передаём interval как timedelta
+            # ранний ретеншн для backtest-таблиц
             grid_iv   = timedelta(hours=BT_GRID_RETENTION_HOURS)
             winner_iv = timedelta(hours=BT_WINNER_RETENTION_HOURS)
 
-            -- MW grid
             mw_grid_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_mw_bt_grid
-                   -- created_at TIMESTAMP WITHOUT TIME ZONE; приводим now() к беззонному через AT TIME ZONE 'utc'
-                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
+                   -- created_at TIMESTAMP WITHOUT TIME ZONE; приводим now() к беззонному
+                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -194,12 +193,11 @@ async def _cleanup_db():
                 grid_iv,
             )
 
-            -- PACK grid
             pack_grid_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_bt_grid
-                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
+                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -207,12 +205,11 @@ async def _cleanup_db():
                 grid_iv,
             )
 
-            -- MW winner
             mw_win_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_mw_bt_winner
-                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
+                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -220,12 +217,11 @@ async def _cleanup_db():
                 winner_iv,
             )
 
-            -- PACK winner
             pack_win_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_bt_winner
-                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
+                   WHERE created_at < ((now() AT TIME ZONE 'utc') - $1)
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -247,6 +243,7 @@ async def _cleanup_db():
         BT_GRID_RETENTION_HOURS,
         BT_WINNER_RETENTION_HOURS,
     )
+
 # 🔸 Очистка Redis Streams (XTRIM MINID по всем стримам oracle_v4)
 async def _trim_streams():
     # узнаём серверное время Redis (секунды, микросекунды) и считаем minid для XTRIM MINID
