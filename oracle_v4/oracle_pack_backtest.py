@@ -1,11 +1,11 @@
-# oracle_pack_backtest.py — воркер PACK-backtest: 7d-подбор порогов (winrate/confidence) по PACK-осям, защита от гонок, публикация WL/BL v3 (пороги как NUMERIC(6,4) + расширенные логи)
+# oracle_pack_backtest.py — воркер PACK-backtest: 7d-подбор порогов (winrate/confidence) по PACK-осям,
+# защита от гонок, публикация WL/BL v3 (пороги как NUMERIC(6,4), pass-through при baseline ROI>0)
 
 # 🔸 Импорты
 import asyncio
 import logging
 import json
-import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -34,8 +34,13 @@ CONF_BT_MIN     = 0.25   # глобальный нижний порог по con
 WINNER_MIN_ABS  = 20     # минимальная масса сделок у победителя (абс.)
 WINNER_MIN_FRAC = 0.10   # минимальная масса у победителя (доля от baseline_trades)
 ROW_MIN_SHARE   = 0.03   # строка попадает в сетку, если её масса ≥ 3% от всех сделок стратегии (7d)
-WR_BL_MAX       = 0.50   # порог для blacklist v3 (WinRate < 0.50)
-UPLIFT_MIN = 0.001
+
+# 🔸 Порог минимального улучшения ROI для назначения победителя
+UPLIFT_MIN = 0.001  # ≈ +0.1 п.п.
+
+# 🔸 Порог для blacklist v3
+WR_BL_MAX = 0.50
+
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_pack_backtest():
@@ -79,7 +84,7 @@ async def run_oracle_pack_backtest():
 
             tasks: List[asyncio.Task] = []
             to_ack: List[str] = []
-            seen: set[Tuple[int, int]] = set()  # дедуп в батче: (strategy_id, report_id)
+            seen: Set[Tuple[int, int]] = set()  # (strategy_id, report_id)
 
             for _stream, msgs in resp:
                 for msg_id, fields in msgs:
@@ -89,7 +94,6 @@ async def run_oracle_pack_backtest():
                     except Exception:
                         payload = {}
 
-                    # работаем только с 7d
                     if str(payload.get("time_frame", "")).strip() != "7d":
                         continue
 
@@ -103,10 +107,10 @@ async def run_oracle_pack_backtest():
                     if not (strategy_id and report_id and window_end):
                         continue
 
-                    k = (strategy_id, report_id)
-                    if k in seen:
+                    key = (strategy_id, report_id)
+                    if key in seen:
                         continue
-                    seen.add(k)
+                    seen.add(key)
 
                     tasks.append(asyncio.create_task(_guarded_run(sem, strategy_id, report_id, window_end)))
 
@@ -172,13 +176,13 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
             )
             bt_run_id = int(row["id"])
 
-            # общий объём закрытых сделок стратегии (7d) — для порога строки
+            # общий объём закрытых сделок стратегии (7d) — порог для строки
             closed_total = await conn.fetchval(
                 "SELECT closed_total FROM oracle_report_stat WHERE id = $1",
                 int(report_id)
             )
             closed_total = int(closed_total or 0)
-            row_min_trades = max(1, int(math.ceil(ROW_MIN_SHARE * float(closed_total))))
+            row_min_trades = max(1, int((ROW_MIN_SHARE * closed_total) + 0.9999))  # ceil
 
             # агрегаты 7d (весь набор)
             rows = await conn.fetch(
@@ -229,8 +233,11 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
             total_blocks = 0
             total_cells  = 0
             winners_written = 0
-            wl_v3_rows: List[Tuple] = []
-            bl_v3_rows: List[Tuple] = []
+
+            wl_rows: List[Tuple] = []  # (aggregated_id, strategy_id, direction, timeframe, pack_base, agg_type, agg_key, agg_value, winrate, confidence)
+            bl_rows: List[Tuple] = []
+            wl_ids: Set[int] = set()
+            bl_ids: Set[int] = set()
 
             for (direction, timeframe, pack_base, agg_type, agg_key), items in blocks.items():
                 base_trd = int(baseline_acc.get((direction, timeframe, pack_base, agg_type, agg_key), {}).get("trd", 0))
@@ -267,7 +274,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                             sP -= PS[i + 1][j + 1]; sT -= TS[i + 1][j + 1]
                         PS[i][j] = sP; TS[i][j] = sT
 
-                # сетка + выбор победителя (ограничения: conf_min, масса)
+                # сетка + выбор победителя
                 grid_rows = []
                 best = None  # (roi, trades_kept, conf_min(Dec), wr_min(Dec), pnl)
                 min_trades_winner = max(WINNER_MIN_ABS, int(round(WINNER_MIN_FRAC * base_trd)))
@@ -275,14 +282,14 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 for i, wmin in enumerate(w_vals):
                     for j, cmin in enumerate(c_vals):
                         if cmin < CONF_BT_MIN:
-                            continue  # глобальный пол по confidence
+                            continue
 
-                        d_wmin  = _n4d(wmin)   # NUMERIC(6,4)
-                        d_cmin  = _n4d(cmin)   # NUMERIC(6,4)
+                        d_wmin  = _n4d(wmin)
+                        d_cmin  = _n4d(cmin)
 
                         pnl_kept = _r4f(PS[i][j])
                         trd_kept = int(TS[i][j])
-                        roi = pnl_kept / deposit_used if deposit_used != 0 else 0.0
+                        roi      = pnl_kept / deposit_used if deposit_used != 0 else 0.0
 
                         grid_rows.append((
                             int(bt_run_id), str(direction), str(timeframe), str(pack_base), str(agg_type), str(agg_key),
@@ -297,107 +304,246 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         if (best is None) or _better(cand, best):
                             best = cand
 
-                # запись grid
                 total_cells += len(grid_rows)
                 await _insert_grid_rows(conn, grid_rows)
 
-                # запись победителя + подготовка WL/BL v3
+                published_winner_for_block = False
+
+                # победитель (только при pnl>0 и uplift>UPLIFT_MIN)
                 if best is not None:
                     roi, trd_kept, d_cmin, d_wmin, pnl_kept = best
 
-                    # 1) PnL должен быть положительным
                     if pnl_kept <= 0.0:
                         log.debug(
                             "⚠️ PACK-BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
                             strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
-                        total_blocks += 1
-                        continue
+                    else:
+                        uplift = roi - base_roi
+                        if uplift <= UPLIFT_MIN:
+                            log.debug(
+                                "⚠️ PACK-BACKTEST: skip winner (non-positive uplift) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s roi=%.6f base=%.6f upl=%.6f kept=%d",
+                                strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, roi, base_roi, uplift, trd_kept
+                            )
+                        else:
+                            # запись победителя
+                            await conn.execute(
+                                """
+                                INSERT INTO oracle_pack_bt_winner (
+                                  bt_run_id, strategy_id, direction, timeframe, pack_base, agg_type, agg_key,
+                                  wr_min, conf_min, trades_kept, pnl_sum_total, roi,
+                                  baseline_trades, baseline_pnl_sum, baseline_roi, uplift_roi
+                                ) VALUES (
+                                  $1,$2,$3,$4,$5,$6,$7,
+                                  $8,$9,$10,$11,$12,
+                                  $13,$14,$15,$16
+                                )
+                                ON CONFLICT (bt_run_id, direction, timeframe, pack_base, agg_type, agg_key)
+                                DO UPDATE SET
+                                  strategy_id      = EXCLUDED.strategy_id,
+                                  wr_min           = EXCLUDED.wr_min,
+                                  conf_min         = EXCLUDED.conf_min,
+                                  trades_kept      = EXCLUDED.trades_kept,
+                                  pnl_sum_total    = EXCLUDED.pnl_sum_total,
+                                  roi              = EXCLUDED.roi,
+                                  baseline_trades  = EXCLUDED.baseline_trades,
+                                  baseline_pnl_sum = EXCLUDED.baseline_pnl_sum,
+                                  baseline_roi     = EXCLUDED.baseline_roi,
+                                  uplift_roi       = EXCLUDED.uplift_roi
+                                """,
+                                int(bt_run_id), int(strategy_id),
+                                str(direction), str(timeframe), str(pack_base), str(agg_type), str(agg_key),
+                                d_wmin, d_cmin, int(trd_kept), _r4f(pnl_kept), _r6f(roi),
+                                int(base_trd), _r4f(base_pnl), _r6f(base_roi), _r6f(uplift)
+                            )
+                            published_winner_for_block = True
 
-                    # 2) Uplift ROI должен быть положительным
-                    uplift = roi - base_roi
-                    if uplift <= UPLIFT_MIN:
-                        log.debug(
-                            "⚠️ PACK-BACKTEST: skip winner (non-positive uplift) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s roi=%.6f base=%.6f upl=%.6f kept=%d",
-                            strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, roi, base_roi, uplift, trd_kept
-                        )
-                        total_blocks += 1
-                        continue
+                            # WL v3 — по порогам победителя + масса строки
+                            wl_block_rows = await conn.fetch(
+                                """
+                                SELECT
+                                  a.id            AS aggregated_id,
+                                  a.strategy_id   AS strategy_id,
+                                  a.direction     AS direction,
+                                  a.timeframe     AS timeframe,
+                                  a.pack_base     AS pack_base,
+                                  a.agg_type      AS agg_type,
+                                  a.agg_key       AS agg_key,
+                                  a.agg_value     AS agg_value,
+                                  a.winrate       AS winrate,
+                                  a.confidence    AS confidence
+                                FROM oracle_pack_aggregated_stat a
+                                WHERE a.report_id   = $1
+                                  AND a.strategy_id = $2
+                                  AND a.direction   = $3
+                                  AND a.timeframe   = $4
+                                  AND a.pack_base   = $5
+                                  AND a.agg_type    = $6
+                                  AND a.agg_key     = $7
+                                  AND a.trades_total >= $8
+                                  AND a.winrate     >= $9
+                                  AND a.confidence  >= $10
+                                """,
+                                int(report_id), int(strategy_id),
+                                str(direction), str(timeframe),
+                                str(pack_base), str(agg_type), str(agg_key),
+                                int(row_min_trades), d_wmin, d_cmin
+                            )
+                            for r in wl_block_rows:
+                                aid = int(r["aggregated_id"])
+                                if aid not in wl_ids:
+                                    wl_rows.append((
+                                        aid,
+                                        int(r["strategy_id"]),
+                                        str(r["direction"]),
+                                        str(r["timeframe"]),
+                                        str(r["pack_base"]),
+                                        str(r["agg_type"]),
+                                        str(r["agg_key"]),
+                                        str(r["agg_value"]),
+                                        float(r["winrate"] or 0.0),
+                                        float(r["confidence"] or 0.0),
+                                    ))
+                                    wl_ids.add(aid)
 
-                    await conn.execute(
+                            # BL v3 — дополняем: масса и (не проходит пороги) и низкий WR
+                            bl_block_rows = await conn.fetch(
+                                """
+                                SELECT
+                                  a.id            AS aggregated_id,
+                                  a.strategy_id   AS strategy_id,
+                                  a.direction     AS direction,
+                                  a.timeframe     AS timeframe,
+                                  a.pack_base     AS pack_base,
+                                  a.agg_type      AS agg_type,
+                                  a.agg_key       AS agg_key,
+                                  a.agg_value     AS agg_value,
+                                  a.winrate       AS winrate,
+                                  a.confidence    AS confidence
+                                FROM oracle_pack_aggregated_stat a
+                                WHERE a.report_id   = $1
+                                  AND a.strategy_id = $2
+                                  AND a.direction   = $3
+                                  AND a.timeframe   = $4
+                                  AND a.pack_base   = $5
+                                  AND a.agg_type    = $6
+                                  AND a.agg_key     = $7
+                                  AND a.trades_total >= $8
+                                  AND (a.winrate <  $9 OR a.confidence < $10)
+                                  AND a.winrate <  $11
+                                """,
+                                int(report_id), int(strategy_id),
+                                str(direction), str(timeframe),
+                                str(pack_base), str(agg_type), str(agg_key),
+                                int(row_min_trades), d_wmin, d_cmin, WR_BL_MAX
+                            )
+                            for r in bl_block_rows:
+                                aid = int(r["aggregated_id"])
+                                if aid not in bl_ids and aid not in wl_ids:
+                                    bl_rows.append((
+                                        aid,
+                                        int(r["strategy_id"]),
+                                        str(r["direction"]),
+                                        str(r["timeframe"]),
+                                        str(r["pack_base"]),
+                                        str(r["agg_type"]),
+                                        str(r["agg_key"]),
+                                        str(r["agg_value"]),
+                                        float(r["winrate"] or 0.0),
+                                        float(r["confidence"] or 0.0),
+                                    ))
+                                    bl_ids.add(aid)
+
+                # pass-through: winner нет/отклонён, но baseline ROI > 0 → WL/BL по WR 0.50 (масса строки)
+                if not published_winner_for_block and base_roi > 0.0:
+                    # WL pass-through (wr >= 0.50)
+                    pt_wl_rows = await conn.fetch(
                         """
-                        INSERT INTO oracle_pack_bt_winner (
-                          bt_run_id, strategy_id, direction, timeframe, pack_base, agg_type, agg_key,
-                          wr_min, conf_min, trades_kept, pnl_sum_total, roi,
-                          baseline_trades, baseline_pnl_sum, baseline_roi, uplift_roi
-                        ) VALUES (
-                          $1,$2,$3,$4,$5,$6,$7,
-                          $8,$9,$10,$11,$12,
-                          $13,$14,$15,$16
-                        )
-                        ON CONFLICT (bt_run_id, direction, timeframe, pack_base, agg_type, agg_key)
-                        DO UPDATE SET
-                          strategy_id      = EXCLUDED.strategy_id,
-                          wr_min           = EXCLUDED.wr_min,
-                          conf_min         = EXCLUDED.conf_min,
-                          trades_kept      = EXCLUDED.trades_kept,
-                          pnl_sum_total    = EXCLUDED.pnl_sum_total,
-                          roi              = EXCLUDED.roi,
-                          baseline_trades  = EXCLUDED.baseline_trades,
-                          baseline_pnl_sum = EXCLUDED.baseline_pnl_sum,
-                          baseline_roi     = EXCLUDED.baseline_roi,
-                          uplift_roi       = EXCLUDED.uplift_roi
+                        SELECT a.id AS aggregated_id, a.strategy_id, a.direction, a.timeframe,
+                               a.pack_base, a.agg_type, a.agg_key, a.agg_value,
+                               a.winrate, a.confidence
+                        FROM   oracle_pack_aggregated_stat a
+                        WHERE  a.report_id   = $1
+                          AND  a.strategy_id = $2
+                          AND  a.direction   = $3
+                          AND  a.timeframe   = $4
+                          AND  a.pack_base   = $5
+                          AND  a.agg_type    = $6
+                          AND  a.agg_key     = $7
+                          AND  a.trades_total >= $8
+                          AND  a.winrate >= $9
                         """,
-                        int(bt_run_id), int(strategy_id),
-                        str(direction), str(timeframe), str(pack_base), str(agg_type), str(agg_key),
-                        d_wmin, d_cmin, int(trd_kept), _r4f(pnl_kept), _r6f(roi),
-                        int(base_trd), _r4f(base_pnl), _r6f(base_roi), _r6f(uplift)
+                        int(report_id), int(strategy_id),
+                        str(direction), str(timeframe),
+                        str(pack_base), str(agg_type), str(agg_key),
+                        int(row_min_trades), WR_BL_MAX
                     )
-                    winners_written += 1
+                    wl_added = 0
+                    for r in pt_wl_rows:
+                        aid = int(r["aggregated_id"])
+                        if aid not in wl_ids:
+                            wl_rows.append((
+                                aid, int(r["strategy_id"]), str(r["direction"]), str(r["timeframe"]),
+                                str(r["pack_base"]), str(r["agg_type"]), str(r["agg_key"]), str(r["agg_value"]),
+                                float(r["winrate"] or 0.0), float(r["confidence"] or 0.0),
+                            ))
+                            wl_ids.add(aid)
+                            wl_added += 1
 
-                    # диагностический лог перед сбором WL/BL v3
+                    # BL pass-through (wr < 0.50)
+                    pt_bl_rows = await conn.fetch(
+                        """
+                        SELECT a.id AS aggregated_id, a.strategy_id, a.direction, a.timeframe,
+                               a.pack_base, a.agg_type, a.agg_key, a.agg_value,
+                               a.winrate, a.confidence
+                        FROM   oracle_pack_aggregated_stat a
+                        WHERE  a.report_id   = $1
+                          AND  a.strategy_id = $2
+                          AND  a.direction   = $3
+                          AND  a.timeframe   = $4
+                          AND  a.pack_base   = $5
+                          AND  a.agg_type    = $6
+                          AND  a.agg_key     = $7
+                          AND  a.trades_total >= $8
+                          AND  a.winrate < $9
+                        """,
+                        int(report_id), int(strategy_id),
+                        str(direction), str(timeframe),
+                        str(pack_base), str(agg_type), str(agg_key),
+                        int(row_min_trades), WR_BL_MAX
+                    )
+                    bl_added = 0
+                    for r in pt_bl_rows:
+                        aid = int(r["aggregated_id"])
+                        if aid not in bl_ids and aid not in wl_ids:
+                            bl_rows.append((
+                                aid, int(r["strategy_id"]), str(r["direction"]), str(r["timeframe"]),
+                                str(r["pack_base"]), str(r["agg_type"]), str(r["agg_key"]), str(r["agg_value"]),
+                                float(r["winrate"] or 0.0), float(r["confidence"] or 0.0),
+                            ))
+                            bl_ids.add(aid)
+                            bl_added += 1
+
                     log.debug(
-                        "PACK-BT winner thresholds: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s row_min=%d baseline_trd=%d",
-                        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, row_min_trades, base_trd
+                        "PACK-BT pass-through partition: sid=%s dir=%s tf=%s base=%s/%s key=%s base_roi=%.6f wl_added=%d bl_added=%d row_min=%d",
+                        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, base_roi, wl_added, bl_added, row_min_trades
                     )
-
-                    # WL v3 (по победным порогам) и BL v3 (дополнение в рамках блока)
-                    wl_rows, bl_rows, wl_probe_count = await _collect_wl_bl_v3_for_block(
-                        conn=conn,
-                        report_id=report_id,
-                        strategy_id=strategy_id,
-                        direction=direction,
-                        timeframe=timeframe,
-                        pack_base=pack_base,
-                        agg_type=agg_type,
-                        agg_key=agg_key,
-                        wr_min=d_wmin,
-                        conf_min=d_cmin,
-                        row_min_trades=row_min_trades,
-                    )
-                    if wl_probe_count == 0:
-                        log.debug(
-                            "WL v3 empty despite winner: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s",
-                            strategy_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin
-                        )
-                    wl_v3_rows.extend(wl_rows)
-                    bl_v3_rows.extend(bl_rows)
 
                 total_blocks += 1
 
-            # публикация WL/BL v3 (перестройка версии 'v3' для стратегии)
-            wl_count = 0
-            bl_count = 0
-            if wl_v3_rows or bl_v3_rows:
+            # публикация WL/BL v3 (если есть строки)
+            wl_count = len(wl_rows)
+            bl_count = len(bl_rows)
+            if wl_rows or bl_rows:
                 async with conn.transaction():
+                    # Полная перестройка v3-среза стратегии
                     await conn.execute(
                         "DELETE FROM oracle_pack_whitelist WHERE strategy_id = $1 AND version = 'v3'",
                         int(strategy_id)
                     )
-                    # WL
-                    i = 0
-                    while i < len(wl_v3_rows):
-                        chunk = wl_v3_rows[i:i+WL_INSERT_BATCH]
+                    # WL v3
+                    for i in range(0, wl_count, WL_INSERT_BATCH):
+                        chunk = wl_rows[i:i+WL_INSERT_BATCH]
                         await conn.executemany(
                             """
                             INSERT INTO oracle_pack_whitelist (
@@ -410,12 +556,9 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                             """,
                             chunk
                         )
-                        wl_count += len(chunk)
-                        i += len(chunk)
-                    # BL
-                    j = 0
-                    while j < len(bl_v3_rows):
-                        chunk = bl_v3_rows[j:j+WL_INSERT_BATCH]
+                    # BL v3
+                    for j in range(0, bl_count, WL_INSERT_BATCH):
+                        chunk = bl_rows[j:j+WL_INSERT_BATCH]
                         await conn.executemany(
                             """
                             INSERT INTO oracle_pack_whitelist (
@@ -428,8 +571,6 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                             """,
                             chunk
                         )
-                        bl_count += len(chunk)
-                        j += len(chunk)
 
                 # уведомление consumers о готовности v3
                 try:
@@ -454,9 +595,8 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
 
             # итоговый лог
             log.debug(
-                "✅ PACK_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d wl_v3=%d bl_v3=%d deposit=%.4f row_min=%d conf_min>=%.2f",
-                strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written, wl_count, bl_count,
-                deposit_used, row_min_trades, CONF_BT_MIN
+                "✅ PACK_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d wl_v3=%d bl_v3=%d",
+                strategy_id, report_id, bt_run_id, total_blocks, total_cells, wl_count, bl_count
             )
 
         finally:
@@ -467,129 +607,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 pass
 
 
-# 🔸 Сбор WL/BL v3 для одного блока (пороги NUMERIC(6,4) + диагностические логи)
-async def _collect_wl_bl_v3_for_block(
-    *,
-    conn,
-    report_id: int,
-    strategy_id: int,
-    direction: str,
-    timeframe: str,
-    pack_base: str,
-    agg_type: str,
-    agg_key: str,
-    wr_min: Decimal,
-    conf_min: Decimal,
-    row_min_trades: int,
-) -> Tuple[List[Tuple], List[Tuple], int]:
-    # лог параметров отбора
-    log.debug(
-        "WL/BL v3 collect: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s row_min=%d",
-        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, wr_min, conf_min, row_min_trades
-    )
-
-    # выбираем строки блока, прошедшие победные пороги (для WL v3)
-    rows_wl = await conn.fetch(
-        """
-        SELECT
-          a.id            AS aggregated_id,
-          a.strategy_id   AS strategy_id,
-          a.direction     AS direction,
-          a.timeframe     AS timeframe,
-          a.pack_base     AS pack_base,
-          a.agg_type      AS agg_type,
-          a.agg_key       AS agg_key,
-          a.agg_value     AS agg_value,
-          a.winrate       AS winrate,
-          a.confidence    AS confidence
-        FROM oracle_pack_aggregated_stat a
-        WHERE a.report_id   = $1
-          AND a.strategy_id = $2
-          AND a.direction   = $3
-          AND a.timeframe   = $4
-          AND a.pack_base   = $5
-          AND a.agg_type    = $6
-          AND a.agg_key     = $7
-          AND a.winrate     >= $8
-          AND a.confidence  >= $9
-          AND a.trades_total >= $10
-        """,
-        int(report_id), int(strategy_id), str(direction), str(timeframe),
-        str(pack_base), str(agg_type), str(agg_key),
-        wr_min, conf_min, int(row_min_trades)
-    )
-
-    wl_rows: List[Tuple] = []
-    for r in rows_wl:
-        wl_rows.append((
-            int(r["aggregated_id"]),
-            int(r["strategy_id"]),
-            str(r["direction"]),
-            str(r["timeframe"]),
-            str(r["pack_base"]),
-            str(r["agg_type"]),
-            str(r["agg_key"]),
-            str(r["agg_value"]),
-            float(r["winrate"] or 0.0),
-            float(r["confidence"] or 0.0),
-        ))
-
-    # выбираем строки блока, НЕ прошедшие победные пороги и с низким WR (для BL v3)
-    rows_bl = await conn.fetch(
-        """
-        SELECT
-          a.id            AS aggregated_id,
-          a.strategy_id   AS strategy_id,
-          a.direction     AS direction,
-          a.timeframe     AS timeframe,
-          a.pack_base     AS pack_base,
-          a.agg_type      AS agg_type,
-          a.agg_key       AS agg_key,
-          a.agg_value     AS agg_value,
-          a.winrate       AS winrate,
-          a.confidence    AS confidence
-        FROM oracle_pack_aggregated_stat a
-        WHERE a.report_id   = $1
-          AND a.strategy_id = $2
-          AND a.direction   = $3
-          AND a.timeframe   = $4
-          AND a.pack_base   = $5
-          AND a.agg_type    = $6
-          AND a.agg_key     = $7
-          AND a.trades_total >= $8
-          AND (a.winrate <  $9 OR a.confidence < $10)
-          AND a.winrate <  $11
-        """,
-        int(report_id), int(strategy_id), str(direction), str(timeframe),
-        str(pack_base), str(agg_type), str(agg_key),
-        int(row_min_trades), wr_min, conf_min, Decimal(str(WR_BL_MAX)).quantize(Decimal("0.0001"))
-    )
-
-    bl_rows: List[Tuple] = []
-    for r in rows_bl:
-        bl_rows.append((
-            int(r["aggregated_id"]),
-            int(r["strategy_id"]),
-            str(r["direction"]),
-            str(r["timeframe"]),
-            str(r["pack_base"]),
-            str(r["agg_type"]),
-            str(r["agg_key"]),
-            str(r["agg_value"]),
-            float(r["winrate"] or 0.0),
-            float(r["confidence"] or 0.0),
-        ))
-
-    # лог о факте отбора по блоку
-    log.debug(
-        "WL/BL v3 block result: sid=%s dir=%s tf=%s base=%s/%s key=%s wl=%d bl=%d",
-        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, len(wl_rows), len(bl_rows)
-    )
-
-    return wl_rows, bl_rows, len(rows_wl)
-
-
-# 🔸 Округления/квантизации под числовые поля БД
+# 🔸 Округления/квантизация под NUMERIC(6,4)
 def _r4f(x) -> float:
     try:
         return round(float(x or 0.0), 4)

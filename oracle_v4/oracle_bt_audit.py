@@ -1,4 +1,4 @@
-# oracle_bt_audit.py — воркер BT-audit: проверка соответствия WL/BL v3 фактическим данным по winner-порогам (без записи в БД — только логи)
+# oracle_bt_audit.py — воркер BT-audit: проверка соответствия WL/BL v3 фактическим данным по winner-порогам и в pass-through (без записи в БД — только логи)
 
 # 🔸 Импорты
 import asyncio
@@ -134,7 +134,7 @@ async def _guarded_audit(sem: asyncio.Semaphore, src: str, strategy_id: int, rep
             log.exception("❌ BT-AUDIT сбой: src=%s sid=%s rid=%s", src, strategy_id, report_id)
 
 
-# 🔸 Аудит MW v3 (WL и BL)
+# 🔸 Аудит MW v3 (WL и BL) + pass-through
 async def _audit_mw(strategy_id: int, report_id: int):
     async with infra.pg_pool.acquire() as conn:
         # порог массы на строку
@@ -148,9 +148,6 @@ async def _audit_mw(strategy_id: int, report_id: int):
         bt_run_ids = [int(r["id"]) for r in await conn.fetch(
             "SELECT id FROM oracle_mw_bt_run WHERE report_id=$1", int(report_id)
         )]
-        if not bt_run_ids:
-            log.debug("ℹ️ BT_AUDIT MW: нет bt_run (sid=%s rid=%s) — пропуск", strategy_id, report_id)
-            return
 
         winners = await conn.fetch(
             """
@@ -159,15 +156,16 @@ async def _audit_mw(strategy_id: int, report_id: int):
             WHERE bt_run_id = ANY($1::bigint[]) AND strategy_id = $2
             """,
             bt_run_ids, int(strategy_id)
-        )
-        if not winners:
-            log.debug("ℹ️ BT_AUDIT MW: winners=0 (sid=%s rid=%s) — WL/BL v3 по MW отсутствуют", strategy_id, report_id)
-            return
+        ) if bt_run_ids else []
 
         total_wl_missing = total_wl_extra = 0
         total_bl_missing = total_bl_extra = 0
         blocks = 0
 
+        # набор winner-блоков
+        winner_blocks: Set[Tuple[str, str, str, str]] = set()
+
+        # — проверка winner-блоков
         for w in winners:
             direction = str(w["direction"])
             timeframe = str(w["timeframe"])
@@ -176,7 +174,9 @@ async def _audit_mw(strategy_id: int, report_id: int):
             wr_min    = _n4d(w["wr_min"])
             conf_min  = _n4d(w["conf_min"])
 
-            # WL expected
+            winner_blocks.add((direction, timeframe, agg_type, agg_base))
+
+            # WL expected (по порогам)
             wl_expected = await conn.fetch(
                 """
                 SELECT a.id AS aggregated_id
@@ -229,7 +229,7 @@ async def _audit_mw(strategy_id: int, report_id: int):
                     strategy_id, report_id, direction, timeframe, agg_base, agg_type, len(wl_expected_ids)
                 )
 
-            # BL expected — дополняем в рамках блока: масса и (не проходит победные пороги) и низкий WR
+            # BL expected (масса & (wr<wr_min OR conf<conf_min) & wr<0.5)
             bl_expected = await conn.fetch(
                 """
                 SELECT a.id AS aggregated_id
@@ -284,13 +284,125 @@ async def _audit_mw(strategy_id: int, report_id: int):
 
             blocks += 1
 
+        # 🔸 PASS-THROUGH (MW): блоки без winner, но присутствующие в v3 → WL: wr≥0.5; BL: wr<0.5 (оба с порогом массы)
+        v3_blocks_rows = await conn.fetch(
+            """
+            SELECT DISTINCT a.direction, a.timeframe, a.agg_type, a.agg_base
+            FROM oracle_mw_whitelist w
+            JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE w.strategy_id = $1 AND w.version = 'v3' AND a.report_id = $2
+            """,
+            int(strategy_id), int(report_id)
+        )
+        v3_blocks = {(r["direction"], r["timeframe"], r["agg_type"], r["agg_base"]) for r in v3_blocks_rows}
+        pt_blocks = sorted(v3_blocks - {tuple(x) for x in winner_blocks})
+
+        for (direction, timeframe, agg_type, agg_base) in pt_blocks:
+            # WL expected (pass-through): mass & wr ≥ 0.50
+            pt_wl_exp = await conn.fetch(
+                """
+                SELECT a.id AS aggregated_id
+                FROM oracle_mw_aggregated_stat a
+                WHERE a.report_id   = $1
+                  AND a.strategy_id = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.agg_type    = $5
+                  AND a.agg_base    = $6
+                  AND a.trades_total >= $7
+                  AND a.winrate >= $8
+                """,
+                int(report_id), int(strategy_id),
+                direction, timeframe, agg_type, agg_base,
+                int(row_min_trades), WR_BL_MAX
+            )
+            pt_wl_exp_ids = {int(r["aggregated_id"]) for r in pt_wl_exp}
+
+            pt_wl_act = await conn.fetch(
+                """
+                SELECT w.aggregated_id
+                FROM oracle_mw_whitelist w
+                JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+                WHERE w.strategy_id = $1 AND w.version='v3' AND w.list='whitelist'
+                  AND a.report_id   = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.agg_type    = $5
+                  AND a.agg_base    = $6
+                """,
+                int(strategy_id), int(report_id),
+                direction, timeframe, agg_type, agg_base
+            )
+            pt_wl_act_ids = {int(r["aggregated_id"]) for r in pt_wl_act}
+
+            wl_missing = sorted(pt_wl_exp_ids - pt_wl_act_ids)
+            wl_extra   = sorted(pt_wl_act_ids - pt_wl_exp_ids)
+            if wl_missing or wl_extra:
+                total_wl_missing += len(wl_missing)
+                total_wl_extra   += len(wl_extra)
+                log.info(
+                    "❌ BT_AUDIT MISMATCH (MW WL PT): sid=%s rid=%s dir=%s tf=%s base=%s type=%s "
+                    "expected=%d actual=%d missing=%s extra=%s row_min=%d",
+                    strategy_id, report_id, direction, timeframe, agg_base, agg_type,
+                    len(pt_wl_exp_ids), len(pt_wl_act_ids), wl_missing, wl_extra, row_min_trades
+                )
+
+            # BL expected (pass-through): mass & wr < 0.50
+            pt_bl_exp = await conn.fetch(
+                """
+                SELECT a.id AS aggregated_id
+                FROM oracle_mw_aggregated_stat a
+                WHERE a.report_id   = $1
+                  AND a.strategy_id = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.agg_type    = $5
+                  AND a.agg_base    = $6
+                  AND a.trades_total >= $7
+                  AND a.winrate < $8
+                """,
+                int(report_id), int(strategy_id),
+                direction, timeframe, agg_type, agg_base,
+                int(row_min_trades), WR_BL_MAX
+            )
+            pt_bl_exp_ids = {int(r["aggregated_id"]) for r in pt_bl_exp}
+
+            pt_bl_act = await conn.fetch(
+                """
+                SELECT w.aggregated_id
+                FROM oracle_mw_whitelist w
+                JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+                WHERE w.strategy_id = $1 AND w.version='v3' AND w.list='blacklist'
+                  AND a.report_id   = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.agg_type    = $5
+                  AND a.agg_base    = $6
+                """,
+                int(strategy_id), int(report_id),
+                direction, timeframe, agg_type, agg_base
+            )
+            pt_bl_act_ids = {int(r["aggregated_id"]) for r in pt_bl_act}
+
+            bl_missing = sorted(pt_bl_exp_ids - pt_bl_act_ids)
+            bl_extra   = sorted(pt_bl_act_ids - pt_bl_exp_ids)
+            if bl_missing or bl_extra:
+                total_bl_missing += len(bl_missing)
+                total_bl_extra   += len(bl_extra)
+                log.info(
+                    "❌ BT_AUDIT MISMATCH (MW BL PT): sid=%s rid=%s dir=%s tf=%s base=%s type=%s "
+                    "expected=%d actual=%d missing=%s extra=%s row_min=%d",
+                    strategy_id, report_id, direction, timeframe, agg_base, agg_type,
+                    len(pt_bl_exp_ids), len(pt_bl_act_ids), bl_missing, bl_extra, row_min_trades
+                )
+
         log.debug(
             "📊 BT_AUDIT SUMMARY (MW): sid=%s rid=%s blocks=%d wl_missing=%d wl_extra=%d bl_missing=%d bl_extra=%d row_min=%d",
             strategy_id, report_id, blocks, total_wl_missing, total_wl_extra, total_bl_missing, total_bl_extra, row_min_trades
         )
 
 
-# 🔸 Аудит PACK v3 (WL и BL)
+# 🔸 Аудит PACK v3 (WL и BL) + pass-through
 async def _audit_pack(strategy_id: int, report_id: int):
     async with infra.pg_pool.acquire() as conn:
         # порог массы на строку
@@ -304,9 +416,6 @@ async def _audit_pack(strategy_id: int, report_id: int):
         bt_run_ids = [int(r["id"]) for r in await conn.fetch(
             "SELECT id FROM oracle_pack_bt_run WHERE report_id=$1", int(report_id)
         )]
-        if not bt_run_ids:
-            log.debug("ℹ️ BT_AUDIT PACK: нет bt_run (sid=%s rid=%s) — пропуск", strategy_id, report_id)
-            return
 
         winners = await conn.fetch(
             """
@@ -315,15 +424,16 @@ async def _audit_pack(strategy_id: int, report_id: int):
             WHERE bt_run_id = ANY($1::bigint[]) AND strategy_id = $2
             """,
             bt_run_ids, int(strategy_id)
-        )
-        if not winners:
-            log.debug("ℹ️ BT_AUDIT PACK: winners=0 (sid=%s rid=%s) — WL/BL v3 отсутствуют", strategy_id, report_id)
-            return
+        ) if bt_run_ids else []
 
         total_wl_missing = total_wl_extra = 0
         total_bl_missing = total_bl_extra = 0
         blocks = 0
 
+        # набор winner-блоков
+        winner_blocks: Set[Tuple[str, str, str, str, str]] = set()
+
+        # — проверка winner-блоков
         for w in winners:
             direction = str(w["direction"])
             timeframe = str(w["timeframe"])
@@ -332,6 +442,8 @@ async def _audit_pack(strategy_id: int, report_id: int):
             agg_key   = str(w["agg_key"])
             wr_min    = _n4d(w["wr_min"])
             conf_min  = _n4d(w["conf_min"])
+
+            winner_blocks.add((direction, timeframe, pack_base, agg_type, agg_key))
 
             # WL expected
             wl_expected = await conn.fetch(
@@ -434,6 +546,123 @@ async def _audit_pack(strategy_id: int, report_id: int):
                 )
 
             blocks += 1
+
+        # 🔸 PASS-THROUGH (PACK): блоки без winner, но присутствующие в v3 → WL: wr≥0.5; BL: wr<0.5
+        v3_blocks_rows = await conn.fetch(
+            """
+            SELECT DISTINCT a.direction, a.timeframe, a.pack_base, a.agg_type, a.agg_key
+            FROM oracle_pack_whitelist w
+            JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE w.strategy_id = $1 AND w.version = 'v3' AND a.report_id = $2
+            """,
+            int(strategy_id), int(report_id)
+        )
+        v3_blocks = {(r["direction"], r["timeframe"], r["pack_base"], r["agg_type"], r["agg_key"]) for r in v3_blocks_rows}
+        winner_blocks_pack = {(d, t, b, at, ak) for (d, t, b, at, ak) in v3_blocks if (d, t, b, at, ak) in v3_blocks}  # no-op, для читаемости
+        pt_blocks = sorted(v3_blocks - {tuple(x) for x in winner_blocks_pack}.union(set()))  # v3 - winners
+
+        for (direction, timeframe, pack_base, agg_type, agg_key) in pt_blocks:
+            # WL expected (pass-through): mass & wr ≥ 0.50
+            pt_wl_exp = await conn.fetch(
+                """
+                SELECT a.id AS aggregated_id
+                FROM oracle_pack_aggregated_stat a
+                WHERE a.report_id   = $1
+                  AND a.strategy_id = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.pack_base   = $5
+                  AND a.agg_type    = $6
+                  AND a.agg_key     = $7
+                  AND a.trades_total >= $8
+                  AND a.winrate >= $9
+                """,
+                int(report_id), int(strategy_id),
+                direction, timeframe, pack_base, agg_type, agg_key,
+                int(row_min_trades), WR_BL_MAX
+            )
+            pt_wl_exp_ids = {int(r["aggregated_id"]) for r in pt_wl_exp}
+
+            pt_wl_act = await conn.fetch(
+                """
+                SELECT w.aggregated_id
+                FROM oracle_pack_whitelist w
+                JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
+                WHERE w.strategy_id = $1 AND w.version='v3' AND w.list='whitelist'
+                  AND a.report_id   = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.pack_base   = $5
+                  AND a.agg_type    = $6
+                  AND a.agg_key     = $7
+                """,
+                int(strategy_id), int(report_id),
+                direction, timeframe, pack_base, agg_type, agg_key
+            )
+            pt_wl_act_ids = {int(r["aggregated_id"]) for r in pt_wl_act}
+
+            wl_missing = sorted(pt_wl_exp_ids - pt_wl_act_ids)
+            wl_extra   = sorted(pt_wl_act_ids - pt_wl_exp_ids)
+            if wl_missing or wl_extra:
+                total_wl_missing += len(wl_missing)
+                total_wl_extra   += len(wl_extra)
+                log.info(
+                    "❌ BT_AUDIT MISMATCH (PACK WL PT): sid=%s rid=%s dir=%s tf=%s base=%s type=%s key=%s "
+                    "expected=%d actual=%d missing=%s extra=%s row_min=%d",
+                    strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key,
+                    len(pt_wl_exp_ids), len(pt_wl_act_ids), wl_missing, wl_extra, row_min_trades
+                )
+
+            # BL expected (pass-through): mass & wr < 0.50
+            pt_bl_exp = await conn.fetch(
+                """
+                SELECT a.id AS aggregated_id
+                FROM oracle_pack_aggregated_stat a
+                WHERE a.report_id   = $1
+                  AND a.strategy_id = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.pack_base   = $5
+                  AND a.agg_type    = $6
+                  AND a.agg_key     = $7
+                  AND a.trades_total >= $8
+                  AND a.winrate < $9
+                """,
+                int(report_id), int(strategy_id),
+                direction, timeframe, pack_base, agg_type, agg_key,
+                int(row_min_trades), WR_BL_MAX
+            )
+            pt_bl_exp_ids = {int(r["aggregated_id"]) for r in pt_bl_exp}
+
+            pt_bl_act = await conn.fetch(
+                """
+                SELECT w.aggregated_id
+                FROM oracle_pack_whitelist w
+                JOIN oracle_pack_aggregated_stat a ON a.id = w.aggregated_id
+                WHERE w.strategy_id = $1 AND w.version='v3' AND w.list='blacklist'
+                  AND a.report_id   = $2
+                  AND a.direction   = $3
+                  AND a.timeframe   = $4
+                  AND a.pack_base   = $5
+                  AND a.agg_type    = $6
+                  AND a.agg_key     = $7
+                """,
+                int(strategy_id), int(report_id),
+                direction, timeframe, pack_base, agg_type, agg_key
+            )
+            pt_bl_act_ids = {int(r["aggregated_id"]) for r in pt_bl_act}
+
+            bl_missing = sorted(pt_bl_exp_ids - pt_bl_act_ids)
+            bl_extra   = sorted(pt_bl_act_ids - pt_bl_exp_ids)
+            if bl_missing or bl_extra:
+                total_bl_missing += len(bl_missing)
+                total_bl_extra   += len(bl_extra)
+                log.info(
+                    "❌ BT_AUDIT MISMATCH (PACK BL PT): sid=%s rid=%s dir=%s tf=%s base=%s type=%s key=%s "
+                    "expected=%d actual=%d missing=%s extra=%s row_min=%d",
+                    strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key,
+                    len(pt_bl_exp_ids), len(pt_bl_act_ids), bl_missing, bl_extra, row_min_trades
+                )
 
         log.debug(
             "📊 BT_AUDIT SUMMARY (PACK): sid=%s rid=%s blocks=%d wl_missing=%d wl_extra=%d bl_missing=%d bl_extra=%d row_min=%d",
