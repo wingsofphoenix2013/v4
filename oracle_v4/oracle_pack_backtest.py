@@ -1,4 +1,4 @@
-# oracle_pack_backtest.py — воркер PACK-backtest: 7d-подбор порогов (winrate/confidence) по PACK-осям, защита от гонок, публикация WL/BL v3
+# oracle_pack_backtest.py — воркер PACK-backtest: 7d-подбор порогов (winrate/confidence) по PACK-осям, защита от гонок, публикация WL/BL v3 (пороги как NUMERIC(6,4) + расширенные логи)
 
 # 🔸 Импорты
 import asyncio
@@ -6,6 +6,7 @@ import logging
 import json
 from typing import Dict, List, Tuple
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 import infra
 
@@ -38,7 +39,7 @@ WR_BL_MAX       = 0.50   # порог для blacklist v3 (WinRate < 0.50)
 async def run_oracle_pack_backtest():
     # условия достаточности окружения
     if infra.pg_pool is None or infra.redis_client is None:
-        log.debug("❌ Пропуск PACK-BACKTEST: PG/Redis не инициализированы")
+        log.info("❌ Пропуск PACK-BACKTEST: PG/Redis не инициализированы")
         return
 
     # создание consumer group (идемпотентно)
@@ -49,14 +50,14 @@ async def run_oracle_pack_backtest():
             id="$",
             mkstream=True,
         )
-        log.debug("📡 Создана группа потребителей в Redis Stream: %s", PACK_BT_CONSUMER_GROUP)
+        log.info("📡 Создана группа потребителей в Redis Stream: %s", PACK_BT_CONSUMER_GROUP)
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             log.exception("❌ Ошибка инициализации группы Redis Stream для PACK-BACKTEST")
             return
 
     sem = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
-    log.debug(
+    log.info(
         "🚀 Старт PACK-backtest (parallel=%d, conf_min>=%.2f, winner_mass≥max(%d,%d%% baseline), row_min_share=%.1f%%)",
         MAX_CONCURRENT_RUNS, CONF_BT_MIN, WINNER_MIN_ABS, int(WINNER_MIN_FRAC*100), ROW_MIN_SHARE*100
     )
@@ -117,7 +118,7 @@ async def run_oracle_pack_backtest():
                     log.exception("⚠️ Ошибка ACK для PACK-BACKTEST")
 
         except asyncio.CancelledError:
-            log.debug("⏹️ PACK-backtest остановлен по сигналу")
+            log.info("⏹️ PACK-backtest остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ Ошибка цикла PACK-backtest — пауза 5 секунд")
@@ -146,7 +147,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
         # advisory lock на report_id (сериализация расчёта)
         locked = await conn.fetchval("SELECT pg_try_advisory_lock($1)", int(report_id))
         if not locked:
-            log.debug("⏭️ PACK-BACKTEST: пропуск (уже идёт расчёт) sid=%s report_id=%s", strategy_id, report_id)
+            log.info("⏭️ PACK-BACKTEST: пропуск (уже идёт расчёт) sid=%s report_id=%s", strategy_id, report_id)
             return
         try:
             # депозит стратегии
@@ -212,8 +213,8 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     continue  # в сетку не пускаем малые строки
 
                 blocks.setdefault(key, []).append({
-                    "wr":   _r4(r["wr"]),
-                    "conf": _r4(r["conf"]),
+                    "wr":   _r4f(r["wr"]),
+                    "conf": _r4f(r["conf"]),
                     "n":    n,
                     "pnl":  pnl,
                 })
@@ -235,8 +236,8 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 base_roi = base_pnl / deposit_used if deposit_used != 0 else 0.0
 
                 # дискретная сетка порогов (+0.0)
-                w_vals = sorted(({_r4(x["wr"]) for x in items} | {0.0})) if items else [0.0]
-                c_vals = sorted(({_r4(x["conf"]) for x in items} | {0.0})) if items else [0.0]
+                w_vals = sorted(({_r4f(x["wr"]) for x in items} | {0.0})) if items else [0.0]
+                c_vals = sorted(({_r4f(x["conf"]) for x in items} | {0.0})) if items else [0.0]
                 wi = {w: i for i, w in enumerate(w_vals)}
                 ci = {c: j for j, c in enumerate(c_vals)}
                 nw, nc = len(w_vals), len(c_vals)
@@ -245,8 +246,8 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 P = [[0.0 for _ in range(nc)] for _ in range(nw)]
                 T = [[0   for _ in range(nc)] for _ in range(nw)]
                 for x in items:
-                    i = wi[_r4(x["wr"])]
-                    j = ci[_r4(x["conf"])]
+                    i = wi[_r4f(x["wr"])]
+                    j = ci[_r4f(x["conf"])]
                     P[i][j] += x["pnl"]
                     T[i][j] += x["n"]
 
@@ -266,7 +267,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
 
                 # сетка + выбор победителя (ограничения: conf_min, масса)
                 grid_rows = []
-                best = None  # (roi, trades_kept, conf_min, wr_min, pnl)
+                best = None  # (roi, trades_kept, conf_min(Dec), wr_min(Dec), pnl)
                 min_trades_winner = max(WINNER_MIN_ABS, int(round(WINNER_MIN_FRAC * base_trd)))
 
                 for i, wmin in enumerate(w_vals):
@@ -274,20 +275,23 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         if cmin < CONF_BT_MIN:
                             continue  # глобальный пол по confidence
 
+                        d_wmin  = _n4d(wmin)   # NUMERIC(6,4)
+                        d_cmin  = _n4d(cmin)   # NUMERIC(6,4)
+
                         pnl_kept = _r4f(PS[i][j])
                         trd_kept = int(TS[i][j])
                         roi = pnl_kept / deposit_used if deposit_used != 0 else 0.0
 
                         grid_rows.append((
                             int(bt_run_id), str(direction), str(timeframe), str(pack_base), str(agg_type), str(agg_key),
-                            _r4(wmin), _r4(cmin),
+                            d_wmin, d_cmin,
                             int(trd_kept), _r4f(pnl_kept), _r6f(roi),
                             int(base_trd), _r4f(base_pnl), _r6f(base_roi),
                         ))
 
                         if trd_kept < min_trades_winner:
                             continue
-                        cand = (roi, trd_kept, cmin, wmin, pnl_kept)
+                        cand = (roi, trd_kept, d_cmin, d_wmin, pnl_kept)
                         if (best is None) or _better(cand, best):
                             best = cand
 
@@ -297,12 +301,12 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
 
                 # запись победителя + подготовка WL/BL v3
                 if best is not None:
-                    roi, trd_kept, cmin, wmin, pnl_kept = best
+                    roi, trd_kept, d_cmin, d_wmin, pnl_kept = best
 
                     if pnl_kept <= 0.0:
                         log.info(
-                            "⚠️ PACK-BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%.4f conf>=%.4f kept=%d pnl=%.4f",
-                            strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, wmin, cmin, trd_kept, pnl_kept
+                            "⚠️ PACK-BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
+                            strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
                         total_blocks += 1
                         continue
@@ -334,13 +338,19 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         """,
                         int(bt_run_id), int(strategy_id),
                         str(direction), str(timeframe), str(pack_base), str(agg_type), str(agg_key),
-                        _r4(wmin), _r4(cmin), int(trd_kept), _r4f(pnl_kept), _r6f(roi),
+                        d_wmin, d_cmin, int(trd_kept), _r4f(pnl_kept), _r6f(roi),
                         int(base_trd), _r4f(base_pnl), _r6f(base_roi), _r6f(uplift)
                     )
                     winners_written += 1
 
+                    # диагностический лог перед сбором WL/BL v3
+                    log.info(
+                        "PACK-BT winner thresholds: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s row_min=%d baseline_trd=%d",
+                        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, row_min_trades, base_trd
+                    )
+
                     # WL v3 (по победным порогам) и BL v3 (дополнение в рамках блока)
-                    wl_rows, bl_rows = await _collect_wl_bl_v3_for_block(
+                    wl_rows, bl_rows, wl_probe_count = await _collect_wl_bl_v3_for_block(
                         conn=conn,
                         report_id=report_id,
                         strategy_id=strategy_id,
@@ -349,10 +359,15 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         pack_base=pack_base,
                         agg_type=agg_type,
                         agg_key=agg_key,
-                        wr_min=wmin,
-                        conf_min=cmin,
+                        wr_min=d_wmin,
+                        conf_min=d_cmin,
                         row_min_trades=row_min_trades,
                     )
+                    if wl_probe_count == 0:
+                        log.info(
+                            "WL v3 empty despite winner: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s",
+                            strategy_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin
+                        )
                     wl_v3_rows.extend(wl_rows)
                     bl_v3_rows.extend(bl_rows)
 
@@ -440,7 +455,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 pass
 
 
-# 🔸 Сбор WL/BL v3 для одного блока
+# 🔸 Сбор WL/BL v3 для одного блока (пороги NUMERIC(6,4) + диагностические логи)
 async def _collect_wl_bl_v3_for_block(
     *,
     conn,
@@ -451,10 +466,16 @@ async def _collect_wl_bl_v3_for_block(
     pack_base: str,
     agg_type: str,
     agg_key: str,
-    wr_min: float,
-    conf_min: float,
+    wr_min: Decimal,
+    conf_min: Decimal,
     row_min_trades: int,
-) -> Tuple[List[Tuple], List[Tuple]]:
+) -> Tuple[List[Tuple], List[Tuple], int]:
+    # лог параметров отбора
+    log.info(
+        "WL/BL v3 collect: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s row_min=%d",
+        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, wr_min, conf_min, row_min_trades
+    )
+
     # выбираем строки блока, прошедшие победные пороги (для WL v3)
     rows_wl = await conn.fetch(
         """
@@ -483,7 +504,7 @@ async def _collect_wl_bl_v3_for_block(
         """,
         int(report_id), int(strategy_id), str(direction), str(timeframe),
         str(pack_base), str(agg_type), str(agg_key),
-        float(wr_min), float(conf_min), int(row_min_trades)
+        wr_min, conf_min, int(row_min_trades)
     )
 
     wl_rows: List[Tuple] = []
@@ -524,12 +545,12 @@ async def _collect_wl_bl_v3_for_block(
           AND a.agg_type    = $6
           AND a.agg_key     = $7
           AND a.trades_total >= $8
-          AND (a.winrate < $9 OR a.confidence < $10)
-          AND a.winrate < $11
+          AND (a.winrate <  $9 OR a.confidence < $10)
+          AND a.winrate <  $11
         """,
         int(report_id), int(strategy_id), str(direction), str(timeframe),
         str(pack_base), str(agg_type), str(agg_key),
-        int(row_min_trades), float(wr_min), float(conf_min), float(WR_BL_MAX)
+        int(row_min_trades), wr_min, conf_min, Decimal(str(WR_BL_MAX)).quantize(Decimal("0.0001"))
     )
 
     bl_rows: List[Tuple] = []
@@ -547,16 +568,16 @@ async def _collect_wl_bl_v3_for_block(
             float(r["confidence"] or 0.0),
         ))
 
-    return wl_rows, bl_rows
+    # лог о факте отбора по блоку
+    log.info(
+        "WL/BL v3 block result: sid=%s dir=%s tf=%s base=%s/%s key=%s wl=%d bl=%d",
+        strategy_id, direction, timeframe, pack_base, agg_type, agg_key, len(wl_rows), len(bl_rows)
+    )
+
+    return wl_rows, bl_rows, len(rows_wl)
 
 
-# 🔸 Округления под числовые поля БД
-def _r4(x) -> float:
-    try:
-        return round(float(x or 0.0), 4)
-    except Exception:
-        return 0.0
-
+# 🔸 Округления/квантизации под числовые поля БД
 def _r4f(x) -> float:
     try:
         return round(float(x or 0.0), 4)
@@ -569,10 +590,16 @@ def _r6f(x) -> float:
     except Exception:
         return 0.0
 
+def _n4d(x) -> Decimal:
+    try:
+        return Decimal(str(x)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    except Exception:
+        return Decimal("0.0000")
+
 
 # 🔸 Сравнение кандидатов победителя (tie-breakers)
-def _better(a: Tuple[float, int, float, float, float],
-            b: Tuple[float, int, float, float, float]) -> bool:
+def _better(a: Tuple[float, int, Decimal, Decimal, float],
+            b: Tuple[float, int, Decimal, Decimal, float]) -> bool:
     # порядок: roi DESC, trades_kept DESC, conf_min DESC, wr_min DESC
     ar, an, ac, aw, _ = a
     br, bn, bc, bw, _ = b
