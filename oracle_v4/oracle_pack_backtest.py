@@ -39,7 +39,7 @@ WR_BL_MAX       = 0.50   # порог для blacklist v3 (WinRate < 0.50)
 async def run_oracle_pack_backtest():
     # условия достаточности окружения
     if infra.pg_pool is None or infra.redis_client is None:
-        log.info("❌ Пропуск PACK-BACKTEST: PG/Redis не инициализированы")
+        log.debug("❌ Пропуск PACK-BACKTEST: PG/Redis не инициализированы")
         return
 
     # создание consumer group (идемпотентно)
@@ -50,14 +50,14 @@ async def run_oracle_pack_backtest():
             id="$",
             mkstream=True,
         )
-        log.info("📡 Создана группа потребителей в Redis Stream: %s", PACK_BT_CONSUMER_GROUP)
+        log.debug("📡 Создана группа потребителей в Redis Stream: %s", PACK_BT_CONSUMER_GROUP)
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             log.exception("❌ Ошибка инициализации группы Redis Stream для PACK-BACKTEST")
             return
 
     sem = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
-    log.info(
+    log.debug(
         "🚀 Старт PACK-backtest (parallel=%d, conf_min>=%.2f, winner_mass≥max(%d,%d%% baseline), row_min_share=%.1f%%)",
         MAX_CONCURRENT_RUNS, CONF_BT_MIN, WINNER_MIN_ABS, int(WINNER_MIN_FRAC*100), ROW_MIN_SHARE*100
     )
@@ -118,7 +118,7 @@ async def run_oracle_pack_backtest():
                     log.exception("⚠️ Ошибка ACK для PACK-BACKTEST")
 
         except asyncio.CancelledError:
-            log.info("⏹️ PACK-backtest остановлен по сигналу")
+            log.debug("⏹️ PACK-backtest остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ Ошибка цикла PACK-backtest — пауза 5 секунд")
@@ -147,7 +147,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
         # advisory lock на report_id (сериализация расчёта)
         locked = await conn.fetchval("SELECT pg_try_advisory_lock($1)", int(report_id))
         if not locked:
-            log.info("⏭️ PACK-BACKTEST: пропуск (уже идёт расчёт) sid=%s report_id=%s", strategy_id, report_id)
+            log.debug("⏭️ PACK-BACKTEST: пропуск (уже идёт расчёт) sid=%s report_id=%s", strategy_id, report_id)
             return
         try:
             # депозит стратегии
@@ -193,7 +193,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 int(report_id)
             )
             if not rows:
-                log.info("ℹ️ PACK-BACKTEST: пустые агрегаты report_id=%s sid=%s — пропуск", report_id, strategy_id)
+                log.debug("ℹ️ PACK-BACKTEST: пустые агрегаты report_id=%s sid=%s — пропуск", report_id, strategy_id)
                 return
 
             # baseline и элементы блоков
@@ -304,7 +304,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     roi, trd_kept, d_cmin, d_wmin, pnl_kept = best
 
                     if pnl_kept <= 0.0:
-                        log.info(
+                        log.debug(
                             "⚠️ PACK-BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
                             strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
@@ -344,7 +344,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     winners_written += 1
 
                     # диагностический лог перед сбором WL/BL v3
-                    log.info(
+                    log.debug(
                         "PACK-BT winner thresholds: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s row_min=%d baseline_trd=%d",
                         strategy_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, row_min_trades, base_trd
                     )
@@ -364,7 +364,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         row_min_trades=row_min_trades,
                     )
                     if wl_probe_count == 0:
-                        log.info(
+                        log.debug(
                             "WL v3 empty despite winner: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s",
                             strategy_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin
                         )
@@ -441,7 +441,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     log.exception("❌ Ошибка публикации события v3 в %s", PACK_LISTS_REPORTS_READY_STREAM)
 
             # итоговый лог
-            log.info(
+            log.debug(
                 "✅ PACK_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d wl_v3=%d bl_v3=%d deposit=%.4f row_min=%d conf_min>=%.2f",
                 strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written, wl_count, bl_count,
                 deposit_used, row_min_trades, CONF_BT_MIN
@@ -471,7 +471,7 @@ async def _collect_wl_bl_v3_for_block(
     row_min_trades: int,
 ) -> Tuple[List[Tuple], List[Tuple], int]:
     # лог параметров отбора
-    log.info(
+    log.debug(
         "WL/BL v3 collect: sid=%s dir=%s tf=%s base=%s/%s key=%s wr_min=%s conf_min=%s row_min=%d",
         strategy_id, direction, timeframe, pack_base, agg_type, agg_key, wr_min, conf_min, row_min_trades
     )
@@ -569,7 +569,7 @@ async def _collect_wl_bl_v3_for_block(
         ))
 
     # лог о факте отбора по блоку
-    log.info(
+    log.debug(
         "WL/BL v3 block result: sid=%s dir=%s tf=%s base=%s/%s key=%s wl=%d bl=%d",
         strategy_id, direction, timeframe, pack_base, agg_type, agg_key, len(wl_rows), len(bl_rows)
     )
