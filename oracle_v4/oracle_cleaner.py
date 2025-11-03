@@ -176,15 +176,17 @@ async def _cleanup_db():
                 cutoff_ts,
             )
 
-            # 🔸 Ранний (короткий) ретеншн для артефактов backtest — используем timedelta для interval-параметров
+            # 🔸 Ранний (короткий) ретеншн для артефактов backtest — передаём interval как timedelta
             grid_iv   = timedelta(hours=BT_GRID_RETENTION_HOURS)
             winner_iv = timedelta(hours=BT_WINNER_RETENTION_HOURS)
 
+            -- MW grid
             mw_grid_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_mw_bt_grid
-                   WHERE created_at < (now() - $1)
+                   -- created_at TIMESTAMP WITHOUT TIME ZONE; приводим now() к беззонному через AT TIME ZONE 'utc'
+                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -192,11 +194,12 @@ async def _cleanup_db():
                 grid_iv,
             )
 
+            -- PACK grid
             pack_grid_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_bt_grid
-                   WHERE created_at < (now() - $1)
+                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -204,11 +207,12 @@ async def _cleanup_db():
                 grid_iv,
             )
 
+            -- MW winner
             mw_win_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_mw_bt_winner
-                   WHERE created_at < (now() - $1)
+                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -216,11 +220,12 @@ async def _cleanup_db():
                 winner_iv,
             )
 
+            -- PACK winner
             pack_win_deleted = await conn.fetchval(
                 """
                 WITH del AS (
                   DELETE FROM oracle_pack_bt_winner
-                   WHERE created_at < (now() - $1)
+                   WHERE created_at < ( (now() AT TIME ZONE 'utc') - $1 )
                    RETURNING 1
                 )
                 SELECT COUNT(*)::int FROM del
@@ -242,7 +247,6 @@ async def _cleanup_db():
         BT_GRID_RETENTION_HOURS,
         BT_WINNER_RETENTION_HOURS,
     )
-
 # 🔸 Очистка Redis Streams (XTRIM MINID по всем стримам oracle_v4)
 async def _trim_streams():
     # узнаём серверное время Redis (секунды, микросекунды) и считаем minid для XTRIM MINID
