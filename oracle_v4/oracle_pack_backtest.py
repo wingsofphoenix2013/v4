@@ -307,7 +307,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
 
                     # 1) PnL должен быть положительным
                     if pnl_kept <= 0.0:
-                        log.info(
+                        log.debug(
                             "⚠️ PACK-BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
                             strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
@@ -317,7 +317,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     # 2) Uplift ROI должен быть положительным
                     uplift = roi - base_roi
                     if uplift <= UPLIFT_MIN:
-                        log.info(
+                        log.debug(
                             "⚠️ PACK-BACKTEST: skip winner (non-positive uplift) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s roi=%.6f base=%.6f upl=%.6f kept=%d",
                             strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, roi, base_roi, uplift, trd_kept
                         )

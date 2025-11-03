@@ -1,4 +1,4 @@
-# oracle_mw_backtest.py — воркер MW-backtest: 7d-подбор порогов (winrate/confidence) с защитой от гонок, conf≥0.25, фильтрами по массе и публикацией WL v3 (пороги как NUMERIC(6,4))
+# oracle_mw_backtest.py — воркер MW-backtest: 7d-подбор порогов (winrate/confidence) с защитой от гонок, conf≥0.25, фильтрами по массе и публикацией WL/BL v3 (пороги как NUMERIC(6,4))
 
 # 🔸 Импорты
 import asyncio
@@ -19,7 +19,7 @@ SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"      # вход: г�
 BT_CONSUMER_GROUP = "oracle_mw_backtest_group"
 BT_CONSUMER_NAME  = "oracle_mw_backtest_worker"
 
-WHITELIST_READY_STREAM = "oracle:mw_whitelist:reports_ready"     # выход: готовность WL (v3)
+WHITELIST_READY_STREAM = "oracle:mw_whitelist:reports_ready"     # выход: готовность WL/BL v3
 WHITELIST_READY_MAXLEN = 10_000
 
 # 🔸 Параллелизм
@@ -37,6 +37,9 @@ ROW_MIN_SHARE   = 0.03   # минимальная масса для агрега
 
 # 🔸 Порог минимального улучшения ROI для назначения победителя
 UPLIFT_MIN = 0.001
+
+# 🔸 Порог для MW blacklist v3 (как в PACK)
+WR_BL_MAX = 0.50
 
 
 # 🔸 Публичная точка входа воркера
@@ -232,7 +235,8 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
             total_blocks = 0
             total_cells  = 0
             winners_written = 0
-            wl_rows: List[Tuple] = []  # кандидатные строки для WL v3 (все блоки-победители)
+            wl_rows: List[Tuple] = []  # кандидатные строки WL v3 (все блоки-победители)
+            bl_rows: List[Tuple] = []  # кандидатные строки BL v3 (все блоки-победители)
 
             for (direction, timeframe, agg_type, agg_base), items in blocks.items():
                 base_trd = int(baseline_acc.get((direction, timeframe, agg_type, agg_base), {}).get("trd", 0))
@@ -354,13 +358,13 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     )
                     winners_written += 1
 
-                    # диагностический лог перед сбором WL v3
+                    # диагностический лог перед сбором WL/BL v3
                     log.debug(
                         "MW-BT winner thresholds: sid=%s dir=%s tf=%s base=%s wr_min=%s conf_min=%s row_min=%d baseline_trd=%d",
                         strategy_id, direction, timeframe, agg_base, d_wmin, d_cmin, row_min_trades, base_trd
                     )
 
-                    # подготовка WL v3 для этого блока: все строки, прошедшие пороги (и >= row_min_trades)
+                    # WL v3: пороги победителя + масса строки
                     wl_block_rows = await conn.fetch(
                         """
                         SELECT
@@ -371,8 +375,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                           a.agg_base      AS agg_base,
                           a.agg_state     AS agg_state,
                           a.winrate       AS winrate,
-                          a.confidence    AS confidence,
-                          a.trades_total  AS trades_total
+                          a.confidence    AS confidence
                         FROM oracle_mw_aggregated_stat a
                         WHERE a.report_id   = $1
                           AND a.strategy_id = $2
@@ -380,14 +383,14 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                           AND a.timeframe   = $4
                           AND a.agg_type    = $5
                           AND a.agg_base    = $6
-                          AND a.winrate     >= $7
-                          AND a.confidence  >= $8
-                          AND a.trades_total >= $9
+                          AND a.trades_total >= $7
+                          AND a.winrate     >= $8
+                          AND a.confidence  >= $9
                         """,
                         int(report_id), int(strategy_id),
                         str(direction), str(timeframe),
                         str(agg_type), str(agg_base),
-                        d_wmin, d_cmin, int(row_min_trades)
+                        int(row_min_trades), d_wmin, d_cmin
                     )
                     if not wl_block_rows:
                         log.debug(
@@ -405,39 +408,94 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                             str(r["agg_state"]),
                             float(r["winrate"] or 0.0),
                             float(r["confidence"] or 0.0),
-                            'v3',
+                        ))
+
+                    # BL v3: дополняем в рамках блока — масса строки и (не проходит победные пороги) и низкий WR
+                    bl_block_rows = await conn.fetch(
+                        """
+                        SELECT
+                          a.id            AS aggregated_id,
+                          a.strategy_id   AS strategy_id,
+                          a.direction     AS direction,
+                          a.timeframe     AS timeframe,
+                          a.agg_base      AS agg_base,
+                          a.agg_state     AS agg_state,
+                          a.winrate       AS winrate,
+                          a.confidence    AS confidence
+                        FROM oracle_mw_aggregated_stat a
+                        WHERE a.report_id   = $1
+                          AND a.strategy_id = $2
+                          AND a.direction   = $3
+                          AND a.timeframe   = $4
+                          AND a.agg_type    = $5
+                          AND a.agg_base    = $6
+                          AND a.trades_total >= $7
+                          AND (a.winrate <  $8 OR a.confidence < $9)
+                          AND a.winrate <  $10
+                        """,
+                        int(report_id), int(strategy_id),
+                        str(direction), str(timeframe),
+                        str(agg_type), str(agg_base),
+                        int(row_min_trades), d_wmin, d_cmin, WR_BL_MAX
+                    )
+                    for r in bl_block_rows:
+                        bl_rows.append((
+                            int(r["aggregated_id"]),
+                            int(r["strategy_id"]),
+                            str(r["direction"]),
+                            str(r["timeframe"]),
+                            str(r["agg_base"]),
+                            str(r["agg_state"]),
+                            float(r["winrate"] or 0.0),
+                            float(r["confidence"] or 0.0),
                         ))
 
                 total_blocks += 1
 
-            # публикуем WL v3 (если есть блоки-победители и строки)
-            wl_inserted = 0
-            if wl_rows:
+            # публикуем WL/BL v3 (если есть блоки-победители и строки)
+            wl_count = len(wl_rows)
+            bl_count = len(bl_rows)
+            if wl_rows or bl_rows:
                 async with conn.transaction():
-                    # Перестраиваем v3-срез стратегии
+                    # Полная перестройка v3-среза стратегии
                     await conn.execute(
                         "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v3'",
                         int(strategy_id)
                     )
+                    # WL v3
                     i = 0
-                    total = len(wl_rows)
-                    while i < total:
+                    while i < len(wl_rows):
                         chunk = wl_rows[i:i+WL_INSERT_BATCH]
                         await conn.executemany(
                             """
                             INSERT INTO oracle_mw_whitelist (
                                 aggregated_id, strategy_id, direction, timeframe,
-                                agg_base, agg_state, winrate, confidence, version
+                                agg_base, agg_state, winrate, confidence, list, version
                             ) VALUES (
-                                $1,$2,$3,$4,$5,$6,$7,$8,$9
+                                $1,$2,$3,$4,$5,$6,$7,$8,'whitelist','v3'
                             )
                             """,
                             chunk
                         )
                         i += len(chunk)
-                        wl_inserted += len(chunk)
+                    # BL v3
+                    j = 0
+                    while j < len(bl_rows):
+                        chunk = bl_rows[j:j+WL_INSERT_BATCH]
+                        await conn.executemany(
+                            """
+                            INSERT INTO oracle_mw_whitelist (
+                                aggregated_id, strategy_id, direction, timeframe,
+                                agg_base, agg_state, winrate, confidence, list, version
+                            ) VALUES (
+                                $1,$2,$3,$4,$5,$6,$7,$8,'blacklist','v3'
+                            )
+                            """,
+                            chunk
+                        )
+                        j += len(chunk)
 
-                # событие WL v3 ready
+                # событие WL/BL v3 ready (оставим payload с rows_inserted = WL+BL)
                 try:
                     payload = {
                         "strategy_id": int(strategy_id),
@@ -445,7 +503,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         "time_frame": "7d",
                         "version": "v3",
                         "window_end": window_end_dt.isoformat(),
-                        "rows_inserted": int(wl_inserted),
+                        "rows_inserted": int(wl_count + bl_count),
                         "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
                     }
                     await infra.redis_client.xadd(
@@ -455,13 +513,13 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         approximate=True,
                     )
                 except Exception:
-                    log.exception("❌ Ошибка публикации события WL v3 в %s", WHITELIST_READY_STREAM)
+                    log.exception("❌ Ошибка публикации события WL/BL v3 в %s", WHITELIST_READY_STREAM)
 
             # итоговый лог
-            log.debug(
-                "✅ MW_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d wl_v3=%d deposit=%.4f row_min=%d conf_min>=%.2f",
-                strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written, wl_inserted,
-                deposit_used, row_min_trades, CONF_BT_MIN
+            log.info(
+                "✅ MW_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d wl_v3=%d bl_v3=%d deposit=%.4f row_min=%d conf_min>=%.2f",
+                strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written,
+                wl_count, bl_count, deposit_used, row_min_trades, CONF_BT_MIN
             )
 
         finally:
