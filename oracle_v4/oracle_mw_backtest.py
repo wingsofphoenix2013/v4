@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import json
+import math
 from typing import Dict, List, Tuple
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -178,7 +179,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 int(report_id)
             )
             closed_total = int(closed_total or 0)
-           row_min_trades = max(1, int(math.ceil(ROW_MIN_SHARE * float(closed_total))))
+            row_min_trades = max(1, int(math.ceil(ROW_MIN_SHARE * float(closed_total))))
 
             # агрегаты окна
             rows = await conn.fetch(
