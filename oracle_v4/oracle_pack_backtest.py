@@ -176,7 +176,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 int(report_id)
             )
             closed_total = int(closed_total or 0)
-            row_min_trades = max(1, int(round(ROW_MIN_SHARE * closed_total)))
+            row_min_trades = max(1, int(math.ceil(ROW_MIN_SHARE * float(closed_total))))
 
             # агрегаты 7d (весь набор)
             rows = await conn.fetch(
