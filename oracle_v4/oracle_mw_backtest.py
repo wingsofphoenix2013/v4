@@ -312,7 +312,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
 
                     # правило: если pnl_sum_total <= 0 — победителя не назначаем (весь agg_base признаём бесперспективным)
                     if pnl_kept <= 0.0:
-                        log.info(
+                        log.debug(
                             "⚠️ BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
                             strategy_id, report_id, direction, timeframe, agg_base, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
@@ -321,7 +321,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
 
                     uplift = roi - base_roi
                     if uplift <= UPLIFT_MIN:
-                        log.info(
+                        log.debug(
                             "⚠️ BACKTEST: skip winner (non-positive uplift) sid=%s report=%s dir=%s tf=%s base=%s wr>=%s conf>=%s roi=%.6f base=%.6f upl=%.6f kept=%d",
                             strategy_id, report_id, direction, timeframe, agg_base, d_wmin, d_cmin, roi, base_roi, uplift, trd_kept
                         )
@@ -516,7 +516,7 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                     log.exception("❌ Ошибка публикации события WL/BL v3 в %s", WHITELIST_READY_STREAM)
 
             # итоговый лог
-            log.info(
+            log.debug(
                 "✅ MW_BACKTEST: sid=%s report_id=%s bt_run_id=%s blocks=%d grid_cells=%d winners=%d wl_v3=%d bl_v3=%d deposit=%.4f row_min=%d conf_min>=%.2f",
                 strategy_id, report_id, bt_run_id, total_blocks, total_cells, winners_written,
                 wl_count, bl_count, deposit_used, row_min_trades, CONF_BT_MIN
