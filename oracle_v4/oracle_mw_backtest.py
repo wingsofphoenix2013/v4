@@ -35,6 +35,9 @@ WINNER_MIN_ABS  = 20     # минимальная масса сделок у п�
 WINNER_MIN_FRAC = 0.10   # минимальная масса сделок у победителя (доля от baseline_trades)
 ROW_MIN_SHARE   = 0.03   # минимальная масса для агрегатной строки (доля от всех сделок стратегии за 7d)
 
+# 🔸 Порог минимального улучшения ROI для назначения победителя
+UPLIFT_MIN = 0.001
+
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_mw_backtest():
@@ -299,13 +302,13 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 total_cells += len(grid_rows)
                 await _insert_grid_rows(conn, grid_rows)
 
-                # если победитель найден — проверяем знак pnl и пишем результаты
+                # если победитель найден — проверяем знак pnl и улучшение ROI; иначе пропускаем
                 if best is not None:
                     roi, trd_kept, d_cmin, d_wmin, pnl_kept = best
 
                     # правило: если pnl_sum_total <= 0 — победителя не назначаем (весь agg_base признаём бесперспективным)
                     if pnl_kept <= 0.0:
-                        log.debug(
+                        log.info(
                             "⚠️ BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
                             strategy_id, report_id, direction, timeframe, agg_base, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
@@ -313,6 +316,13 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                         continue
 
                     uplift = roi - base_roi
+                    if uplift <= UPLIFT_MIN:
+                        log.info(
+                            "⚠️ BACKTEST: skip winner (non-positive uplift) sid=%s report=%s dir=%s tf=%s base=%s wr>=%s conf>=%s roi=%.6f base=%.6f upl=%.6f kept=%d",
+                            strategy_id, report_id, direction, timeframe, agg_base, d_wmin, d_cmin, roi, base_roi, uplift, trd_kept
+                        )
+                        total_blocks += 1
+                        continue
 
                     # запись победителя
                     await conn.execute(

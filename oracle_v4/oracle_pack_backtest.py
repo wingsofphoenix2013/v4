@@ -35,6 +35,7 @@ WINNER_MIN_ABS  = 20     # минимальная масса сделок у п�
 WINNER_MIN_FRAC = 0.10   # минимальная масса у победителя (доля от baseline_trades)
 ROW_MIN_SHARE   = 0.03   # строка попадает в сетку, если её масса ≥ 3% от всех сделок стратегии (7d)
 WR_BL_MAX       = 0.50   # порог для blacklist v3 (WinRate < 0.50)
+UPLIFT_MIN = 0.001
 
 # 🔸 Публичная точка входа воркера
 async def run_oracle_pack_backtest():
@@ -304,15 +305,25 @@ async def _run_for_report(strategy_id: int, report_id: int, window_end_iso: str)
                 if best is not None:
                     roi, trd_kept, d_cmin, d_wmin, pnl_kept = best
 
+                    # 1) PnL должен быть положительным
                     if pnl_kept <= 0.0:
-                        log.debug(
+                        log.info(
                             "⚠️ PACK-BACKTEST: skip winner (non-positive pnl) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s kept=%d pnl=%.4f",
                             strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, trd_kept, pnl_kept
                         )
                         total_blocks += 1
                         continue
 
+                    # 2) Uplift ROI должен быть положительным
                     uplift = roi - base_roi
+                    if uplift <= UPLIFT_MIN:
+                        log.info(
+                            "⚠️ PACK-BACKTEST: skip winner (non-positive uplift) sid=%s report=%s dir=%s tf=%s base=%s/%s key=%s wr>=%s conf>=%s roi=%.6f base=%.6f upl=%.6f kept=%d",
+                            strategy_id, report_id, direction, timeframe, pack_base, agg_type, agg_key, d_wmin, d_cmin, roi, base_roi, uplift, trd_kept
+                        )
+                        total_blocks += 1
+                        continue
+
                     await conn.execute(
                         """
                         INSERT INTO oracle_pack_bt_winner (
