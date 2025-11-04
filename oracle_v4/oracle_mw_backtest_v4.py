@@ -1,4 +1,4 @@
-# oracle_mw_backtest.py — воркер v4-бэктеста: кривая ROI(t) по agg_state, выбор порога, публикация WL/BL v4
+# oracle_mw_backtest_v4.py — воркер v4-бэктеста: кривая ROI(t) по agg_state, выбор порога, публикация WL/BL v4 + событие готовности
 
 # 🔸 Импорты
 import asyncio
@@ -16,6 +16,10 @@ log = logging.getLogger("ORACLE_MW_BACKTEST")
 REPORT_STREAM = "oracle:mw:reports_ready"
 CONSUMER_GROUP = "oracle_backtest_group"
 CONSUMER_NAME = "oracle_backtest_worker"
+
+# 🔸 Стрим для уведомления о готовности WL/BL (как у v1/v2/v3)
+WHITELIST_READY_STREAM = "oracle:mw_whitelist:reports_ready"
+WHITELIST_READY_MAXLEN = 10_000
 
 # 🔸 Общие настройки
 TF_LIST = ("m5", "m15", "h1")
@@ -106,7 +110,7 @@ async def run_oracle_mw_backtest():
             await asyncio.sleep(5)
 
 
-# 🔸 Обработка одного 7d-отчёта: по каждому TF считаем кривые v4 и публикуем WL/BL
+# 🔸 Обработка одного 7d-отчёта: по каждому TF считаем кривые v4, публикуем WL/BL и отправляем событие готовности
 async def _process_report_7d(report_id: int, strategy_id: int, window_end_iso: str):
     # парсинг window_end (для логов/метаданных)
     try:
@@ -123,7 +127,6 @@ async def _process_report_7d(report_id: int, strategy_id: int, window_end_iso: s
             return
         deposit = float(deposit)
 
-        # идемпотентность: по одному логу на TF/метод
         method = "v4"
 
         # собираем все строки агрегатов отчёта (за один проход)
@@ -150,9 +153,13 @@ async def _process_report_7d(report_id: int, strategy_id: int, window_end_iso: s
             key = (str(r["timeframe"]), str(r["direction"]), str(r["agg_base"]))
             by_key.setdefault(key, []).append(dict(r))
 
+        # для единого события после всех TF накапливаем суммы вставленных строк
+        total_wl_inserted = 0
+        total_bl_inserted = 0
+
         # проход по каждому TF — один run на TF
         for tf in TF_LIST:
-            # создаём лог прогона или пропускаем при наличии
+            # идемпотентность: по одному логу на TF/метод
             exists = await conn.fetchval(
                 """
                 SELECT 1 FROM oracle_mw_backtest_log
@@ -238,6 +245,31 @@ async def _process_report_7d(report_id: int, strategy_id: int, window_end_iso: s
                 "✅ backtest v4 готов: sid=%s rep=%s tf=%s total=%d improved=%d fallback=%d skipped=%d wl=%d bl=%d",
                 strategy_id, report_id, tf, summary_total, summary_improved, summary_fallback, summary_skipped, wl_written, bl_written
             )
+
+            # аккумулируем итог по TF для общего события
+            total_wl_inserted += wl_written
+            total_bl_inserted += bl_written
+
+        # отправляем ОДНО уведомление в стрим (как v1/v2/v3) после всех TF
+        try:
+            payload = {
+                "strategy_id": int(strategy_id),
+                "report_id": int(report_id),
+                "time_frame": "7d",
+                "version": "v4",
+                "window_end": window_end_dt.isoformat(),
+                "rows_inserted": int(total_wl_inserted + total_bl_inserted),
+                "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+            }
+            await infra.redis_client.xadd(
+                name=WHITELIST_READY_STREAM,
+                fields={"data": json.dumps(payload, separators=(",", ":"))},
+                maxlen=WHITELIST_READY_MAXLEN,
+                approximate=True,
+            )
+            log.debug("[WL_READY v4] sid=%s rep=%s rows=%d", strategy_id, report_id, payload["rows_inserted"])
+        except Exception:
+            log.exception("❌ Ошибка публикации события в %s (v4)", WHITELIST_READY_STREAM)
 
 
 # 🔸 Создание записи лога прогона

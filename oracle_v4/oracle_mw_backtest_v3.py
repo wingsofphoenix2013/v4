@@ -14,6 +14,7 @@ log = logging.getLogger("ORACLE_MW_BACKTEST_V3")
 
 # 🔸 Константы стрима (триггер — готов whitelist v1, значит confidence+sense уже посчитаны)
 WHITELIST_READY_STREAM = "oracle:mw_whitelist:reports_ready"
+WHITELIST_READY_MAXLEN = 10_000
 CONSUMER_GROUP = "oracle_backtest_v3_group"
 CONSUMER_NAME = "oracle_backtest_v3_worker"
 
@@ -146,6 +147,10 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
                 continue
             by_key.setdefault(key, []).append(dict(r))
 
+        # подсчёт итоговых вставок (для единого события v3 по всему report_id)
+        total_wl_inserted = 0
+        total_bl_inserted = 0
+
         # по каждому TF — отдельный run
         for tf in TF_LIST:
             # если для TF нет ключей — пропускаем
@@ -216,6 +221,10 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
                 wl_written += w_wl
                 bl_written += w_bl
 
+            # аккумулируем итог по TF
+            total_wl_inserted += wl_written
+            total_bl_inserted += bl_written
+
             await _finalize_run_log(
                 conn=conn,
                 run_id=run_id,
@@ -234,6 +243,31 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
                 "✅ backtest v3 готов: sid=%s rep=%s tf=%s total=%d improved=%d fallback=%d skipped=%d wl=%d bl=%d",
                 strategy_id, report_id, tf, summary_total, summary_improved, summary_fallback, summary_skipped, wl_written, bl_written
             )
+
+        # после обработки ВСЕХ TF публикуем событие, как в v1/v2 (одна запись на report_id)
+        try:
+            window_end_dt = await conn.fetchval(
+                "SELECT window_end FROM oracle_report_stat WHERE id = $1",
+                int(report_id)
+            )
+            payload = {
+                "strategy_id": int(strategy_id),
+                "report_id": int(report_id),
+                "time_frame": "7d",
+                "version": "v3",
+                "window_end": (window_end_dt.isoformat() if hasattr(window_end_dt, 'isoformat') else str(window_end_dt)),
+                "rows_inserted": int(total_wl_inserted + total_bl_inserted),
+                "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+            }
+            await infra.redis_client.xadd(
+                name=WHITELIST_READY_STREAM,
+                fields={"data": json.dumps(payload, separators=(",", ":"))},
+                maxlen=WHITELIST_READY_MAXLEN,
+                approximate=True,
+            )
+            log.debug("[WL_READY v3] sid=%s rep=%s rows=%d", strategy_id, report_id, payload["rows_inserted"])
+        except Exception:
+            log.exception("❌ Ошибка публикации события в %s (v3)", WHITELIST_READY_STREAM)
 
 
 # 🔸 Создание записи лога прогона
