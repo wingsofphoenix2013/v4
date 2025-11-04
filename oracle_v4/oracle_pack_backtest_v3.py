@@ -35,7 +35,7 @@ BL_WR_MAX = 0.50
 
 
 # 🔸 Публичная точка входа воркера (вызывается из oracle_v4_main.py → run_safe_loop)
-async def run_oracle_mw_backtest_v3():
+async def run_oracle_pack_backtest_v3():
     # условия достаточности окружения
     if infra.pg_pool is None or infra.redis_client is None:
         log.debug("❌ Пропуск: PG/Redis не инициализированы")
