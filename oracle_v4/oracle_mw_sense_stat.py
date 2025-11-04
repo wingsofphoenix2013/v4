@@ -1,4 +1,4 @@
-# oracle_mw_sense_stat.py — воркер sense-stat: оценка «разделяющей силы» agg_base (0..1) и формирование whitelist (7d)
+# oracle_mw_sense_stat.py — воркер sense-stat: оценка «разделяющей силы» agg_base (0..1) и формирование whitelist/blacklist (7d)
 
 # 🔸 Импорты
 import asyncio
@@ -17,7 +17,7 @@ SENSE_REPORT_READY_STREAM = "oracle:mw_sense:reports_ready"
 SENSE_CONSUMER_GROUP = "oracle_sense_stat_group"
 SENSE_CONSUMER_NAME = "oracle_sense_stat_worker"
 
-# 🔸 Константы Redis Stream для whitelist
+# 🔸 Константы Redis Stream для уведомлений по спискам (WL/BL)
 WHITELIST_READY_STREAM = "oracle:mw_whitelist:reports_ready"
 WHITELIST_READY_MAXLEN = 10_000
 
@@ -34,7 +34,7 @@ AGG_BASES = (
     "trend_momentum",
 
     # derived-пары (добавлены в position_snapshot_live.py и oracle_mw_snapshot.py)
-    "trend_mom_align",         # импульс согласован/против тренда: aligned|countertrend|flat
+    "trend_mom_align",
 
     "trend_volatility_extremes",
     "trend_volatility_momentum",
@@ -48,16 +48,18 @@ AGG_BASES = (
 )
 
 SMOOTH_HISTORY_N = 10
-CONF_THRESHOLD_SENSE = 0.1  # включаем в расчёт sense только состояния с confidence > 0.1
+CONF_THRESHOLD_SENSE = 0.1   # в расчёт sense включаем только строки с confidence > 0.1
 EPS = 1e-12
 
-# 🔸 Пороговые значения для whitelist v1 (настраиваются перезапуском сервиса)
-SCORE_SENSE_MIN = 0.5    # база попадает в WL только если score_smoothed > 0.5
-CONF_THRESHOLD_WL = 0.5  # строка агрегата (agg_state) — confidence > 0.5
-WL_WR_MIN = 0.60         # минимальный winrate для попадания строки в whitelist (>= 0.60)
+# 🔸 Пороговые значения для whitelist (v1/v2)
+SCORE_SENSE_MIN = 0.5        # база попадает в WL только если score_smoothed > 0.5
+CONF_THRESHOLD_WL = 0.5      # в WL v1 берём строки агрегатов с confidence > 0.5
+WL_WR_MIN = 0.60             # WL: минимальный winrate (>= 0.60)
 
-# 🔸 Порог для whitelist v2 (доля от общего числа закрытых сделок в окне 7d)
-WL_V2_MIN_SHARE = 0.02   # 2%
+# 🔸 Пороговые значения для blacklist (v1/v2)
+BL_WR_MAX = 0.50             # BL: winrate строго ниже 0.50
+# для BL v1 используем тот же порог confidence, что и для WL v1 → CONF_THRESHOLD_WL
+WL_V2_MIN_SHARE = 0.02       # v2: доля от общего числа закрытых сделок в окне 7d (2%)
 
 
 # 🔸 Публичная точка входа воркера
@@ -125,7 +127,7 @@ async def run_oracle_sense_stat():
             await asyncio.sleep(5)
 
 
-# 🔸 Обработка одного отчёта: расчёт sense-stat + WL v1 (7d) + WL v2 (7d)
+# 🔸 Обработка одного отчёта: расчёт sense + WL(v1/v2, 7d) + BL(v1/v2, 7d)
 async def _process_report(report_id: int, strategy_id: int, time_frame: str, window_end_iso: str):
     # парсинг window_end
     try:
@@ -171,7 +173,7 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
 
                         score_current, states_used, components = _compute_score(states)
 
-                        # сглаживание по истории (≤5 предыдущих прогонов)
+                        # сглаживание по истории (≤10 предыдущих прогонов)
                         prev_vals = await conn.fetch(
                             """
                             SELECT score_current
@@ -223,9 +225,9 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
             log.debug("ℹ️ Нет строк (confidence>%s) для report_id=%s (sid=%s tf=%s) — sense пропущен",
                       CONF_THRESHOLD_SENSE, report_id, strategy_id, time_frame)
 
-        # whitelist формируем ТОЛЬКО для 7d (и v1, и v2)
+        # whitelist/blacklist формируем ТОЛЬКО для 7d (и v1, и v2)
         if str(time_frame) == "7d":
-            # v1 (по SENSE/CONF/WR)
+            # v1 (WL: по SENSE/CONF/WR)
             inserted_v1 = await _build_whitelist_for_7d(conn, report_id, strategy_id, window_end_dt)
             log.debug("✅ whitelist обновлён (v1, 7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted_v1)
             try:
@@ -245,9 +247,9 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
                     approximate=True,
                 )
             except Exception:
-                log.exception("❌ Ошибка публикации события в %s (v1)", WHITELIST_READY_STREAM)
+                log.exception("❌ Ошибка публикации события в %s (WL v1)", WHITELIST_READY_STREAM)
 
-            # v2 (по доле от общего числа закрытых сделок; игнорируем sense/conf)
+            # v2 (WL: по доле от общего числа закрытых сделок; игнорируем sense/conf)
             inserted_v2 = await _build_whitelist_v2(conn, report_id, strategy_id, "7d", window_end_dt, WL_V2_MIN_SHARE)
             log.debug("✅ whitelist обновлён (v2, 7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted_v2)
             try:
@@ -267,10 +269,56 @@ async def _process_report(report_id: int, strategy_id: int, time_frame: str, win
                     approximate=True,
                 )
             except Exception:
-                log.exception("❌ Ошибка публикации события в %s (v2)", WHITELIST_READY_STREAM)
+                log.exception("❌ Ошибка публикации события в %s (WL v2)", WHITELIST_READY_STREAM)
+
+            # v1 (BL: зеркально WL v1, но по условию winrate < 0.50)
+            inserted_bl_v1 = await _build_blacklist_for_7d(conn, report_id, strategy_id, window_end_dt)
+            log.debug("✅ blacklist обновлён (v1, 7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted_bl_v1)
+            try:
+                payload_bl_v1 = {
+                    "strategy_id": int(strategy_id),
+                    "report_id": int(report_id),
+                    "time_frame": "7d",
+                    "version": "v1",
+                    "list": "blacklist",
+                    "window_end": window_end_dt.isoformat(),
+                    "rows_inserted": int(inserted_bl_v1),
+                    "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+                }
+                await infra.redis_client.xadd(
+                    name=WHITELIST_READY_STREAM,
+                    fields={"data": json.dumps(payload_bl_v1, separators=(",", ":"))},
+                    maxlen=WHITELIST_READY_MAXLEN,
+                    approximate=True,
+                )
+            except Exception:
+                log.exception("❌ Ошибка публикации события в %s (BL v1)", WHITELIST_READY_STREAM)
+
+            # v2 (BL: по доле массы и WR, без sense/conf)
+            inserted_bl_v2 = await _build_blacklist_v2(conn, report_id, strategy_id, "7d", window_end_dt, WL_V2_MIN_SHARE)
+            log.debug("✅ blacklist обновлён (v2, 7d): report_id=%s sid=%s rows=%d", report_id, strategy_id, inserted_bl_v2)
+            try:
+                payload_bl_v2 = {
+                    "strategy_id": int(strategy_id),
+                    "report_id": int(report_id),
+                    "time_frame": "7d",
+                    "version": "v2",
+                    "list": "blacklist",
+                    "window_end": window_end_dt.isoformat(),
+                    "rows_inserted": int(inserted_bl_v2),
+                    "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+                }
+                await infra.redis_client.xadd(
+                    name=WHITELIST_READY_STREAM,
+                    fields={"data": json.dumps(payload_bl_v2, separators=(",", ":"))},
+                    maxlen=WHITELIST_READY_MAXLEN,
+                    approximate=True,
+                )
+            except Exception:
+                log.exception("❌ Ошибка публикации события в %s (BL v2)", WHITELIST_READY_STREAM)
 
 
-# 🔸 Построение whitelist v1 для 7d: очищаем ТОЛЬКО v1 по стратегии и заполняем свежим набором
+# 🔸 Построение whitelist v1 для 7d: очищаем ТОЛЬКО WL/v1 по стратегии и заполняем свежим набором
 async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window_end_dt: datetime) -> int:
     # оси (agg_base), прошедшие sense-фильтр (score_smoothed > SCORE_SENSE_MIN) на этом отчёте
     bases_rows = await conn.fetch(
@@ -286,7 +334,7 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
     if not bases_rows:
         async with conn.transaction():
             await conn.execute(
-                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1'",
+                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1' AND list = 'whitelist'",
                 strategy_id
             )
         return 0
@@ -321,10 +369,10 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
         if (r["timeframe"], r["direction"], r["agg_base"]) in selectors
     ]
 
-    # атомарно обновляем v1-срез для стратегии
+    # атомарно обновляем WL v1-срез для стратегии
     async with conn.transaction():
         await conn.execute(
-            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1'",
+            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1' AND list = 'whitelist'",
             strategy_id
         )
         if filtered:
@@ -332,9 +380,9 @@ async def _build_whitelist_for_7d(conn, report_id: int, strategy_id: int, window
                 """
                 INSERT INTO oracle_mw_whitelist (
                     aggregated_id, strategy_id, direction, timeframe,
-                    agg_base, agg_state, winrate, confidence, version
+                    agg_base, agg_state, winrate, confidence, version, list
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,'v1'
+                    $1,$2,$3,$4,$5,$6,$7,$8,'v1','whitelist'
                 )
                 """,
                 [
@@ -366,7 +414,7 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
     if closed_total <= 0:
         async with conn.transaction():
             await conn.execute(
-                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2'",
+                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2' AND list = 'whitelist'",
                 strategy_id
             )
         return 0
@@ -400,10 +448,10 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
            and float(r["winrate"] or 0.0) >= float(WL_WR_MIN)
     ]
 
-    # атомарно перестраиваем v2-срез
+    # атомарно перестраиваем WL v2-срез
     async with conn.transaction():
         await conn.execute(
-            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2'",
+            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2' AND list = 'whitelist'",
             strategy_id
         )
         if filtered:
@@ -411,9 +459,173 @@ async def _build_whitelist_v2(conn, report_id: int, strategy_id: int, time_frame
                 """
                 INSERT INTO oracle_mw_whitelist (
                     aggregated_id, strategy_id, direction, timeframe,
-                    agg_base, agg_state, winrate, confidence, version
+                    agg_base, agg_state, winrate, confidence, version, list
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,'v2'
+                    $1,$2,$3,$4,$5,$6,$7,$8,'v2','whitelist'
+                )
+                """,
+                [
+                    (
+                        int(r["aggregated_id"]),
+                        int(r["strategy_id"]),
+                        str(r["direction"]),
+                        str(r["timeframe"]),
+                        str(r["agg_base"]),
+                        str(r["agg_state"]),
+                        float(r["winrate"] or 0.0),
+                        float(r["confidence"] or 0.0),
+                    )
+                    for r in filtered
+                ]
+            )
+
+    return len(filtered)
+
+
+# 🔸 Построение blacklist v1 для 7d: зеркально WL v1, но WR < 0.50
+async def _build_blacklist_for_7d(conn, report_id: int, strategy_id: int, window_end_dt: datetime) -> int:
+    # оси (agg_base), прошедшие sense-фильтр (score_smoothed > SCORE_SENSE_MIN) на этом отчёте
+    bases_rows = await conn.fetch(
+        """
+        SELECT timeframe, direction, agg_base
+          FROM oracle_mw_sense_stat
+         WHERE report_id = $1
+           AND time_frame = '7d'
+           AND score_smoothed > $2
+        """,
+        report_id, float(SCORE_SENSE_MIN)
+    )
+    if not bases_rows:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1' AND list = 'blacklist'",
+                strategy_id
+            )
+        return 0
+
+    selectors = {(r["timeframe"], r["direction"], r["agg_base"]) for r in bases_rows}
+
+    # кандидаты из aggregated_stat по 7d с порогами confidence / winrate
+    cand_rows = await conn.fetch(
+        """
+        SELECT
+            a.id          AS aggregated_id,
+            a.strategy_id AS strategy_id,
+            a.direction   AS direction,
+            a.timeframe   AS timeframe,
+            a.agg_base    AS agg_base,
+            a.agg_state   AS agg_state,
+            a.winrate     AS winrate,
+            a.confidence  AS confidence
+        FROM oracle_mw_aggregated_stat a
+        WHERE a.report_id   = $1
+          AND a.time_frame  = '7d'
+          AND a.strategy_id = $2
+          AND a.confidence  > $3
+          AND a.winrate     <  $4
+        """,
+        report_id, strategy_id, float(CONF_THRESHOLD_WL), float(BL_WR_MAX)
+    )
+
+    # фильтр по выбранным осям
+    filtered = [
+        dict(r) for r in cand_rows
+        if (r["timeframe"], r["direction"], r["agg_base"]) in selectors
+    ]
+
+    # атомарно обновляем BL v1-срез для стратегии
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v1' AND list = 'blacklist'",
+            strategy_id
+        )
+        if filtered:
+            await conn.executemany(
+                """
+                INSERT INTO oracle_mw_whitelist (
+                    aggregated_id, strategy_id, direction, timeframe,
+                    agg_base, agg_state, winrate, confidence, version, list
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,'v1','blacklist'
+                )
+                """,
+                [
+                    (
+                        int(r["aggregated_id"]),
+                        int(r["strategy_id"]),
+                        str(r["direction"]),
+                        str(r["timeframe"]),
+                        str(r["agg_base"]),
+                        str(r["agg_state"]),
+                        float(r["winrate"] or 0.0),
+                        float(r["confidence"] or 0.0),
+                    )
+                    for r in filtered
+                ]
+            )
+
+    return len(filtered)
+
+
+# 🔸 Построение blacklist v2 (7d): по доле массы и WR < 0.50 (без sense/conf)
+async def _build_blacklist_v2(conn, report_id: int, strategy_id: int, time_frame: str, window_end_dt: datetime, min_share: float) -> int:
+    # общий объём закрытых сделок из шапки отчёта (для текущего окна)
+    closed_total = await conn.fetchval(
+        "SELECT closed_total FROM oracle_report_stat WHERE id = $1",
+        report_id
+    )
+    closed_total = int(closed_total or 0)
+    if closed_total <= 0:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2' AND list = 'blacklist'",
+                strategy_id
+            )
+        return 0
+
+    threshold = float(closed_total) * float(min_share)
+
+    # все агрегаты текущего отчёта 7d
+    cand_rows = await conn.fetch(
+        """
+        SELECT
+            a.id            AS aggregated_id,
+            a.strategy_id   AS strategy_id,
+            a.direction     AS direction,
+            a.timeframe     AS timeframe,
+            a.agg_base      AS agg_base,
+            a.agg_state     AS agg_state,
+            a.winrate       AS winrate,
+            a.confidence    AS confidence,
+            a.trades_total  AS trades_total
+        FROM oracle_mw_aggregated_stat a
+        WHERE a.report_id = $1
+          AND a.time_frame = $2
+        """,
+        report_id, str(time_frame)
+    )
+
+    # фильтр по массе и WR
+    filtered = [
+        dict(r) for r in cand_rows
+        if float(r["trades_total"] or 0.0) > threshold
+           and float(r["winrate"] or 0.0) < float(BL_WR_MAX)
+    ]
+
+    # атомарно перестраиваем BL v2-срез
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM oracle_mw_whitelist WHERE strategy_id = $1 AND version = 'v2' AND list = 'blacklist'",
+            strategy_id
+        )
+        if filtered:
+            await conn.executemany(
+                """
+                INSERT INTO oracle_mw_whitelist (
+                    aggregated_id, strategy_id, direction, timeframe,
+                    agg_base, agg_state, winrate, confidence, version, list
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,'v2','blacklist'
                 )
                 """,
                 [
@@ -473,7 +685,7 @@ def _compute_score(states: List[dict]) -> Tuple[float, int, Dict]:
     return score, len(states), comps
 
 
-# 🔸 Сглаживание (среднее по текущему и ≤5 предыдущим)
+# 🔸 Сглаживание (среднее по текущему и ≤10 предыдущим)
 def _smooth_mean(current: float, history: List[float]) -> float:
     vals = [float(current)] + [float(x) for x in history if x is not None]
     if not vals:
