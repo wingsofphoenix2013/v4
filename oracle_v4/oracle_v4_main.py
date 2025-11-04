@@ -24,8 +24,9 @@ from oracle_pack_confidence import run_oracle_pack_confidence
 from oracle_mw_sense_stat import run_oracle_sense_stat
 from oracle_pack_sense_stat import run_oracle_pack_sense
 from oracle_pack_lists import run_oracle_pack_lists
-# 🔸 импорт воркера backtest v4
-from oracle_mw_backtest import run_oracle_mw_backtest
+# 🔸 импорт воркера backtest v3/v4
+from oracle_mw_backtest_v3 import run_oracle_mw_backtest_v3
+from oracle_mw_backtest_v4 import run_oracle_mw_backtest
 # 🔸 импорт воркера уборщика
 from oracle_cleaner import run_oracle_cleaner
 
@@ -98,6 +99,7 @@ async def main():
         run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
+        run_safe_loop(run_oracle_mw_backtest_v3, "ORACLE_BACKTEST_V3"),
         run_safe_loop(run_oracle_mw_backtest, "ORACLE_BACKTEST_V4"),
         run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
     )
