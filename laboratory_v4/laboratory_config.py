@@ -47,7 +47,7 @@ async def load_initial_config():
     await _load_pack_lists_all()
 
     # итог
-    log.debug(
+    log.info(
         "✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, "
         "mw_wl[v1]=%d, mw_wl[v2]=%d, mw_wl[v3]=%d, mw_wl[v4]=%d, "
         "pack_wl[v1]=%d, pack_wl[v2]=%d, pack_wl[v3]=%d, pack_wl[v4]=%d, "
@@ -193,7 +193,7 @@ async def _load_active_tickers():
         )
         tickers = {str(r["symbol"]): dict(r) for r in rows}
         set_lab_tickers(tickers)
-    log.debug("✅ LAB: загружены активные тикеры (%d)", len(infra.lab_tickers))
+    log.info("✅ LAB: загружены активные тикеры (%d)", len(infra.lab_tickers))
 
 
 async def _load_active_strategies():
@@ -207,7 +207,7 @@ async def _load_active_strategies():
         )
         strategies = {int(r["id"]): dict(r) for r in rows}
         set_lab_strategies(strategies)
-    log.debug("✅ LAB: загружены активные стратегии (%d)", len(infra.lab_strategies))
+    log.info("✅ LAB: загружены активные стратегии (%d)", len(infra.lab_strategies))
 
 
 # 🔸 Загрузка MW Whitelist (все версии v1–v4, 7d)
@@ -255,7 +255,7 @@ async def _load_mw_whitelists_all():
         replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
     # лог сводный по версиям
-    log.debug(
+    log.info(
         "✅ LAB: MW WL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
         len(infra.lab_mw_wl.get("v1", {})),
         len(infra.lab_mw_wl.get("v2", {})),
@@ -326,7 +326,7 @@ async def _load_pack_lists_all():
         replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
     # лог сводный по версиям
-    log.debug(
+    log.info(
         "✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, wl[v3]=%d, wl[v4]=%d, bl[v1]=%d, bl[v2]=%d, bl[v3]=%d, bl[v4]=%d",
         len(infra.lab_pack_wl.get("v1", {})),
         len(infra.lab_pack_wl.get("v2", {})),
