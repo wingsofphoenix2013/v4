@@ -36,7 +36,7 @@ READ_BLOCK_MS = 30_000
 ALLOWED_TFS = ("m5", "m15", "h1")
 ALLOWED_DECISION_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 ALLOWED_DIRECTIONS = ("long", "short")
-ALLOWED_VERSIONS = ("v1", "v2")
+ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4")
 MW_BASES = ("trend", "volatility", "momentum", "extremes")
 
 

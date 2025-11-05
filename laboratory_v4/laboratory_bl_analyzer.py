@@ -27,7 +27,7 @@ BL_CONSUMER_NAME = "LAB_BL_ANALYZER_WORKER"
 ALLOWED_TFS = ("m5", "m15", "h1")
 DECISION_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 DIRECTIONS = ("long", "short")
-VERSIONS = ("v1", "v2")
+VERSIONS = ("v1","v2","v3","v4")
 
 
 # 🔸 Публичная точка входа воркера
@@ -143,7 +143,7 @@ async def _load_active_from_db():
 # 🔸 Построение карты: (master_sid, version, mode) -> (client_sid, direction, tfs, deposit)
 async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str, str, float]]:
     """
-    Вариант B: строим фиксированную карту 12×2×4 = 96 комбинаций из истории позиций,
+    Вариант B: строим фиксированную карту 12×4×4 = 192 комбинаций из истории позиций,
     с фолбэком к laboratory_request_head. Находим единственного клиента-дублёра
     для каждой тройки (master, version, mode), его direction и tfs (если есть в head).
     """
@@ -166,7 +166,7 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
             expected AS (
               SELECT m.master_sid, v.version, d.mode
               FROM masters m
-              CROSS JOIN (VALUES ('v1'),('v2')) AS v(version)
+              CROSS JOIN (VALUES ('v1'),('v2'),('v3'),('v4')) AS v(version)
               CROSS JOIN (VALUES ('mw_only'),('mw_then_pack'),('mw_and_pack'),('pack_only')) AS d(mode)
             ),
 
@@ -198,11 +198,11 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
               SELECT *
               FROM (
                 SELECT
-                  h.strategy_id        AS master_sid,
-                  h.oracle_version     AS version,
-                  h.decision_mode      AS mode,
-                  h.client_strategy_id AS client_sid,
-                  h.direction          AS direction,
+                  h.strategy_id          AS master_sid,
+                  h.oracle_version       AS version,
+                  h.decision_mode        AS mode,
+                  h.client_strategy_id   AS client_sid,
+                  h.direction            AS direction,
                   h.timeframes_requested AS tfs,
                   ROW_NUMBER() OVER (
                     PARTITION BY h.strategy_id, h.oracle_version, h.decision_mode
@@ -252,8 +252,10 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
         mapping[(master_sid, version, mode)] = (int(client_sid), direction, tfs, deposit)
 
     if missing:
-        log.debug("ℹ️ LAB_BL_ANALYZER: нет данных для %d комбинаций (они будут пропущены): %s",
-                  len(missing), ", ".join(f"{ms}/{v}/{m}" for ms,v,m in missing))
+        log.debug(
+            "ℹ️ LAB_BL_ANALYZER: нет данных для %d комбинаций (они будут пропущены): %s",
+            len(missing), ", ".join(f"{ms}/{v}/{m}" for ms, v, m in missing)
+        )
     log.debug("🔎 LAB_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
     return mapping
 

@@ -29,7 +29,7 @@ WL_CONSUMER_NAME = "LAB_WL_ANALYZER_WORKER"
 ALLOWED_TFS = ("m5", "m15", "h1")
 DECISION_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 DIRECTIONS = ("long", "short")
-VERSIONS = ("v1", "v2")
+VERSIONS = ("v1","v2","v3","v4")
 SOURCES = ("mw", "pack")
 
 # 🔸 Сетка порогов WR
@@ -126,8 +126,7 @@ async def run_laboratory_wl_analyzer():
             log.exception("❌ LAB_WL_ANALYZER: ошибка цикла — пауза 5 секунд")
             await asyncio.sleep(5)
 
-
-# построение карты соответствий из истории позиций (fallback к head)
+# 🔸 построение карты соответствий из истории позиций (fallback к head; версии v1–v4)
 async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str, str, float]]:
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -148,7 +147,7 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
             expected AS (
               SELECT m.master_sid, v.version, d.mode
               FROM masters m
-              CROSS JOIN (VALUES ('v1'),('v2')) AS v(version)
+              CROSS JOIN (VALUES ('v1'),('v2'),('v3'),('v4')) AS v(version)
               CROSS JOIN (VALUES ('mw_only'),('mw_then_pack'),('mw_and_pack'),('pack_only')) AS d(mode)
             ),
             pos_pick AS (
@@ -176,11 +175,11 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
               SELECT *
               FROM (
                 SELECT
-                  h.strategy_id        AS master_sid,
-                  h.oracle_version     AS version,
-                  h.decision_mode      AS mode,
-                  h.client_strategy_id AS client_sid,
-                  h.direction          AS direction,
+                  h.strategy_id          AS master_sid,
+                  h.oracle_version       AS version,
+                  h.decision_mode        AS mode,
+                  h.client_strategy_id   AS client_sid,
+                  h.direction            AS direction,
                   h.timeframes_requested AS tfs,
                   ROW_NUMBER() OVER (
                     PARTITION BY h.strategy_id, h.oracle_version, h.decision_mode
@@ -229,7 +228,6 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
         log.debug("ℹ️ LAB_WL_ANALYZER: нет данных для %d комбинаций: %s",
                   len(missing), ", ".join(f"{ms}/{v}/{m}" for ms, v, m in missing))
     return mapping
-
 
 # полный пересчёт по всей карте для обоих источников
 async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]]):
