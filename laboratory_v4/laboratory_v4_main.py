@@ -23,6 +23,8 @@ from laboratory_postproc import run_laboratory_postproc
 from laboratory_bl_analyzer import run_laboratory_bl_analyzer
 # 🔸 импорт воркера WL-анализатора
 from laboratory_wl_analyzer import run_laboratory_wl_analyzer
+# 🔸 импорт воркера PACK-анализатора
+from laboratory_pack_analyzer import run_laboratory_pack_analyzer
 # 🔸 импорт воркера CLEANER
 from laboratory_cleaner import run_laboratory_cleaner
 
@@ -38,6 +40,8 @@ INITIAL_DELAY_POSTPROC = 0
 INITIAL_DELAY_BL = 60
 INITIAL_DELAY_WL = 60
 INITIAL_DELAY_CLEANER = 0
+INITIAL_DELAY_PACK = 0
+
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
 
@@ -133,6 +137,11 @@ async def main():
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_cleaner, INITIAL_DELAY_CLEANER),
             "LAB_CLEANER",
+        ),
+        # PACK-анализатор (комбо-статистика 7d, периодический)
+        run_safe_loop(
+            lambda: _start_with_delay(run_laboratory_pack_analyzer, INITIAL_DELAY_PACK),
+            "LAB_PACK_ANALYZER",
         ),
     )
 
