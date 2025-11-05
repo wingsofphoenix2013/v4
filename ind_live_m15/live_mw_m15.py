@@ -1,4 +1,4 @@
-# live_mw_m15.py — live-расчёт MW m15 (trend/volatility/momentum/extremes) с использованием L1; публикация «минимального» JSON в ind_mw_live:* (state + open_time; для trend — direction/strong; для volatility — atr_pct)
+# live_mw_m15.py — live-расчёт MW m15 (trend/volatility/momentum/extremes + mom_align) с использованием L1; публикация «минимального» JSON в ind_mw_live:* (state + open_time; для trend — direction/strong; для volatility — atr_pct; для mom_align — aligned/countertrend/flat)
 
 # 🔸 Импорты
 import asyncio
@@ -15,15 +15,13 @@ from packs.momentum_pack import build_momentum_pack
 from packs.extremes_pack import build_extremes_pack
 from packs.pack_utils import floor_to_bar
 
-
 # 🔸 Логгер
 log = logging.getLogger("MW_M15")
 
 # 🔸 Константы
 TF = "m15"
 TTL_SEC = 90
-MW_KINDS = ("trend", "volatility", "momentum", "extremes")
-
+MW_KINDS = ("trend","volatility","momentum","extremes","mom_align")
 
 # 🔸 Обёртка compute_fn: сначала L1, потом фолбэк к compute_snapshot_values_async
 def make_compute_with_l1(live_cache, bar_open_ms: int):
@@ -41,7 +39,6 @@ def make_compute_with_l1(live_cache, bar_open_ms: int):
         # фолбэк к расчёту
         return await compute_snapshot_values_async(inst, symbol, df, precision)
     return _compute
-
 
 # 🔸 Публикация «минимального» MW-пакета в ind_mw_live:{symbol}:{tf}:{kind}
 async def _publish_mw_min(redis, symbol: str, tf: str, kind: str, full_pack: Dict[str, Any]) -> bool:
@@ -65,7 +62,7 @@ async def _publish_mw_min(redis, symbol: str, tf: str, kind: str, full_pack: Dic
             if "strong" in p:
                 out_pack["strong"] = p["strong"]
 
-        # для volatility добавим atr_pct (если присутствует) — нужно снапшот-воркеру
+        # для volatility добавим atr_pct (если присутствует)
         if kind == "volatility" and "atr_pct" in p:
             out_pack["atr_pct"] = p["atr_pct"]
 
@@ -75,7 +72,6 @@ async def _publish_mw_min(redis, symbol: str, tf: str, kind: str, full_pack: Dic
     except Exception as e:
         log.debug(f"MW_M15 publish error {symbol}/{tf} {kind}: {e}")
         return False
-
 
 # 🔸 Один проход MW m15 (использовать после LIVE m15, чтобы L1 был тёплый)
 async def mw_m15_pass(redis,
@@ -90,7 +86,7 @@ async def mw_m15_pass(redis,
         log.debug(f"MW_M15 PASS done: symbols=0 written=0 errors=0 elapsed_ms={elapsed_ms}")
         return
 
-    now_ms = time.time_ns() // 1_000_000
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
     bar_open_ms = floor_to_bar(now_ms, TF)
     compute_with_l1 = make_compute_with_l1(live_cache, bar_open_ms)
 
@@ -129,6 +125,50 @@ async def mw_m15_pass(redis,
                 # extremes
                 ext = await build_extremes_pack(sym, TF, now_ms, precision, redis, compute_with_l1)
                 if ext and await _publish_mw_min(redis, sym, TF, "extremes", ext):
+                    written += 1
+
+                # mom_align (derived из trend + momentum)
+                # извлекаем направления/состояния из уже построенных пакетов
+                trend_dir = None
+                trend_open_iso = None
+                try:
+                    tp = (trend.get("pack") or {}) if isinstance(trend, dict) else {}
+                    tstate = tp.get("state")
+                    trend_open_iso = tp.get("open_time")
+                    if isinstance(tstate, str):
+                        if tstate.startswith("up_"):
+                            trend_dir = "up"
+                        elif tstate.startswith("down_"):
+                            trend_dir = "down"
+                        else:
+                            trend_dir = "sideways"
+                except Exception:
+                    trend_dir = None
+
+                mom_state = None
+                mom_open_iso = None
+                try:
+                    mp = (mom.get("pack") or {}) if isinstance(mom, dict) else {}
+                    mom_state = mp.get("state")
+                    mom_open_iso = mp.get("open_time")
+                except Exception:
+                    mom_state = None
+
+                # условия достаточности
+                if mom_state in ("bull_impulse", "bear_impulse") and trend_dir in ("up", "down"):
+                    mom_align_state = "aligned" if (
+                        (mom_state == "bull_impulse" and trend_dir == "up") or
+                        (mom_state == "bear_impulse" and trend_dir == "down")
+                    ) else "countertrend"
+                else:
+                    mom_align_state = "flat"
+
+                # open_time для mom_align берём из mom/trend или вычисляем по bar_open_ms
+                open_iso = mom_open_iso or trend_open_iso or datetime.utcfromtimestamp(bar_open_ms / 1000).isoformat()
+
+                # формируем «минимальный» пакет и публикуем
+                mom_align_pack = {"pack": {"state": mom_align_state, "open_time": open_iso}}
+                if await _publish_mw_min(redis, sym, TF, "mom_align", mom_align_pack):
                     written += 1
 
             except Exception as e:
