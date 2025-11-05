@@ -1,4 +1,4 @@
-# 🔸 laboratory_pack_analyzer.py — анализатор PACK-комбинаций: 7d-статистика по (family/base/combokey) для WL/BL и v1–v4, запись последнего среза в laboratory_pack_stat
+# 🔸 laboratory_pack_analyzer.py — анализатор PACK-комбинаций: 7d-статистика по (family/base/combokey) для WL/BL и v1–v4
 
 # 🔸 Импорты
 import asyncio
@@ -295,47 +295,52 @@ async def _run_pack_combo_analysis_once():
         ", ".join(f"{lt}={by_list.get(lt,0)}" for lt in ALLOWED_LIST_TAGS),
     )
 
-
-# 🔸 Загрузка депозитов клиентов стратегий
+# 🔸 Загрузка депозитов клиентов стратегий (только нужные клиенты)
 async def _load_client_deposits() -> Dict[int, float]:
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT id, COALESCE(deposit,0) AS deposit
             FROM strategies_v4
+            WHERE enabled = true AND (archived IS NOT TRUE)
+              AND market_watcher = false
+              AND blacklist_watcher = true
+              AND market_mirrow IS NOT NULL
             """
         )
-    res: Dict[int, float] = {}
-    for r in rows:
-        sid = int(r["id"])
-        dep = float(r["deposit"] or 0.0)
-        res[sid] = dep
-    return res
+    return {int(r["id"]): float(r["deposit"] or 0.0) for r in rows}
 
-
-# 🔸 Загрузка позиций за 7 дней (минимальные поля)
+# 🔸 Загрузка позиций за 7 дней (только по клиентам из выборки выше)
 async def _load_positions_7d(win_start: datetime, win_end: datetime):
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
+            WITH clients AS (
+              SELECT id
+              FROM strategies_v4
+              WHERE enabled = true AND (archived IS NOT TRUE)
+                AND market_watcher = false
+                AND blacklist_watcher = true
+                AND market_mirrow IS NOT NULL
+            )
             SELECT
-              strategy_id,
-              client_strategy_id,
-              oracle_version,
-              decision_mode,
-              direction,
-              tf,
-              COALESCE(pnl,0) AS pnl,
-              COALESCE(pack_wl_matches, '[]'::jsonb) AS pack_wl_matches,
-              COALESCE(pack_bl_matches, '[]'::jsonb) AS pack_bl_matches
-            FROM laboratory_positions_stat
-            WHERE closed_at >= $1 AND closed_at < $2
+              lps.strategy_id,
+              lps.client_strategy_id,
+              lps.oracle_version,
+              lps.decision_mode,
+              lps.direction,
+              lps.tf,
+              COALESCE(lps.pnl,0) AS pnl,
+              COALESCE(lps.pack_wl_matches, '[]'::jsonb) AS pack_wl_matches,
+              COALESCE(lps.pack_bl_matches, '[]'::jsonb) AS pack_bl_matches
+            FROM laboratory_positions_stat lps
+            JOIN clients c ON c.id = lps.client_strategy_id
+            WHERE lps.closed_at >= $1 AND lps.closed_at < $2
             """,
             win_start, win_end
         )
     return rows
-
-
+    
 # 🔸 TRUNCATE и массовая вставка результатов в laboratory_pack_stat
 async def _truncate_and_insert(rows: List[Tuple[Any, ...]]):
     async with infra.pg_pool.acquire() as conn:
