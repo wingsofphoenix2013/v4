@@ -9,8 +9,6 @@ from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any, Set
 
 from indicators.compute_and_store import get_expected_param_names
-# 🔸 Общие пороги MW (для derived-флага high_vol)
-from indicator_mw_shared import vol_thresholds
 
 # 🔸 Логгер
 log = logging.getLogger("POS_SNAPSHOT_LIVE")
@@ -224,8 +222,7 @@ async def process_tf_live(redis,
                                     val, open_time_iso, status="ok"))
 
     # ----- MW (ind_mw_live) -----
-    mw_objs: Dict[str, Dict[str, Any]] = {}   # kind -> pack-dict
-    mw_states: Dict[str, str] = {}            # kind -> state
+    mw_states: Dict[str, str] = {}  # kind -> state
 
     for kind in MW_TYPES:
         mw_key = f"ind_mw_live:{symbol}:{tf}:{kind}"
@@ -257,15 +254,14 @@ async def process_tf_live(redis,
             continue
 
         mw_states[kind] = str(state)
-        mw_objs[kind] = pack
 
         # state по kind (как раньше)
         rows_ok.append(make_row(position_uid, strategy_id, symbol, tf,
                                 "marketwatch", kind, "state",
                                 str(state), open_time_iso, status="ok"))
 
-    # ----- MW-derived: pullback_flag / mom_align / high_vol -----
-    # trend_dir из trend.state
+    # ----- MW-derived: mom_align (оставляем только его) -----
+    # направление тренда из trend.state
     trend_state = mw_states.get("trend")
     if trend_state:
         if trend_state.startswith("up_"):
@@ -276,41 +272,6 @@ async def process_tf_live(redis,
             trend_dir = "sideways"
     else:
         trend_dir = None
-
-    # pullback_flag: берём ТОЛЬКО из BB PACK (pack_live:bb:{symbol}:{tf}:bb20_2_0)
-    pullback_flag = "none"
-    bdelta = None
-    try:
-        bb_base = "bb20_2_0"  # фиксированный BB (20, 2.0)
-        pkey_bb = f"pack_live:bb:{symbol}:{tf}:{bb_base}"
-        pjson_bb = await redis.get(pkey_bb)
-        if pjson_bb:
-            pobj_bb = json.loads(pjson_bb)
-            pack_bb = pobj_bb.get("pack") or {}
-            bd = pack_bb.get("bucket_delta")
-            if bd is not None:
-                bdelta = int(bd)
-    except Exception:
-        bdelta = None
-
-    # финальный флаг: против/по тренду; при sideways или неизвестной дельте остаётся 'none'
-    if trend_dir in ("up", "down") and isinstance(bdelta, int):
-        if trend_dir == "up":
-            if bdelta <= -1:
-                pullback_flag = "against"
-            elif bdelta >= +1:
-                pullback_flag = "with"
-        elif trend_dir == "down":
-            if bdelta >= +1:
-                pullback_flag = "against"
-            elif bdelta <= -1:
-                pullback_flag = "with"
-
-    rows_ok.append(make_row(
-        position_uid, strategy_id, symbol, tf,
-        "marketwatch", "pullback_flag", "state",
-        pullback_flag, open_time_iso, status="ok"
-    ))
 
     # mom_align: импульс Momentum относительно направления тренда
     mom_state = mw_states.get("momentum")
@@ -326,29 +287,6 @@ async def process_tf_live(redis,
         position_uid, strategy_id, symbol, tf,
         "marketwatch", "mom_align", "state",
         mom_align, open_time_iso, status="ok"
-    ))
-
-    # high_vol: ATR% из volatility MW-pack (ind_mw_live), по порогу shared
-    vol_pack = mw_objs.get("volatility") or {}
-    atr_pct_str = None
-    try:
-        atr_pct_str = vol_pack.get("atr_pct") or (vol_pack.get("atr") or {}).get("pct")
-    except Exception:
-        atr_pct_str = None
-
-    atr_pct_val = None
-    try:
-        atr_pct_val = float(atr_pct_str) if atr_pct_str is not None else None
-    except Exception:
-        atr_pct_val = None
-
-    high_thr = vol_thresholds(tf)["atr_high"]
-    high_vol = "yes" if (atr_pct_val is not None and atr_pct_val >= high_thr) else "no"
-
-    rows_ok.append(make_row(
-        position_uid, strategy_id, symbol, tf,
-        "marketwatch", "high_vol", "state",
-        high_vol, open_time_iso, status="ok"
     ))
 
     # ----- PACK (pack_live) -----
