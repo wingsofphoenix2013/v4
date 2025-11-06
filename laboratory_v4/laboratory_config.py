@@ -34,7 +34,7 @@ PUBSUB_STRATEGIES = "strategies_v4_events"
 async def load_initial_config():
     # условия достаточности
     if infra.pg_pool is None or infra.redis_client is None:
-        log.debug("❌ Пропуск initial_config: PG/Redis не инициализированы")
+        log.info("❌ Пропуск initial_config: PG/Redis не инициализированы")
         return
 
     # тикеры
@@ -72,7 +72,7 @@ async def load_initial_config():
 async def lists_stream_listener():
     # условия достаточности
     if infra.redis_client is None:
-        log.debug("❌ Пропуск lists_stream_listener: Redis не инициализирован")
+        log.info("❌ Пропуск lists_stream_listener: Redis не инициализирован")
         return
 
     # допустимые версии oracle для online-перезагрузок
@@ -82,7 +82,7 @@ async def lists_stream_listener():
     for s in (MW_WL_READY_STREAM, PACK_LISTS_READY_STREAM):
         try:
             await infra.redis_client.xgroup_create(name=s, groupname=LAB_LISTS_GROUP, id="$", mkstream=True)
-            log.debug("📡 LAB: создана consumer group для стрима %s", s)
+            log.info("📡 LAB: создана consumer group для стрима %s", s)
         except Exception as e:
             if "BUSYGROUP" in str(e):
                 pass
@@ -90,7 +90,7 @@ async def lists_stream_listener():
                 log.exception("❌ LAB: ошибка создания consumer group для %s", s)
                 return
 
-    log.debug("🚀 LAB: старт lists_stream_listener")
+    log.info("🚀 LAB: старт lists_stream_listener")
 
     # основной цикл
     while True:
@@ -121,17 +121,17 @@ async def lists_stream_listener():
                             # ожидаем: {strategy_id, time_frame='7d', version ∈ allowed_versions, ...}
                             if sid and version in allowed_versions:
                                 await _reload_mw_wl_for_strategy(sid, version)
-                                log.debug("🔁 LAB: MW WL обновлён из стрима (sid=%s, version=%s)", sid, version)
+                                log.info("🔁 LAB: MW WL обновлён из стрима (sid=%s, version=%s)", sid, version)
                             else:
-                                log.debug("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
+                                log.info("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
 
                         elif stream_name == PACK_LISTS_READY_STREAM:
                             # ожидаем: {strategy_id, time_frame='7d', version ∈ allowed_versions, ...}
                             if sid and version in allowed_versions:
                                 await _reload_pack_lists_for_strategy(sid, version)
-                                log.debug("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
+                                log.info("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
                             else:
-                                log.debug("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
+                                log.info("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
 
                         acks.setdefault(stream_name, []).append(msg_id)
                     except Exception:
@@ -146,7 +146,7 @@ async def lists_stream_listener():
                         log.exception("⚠️ LAB: ошибка ACK в %s (ids=%s)", s, ids)
 
         except asyncio.CancelledError:
-            log.debug("⏹️ LAB: lists_stream_listener остановлен по сигналу")
+            log.info("⏹️ LAB: lists_stream_listener остановлен по сигналу")
             raise
         except Exception:
             log.exception("❌ LAB: ошибка цикла lists_stream_listener — пауза 5 секунд")
@@ -156,12 +156,12 @@ async def lists_stream_listener():
 async def config_event_listener():
     # условия достаточности
     if infra.redis_client is None:
-        log.debug("❌ Пропуск config_event_listener: Redis не инициализирован")
+        log.info("❌ Пропуск config_event_listener: Redis не инициализирован")
         return
 
     pubsub = infra.redis_client.pubsub()
     await pubsub.subscribe(PUBSUB_TICKERS, PUBSUB_STRATEGIES)
-    log.debug("📡 LAB: подписка на каналы: %s, %s", PUBSUB_TICKERS, PUBSUB_STRATEGIES)
+    log.info("📡 LAB: подписка на каналы: %s, %s", PUBSUB_TICKERS, PUBSUB_STRATEGIES)
 
     async for message in pubsub.listen():
         if message.get("type") != "message":
@@ -171,11 +171,11 @@ async def config_event_listener():
             # события тикеров → полная перезагрузка кэша тикеров
             if channel == PUBSUB_TICKERS:
                 await _load_active_tickers()
-                log.debug("🔔 LAB: обновлён кэш тикеров по событию %s", channel)
+                log.info("🔔 LAB: обновлён кэш тикеров по событию %s", channel)
             # события стратегий → полная перезагрузка кэша стратегий
             elif channel == PUBSUB_STRATEGIES:
                 await _load_active_strategies()
-                log.debug("🔔 LAB: обновлён кэш стратегий по событию %s", channel)
+                log.info("🔔 LAB: обновлён кэш стратегий по событию %s", channel)
         except Exception:
             log.exception("❌ LAB: ошибка обработки сообщения Pub/Sub")
 
