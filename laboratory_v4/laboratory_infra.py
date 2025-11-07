@@ -1,4 +1,4 @@
-# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты WL/BL v1–v4, активные пороги BL/WL)
+# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты WL/BL v1–v4, активные пороги BL/WL, MW-BL)
 
 # 🔸 Импорты
 import os
@@ -23,6 +23,12 @@ lab_strategies: Dict[int, dict] = {}
 lab_mw_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
 lab_mw_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
 
+# 🔸 MW blacklist и winrates по версиям (v1–v4)
+#   lab_mw_bl: версия -> {(sid, tf, dir) -> {(agg_base, agg_state), ...}}
+#   lab_mw_bl_wr: версия -> {(sid, tf, dir) -> {(agg_base, agg_state) -> wr}}
+lab_mw_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
+lab_mw_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
+
 # 🔸 PACK lists (WL/BL) и winrates по версиям (v1–v4)
 #   whitelist: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
 #   blacklist: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
@@ -33,7 +39,7 @@ lab_pack_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = 
 lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
 lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
 
-# 🔸 Активные пороги BL (для быстрых онлайн-фильтров)
+# 🔸 Активные пороги BL (PACK) — для онлайн-вето
 # ключ: (master_sid, version, decision_mode, direction, tf)
 # значение: {"threshold": int, "best_roi": float, "roi_base": float, "positions_total": int,
 #            "deposit_used": float, "computed_at": "ISO8601"}
@@ -44,6 +50,12 @@ lab_bl_active: Dict[Tuple[int, str, str, str, str], Dict[str, Any]] = {}
 # значение: {"threshold": float, "best_roi": float, "roi_base": float, "positions_total": int,
 #            "deposit_used": float, "computed_at": "ISO8601"}
 lab_wl_active: Dict[Tuple[int, str, str, str, str, str], Dict[str, Any]] = {}
+
+# 🔸 Активные пороги MW-BL (аналог PACK-BL, но для MW)
+# ключ: (master_sid, version, decision_mode, direction, tf)
+# значение: {"threshold": int, "best_roi": float, "roi_base": float, "positions_total": int,
+#            "deposit_used": float, "computed_at": "ISO8601"}
+lab_mw_bl_active: Dict[Tuple[int, str, str, str, str], Dict[str, Any]] = {}
 
 # 🔸 Переменные окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -147,6 +159,27 @@ def replace_mw_whitelist(
     log.debug("MW WL[%s] обновлён: срезов=%d", v, len(lab_mw_wl[v]))
 
 
+def replace_mw_blacklist(
+    version: str,
+    new_map: Dict[Tuple[int, str, str], Set[Tuple[str, str]]],
+    wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = None,
+):
+    """
+    Полная замена BL MW для указанной версии ('v1'|'v2'|'v3'|'v4') + (опционально) карта winrate.
+    """
+    v = str(version or "").lower()
+    if v not in lab_mw_bl:
+        lab_mw_bl[v] = {}
+    if v not in lab_mw_bl_wr:
+        lab_mw_bl_wr[v] = {}
+
+    lab_mw_bl[v] = new_map or {}
+    if wr_map is not None:
+        lab_mw_bl_wr[v] = wr_map or {}
+
+    log.debug("MW BL[%s] обновлён: срезов=%d", v, len(lab_mw_bl[v]))
+
+
 def replace_pack_list(
     list_tag: str,
     version: str,
@@ -231,6 +264,43 @@ def update_mw_whitelist_for_strategy(
     )
 
 
+def update_mw_blacklist_for_strategy(
+    version: str,
+    strategy_id: int,
+    slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]],
+    wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = None,
+):
+    """
+    Обновить MW BL для конкретной стратегии и версии:
+      slice_map: {(timeframe, direction) -> {(agg_base, agg_state), ...}}
+      wr_map: {(sid, timeframe, direction) -> {(agg_base, agg_state) -> winrate}}
+    """
+    v = str(version or "").lower()
+    if v not in lab_mw_bl:
+        lab_mw_bl[v] = {}
+    if v not in lab_mw_bl_wr:
+        lab_mw_bl_wr[v] = {}
+
+    sid = int(strategy_id)
+
+    # удаляем прежние ключи по sid
+    for k in [k for k in list(lab_mw_bl[v].keys()) if k[0] == sid]:
+        lab_mw_bl[v].pop(k, None)
+    for k in [k for k in list(lab_mw_bl_wr[v].keys()) if k[0] == sid]:
+        lab_mw_bl_wr[v].pop(k, None)
+
+    # добавляем новые срезы
+    for (tf, direction), states in (slice_map or {}).items():
+        lab_mw_bl[v][(sid, str(tf), str(direction))] = set(states or set())
+
+    # добавляем winrate-карты
+    if wr_map:
+        for sid_tf_dir, m in wr_map.items():
+            lab_mw_bl_wr[v][sid_tf_dir] = dict(m or {})
+
+    # (опциональные метрики можно добавить по аналогии с WL)
+
+
 def update_pack_list_for_strategy(
     list_tag: str,
     version: str,
@@ -291,16 +361,16 @@ def update_pack_list_for_strategy(
     )
 
 
-# 🔸 BL Active: массовая установка, точечный upsert и быстрый доступ к порогу
+# 🔸 BL Active (PACK): массовая установка, точечный upsert и быстрый доступ к порогу
 
 def set_bl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str], Dict[str, Any]]):
     """
-    Полная замена in-memory кэша активных порогов BL.
+    Полная замена in-memory кэша активных порогов BL (PACK).
     new_map: {(master_sid, version, decision_mode, direction, tf) -> {...}}
     """
     global lab_bl_active
     lab_bl_active = new_map or {}
-    log.debug("LAB: BL active cache replaced (records=%d)", len(lab_bl_active))
+    log.debug("LAB: BL(PACK) active cache replaced (records=%d)", len(lab_bl_active))
 
 
 def upsert_bl_active(
@@ -318,7 +388,7 @@ def upsert_bl_active(
     computed_at: Optional[str] = None,
 ):
     """
-    Точечное обновление записи активного порога BL в памяти (после UPSERT в БД).
+    Точечное обновление записи активного порога BL (PACK) в памяти (после UPSERT в БД).
     """
     key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf))
     rec = {
@@ -330,7 +400,10 @@ def upsert_bl_active(
         "computed_at": computed_at or "",
     }
     lab_bl_active[key] = rec
-    log.debug("LAB: BL active upsert %s -> T=%s ROI=%.6f (base=%.6f, n=%d)", key, rec["threshold"], rec["best_roi"], rec["roi_base"], rec["positions_total"])
+    log.debug(
+        "LAB: BL(PACK) active upsert %s -> T=%s ROI=%.6f (base=%.6f, n=%d)",
+        key, rec["threshold"], rec["best_roi"], rec["roi_base"], rec["positions_total"]
+    )
 
 
 def get_bl_threshold(
@@ -342,10 +415,73 @@ def get_bl_threshold(
     default: int = 0,
 ) -> int:
     """
-    Быстрый доступ к активному порогу BL. Если записи нет — возвращает default (по договорённости, 0).
+    Быстрый доступ к активному порогу BL (PACK). Если записи нет — возвращает default (по договорённости, 0).
     """
     key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf))
     rec = lab_bl_active.get(key)
+    if not rec:
+        return int(default)
+    return int(rec.get("threshold", default))
+
+
+# 🔸 MW-BL Active: массовая установка, точечный upsert и быстрый доступ к порогу
+
+def set_mw_bl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str], Dict[str, Any]]):
+    """
+    Полная замена in-memory кэша активных порогов MW-BL.
+    new_map: {(master_sid, version, decision_mode, direction, tf) -> {...}}
+    """
+    global lab_mw_bl_active
+    lab_mw_bl_active = new_map or {}
+    log.debug("LAB: MW-BL active cache replaced (records=%d)", len(lab_mw_bl_active))
+
+
+def upsert_mw_bl_active(
+    master_sid: int,
+    version: str,
+    decision_mode: str,
+    direction: str,
+    tf: str,
+    threshold: int,
+    *,
+    best_roi: float = 0.0,
+    roi_base: float = 0.0,
+    positions_total: int = 0,
+    deposit_used: float = 0.0,
+    computed_at: Optional[str] = None,
+):
+    """
+    Точечное обновление записи активного порога MW-BL в памяти (после UPSERT в БД).
+    """
+    key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf))
+    rec = {
+        "threshold": int(threshold),
+        "best_roi": float(best_roi),
+        "roi_base": float(roi_base),
+        "positions_total": int(positions_total),
+        "deposit_used": float(deposit_used),
+        "computed_at": computed_at or "",
+    }
+    lab_mw_bl_active[key] = rec
+    log.debug(
+        "LAB: MW-BL active upsert %s -> T=%s ROI=%.6f (base=%.6f, n=%d)",
+        key, rec["threshold"], rec["best_roi"], rec["roi_base"], rec["positions_total"]
+    )
+
+
+def get_mw_bl_threshold(
+    master_sid: int,
+    version: str,
+    decision_mode: str,
+    direction: str,
+    tf: str,
+    default: int = 0,
+) -> int:
+    """
+    Быстрый доступ к активному порогу MW-BL. Если записи нет — возвращает default (по договорённости, 0).
+    """
+    key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf))
+    rec = lab_mw_bl_active.get(key)
     if not rec:
         return int(default)
     return int(rec.get("threshold", default))

@@ -1,4 +1,4 @@
-# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/WL/BL (+winrate) и слушатели обновлений
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/MW-WL/MW-BL/PACK-WL/PACK-BL (+winrate) и слушатели обновлений
 
 # 🔸 Импорты
 import asyncio
@@ -11,8 +11,10 @@ from laboratory_infra import (
     set_lab_tickers,
     set_lab_strategies,
     replace_mw_whitelist,
+    replace_mw_blacklist,
     replace_pack_list,
     update_mw_whitelist_for_strategy,
+    update_mw_blacklist_for_strategy,
     update_pack_list_for_strategy,
 )
 
@@ -30,6 +32,7 @@ LAB_LISTS_WORKER = "LAB_LISTS_WORKER"
 PUBSUB_TICKERS = "bb:tickers_events"
 PUBSUB_STRATEGIES = "strategies_v4_events"
 
+
 # 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL v1–v4)
 async def load_initial_config():
     # условия достаточности
@@ -43,6 +46,8 @@ async def load_initial_config():
     await _load_active_strategies()
     # MW WL (v1–v4) + winrate карты
     await _load_mw_whitelists_all()
+    # MW BL (v1–v4) + winrate карты
+    await _load_mw_blacklists_all()
     # PACK WL/BL (v1–v4) + winrate карты
     await _load_pack_lists_all()
 
@@ -50,23 +55,29 @@ async def load_initial_config():
     log.info(
         "✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, "
         "mw_wl[v1]=%d, mw_wl[v2]=%d, mw_wl[v3]=%d, mw_wl[v4]=%d, "
+        "mw_bl[v1]=%d, mw_bl[v2]=%d, mw_bl[v3]=%d, mw_bl[v4]=%d, "
         "pack_wl[v1]=%d, pack_wl[v2]=%d, pack_wl[v3]=%d, pack_wl[v4]=%d, "
         "pack_bl[v1]=%d, pack_bl[v2]=%d, pack_bl[v3]=%d, pack_bl[v4]=%d",
         len(infra.lab_tickers),
         len(infra.lab_strategies),
-        len(infra.lab_mw_wl.get('v1', {})),
-        len(infra.lab_mw_wl.get('v2', {})),
-        len(infra.lab_mw_wl.get('v3', {})),
-        len(infra.lab_mw_wl.get('v4', {})),
-        len(infra.lab_pack_wl.get('v1', {})),
-        len(infra.lab_pack_wl.get('v2', {})),
-        len(infra.lab_pack_wl.get('v3', {})),
-        len(infra.lab_pack_wl.get('v4', {})),
-        len(infra.lab_pack_bl.get('v1', {})),
-        len(infra.lab_pack_bl.get('v2', {})),
-        len(infra.lab_pack_bl.get('v3', {})),
-        len(infra.lab_pack_bl.get('v4', {})),
+        len(infra.lab_mw_wl.get("v1", {})),
+        len(infra.lab_mw_wl.get("v2", {})),
+        len(infra.lab_mw_wl.get("v3", {})),
+        len(infra.lab_mw_wl.get("v4", {})),
+        len(infra.lab_mw_bl.get("v1", {})),
+        len(infra.lab_mw_bl.get("v2", {})),
+        len(infra.lab_mw_bl.get("v3", {})),
+        len(infra.lab_mw_bl.get("v4", {})),
+        len(infra.lab_pack_wl.get("v1", {})),
+        len(infra.lab_pack_wl.get("v2", {})),
+        len(infra.lab_pack_wl.get("v3", {})),
+        len(infra.lab_pack_wl.get("v4", {})),
+        len(infra.lab_pack_bl.get("v1", {})),
+        len(infra.lab_pack_bl.get("v2", {})),
+        len(infra.lab_pack_bl.get("v3", {})),
+        len(infra.lab_pack_bl.get("v4", {})),
     )
+
 
 # 🔸 Слушатель списков (Streams): обновление кэшей WL/BL oracle по сообщениям (v1–v4)
 async def lists_stream_listener():
@@ -120,8 +131,10 @@ async def lists_stream_listener():
                         if stream_name == MW_WL_READY_STREAM:
                             # ожидаем: {strategy_id, time_frame='7d', version ∈ allowed_versions, ...}
                             if sid and version in allowed_versions:
+                                # WL и BL приходят на одном стриме — обновляем оба
                                 await _reload_mw_wl_for_strategy(sid, version)
-                                log.info("🔁 LAB: MW WL обновлён из стрима (sid=%s, version=%s)", sid, version)
+                                await _reload_mw_bl_for_strategy(sid, version)
+                                log.info("🔁 LAB: MW WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
                             else:
                                 log.info("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
 
@@ -151,6 +164,7 @@ async def lists_stream_listener():
         except Exception:
             log.exception("❌ LAB: ошибка цикла lists_stream_listener — пауза 5 секунд")
             await asyncio.sleep(5)
+
 
 # 🔸 Слушатель Pub/Sub конфигов: тикеры и стратегии
 async def config_event_listener():
@@ -218,7 +232,7 @@ async def _load_mw_whitelists_all():
     v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
     wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {}
 
-    # допустимые версии oracle (используются и для очистки устаревших кэшей)
+    # допустимые версии oracle
     allowed_versions = ("v1", "v2", "v3", "v4")
 
     async with infra.pg_pool.acquire() as conn:
@@ -233,14 +247,13 @@ async def _load_mw_whitelists_all():
                    a.winrate
             FROM oracle_mw_whitelist w
             JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
-            WHERE a.time_frame = '7d'
+            WHERE a.time_frame = '7d' AND w.list = 'whitelist'
             """
         )
 
     for r in rows:
         ver = str(r["version"]).lower()
         if ver not in allowed_versions:
-            # игнорируем неизвестные версии
             continue
         sid = int(r["strategy_id"])
         tf = str(r["timeframe"]); direction = str(r["direction"])
@@ -250,11 +263,9 @@ async def _load_mw_whitelists_all():
         v_maps.setdefault(ver, {}).setdefault(key, set()).add((base, state))
         wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, state)] = wr
 
-    # обновляем кэши для всех поддерживаемых версий (в т.ч. очистим отсутствующие)
     for ver in allowed_versions:
         replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
-    # лог сводный по версиям
     log.info(
         "✅ LAB: MW WL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
         len(infra.lab_mw_wl.get("v1", {})),
@@ -262,6 +273,57 @@ async def _load_mw_whitelists_all():
         len(infra.lab_mw_wl.get("v3", {})),
         len(infra.lab_mw_wl.get("v4", {})),
     )
+
+
+# 🔸 Загрузка MW Blacklist (все версии v1–v4, 7d)
+async def _load_mw_blacklists_all():
+    # карты по версиям:
+    #   v_maps: (sid, tf, dir) -> {(agg_base, agg_state)}
+    #   wr_maps: (sid, tf, dir) -> {(agg_base, agg_state) -> winrate}
+    v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
+    wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {}
+
+    allowed_versions = ("v1", "v2", "v3", "v4")
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT w.version,
+                   w.strategy_id,
+                   a.timeframe,
+                   a.direction,
+                   a.agg_base,
+                   a.agg_state,
+                   a.winrate
+            FROM oracle_mw_whitelist w
+            JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE a.time_frame = '7d' AND w.list = 'blacklist'
+            """
+        )
+
+    for r in rows:
+        ver = str(r["version"]).lower()
+        if ver not in allowed_versions:
+            continue
+        sid = int(r["strategy_id"])
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        base = str(r["agg_base"]); state = str(r["agg_state"])
+        wr = float(r["winrate"] or 0.0)
+        key = (sid, tf, direction)
+        v_maps.setdefault(ver, {}).setdefault(key, set()).add((base, state))
+        wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, state)] = wr
+
+    for ver in allowed_versions:
+        infra.replace_mw_blacklist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
+
+    log.info(
+        "✅ LAB: MW BL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
+        len(infra.lab_mw_bl.get("v1", {})),
+        len(infra.lab_mw_bl.get("v2", {})),
+        len(infra.lab_mw_bl.get("v3", {})),
+        len(infra.lab_mw_bl.get("v4", {})),
+    )
+
 
 # 🔸 Загрузка PACK WL/BL (все версии v1–v4, 7d)
 async def _load_pack_lists_all():
@@ -273,7 +335,6 @@ async def _load_pack_lists_all():
     wl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {}
     bl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {}
 
-    # допустимые версии и типы списков
     allowed_versions = ("v1", "v2", "v3", "v4")
     allowed_lists = ("whitelist", "blacklist")
 
@@ -298,11 +359,9 @@ async def _load_pack_lists_all():
     for r in rows:
         ver = str(r["version"]).lower()
         if ver not in allowed_versions:
-            # игнорируем неизвестные версии
             continue
         lst = str(r["list"]).lower()  # whitelist|blacklist
         if lst not in allowed_lists:
-            # игнорируем неизвестные типы списков
             continue
 
         sid = int(r["strategy_id"])
@@ -320,12 +379,10 @@ async def _load_pack_lists_all():
             bl_maps.setdefault(ver, {}).setdefault(key, set()).add(tpl)
             bl_wr_maps.setdefault(ver, {}).setdefault(key, {})[tpl] = wr
 
-    # обновляем кэши для всех поддерживаемых версий (в т.ч. очистим отсутствующие)
     for ver in allowed_versions:
         replace_pack_list("whitelist", ver, wl_maps.get(ver, {}), wr_map=wl_wr_maps.get(ver, {}))
         replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
-    # лог сводный по версиям
     log.info(
         "✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, wl[v3]=%d, wl[v4]=%d, bl[v1]=%d, bl[v2]=%d, bl[v3]=%d, bl[v4]=%d",
         len(infra.lab_pack_wl.get("v1", {})),
@@ -337,6 +394,7 @@ async def _load_pack_lists_all():
         len(infra.lab_pack_bl.get("v3", {})),
         len(infra.lab_pack_bl.get("v4", {})),
     )
+
 
 # 🔸 Точечные перезагрузки по сообщениям стримов
 
@@ -350,7 +408,7 @@ async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
             SELECT a.timeframe, a.direction, a.agg_base, a.agg_state, a.winrate
             FROM oracle_mw_whitelist w
             JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
-            WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2
+            WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2 AND w.list = 'whitelist'
             """,
             int(strategy_id), str(version)
         )
@@ -365,6 +423,33 @@ async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
         wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
 
     update_mw_whitelist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
+
+
+async def _reload_mw_bl_for_strategy(strategy_id: int, version: str):
+    slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+    wr_map: Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]] = {}
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT a.timeframe, a.direction, a.agg_base, a.agg_state, a.winrate
+            FROM oracle_mw_whitelist w
+            JOIN oracle_mw_aggregated_stat a ON a.id = w.aggregated_id
+            WHERE a.time_frame = '7d' AND w.strategy_id = $1 AND w.version = $2 AND w.list = 'blacklist'
+            """,
+            int(strategy_id), str(version)
+        )
+
+    for r in rows:
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        base = str(r["agg_base"]); state = str(r["agg_state"])
+        wr = float(r["winrate"] or 0.0)
+
+        key = (tf, direction)
+        slice_map.setdefault(key, set()).add((base, state))
+        wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
+
+    update_mw_blacklist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
 
 
 async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):

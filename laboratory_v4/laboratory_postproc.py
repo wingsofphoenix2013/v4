@@ -1,4 +1,4 @@
-# 🔸 laboratory_postproc.py — пост-процессинг закрытых позиций: читает signal_log_queue, сопоставляет с лабораторией, пишет в laboratory_positions_stat
+# 🔸 laboratory_postproc.py — пост-процессинг закрытых позиций: читает signal_log_queue, сопоставляет с лабораторией, пишет в laboratory_positions_stat (включая MW-BL)
 
 # 🔸 Импорты
 import asyncio
@@ -133,7 +133,6 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
     # подтянем позицию (символ/направление/pnl/closed_at)
     pos = await _load_position(position_uid)
     if pos is None:
-        # позиция не найдена — логируем и выходим
         log.debug("ℹ️ LAB_POSTPROC: позиция не найдена (position_uid=%s)", position_uid)
         return
 
@@ -142,7 +141,6 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
     # находим связанный лабораторный запрос по log_uid + client_strategy_id
     head = await _find_lab_head(log_uid, client_sid)
     if head is None:
-        # не наше событие — пропускаем без ретраев
         log.debug("ℹ️ LAB_POSTPROC: head не найден (log_uid=%s, client_sid=%s)", log_uid, client_sid)
         return
 
@@ -168,13 +166,18 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
             if not tfrow:
                 continue
 
-            mw_hits = int(tfrow.get("mw_wl_hits") or 0)
+            # счётчики/матчи MW (WL) и PACK
+            mw_wl_hits = int(tfrow.get("mw_wl_hits") or 0)
             pack_wl_hits = int(tfrow.get("pack_wl_hits") or 0)
             pack_bl_hits = int(tfrow.get("pack_bl_hits") or 0)
             path_used = str(tfrow.get("path_used") or "none")
 
             tf_results = tfrow.get("tf_results") or {}
-            mw_matches = list(tf_results.get("mw", {}).get("wl_matches", []))
+            mw_wl_matches = list(tf_results.get("mw", {}).get("wl_matches", []))
+            # MW-BL из tf_results.mw.bl_matches (новое)
+            mw_bl_matches = list(tf_results.get("mw", {}).get("bl_matches", []))
+            mw_bl_hits = int(tf_results.get("mw", {}).get("bl_hits", len(mw_bl_matches)) or len(mw_bl_matches))
+
             pack_wl_matches = list(tf_results.get("pack", {}).get("wl_matches", []))
             pack_bl_matches = list(tf_results.get("pack", {}).get("bl_matches", []))
 
@@ -190,6 +193,7 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
                     position_uid, symbol, direction, tf,
                     oracle_version, decision_mode, decision_origin,
                     mw_match_count, mw_matches,
+                    mw_bl_match_count, mw_bl_matches,
                     pack_wl_match_count, pack_wl_matches, pack_wl_families,
                     pack_bl_match_count, pack_bl_matches, pack_bl_families,
                     pnl, status, closed_at, created_at, updated_at
@@ -199,9 +203,10 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
                     $4,$5,$6,$7,
                     $8,$9,$10,
                     $11,$12::jsonb,
-                    $13,$14::jsonb,$15::jsonb,
-                    $16,$17::jsonb,$18::jsonb,
-                    $19,$20,$21, now(), now()
+                    $13,$14::jsonb,
+                    $15,$16::jsonb,$17::jsonb,
+                    $18,$19::jsonb,$20::jsonb,
+                    $21,$22,$23, now(), now()
                 )
                 ON CONFLICT (position_uid, tf) DO UPDATE SET
                     strategy_id = EXCLUDED.strategy_id,
@@ -213,6 +218,8 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
                     decision_origin = EXCLUDED.decision_origin,
                     mw_match_count = EXCLUDED.mw_match_count,
                     mw_matches = EXCLUDED.mw_matches,
+                    mw_bl_match_count = EXCLUDED.mw_bl_match_count,
+                    mw_bl_matches = EXCLUDED.mw_bl_matches,
                     pack_wl_match_count = EXCLUDED.pack_wl_match_count,
                     pack_wl_matches = EXCLUDED.pack_wl_matches,
                     pack_wl_families = EXCLUDED.pack_wl_families,
@@ -228,7 +235,8 @@ async def _process_message(msg_id: str, fields: Dict[str, str]):
                 log_uid, int(master_sid), int(client_sid),
                 position_uid, symbol, direction, tf,
                 oracle_version, decision_mode, path_used,
-                mw_hits, json.dumps(mw_matches, ensure_ascii=False, separators=(",", ":")),
+                mw_wl_hits, json.dumps(mw_wl_matches, ensure_ascii=False, separators=(",", ":")),
+                mw_bl_hits, json.dumps(mw_bl_matches, ensure_ascii=False, separators=(",", ":")),
                 pack_wl_hits, json.dumps(pack_wl_matches, ensure_ascii=False, separators=(",", ":")), json.dumps(wl_families, separators=(",", ":")),
                 pack_bl_hits, json.dumps(pack_bl_matches, ensure_ascii=False, separators=(",", ":")), json.dumps(bl_families, separators=(",", ":")),
                 float(pnl or 0), status_label, closed_at,

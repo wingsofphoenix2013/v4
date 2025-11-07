@@ -1,4 +1,4 @@
-# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов (до 16), внутри запроса — последовательная проверка TF (младший→старший) + BL/WL пороги
+# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов (до 16), внутри запроса — последовательная проверка TF (младший→старший) + BL/WL пороги (PACK и MW)
 
 # 🔸 Импорты
 import asyncio
@@ -307,7 +307,7 @@ async def _handle_request(payload: dict):
     version = str(payload.get("version") or "").lower()
     decision_mode = str(payload.get("decision_mode") or "").lower()
     use_bl = _parse_bool(payload.get("use_bl"))
-    use_wl = _parse_bool(payload.get("use_wl"))  # 🔸 новый флаг: применять ли WL-пороги
+    use_wl = _parse_bool(payload.get("use_wl"))
     timeframes_raw = str(payload.get("timeframes") or "")
     tfs = _parse_timeframes(timeframes_raw)
 
@@ -392,20 +392,23 @@ async def _handle_request(payload: dict):
 
             # WL/BL наборы и карты WR (для логов wr по матчам)
             mw_wl_set = infra.lab_mw_wl.get(version, {}).get(cache_key, set())
+            mw_bl_set = infra.lab_mw_bl.get(version, {}).get(cache_key, set())
             pack_wl_set = infra.lab_pack_wl.get(version, {}).get(cache_key, set())
             pack_bl_set = infra.lab_pack_bl.get(version, {}).get(cache_key, set())
             mw_wr_map = infra.lab_mw_wl_wr.get(version, {}).get(cache_key, {})
+            mbl_wr_map = infra.lab_mw_bl_wr.get(version, {}).get(cache_key, {})
             pwl_wr_map = infra.lab_pack_wl_wr.get(version, {}).get(cache_key, {})
             pbl_wr_map = infra.lab_pack_bl_wr.get(version, {}).get(cache_key, {})
 
             mw_wl_total = len(mw_wl_set)
+            mw_bl_total = len(mw_bl_set)
             pack_wl_total = len(pack_wl_set)
             pack_bl_total = len(pack_bl_set)
 
             # живые MW состояния
             mw_states = await _get_live_mw_states(symbol, tf)
 
-            # MW сопоставления (+ wr)
+            # MW (WL) сопоставления
             mw_hits = 0
             mw_matches: List[dict] = []
             if mw_wl_total > 0:
@@ -417,6 +420,19 @@ async def _handle_request(payload: dict):
                         mw_hits += 1
                         wr = float(mw_wr_map.get((agg_base, agg_state_need), 0.0))
                         mw_matches.append({"agg_base": agg_base, "agg_state": agg_state_need, "wr": wr})
+
+            # MW (BL) сопоставления
+            mw_bl_hits = 0
+            mw_bl_matches: List[dict] = []
+            if mw_bl_total > 0:
+                for (agg_base, agg_state_need) in mw_bl_set:
+                    state_live = _build_mw_agg_state(agg_base, mw_states)
+                    if state_live is None:
+                        continue
+                    if state_live == agg_state_need:
+                        mw_bl_hits += 1
+                        wr = float(mbl_wr_map.get((agg_base, agg_state_need), 0.0))
+                        mw_bl_matches.append({"agg_base": agg_base, "agg_state": agg_state_need, "wr": wr})
 
             # PACK сопоставления: читаем паки один раз на base
             by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
@@ -474,13 +490,15 @@ async def _handle_request(payload: dict):
                         wr = float(pbl_wr_map.get((base, agg_key, agg_value_need), 0.0))
                         pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
 
-            # ---- BL-пороговое вето (если включено)
+            # ---- BL-пороговое вето (если включено) — учитываем PACK и MW
             tf_allow: Optional[bool] = None
             tf_reason: Optional[str] = None
             path_used: str = "none"
-            bl_threshold_used: Optional[int] = None
+            bl_threshold_used_pack: Optional[int] = None
+            bl_threshold_used_mw: Optional[int] = None
             if use_bl:
-                T_bl = infra.get_bl_threshold(
+                # порог PACK-BL
+                T_pack = infra.get_bl_threshold(
                     master_sid=strategy_id,
                     version=version,
                     decision_mode=decision_mode,
@@ -488,14 +506,27 @@ async def _handle_request(payload: dict):
                     tf=tf,
                     default=0
                 )
-                bl_threshold_used = int(T_bl or 0)
-                if bl_threshold_used > 0 and pack_bl_hits >= bl_threshold_used:
+                bl_threshold_used_pack = int(T_pack or 0)
+
+                # порог MW-BL
+                T_mw = infra.get_mw_bl_threshold(
+                    master_sid=strategy_id,
+                    version=version,
+                    decision_mode=decision_mode,
+                    direction=direction,
+                    tf=tf,
+                    default=0
+                )
+                bl_threshold_used_mw = int(T_mw or 0)
+
+                # вето если сработал любой из двух порогов
+                if (bl_threshold_used_pack > 0 and pack_bl_hits >= bl_threshold_used_pack) or \
+                   (bl_threshold_used_mw   > 0 and mw_bl_hits   >= bl_threshold_used_mw):
                     tf_allow = False
                     tf_reason = "bl_threshold"
                     path_used = "bl_veto"
 
             # ---- WL-пороги (минимальный winrate), применяются если BL не «срезал» TF
-            # вычислим max wr по матчам MW/PACK
             mw_max_wr = max((float(m.get("wr", 0.0)) for m in mw_matches), default=0.0) if mw_matches else 0.0
             pack_max_wr = max((float(m.get("wr", 0.0)) for m in pack_wl_matches), default=0.0) if pack_wl_matches else 0.0
 
@@ -547,6 +578,9 @@ async def _handle_request(payload: dict):
                     "wl_total": mw_wl_total,
                     "wl_hits": mw_hits,
                     "wl_matches": mw_matches,
+                    "bl_total": mw_bl_total,
+                    "bl_hits": mw_bl_hits,
+                    "bl_matches": mw_bl_matches,
                     "wl_threshold": float(mw_wl_threshold_used or 0.0),
                     "wl_max_wr": float(mw_max_wr),
                 },
@@ -562,8 +596,11 @@ async def _handle_request(payload: dict):
                 },
                 "live": {"mw_states": mw_states, "missing": missing_live},
             }
-            if bl_threshold_used is not None:
-                tf_results["bl_threshold"] = bl_threshold_used
+            if use_bl:
+                tf_results["bl_thresholds"] = {
+                    "pack": int(bl_threshold_used_pack or 0),
+                    "mw": int(bl_threshold_used_mw or 0),
+                }
 
             # строка TF для БД
             tf_rows.append((tf, {
