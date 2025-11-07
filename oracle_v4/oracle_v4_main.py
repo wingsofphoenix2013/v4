@@ -20,24 +20,24 @@ from oracle_positions_analyzer import (
     INITIAL_DELAY_SEC as POS_INITIAL_DELAY_SEC,
     INTERVAL_SEC as POS_INTERVAL_SEC,
 )
-# 🔸 импорт воркера отчётов
-# from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
-# from oracle_pack_snapshot import run_oracle_pack_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
-# # 🔸 импорт воркера confidence
-# from oracle_mw_confidence import run_oracle_confidence
-# from oracle_pack_confidence import run_oracle_pack_confidence
-# # 🔸 импорт воркера проверки sense
-# from oracle_mw_sense_stat import run_oracle_sense_stat
-# from oracle_pack_sense_stat import run_oracle_pack_sense
-# from oracle_pack_lists import run_oracle_pack_lists
-# # 🔸 импорт воркера backtest v3/v4
-# from oracle_mw_backtest_v3 import run_oracle_mw_backtest_v3
-# from oracle_mw_backtest_v4 import run_oracle_mw_backtest
-# # 🔸 импорт воркеров PACK backtest v3/v4
-# from oracle_pack_backtest_v3 import run_oracle_pack_backtest_v3
-# from oracle_pack_backtest_v4 import run_oracle_pack_backtest_v4
-# # 🔸 импорт воркера уборщика
-# from oracle_cleaner import run_oracle_cleaner
+🔸 импорт воркера отчётов
+from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
+from oracle_pack_snapshot import run_oracle_pack_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
+# 🔸 импорт воркера confidence
+from oracle_mw_confidence import run_oracle_confidence
+from oracle_pack_confidence import run_oracle_pack_confidence
+# 🔸 импорт воркера проверки sense
+from oracle_mw_sense_stat import run_oracle_sense_stat
+from oracle_pack_sense_stat import run_oracle_pack_sense
+from oracle_pack_lists import run_oracle_pack_lists
+# 🔸 импорт воркера backtest v3/v4
+from oracle_mw_backtest_v3 import run_oracle_mw_backtest_v3
+from oracle_mw_backtest_v4 import run_oracle_mw_backtest
+# 🔸 импорт воркеров PACK backtest v3/v4
+from oracle_pack_backtest_v3 import run_oracle_pack_backtest_v3
+from oracle_pack_backtest_v4 import run_oracle_pack_backtest_v4
+# 🔸 импорт воркера уборщика
+from oracle_cleaner import run_oracle_cleaner
 
 log = logging.getLogger("ORACLE_MAIN")
 
@@ -102,18 +102,18 @@ async def main():
     await asyncio.gather(
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_periodic(run_oracle_positions_analyzer, POS_INTERVAL_SEC, "ORACLE_POSITIONS_ANALYZER", initial_delay=POS_INITIAL_DELAY_SEC),
-#         run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
-#         run_periodic(run_oracle_pack_snapshot, INTERVAL_SEC, "ORACLE_PACK_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
-#         run_safe_loop(run_oracle_pack_confidence, "ORACLE_PACK_CONFIDENCE"),
-#         run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
-#         run_safe_loop(run_oracle_pack_lists, "ORACLE_PACK_LISTS"),
-#         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
-#         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
-#         run_safe_loop(run_oracle_mw_backtest_v3, "ORACLE_BACKTEST_V3"),
-#         run_safe_loop(run_oracle_mw_backtest, "ORACLE_BACKTEST_V4"),
-#         run_safe_loop(run_oracle_pack_backtest_v3, "PACK_BACKTEST_V3"),
-#         run_safe_loop(run_oracle_pack_backtest_v4, "PACK_BACKTEST_V4"),
-#         run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
+        run_periodic(run_oracle_mw_snapshot, INTERVAL_SEC, "ORACLE_MW_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
+        run_periodic(run_oracle_pack_snapshot, INTERVAL_SEC, "ORACLE_PACK_SNAPSHOT", initial_delay=INITIAL_DELAY_SEC),
+        run_safe_loop(run_oracle_pack_confidence, "ORACLE_PACK_CONFIDENCE"),
+        run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
+        run_safe_loop(run_oracle_pack_lists, "ORACLE_PACK_LISTS"),
+        run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
+        run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
+        run_safe_loop(run_oracle_mw_backtest_v3, "ORACLE_BACKTEST_V3"),
+        run_safe_loop(run_oracle_mw_backtest, "ORACLE_BACKTEST_V4"),
+        run_safe_loop(run_oracle_pack_backtest_v3, "PACK_BACKTEST_V3"),
+        run_safe_loop(run_oracle_pack_backtest_v4, "PACK_BACKTEST_V4"),
+        run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
     )
 
 if __name__ == "__main__":
