@@ -20,7 +20,7 @@ from oracle_positions_analyzer import (
     INITIAL_DELAY_SEC as POS_INITIAL_DELAY_SEC,
     INTERVAL_SEC as POS_INTERVAL_SEC,
 )
-🔸 импорт воркера отчётов
+# 🔸 импорт воркера отчётов
 from oracle_mw_snapshot import run_oracle_mw_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
 from oracle_pack_snapshot import run_oracle_pack_snapshot, INITIAL_DELAY_SEC, INTERVAL_SEC
 # 🔸 импорт воркера confidence
