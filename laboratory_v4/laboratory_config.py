@@ -134,17 +134,17 @@ async def lists_stream_listener():
                                 # WL и BL приходят на одном стриме — обновляем оба
                                 await _reload_mw_wl_for_strategy(sid, version)
                                 await _reload_mw_bl_for_strategy(sid, version)
-                                log.info("🔁 LAB: MW WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
+                                log.debug("🔁 LAB: MW WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
                             else:
-                                log.info("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
+                                log.debug("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
 
                         elif stream_name == PACK_LISTS_READY_STREAM:
                             # ожидаем: {strategy_id, time_frame='7d', version ∈ allowed_versions, ...}
                             if sid and version in allowed_versions:
                                 await _reload_pack_lists_for_strategy(sid, version)
-                                log.info("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
+                                log.debug("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
                             else:
-                                log.info("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
+                                log.debug("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
 
                         acks.setdefault(stream_name, []).append(msg_id)
                     except Exception:
@@ -266,7 +266,7 @@ async def _load_mw_whitelists_all():
     for ver in allowed_versions:
         replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
-    log.info(
+    log.debug(
         "✅ LAB: MW WL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
         len(infra.lab_mw_wl.get("v1", {})),
         len(infra.lab_mw_wl.get("v2", {})),
@@ -316,7 +316,7 @@ async def _load_mw_blacklists_all():
     for ver in allowed_versions:
         infra.replace_mw_blacklist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
-    log.info(
+    log.debug(
         "✅ LAB: MW BL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
         len(infra.lab_mw_bl.get("v1", {})),
         len(infra.lab_mw_bl.get("v2", {})),
@@ -383,7 +383,7 @@ async def _load_pack_lists_all():
         replace_pack_list("whitelist", ver, wl_maps.get(ver, {}), wr_map=wl_wr_maps.get(ver, {}))
         replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
-    log.info(
+    log.debug(
         "✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, wl[v3]=%d, wl[v4]=%d, bl[v1]=%d, bl[v2]=%d, bl[v3]=%d, bl[v4]=%d",
         len(infra.lab_pack_wl.get("v1", {})),
         len(infra.lab_pack_wl.get("v2", {})),

@@ -210,7 +210,7 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
                     ORDER BY h.finished_at DESC
                   ) AS rn
                 FROM laboratory_request_head h
-                JOIN clients c ON c.client_strategy_id = h.client_strategy_id
+                JOIN clients c ON c.client_sid = h.client_strategy_id
               ) s
               WHERE rn = 1
             )
@@ -222,14 +222,14 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
               COALESCE(pp.client_sid, hp.client_sid)                       AS client_sid,
               COALESCE(pp.direction,  hp.direction)                        AS direction,
               COALESCE(hp.tfs, 'm5,m15,h1')                                AS tfs,
-              COALESCE(c.deposit, 0)                                       AS deposit
+              COALESCE(sv.deposit, 0)                                      AS deposit
             FROM expected e
             LEFT JOIN pos_pick pp
               ON pp.master_sid = e.master_sid AND pp.version = e.version AND pp.mode = e.mode
             LEFT JOIN head_pick hp
               ON hp.master_sid = e.master_sid AND hp.version = e.version AND hp.mode = e.mode
-            LEFT JOIN strategies_v4 c
-              ON c.id = COALESCE(pp.client_sid, hp.client_sid)
+            LEFT JOIN strategies_v4 sv
+              ON sv.id = COALESCE(pp.client_sid, hp.client_sid)
             ORDER BY e.master_sid, e.version, e.mode
             """
         )
@@ -253,10 +253,9 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
 
     if missing:
         log.debug("ℹ️ LAB_MW_BL_ANALYZER: нет данных для %d комбинаций (они будут пропущены): %s",
-                  len(missing), ", ".join(f"{ms}/{v}/{m}" for ms,v,m in missing))
+                  len(missing), ", ".join(f"{ms}/{v}/{m}" for ms, v, m in missing))
     log.debug("🔎 LAB_MW_BL_ANALYZER: карта соответствий собрана (комбинаций=%d)", len(mapping))
     return mapping
-
 
 # 🔸 Полный пересчёт по всей карте
 async def _recompute_mapping(mapping: Dict[Tuple[int, str, str], Tuple[int, str, str, float]]):
