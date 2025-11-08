@@ -1,4 +1,4 @@
-# oracle_mw_backtest_v4.py — воркер v4-бэктеста: кривая ROI(t) по agg_state, выбор порога, публикация WL/BL v4 + событие готовности
+# oracle_mw_backtest_v4.py — воркер v4-бэктеста: кривая ROI(t) по agg_state, выбор порога, публикация WL/BL v4 + глобальная очистка старых записей
 
 # 🔸 Импорты
 import asyncio
@@ -32,12 +32,10 @@ AGG_BASES = (
     "trend_extremes",
     "trend_momentum",
     "trend_mom_align",
-    "trend_pullback_flag",
     "trend_volatility_extremes",
     "trend_volatility_momentum",
     "trend_extremes_momentum",
     "trend_volatility_mom_align",
-    "trend_volatility_pullback_flag",
     "trend_volatility_extremes_momentum",
 )
 
@@ -120,10 +118,42 @@ async def _process_report_7d(report_id: int, strategy_id: int, window_end_iso: s
         return
 
     async with infra.pg_pool.acquire() as conn:
+        # ранний гард: обрабатываем только самый свежий 7d-отчёт стратегии
+        latest_id = await conn.fetchval(
+            """
+            SELECT id
+            FROM oracle_report_stat
+            WHERE strategy_id = $1 AND time_frame = '7d' AND source = 'mw'
+            ORDER BY window_end DESC, created_at DESC
+            LIMIT 1
+            """,
+            int(strategy_id)
+        )
+        if latest_id is None:
+            log.debug("ℹ️ Пропуск sid=%s: нет записей oracle_report_stat для 7d", strategy_id)
+            return
+        if int(latest_id) != int(report_id):
+            log.debug("⏭️ Пропуск sid=%s rep=%s: не последний отчёт (latest=%s)", strategy_id, report_id, latest_id)
+            return
+
+        # глобальная очистка: удалить ВСЕ v4 записи WL/BL по стратегии, ссылающиеся на старые report_id
+        res = await conn.execute(
+            """
+            DELETE FROM oracle_mw_whitelist w
+            USING oracle_mw_aggregated_stat a
+            WHERE w.version = 'v4'
+              AND w.strategy_id = $1
+              AND w.aggregated_id = a.id
+              AND a.report_id <> $2
+            """,
+            int(strategy_id), int(report_id)
+        )
+        log.debug("🧹 Очистка v4 по sid=%s rep=%s: %s", strategy_id, report_id, res)
+
         # депозит стратегии (ROI считается по нему)
         deposit = await conn.fetchval("SELECT deposit FROM strategies_v4 WHERE id = $1", int(strategy_id))
         if deposit is None:
-            log.debug("ℹ️ Пропуск sid=%s: депозит отсутствует", strategy_id)
+            log.debug("ℹ️ Пропуск sid=%s: депозит отсутствует (после очистки)", strategy_id)
             return
         deposit = float(deposit)
 
@@ -144,7 +174,7 @@ async def _process_report_7d(report_id: int, strategy_id: int, window_end_iso: s
             int(report_id), list(AGG_BASES), list(TF_LIST), list(DIRECTIONS)
         )
         if not rows:
-            log.debug("ℹ️ Нет агрегатов для report_id=%s (v4)", report_id)
+            log.debug("ℹ️ Нет агрегатов для report_id=%s (после очистки)", report_id)
             return
 
         # группируем по ключу (tf, dir, base)

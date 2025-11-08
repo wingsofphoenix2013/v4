@@ -1,4 +1,4 @@
-# oracle_mw_backtest_v3.py — воркер v3-бэктеста: ROI по порогу confidence (c гейтом sense>0.5), публикация WL/BL v3
+# oracle_mw_backtest_v3.py — воркер v3-бэктеста: ROI по порогу confidence (гейт sense>0.5), публикация WL/BL v3 + глобальная очистка старых записей
 
 # 🔸 Импорты
 import asyncio
@@ -95,7 +95,7 @@ async def run_oracle_mw_backtest_v3():
             await asyncio.sleep(5)
 
 
-# 🔸 Обработка одного 7d-отчёта по всем TF (v3)
+# 🔸 Обработка одного 7d-отчёта по всем TF (v3) с глобальной очисткой старых v3-записей
 async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: str):
     async with infra.pg_pool.acquire() as conn:
         # депозит стратегии
@@ -104,6 +104,38 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
             log.debug("ℹ️ Пропуск sid=%s: депозит отсутствует", strategy_id)
             return
         deposit = float(deposit)
+
+        # ранний гард: обрабатываем только самый свежий 7d-отчёт стратегии
+        latest_id = await conn.fetchval(
+            """
+            SELECT id
+            FROM oracle_report_stat
+            WHERE strategy_id = $1 AND time_frame = '7d' AND source = 'mw'
+            ORDER BY window_end DESC, created_at DESC
+            LIMIT 1
+            """,
+            int(strategy_id)
+        )
+        if latest_id is None:
+            log.debug("ℹ️ Пропуск sid=%s: нет записей oracle_report_stat для 7d", strategy_id)
+            return
+        if int(latest_id) != int(report_id):
+            log.debug("⏭️ Пропуск sid=%s rep=%s: не последний отчёт (latest=%s)", strategy_id, report_id, latest_id)
+            return
+
+        # глобальная очистка: удалить ВСЕ v3 записи WL/BL по стратегии, ссылающиеся на старые report_id
+        res = await conn.execute(
+            """
+            DELETE FROM oracle_mw_whitelist w
+            USING oracle_mw_aggregated_stat a
+            WHERE w.version = 'v3'
+              AND w.strategy_id = $1
+              AND w.aggregated_id = a.id
+              AND a.report_id <> $2
+            """,
+            int(strategy_id), int(report_id)
+        )
+        log.debug("🧹 Очистка v3 по sid=%s rep=%s: %s", strategy_id, report_id, res)
 
         method = "v3"
 
@@ -120,7 +152,7 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
         )
         sense_keys = {(str(r["timeframe"]), str(r["direction"]), str(r["agg_base"])) for r in rows_sense}
         if not sense_keys:
-            log.debug("ℹ️ Нет баз с sense>%.2f для report_id=%s — v3 пропущен", SENSE_SCORE_MIN, report_id)
+            log.debug("ℹ️ Нет баз с sense>%.2f для report_id=%s — v3 расчёт пропущен (после очистки)", SENSE_SCORE_MIN, report_id)
             return
 
         # поднабор агрегатов по conf >= 0.20 и только по ключам из sense
@@ -136,7 +168,7 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
             int(report_id), float(CONF_BASE_MIN)
         )
         if not rows:
-            log.debug("ℹ️ Нет агрегатов с confidence>=%.2f для report_id=%s", CONF_BASE_MIN, report_id)
+            log.debug("ℹ️ Нет агрегатов с confidence>=%.2f для report_id=%s (после очистки)", CONF_BASE_MIN, report_id)
             return
 
         # группируем по ключу и фильтруем sense

@@ -1,4 +1,4 @@
-# oracle_pack_backtest_v4.py — воркер v4-бэктеста (PACK): кривая ROI(t) по состояниям оси, выбор порога, WL/BL v4 + событие готовности
+# oracle_pack_backtest_v4.py — воркер v4-бэктеста (PACK): кривая ROI(t) по состояниям оси, выбор порога, WL/BL v4 + глобальная очистка старых записей
 
 # 🔸 Импорты
 import asyncio
@@ -104,10 +104,42 @@ async def _process_report_v4(report_id: int, strategy_id: int, window_end_iso: s
         return
 
     async with infra.pg_pool.acquire() as conn:
+        # гард: обрабатываем только самый свежий PACK-отчёт 7d по стратегии
+        latest_id = await conn.fetchval(
+            """
+            SELECT id
+            FROM oracle_report_stat
+            WHERE strategy_id = $1 AND time_frame = '7d' AND source = 'pack'
+            ORDER BY window_end DESC, created_at DESC
+            LIMIT 1
+            """,
+            int(strategy_id)
+        )
+        if latest_id is None:
+            log.debug("ℹ️ Пропуск sid=%s: нет PACK-отчётов 7d", strategy_id)
+            return
+        if int(latest_id) != int(report_id):
+            log.debug("⏭️ Пропуск sid=%s rep=%s: не последний PACK-отчёт (latest=%s)", strategy_id, report_id, latest_id)
+            return
+
+        # глобальная очистка: удалить ВСЕ v4 записи PACK WL/BL по стратегии, ссылающиеся на старые report_id
+        res = await conn.execute(
+            """
+            DELETE FROM oracle_pack_whitelist w
+            USING oracle_pack_aggregated_stat a
+            WHERE w.version = 'v4'
+              AND w.strategy_id = $1
+              AND w.aggregated_id = a.id
+              AND a.report_id <> $2
+            """,
+            int(strategy_id), int(report_id)
+        )
+        log.debug("🧹 PACK v4 очистка по sid=%s rep=%s: %s", strategy_id, report_id, res)
+
         # депозит стратегии
         deposit = await conn.fetchval("SELECT deposit FROM strategies_v4 WHERE id = $1", int(strategy_id))
         if deposit is None:
-            log.debug("ℹ️ Пропуск sid=%s: отсутствует депозит", strategy_id)
+            log.debug("ℹ️ Пропуск sid=%s: отсутствует депозит (после очистки)", strategy_id)
             return
         deposit = float(deposit)
 
@@ -126,7 +158,7 @@ async def _process_report_v4(report_id: int, strategy_id: int, window_end_iso: s
             int(report_id)
         )
         if not rows:
-            log.debug("ℹ️ Нет PACK-агрегатов для report_id=%s (v4)", report_id)
+            log.debug("ℹ️ Нет PACK-агрегатов для report_id=%s (после очистки)", report_id)
             return
 
         # группировка по оси: (tf, dir, pack_base, agg_type, agg_key)
@@ -338,7 +370,7 @@ async def _build_curve_and_decide_v4(
         items.append({"id": int(s["id"]), "n": n, "pnl": pnl, "share": share})
     items.sort(key=lambda it: (it["n"], it["id"]))  # от редких к частым
 
-    # базовый шаг (без фильтра): cutoff_share=0.0
+    # шаг 0 (без фильтра)
     grid_rows = []
     kept_ids_all = [it["id"] for it in items]
     grid_rows.append({
@@ -356,7 +388,7 @@ async def _build_curve_and_decide_v4(
         "skip_negative": False,
     })
 
-    # функция шага: отбрасываем все состояния с share ≤ t
+    # шаг по порогу: отбрасываем состояния с share ≤ t
     def build_step_for_cut(t: float):
         kept = [it for it in items if it["share"] > t]
         kept_ids = [it["id"] for it in kept]
@@ -388,7 +420,7 @@ async def _build_curve_and_decide_v4(
             seen.add(t)
             unique_cuts.append(t)
 
-    # добавляем шаги; последний шаг допускаем, даже если пусто (фиксация «0 осталось»)
+    # проходим по порогам; последний шаг фиксируем даже если пусто
     rank = 1
     for t in unique_cuts:
         step = build_step_for_cut(t)
@@ -396,12 +428,12 @@ async def _build_curve_and_decide_v4(
             grid_rows.append({**step, "step_rank": rank})
             rank += 1
             break
-        if set(step["kept_ids"]) == set(grid_rows[-1]["kept_ids"]):
+        if grid_rows and set(step["kept_ids"]) == set(grid_rows[-1]["kept_ids"]):
             continue
         grid_rows.append({**step, "step_rank": rank})
         rank += 1
 
-    # выбор лучшего шага (макс ROI; tie-break — минимальный порог)
+    # выбор лучшего шага (макс ROI; tie-break — меньший cutoff_share)
     best = max(grid_rows, key=lambda r: (r["roi"], -r["cutoff_share"]))
     improved = best["roi"] > roi_base
 

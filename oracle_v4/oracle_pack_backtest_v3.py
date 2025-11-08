@@ -1,4 +1,4 @@
-# oracle_pack_backtest_v3.py — воркер v3-бэктеста (PACK): ROI по порогу confidence (с гейтом sense>0.5), WL/BL v3 + событие готовности
+# oracle_pack_backtest_v3.py — воркер v3-бэктеста (PACK): ROI по порогу confidence (с гейтом sense>0.5), WL/BL v3 + событие готовности; добавлена глобальная очистка старых записей
 
 # 🔸 Импорты
 import asyncio
@@ -101,10 +101,42 @@ async def run_oracle_pack_backtest_v3():
 # 🔸 Обработка одного 7d-отчёта для всех TF (формирование кривых и публикация WL/BL v3)
 async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: str):
     async with infra.pg_pool.acquire() as conn:
+        # ранний гард: обрабатываем только самый свежий 7d-отчёт стратегии в контуре PACK
+        latest_id = await conn.fetchval(
+            """
+            SELECT id
+            FROM oracle_report_stat
+            WHERE strategy_id = $1 AND time_frame = '7d' AND source = 'pack'
+            ORDER BY window_end DESC, created_at DESC
+            LIMIT 1
+            """,
+            int(strategy_id)
+        )
+        if latest_id is None:
+            log.debug("ℹ️ Пропуск sid=%s: нет PACK-отчётов 7d", strategy_id)
+            return
+        if int(latest_id) != int(report_id):
+            log.debug("⏭️ Пропуск sid=%s rep=%s: не последний PACK-отчёт (latest=%s)", strategy_id, report_id, latest_id)
+            return
+
+        # глобальная очистка: удалить ВСЕ v3 записи PACK WL/BL по стратегии, ссылающиеся на старые report_id
+        res = await conn.execute(
+            """
+            DELETE FROM oracle_pack_whitelist w
+            USING oracle_pack_aggregated_stat a
+            WHERE w.version = 'v3'
+              AND w.strategy_id = $1
+              AND w.aggregated_id = a.id
+              AND a.report_id <> $2
+            """,
+            int(strategy_id), int(report_id)
+        )
+        log.debug("🧹 PACK v3 очистка по sid=%s rep=%s: %s", strategy_id, report_id, res)
+
         # депозит стратегии
         deposit = await conn.fetchval("SELECT deposit FROM strategies_v4 WHERE id = $1", int(strategy_id))
         if deposit is None:
-            log.debug("ℹ️ Пропуск sid=%s: отсутствует депозит", strategy_id)
+            log.debug("ℹ️ Пропуск sid=%s: отсутствует депозит (после очистки)", strategy_id)
             return
         deposit = float(deposit)
 
@@ -123,7 +155,7 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
         )
         sense_axes = {(str(r["timeframe"]), str(r["direction"]), str(r["pack_base"]), str(r["agg_type"]), str(r["agg_key"])) for r in rows_sense}
         if not sense_axes:
-            log.debug("ℹ️ Нет осей с sense>%.2f для report_id=%s — v3 пропущен", SENSE_SCORE_MIN, report_id)
+            log.debug("ℹ️ Нет PACK-осей с sense>%.2f для report_id=%s — v3 пропущен (после очистки)", SENSE_SCORE_MIN, report_id)
             return
 
         # агрегаты текущего отчёта, отфильтрованные по conf ≥ 0.20
@@ -140,7 +172,7 @@ async def _process_report_v3(report_id: int, strategy_id: int, stream_msg_id: st
             int(report_id), float(CONF_BASE_MIN)
         )
         if not rows:
-            log.debug("ℹ️ Нет PACK-агрегатов с conf≥%.2f для report_id=%s", CONF_BASE_MIN, report_id)
+            log.debug("ℹ️ Нет PACK-агрегатов с conf≥%.2f для report_id=%s (после очистки)", CONF_BASE_MIN, report_id)
             return
 
         # группировка по оси, с учётом sense-гейта
@@ -543,7 +575,7 @@ async def _publish_v3_lists_for_decision(
           agg_value     AS agg_value,
           winrate       AS winrate,
           confidence    AS confidence
-        FROM oracle_pacK_aggregated_stat
+        FROM oracle_pack_aggregated_stat
         WHERE id = ANY($1::bigint[])
         """,
         list(kept_ids)
