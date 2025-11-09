@@ -18,7 +18,7 @@ LAB_DECISION_MODE = "mw_and_pack"    	# mw_only | mw_then_pack | mw_and_pack | p
 LAB_VERSION = "v1"               		# v1 | v2 | v3 | v4
 LAB_USE_WL = "false"             		# "true" | "false" (строкой)
 LAB_USE_BL = "false"             		# "true" | "false" (строкой)
-LAB_WAIT_TIMEOUT_SEC = 90        		# таймаут ожидания ответа
+LAB_WAIT_TIMEOUT_SEC = 120        		# таймаут ожидания ответа
 
 # 🔸 Класс стратегии
 class Strategy201Long:

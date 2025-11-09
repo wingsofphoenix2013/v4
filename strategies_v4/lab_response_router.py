@@ -15,7 +15,7 @@ log = logging.getLogger("LAB_RESP_ROUTER")
 # 🔸 Константы
 RESP_STREAM = "laboratory:decision_response"
 XREAD_BLOCK_MS = 1000
-XREAD_COUNT = 100
+XREAD_COUNT = 200
 
 # 🔸 Реестр ожиданий и ранние результаты
 _pending: Dict[str, asyncio.Future] = {}
