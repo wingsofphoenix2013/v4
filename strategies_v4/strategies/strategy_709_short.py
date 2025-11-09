@@ -1,11 +1,11 @@
-# strategy_705_short.py
+# strategy_709_short.py
 
 import logging
 import json
 
-log = logging.getLogger("strategy_705_short")
+log = logging.getLogger("strategy_709_short")
 
-class Strategy705Short:
+class Strategy709Short:
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
 
