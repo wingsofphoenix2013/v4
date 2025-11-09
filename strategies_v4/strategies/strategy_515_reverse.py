@@ -1,4 +1,4 @@
-# strategy_405_short.py — шортовая стратегия с LAB-гейтингом (mw_and_pack, v5, без BL)
+# strategy_515_reverse.py — двунаправленная стратегия с LAB-гейтингом и выбором мастера по направлению (long/short)
 
 # 🔸 Импорты
 import logging
@@ -9,11 +9,11 @@ from infra import lab_sema_acquire, lab_sema_release
 from lab_response_router import wait_lab_response
 
 # 🔸 Логгер
-log = logging.getLogger("strategy_405_short")
+log = logging.getLogger("strategy_515_reverse")
 
-# 🔸 Константы LAB-запроса (индивидуальные настройки стратегии)
+# 🔸 Константы LAB-запроса (общие настройки стратегии)
 LAB_REQ_STREAM = "laboratory:decision_request"
-LAB_TIMEFRAMES = "m5"		     		# порядок обязателен
+LAB_TIMEFRAMES = "m5,m15"	     		# порядок обязателен
 LAB_DECISION_MODE = "mw_and_pack"    	# mw_only | mw_then_pack | mw_and_pack | pack_only
 LAB_VERSION = "v5"               		# v1 | v2 | v3 | v4 | v5
 LAB_USE_WL = "false"             		# "true" | "false" (строкой)
@@ -21,14 +21,12 @@ LAB_USE_BL = "false"             		# "true" | "false" (строкой)
 LAB_WAIT_TIMEOUT_SEC = 120        		# таймаут ожидания ответа
 
 # 🔸 Класс стратегии
-class Strategy405Short:
-    # 🔸 Валидация сигнала + запрос в LAB
+class Strategy515Reverse:
+    # 🔸 Валидация сигнала + запрос в LAB (двунаправленный выбор master по направлению)
     async def validate_signal(self, signal, context):
-        # базовая валидация направления
+        # базовая валидация направления (двунаправленно)
         direction = str(signal.get("direction", "")).lower()
-        if direction == "long":
-            return ("ignore", "long сигналы отключены")
-        if direction != "short":
+        if direction not in ("long", "short"):
             return ("ignore", f"неизвестное направление: {direction}")
 
         # обязательные зависимости
@@ -38,19 +36,23 @@ class Strategy405Short:
 
         strategy_cfg = context.get("strategy") or {}
         client_sid = strategy_cfg.get("id")
-        master_sid = strategy_cfg.get("market_mirrow")  # мастер для WL/BL
+
+        # выбор мастера по направлению с фолбэком на универсальное поле
+        if direction == "long":
+            master_sid = strategy_cfg.get("market_mirrow_long") or strategy_cfg.get("market_mirrow")
+        else:
+            master_sid = strategy_cfg.get("market_mirrow_short") or strategy_cfg.get("market_mirrow")
 
         # проверка конфигурации мастера
         if not master_sid:
-            # договорённость: не захватываем семафор, сразу ignore
             log.error(
-                "❌ invalid_config: отсутствует master (market_mirrow is NULL) "
+                "❌ invalid_config: отсутствует master для направления [%s] "
                 "[client_sid=%s symbol=%s dir=%s log_uid=%s]",
-                client_sid, signal.get("symbol"), direction, signal.get("log_uid"),
+                direction, client_sid, signal.get("symbol"), direction, signal.get("log_uid"),
             )
             return ("ignore", "invalid_config")
 
-        # генерируем действительно уникальный req_uid
+        # генерируем уникальный req_uid
         req_uid = str(uuid.uuid4())
         symbol = str(signal.get("symbol", "")).upper()
         log_uid = signal.get("log_uid")
@@ -59,8 +61,8 @@ class Strategy405Short:
         request = {
             "req_uid": req_uid,
             "log_uid": log_uid,
-            "strategy_id": int(master_sid),           # master (WL/BL)
-            "client_strategy_id": int(client_sid),    # текущая стратегия
+            "strategy_id": int(master_sid),           # master (WL/BL) — по направлению
+            "client_strategy_id": int(client_sid),    # текущая (двунаправленная) стратегия
             "symbol": symbol,
             "direction": direction,                   # long | short
             "timeframes": LAB_TIMEFRAMES,             # "m5,m15,h1"

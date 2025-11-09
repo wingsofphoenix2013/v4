@@ -13,7 +13,7 @@ log = logging.getLogger("strategy_405_reverse")
 
 # 🔸 Константы LAB-запроса (общие настройки стратегии)
 LAB_REQ_STREAM = "laboratory:decision_request"
-LAB_TIMEFRAMES = "m5,m15,h1"     		# порядок обязателен
+LAB_TIMEFRAMES = "m5"     				# порядок обязателен
 LAB_DECISION_MODE = "mw_and_pack"    	# mw_only | mw_then_pack | mw_and_pack | pack_only
 LAB_VERSION = "v5"               		# v1 | v2 | v3 | v4 | v5
 LAB_USE_WL = "false"             		# "true" | "false" (строкой)

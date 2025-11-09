@@ -1,4 +1,4 @@
-# strategy_405_short.py — шортовая стратегия с LAB-гейтингом (mw_and_pack, v5, без BL)
+# strategy_515_long.py — лонговая стратегия с LAB-гейтингом (mw_and_pack, v5, без BL)
 
 # 🔸 Импорты
 import logging
@@ -9,11 +9,11 @@ from infra import lab_sema_acquire, lab_sema_release
 from lab_response_router import wait_lab_response
 
 # 🔸 Логгер
-log = logging.getLogger("strategy_405_short")
+log = logging.getLogger("strategy_515_long")
 
 # 🔸 Константы LAB-запроса (индивидуальные настройки стратегии)
 LAB_REQ_STREAM = "laboratory:decision_request"
-LAB_TIMEFRAMES = "m5"		     		# порядок обязателен
+LAB_TIMEFRAMES = "m5,m15"	     		# порядок обязателен
 LAB_DECISION_MODE = "mw_and_pack"    	# mw_only | mw_then_pack | mw_and_pack | pack_only
 LAB_VERSION = "v5"               		# v1 | v2 | v3 | v4 | v5
 LAB_USE_WL = "false"             		# "true" | "false" (строкой)
@@ -21,14 +21,14 @@ LAB_USE_BL = "false"             		# "true" | "false" (строкой)
 LAB_WAIT_TIMEOUT_SEC = 120        		# таймаут ожидания ответа
 
 # 🔸 Класс стратегии
-class Strategy405Short:
+class Strategy515Long:
     # 🔸 Валидация сигнала + запрос в LAB
     async def validate_signal(self, signal, context):
         # базовая валидация направления
         direction = str(signal.get("direction", "")).lower()
-        if direction == "long":
-            return ("ignore", "long сигналы отключены")
-        if direction != "short":
+        if direction == "short":
+            return ("ignore", "short сигналы отключены")
+        if direction != "long":
             return ("ignore", f"неизвестное направление: {direction}")
 
         # обязательные зависимости
