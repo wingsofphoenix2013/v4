@@ -1,4 +1,4 @@
-# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/MW-WL/MW-BL/PACK-WL/PACK-BL (+winrate) и слушатели обновлений
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/MW-WL/MW-BL/PACK-WL/PACK-BL (+winrate) и слушатели обновлений (v1–v5)
 
 # 🔸 Импорты
 import asyncio
@@ -33,7 +33,7 @@ PUBSUB_TICKERS = "bb:tickers_events"
 PUBSUB_STRATEGIES = "strategies_v4_events"
 
 
-# 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL v1–v4)
+# 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL v1–v5)
 async def load_initial_config():
     # условия достаточности
     if infra.pg_pool is None or infra.redis_client is None:
@@ -44,42 +44,46 @@ async def load_initial_config():
     await _load_active_tickers()
     # стратегии
     await _load_active_strategies()
-    # MW WL (v1–v4) + winrate карты
+    # MW WL (v1–v5) + winrate карты
     await _load_mw_whitelists_all()
-    # MW BL (v1–v4) + winrate карты
+    # MW BL (v1–v5) + winrate карты
     await _load_mw_blacklists_all()
-    # PACK WL/BL (v1–v4) + winrate карты
+    # PACK WL/BL (v1–v5) + winrate карты
     await _load_pack_lists_all()
 
     # итог
     log.info(
         "✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, "
-        "mw_wl[v1]=%d, mw_wl[v2]=%d, mw_wl[v3]=%d, mw_wl[v4]=%d, "
-        "mw_bl[v1]=%d, mw_bl[v2]=%d, mw_bl[v3]=%d, mw_bl[v4]=%d, "
-        "pack_wl[v1]=%d, pack_wl[v2]=%d, pack_wl[v3]=%d, pack_wl[v4]=%d, "
-        "pack_bl[v1]=%d, pack_bl[v2]=%d, pack_bl[v3]=%d, pack_bl[v4]=%d",
+        "mw_wl[v1]=%d, mw_wl[v2]=%d, mw_wl[v3]=%d, mw_wl[v4]=%d, mw_wl[v5]=%d, "
+        "mw_bl[v1]=%d, mw_bl[v2]=%d, mw_bl[v3]=%d, mw_bl[v4]=%d, mw_bl[v5]=%d, "
+        "pack_wl[v1]=%d, pack_wl[v2]=%d, pack_wl[v3]=%d, pack_wl[v4]=%d, pack_wl[v5]=%d, "
+        "pack_bl[v1]=%d, pack_bl[v2]=%d, pack_bl[v3]=%d, pack_bl[v4]=%d, pack_bl[v5]=%d",
         len(infra.lab_tickers),
         len(infra.lab_strategies),
         len(infra.lab_mw_wl.get("v1", {})),
         len(infra.lab_mw_wl.get("v2", {})),
         len(infra.lab_mw_wl.get("v3", {})),
         len(infra.lab_mw_wl.get("v4", {})),
+        len(infra.lab_mw_wl.get("v5", {})),
         len(infra.lab_mw_bl.get("v1", {})),
         len(infra.lab_mw_bl.get("v2", {})),
         len(infra.lab_mw_bl.get("v3", {})),
         len(infra.lab_mw_bl.get("v4", {})),
+        len(infra.lab_mw_bl.get("v5", {})),
         len(infra.lab_pack_wl.get("v1", {})),
         len(infra.lab_pack_wl.get("v2", {})),
         len(infra.lab_pack_wl.get("v3", {})),
         len(infra.lab_pack_wl.get("v4", {})),
+        len(infra.lab_pack_wl.get("v5", {})),
         len(infra.lab_pack_bl.get("v1", {})),
         len(infra.lab_pack_bl.get("v2", {})),
         len(infra.lab_pack_bl.get("v3", {})),
         len(infra.lab_pack_bl.get("v4", {})),
+        len(infra.lab_pack_bl.get("v5", {})),
     )
 
 
-# 🔸 Слушатель списков (Streams): обновление кэшей WL/BL oracle по сообщениям (v1–v4)
+# 🔸 Слушатель списков (Streams): обновление кэшей WL/BL oracle по сообщениям (v1–v5)
 async def lists_stream_listener():
     # условия достаточности
     if infra.redis_client is None:
@@ -87,7 +91,7 @@ async def lists_stream_listener():
         return
 
     # допустимые версии oracle для online-перезагрузок
-    allowed_versions = ("v1", "v2", "v3", "v4")
+    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
 
     # создать consumer group (идемпотентно)
     for s in (MW_WL_READY_STREAM, PACK_LISTS_READY_STREAM):
@@ -224,7 +228,7 @@ async def _load_active_strategies():
     log.info("✅ LAB: загружены активные стратегии (%d)", len(infra.lab_strategies))
 
 
-# 🔸 Загрузка MW Whitelist (все версии v1–v4, 7d)
+# 🔸 Загрузка MW Whitelist (все версии v1–v5, 7d)
 async def _load_mw_whitelists_all():
     # карты по версиям:
     #   v_maps: (sid, tf, dir) -> {(agg_base, agg_state)}
@@ -232,8 +236,7 @@ async def _load_mw_whitelists_all():
     v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
     wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {}
 
-    # допустимые версии oracle
-    allowed_versions = ("v1", "v2", "v3", "v4")
+    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
 
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -266,16 +269,17 @@ async def _load_mw_whitelists_all():
     for ver in allowed_versions:
         replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
-    log.debug(
-        "✅ LAB: MW WL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
+    log.info(
+        "✅ LAB: MW WL загружены: v1=%d, v2=%d, v3=%d, v4=%d, v5=%d",
         len(infra.lab_mw_wl.get("v1", {})),
         len(infra.lab_mw_wl.get("v2", {})),
         len(infra.lab_mw_wl.get("v3", {})),
         len(infra.lab_mw_wl.get("v4", {})),
+        len(infra.lab_mw_wl.get("v5", {})),
     )
 
 
-# 🔸 Загрузка MW Blacklist (все версии v1–v4, 7d)
+# 🔸 Загрузка MW Blacklist (все версии v1–v5, 7d)
 async def _load_mw_blacklists_all():
     # карты по версиям:
     #   v_maps: (sid, tf, dir) -> {(agg_base, agg_state)}
@@ -283,7 +287,7 @@ async def _load_mw_blacklists_all():
     v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
     wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {}
 
-    allowed_versions = ("v1", "v2", "v3", "v4")
+    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
 
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -316,16 +320,17 @@ async def _load_mw_blacklists_all():
     for ver in allowed_versions:
         infra.replace_mw_blacklist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
-    log.debug(
-        "✅ LAB: MW BL загружены: v1=%d, v2=%d, v3=%d, v4=%d",
+    log.info(
+        "✅ LAB: MW BL загружены: v1=%d, v2=%d, v3=%d, v4=%d, v5=%d",
         len(infra.lab_mw_bl.get("v1", {})),
         len(infra.lab_mw_bl.get("v2", {})),
         len(infra.lab_mw_bl.get("v3", {})),
         len(infra.lab_mw_bl.get("v4", {})),
+        len(infra.lab_mw_bl.get("v5", {})),
     )
 
 
-# 🔸 Загрузка PACK WL/BL (все версии v1–v4, 7d)
+# 🔸 Загрузка PACK WL/BL (все версии v1–v5, 7d)
 async def _load_pack_lists_all():
     # карты по версиям и типу списка:
     #   wl_maps/bl_maps: (sid, tf, dir) -> {(pack_base, agg_key, agg_value)}
@@ -335,7 +340,7 @@ async def _load_pack_lists_all():
     wl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {}
     bl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {}
 
-    allowed_versions = ("v1", "v2", "v3", "v4")
+    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
     allowed_lists = ("whitelist", "blacklist")
 
     async with infra.pg_pool.acquire() as conn:
@@ -383,16 +388,19 @@ async def _load_pack_lists_all():
         replace_pack_list("whitelist", ver, wl_maps.get(ver, {}), wr_map=wl_wr_maps.get(ver, {}))
         replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
-    log.debug(
-        "✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, wl[v3]=%d, wl[v4]=%d, bl[v1]=%d, bl[v2]=%d, bl[v3]=%d, bl[v4]=%d",
+    log.info(
+        "✅ LAB: PACK WL/BL загружены: wl[v1]=%d, wl[v2]=%d, wl[v3]=%d, wl[v4]=%d, wl[v5]=%d, "
+        "bl[v1]=%d, bl[v2]=%d, bl[v3]=%d, bl[v4]=%d, bl[v5]=%d",
         len(infra.lab_pack_wl.get("v1", {})),
         len(infra.lab_pack_wl.get("v2", {})),
         len(infra.lab_pack_wl.get("v3", {})),
         len(infra.lab_pack_wl.get("v4", {})),
+        len(infra.lab_pack_wl.get("v5", {})),
         len(infra.lab_pack_bl.get("v1", {})),
         len(infra.lab_pack_bl.get("v2", {})),
         len(infra.lab_pack_bl.get("v3", {})),
         len(infra.lab_pack_bl.get("v4", {})),
+        len(infra.lab_pack_bl.get("v5", {})),
     )
 
 

@@ -19,7 +19,7 @@ INTERVAL_SEC = 3 * 60 * 60      # периодичность — раз в 3 ч�
 
 # 🔸 Допустимые доменные константы
 ALLOWED_TFS = ("m5", "m15", "h1")
-ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4")
+ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4", "v5")
 ALLOWED_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 ALLOWED_DIRS = ("long", "short")
 ALLOWED_LIST_TAGS = ("whitelist", "blacklist")

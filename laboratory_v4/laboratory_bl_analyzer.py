@@ -27,7 +27,7 @@ BL_CONSUMER_NAME = "LAB_BL_ANALYZER_WORKER"
 ALLOWED_TFS = ("m5", "m15", "h1")
 DECISION_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 DIRECTIONS = ("long", "short")
-VERSIONS = ("v1","v2","v3","v4")
+VERSIONS = ("v1","v2","v3","v4","v5")
 
 
 # 🔸 Публичная точка входа воркера
@@ -166,7 +166,7 @@ async def _build_master_mode_map() -> Dict[Tuple[int, str, str], Tuple[int, str,
             expected AS (
               SELECT m.master_sid, v.version, d.mode
               FROM masters m
-              CROSS JOIN (VALUES ('v1'),('v2'),('v3'),('v4')) AS v(version)
+              CROSS JOIN (VALUES ('v1'),('v2'),('v3'),('v4'),('v5')) AS v(version)
               CROSS JOIN (VALUES ('mw_only'),('mw_then_pack'),('mw_and_pack'),('pack_only')) AS d(mode)
             ),
 

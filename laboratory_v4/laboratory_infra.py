@@ -1,4 +1,4 @@
-# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты WL/BL v1–v4, активные пороги BL/WL, MW-BL)
+# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты WL/BL v1–v5, активные пороги BL/WL, MW-BL)
 
 # 🔸 Импорты
 import os
@@ -17,27 +17,27 @@ lab_tickers: Dict[str, dict] = {}
 # стратегии: id -> row_dict
 lab_strategies: Dict[int, dict] = {}
 
-# 🔸 MW whitelist и winrates по версиям (v1–v4)
+# 🔸 MW whitelist и winrates по версиям (v1–v5)
 #   lab_mw_wl: версия -> {(sid, timeframe, direction) -> {(agg_base, agg_state), ...}}
 #   lab_mw_wl_wr: версия -> {(sid, tf, dir) -> {(agg_base, agg_state) -> wr}}
-lab_mw_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
-lab_mw_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
+lab_mw_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
+lab_mw_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 
-# 🔸 MW blacklist и winrates по версиям (v1–v4)
+# 🔸 MW blacklist и winrates по версиям (v1–v5)
 #   lab_mw_bl: версия -> {(sid, tf, dir) -> {(agg_base, agg_state), ...}}
 #   lab_mw_bl_wr: версия -> {(sid, tf, dir) -> {(agg_base, agg_state) -> wr}}
-lab_mw_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
-lab_mw_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
+lab_mw_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
+lab_mw_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 
-# 🔸 PACK lists (WL/BL) и winrates по версиям (v1–v4)
+# 🔸 PACK lists (WL/BL) и winrates по версиям (v1–v5)
 #   whitelist: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
 #   blacklist: версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
-lab_pack_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
-lab_pack_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
+lab_pack_wl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
+lab_pack_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 #   winrates:
 #   версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value) -> wr}}
-lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
-lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}}
+lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
+lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 
 # 🔸 Активные пороги BL (PACK) — для онлайн-вето
 # ключ: (master_sid, version, decision_mode, direction, tf)
@@ -144,7 +144,7 @@ def replace_mw_whitelist(
     wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = None,
 ):
     """
-    Полная замена WL MW для указанной версии ('v1'|'v2'|'v3'|'v4') + (опционально) карта winrate.
+    Полная замена WL MW для указанной версии ('v1'|'v2'|'v3'|'v4'|'v5') + (опционально) карта winrate.
     """
     v = str(version or "").lower()
     if v not in lab_mw_wl:
@@ -165,7 +165,7 @@ def replace_mw_blacklist(
     wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = None,
 ):
     """
-    Полная замена BL MW для указанной версии ('v1'|'v2'|'v3'|'v4') + (опционально) карта winrate.
+    Полная замена BL MW для указанной версии ('v1'|'v2'|'v3'|'v4'|'v5') + (опционально) карта winrate.
     """
     v = str(version or "").lower()
     if v not in lab_mw_bl:
@@ -187,7 +187,7 @@ def replace_pack_list(
     wr_map: Optional[Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = None,
 ):
     """
-    Полная замена PACK WL/BL для указанной версии ('v1'|'v2'|'v3'|'v4') и списка ('whitelist'|'blacklist')
+    Полная замена PACK WL/BL для указанной версии ('v1'|'v2'|'v3'|'v4'|'v5') и списка ('whitelist'|'blacklist')
     + (опционально) карта winrate.
     """
     v = str(version or "").lower()
@@ -297,8 +297,6 @@ def update_mw_blacklist_for_strategy(
     if wr_map:
         for sid_tf_dir, m in wr_map.items():
             lab_mw_bl_wr[v][sid_tf_dir] = dict(m or {})
-
-    # (опциональные метрики можно добавить по аналогии с WL)
 
 
 def update_pack_list_for_strategy(
