@@ -1,4 +1,4 @@
-# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов (до 16), внутри запроса — последовательная проверка TF (младший→старший) + BL/WL пороги (PACK и MW)
+# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов, проверка TF (m5→m15→h1), новый слой Oracle-VETO (PACK-BL detailed + Active-пороги) поверх текущей WL/BL-логики
 
 # 🔸 Импорты
 import asyncio
@@ -28,7 +28,7 @@ GATE_KEY_TMPL = "lab:gate:busy:{client_sid}:{symbol}:{direction}"
 DUP_GUARD_TTL_SEC = 20  # TTL ворот, сек (пока нет ответа по первому запросу)
 
 # 🔸 Параллелизм/чтение
-MAX_CONCURRENCY = 16     # одновременно обрабатываем до 15 запросов
+MAX_CONCURRENCY = 16
 READ_COUNT = 32
 READ_BLOCK_MS = 3000
 
@@ -38,6 +38,13 @@ ALLOWED_DECISION_MODES = ("mw_only", "mw_then_pack", "mw_and_pack", "pack_only")
 ALLOWED_DIRECTIONS = ("long", "short")
 ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4", "v5")
 MW_BASES = ("trend", "volatility", "momentum", "extremes", "mom_align")
+
+# 🔸 Режим для Active-порогов oracle (таблицы *_bl_active содержат пороги в «smoothed»)
+BL_ACTIVE_DECISION_MODE = "smoothed"
+
+# 🔸 Причины отказа (новые для VETO)
+REASON_VETO_EXACT = "pack_detailed_veto_exact"
+REASON_VETO_BYKEY = "pack_detailed_veto_by_key"
 
 
 # 🔸 Публичная точка входа воркера
@@ -308,6 +315,7 @@ async def _handle_request(payload: dict):
     decision_mode = str(payload.get("decision_mode") or "").lower()
     use_bl = _parse_bool(payload.get("use_bl"))
     use_wl = _parse_bool(payload.get("use_wl"))
+    use_oracle_bl = _parse_bool(payload.get("use_oracle_bl"))
     timeframes_raw = str(payload.get("timeframes") or "")
     tfs = _parse_timeframes(timeframes_raw)
 
@@ -385,25 +393,33 @@ async def _handle_request(payload: dict):
 
     final_allow = True
     final_reason = "ok"
+    oracle_short_circuit = False
 
     try:
         for tf in tfs:
             cache_key = (strategy_id, tf, direction)
 
-            # WL/BL наборы и карты WR (для логов wr по матчам)
+            # WL/BL наборы и карты WR
             mw_wl_set = infra.lab_mw_wl.get(version, {}).get(cache_key, set())
             mw_bl_set = infra.lab_mw_bl.get(version, {}).get(cache_key, set())
             pack_wl_set = infra.lab_pack_wl.get(version, {}).get(cache_key, set())
             pack_bl_set = infra.lab_pack_bl.get(version, {}).get(cache_key, set())
+
             mw_wr_map = infra.lab_mw_wl_wr.get(version, {}).get(cache_key, {})
             mbl_wr_map = infra.lab_mw_bl_wr.get(version, {}).get(cache_key, {})
             pwl_wr_map = infra.lab_pack_wl_wr.get(version, {}).get(cache_key, {})
             pbl_wr_map = infra.lab_pack_bl_wr.get(version, {}).get(cache_key, {})
 
+            # DETAILED VETO (PACK-BL): by_key/exact (в кэше только status='active')
+            pack_det_bykey = infra.lab_pack_bl_detailed_bykey.get(version, {}).get(cache_key, set())
+            pack_det_exact = infra.lab_pack_bl_detailed_exact.get(version, {}).get(cache_key, set())
+
             mw_wl_total = len(mw_wl_set)
             mw_bl_total = len(mw_bl_set)
             pack_wl_total = len(pack_wl_set)
             pack_bl_total = len(pack_bl_set)
+            det_bykey_total = len(pack_det_bykey)
+            det_exact_total = len(pack_det_exact)
 
             # живые MW состояния
             mw_states = await _get_live_mw_states(symbol, tf)
@@ -434,7 +450,7 @@ async def _handle_request(payload: dict):
                         wr = float(mbl_wr_map.get((agg_base, agg_state_need), 0.0))
                         mw_bl_matches.append({"agg_base": agg_base, "agg_state": agg_state_need, "wr": wr})
 
-            # PACK сопоставления: читаем паки один раз на base
+            # PACK: подготовка live-паков (читаем один раз на base) — учтём WL/BL и Detailed базы
             by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
             for (pack_base, agg_key, agg_value) in pack_wl_set:
                 by_base_wl.setdefault(pack_base, []).append((agg_key, agg_value))
@@ -442,12 +458,13 @@ async def _handle_request(payload: dict):
             for (pack_base, agg_key, agg_value) in pack_bl_set:
                 by_base_bl.setdefault(pack_base, []).append((agg_key, agg_value))
 
-            pack_wl_hits = 0
-            pack_bl_hits = 0
-            pack_wl_matches: List[dict] = []
-            pack_bl_matches: List[dict] = []
+            bases_detailed = set()
+            for (b, _akey) in pack_det_bykey:
+                bases_detailed.add(b)
+            for (b, _akey, _aval) in pack_det_exact:
+                bases_detailed.add(b)
 
-            all_pack_bases = sorted(set(list(by_base_wl.keys()) + list(by_base_bl.keys())))
+            all_pack_bases = sorted(set(list(by_base_wl.keys()) + list(by_base_bl.keys()) + list(bases_detailed)))
             pack_cache: Dict[str, dict] = {}
             missing_live: List[str] = []
 
@@ -463,6 +480,8 @@ async def _handle_request(payload: dict):
                 pack_cache[base] = obj
 
             # WL (PACK)
+            pack_wl_hits = 0
+            pack_wl_matches: List[dict] = []
             for base, rules in by_base_wl.items():
                 obj = pack_cache.get(base)
                 if not obj:
@@ -477,6 +496,8 @@ async def _handle_request(payload: dict):
                         pack_wl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
 
             # BL (PACK)
+            pack_bl_hits = 0
+            pack_bl_matches: List[dict] = []
             for base, rules in by_base_bl.items():
                 obj = pack_cache.get(base)
                 if not obj:
@@ -490,25 +511,88 @@ async def _handle_request(payload: dict):
                         wr = float(pbl_wr_map.get((base, agg_key, agg_value_need), 0.0))
                         pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
 
-            # ---- BL-пороговое вето (если включено) — учитываем PACK и MW
+            # ---- ORACLE-VETO (если включён): сначала DETAILED, затем Active-пороги
             tf_allow: Optional[bool] = None
             tf_reason: Optional[str] = None
             path_used: str = "none"
-            bl_threshold_used_pack: Optional[int] = None
-            bl_threshold_used_mw: Optional[int] = None
-            if use_bl:
-                # порог PACK-BL
+
+            pack_det_exact_hits = 0
+            pack_det_bykey_hits = 0
+            det_exact_matches: List[dict] = []
+            det_bykey_matches: List[dict] = []
+
+            if use_oracle_bl:
+                # Detailed exact: вето при точном совпадении (base, key, value)
+                if det_exact_total > 0:
+                    for (base, agg_key, agg_value_need) in pack_det_exact:
+                        obj = pack_cache.get(base)
+                        if not obj:
+                            continue
+                        val_live = _build_pack_agg_value(agg_key, obj)
+                        if val_live is None:
+                            continue
+                        if val_live == agg_value_need:
+                            pack_det_exact_hits += 1
+                            det_exact_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
+                    if pack_det_exact_hits > 0:
+                        tf_allow = False
+                        tf_reason = REASON_VETO_EXACT
+                        path_used = "bl_veto_detailed_exact"
+
+                # Detailed by_key: вето при любом валидном значении (base, key, ANY value)
+                if tf_allow is None and det_bykey_total > 0:
+                    for (base, agg_key) in pack_det_bykey:
+                        obj = pack_cache.get(base)
+                        if not obj:
+                            continue
+                        val_live = _build_pack_agg_value(agg_key, obj)
+                        if val_live is None:
+                            continue  # нет данных — не вето
+                        pack_det_bykey_hits += 1
+                        det_bykey_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value_live": val_live})
+                    if pack_det_bykey_hits > 0:
+                        tf_allow = False
+                        tf_reason = REASON_VETO_BYKEY
+                        path_used = "bl_veto_detailed_by_key"
+
+                # Active-пороги (PACK/MW, «smoothed»)
+                if tf_allow is None:
+                    T_pack_oracle = infra.get_bl_threshold(
+                        master_sid=strategy_id,
+                        version=version,
+                        decision_mode=BL_ACTIVE_DECISION_MODE,
+                        direction=direction,
+                        tf=tf,
+                        default=0
+                    )
+                    T_mw_oracle = infra.get_mw_bl_threshold(
+                        master_sid=strategy_id,
+                        version=version,
+                        decision_mode=BL_ACTIVE_DECISION_MODE,
+                        direction=direction,
+                        tf=tf,
+                        default=0
+                    )
+                    if (int(T_pack_oracle or 0) > 0 and pack_bl_hits >= int(T_pack_oracle)) or \
+                       (int(T_mw_oracle or 0) > 0 and mw_bl_hits >= int(T_mw_oracle)):
+                        tf_allow = False
+                        tf_reason = "bl_threshold"
+                        path_used = "bl_veto"
+                    # для прозрачности добавим в tf_results ниже фактически использованные oracle-пороги
+                # если после VETO tf_allow уже False — короткое замыкание запроса после формирования tf_rows
+
+            # ---- СТАРЫЙ BL-КОНТУР (если включён) — выполняется только если oracle не срезал TF
+            bl_threshold_used_pack = None
+            bl_threshold_used_mw = None
+            if tf_allow is None and use_bl:
                 T_pack = infra.get_bl_threshold(
                     master_sid=strategy_id,
                     version=version,
-                    decision_mode=decision_mode,
+                    decision_mode=decision_mode,   # как и раньше: используем decision_mode из запроса
                     direction=direction,
                     tf=tf,
                     default=0
                 )
-                bl_threshold_used_pack = int(T_pack or 0)
-
-                # порог MW-BL
                 T_mw = infra.get_mw_bl_threshold(
                     master_sid=strategy_id,
                     version=version,
@@ -517,9 +601,8 @@ async def _handle_request(payload: dict):
                     tf=tf,
                     default=0
                 )
+                bl_threshold_used_pack = int(T_pack or 0)
                 bl_threshold_used_mw = int(T_mw or 0)
-
-                # вето если сработал любой из двух порогов
                 if (bl_threshold_used_pack > 0 and pack_bl_hits >= bl_threshold_used_pack) or \
                    (bl_threshold_used_mw   > 0 and mw_bl_hits   >= bl_threshold_used_mw):
                     tf_allow = False
@@ -532,7 +615,7 @@ async def _handle_request(payload: dict):
 
             mw_wl_threshold_used: Optional[float] = None
             pack_wl_threshold_used: Optional[float] = None
-            if use_wl:
+            if tf_allow is None and use_wl:
                 mw_wl_threshold_used = infra.get_wl_threshold(
                     master_sid=strategy_id,
                     version=version,
@@ -552,10 +635,10 @@ async def _handle_request(payload: dict):
                     default=0.55
                 )
             else:
-                mw_wl_threshold_used = 0.0
-                pack_wl_threshold_used = 0.0
+                mw_wl_threshold_used = mw_wl_threshold_used or 0.0
+                pack_wl_threshold_used = pack_wl_threshold_used or 0.0
 
-            # теперь решаем по режиму, используя «проход» с учётом WL-порогов
+            # итог по TF (если не задан VETO/BL отказ — решаем по decision_mode с учётом WL)
             if tf_allow is None:
                 mw_pass = (mw_hits > 0) and (not use_wl or mw_max_wr >= float(mw_wl_threshold_used or 0.0))
                 pack_pass = (pack_wl_hits > 0) and (not use_wl or pack_max_wr >= float(pack_wl_threshold_used or 0.0))
@@ -594,13 +677,24 @@ async def _handle_request(payload: dict):
                     "wl_threshold": float(pack_wl_threshold_used or 0.0),
                     "wl_max_wr": float(pack_max_wr),
                 },
+                "pack_detailed": {
+                    "by_key_total": det_bykey_total,
+                    "by_key_hits": pack_det_bykey_hits,
+                    "by_key_matches": det_bykey_matches,
+                    "exact_total": det_exact_total,
+                    "exact_hits": pack_det_exact_hits,
+                    "exact_matches": det_exact_matches,
+                },
                 "live": {"mw_states": mw_states, "missing": missing_live},
             }
-            if use_bl:
-                tf_results["bl_thresholds"] = {
-                    "pack": int(bl_threshold_used_pack or 0),
-                    "mw": int(bl_threshold_used_mw or 0),
-                }
+
+            # добавим в tf_results пороговые значения
+            tf_results["bl_thresholds"] = {
+                "pack": int(bl_threshold_used_pack or 0),
+                "mw": int(bl_threshold_used_mw or 0),
+                "pack_oracle": int(infra.get_bl_threshold(strategy_id, version, BL_ACTIVE_DECISION_MODE, direction, tf, 0)) if use_oracle_bl else 0,
+                "mw_oracle": int(infra.get_mw_bl_threshold(strategy_id, version, BL_ACTIVE_DECISION_MODE, direction, tf, 0)) if use_oracle_bl else 0,
+            }
 
             # строка TF для БД
             tf_rows.append((tf, {
@@ -616,6 +710,11 @@ async def _handle_request(payload: dict):
                 "tf_results": tf_results,
                 "errors": None,
             }))
+
+            # короткое замыкание при срабатывании oracle-VETO (detailed/active)
+            if use_oracle_bl and (tf_reason in (REASON_VETO_EXACT, REASON_VETO_BYKEY, "bl_threshold")):
+                oracle_short_circuit = True
+                break
 
         # сформировать и отправить ответ СРАЗУ (до записи в БД)
         await _respond_once(req_uid, allow=final_allow, reason=final_reason)
@@ -649,11 +748,14 @@ async def _handle_request(payload: dict):
         used_path_by_tf=used_path_by_tf,
     )
 
-    # лог сводный
-    log.debug(
-        "LAB_DECISION: req=%s sid=%s %s %s tfs=%s ver=%s mode=%s bl=%s wl=%s -> allow=%s reason=%s duration_ms=%d",
-        req_uid, strategy_id, symbol, direction, timeframes_raw, version, decision_mode, use_bl, use_wl,
-        final_allow, final_reason, duration_ms
+    # итоговый лог
+    # если был короткий выход из-за oracle-VETO — пометим это в логе
+    log.info(
+        "LAB_DECISION: req=%s sid=%s %s %s ver=%s tfs=%s flags[oracle_bl=%s bl=%s wl=%s] -> allow=%s reason=%s duration_ms=%d%s",
+        req_uid, strategy_id, symbol, direction, version, timeframes_raw,
+        use_oracle_bl, use_bl, use_wl,
+        final_allow, final_reason, duration_ms,
+        " (oracle_veto_shortcut)" if oracle_short_circuit else ""
     )
 
 
@@ -661,8 +763,8 @@ async def _handle_request(payload: dict):
 def _decide_per_tf_with_wl(decision_mode: str, mw_pass: bool, pack_pass: bool, *, missing: bool) -> Tuple[bool, str, str]:
     """
     Возвращает (allow, reason, path_used) по одному TF.
-    path_used ∈ {'mw','pack','both','none','bl_veto'}
-    Примечание: BL-вето применяется раньше (в _handle_request).
+    path_used ∈ {'mw','pack','both','none','bl_veto','bl_veto_detailed_exact','bl_veto_detailed_by_key'}
+    Примечание: BL-вето (включая detailed/active) применяется раньше (в _handle_request).
     """
     if decision_mode == "mw_only":
         if mw_pass:
