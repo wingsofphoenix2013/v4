@@ -20,6 +20,10 @@ PACK_WL_CONSUMER_NAME = "oracle_pack_bl_detailed_worker"
 READ_COUNT = 128
 READ_BLOCK_MS = 30_000
 
+# 🔸 Новый стрим «всё готово по стратегии»
+ALL_READY_STREAM = "oracle:pack_lists:all_ready"
+ALL_READY_MAXLEN = 10_000
+
 # 🔸 Доменные константы
 ONLY_VERSION = "v5"
 ONLY_TIME_FRAME = "7d"
@@ -110,7 +114,10 @@ async def run_oracle_pack_bl_detailed():
 
                             # окно и депозит
                             t_start = t_end - WINDOW_SIZE_7D
-                            deposit = await conn.fetchval("SELECT deposit FROM strategies_v4 WHERE id = $1", int(sid))
+                            deposit = await conn.fetchval(
+                                "SELECT deposit FROM strategies_v4 WHERE id = $1",
+                                int(sid)
+                            )
                             dep = float(deposit or 0.0)
                             if dep <= 0.0:
                                 dep = 1.0
@@ -136,13 +143,14 @@ async def run_oracle_pack_bl_detailed():
                                         loss_rate_base = base_losses / n_total
                                         roi_base = base_pnl / dep
 
-                                        # exact-статистика (по pack_base|agg_key|agg_value)
+                                        # exact-статистика (pack_base|agg_key|agg_value)
                                         rows_exact = await _fetch_hits_exact(conn, sid, tf, direction, t_start, t_end)
-                                        # by_key-статистика (по pack_base|agg_key, без значения)
+                                        # by_key-статистика (pack_base|agg_key, без значения)
                                         rows_bykey = await _fetch_hits_bykey(conn, sid, tf, direction, t_start, t_end)
 
                                         # вставка в историю oracle_pack_bl_detailed_analysis
-                                        ana_rows = []
+                                        ana_rows: List[Dict] = []
+
                                         for (pack_base, agg_key, agg_value, n_hits, losses, wins, pnl_sum) in rows_exact:
                                             rec = _build_analysis_row(
                                                 level="exact",
@@ -154,6 +162,7 @@ async def run_oracle_pack_bl_detailed():
                                                 loss_rate_base=loss_rate_base, roi_base=roi_base, deposit_used=dep,
                                             )
                                             ana_rows.append(rec)
+
                                         for (pack_base, agg_key, n_hits, losses, wins, pnl_sum) in rows_bykey:
                                             rec = _build_analysis_row(
                                                 level="by_key",
@@ -182,16 +191,18 @@ async def run_oracle_pack_bl_detailed():
                                         log.exception("❌ Ошибка детального анализа sid=%s tf=%s dir=%s", sid, tf, direction)
 
                             # построение устойчивости и full-refresh ACTIVE по стратегии
-                            active_rows = []
+                            active_rows: List[Tuple] = []
                             if candidates_active:
                                 for rec in candidates_active:
                                     try:
                                         pres = await _compute_presence(conn, rec)
                                         active_rows.append(_build_active_row(rec, pres))
                                     except Exception:
-                                        log.exception("❌ Ошибка рассчёта устойчивости по правилу sid=%s tf=%s dir=%s %s|%s",
-                                                      rec["strategy_id"], rec["timeframe"], rec["direction"],
-                                                      rec["pack_base"], rec["agg_key"])
+                                        log.exception(
+                                            "❌ Ошибка рассчёта устойчивости по правилу sid=%s tf=%s dir=%s %s|%s",
+                                            rec["strategy_id"], rec["timeframe"], rec["direction"],
+                                            rec["pack_base"], rec["agg_key"]
+                                        )
 
                             # full refresh ACTIVE (по стратегии)
                             await _refresh_active_for_strategy(conn, sid, active_rows)
@@ -203,6 +214,25 @@ async def run_oracle_pack_bl_detailed():
                                 total_rules_exact, total_rules_bykey, inserted_analysis, len(active_rows)
                             )
 
+                            # отправка итогового события «всё готово по стратегии»
+                            try:
+                                await _emit_all_ready(
+                                    infra.redis_client,
+                                    strategy_id=sid,
+                                    window_start=t_start,
+                                    window_end=t_end,
+                                    version=ONLY_VERSION,
+                                    totals={
+                                        "rules_exact": total_rules_exact,
+                                        "rules_bykey": total_rules_bykey,
+                                        "analysis_rows": inserted_analysis,
+                                        "active_rows": len(active_rows),
+                                    },
+                                )
+                            except Exception:
+                                log.exception("❌ Ошибка отправки события ALL_READY sid=%s", sid)
+
+                            # помечаем сообщение к ACK
                             acks.append(msg_id)
 
                         except Exception:
@@ -680,6 +710,39 @@ async def _refresh_active_for_strategy(conn, strategy_id: int, rows: List[Tuple]
     # итог по стратегии
     log.info("[BL_DETAILED_ACTIVE] sid=%s full-refresh: inserted=%d", strategy_id, inserted)
 
+# 🔸 Публикация события «всё готово по стратегии»
+async def _emit_all_ready(
+    redis,
+    *,
+    strategy_id: int,
+    window_start: datetime,
+    window_end: datetime,
+    version: str,
+    totals: Dict[str, int],
+):
+    payload = {
+        "strategy_id": int(strategy_id),
+        "version": str(version),
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "rules_exact": int(totals.get("rules_exact", 0)),
+        "rules_bykey": int(totals.get("rules_bykey", 0)),
+        "analysis_rows": int(totals.get("analysis_rows", 0)),
+        "active_rows": int(totals.get("active_rows", 0)),
+        "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat(),
+    }
+    fields = {"data": json.dumps(payload, separators=(",", ":"))}
+    await redis.xadd(
+        name=ALL_READY_STREAM,
+        fields=fields,
+        maxlen=ALL_READY_MAXLEN,
+        approximate=True,
+    )
+    log.info(
+        "[BL_DETAILED_ALL_READY] sid=%s win=[%s..%s) emitted → %s (active=%d, analysis=%d)",
+        strategy_id, window_start.isoformat(), window_end.isoformat(),
+        ALL_READY_STREAM, payload["active_rows"], payload["analysis_rows"]
+    )
 
 # 🔸 Вспомогательные: ISO-парсинг и гард «последний 7d pack»
 def _parse_iso_utcnaive(s: Optional[str]) -> Optional[datetime]:
