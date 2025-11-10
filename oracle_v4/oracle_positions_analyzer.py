@@ -1,4 +1,4 @@
-# oracle_positions_analyzer.py — воркер каталога MW/PACK и фиксации состояний на открытии позиций (7d окно, каждые 3 часа)
+# oracle_positions_analyzer.py — воркер каталога MW/PACK и фиксации состояний на открытии позиций (7d окно, каждые 3 часа). Всегда эмитит reports_start (даже при нулевых изменениях)
 
 # 🔸 Импорты
 import asyncio
@@ -74,7 +74,7 @@ async def run_oracle_positions_analyzer():
                 log.exception("❌ Ошибка обработки strategy_id=%s", sid)
 
     # запускаем задачи
-    await asyncio.gather(*[ _guarded_process(sid) for sid in strategies ])
+    await asyncio.gather(*[_guarded_process(sid) for sid in strategies])
 
     log.info("✅ Завершён цикл oracle_positions_analyzer: стратегий обработано=%d", len(strategies))
 
@@ -84,7 +84,7 @@ async def _process_strategy(conn, strategy_id: int, win_start, win_end):
     # собираем позиции за окно
     rows_all = await conn.fetch(
         """
-        SELECT position_uid, direction
+        SELECT position_uid, direction, pnl
           FROM positions_v4
          WHERE strategy_id = $1
            AND status = 'closed'
@@ -95,6 +95,7 @@ async def _process_strategy(conn, strategy_id: int, win_start, win_end):
     )
     positions_all = [dict(r) for r in rows_all]
     uid_dir_all: Dict[str, str] = {r["position_uid"]: r["direction"] for r in positions_all}
+    positions_total = len(positions_all)
 
     # позиции, требующие фиксации (oracle_checked = false)
     rows_unchecked = await conn.fetch(
@@ -114,12 +115,7 @@ async def _process_strategy(conn, strategy_id: int, win_start, win_end):
 
     # логи на вход
     log.debug("[SID=%s] входные позиции: всего=%d, к фиксации=%d",
-              strategy_id, len(positions_all), len(positions_unchecked))
-
-    # если за окно нет позиций — ничего делать
-    if not positions_all and not positions_unchecked:
-        log.info("[SID=%s] окно пустое — пропуск", strategy_id)
-        return
+              strategy_id, positions_total, len(positions_unchecked))
 
     # Этап A: пополнение словарей на основании ВСЕХ закрытых позиций окна
     mw_added_total = 0
@@ -220,53 +216,60 @@ async def _process_strategy(conn, strategy_id: int, win_start, win_end):
 
     # итоги по стратегии
     log.info(
-        "[SID=%s] итог: словарь(MW+PACK) новые=%d+%d, связи добавлены MW=%d PACK=%d, позиций зафиксировано=%d",
-        strategy_id, mw_added_total, pack_added_total, mw_links_total, pack_links_total, len(captured_positions)
+        "[SID=%s] итог: словарь(MW+PACK) новые=%d+%d, связи добавлены MW=%d PACK=%d, позиций зафиксировано=%d, позиций всего=%d",
+        strategy_id, mw_added_total, pack_added_total, mw_links_total, pack_links_total, len(captured_positions), positions_total
     )
 
-    # после полного завершения Этапа B — отправляем сигналы (только если появились новые записи)
+    # после полного завершения Этапа B — отправляем сигналы ВСЕГДА (даже при нулевых изменениях)
     now_iso = datetime.utcnow().replace(tzinfo=None).isoformat()
     tf_done = ["m5", "m15", "h1"]
+    event_id = f"{int(strategy_id)}:{win_start.isoformat()}:{win_end.isoformat()}"
 
-    if mw_added_total > 0:
-        await _emit_reports_start(
-            redis=infra.redis_client,
-            stream=MW_REPORTS_START_STREAM,
-            payload={
-                "strategy_id": int(strategy_id),
-                "window_start": win_start.isoformat(),
-                "window_end": win_end.isoformat(),
-                "processed_at": now_iso,
-                "tf_done": tf_done,
-                "dict_rows_added": int(mw_added_total),
-                "positions_captured": int(len(captured_positions)),
-            },
-        )
-        log.debug("[SID=%s] 📣 STREAM %s отправлен (dict_rows_added=%d)",
-                 strategy_id, MW_REPORTS_START_STREAM, mw_added_total)
+    # MW
+    await _emit_reports_start(
+        redis=infra.redis_client,
+        stream=MW_REPORTS_START_STREAM,
+        payload={
+            "strategy_id": int(strategy_id),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "processed_at": now_iso,
+            "tf_done": tf_done,
+            "dict_rows_added": int(mw_added_total),
+            "positions_captured": int(len(captured_positions)),
+            "positions_total": int(positions_total),
+            "event_id": event_id,
+            "run_kind": "periodic",
+        },
+    )
+    log.debug("[SID=%s] 📣 STREAM %s отправлен (dict_rows_added=%d, positions_captured=%d, positions_total=%d)",
+              strategy_id, MW_REPORTS_START_STREAM, mw_added_total, len(captured_positions), positions_total)
 
-    if pack_added_total > 0:
-        await _emit_reports_start(
-            redis=infra.redis_client,
-            stream=PACK_REPORTS_START_STREAM,
-            payload={
-                "strategy_id": int(strategy_id),
-                "window_start": win_start.isoformat(),
-                "window_end": win_end.isoformat(),
-                "processed_at": now_iso,
-                "tf_done": tf_done,
-                "dict_rows_added": int(pack_added_total),
-                "positions_captured": int(len(captured_positions)),
-            },
-        )
-        log.debug("[SID=%s] 📣 STREAM %s отправлен (dict_rows_added=%d)",
-                 strategy_id, PACK_REPORTS_START_STREAM, pack_added_total)
+    # PACK
+    await _emit_reports_start(
+        redis=infra.redis_client,
+        stream=PACK_REPORTS_START_STREAM,
+        payload={
+            "strategy_id": int(strategy_id),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "processed_at": now_iso,
+            "tf_done": tf_done,
+            "dict_rows_added": int(pack_added_total),
+            "positions_captured": int(len(captured_positions)),
+            "positions_total": int(positions_total),
+            "event_id": event_id,
+            "run_kind": "periodic",
+        },
+    )
+    log.debug("[SID=%s] 📣 STREAM %s отправлен (dict_rows_added=%d, positions_captured=%d, positions_total=%d)",
+              strategy_id, PACK_REPORTS_START_STREAM, pack_added_total, len(captured_positions), positions_total)
 
 
 # 🔸 Итератор батчей UID
 def _iter_batches(items: List[str], batch_size: int):
     for i in range(0, len(items), batch_size):
-        yield items[i : i + batch_size]
+        yield items[i: i + batch_size]
 
 
 # 🔸 Сбор MW-состояний для батча UID (и для словаря, и для связей)

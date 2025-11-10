@@ -21,7 +21,7 @@ from oracle_positions_analyzer import (
     INTERVAL_SEC as POS_INTERVAL_SEC,
 )
 # 🔸 импорт воркера отчётов
-from oracle_mw_snapshot   import run_oracle_mw_snapshot, INITIAL_DELAY_SEC as MW_INIT, INTERVAL_SEC as MW_INT
+from oracle_mw_snapshot import run_oracle_mw_snapshot
 from oracle_pack_snapshot import run_oracle_pack_snapshot, INITIAL_DELAY_SEC as PACK_INIT, INTERVAL_SEC as PACK_INT
 # 🔸 импорт воркера confidence
 # from oracle_mw_confidence import run_oracle_confidence
@@ -38,6 +38,8 @@ from oracle_mw_backtest_v5 import run_oracle_mw_backtest_v5
 # from oracle_pack_backtest_v3 import run_oracle_pack_backtest_v3
 # from oracle_pack_backtest_v4 import run_oracle_pack_backtest_v4
 from oracle_pack_backtest_v5 import run_oracle_pack_backtest_v5
+# 🔸 импорт анализаторов
+from oracle_mw_bl_analyzer import run_oracle_mw_bl_analyzer
 # 🔸 импорт воркера уборщика
 from oracle_cleaner import run_oracle_cleaner
 
@@ -104,7 +106,6 @@ async def main():
     await asyncio.gather(
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_periodic(run_oracle_positions_analyzer, POS_INTERVAL_SEC, "ORACLE_POSITIONS_ANALYZER", initial_delay=POS_INITIAL_DELAY_SEC),
-        run_periodic(run_oracle_mw_snapshot, MW_INT, "ORACLE_MW_SNAPSHOT", initial_delay=MW_INIT),
         run_periodic(run_oracle_pack_snapshot, PACK_INT, "ORACLE_PACK_SNAPSHOT", initial_delay=PACK_INIT),
 #         run_safe_loop(run_oracle_pack_confidence, "ORACLE_PACK_CONFIDENCE"),
 #         run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
@@ -113,7 +114,9 @@ async def main():
 #         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
 #         run_safe_loop(run_oracle_mw_backtest_v3, "ORACLE_BACKTEST_V3"),
 #         run_safe_loop(run_oracle_mw_backtest, "ORACLE_BACKTEST_V4"),
+        run_safe_loop(run_oracle_mw_snapshot, "ORACLE_MW_SNAPSHOT_EVENT"),
         run_safe_loop(run_oracle_mw_backtest_v5,"ORACLE_BACKTEST_V5"),
+        run_safe_loop(run_oracle_mw_bl_analyzer, "ORACLE_MW_BL_ANALYZER"),
 #         run_safe_loop(run_oracle_pack_backtest_v3, "PACK_BACKTEST_V3"),
 #         run_safe_loop(run_oracle_pack_backtest_v4, "PACK_BACKTEST_V4"),
         run_safe_loop(run_oracle_pack_backtest_v5, "PACK_BACKTEST_V5"),

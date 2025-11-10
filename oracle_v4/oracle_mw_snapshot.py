@@ -1,10 +1,10 @@
-# oracle_mw_snapshot.py — воркер MW-отчётов: батч-агрегация по состояниям (solo/combos) и публикация события «отчёт готов» в Redis Stream
+# oracle_mw_snapshot.py — воркер MW-отчётов: событийный запуск от reports_start, UPSERT шапок по окну, батч-агрегация (solo/combos), публикация «отчёт готов»
 
 # 🔸 Импорты
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import json
 
 import infra
@@ -13,20 +13,19 @@ import infra
 log = logging.getLogger("ORACLE_MW_SNAPSHOT")
 
 # 🔸 Константы воркера / параметры исполнения
-INITIAL_DELAY_SEC = 90                    # первый запуск через 90 секунд
-INTERVAL_SEC = 3 * 60 * 60                # периодичность — каждые 3 часа
-BATCH_SIZE = 250                          # размер батча по позициям
-WINDOW_TAGS = ("7d", "14d", "28d")        # метки окон
+INITIAL_DELAY_SEC = 90                        # первый запуск fallback (если используешь) через 90 секунд
+INTERVAL_SEC = 3 * 60 * 60                    # периодичность fallback — каждые 3 часа
+BATCH_SIZE = 250                              # размер батча по позициям
+WINDOW_TAGS = ("7d", "14d", "28d")            # метки окон
 WINDOW_SIZES = {
     "7d": timedelta(days=7),
     "14d": timedelta(days=14),
     "28d": timedelta(days=28),
 }
-TF_ORDER = ("m5", "m15", "h1")            # последовательная обработка TF
+TF_ORDER = ("m5", "m15", "h1")                # последовательная обработка TF
 
 # 🔸 Наборы баз для MW
 # Порядок важен для построения комбо; базовый канонический порядок: trend → volatility → extremes → momentum.
-# Дополнительно включаем derived-базы (pullback_flag, mom_align, high_vol), которые пишет position_snapshot_live.py
 MW_BASES_FETCH = (
     "trend",
     "volatility",
@@ -43,115 +42,190 @@ COMBOS_2_ALLOWED = (
     ("trend", "volatility"),
     ("trend", "extremes"),
     ("trend", "momentum"),
-    ("trend", "mom_align"),       # новый информативный флаг: импульс согласован/против тренда
+    ("trend", "mom_align"),
 )
 
 COMBOS_3_ALLOWED = (
     ("trend", "volatility", "extremes"),
     ("trend", "volatility", "momentum"),
     ("trend", "extremes", "momentum"),
-    ("trend", "volatility", "mom_align"),      # информативный триплет (направление × среда × согласованность импульса)
+    ("trend", "volatility", "mom_align"),
 )
 
 # Квартет оставляем только в исходном виде (иначе размерность становится избыточной)
 COMBOS_4_ALLOWED = (("trend", "volatility", "extremes", "momentum"),)
 
+# 🔸 Настройки Redis Stream
+REPORTS_START_STREAM = "oracle:mw:reports_start"    # источник: сигнал «старт отчётов» от oracle_positions_analyzer
+START_CONSUMER_GROUP = "oracle_mw_snapshot_group"
+START_CONSUMER_NAME  = "oracle_mw_snapshot_worker"
+READ_COUNT = 128
+READ_BLOCK_MS = 30_000
+
 # 🔸 Настройки Redis Stream для сигнала «отчёт готов»
-REPORT_READY_STREAM = "oracle:mw:reports_ready"   # имя стрима с уведомлениями о готовности отчёта
-REPORT_READY_MAXLEN = 10000                       # мягкое ограничение длины стрима (XADD ... MAXLEN ~)
+REPORT_READY_STREAM = "oracle:mw:reports_ready"     # имя стрима с уведомлениями о готовности отчёта
+REPORT_READY_MAXLEN = 10_000                        # мягкое ограничение длины стрима (XADD ... MAXLEN ~)
 
 
-# 🔸 Публичная точка запуска воркера (вызывается из oracle_v4_main.py → run_periodic)
+# 🔸 Публичная точка запуска (ивент-драйв: слушаем reports_start)
 async def run_oracle_mw_snapshot():
     # условия достаточности окружения
     if infra.pg_pool is None or infra.redis_client is None:
         log.debug("❌ Пропуск: PG/Redis не инициализированы")
         return
 
-    strategies = sorted(infra.market_watcher_strategies or [])
-    if not strategies:
-        log.debug("ℹ️ Стратегий с market_watcher=true нет — нечего обрабатывать")
+    # создаём consumer group (идемпотентно)
+    try:
+        await infra.redis_client.xgroup_create(
+            name=REPORTS_START_STREAM,
+            groupname=START_CONSUMER_GROUP,
+            id="$",
+            mkstream=True,
+        )
+        log.debug("📡 Создана consumer group для %s", REPORTS_START_STREAM)
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            pass
+        else:
+            log.exception("❌ Ошибка создания consumer group для %s", REPORTS_START_STREAM)
+            return
+
+    log.info("🚀 MW snapshot слушает %s", REPORTS_START_STREAM)
+
+    # основной цикл чтения событий
+    while True:
+        try:
+            resp = await infra.redis_client.xreadgroup(
+                groupname=START_CONSUMER_GROUP,
+                consumername=START_CONSUMER_NAME,
+                streams={REPORTS_START_STREAM: ">"},
+                count=READ_COUNT,
+                block=READ_BLOCK_MS,
+            )
+            if not resp:
+                continue
+
+            acks: List[str] = []
+            async with infra.pg_pool.acquire() as conn:
+                for _stream_name, msgs in resp:
+                    for msg_id, fields in msgs:
+                        try:
+                            payload = json.loads(fields.get("data", "{}"))
+                            sid = int(payload.get("strategy_id", 0))
+                            win_end_iso = payload.get("window_end")
+                            win_start_iso = payload.get("window_start")  # опционально (для 7d)
+
+                            if not (sid and win_end_iso):
+                                log.debug("ℹ️ Пропуск события (недостаточно данных): %s", payload)
+                                acks.append(msg_id)
+                                continue
+
+                            # стратегия должна быть актуальна для MW
+                            if infra.market_watcher_strategies and sid not in infra.market_watcher_strategies:
+                                log.debug("ℹ️ Пропуск sid=%s: не в кэше market_watcher", sid)
+                                acks.append(msg_id)
+                                continue
+
+                            t_ref = _parse_iso_utcnaive(win_end_iso)
+                            if t_ref is None:
+                                log.debug("ℹ️ Пропуск sid=%s: неверный window_end=%r", sid, win_end_iso)
+                                acks.append(msg_id)
+                                continue
+
+                            # гард «последний отчёт» (устаревшие окна не считаем)
+                            if not await _is_latest_or_equal_7d(conn, sid, t_ref):
+                                log.debug("⏭️ Пропуск sid=%s: устаревшее окно window_end=%s", sid, t_ref.isoformat())
+                                acks.append(msg_id)
+                                continue
+
+                            # формируем окна от t_ref; для 7d используем заданный window_start, если пришёл
+                            windows = _build_windows_from_ref(t_ref, win_start_iso)
+
+                            # последовательная обработка трёх окон
+                            for tag, (w_start, w_end) in windows.items():
+                                try:
+                                    await _process_window(conn, sid, tag, w_start, w_end)
+                                except Exception:
+                                    log.exception("❌ Ошибка обработки sid=%s tag=%s", sid, tag)
+
+                            acks.append(msg_id)
+
+                        except Exception:
+                            log.exception("❌ Ошибка разбора/обработки сообщения snapshot")
+                            acks.append(msg_id)
+
+            # подтверждаем обработанные сообщения
+            if acks:
+                try:
+                    await infra.redis_client.xack(REPORTS_START_STREAM, START_CONSUMER_GROUP, *acks)
+                except Exception:
+                    log.exception("⚠️ Ошибка ACK для %s", REPORTS_START_STREAM)
+
+        except asyncio.CancelledError:
+            log.debug("⏹️ MW snapshot остановлен по сигналу")
+            raise
+        except Exception:
+            log.exception("❌ Ошибка цикла MW snapshot — пауза 5 секунд")
+            await asyncio.sleep(5)
+
+
+# 🔸 (Опционально) Fallback-проход (редко): обрабатывает все стратегии по now()
+async def run_oracle_mw_snapshot_fallback():
+    if infra.pg_pool is None or infra.redis_client is None:
+        log.debug("❌ Пропуск fallback: PG/Redis не инициализированы")
         return
 
-    t_ref = datetime.utcnow().replace(tzinfo=None)  # UTC-naive по инвариантам системы
-    log.debug("🚀 Старт MW-отчёта t0=%s, стратегий=%d", t_ref.isoformat(), len(strategies))
+    strategies = sorted(infra.market_watcher_strategies or [])
+    if not strategies:
+        log.debug("ℹ️ Fallback: нет стратегий MW")
+        return
 
-    # последовательная обработка стратегий
+    t_ref = datetime.utcnow().replace(tzinfo=None)
+    windows = _build_windows_from_ref(t_ref, win_start_7d_iso=None)
+
     async with infra.pg_pool.acquire() as conn:
         for sid in strategies:
-            try:
-                await _process_strategy(conn, sid, t_ref)
-            except Exception:
-                log.exception("❌ Ошибка обработки strategy_id=%s", sid)
+            # гард «последний 7d»
+            if not await _is_latest_or_equal_7d(conn, sid, t_ref):
+                continue
+            for tag, (w_start, w_end) in windows.items():
+                try:
+                    await _process_window(conn, sid, tag, w_start, w_end)
+                except Exception:
+                    log.exception("❌ Ошибка fallback обработки sid=%s tag=%s", sid, tag)
 
-    log.debug("✅ Завершено формирование MW-отчётов (стратегий=%d)", len(strategies))
 
+# 🔸 Полный проход по одному окну (шапка → TF-агрегации → сигнал готовности)
+async def _process_window(conn, strategy_id: int, tag: str, win_start: datetime, win_end: datetime):
+    # шапка отчёта: UPSERT по окну → получаем report_id
+    report_id = await _upsert_report_header(conn, strategy_id, tag, win_start, win_end)
 
-# 🔸 Полный проход по стратегии: все окна → по каждому окну все TF последовательно
-async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
-    for tag in WINDOW_TAGS:
-        win_start = t_ref - WINDOW_SIZES[tag]
-        win_end = t_ref
+    # агрегаты для шапки — одним SQL
+    closed_total, closed_wins, pnl_sum_total, pnl_sum_wins = await _calc_report_head_metrics(
+        conn, strategy_id, win_start, win_end
+    )
 
-        # шапка отчёта: создаём черновик
-        report_id = await _create_report_header(conn, strategy_id, tag, win_start, win_end)
+    days_in_window = WINDOW_SIZES[tag].total_seconds() / 86400.0
+    winrate = round((closed_wins / closed_total) if closed_total else 0.0, 4)
+    avg_pnl_per_trade = round((pnl_sum_total / closed_total) if closed_total else 0.0, 4)
+    avg_trades_per_day = round(closed_total / days_in_window, 4)
 
-        # агрегаты для шапки — одним SQL
-        closed_total, closed_wins, pnl_sum_total, pnl_sum_wins = await _calc_report_head_metrics(
-            conn, strategy_id, win_start, win_end
-        )
+    await _finalize_report_header(
+        conn=conn,
+        report_id=report_id,
+        closed_total=closed_total,
+        closed_wins=closed_wins,
+        winrate=winrate,
+        pnl_sum_total=pnl_sum_total,
+        pnl_sum_wins=pnl_sum_wins,
+        avg_pnl_per_trade=avg_pnl_per_trade,
+        avg_trades_per_day=avg_trades_per_day,
+    )
 
-        days_in_window = WINDOW_SIZES[tag].total_seconds() / 86400.0
-        winrate = round((closed_wins / closed_total) if closed_total else 0.0, 4)
-        avg_pnl_per_trade = round((pnl_sum_total / closed_total) if closed_total else 0.0, 4)
-        avg_trades_per_day = round(closed_total / days_in_window, 4)
-
-        await _finalize_report_header(
-            conn=conn,
-            report_id=report_id,
-            closed_total=closed_total,
-            closed_wins=closed_wins,
-            winrate=winrate,
-            pnl_sum_total=pnl_sum_total,
-            pnl_sum_wins=pnl_sum_wins,
-            avg_pnl_per_trade=avg_pnl_per_trade,
-            avg_trades_per_day=avg_trades_per_day,
-        )
-
-        if closed_total == 0:
-            log.debug("[REPORT] sid=%s win=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
-            # отправим событие о готовности отчёта даже при total=0 (пусть downstream решит, что с этим делать)
-            try:
-                await _emit_report_ready(
-                    redis=infra.redis_client,
-                    report_id=report_id,
-                    strategy_id=strategy_id,
-                    time_frame=tag,
-                    window_start=win_start,
-                    window_end=win_end,
-                    aggregate_rows=0,
-                    tf_done=[],
-                    generated_at=datetime.utcnow().replace(tzinfo=None),
-                )
-            except Exception:
-                log.exception("❌ Ошибка публикации события REPORT_READY sid=%s win=%s (total=0)", strategy_id, tag)
-            continue
-
-        # последовательный проход по TF
-        tf_done: List[str] = []
-        for tf in TF_ORDER:
-            try:
-                await _process_timeframe(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
-                tf_done.append(tf)
-            except Exception:
-                log.exception("❌ Ошибка агрегации sid=%s win=%s tf=%s", strategy_id, tag, tf)
-
-        # после завершения TF — отправляем событие «отчёт готов» в Redis Stream
+    if closed_total == 0:
+        log.debug("[REPORT] sid=%s tag=%s total=0 — пропуск TF/агрегации", strategy_id, tag)
+        # даже при total=0 отправляем событие «готов»
         try:
-            row_count = await conn.fetchval(
-                "SELECT COUNT(*)::int FROM oracle_mw_aggregated_stat WHERE report_id = $1",
-                report_id,
-            )
             await _emit_report_ready(
                 redis=infra.redis_client,
                 report_id=report_id,
@@ -159,25 +233,57 @@ async def _process_strategy(conn, strategy_id: int, t_ref: datetime):
                 time_frame=tag,
                 window_start=win_start,
                 window_end=win_end,
-                aggregate_rows=int(row_count or 0),
-                tf_done=tf_done,
+                aggregate_rows=0,
+                tf_done=[],
                 generated_at=datetime.utcnow().replace(tzinfo=None),
             )
         except Exception:
-            log.exception("❌ Ошибка публикации события REPORT_READY sid=%s win=%s", strategy_id, tag)
+            log.exception("❌ Ошибка публикации REPORT_READY sid=%s tag=%s (total=0)", strategy_id, tag)
+        return
 
-        log.debug(
-            "[REPORT] sid=%s win=%s report_id=%s total=%d wins=%d wr=%.4f pnl_sum=%.4f avg_pnl=%.4f avg_tpd=%.4f",
-            strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
+    # последовательный проход по TF
+    tf_done: List[str] = []
+    for tf in TF_ORDER:
+        try:
+            await _process_timeframe(conn, report_id, strategy_id, tag, tf, win_start, win_end, days_in_window)
+            tf_done.append(tf)
+        except Exception:
+            log.exception("❌ Ошибка агрегации sid=%s tag=%s tf=%s", strategy_id, tag, tf)
+
+    # после завершения TF — отправляем событие «отчёт готов»
+    try:
+        row_count = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM oracle_mw_aggregated_stat WHERE report_id = $1",
+            report_id,
         )
+        await _emit_report_ready(
+            redis=infra.redis_client,
+            report_id=report_id,
+            strategy_id=strategy_id,
+            time_frame=tag,
+            window_start=win_start,
+            window_end=win_end,
+            aggregate_rows=int(row_count or 0),
+            tf_done=tf_done,
+            generated_at=datetime.utcnow().replace(tzinfo=None),
+        )
+    except Exception:
+        log.exception("❌ Ошибка публикации REPORT_READY sid=%s tag=%s", strategy_id, tag)
+
+    log.debug(
+        "[REPORT] sid=%s tag=%s report_id=%s total=%d wins=%d wr=%.4f pnl_sum=%.4f avg_pnl=%.4f avg_tpd=%.4f",
+        strategy_id, tag, report_id, closed_total, closed_wins, winrate, pnl_sum_total, avg_pnl_per_trade, avg_trades_per_day
+    )
 
 
-# 🔸 Создание черновика шапки отчёта (с указанием source='mw')
-async def _create_report_header(conn, strategy_id: int, time_frame: str, win_start: datetime, win_end: datetime) -> int:
+# 🔸 UPSERT шапки отчёта (source='mw') по окну → возвращает report_id
+async def _upsert_report_header(conn, strategy_id: int, time_frame: str, win_start: datetime, win_end: datetime) -> int:
     row = await conn.fetchrow(
         """
         INSERT INTO oracle_report_stat (strategy_id, time_frame, window_start, window_end, source)
         VALUES ($1, $2, $3, $4, 'mw')
+        ON CONFLICT (strategy_id, time_frame, window_start, window_end, source)
+        DO UPDATE SET source = EXCLUDED.source
         RETURNING id
         """,
         strategy_id, time_frame, win_start, win_end
@@ -265,7 +371,7 @@ async def _process_timeframe(
     )
     positions = [dict(r) for r in rows]
     if not positions:
-        log.debug("[TF] sid=%s win=%s tf=%s total=0", strategy_id, time_frame, timeframe)
+        log.debug("[TF] sid=%s tag=%s tf=%s total=0", strategy_id, time_frame, timeframe)
         return
 
     total = len(positions)
@@ -376,7 +482,7 @@ async def _process_timeframe(
             await _upsert_aggregates_batch(conn, inc_map, days_in_window)
             ok_rows += sum(v["t"] for v in inc_map.values())
 
-    log.debug("[TF] sid=%s win=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
+    log.debug("[TF] sid=%s tag=%s tf=%s positions=%d agg_rows=%d", strategy_id, time_frame, timeframe, total, ok_rows)
 
 
 # 🔸 Батчевый UPSERT агрегатов (UNNEST + ON CONFLICT) с пересчётом метрик
@@ -491,12 +597,50 @@ async def _emit_report_ready(
     }
 
     # отправка в Redis Stream (мягкое ограничение длины)
-    # используем одно поле 'data' со строкой JSON — унифицировано с остальными стримами проекта
     fields = {"data": json.dumps(payload, separators=(",", ":"))}
     await redis.xadd(name=REPORT_READY_STREAM, fields=fields, maxlen=REPORT_READY_MAXLEN, approximate=True)
 
     # лог на результат
     log.debug(
-        "[REPORT_READY] sid=%s win=%s report_id=%s rows=%d tf_done=%s",
+        "[REPORT_READY] sid=%s tag=%s report_id=%s rows=%d tf_done=%s",
         strategy_id, time_frame, report_id, aggregate_rows, ",".join(tf_done) if tf_done else "-",
     )
+
+
+# 🔸 Вспомогательные
+
+def _parse_iso_utcnaive(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", ""))
+    except Exception:
+        return None
+
+
+def _build_windows_from_ref(t_ref: datetime, win_start_7d_iso: Optional[str]) -> Dict[str, Tuple[datetime, datetime]]:
+    windows: Dict[str, Tuple[datetime, datetime]] = {}
+    # 7d
+    if win_start_7d_iso:
+        s7 = _parse_iso_utcnaive(win_start_7d_iso) or (t_ref - WINDOW_SIZES["7d"])
+    else:
+        s7 = t_ref - WINDOW_SIZES["7d"]
+    windows["7d"] = (s7, t_ref)
+    # 14d/28d
+    windows["14d"] = (t_ref - WINDOW_SIZES["14d"], t_ref)
+    windows["28d"] = (t_ref - WINDOW_SIZES["28d"], t_ref)
+    return windows
+
+
+async def _is_latest_or_equal_7d(conn, strategy_id: int, window_end: datetime) -> bool:
+    last = await conn.fetchval(
+        """
+        SELECT MAX(window_end) FROM oracle_report_stat
+        WHERE strategy_id = $1 AND time_frame = '7d' AND source = 'mw'
+        """,
+        int(strategy_id)
+    )
+    if last is None:
+        return True
+    # обрабатываем, если входящее окно не старше последнего
+    return window_end >= last
