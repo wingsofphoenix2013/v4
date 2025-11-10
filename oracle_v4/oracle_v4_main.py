@@ -39,6 +39,7 @@ from oracle_mw_backtest_v5 import run_oracle_mw_backtest_v5
 # from oracle_pack_backtest_v4 import run_oracle_pack_backtest_v4
 from oracle_pack_backtest_v5 import run_oracle_pack_backtest_v5
 # 🔸 импорт анализаторов
+from oracle_pack_analysis import run_oracle_pack_analysis
 from oracle_mw_bl_analyzer import run_oracle_mw_bl_analyzer
 from oracle_pack_bl_analyzer import run_oracle_pack_bl_analyzer
 # 🔸 импорт воркера уборщика
@@ -108,26 +109,28 @@ async def main():
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         
         run_periodic(run_oracle_positions_analyzer, POS_INTERVAL_SEC, "ORACLE_POSITIONS_ANALYZER", initial_delay=POS_INITIAL_DELAY_SEC),
-        
-#         run_safe_loop(run_oracle_pack_confidence, "ORACLE_PACK_CONFIDENCE"),
-#         run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
-#         run_safe_loop(run_oracle_pack_lists, "ORACLE_PACK_LISTS"),
-#         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
-#         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
-#         run_safe_loop(run_oracle_mw_backtest_v3, "ORACLE_BACKTEST_V3"),
-#         run_safe_loop(run_oracle_mw_backtest, "ORACLE_BACKTEST_V4"),
 
         run_safe_loop(run_oracle_mw_snapshot, "ORACLE_MW_SNAPSHOT_EVENT"),
         run_safe_loop(run_oracle_mw_backtest_v5,"ORACLE_BACKTEST_V5"),
         run_safe_loop(run_oracle_mw_bl_analyzer, "ORACLE_MW_BL_ANALYZER"),
-        
-#         run_safe_loop(run_oracle_pack_backtest_v3, "PACK_BACKTEST_V3"),
-#         run_safe_loop(run_oracle_pack_backtest_v4, "PACK_BACKTEST_V4"),
+
         run_safe_loop(run_oracle_pack_snapshot, "ORACLE_PACK_SNAPSHOT_EVENT"),
         run_safe_loop(run_oracle_pack_backtest_v5, "PACK_BACKTEST_V5"),
         run_safe_loop(run_oracle_pack_bl_analyzer, "ORACLE_PACK_BL_ANALYZER"),
+        
+        run_safe_loop(run_oracle_pack_analysis, "ORACLE_PACK_ANALYSIS"),
 
         run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
+
+#         run_safe_loop(run_oracle_pack_sense, "ORACLE_PACK_SENSE"),
+#         run_safe_loop(run_oracle_pack_lists, "ORACLE_PACK_LISTS"),
+#         run_safe_loop(run_oracle_confidence, "ORACLE_CONFIDENCE"),
+#         run_safe_loop(run_oracle_pack_confidence, "ORACLE_PACK_CONFIDENCE"),
+#         run_safe_loop(run_oracle_sense_stat, "ORACLE_SENSE_STAT"),
+#         run_safe_loop(run_oracle_mw_backtest_v3, "ORACLE_BACKTEST_V3"),
+#         run_safe_loop(run_oracle_mw_backtest, "ORACLE_BACKTEST_V4"),
+#         run_safe_loop(run_oracle_pack_backtest_v3, "PACK_BACKTEST_V3"),
+#         run_safe_loop(run_oracle_pack_backtest_v4, "PACK_BACKTEST_V4"),
     )
 
 if __name__ == "__main__":
