@@ -39,7 +39,7 @@ from oracle_mw_backtest_v5 import run_oracle_mw_backtest_v5
 # from oracle_pack_backtest_v4 import run_oracle_pack_backtest_v4
 from oracle_pack_backtest_v5 import run_oracle_pack_backtest_v5
 # 🔸 импорт анализаторов
-from oracle_pack_analysis import run_oracle_pack_analysis
+from oracle_pack_bl_detailed import run_oracle_pack_bl_detailed
 from oracle_mw_bl_analyzer import run_oracle_mw_bl_analyzer
 from oracle_pack_bl_analyzer import run_oracle_pack_bl_analyzer
 # 🔸 импорт воркера уборщика
@@ -117,8 +117,7 @@ async def main():
         run_safe_loop(run_oracle_pack_snapshot, "ORACLE_PACK_SNAPSHOT_EVENT"),
         run_safe_loop(run_oracle_pack_backtest_v5, "PACK_BACKTEST_V5"),
         run_safe_loop(run_oracle_pack_bl_analyzer, "ORACLE_PACK_BL_ANALYZER"),
-        
-        run_safe_loop(run_oracle_pack_analysis, "ORACLE_PACK_ANALYSIS"),
+        run_safe_loop(run_oracle_pack_bl_detailed, "ORACLE_PACK_BL_DETAILED"),
 
         run_safe_loop(run_oracle_cleaner, "ORACLE_CLEANER"),
 
