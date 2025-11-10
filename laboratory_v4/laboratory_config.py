@@ -1,10 +1,10 @@
-# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/MW-WL/MW-BL/PACK-WL/PACK-BL (+winrate) и слушатели обновлений (v1–v5)
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/MW-WL/MW-BL/PACK-WL/PACK-BL (+winrate), Active-пороги (MW-BL, PACK-BL) и слушатель единого стрима all_ready
 
 # 🔸 Импорты
 import asyncio
 import json
 import logging
-from typing import Dict, Set, Tuple
+from typing import Dict, Set, Tuple, Dict as _Dict, Set as _Set, Tuple as _Tuple
 
 import laboratory_infra as infra
 from laboratory_infra import (
@@ -16,15 +16,18 @@ from laboratory_infra import (
     update_mw_whitelist_for_strategy,
     update_mw_blacklist_for_strategy,
     update_pack_list_for_strategy,
+    # Active-пороги:
+    set_bl_active_bulk,
+    upsert_bl_active,
+    set_mw_bl_active_bulk,
+    upsert_mw_bl_active,
 )
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_CONFIG")
 
 # 🔸 Константы потоков/групп
-MW_WL_READY_STREAM = "oracle:mw_whitelist:reports_ready"
-PACK_LISTS_READY_STREAM = "oracle:pack_lists:reports_ready"
-
+ALL_READY_STREAM = "oracle:pack_lists:all_ready"
 LAB_LISTS_GROUP = "LAB_LISTS_GROUP"
 LAB_LISTS_WORKER = "LAB_LISTS_WORKER"
 
@@ -32,8 +35,13 @@ LAB_LISTS_WORKER = "LAB_LISTS_WORKER"
 PUBSUB_TICKERS = "bb:tickers_events"
 PUBSUB_STRATEGIES = "strategies_v4_events"
 
+# 🔸 Версии/режимы
+ACTIVE_LISTS_VERSION = "v5"          # активная версия при initial-load для Active-таблиц (в payload тоже приходит "v5")
+ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4", "v5")
+DECISION_MODE_SMOOTHED = "smoothed"  # режим для best_threshold_smoothed
 
-# 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL v1–v5)
+
+# 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL v1–v5 + Active-пороги)
 async def load_initial_config():
     # условия достаточности
     if infra.pg_pool is None or infra.redis_client is None:
@@ -50,14 +58,20 @@ async def load_initial_config():
     await _load_mw_blacklists_all()
     # PACK WL/BL (v1–v5) + winrate карты
     await _load_pack_lists_all()
+    # Active-пороги MW-BL (используем smoothed как рабочий)
+    await _load_mw_bl_active_all()
+    # Active-пороги PACK-BL (используем smoothed как рабочий)
+    await _load_pack_bl_active_all()
 
     # итог
     log.info(
-        "✅ LAB стартовая конфигурация загружена: тикеры=%d, стратегии=%d, "
+        "✅ LAB стартовая конфигурация загружена: "
+        "тикеры=%d, стратегии=%d, "
         "mw_wl[v1]=%d, mw_wl[v2]=%d, mw_wl[v3]=%d, mw_wl[v4]=%d, mw_wl[v5]=%d, "
         "mw_bl[v1]=%d, mw_bl[v2]=%d, mw_bl[v3]=%d, mw_bl[v4]=%d, mw_bl[v5]=%d, "
         "pack_wl[v1]=%d, pack_wl[v2]=%d, pack_wl[v3]=%d, pack_wl[v4]=%d, pack_wl[v5]=%d, "
-        "pack_bl[v1]=%d, pack_bl[v2]=%d, pack_bl[v3]=%d, pack_bl[v4]=%d, pack_bl[v5]=%d",
+        "pack_bl[v1]=%d, pack_bl[v2]=%d, pack_bl[v3]=%d, pack_bl[v4]=%d, pack_bl[v5]=%d, "
+        "mw_bl_active=%d, pack_bl_active=%d (version=%s, mode=%s)",
         len(infra.lab_tickers),
         len(infra.lab_strategies),
         len(infra.lab_mw_wl.get("v1", {})),
@@ -80,32 +94,32 @@ async def load_initial_config():
         len(infra.lab_pack_bl.get("v3", {})),
         len(infra.lab_pack_bl.get("v4", {})),
         len(infra.lab_pack_bl.get("v5", {})),
+        len(infra.lab_mw_bl_active),
+        len(infra.lab_bl_active),
+        ACTIVE_LISTS_VERSION,
+        DECISION_MODE_SMOOTHED,
     )
 
 
-# 🔸 Слушатель списков (Streams): обновление кэшей WL/BL oracle по сообщениям (v1–v5)
+# 🔸 Слушатель единого стрима (all_ready): обновление кэшей WL/BL (MW+PACK) и Active-порогов по событиям oracle_v4
 async def lists_stream_listener():
     # условия достаточности
     if infra.redis_client is None:
         log.info("❌ Пропуск lists_stream_listener: Redis не инициализирован")
         return
 
-    # допустимые версии oracle для online-перезагрузок
-    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
-
     # создать consumer group (идемпотентно)
-    for s in (MW_WL_READY_STREAM, PACK_LISTS_READY_STREAM):
-        try:
-            await infra.redis_client.xgroup_create(name=s, groupname=LAB_LISTS_GROUP, id="$", mkstream=True)
-            log.info("📡 LAB: создана consumer group для стрима %s", s)
-        except Exception as e:
-            if "BUSYGROUP" in str(e):
-                pass
-            else:
-                log.exception("❌ LAB: ошибка создания consumer group для %s", s)
-                return
+    try:
+        await infra.redis_client.xgroup_create(name=ALL_READY_STREAM, groupname=LAB_LISTS_GROUP, id="$", mkstream=True)
+        log.info("📡 LAB: создана consumer group для стрима %s", ALL_READY_STREAM)
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            pass
+        else:
+            log.exception("❌ LAB: ошибка создания consumer group для %s", ALL_READY_STREAM)
+            return
 
-    log.info("🚀 LAB: старт lists_stream_listener")
+    log.info("🚀 LAB: старт lists_stream_listener (stream=%s)", ALL_READY_STREAM)
 
     # основной цикл
     while True:
@@ -113,7 +127,7 @@ async def lists_stream_listener():
             resp = await infra.redis_client.xreadgroup(
                 groupname=LAB_LISTS_GROUP,
                 consumername=LAB_LISTS_WORKER,
-                streams={MW_WL_READY_STREAM: ">", PACK_LISTS_READY_STREAM: ">"},
+                streams={ALL_READY_STREAM: ">"},
                 count=128,
                 block=30_000,
             )
@@ -121,7 +135,7 @@ async def lists_stream_listener():
                 continue
 
             # аккумулируем ack
-            acks: Dict[str, list] = {}
+            acks = []
 
             for stream_name, msgs in resp:
                 for msg_id, fields in msgs:
@@ -131,36 +145,47 @@ async def lists_stream_listener():
                         # общие поля
                         sid = int(payload.get("strategy_id", 0))
                         version = str(payload.get("version", "")).lower()
+                        window_start = str(payload.get("window_start", "") or "")
+                        window_end = str(payload.get("window_end", "") or "")
+                        rules_exact = int(payload.get("rules_exact", 0))
+                        rules_bykey = int(payload.get("rules_bykey", 0))
+                        analysis_rows = int(payload.get("analysis_rows", 0))
+                        active_rows = int(payload.get("active_rows", 0))
+                        generated_at = str(payload.get("generated_at", "") or "")
 
-                        if stream_name == MW_WL_READY_STREAM:
-                            # ожидаем: {strategy_id, time_frame='7d', version ∈ allowed_versions, ...}
-                            if sid and version in allowed_versions:
-                                # WL и BL приходят на одном стриме — обновляем оба
-                                await _reload_mw_wl_for_strategy(sid, version)
-                                await _reload_mw_bl_for_strategy(sid, version)
-                                log.debug("🔁 LAB: MW WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
-                            else:
-                                log.debug("ℹ️ MW_WL_READY: пропуск payload=%s", payload)
+                        # валидация
+                        if not sid or version not in ALLOWED_VERSIONS:
+                            log.info("ℹ️ ALL_READY: пропуск payload sid=%s version=%s", sid, version)
+                            acks.append(msg_id)
+                            continue
 
-                        elif stream_name == PACK_LISTS_READY_STREAM:
-                            # ожидаем: {strategy_id, time_frame='7d', version ∈ allowed_versions, ...}
-                            if sid and version in allowed_versions:
-                                await _reload_pack_lists_for_strategy(sid, version)
-                                log.debug("🔁 LAB: PACK WL/BL обновлены из стрима (sid=%s, version=%s)", sid, version)
-                            else:
-                                log.debug("ℹ️ PACK_LISTS_READY: пропуск payload=%s", payload)
+                        # последовательная перезагрузка: MW WL → MW BL → PACK WL/BL → Active (MW-BL, PACK-BL)
+                        await _reload_mw_wl_for_strategy(sid, version)
+                        await _reload_mw_bl_for_strategy(sid, version)
+                        await _reload_pack_lists_for_strategy(sid, version)
+                        mw_upd = await _reload_mw_bl_active_for_strategy(sid, version)
+                        pack_upd = await _reload_pack_bl_active_for_strategy(sid, version)
 
-                        acks.setdefault(stream_name, []).append(msg_id)
+                        # суммирующий лог по сообщению
+                        log.info(
+                            "🔁 LAB: all_ready применён — sid=%d, version=%s, window=[%s..%s], "
+                            "oracle: rules_exact=%d, rules_bykey=%d, analysis_rows=%d, active_rows=%d, "
+                            "active_upd[mw=%d, pack=%d], generated_at=%s",
+                            sid, version, window_start, window_end,
+                            rules_exact, rules_bykey, analysis_rows, active_rows,
+                            mw_upd, pack_upd, generated_at
+                        )
+
+                        acks.append(msg_id)
                     except Exception:
                         log.exception("❌ LAB: ошибка обработки сообщения в %s", stream_name)
 
             # ACK после успешной обработки
-            for s, ids in acks.items():
-                if ids:
-                    try:
-                        await infra.redis_client.xack(s, LAB_LISTS_GROUP, *ids)
-                    except Exception:
-                        log.exception("⚠️ LAB: ошибка ACK в %s (ids=%s)", s, ids)
+            if acks:
+                try:
+                    await infra.redis_client.xack(ALL_READY_STREAM, LAB_LISTS_GROUP, *acks)
+                except Exception:
+                    log.exception("⚠️ LAB: ошибка ACK (ids=%s)", acks)
 
         except asyncio.CancelledError:
             log.info("⏹️ LAB: lists_stream_listener остановлен по сигналу")
@@ -236,8 +261,6 @@ async def _load_mw_whitelists_all():
     v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
     wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {}
 
-    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
-
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -256,7 +279,7 @@ async def _load_mw_whitelists_all():
 
     for r in rows:
         ver = str(r["version"]).lower()
-        if ver not in allowed_versions:
+        if ver not in ALLOWED_VERSIONS:
             continue
         sid = int(r["strategy_id"])
         tf = str(r["timeframe"]); direction = str(r["direction"])
@@ -266,7 +289,7 @@ async def _load_mw_whitelists_all():
         v_maps.setdefault(ver, {}).setdefault(key, set()).add((base, state))
         wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, state)] = wr
 
-    for ver in allowed_versions:
+    for ver in ALLOWED_VERSIONS:
         replace_mw_whitelist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
     log.info(
@@ -287,8 +310,6 @@ async def _load_mw_blacklists_all():
     v_maps: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
     wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str], float]]] = {}
 
-    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
-
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -307,7 +328,7 @@ async def _load_mw_blacklists_all():
 
     for r in rows:
         ver = str(r["version"]).lower()
-        if ver not in allowed_versions:
+        if ver not in ALLOWED_VERSIONS:
             continue
         sid = int(r["strategy_id"])
         tf = str(r["timeframe"]); direction = str(r["direction"])
@@ -317,7 +338,7 @@ async def _load_mw_blacklists_all():
         v_maps.setdefault(ver, {}).setdefault(key, set()).add((base, state))
         wr_maps.setdefault(ver, {}).setdefault(key, {})[(base, state)] = wr
 
-    for ver in allowed_versions:
+    for ver in ALLOWED_VERSIONS:
         infra.replace_mw_blacklist(ver, v_maps.get(ver, {}), wr_map=wr_maps.get(ver, {}))
 
     log.info(
@@ -340,9 +361,6 @@ async def _load_pack_lists_all():
     wl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {}
     bl_wr_maps: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {}
 
-    allowed_versions = ("v1", "v2", "v3", "v4", "v5")
-    allowed_lists = ("whitelist", "blacklist")
-
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -363,12 +381,9 @@ async def _load_pack_lists_all():
 
     for r in rows:
         ver = str(r["version"]).lower()
-        if ver not in allowed_versions:
+        if ver not in ALLOWED_VERSIONS:
             continue
         lst = str(r["list"]).lower()  # whitelist|blacklist
-        if lst not in allowed_lists:
-            continue
-
         sid = int(r["strategy_id"])
         tf = str(r["timeframe"]); direction = str(r["direction"])
         base = str(r["pack_base"]); akey = str(r["agg_key"]); aval = str(r["agg_value"])
@@ -384,7 +399,7 @@ async def _load_pack_lists_all():
             bl_maps.setdefault(ver, {}).setdefault(key, set()).add(tpl)
             bl_wr_maps.setdefault(ver, {}).setdefault(key, {})[tpl] = wr
 
-    for ver in allowed_versions:
+    for ver in ALLOWED_VERSIONS:
         replace_pack_list("whitelist", ver, wl_maps.get(ver, {}), wr_map=wl_wr_maps.get(ver, {}))
         replace_pack_list("blacklist", ver, bl_maps.get(ver, {}), wr_map=bl_wr_maps.get(ver, {}))
 
@@ -404,7 +419,63 @@ async def _load_pack_lists_all():
     )
 
 
-# 🔸 Точечные перезагрузки по сообщениям стримов
+# 🔸 Загрузка Active-порогов MW-BL (smoothed) — initial-load
+async def _load_mw_bl_active_all():
+    cache: _Dict[_Tuple[int, str, str, str, str], dict] = {}
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT strategy_id, timeframe, direction,
+                   best_threshold_smoothed, best_roi, roi_base, positions_total, deposit_used, computed_at
+            FROM oracle_mw_bl_active
+            """
+        )
+    for r in rows:
+        sid = int(r["strategy_id"])
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        threshold = int(r["best_threshold_smoothed"] or 0)
+        cache[(sid, ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED, direction, tf)] = {
+            "threshold": threshold,
+            "best_roi": float(r["best_roi"] or 0.0),
+            "roi_base": float(r["roi_base"] or 0.0),
+            "positions_total": int(r["positions_total"] or 0),
+            "deposit_used": float(r["deposit_used"] or 0.0),
+            "computed_at": str(r["computed_at"] or "") or "",
+        }
+    set_mw_bl_active_bulk(cache)
+    log.info("✅ LAB: MW-BL Active загружены (initial): records=%d, version=%s, mode=%s",
+             len(infra.lab_mw_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED)
+
+
+# 🔸 Загрузка Active-порогов PACK-BL (smoothed) — initial-load
+async def _load_pack_bl_active_all():
+    cache: _Dict[_Tuple[int, str, str, str, str], dict] = {}
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT strategy_id, timeframe, direction,
+                   best_threshold_smoothed, best_roi, roi_base, positions_total, deposit_used, computed_at
+            FROM oracle_pack_bl_active
+            """
+        )
+    for r in rows:
+        sid = int(r["strategy_id"])
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        threshold = int(r["best_threshold_smoothed"] or 0)
+        cache[(sid, ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED, direction, tf)] = {
+            "threshold": threshold,
+            "best_roi": float(r["best_roi"] or 0.0),
+            "roi_base": float(r["roi_base"] or 0.0),
+            "positions_total": int(r["positions_total"] or 0),
+            "deposit_used": float(r["deposit_used"] or 0.0),
+            "computed_at": str(r["computed_at"] or "") or "",
+        }
+    set_bl_active_bulk(cache)
+    log.info("✅ LAB: PACK-BL Active загружены (initial): records=%d, version=%s, mode=%s",
+             len(infra.lab_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED)
+
+
+# 🔸 Точечные перезагрузки по сообщению стрима (sid+version)
 
 async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
     slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
@@ -431,6 +502,8 @@ async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
         wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
 
     update_mw_whitelist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
+    log.info("🔁 LAB: MW WL обновлён из all_ready — sid=%d, version=%s, slices=%d",
+             strategy_id, version, sum(len(v) for v in slice_map.values()))
 
 
 async def _reload_mw_bl_for_strategy(strategy_id: int, version: str):
@@ -458,6 +531,8 @@ async def _reload_mw_bl_for_strategy(strategy_id: int, version: str):
         wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
 
     update_mw_blacklist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
+    log.info("🔁 LAB: MW BL обновлён из all_ready — sid=%d, version=%s, slices=%d",
+             strategy_id, version, sum(len(v) for v in slice_map.values()))
 
 
 async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
@@ -496,3 +571,73 @@ async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
 
     update_pack_list_for_strategy("whitelist", version, strategy_id, wl_slice, wr_map=wl_wr)
     update_pack_list_for_strategy("blacklist", version, strategy_id, bl_slice, wr_map=bl_wr)
+    log.info(
+        "🔁 LAB: PACK WL/BL обновлены из all_ready — sid=%d, version=%s, wl_slices=%d, bl_slices=%d",
+        strategy_id, version, sum(len(v) for v in wl_slice.values()), sum(len(v) for v in bl_slice.values())
+    )
+
+
+# 🔸 Active: точечная перезагрузка MW-BL (smoothed) по sid
+async def _reload_mw_bl_active_for_strategy(strategy_id: int, version: str) -> int:
+    updated = 0
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT timeframe, direction, best_threshold_smoothed, best_roi, roi_base, positions_total, deposit_used, computed_at
+            FROM oracle_mw_bl_active
+            WHERE strategy_id = $1
+            """,
+            int(strategy_id),
+        )
+    for r in rows:
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        upsert_mw_bl_active(
+            master_sid=int(strategy_id),
+            version=str(version),
+            decision_mode=DECISION_MODE_SMOOTHED,
+            direction=direction,
+            tf=tf,
+            threshold=int(r["best_threshold_smoothed"] or 0),
+            best_roi=float(r["best_roi"] or 0.0),
+            roi_base=float(r["roi_base"] or 0.0),
+            positions_total=int(r["positions_total"] or 0),
+            deposit_used=float(r["deposit_used"] or 0.0),
+            computed_at=str(r["computed_at"] or "") or "",
+        )
+        updated += 1
+    log.info("🔁 LAB: MW-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
+             strategy_id, version, updated, DECISION_MODE_SMOOTHED)
+    return updated
+
+
+# 🔸 Active: точечная перезагрузка PACK-BL (smoothed) по sid
+async def _reload_pack_bl_active_for_strategy(strategy_id: int, version: str) -> int:
+    updated = 0
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT timeframe, direction, best_threshold_smoothed, best_roi, roi_base, positions_total, deposit_used, computed_at
+            FROM oracle_pack_bl_active
+            WHERE strategy_id = $1
+            """,
+            int(strategy_id),
+        )
+    for r in rows:
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        upsert_bl_active(
+            master_sid=int(strategy_id),
+            version=str(version),
+            decision_mode=DECISION_MODE_SMOOTHED,
+            direction=direction,
+            tf=tf,
+            threshold=int(r["best_threshold_smoothed"] or 0),
+            best_roi=float(r["best_roi"] or 0.0),
+            roi_base=float(r["roi_base"] or 0.0),
+            positions_total=int(r["positions_total"] or 0),
+            deposit_used=float(r["deposit_used"] or 0.0),
+            computed_at=str(r["computed_at"] or "") or "",
+        )
+        updated += 1
+    log.info("🔁 LAB: PACK-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
+             strategy_id, version, updated, DECISION_MODE_SMOOTHED)
+    return updated
