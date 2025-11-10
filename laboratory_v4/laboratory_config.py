@@ -1,10 +1,10 @@
-# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: кэши тикеров/стратегий/MW-WL/MW-BL/PACK-WL/PACK-BL (+winrate), Active-пороги (MW-BL, PACK-BL) и слушатель единого стрима all_ready
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: тикеры/стратегии, MW/PACK WL/BL (+winrate), Active-пороги (MW-BL, PACK-BL) и VETO-карты PACK-BL detailed (by_key/exact) + слушатель единого стрима all_ready
 
 # 🔸 Импорты
 import asyncio
 import json
 import logging
-from typing import Dict, Set, Tuple, Dict as _Dict, Set as _Set, Tuple as _Tuple
+from typing import Dict, Set, Tuple
 
 import laboratory_infra as infra
 from laboratory_infra import (
@@ -16,11 +16,14 @@ from laboratory_infra import (
     update_mw_whitelist_for_strategy,
     update_mw_blacklist_for_strategy,
     update_pack_list_for_strategy,
-    # Active-пороги:
-    set_bl_active_bulk,
-    upsert_bl_active,
+    # Active-пороги
     set_mw_bl_active_bulk,
+    set_bl_active_bulk,
     upsert_mw_bl_active,
+    upsert_bl_active,
+    # VETO-карты PACK-BL detailed
+    replace_pack_bl_detailed,
+    update_pack_bl_detailed_for_strategy,
 )
 
 # 🔸 Логгер
@@ -36,12 +39,12 @@ PUBSUB_TICKERS = "bb:tickers_events"
 PUBSUB_STRATEGIES = "strategies_v4_events"
 
 # 🔸 Версии/режимы
-ACTIVE_LISTS_VERSION = "v5"          # активная версия при initial-load для Active-таблиц (в payload тоже приходит "v5")
+ACTIVE_LISTS_VERSION = "v5"          # версия для initial-load Active-таблиц
 ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4", "v5")
-DECISION_MODE_SMOOTHED = "smoothed"  # режим для best_threshold_smoothed
+DECISION_MODE_SMOOTHED = "smoothed"  # для best_threshold_smoothed
 
 
-# 🔸 Первичная стартовая загрузка (кэш тикеров, стратегий, WL/BL v1–v5 + Active-пороги)
+# 🔸 Первичная стартовая загрузка (тикеры, стратегии, WL/BL v1–v5 + Active-пороги + VETO-карты detailed)
 async def load_initial_config():
     # условия достаточности
     if infra.pg_pool is None or infra.redis_client is None:
@@ -58,10 +61,12 @@ async def load_initial_config():
     await _load_mw_blacklists_all()
     # PACK WL/BL (v1–v5) + winrate карты
     await _load_pack_lists_all()
-    # Active-пороги MW-BL (используем smoothed как рабочий)
+    # MW-BL Active (по всем sid, tf, dir) — smoothed-порог
     await _load_mw_bl_active_all()
-    # Active-пороги PACK-BL (используем smoothed как рабочий)
+    # PACK-BL Active (по всем sid, tf, dir) — smoothed-порог
     await _load_pack_bl_active_all()
+    # PACK-BL Detailed Active → VETO-карты (by_key/exact, только status='active')
+    await _load_pack_bl_detailed_active_all()
 
     # итог
     log.info(
@@ -101,7 +106,7 @@ async def load_initial_config():
     )
 
 
-# 🔸 Слушатель единого стрима (all_ready): обновление кэшей WL/BL (MW+PACK) и Active-порогов по событиям oracle_v4
+# 🔸 Слушатель единого стрима (Streams): oracle:pack_lists:all_ready → точечные перезагрузки WL/BL (MW/PACK), Active-порогов и VETO detailed
 async def lists_stream_listener():
     # условия достаточности
     if infra.redis_client is None:
@@ -159,21 +164,22 @@ async def lists_stream_listener():
                             acks.append(msg_id)
                             continue
 
-                        # последовательная перезагрузка: MW WL → MW BL → PACK WL/BL → Active (MW-BL, PACK-BL)
+                        # последовательные перезагрузки: MW WL → MW BL → PACK WL/BL → Active (MW-BL, PACK-BL) → Detailed VETO
                         await _reload_mw_wl_for_strategy(sid, version)
                         await _reload_mw_bl_for_strategy(sid, version)
                         await _reload_pack_lists_for_strategy(sid, version)
                         mw_upd = await _reload_mw_bl_active_for_strategy(sid, version)
                         pack_upd = await _reload_pack_bl_active_for_strategy(sid, version)
+                        det_bykey_upd, det_exact_upd = await _reload_pack_bl_detailed_active_for_strategy(sid, version)
 
                         # суммирующий лог по сообщению
                         log.info(
                             "🔁 LAB: all_ready применён — sid=%d, version=%s, window=[%s..%s], "
                             "oracle: rules_exact=%d, rules_bykey=%d, analysis_rows=%d, active_rows=%d, "
-                            "active_upd[mw=%d, pack=%d], generated_at=%s",
+                            "active_upd[mw=%d, pack=%d], detailed_upd[by_key=%d, exact=%d], generated_at=%s",
                             sid, version, window_start, window_end,
                             rules_exact, rules_bykey, analysis_rows, active_rows,
-                            mw_upd, pack_upd, generated_at
+                            mw_upd, pack_upd, det_bykey_upd, det_exact_upd, generated_at
                         )
 
                         acks.append(msg_id)
@@ -419,9 +425,10 @@ async def _load_pack_lists_all():
     )
 
 
-# 🔸 Загрузка Active-порогов MW-BL (smoothed) — initial-load
+# 🔸 Загрузка MW-BL Active (smoothed) — initial-load
 async def _load_mw_bl_active_all():
-    cache: _Dict[_Tuple[int, str, str, str, str], dict] = {}
+    active_map: Dict[Tuple[int, str, str, str, str], dict] = {}
+
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -430,26 +437,31 @@ async def _load_mw_bl_active_all():
             FROM oracle_mw_bl_active
             """
         )
+
     for r in rows:
         sid = int(r["strategy_id"])
-        tf = str(r["timeframe"]); direction = str(r["direction"])
-        threshold = int(r["best_threshold_smoothed"] or 0)
-        cache[(sid, ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED, direction, tf)] = {
-            "threshold": threshold,
+        tf = str(r["timeframe"])
+        direction = str(r["direction"])
+        key = (sid, ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED, direction, tf)
+
+        active_map[key] = {
+            "threshold": int(r["best_threshold_smoothed"] or 0),
             "best_roi": float(r["best_roi"] or 0.0),
             "roi_base": float(r["roi_base"] or 0.0),
             "positions_total": int(r["positions_total"] or 0),
             "deposit_used": float(r["deposit_used"] or 0.0),
-            "computed_at": str(r["computed_at"] or "") or "",
+            "computed_at": (r["computed_at"].isoformat() if r["computed_at"] else ""),
         }
-    set_mw_bl_active_bulk(cache)
+
+    set_mw_bl_active_bulk(active_map)
     log.info("✅ LAB: MW-BL Active загружены (initial): records=%d, version=%s, mode=%s",
              len(infra.lab_mw_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED)
 
 
-# 🔸 Загрузка Active-порогов PACK-BL (smoothed) — initial-load
+# 🔸 Загрузка PACK-BL Active (smoothed) — initial-load
 async def _load_pack_bl_active_all():
-    cache: _Dict[_Tuple[int, str, str, str, str], dict] = {}
+    active_map: Dict[Tuple[int, str, str, str, str], dict] = {}
+
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -458,24 +470,84 @@ async def _load_pack_bl_active_all():
             FROM oracle_pack_bl_active
             """
         )
+
     for r in rows:
         sid = int(r["strategy_id"])
-        tf = str(r["timeframe"]); direction = str(r["direction"])
-        threshold = int(r["best_threshold_smoothed"] or 0)
-        cache[(sid, ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED, direction, tf)] = {
-            "threshold": threshold,
+        tf = str(r["timeframe"])
+        direction = str(r["direction"])
+        key = (sid, ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED, direction, tf)
+
+        active_map[key] = {
+            "threshold": int(r["best_threshold_smoothed"] or 0),
             "best_roi": float(r["best_roi"] or 0.0),
             "roi_base": float(r["roi_base"] or 0.0),
             "positions_total": int(r["positions_total"] or 0),
             "deposit_used": float(r["deposit_used"] or 0.0),
-            "computed_at": str(r["computed_at"] or "") or "",
+            "computed_at": (r["computed_at"].isoformat() if r["computed_at"] else ""),
         }
-    set_bl_active_bulk(cache)
+
+    set_bl_active_bulk(active_map)
     log.info("✅ LAB: PACK-BL Active загружены (initial): records=%d, version=%s, mode=%s",
              len(infra.lab_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED)
 
 
-# 🔸 Точечные перезагрузки по сообщению стрима (sid+version)
+# 🔸 Загрузка PACK-BL Detailed Active → VETO-карты (by_key/exact, только status='active') — initial-load
+async def _load_pack_bl_detailed_active_all():
+    # карты по версиям:
+    #   by_key[v]: (sid, tf, dir) -> {(pack_base, agg_key)}
+    #   exact[v]:  (sid, tf, dir) -> {(pack_base, agg_key, agg_value)}
+    bykey_per_ver: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {}
+    exact_per_ver: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {}
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT version, strategy_id, timeframe, direction, analysis_level,
+                   pack_base, agg_key, agg_value, status
+            FROM oracle_pack_bl_detailed_active
+            WHERE status = 'active'
+            """
+        )
+
+    for r in rows:
+        ver = str(r["version"]).lower()
+        if ver not in ALLOWED_VERSIONS:
+            continue
+        sid = int(r["strategy_id"])
+        tf = str(r["timeframe"])
+        direction = str(r["direction"])
+        level = str(r["analysis_level"]).lower()
+        base = str(r["pack_base"]); akey = str(r["agg_key"]); aval = r["agg_value"]
+        key = (sid, tf, direction)
+
+        if level == "by_key":
+            bykey_per_ver.setdefault(ver, {}).setdefault(key, set()).add((base, akey))
+        elif level == "exact":
+            exact_per_ver.setdefault(ver, {}).setdefault(key, set()).add((base, akey, str(aval)))
+
+    # массовая замена кэшей по версиям
+    total_bykey_slices = total_bykey_entries = total_exact_slices = total_exact_entries = 0
+    for ver in ALLOWED_VERSIONS:
+        bmap = bykey_per_ver.get(ver, {})
+        emap = exact_per_ver.get(ver, {})
+        replace_pack_bl_detailed("by_key", ver, bmap)
+        replace_pack_bl_detailed("exact", ver, emap)
+        total_bykey_slices += len(bmap)
+        total_exact_slices += len(emap)
+        total_bykey_entries += sum(len(s) for s in bmap.values())
+        total_exact_entries += sum(len(s) for s in emap.values())
+
+    log.info(
+        "✅ LAB: PACK-BL Detailed Active загружены: by_key[v5]=%d entries=%d; exact[v5]=%d entries=%d (по всем версиям: slices_by_key=%d, entries_by_key=%d, slices_exact=%d, entries_exact=%d)",
+        len(bykey_per_ver.get("v5", {})),
+        sum(len(s) for s in bykey_per_ver.get("v5", {}).values()),
+        len(exact_per_ver.get("v5", {})),
+        sum(len(s) for s in exact_per_ver.get("v5", {}).values()),
+        total_bykey_slices, total_bykey_entries, total_exact_slices, total_exact_entries
+    )
+
+
+# 🔸 Точечные перезагрузки по сообщению единого стрима
 
 async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
     slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
@@ -602,7 +674,7 @@ async def _reload_mw_bl_active_for_strategy(strategy_id: int, version: str) -> i
             roi_base=float(r["roi_base"] or 0.0),
             positions_total=int(r["positions_total"] or 0),
             deposit_used=float(r["deposit_used"] or 0.0),
-            computed_at=str(r["computed_at"] or "") or "",
+            computed_at=(r["computed_at"].isoformat() if r["computed_at"] else ""),
         )
         updated += 1
     log.info("🔁 LAB: MW-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
@@ -635,9 +707,50 @@ async def _reload_pack_bl_active_for_strategy(strategy_id: int, version: str) ->
             roi_base=float(r["roi_base"] or 0.0),
             positions_total=int(r["positions_total"] or 0),
             deposit_used=float(r["deposit_used"] or 0.0),
-            computed_at=str(r["computed_at"] or "") or "",
+            computed_at=(r["computed_at"].isoformat() if r["computed_at"] else ""),
         )
         updated += 1
     log.info("🔁 LAB: PACK-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
              strategy_id, version, updated, DECISION_MODE_SMOOTHED)
     return updated
+
+
+# 🔸 Detailed VETO: точечная перезагрузка PACK-BL detailed по sid+version (только status='active')
+async def _reload_pack_bl_detailed_active_for_strategy(strategy_id: int, version: str) -> Tuple[int, int]:
+    # собираем срезы отдельными картами по (tf,dir)
+    bykey_slice: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+    exact_slice: Dict[Tuple[str, str], Set[Tuple[str, str, str]]] = {}
+
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT timeframe, direction, analysis_level, pack_base, agg_key, agg_value
+            FROM oracle_pack_bl_detailed_active
+            WHERE strategy_id = $1 AND version = $2 AND status = 'active'
+            """,
+            int(strategy_id), str(version)
+        )
+
+    for r in rows:
+        tf = str(r["timeframe"]); direction = str(r["direction"])
+        level = str(r["analysis_level"]).lower()
+        base = str(r["pack_base"]); akey = str(r["agg_key"]); aval = r["agg_value"]
+        key = (tf, direction)
+
+        if level == "by_key":
+            bykey_slice.setdefault(key, set()).add((base, akey))
+        elif level == "exact":
+            exact_slice.setdefault(key, set()).add((base, akey, str(aval)))
+
+    # обновляем кэши per-strategy
+    update_pack_bl_detailed_for_strategy("by_key", version, strategy_id, bykey_slice)
+    update_pack_bl_detailed_for_strategy("exact",  version, strategy_id, exact_slice)
+
+    bykey_entries = sum(len(s) for s in bykey_slice.values())
+    exact_entries = sum(len(s) for s in exact_slice.values())
+
+    log.info(
+        "🔁 LAB: PACK-BL Detailed VETO обновлены из all_ready — sid=%d, version=%s, by_key_slices=%d entries=%d, exact_slices=%d entries=%d",
+        strategy_id, version, len(bykey_slice), bykey_entries, len(exact_slice), exact_entries
+    )
+    return bykey_entries, exact_entries

@@ -1,4 +1,4 @@
-# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate карты WL/BL v1–v5, активные пороги BL/WL, MW-BL)
+# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate), активные пороги и VETO-карты PACK-BL (by_key/exact)
 
 # 🔸 Импорты
 import os
@@ -38,6 +38,12 @@ lab_pack_bl: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = 
 #   версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value) -> wr}}
 lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
+
+# 🔸 PACK-BL Detailed (VETO) — активные правила по версиям (v1–v5)
+#   by_key: версия -> {(sid, tf, dir) -> {(pack_base, agg_key), ...}}     # блокировать любые agg_value внутри пары (pack_base, agg_key)
+#   exact:  версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}  # блокировать только конкретное значение
+lab_pack_bl_detailed_bykey: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
+lab_pack_bl_detailed_exact: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 
 # 🔸 Активные пороги BL (PACK) — для онлайн-вето
 # ключ: (master_sid, version, decision_mode, direction, tf)
@@ -359,6 +365,84 @@ def update_pack_list_for_strategy(
     )
 
 
+# 🔸 PACK-BL Detailed (VETO): массовая установка и точечный апдейт per-strategy
+
+def replace_pack_bl_detailed(
+    level: str,  # 'by_key' | 'exact'
+    version: str,
+    new_map: Dict[Tuple[int, str, str], Set[Tuple[Any, ...]]],
+):
+    """
+    Полная замена активных VETO-правил PACK-BL для указанной версии и уровня детализации.
+
+    level:
+      - 'by_key' → значения: {(pack_base, agg_key)}
+      - 'exact'  → значения: {(pack_base, agg_key, agg_value)}
+    """
+    v = str(version or "").lower()
+    lvl = str(level or "").lower()
+
+    if lvl == "by_key":
+        if v not in lab_pack_bl_detailed_bykey:
+            lab_pack_bl_detailed_bykey[v] = {}
+        lab_pack_bl_detailed_bykey[v] = {k: set(vv or set()) for k, vv in (new_map or {}).items()}
+        log.info("LAB: PACK-BL DETAILED[BY_KEY %s] replaced — slices=%d", v, len(lab_pack_bl_detailed_bykey[v]))
+    else:
+        if v not in lab_pack_bl_detailed_exact:
+            lab_pack_bl_detailed_exact[v] = {}
+        lab_pack_bl_detailed_exact[v] = {k: set(vv or set()) for k, vv in (new_map or {}).items()}
+        log.info("LAB: PACK-BL DETAILED[EXACT %s] replaced — slices=%d", v, len(lab_pack_bl_detailed_exact[v]))
+
+
+def update_pack_bl_detailed_for_strategy(
+    level: str,  # 'by_key' | 'exact'
+    version: str,
+    strategy_id: int,
+    slice_map: Dict[Tuple[str, str], Set[Tuple[Any, ...]]],
+):
+    """
+    Точечное обновление активных VETO-правил PACK-BL для стратегии и версии.
+
+    slice_map:
+      - level='by_key': {(timeframe, direction) -> {(pack_base, agg_key), ...}}
+      - level='exact' : {(timeframe, direction) -> {(pack_base, agg_key, agg_value), ...}}
+    """
+    v = str(version or "").lower()
+    lvl = str(level or "").lower()
+    sid = int(strategy_id)
+
+    target = lab_pack_bl_detailed_bykey if lvl == "by_key" else lab_pack_bl_detailed_exact
+    if v not in target:
+        target[v] = {}
+
+    # удаляем прежние ключи по sid
+    for k in [k for k in list(target[v].keys()) if k[0] == sid]:
+        target[v].pop(k, None)
+
+    # добавляем новые срезы
+    for (tf, direction), states in (slice_map or {}).items():
+        target[v][(sid, str(tf), str(direction))] = set(states or set())
+
+    # метрики после обновления по sid
+    total_slices = 0
+    total_entries = 0
+    per_tf_entries = {"m5": 0, "m15": 0, "h1": 0}
+    for (k_sid, tf, _dir), states in target[v].items():
+        if k_sid != sid:
+            continue
+        total_slices += 1
+        cnt = len(states)
+        total_entries += cnt
+        if tf in per_tf_entries:
+            per_tf_entries[tf] += cnt
+
+    log.info(
+        "LAB: PACK-BL DETAILED[%s] updated — sid=%s version=%s slices=%d entries=%d (m5=%d m15=%d h1=%d)",
+        lvl.upper(), sid, v, total_slices, total_entries,
+        per_tf_entries["m5"], per_tf_entries["m15"], per_tf_entries["h1"]
+    )
+
+
 # 🔸 BL Active (PACK): массовая установка, точечный upsert и быстрый доступ к порогу
 
 def set_bl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str], Dict[str, Any]]):
@@ -538,10 +622,10 @@ def get_wl_threshold(
     direction: str,
     tf: str,
     source: str,                     # 'mw' | 'pack'
-    default: float = 0.55,
+    default: float = 0.60,
 ) -> float:
     """
-    Быстрый доступ к активному порогу WL (winrate). Если записи нет — возвращает default (по договорённости, 0.55).
+    Быстрый доступ к активному порогу WL (winrate). Если записи нет — возвращает default (по договорённости, 0.60).
     """
     key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf), str(source))
     rec = lab_wl_active.get(key)
