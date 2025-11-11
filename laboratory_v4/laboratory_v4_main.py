@@ -19,14 +19,6 @@ from laboratory_config import (
 from laboratory_decision_maker import run_laboratory_decision_maker
 # 🔸 импорт воркера пост-процессинга
 from laboratory_postproc import run_laboratory_postproc
-# 🔸 импорт воркера MW-BL-анализатора
-from laboratory_mw_bl_analyzer import run_laboratory_mw_bl_analyzer
-# 🔸 импорт воркера BL-анализатора
-from laboratory_bl_analyzer import run_laboratory_bl_analyzer
-# 🔸 импорт воркера WL-анализатора
-from laboratory_wl_analyzer import run_laboratory_wl_analyzer
-# 🔸 импорт воркера PACK-анализатора
-from laboratory_pack_analyzer import run_laboratory_pack_analyzer
 # 🔸 импорт воркера CLEANER
 from laboratory_cleaner import run_laboratory_cleaner
 
@@ -39,11 +31,7 @@ INITIAL_DELAY_LISTS = 0
 INITIAL_DELAY_CONFIG = 0
 INITIAL_DELAY_DECISION = 0
 INITIAL_DELAY_POSTPROC = 0
-INITIAL_DELAY_BL = 60
-INITIAL_DELAY_WL = 60
 INITIAL_DELAY_CLEANER = 0
-INITIAL_DELAY_PACK = 0
-INITIAL_DELAY_MW_BL = 0
 
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
@@ -126,30 +114,10 @@ async def main():
             lambda: _start_with_delay(run_laboratory_postproc, INITIAL_DELAY_POSTPROC),
             "LAB_POSTPROC",
         ),
-        # MW-BL анализатор (пороговое вето по MW-blacklist)
-        run_safe_loop(
-            lambda: _start_with_delay(run_laboratory_mw_bl_analyzer, INITIAL_DELAY_MW_BL),
-            "LAB_MW_BL_ANALYZER",
-        ),
-        # BL-анализатор (полный прогон + подписка на PACK списки)
-        run_safe_loop(
-            lambda: _start_with_delay(run_laboratory_bl_analyzer, INITIAL_DELAY_BL),
-            "LAB_BL_ANALYZER",
-        ),
-        # WL-анализатор (MW и PACK winrate)
-        run_safe_loop(
-            lambda: _start_with_delay(run_laboratory_wl_analyzer, INITIAL_DELAY_WL),
-            "LAB_WL_ANALYZER",
-        ),
         # очистка (по триггерам PACK_LISTS READY)
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_cleaner, INITIAL_DELAY_CLEANER),
             "LAB_CLEANER",
-        ),
-        # PACK-анализатор (комбо-статистика 7d, периодический)
-        run_safe_loop(
-            lambda: _start_with_delay(run_laboratory_pack_analyzer, INITIAL_DELAY_PACK),
-            "LAB_PACK_ANALYZER",
         ),
     )
 
