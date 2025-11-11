@@ -16,6 +16,7 @@ LAB_REQ_STREAM = "laboratory:decision_request"
 LAB_TIMEFRAMES = "m5,m15"	     		# порядок обязателен
 LAB_DECISION_MODE = "mw_and_pack"    	# mw_only | mw_then_pack | mw_and_pack | pack_only
 LAB_VERSION = "v5"               		# v1 | v2 | v3 | v4 | v5
+LAB_USE_ORACLE_BL = "true"             	# "true" | "false" (строкой)
 LAB_USE_WL = "false"             		# "true" | "false" (строкой)
 LAB_USE_BL = "false"             		# "true" | "false" (строкой)
 LAB_WAIT_TIMEOUT_SEC = 120        		# таймаут ожидания ответа
@@ -59,13 +60,14 @@ class Strategy215Long:
         request = {
             "req_uid": req_uid,
             "log_uid": log_uid,
-            "strategy_id": int(master_sid),           # master (WL/BL)
-            "client_strategy_id": int(client_sid),    # текущая стратегия
+            "strategy_id": int(master_sid),           # master (WL/BL) — по направлению
+            "client_strategy_id": int(client_sid),    # текущая (двунаправленная) стратегия
             "symbol": symbol,
             "direction": direction,                   # long | short
             "timeframes": LAB_TIMEFRAMES,             # "m5,m15,h1"
             "decision_mode": LAB_DECISION_MODE,       # mw_only | mw_then_pack | mw_and_pack | pack_only
             "version": LAB_VERSION,                   # v1 | v2 | v3 | v4 | v5
+            "use_oracle_bl": LAB_USE_ORACLE_BL,       # "true" | "false" (строкой)            
             "use_wl": LAB_USE_WL,                     # "true" | "false" (строкой)
             "use_bl": LAB_USE_BL,                     # "true" | "false" (строкой)
         }
