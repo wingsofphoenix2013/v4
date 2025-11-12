@@ -1,4 +1,4 @@
-# 🔸 auditor_v4_main.py — entrypoint auditor_v4: инициализация, одноразовый аудит закрытых сделок и запуск фоновых воркеров (AUD_CROSS_STRENGTH, AUD_BEST_SELECTOR)
+# 🔸 auditor_v4_main.py — entrypoint auditor_v4: инициализация, одноразовый аудит закрытых сделок и запуск фоновых воркеров (AUD_CROSS_STRENGTH, AUD_EMA200_SIDE, AUD_ATRREG, AUD_EMA2150_SPREAD, AUD_BEST_SELECTOR)
 
 # 🔸 Импорты
 import asyncio
@@ -15,6 +15,7 @@ from auditor_cross_strength import run_auditor_cross_strength
 from auditor_ema200_side import run_auditor_ema200_side
 from auditor_best_selector import run_auditor_best_selector
 from auditor_atrreg import run_auditor_atrreg
+from auditor_ema2150_spread import run_auditor_ema2150_spread
 import auditor_infra as infra
 
 # 🔸 Логгер
@@ -145,6 +146,8 @@ async def main():
         run_safe_loop(lambda: _start_with_delay(run_auditor_ema200_side, 90), "AUD_EMA200_SIDE"),
         # фоновый воркер «ATR% режим волатильности»: старт через 120 сек, далее цикл run→sleep(3h)
         run_safe_loop(lambda: _start_with_delay(run_auditor_atrreg, 120), "AUD_ATRREG"),
+        # фоновый воркер «EMA21/EMA50 spread»: старт через 150 сек, далее цикл run→sleep(3h)
+        run_safe_loop(lambda: _start_with_delay(run_auditor_ema2150_spread, 150), "AUD_EMA2150_SPREAD"),
         # фоновый оркестратор витрины «лучшая идея»
         run_safe_loop(lambda: _start_with_delay(run_auditor_best_selector, 0), "AUD_BEST_SELECTOR"),
         # одноразовый аудит закрытых сделок (выполняется и завершается)

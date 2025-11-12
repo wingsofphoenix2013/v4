@@ -1,4 +1,4 @@
-# auditor_atrreg.py — аудит «ATR% режим волатильности»: биннинг atr14/entry_price по TF и окнам, маски и публикация best-of-three
+# auditor_ema2150_spread.py — аудит «EMACROSS 21/50: spread режим» (|ema21−ema50|/atr14): биннинг по TF/окнам, маски и публикация best-of-three
 
 # 🔸 Импорты
 import asyncio
@@ -12,7 +12,7 @@ import auditor_infra as infra
 from auditor_config import load_active_mw_strategies
 
 # 🔸 Логгер
-log = logging.getLogger("AUD_ATRREG")
+log = logging.getLogger("AUD_EMA2150")
 
 # 🔸 Константы аудита (правим здесь, не через ENV)
 WINDOWS: List[Tuple[str, Optional[int]]] = [("7d", 7), ("14d", 14), ("28d", 28), ("total", None)]
@@ -36,7 +36,7 @@ MASK_BINS: Dict[str, Set[int]] = {
     "any": {1, 2, 3, 4, 5},
     "low": {1, 2, 3},          # ≤ Q60
     "mid": {2, 3, 4},          # Q20..Q80
-    "high": {4, 5},            # ≥ Q60 (базово)
+    "high": {4, 5},            # ≥ Q60
 }
 MASK_QBOUNDS: Dict[str, Tuple[Optional[int], Optional[int]]] = {
     "any":  (None, None),
@@ -47,15 +47,15 @@ MASK_QBOUNDS: Dict[str, Tuple[Optional[int], Optional[int]]] = {
 
 
 # 🔸 Точка входа воркера
-async def run_auditor_atrreg():
+async def run_auditor_ema2150_spread():
     # условия достаточности
     if infra.pg_pool is None:
-        log.debug("❌ Пропуск auditor_atrreg: PG не инициализирован")
+        log.debug("❌ Пропуск auditor_ema2150_spread: PG не инициализирован")
         return
 
     # стартовая задержка (если нужна)
     if INITIAL_DELAY_SEC > 0:
-        log.debug("⏳ AUD_ATRREG: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
+        log.debug("⏳ AUD_EMA2150: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
         await asyncio.sleep(int(INITIAL_DELAY_SEC))
 
     # основной цикл
@@ -63,21 +63,21 @@ async def run_auditor_atrreg():
         try:
             await _run_once()
         except asyncio.CancelledError:
-            log.debug("⏹️ AUD_ATRREG: остановлено по сигналу")
+            log.debug("⏹️ AUD_EMА2150: остановлено по сигналу")
             raise
         except Exception:
-            log.exception("❌ AUD_ATRREG: ошибка прохода — пауза 5 секунд")
+            log.exception("❌ AUD_EMA2150: ошибка прохода — пауза 5 секунд")
             await asyncio.sleep(5)
 
-        log.debug("😴 AUD_ATRREG: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
+        log.debug("😴 AUD_EMA2150: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
 
-# 🔸 Один проход: создать run, пройти по стратегиям, записать покрытия/бины/вердикты и опубликовать лучший вариант
+# 🔸 Один проход: создать run, пройти по стратегиям, записать покрытия/бины/вердикты
 async def _run_once():
     # загрузка активных MW-стратегий
     strategies = await load_active_mw_strategies()
-    log.debug("📦 AUD_ATRREG: найдено активных MW-стратегий: %d", len(strategies))
+    log.debug("📦 AUD_EMA2150: найдено активных MW-стратегий: %d", len(strategies))
     if not strategies:
         return
 
@@ -90,28 +90,28 @@ async def _run_once():
         "total": None,
     }
     log.debug(
-        "🕒 AUD_ATRREG: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
+        "🕒 AUD_EMA2150: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
         now_utc, win_bounds["7d"], win_bounds["14d"], win_bounds["28d"]
     )
 
     # создаём запись прогона
     run_id = await _create_run(now_utc, win_bounds)
-    log.debug("🧾 AUD_ATRREG: создан run_id=%s", run_id)
+    log.debug("🧾 AUD_EMA2150: создан run_id=%s", run_id)
 
     # последовательный проход по стратегиям
     for sid, meta in strategies.items():
         try:
             await _process_strategy(run_id, sid, meta, now_utc, win_bounds)
         except Exception:
-            log.exception("❌ AUD_ATRREG: ошибка обработки стратегии sid=%s", sid)
+            log.exception("❌ AUD_EMA2150: ошибка обработки стратегии sid=%s", sid)
 
 
-# 🔸 Создать запись в auditor_atrreg_runs
+# 🔸 Создать запись в auditor_ema2150_spread_runs
 async def _create_run(now_utc: dt.datetime, win_bounds: Dict[str, Optional[dt.datetime]]) -> int:
     async with infra.pg_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO auditor_atrreg_runs (now_utc, window_7d_from, window_14d_from, window_28d_from)
+            INSERT INTO auditor_ema2150_spread_runs (now_utc, window_7d_from, window_14d_from, window_28d_from)
             VALUES ($1, $2, $3, $4)
             RETURNING id
             """,
@@ -132,63 +132,62 @@ async def _process_strategy(
     human = meta.get("human_name") or ""
     title = f'{sid} "{name}"' if not human else f'{sid} "{name}" ({human})'
 
-    # получить депозит стратегии (аксиома: > 0)
+    # депозит стратегии (аксиома: > 0)
     deposit = await _load_strategy_deposit(sid)
     dep_used_for_bins = float(deposit)
 
-    # выбрать все закрытые позиции (total)
+    # закрытые позиции
     positions = await _load_closed_positions_for_strategy(sid)
     if not positions:
-        log.debug("ℹ️ AUD_ATRREG: %s — закрытых позиций нет", title)
+        log.debug("ℹ️ AUD_EMA2150: %s — закрытых позиций нет", title)
         return
 
-    # пометить принадлежность окнам
+    # принадлежность окнам
     for p in positions:
-        closed_at = p["closed_at"]
+        ca = p["closed_at"]
         p["in_window"] = {
-            "7d":  (closed_at is not None and closed_at >= win_bounds["7d"]),
-            "14d": (closed_at is not None and closed_at >= win_bounds["14d"]),
-            "28d": (closed_at is not None and closed_at >= win_bounds["28d"]),
+            "7d":  (ca is not None and ca >= win_bounds["7d"]),
+            "14d": (ca is not None and ca >= win_bounds["14d"]),
+            "28d": (ca is not None and ca >= win_bounds["28d"]),
             "total": True,
         }
 
-    # посчитать покрытия по окнам и записать в auditor_atrreg_coverage
+    # покрытие по окнам
     coverage = _compute_coverage(positions, now_utc)
     await _insert_coverage_rows(run_id, sid, coverage)
 
-    # подтянуть снапшоты индикаторов по TF (только atr14)
+    # снапшоты ema21/ema50/atr14 по TF (m5/m15/h1)
     pos_uids = [p["position_uid"] for p in positions]
     snaps = await _load_indicator_snapshots_for_positions(pos_uids)
 
-    # подготовка корзин: data[tf][window][direction][symbol] -> [(position_uid, atr_pct, pnl)]
+    # подготовка корзин: data[tf][window][direction][symbol] -> [(position_uid, spread, pnl)]
     data: Dict[str, Dict[str, Dict[str, Dict[str, List[Tuple[str, float, float]]]]]] = {
         tf: {w: {"long": {}, "short": {}} for w, _ in WINDOWS} for tf in TIMEFRAMES
     }
 
-    # расчёт atr_pct и раскладка по корзинам
+    # расчёт spread и раскладка по корзинам
     for p in positions:
         symbol = p["symbol"]
         direction = p["direction"]
         pnl = float(p["pnl"] or 0.0)
         puid = p["position_uid"]
-        entry = float(p["entry_price"] or 0.0)
-        if entry <= 0:
-            continue
 
         for tf in TIMEFRAMES:
             s = snaps.get((puid, tf))
             if not s:
                 continue
-            atr14 = s.get("atr14")
-            if atr14 is None or atr14 <= 0:
+            ema21 = s.get("ema21"); ema50 = s.get("ema50"); atr14 = s.get("atr14")
+            if ema21 is None or ema50 is None or atr14 is None:
+                continue
+            if atr14 <= 0:
                 continue
 
-            atr_pct = (float(atr14) / entry) * 100.0
+            spread = abs(float(ema21) - float(ema50)) / float(atr14)
 
             for w, _days in WINDOWS:
                 if p["in_window"][w]:
                     bucket = data[tf][w][direction].setdefault(symbol, [])
-                    bucket.append((puid, atr_pct, pnl))
+                    bucket.append((puid, spread, pnl))
 
     # агрегаты бинов и карта «бин позиции» для дальнейшей оценки маски
     bin_aggr: Dict[str, Dict[str, Dict[str, Dict[int, Dict[str, float]]]]] = {
@@ -220,10 +219,10 @@ async def _process_strategy(
                     for symbol, triples in symbol_series.items():
                         if not triples:
                             continue
-                        xs = [atr_pct for (_puid, atr_pct, _pnl) in triples]
+                        xs = [spread for (_puid, spread, _pnl) in triples]
                         edges = _quantile_edges(xs, (0.2, 0.4, 0.6, 0.8))
-                        for puid, atr_pct, pnl in triples:
-                            b = _assign_bin(atr_pct, edges)
+                        for puid, spread, pnl in triples:
+                            b = _assign_bin(spread, edges)
                             pos_bins[tf][w][direction][puid] = b
                             rec = btot[b]
                             rec["N"] += 1
@@ -235,8 +234,8 @@ async def _process_strategy(
 
                     # лог (как прежде)
                     warn = " (N<50)" if total_n < MIN_SAMPLE_PER_CELL else ""
-                    log.debug('📈 AUD_ATRREG | %s | TF=%s | dir=%s | window=%s — bins by atr_pct%s',
-                             title, tf, direction, w, warn)
+                    log.debug('📈 AUD_EMA2150 | %s | TF=%s | dir=%s | window=%s — bins by spread%s',
+                              title, tf, direction, w, warn)
                     for idx in (1, 2, 3, 4, 5):
                         rec = btot[idx]
                         N = rec["N"]
@@ -251,7 +250,7 @@ async def _process_strategy(
                     d_roi = (last["pnl_sum"] - first["pnl_sum"]) / dep_used_for_bins * 100.0
                     log.debug("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
 
-                    # запись в auditor_atrreg_bin_stats — 5 строк
+                    # запись в auditor_ema2150_spread_bin_stats — 5 строк
                     cov = coverage.get(direction, {}).get(w, None)
                     win_eff = cov["window_days_effective"] if cov else (0 if w == "total" else (7 if w == "7d" else 14 if w == "14d" else 28))
                     win_nom = cov["window_days_nominal"] if cov else (0 if w == "total" else (7 if w == "7d" else 14 if w == "14d" else 28))
@@ -263,7 +262,7 @@ async def _process_strategy(
                         roi_pct = (pnl_sum / dep_used_for_bins * 100.0) if dep_used_for_bins > 0 else 0.0
                         await conn.execute(
                             """
-                            INSERT INTO auditor_atrreg_bin_stats
+                            INSERT INTO auditor_ema2150_spread_bin_stats
                             (run_id, strategy_id, timeframe, direction, window_tag,
                              window_days_effective, window_days_nominal, window_coverage_pct,
                              bin_index, n, wins, pnl_sum, deposit_used, roi_pct,
@@ -276,7 +275,7 @@ async def _process_strategy(
                             False, None
                         )
 
-    # для каждого направления: выбрать primary-окно, построить классы TF, сформировать 3 маски и выбрать «best-of-three»
+    # выбор масок и публикации по каждому направлению
     for direction in ("long", "short"):
         dir_positions = [p for p in positions if p["direction"] == direction]
         if not dir_positions:
@@ -298,25 +297,27 @@ async def _process_strategy(
             ("m5_m15_h1",   {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": tf_classes.get("h1", "any")},  "mask=m5_m15_h1"),
         ]
 
-        # оценим каждую маску на primary окне и выберем лучшую (best-of-three)
+        # оценка масок
         ranking: List[Tuple[float, float, float, float, int]] = []  # (eligible, delta_roi, roi_sel, conf, coverage, idx)
         mask_metrics_primary: List[Dict[str, Any]] = []
         mask_metrics_all_primary: List[Dict[str, Any]] = []
-        mask_decision_cache: List[Tuple[str, float]] = []  # (class, conf)
 
         for idx, (_label, mask_modes, _note) in enumerate(masks):
             m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
-            m_all = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, primary_win, direction, deposit)
+            m_all = _evaluate_mask_on_positions(dir_positions, pos_bins,
+                                                {"m5": "any", "m15": "any", "h1": "any"},
+                                                primary_win, direction, deposit)
             mask_metrics_primary.append(m_sel)
             mask_metrics_all_primary.append(m_all)
 
-            # предварительная оценка для confidence (как в решении)
-            m_sel_sec = None; m_all_sec = None
+            # confidence через secondary
+            m_sel_sec = m_all_sec = None
             if secondary_win is not None:
                 m_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
-                m_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, secondary_win, direction, deposit)
-            dec_class, dec_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), m_sel, m_all, m_sel_sec, m_all_sec)
-            mask_decision_cache.append((dec_class, dec_conf))
+                m_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins,
+                                                        {"m5": "any", "m15": "any", "h1": "any"},
+                                                        secondary_win, direction, deposit)
+            _, dec_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), m_sel, m_all, m_sel_sec, m_all_sec)
 
             roi_sel = m_sel["roi_selected_pct"]; roi_all = m_sel["roi_all_pct"]
             delta_roi = (roi_sel - roi_all) if (roi_sel is not None and roi_all is not None) else float("-inf")
@@ -345,15 +346,16 @@ async def _process_strategy(
                 primary_note=note
             )
 
-        # 🔸 Публикуем лучший вариант в оркестратор (всегда; если ROI<=0 — как ineligible)
+        # публикация лучшего кандидата
         best_label, best_mask, _ = masks[best_idx]
         best_sel = mask_metrics_primary[best_idx]
         best_all = mask_metrics_all_primary[best_idx]
-        # confidence такой же логикой, как в решении
         best_sel_sec = best_all_sec = None
         if secondary_win is not None:
             best_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, best_mask, secondary_win, direction, deposit)
-            best_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5":"any","m15":"any","h1":"any"}, secondary_win, direction, deposit)
+            best_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins,
+                                                       {"m5": "any", "m15": "any", "h1": "any"},
+                                                       secondary_win, direction, deposit)
         _, best_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), best_sel, best_all, best_sel_sec, best_all_sec)
 
         await _publish_best_candidate(
@@ -368,12 +370,12 @@ async def _process_strategy(
             decision_conf=best_conf,
         )
 
-        # лог-резюме по направлению (info)
+        # суммарный лог по направлению
         d_roi_pp = 0.0
         if best_sel["roi_selected_pct"] is not None and best_sel["roi_all_pct"] is not None:
             d_roi_pp = best_sel["roi_selected_pct"] - best_sel["roi_all_pct"]
         log.debug(
-            "🏁 AUD_ATRREG | %s | dir=%s | primary=%s | best=%s | ΔROI=%.2f pp | ROI_sel=%.2f%% | WR_sel=%.2f%% | cov=%.1f%% | conf=%.2f",
+            "🏁 AUD_EMA2150 | %s | dir=%s | primary=%s | best=%s | ΔROI=%.2f pp | ROI_sel=%.2f%% | WR_sel=%.2f%% | cov=%.1f%% | conf=%.2f",
             title, direction, primary_win, best_label,
             d_roi_pp,
             best_sel["roi_selected_pct"] if best_sel["roi_selected_pct"] is not None else 0.0,
@@ -401,14 +403,18 @@ async def _record_mask_with_validation(
 ):
     # оценка на primary
     metrics_sel_primary = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
-    metrics_all_primary = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, primary_win, direction, deposit)
+    metrics_all_primary = _evaluate_mask_on_positions(dir_positions, pos_bins,
+                                                      {"m5": "any", "m15": "any", "h1": "any"},
+                                                      primary_win, direction, deposit)
 
     # оценка на secondary (если есть)
     metrics_sel_secondary = None
     metrics_all_secondary = None
     if secondary_win is not None:
         metrics_sel_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
-        metrics_all_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, secondary_win, direction, deposit)
+        metrics_all_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins,
+                                                            {"m5": "any", "m15": "any", "h1": "any"},
+                                                            secondary_win, direction, deposit)
 
     # принять решение
     decision_class, decision_conf, rationale = _make_decision(
@@ -420,7 +426,7 @@ async def _record_mask_with_validation(
         metrics_base_secondary=metrics_all_secondary
     )
 
-    # запись primary строки в mask_results
+    # запись primary строки
     await _insert_mask_result(
         run_id=run_id, sid=sid, direction=direction, window_tag=primary_win,
         is_primary=is_primary, primary_window=primary_win,
@@ -428,7 +434,7 @@ async def _record_mask_with_validation(
         decision_class=decision_class, decision_confidence=decision_conf, rationale=(primary_note if primary_note else rationale)
     )
 
-    # лог (DECISION для primary, ALT — для остальных)
+    # лог (DECISION/ALT)
     tag = "DECISION" if is_primary else "ALT"
     d_roi_pp = 0.0
     if metrics_sel_primary["roi_selected_pct"] is not None and metrics_sel_primary["roi_all_pct"] is not None:
@@ -445,7 +451,9 @@ async def _record_mask_with_validation(
         if w == primary_win:
             continue
         m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, w, direction, deposit)
-        m_all = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, w, direction, deposit)
+        m_all = _evaluate_mask_on_positions(dir_positions, pos_bins,
+                                            {"m5": "any", "m15": "any", "h1": "any"},
+                                            w, direction, deposit)
         if m_all["n_all"] > 0:
             await _insert_mask_result(
                 run_id=run_id, sid=sid, direction=direction, window_tag=w,
@@ -470,10 +478,10 @@ async def _publish_best_candidate(
 ):
     # условия достаточности
     if infra.redis_client is None:
-        log.debug("ℹ️ AUD_ATRREG: Redis не инициализирован — пропуск публикации кандидата")
+        log.debug("ℹ️ AUD_EMA2150: Redis не инициализирован — пропуск публикации кандидата")
         return
 
-    idea_key = "atr_pct_regime"
+    idea_key = "emacross_2150_spread"
     stream = "auditor:best:candidates"
 
     roi_sel = metrics_sel["roi_selected_pct"]
@@ -516,38 +524,34 @@ async def _publish_best_candidate(
                 "h1_q_low":  MASK_QBOUNDS[mask_modes.get("h1","any")][0],
                 "h1_q_high": MASK_QBOUNDS[mask_modes.get("h1","any")][1],
             }),
-            "source_table": "auditor_atrreg_mask_results",
+            "source_table": "auditor_ema2150_spread_mask_results",
             "source_run_id": str(run_id),
         })
 
     # публикация
     try:
         await infra.redis_client.xadd(stream, fields, id="*")
-        log.debug("📨 AUD_ATRREG → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
-                 sid, direction, label, fields["eligible"])
+        log.debug("📨 AUD_EMA2150 → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
+                  sid, direction, label, fields["eligible"])
     except Exception:
-        log.exception("❌ AUD_ATRREG: ошибка публикации кандидата в %s", stream)
+        log.exception("❌ AUD_EMA2150: ошибка публикации кандидата в %s", stream)
 
 
 # 🔸 Загрузка депозита стратегии
 async def _load_strategy_deposit(sid: int) -> float:
     async with infra.pg_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT deposit FROM strategies_v4 WHERE id = $1", int(sid))
-    # аксиома: депозит всегда задан и > 0
-    val = float(row["deposit"])
-    return val
+    return float(row["deposit"])
 
 
-# 🔸 Выборка закрытых позиций стратегии (total)
+# 🔸 Выборка закрытых позиций стратегии
 async def _load_closed_positions_for_strategy(sid: int) -> List[Dict[str, Any]]:
     async with infra.pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT position_uid, symbol, direction, entry_price, pnl, notional_value, created_at, closed_at
             FROM positions_v4
-            WHERE strategy_id = $1
-              AND status = 'closed'
-              AND direction IN ('long','short')
+            WHERE strategy_id = $1 AND status = 'closed' AND direction IN ('long','short')
             """,
             int(sid)
         )
@@ -566,7 +570,7 @@ async def _load_closed_positions_for_strategy(sid: int) -> List[Dict[str, Any]]:
     return out
 
 
-# 🔸 Подтянуть снапшоты atr14 для позиций по всем TF
+# 🔸 Подтянуть снапшоты ema21/ema50/atr14 для позиций по всем TF
 async def _load_indicator_snapshots_for_positions(pos_uids: List[str]) -> Dict[Tuple[str, str], Dict[str, float]]:
     snaps: Dict[Tuple[str, str], Dict[str, float]] = {}
     if not pos_uids:
@@ -576,6 +580,8 @@ async def _load_indicator_snapshots_for_positions(pos_uids: List[str]) -> Dict[T
         rows = await conn.fetch(
             """
             SELECT position_uid, timeframe,
+                   MAX(value_num) FILTER (WHERE param_type='indicator' AND param_base='ema' AND param_name='ema21') AS ema21,
+                   MAX(value_num) FILTER (WHERE param_type='indicator' AND param_base='ema' AND param_name='ema50') AS ema50,
                    MAX(value_num) FILTER (WHERE param_type='indicator' AND param_base='atr' AND param_name='atr14') AS atr14
             FROM indicator_position_stat
             WHERE position_uid = ANY($1)
@@ -590,42 +596,34 @@ async def _load_indicator_snapshots_for_positions(pos_uids: List[str]) -> Dict[T
     for r in rows:
         key = (str(r["position_uid"]), str(r["timeframe"]))
         snaps[key] = {
+            "ema21": _to_float_or_none(r["ema21"]),
+            "ema50": _to_float_or_none(r["ema50"]),
             "atr14": _to_float_or_none(r["atr14"]),
         }
     return snaps
 
 
-# 🔸 Посчитать покрытия по окнам для стратегии (по направлениям)
+# 🔸 Покрытие по окнам
 def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> Dict[str, Dict[str, Dict[str, Any]]]:
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"long": {}, "short": {}}
     by_dir: Dict[str, List[Dict[str, Any]]] = {"long": [], "short": []}
     for p in positions:
         by_dir[p["direction"]].append(p)
-
     for direction in ("long", "short"):
         dir_positions = by_dir[direction]
         if not dir_positions:
             continue
-
         for w, nominal_days in WINDOWS:
             if w == "total":
                 n_positions = len(dir_positions)
                 first_closed = min((p["closed_at"] for p in dir_positions if p["closed_at"]), default=None)
                 last_closed = max((p["closed_at"] for p in dir_positions if p["closed_at"]), default=None)
-                out[direction][w] = {
-                    "window_days_effective": 0,
-                    "window_days_nominal": 0,
-                    "window_coverage_pct": 100.0,
-                    "n_positions": n_positions,
-                    "first_closed_at": first_closed,
-                    "last_closed_at": last_closed,
-                }
+                out[direction][w] = {"window_days_effective": 0, "window_days_nominal": 0, "window_coverage_pct": 100.0,
+                                     "n_positions": n_positions, "first_closed_at": first_closed, "last_closed_at": last_closed}
                 continue
-
             cutoff = now_utc - dt.timedelta(days=int(nominal_days or 0))
             win_positions = [p for p in dir_positions if p["closed_at"] and p["closed_at"] >= cutoff]
             n_positions = len(win_positions)
-
             if n_positions > 0:
                 first_closed = min(p["closed_at"] for p in win_positions if p["closed_at"])
                 last_closed = max(p["closed_at"] for p in win_positions if p["closed_at"])
@@ -633,24 +631,14 @@ def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> 
                 eff_days = max(0.0, min(eff_days, float(nominal_days)))
                 coverage_pct = (eff_days / float(nominal_days)) * 100.0 if nominal_days else 100.0
             else:
-                first_closed = None
-                last_closed = None
-                eff_days = 0.0
-                coverage_pct = 0.0
-
-            out[direction][w] = {
-                "window_days_effective": int(eff_days),
-                "window_days_nominal": int(nominal_days or 0),
-                "window_coverage_pct": float(coverage_pct),
-                "n_positions": n_positions,
-                "first_closed_at": first_closed,
-                "last_closed_at": last_closed,
-            }
-
+                first_closed = None; last_closed = None; eff_days = 0.0; coverage_pct = 0.0
+            out[direction][w] = {"window_days_effective": int(eff_days), "window_days_nominal": int(nominal_days or 0),
+                                 "window_coverage_pct": float(coverage_pct),
+                                 "n_positions": n_positions, "first_closed_at": first_closed, "last_closed_at": last_closed}
     return out
 
 
-# 🔸 Вставить покрытия в auditor_atrreg_coverage
+# 🔸 Вставка coverage
 async def _insert_coverage_rows(run_id: int, sid: int, coverage: Dict[str, Dict[str, Dict[str, Any]]]):
     async with infra.pg_pool.acquire() as conn:
         for direction in ("long", "short"):
@@ -659,7 +647,7 @@ async def _insert_coverage_rows(run_id: int, sid: int, coverage: Dict[str, Dict[
             for w, rec in coverage[direction].items():
                 await conn.execute(
                     """
-                    INSERT INTO auditor_atrreg_coverage
+                    INSERT INTO auditor_ema2150_spread_coverage
                     (run_id, strategy_id, direction, window_tag,
                      window_days_effective, window_days_nominal, window_coverage_pct,
                      n_positions, first_closed_at, last_closed_at)
@@ -671,33 +659,7 @@ async def _insert_coverage_rows(run_id: int, sid: int, coverage: Dict[str, Dict[
                 )
 
 
-# 🔸 Выбор primary окна по покрытию
-def _choose_primary_window(cov_map: Dict[str, Dict[str, Any]]) -> str:
-    cov28 = cov_map.get("28d", {}).get("window_coverage_pct", 0.0)
-    cov14 = cov_map.get("14d", {}).get("window_coverage_pct", 0.0)
-    if cov28 >= PRIMARY_28D_COVERAGE * 100.0:
-        return "28d"
-    if cov14 >= PRIMARY_14D_COVERAGE * 100.0:
-        return "14d"
-    return "7d"
-
-
-# 🔸 Выбор secondary окна (для проверки знака)
-def _choose_secondary_window(cov_map: Dict[str, Dict[str, Any]], primary: str) -> Optional[str]:
-    if primary == "28d":
-        if cov_map.get("14d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
-            return "14d"
-        if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
-            return "7d"
-        return None
-    if primary == "14d":
-        if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
-            return "7d"
-        return None
-    return None  # primary=7d
-
-
-# 🔸 Классификация TF по бинам (HIGH/LOW/MID/any) на окне
+# 🔸 Классификация TF по бинам
 def _classify_tf(btot: Optional[Dict[int, Dict[str, float]]], dep_used_for_bins: float) -> str:
     if not btot:
         return "any"
@@ -719,7 +681,7 @@ def _classify_tf(btot: Optional[Dict[int, Dict[str, float]]], dep_used_for_bins:
     return "any"
 
 
-# 🔸 Оценить маску на позициях (пересечение условий по TF)
+# 🔸 Оценка маски
 def _evaluate_mask_on_positions(
     dir_positions: List[Dict[str, Any]],
     pos_bins: Dict[str, Dict[str, Dict[str, Dict[str, int]]]],
@@ -767,7 +729,7 @@ def _evaluate_mask_on_positions(
     }
 
 
-# 🔸 Принять решение по маске (class/confidence/rationale)
+# 🔸 Решение (class/confidence/rationale)
 def _make_decision(
     primary_window: str,
     cov_map_dir: Dict[str, Dict[str, Any]],
@@ -815,7 +777,7 @@ def _make_decision(
     return ("red", conf, f"primary={primary_window} ΔWR={d_wr:.2f}pp (no gain, ROI=n/a)")
 
 
-# 🔸 Вставить строку в auditor_atrreg_mask_results
+# 🔸 Вставка строки в auditor_ema2150_spread_mask_results
 async def _insert_mask_result(
     run_id: int,
     sid: int,
@@ -848,7 +810,7 @@ async def _insert_mask_result(
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO auditor_atrreg_mask_results
+            INSERT INTO auditor_ema2150_spread_mask_results
             (run_id, strategy_id, direction, window_tag,
              is_primary, primary_window,
              m5_mode, m5_q_low, m5_q_high,
