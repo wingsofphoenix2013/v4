@@ -1,13 +1,16 @@
 # 🔸 auditor_cross_strength.py — аудит «силы кросса» EMA9/EMA21:
 #     — считает бины по abs(ema9-ema21)/atr14 на TF (m5/m15/h1) и окнах (7d/14d/28d/total)
 #     — пишет в БД: runs / coverage / bin_stats / mask_results
-#     — формирует три маски совместимые с тест-модулем: m5_only, m5_m15, m5_m15_h1
-#     — ВАЖНО: primary-маска выбирается как «best-of-three» на основном окне (по ΔROI, затем ROI, затем conf, затем coverage)
+#     — формирует три маски под тест-модуль: m5_only, m5_m15, m5_m15_h1
+#     — primary-маска выбирается как «best-of-three» на основном окне (по ΔROI, затем ROI, затем conf, затем coverage)
+#     — публикует лучший вариант в оркестратор витрины (Redis Stream auditor:best:candidates)
 
 # 🔸 Импорты
 import asyncio
 import logging
 import datetime as dt
+import uuid
+import json
 from typing import Dict, List, Tuple, Optional, Iterable, Any, Set
 
 import auditor_infra as infra
@@ -16,7 +19,7 @@ from auditor_config import load_active_mw_strategies
 # 🔸 Логгер
 log = logging.getLogger("AUD_XSTR")
 
-# 🔸 Константы аудита (настраиваемые — держим прямо вверху файла)
+# 🔸 Константы аудита (правим здесь, не через ENV)
 WINDOWS: List[Tuple[str, Optional[int]]] = [("7d", 7), ("14d", 14), ("28d", 28), ("total", None)]
 TIMEFRAMES: Tuple[str, ...] = ("m5", "m15", "h1")
 MIN_SAMPLE_PER_CELL = 50                 # пометка «мало наблюдений»
@@ -38,7 +41,7 @@ MASK_BINS: Dict[str, Set[int]] = {
     "any": {1, 2, 3, 4, 5},
     "low": {1, 2, 3},          # ≤ Q60
     "mid": {2, 3, 4},          # Q20..Q80
-    "high": {4, 5},            # ≥ Q60 (базово; при необходимости можно ужесточить до ≥Q80)
+    "high": {4, 5},            # ≥ Q60 (базово; можно ужесточить до ≥Q80 при необходимости)
 }
 MASK_QBOUNDS: Dict[str, Tuple[Optional[int], Optional[int]]] = {
     "any":  (None, None),
@@ -52,12 +55,12 @@ MASK_QBOUNDS: Dict[str, Tuple[Optional[int], Optional[int]]] = {
 async def run_auditor_cross_strength():
     # условия достаточности
     if infra.pg_pool is None:
-        log.debug("❌ Пропуск auditor_cross_strength: PG не инициализирован")
+        log.info("❌ Пропуск auditor_cross_strength: PG не инициализирован")
         return
 
     # стартовая задержка (если нужна)
     if INITIAL_DELAY_SEC > 0:
-        log.debug("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
+        log.info("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
         await asyncio.sleep(int(INITIAL_DELAY_SEC))
 
     # основной цикл
@@ -65,13 +68,13 @@ async def run_auditor_cross_strength():
         try:
             await _run_once()
         except asyncio.CancelledError:
-            log.debug("⏹️ AUD_XSTR: остановлено по сигналу")
+            log.info("⏹️ AUD_XSTR: остановлено по сигналу")
             raise
         except Exception:
             log.exception("❌ AUD_XSTR: ошибка прохода — пауза 5 секунд")
             await asyncio.sleep(5)
 
-        log.debug("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
+        log.info("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
 
@@ -79,7 +82,7 @@ async def run_auditor_cross_strength():
 async def _run_once():
     # загрузка активных MW-стратегий
     strategies = await load_active_mw_strategies()
-    log.debug("📦 AUD_XSTR: найдено активных MW-стратегий: %d", len(strategies))
+    log.info("📦 AUD_XSTR: найдено активных MW-стратегий: %d", len(strategies))
     if not strategies:
         return
 
@@ -91,14 +94,14 @@ async def _run_once():
         "28d": now_utc - dt.timedelta(days=28),
         "total": None,
     }
-    log.debug(
+    log.info(
         "🕒 AUD_XSTR: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
         now_utc, win_bounds["7d"], win_bounds["14d"], win_bounds["28d"]
     )
 
     # создаём запись прогона
     run_id = await _create_run(now_utc, win_bounds)
-    log.debug("🧾 AUD_XSTR: создан run_id=%s", run_id)
+    log.info("🧾 AUD_XSTR: создан run_id=%s", run_id)
 
     # последовательный проход по стратегиям
     for sid, meta in strategies.items():
@@ -134,14 +137,14 @@ async def _process_strategy(
     human = meta.get("human_name") or ""
     title = f'{sid} "{name}"' if not human else f'{sid} "{name}" ({human})'
 
-    # получить депозит стратегии (ожидаем > 0)
+    # получить депозит стратегии (аксиома: > 0)
     deposit = await _load_strategy_deposit(sid)
-    dep_used_for_bins = float(deposit)  # стратегия всегда с депозитом — аксиома
+    dep_used_for_bins = float(deposit)
 
     # выбрать все закрытые позиции (total)
     positions = await _load_closed_positions_for_strategy(sid)
     if not positions:
-        log.debug("ℹ️ AUD_XSTR: %s — закрытых позиций нет", title)
+        log.info("ℹ️ AUD_XSTR: %s — закрытых позиций нет", title)
         return
 
     # пометить принадлежность окнам
@@ -236,7 +239,7 @@ async def _process_strategy(
 
                     # лог (как прежде)
                     warn = " (N<50)" if total_n < MIN_SAMPLE_PER_CELL else ""
-                    log.debug('📈 AUD_XSTR | %s | TF=%s | dir=%s | window=%s — bins by cross_strength%s',
+                    log.info('📈 AUD_XSTR | %s | TF=%s | dir=%s | window=%s — bins by cross_strength%s',
                              title, tf, direction, w, warn)
                     for idx in (1, 2, 3, 4, 5):
                         rec = btot[idx]
@@ -244,13 +247,13 @@ async def _process_strategy(
                         WR = (rec["wins"] / N * 100.0) if N > 0 else 0.0
                         pnl_sum = rec["pnl_sum"]
                         roi = (pnl_sum / dep_used_for_bins * 100.0) if dep_used_for_bins > 0 else 0.0
-                        log.debug("  B%d: N=%d, WR=%.2f%%, ΣPnL=%.6f, ROI=%.4f%%", idx, N, WR, pnl_sum, roi)
+                        log.info("  B%d: N=%d, WR=%.2f%%, ΣPnL=%.6f, ROI=%.4f%%", idx, N, WR, pnl_sum, roi)
 
                     # итоги по ячейке
                     first, last = btot[1], btot[5]
                     d_wr = _delta_wr(first, last)
                     d_roi = (last["pnl_sum"] - first["pnl_sum"]) / dep_used_for_bins * 100.0
-                    log.debug("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
+                    log.info("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
 
                     # запись в auditor_emacross_bin_stats — 5 строк
                     cov = coverage.get(direction, {}).get(w, None)
@@ -300,10 +303,10 @@ async def _process_strategy(
         ]
 
         # оценим каждую маску на primary окне и выберем лучшую (best-of-three)
-        ranking: List[Tuple[float, float, float, float, int]] = []  # (eligible_flag, delta_roi_pp, roi_sel, conf_stub, coverage, index)
+        ranking: List[Tuple[float, float, float, float, int]] = []  # (eligible, delta_roi, roi_sel, conf, coverage, idx)
         mask_metrics_primary: List[Dict[str, Any]] = []
         mask_metrics_all_primary: List[Dict[str, Any]] = []
-        mask_decision_cache: List[Tuple[str, float]] = []  # (class, conf) — после _make_decision
+        mask_decision_cache: List[Tuple[str, float]] = []  # (class, conf)
 
         for idx, (_label, mask_modes, _note) in enumerate(masks):
             m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
@@ -311,7 +314,7 @@ async def _process_strategy(
             mask_metrics_primary.append(m_sel)
             mask_metrics_all_primary.append(m_all)
 
-            # предварительное решение для оценки confidence (используем ту же логику)
+            # предварительная оценка для confidence (как в решении)
             m_sel_sec = None; m_all_sec = None
             if secondary_win is not None:
                 m_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
@@ -326,7 +329,7 @@ async def _process_strategy(
             # ранжирование: eligible (1/0) → ΔROI → ROI_selected → confidence → coverage
             ranking.append((eligible, delta_roi, (roi_sel or -1e9), dec_conf, coverage_pct, idx))
 
-        # выберем индекс лучшей маски
+        # индекс лучшей маски
         ranking.sort(reverse=True, key=lambda t: (t[0], t[1], t[2], t[3], t[4]))
         best_idx = ranking[0][-1]
 
@@ -348,6 +351,29 @@ async def _process_strategy(
                 is_primary=is_primary_mask,
                 primary_note=note
             )
+
+        # 🔸 Публикуем лучший вариант в оркестратор (всегда; если ROI<=0 — как ineligible)
+        best_label, best_mask, _ = masks[best_idx]
+        best_sel = mask_metrics_primary[best_idx]
+        best_all = mask_metrics_all_primary[best_idx]
+        # confidence такой же логикой, как в решении
+        best_sel_sec = best_all_sec = None
+        if secondary_win is not None:
+            best_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, best_mask, secondary_win, direction, deposit)
+            best_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5":"any","m15":"any","h1":"any"}, secondary_win, direction, deposit)
+        _, best_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), best_sel, best_all, best_sel_sec, best_all_sec)
+
+        await _publish_best_candidate(
+            run_id=run_id,
+            sid=sid,
+            direction=direction,
+            primary_win=primary_win,
+            label=best_label,
+            mask_modes=best_mask,
+            metrics_sel=best_sel,
+            metrics_all=best_all,
+            decision_conf=best_conf,
+        )
 
 
 # 🔸 Запись одной маски (primary + валидация по другим окнам)
@@ -395,12 +421,12 @@ async def _record_mask_with_validation(
         decision_class=decision_class, decision_confidence=decision_conf, rationale=(primary_note if primary_note else rationale)
     )
 
-    # лог решения (DECISION для primary, ALT — для остальных)
+    # лог (DECISION для primary, ALT — для остальных)
     tag = "DECISION" if is_primary else "ALT"
     d_roi_pp = 0.0
     if metrics_sel_primary["roi_selected_pct"] is not None and metrics_sel_primary["roi_all_pct"] is not None:
         d_roi_pp = metrics_sel_primary["roi_selected_pct"] - metrics_sel_primary["roi_all_pct"]
-    log.debug(
+    log.info(
         "✅ %s | sid=%s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | ΔROI=%.2f pp | ΔWR=%.2f pp",
         tag, sid, direction, primary_win, decision_class, decision_conf,
         mask_modes.get('m5','any'), mask_modes.get('m15','any'), mask_modes.get('h1','any'),
@@ -421,6 +447,79 @@ async def _record_mask_with_validation(
                 decision_class=decision_class, decision_confidence=max(0.0, decision_conf - 0.1),
                 rationale=("validation-window; " + (primary_note or ""))
             )
+
+
+# 🔸 Публикация «лучшего кандидата» в оркестратор витрины
+async def _publish_best_candidate(
+    run_id: int,
+    sid: int,
+    direction: str,
+    primary_win: str,
+    label: str,                 # 'm5_only' | 'm5_m15' | 'm5_m15_h1'
+    mask_modes: Dict[str, str],
+    metrics_sel: Dict[str, Any],
+    metrics_all: Dict[str, Any],
+    decision_conf: float,
+):
+    # условия достаточности
+    if infra.redis_client is None:
+        log.info("ℹ️ AUD_XSTR: Redis не инициализирован — пропуск публикации кандидата")
+        return
+
+    idea_key = "emacross_cs"
+    stream = "auditor:best:candidates"
+
+    roi_sel = metrics_sel["roi_selected_pct"]
+    roi_all = metrics_sel["roi_all_pct"]
+    eligible = (roi_sel is not None and roi_sel > 0.0)
+    event_uid = f"{run_id}:{sid}:{direction}:{idea_key}:{label}:{uuid.uuid4().hex[:8]}"
+
+    # базовые поля — всегда
+    fields = {
+        "type": "result",
+        "run_id": str(run_id),
+        "strategy_id": str(sid),
+        "direction": str(direction),
+        "idea_key": idea_key,
+        "variant_key": label,
+        "primary_window": str(primary_win),
+        "eligible": "true" if eligible else "false",
+        "event_uid": event_uid,
+    }
+
+    # метрики и конфиг — только если eligible=true
+    if eligible:
+        delta_roi = roi_sel - roi_all
+        fields.update({
+            "roi_selected_pct": f"{roi_sel}",
+            "roi_all_pct": f"{roi_all}",
+            "delta_roi_pp": f"{delta_roi}",
+            "wr_selected_pct": f"{metrics_sel['wr_selected_pct']}",
+            "wr_all_pct": f"{metrics_sel['wr_all_pct']}",
+            "coverage_pct": f"{metrics_sel['coverage_pct']}",
+            "decision_confidence": f"{decision_conf}",
+            "config_json": json.dumps({
+                "m5_mode": mask_modes.get("m5","any"),
+                "m15_mode": mask_modes.get("m15","any"),
+                "h1_mode": mask_modes.get("h1","any"),
+                "m5_q_low":  MASK_QBOUNDS[mask_modes.get("m5","any")][0],
+                "m5_q_high": MASK_QBOUNDS[mask_modes.get("m5","any")][1],
+                "m15_q_low":  MASK_QBOUNDS[mask_modes.get("m15","any")][0],
+                "m15_q_high": MASK_QBOUNDS[mask_modes.get("m15","any")][1],
+                "h1_q_low":  MASK_QBOUNDS[mask_modes.get("h1","any")][0],
+                "h1_q_high": MASK_QBOUNDS[mask_modes.get("h1","any")][1],
+            }),
+            "source_table": "auditor_emacross_mask_results",
+            "source_run_id": str(run_id),
+        })
+
+    # публикация
+    try:
+        await infra.redis_client.xadd(stream, fields, id="*")
+        log.info("📨 AUD_XSTR → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
+                 sid, direction, label, fields["eligible"])
+    except Exception:
+        log.exception("❌ AUD_XSTR: ошибка публикации кандидата в %s", stream)
 
 
 # 🔸 Загрузка депозита стратегии
