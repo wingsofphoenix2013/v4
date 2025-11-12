@@ -1,82 +1,132 @@
+# 🔸 auditor_v4_main.py — entrypoint auditor_v4: инициализация, загрузка MW-стратегий и одноразовый аудит закрытых сделок (7/14/28 дней и всего)
+
+# 🔸 Импорты
 import asyncio
 import logging
+import datetime as dt
 
-from infra import (
+from auditor_infra import (
     setup_logging,
     setup_pg,
     setup_redis_client,
 )
-from config_loader import (
-    load_enabled_tickers,
-    load_enabled_strategies,
-    load_enabled_indicators,
-    config_event_listener,
-)
-from core_io import pg_task
-from ohlcv_auditor import run_audit_all_symbols, fix_missing_candles
-from redis_io import fix_missing_ts_points
+from auditor_config import load_active_mw_strategies
+import auditor_infra as infra
 
-# 🔸 Логгер для главного процесса
-log = logging.getLogger("AUDITOR_MAIN")
+# 🔸 Логгер
+log = logging.getLogger("AUD_MAIN")
 
 
-# 🔸 Обёртка с автоперезапуском для воркеров
+# 🔸 Обёртка с автоперезапуском воркера (на будущее, в этой базе не используется)
 async def run_safe_loop(coro, label: str):
     while True:
         try:
-            log.debug(f"[{label}] Запуск задачи")
+            log.info(f"[{label}] 🚀 Запуск задачи")
             await coro()
+        except asyncio.CancelledError:
+            log.info(f"[{label}] ⏹️ Остановлено по сигналу")
+            raise
         except Exception:
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Периодическая обёртка с задержкой между циклами
-async def loop_with_interval(coro_func, label: str, interval_sec: int, initial_delay: int = 0):
-    if initial_delay > 0:
-        log.info(f"[{label}] ⏳ Первая задержка {initial_delay} сек перед запуском")
-        await asyncio.sleep(initial_delay)
 
-    while True:
-        try:
-            log.debug(f"[{label}] ⏳ Запуск задачи")
-            await coro_func()
-            log.debug(f"[{label}] ⏸ Следующий запуск через {interval_sec} сек")
-            await asyncio.sleep(interval_sec)
-        except Exception:
-            log.exception(f"[{label}] ❌ Ошибка — перезапуск через 5 секунд")
-            await asyncio.sleep(5)
-            
+# 🔸 Одноразовый аудит: счётчики закрытых сделок по MW-стратегиям (7/14/28 дней и всего)
+async def run_one_shot_audit():
+    # условия достаточности
+    if infra.pg_pool is None:
+        log.info("❌ Пропуск аудита: PG не инициализирован")
+        return
+
+    # загрузка активных MW-стратегий
+    strategies = await load_active_mw_strategies()
+    log.info("📦 Найдено активных MW-стратегий: %d", len(strategies))
+    if not strategies:
+        return
+
+    # расчёт временных границ (UTC, без привязки к началу часа/суток)
+    now_utc = dt.datetime.utcnow().replace(tzinfo=None)
+    d7_from = now_utc - dt.timedelta(days=7)
+    d14_from = now_utc - dt.timedelta(days=14)
+    d28_from = now_utc - dt.timedelta(days=28)
+    log.info(
+        "🕒 Временные окна: now_utc=%s, d7_from=%s, d14_from=%s, d28_from=%s",
+        now_utc, d7_from, d14_from, d28_from
+    )
+
+    # список sid для выборки
+    sid_list = list(strategies.keys())
+
+    # агрегирующий запрос по всем стратегиям сразу
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                strategy_id,
+                direction,
+                COUNT(*) FILTER (WHERE closed_at >= $1) AS cnt_7d,
+                COUNT(*) FILTER (WHERE closed_at >= $2) AS cnt_14d,
+                COUNT(*) FILTER (WHERE closed_at >= $3) AS cnt_28d,
+                COUNT(*) AS cnt_total
+            FROM positions_v4
+            WHERE status = 'closed'
+              AND strategy_id = ANY($4)
+              AND direction IN ('long','short')
+            GROUP BY strategy_id, direction
+            """,
+            d7_from, d14_from, d28_from, sid_list
+        )
+
+    # укладка результатов в {sid: {'long': {...}, 'short': {...}}}
+    result = {sid: {"long": {"7d": 0, "14d": 0, "28d": 0, "total": 0},
+                    "short": {"7d": 0, "14d": 0, "28d": 0, "total": 0}} for sid in sid_list}
+
+    for r in rows:
+        sid = int(r["strategy_id"])
+        direction = str(r["direction"])
+        if sid not in result:
+            continue
+        if direction not in ("long", "short"):
+            continue
+        result[sid][direction]["7d"] = int(r["cnt_7d"] or 0)
+        result[sid][direction]["14d"] = int(r["cnt_14d"] or 0)
+        result[sid][direction]["28d"] = int(r["cnt_28d"] or 0)
+        result[sid][direction]["total"] = int(r["cnt_total"] or 0)
+
+    # суммарные логи по каждой стратегии
+    for sid, stats in result.items():
+        name = strategies[sid].get("name") or f"sid_{sid}"
+        human = strategies[sid].get("human_name") or ""
+        # форматирование человека читаемой подписи стратегии
+        title = f'{sid} "{name}"' if not human else f'{sid} "{name}" ({human})'
+        log.info(
+            "📊 %s | long {7d=%d, 14d=%d, 28d=%d, total=%d} | short {7d=%d, 14d=%d, 28d=%d, total=%d}",
+            title,
+            stats["long"]["7d"], stats["long"]["14d"], stats["long"]["28d"], stats["long"]["total"],
+            stats["short"]["7d"], stats["short"]["14d"], stats["short"]["28d"], stats["short"]["total"],
+        )
+
+    log.info("✅ Одноразовый аудит закрытых сделок завершён")
+
+
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
     log.info("📦 Запуск сервиса auditor_v4")
 
+    # подключения к внешним сервисам
     try:
         await setup_pg()
         await setup_redis_client()
-        log.info("🔌 Подключения PG и Redis инициализированы")
+        log.info("🔌 Подключения к PostgreSQL и Redis инициализированы")
     except Exception:
         log.exception("❌ Ошибка инициализации внешних сервисов")
         return
-        
-    try:
-        await load_enabled_tickers()
-        await load_enabled_strategies()
-        await load_enabled_indicators()
-        log.info("📦 Конфигурации тикеров, стратегий и индикаторов загружены")
-    except Exception:
-        log.exception("❌ Ошибка загрузки начальной конфигурации")
-        return
 
-    log.info("🚀 Запуск фоновых воркеров")
+    log.info("🚀 Запуск одноразового расчёта статистики")
+    await run_one_shot_audit()
 
-    await asyncio.gather(
-        run_safe_loop(pg_task, "CORE_IO"),
-        run_safe_loop(config_event_listener, "CONFIG_LOADER"),
-        loop_with_interval(run_audit_all_symbols, "OHLCV_AUDITOR", 300, initial_delay=120),
-        loop_with_interval(fix_missing_candles, "OHLCV_FIXER", 300, initial_delay=180),
-        loop_with_interval(fix_missing_ts_points, "REDIS_TS_FIXER", 300, initial_delay=240),
-    )
 
+# 🔸 Запуск модуля
 if __name__ == "__main__":
     asyncio.run(main())
