@@ -26,7 +26,7 @@ GROUP_NAME = "AUD_BEST_GROUP"
 CONSUMER_NAME = "AUD_BEST_SELECTOR"
 
 # список активных идей, от которых оркестратор ждёт сообщения result (eligible true/false)
-ACTIVE_IDEAS = {"emacross_cs"}  # добавляй сюда ключи будущих идей
+ACTIVE_IDEAS = {"emacross_cs", "ema200_side"}
 
 # тайминги и TTL
 XREAD_BLOCK_MS = 30_000
