@@ -1,4 +1,4 @@
-# 🔸 auditor_v4_main.py — entrypoint auditor_v4: инициализация, загрузка MW-стратегий и одноразовый аудит закрытых сделок (7/14/28 дней и всего) + удержание процесса в фоне
+# 🔸 auditor_v4_main.py — entrypoint auditor_v4: инициализация, одноразовый аудит закрытых сделок и запуск фоновых воркеров (AUD_CROSS_STRENGTH, AUD_BEST_SELECTOR)
 
 # 🔸 Импорты
 import asyncio
@@ -11,22 +11,15 @@ from auditor_infra import (
     setup_redis_client,
 )
 from auditor_config import load_active_mw_strategies
-import auditor_infra as infra
 from auditor_cross_strength import run_auditor_cross_strength
+from auditor_best_selector import run_auditor_best_selector
+import auditor_infra as infra
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
 
-# 🔸 Вспомогательная функция запуска с задержкой
-async def _start_with_delay(coro_func, delay_sec: int):
-    # условия достаточности
-    if delay_sec and delay_sec > 0:
-        log.info("⏳ Ожидание %d сек перед стартом задачи", delay_sec)
-        await asyncio.sleep(int(delay_sec))
-    # запуск целевой корутины
-    await coro_func()
 
-# 🔸 Обёртка с автоперезапуском воркера (на будущее, в этой базе не используется)
+# 🔸 Обёртка с автоперезапуском воркера
 async def run_safe_loop(coro, label: str):
     while True:
         try:
@@ -38,6 +31,16 @@ async def run_safe_loop(coro, label: str):
         except Exception:
             log.exception(f"[{label}] ❌ Упал с ошибкой — перезапуск через 5 секунд")
             await asyncio.sleep(5)
+
+
+# 🔸 Вспомогательная функция запуска с задержкой
+async def _start_with_delay(coro_func, delay_sec: int):
+    # условия достаточности
+    if delay_sec and delay_sec > 0:
+        log.info("⏳ Ожидание %d сек перед стартом задачи", delay_sec)
+        await asyncio.sleep(int(delay_sec))
+    # запуск целевой корутины
+    await coro_func()
 
 
 # 🔸 Одноразовый аудит: счётчики закрытых сделок по MW-стратегиям (7/14/28 дней и всего)
@@ -54,7 +57,6 @@ async def run_one_shot_audit():
         return
 
     # расчёт временных границ (UTC, без привязки к началу часа/суток)
-    # используем timezone-aware now, затем делаем naive UTC (совместимо с хранением timestamp без TZ в БД)
     now_utc = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     d7_from = now_utc - dt.timedelta(days=7)
     d14_from = now_utc - dt.timedelta(days=14)
@@ -118,6 +120,7 @@ async def run_one_shot_audit():
 
     log.info("✅ Одноразовый аудит закрытых сделок завершён")
 
+
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
@@ -136,9 +139,12 @@ async def main():
     await asyncio.gather(
         # фоновый воркер «сила кросса»: старт через 60 сек, далее цикл run→sleep(3h)
         run_safe_loop(lambda: _start_with_delay(run_auditor_cross_strength, 60), "AUD_CROSS_STRENGTH"),
+        # фоновый оркестратор витрины «лучшая идея»
+        run_safe_loop(lambda: _start_with_delay(run_auditor_best_selector, 0), "AUD_BEST_SELECTOR"),
         # одноразовый аудит закрытых сделок (выполняется и завершается)
         run_one_shot_audit(),
     )
+
 
 # 🔸 Запуск модуля
 if __name__ == "__main__":

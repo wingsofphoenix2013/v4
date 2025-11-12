@@ -1,6 +1,8 @@
-# 🔸 auditor_cross_strength.py — аудит «силы кросса» EMA9/EMA21: запись в БД бинов (ROI/WR), покрытий окон и итоговых масок-вердиктов по стратегиям
-#     Теперь маски считаются в трёх вариантах, совместимых с твоим тестовым модулем:
-#     1) m5-only, 2) m5+m15, 3) m5+m15+h1 (комбинированная, помечается как primary)
+# 🔸 auditor_cross_strength.py — аудит «силы кросса» EMA9/EMA21:
+#     — считает бины по abs(ema9-ema21)/atr14 на TF (m5/m15/h1) и окнах (7d/14d/28d/total)
+#     — пишет в БД: runs / coverage / bin_stats / mask_results
+#     — формирует три маски совместимые с тест-модулем: m5_only, m5_m15, m5_m15_h1
+#     — ВАЖНО: primary-маска выбирается как «best-of-three» на основном окне (по ΔROI, затем ROI, затем conf, затем coverage)
 
 # 🔸 Импорты
 import asyncio
@@ -14,7 +16,7 @@ from auditor_config import load_active_mw_strategies
 # 🔸 Логгер
 log = logging.getLogger("AUD_XSTR")
 
-# 🔸 Константы аудита
+# 🔸 Константы аудита (настраиваемые — держим прямо вверху файла)
 WINDOWS: List[Tuple[str, Optional[int]]] = [("7d", 7), ("14d", 14), ("28d", 28), ("total", None)]
 TIMEFRAMES: Tuple[str, ...] = ("m5", "m15", "h1")
 MIN_SAMPLE_PER_CELL = 50                 # пометка «мало наблюдений»
@@ -53,7 +55,7 @@ async def run_auditor_cross_strength():
         log.debug("❌ Пропуск auditor_cross_strength: PG не инициализирован")
         return
 
-    # стартовая задержка (контролируется из main, но поддержим константу)
+    # стартовая задержка (если нужна)
     if INITIAL_DELAY_SEC > 0:
         log.debug("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
         await asyncio.sleep(int(INITIAL_DELAY_SEC))
@@ -69,7 +71,6 @@ async def run_auditor_cross_strength():
             log.exception("❌ AUD_XSTR: ошибка прохода — пауза 5 секунд")
             await asyncio.sleep(5)
 
-        # сон до следующего запуска
         log.debug("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
@@ -133,12 +134,9 @@ async def _process_strategy(
     human = meta.get("human_name") or ""
     title = f'{sid} "{name}"' if not human else f'{sid} "{name}" ({human})'
 
-    # получить депозит стратегии
+    # получить депозит стратегии (ожидаем > 0)
     deposit = await _load_strategy_deposit(sid)
-    deposit_valid = (deposit is not None and float(deposit) > 0.0)
-    if not deposit_valid:
-        log.debug('⚠️ AUD_XSTR: %s — депозит отсутствует или равен 0; ROI в mask_results будет n/a, в bin_stats — 0', title)
-    dep_used_for_bins = float(deposit) if deposit_valid else 1.0  # для bin_stats нужен not null
+    dep_used_for_bins = float(deposit)  # стратегия всегда с депозитом — аксиома
 
     # выбрать все закрытые позиции (total)
     positions = await _load_closed_positions_for_strategy(sid)
@@ -157,7 +155,7 @@ async def _process_strategy(
         }
 
     # посчитать покрытия по окнам и записать в auditor_emacross_coverage
-    coverage = _compute_coverage(positions, now_utc)  # dict[dir][window] -> dict(...)
+    coverage = _compute_coverage(positions, now_utc)
     await _insert_coverage_rows(run_id, sid, coverage)
 
     # подтянуть снапшоты индикаторов по TF (ema9/ema21/atr14)
@@ -194,11 +192,9 @@ async def _process_strategy(
                     bucket.append((puid, cs, pnl))
 
     # агрегаты бинов и карта «бин позиции» для дальнейшей оценки маски
-    # bin_aggr[tf][window][direction] -> {bin -> {'N','wins','pnl_sum'}}
     bin_aggr: Dict[str, Dict[str, Dict[str, Dict[int, Dict[str, float]]]]] = {
         tf: {w: {"long": {}, "short": {}} for w, _ in WINDOWS} for tf in TIMEFRAMES
     }
-    # pos_bins[tf][window][direction][position_uid] -> bin_index
     pos_bins: Dict[str, Dict[str, Dict[str, Dict[str, int]]]] = {
         tf: {w: {"long": {}, "short": {}} for w, _ in WINDOWS} for tf in TIMEFRAMES
     }
@@ -208,13 +204,11 @@ async def _process_strategy(
         for tf in TIMEFRAMES:
             for w, _days in WINDOWS:
                 for direction in ("long", "short"):
-                    # подготовка
                     symbol_series = data[tf][w][direction]
                     total_n = sum(len(v) for v in symbol_series.values())
                     if total_n == 0:
                         continue
 
-                    # инициализация аггрегатов по 5 бинам
                     btot = {
                         1: {"N": 0, "wins": 0, "pnl_sum": 0.0},
                         2: {"N": 0, "wins": 0, "pnl_sum": 0.0},
@@ -237,7 +231,7 @@ async def _process_strategy(
                             rec["wins"] += 1 if pnl >= 0 else 0
                             rec["pnl_sum"] += float(pnl)
 
-                    # сохранить аггрегаты для последующей классификации
+                    # сохранить аггрегаты
                     bin_aggr[tf][w][direction] = btot
 
                     # лог (как прежде)
@@ -283,13 +277,12 @@ async def _process_strategy(
                             False, None
                         )
 
-    # для каждого направления выбрать primary-окно, построить маски и записать вердикты
+    # для каждого направления: выбрать primary-окно, построить классы TF, сформировать 3 маски и выбрать «best-of-three»
     for direction in ("long", "short"):
         dir_positions = [p for p in positions if p["direction"] == direction]
         if not dir_positions:
             continue
 
-        # выбор primary/secondary окна по покрытию
         primary_win = _choose_primary_window(coverage.get(direction, {}))
         secondary_win = _choose_secondary_window(coverage.get(direction, {}), primary_win)
 
@@ -299,15 +292,47 @@ async def _process_strategy(
             btot = bin_aggr.get(tf, {}).get(primary_win, {}).get(direction, None)
             tf_classes[tf] = _classify_tf(btot, dep_used_for_bins)
 
-        # формируем три маски в терминах твоего тест-модуля
-        masks: List[Tuple[str, Dict[str, str], bool, str]] = [
-            ("m5_only",      {"m5": tf_classes.get("m5", "any"),  "m15": "any",                         "h1": "any"},                         False, f"mask=m5_only"),
-            ("m5_m15",       {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": "any"},                         False, f"mask=m5_m15"),
-            ("m5_m15_h1",    {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": tf_classes.get("h1", "any")},  True,  f"mask=m5_m15_h1"),
+        # три маски под тест-модуль
+        masks: List[Tuple[str, Dict[str, str], str]] = [
+            ("m5_only",     {"m5": tf_classes.get("m5", "any"),  "m15": "any",                         "h1": "any"},                         "mask=m5_only"),
+            ("m5_m15",      {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": "any"},                         "mask=m5_m15"),
+            ("m5_m15_h1",   {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": tf_classes.get("h1", "any")},  "mask=m5_m15_h1"),
         ]
 
-        # прогоняем каждую маску: primary + валидации на прочих окнах
-        for label, mask_modes, is_primary_mask, mask_note in masks:
+        # оценим каждую маску на primary окне и выберем лучшую (best-of-three)
+        ranking: List[Tuple[float, float, float, float, int]] = []  # (eligible_flag, delta_roi_pp, roi_sel, conf_stub, coverage, index)
+        mask_metrics_primary: List[Dict[str, Any]] = []
+        mask_metrics_all_primary: List[Dict[str, Any]] = []
+        mask_decision_cache: List[Tuple[str, float]] = []  # (class, conf) — после _make_decision
+
+        for idx, (_label, mask_modes, _note) in enumerate(masks):
+            m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
+            m_all = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, primary_win, direction, deposit)
+            mask_metrics_primary.append(m_sel)
+            mask_metrics_all_primary.append(m_all)
+
+            # предварительное решение для оценки confidence (используем ту же логику)
+            m_sel_sec = None; m_all_sec = None
+            if secondary_win is not None:
+                m_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
+                m_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, secondary_win, direction, deposit)
+            dec_class, dec_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), m_sel, m_all, m_sel_sec, m_all_sec)
+            mask_decision_cache.append((dec_class, dec_conf))
+
+            roi_sel = m_sel["roi_selected_pct"]; roi_all = m_sel["roi_all_pct"]
+            delta_roi = (roi_sel - roi_all) if (roi_sel is not None and roi_all is not None) else float("-inf")
+            eligible = 1.0 if (roi_sel is not None and roi_sel > 0.0) else 0.0
+            coverage_pct = m_sel["coverage_pct"]
+            # ранжирование: eligible (1/0) → ΔROI → ROI_selected → confidence → coverage
+            ranking.append((eligible, delta_roi, (roi_sel or -1e9), dec_conf, coverage_pct, idx))
+
+        # выберем индекс лучшей маски
+        ranking.sort(reverse=True, key=lambda t: (t[0], t[1], t[2], t[3], t[4]))
+        best_idx = ranking[0][-1]
+
+        # записываем все три маски (primary для best_idx; остальные — ALT), с валидациями по прочим окнам
+        for idx, (label, mask_modes, note) in enumerate(masks):
+            is_primary_mask = (idx == best_idx)
             await _record_mask_with_validation(
                 run_id=run_id,
                 sid=sid,
@@ -318,10 +343,10 @@ async def _process_strategy(
                 coverage_dir=coverage.get(direction, {}),
                 dir_positions=dir_positions,
                 pos_bins=pos_bins,
-                deposit=(deposit if deposit_valid else None),
+                deposit=deposit,
                 mask_modes=mask_modes,
                 is_primary=is_primary_mask,
-                primary_note=mask_note
+                primary_note=note
             )
 
 
@@ -336,7 +361,7 @@ async def _record_mask_with_validation(
     coverage_dir: Dict[str, Dict[str, Any]],
     dir_positions: List[Dict[str, Any]],
     pos_bins: Dict[str, Dict[str, Dict[str, Dict[str, int]]]],
-    deposit: Optional[float],
+    deposit: float,
     mask_modes: Dict[str, str],
     is_primary: bool,
     primary_note: str,
@@ -362,7 +387,7 @@ async def _record_mask_with_validation(
         metrics_base_secondary=metrics_all_secondary
     )
 
-    # записать primary строку
+    # запись primary строки в mask_results
     await _insert_mask_result(
         run_id=run_id, sid=sid, direction=direction, window_tag=primary_win,
         is_primary=is_primary, primary_window=primary_win,
@@ -370,15 +395,15 @@ async def _record_mask_with_validation(
         decision_class=decision_class, decision_confidence=decision_conf, rationale=(primary_note if primary_note else rationale)
     )
 
-    # лог решения (для основной комбинированной маски — «DECISION», для остальных — «ALT»)
+    # лог решения (DECISION для primary, ALT — для остальных)
     tag = "DECISION" if is_primary else "ALT"
     d_roi_pp = 0.0
     if metrics_sel_primary["roi_selected_pct"] is not None and metrics_sel_primary["roi_all_pct"] is not None:
         d_roi_pp = metrics_sel_primary["roi_selected_pct"] - metrics_sel_primary["roi_all_pct"]
     log.debug(
-        "✅ %s | %s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | ΔROI=%.2f pp | ΔWR=%.2f pp",
-        tag, title, direction, primary_win, decision_class, decision_conf,
-        mask_modes['m5'], mask_modes['m15'], mask_modes['h1'],
+        "✅ %s | sid=%s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | ΔROI=%.2f pp | ΔWR=%.2f pp",
+        tag, sid, direction, primary_win, decision_class, decision_conf,
+        mask_modes.get('m5','any'), mask_modes.get('m15','any'), mask_modes.get('h1','any'),
         d_roi_pp, metrics_sel_primary["wr_selected_pct"] - metrics_sel_primary["wr_all_pct"]
     )
 
@@ -399,16 +424,12 @@ async def _record_mask_with_validation(
 
 
 # 🔸 Загрузка депозита стратегии
-async def _load_strategy_deposit(sid: int) -> Optional[float]:
+async def _load_strategy_deposit(sid: int) -> float:
     async with infra.pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT deposit FROM strategies_v4 WHERE id = $1",
-            int(sid)
-        )
-    if not row:
-        return None
-    val = row["deposit"]
-    return float(val) if val is not None else None
+        row = await conn.fetchrow("SELECT deposit FROM strategies_v4 WHERE id = $1", int(sid))
+    # аксиома: депозит всегда задан и > 0
+    val = float(row["deposit"])
+    return val
 
 
 # 🔸 Выборка закрытых позиций стратегии (total)
@@ -473,7 +494,6 @@ async def _load_indicator_snapshots_for_positions(pos_uids: List[str]) -> Dict[T
 
 # 🔸 Посчитать покрытия по окнам для стратегии (по направлениям)
 def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    # группировка по направлению
     out: Dict[str, Dict[str, Dict[str, Any]]] = {"long": {}, "short": {}}
     by_dir: Dict[str, List[Dict[str, Any]]] = {"long": [], "short": []}
     for p in positions:
@@ -603,7 +623,7 @@ def _evaluate_mask_on_positions(
     mask_modes: Dict[str, str],
     window_tag: str,
     direction: str,
-    deposit: Optional[float],
+    deposit: float,
 ) -> Dict[str, Any]:
     allowed = {tf: MASK_BINS.get(mask_modes.get(tf, "any"), MASK_BINS["any"]) for tf in TIMEFRAMES}
 
@@ -611,7 +631,7 @@ def _evaluate_mask_on_positions(
     n_all = len(all_list)
     pnl_all = sum(p["pnl"] for p in all_list)
     wr_all = (sum(1 for p in all_list if p["pnl"] >= 0) / n_all * 100.0) if n_all > 0 else 0.0
-    roi_all = ((pnl_all / deposit) * 100.0) if (deposit and deposit > 0 and n_all > 0) else None
+    roi_all = ((pnl_all / deposit) * 100.0) if (deposit > 0 and n_all > 0) else None
 
     selected = []
     for p in all_list:
@@ -629,7 +649,7 @@ def _evaluate_mask_on_positions(
     n_sel = len(selected)
     pnl_sel = sum(p["pnl"] for p in selected)
     wr_sel = (sum(1 for p in selected if p["pnl"] >= 0) / n_sel * 100.0) if n_sel > 0 else 0.0
-    roi_sel = ((pnl_sel / deposit) * 100.0) if (deposit and deposit > 0 and n_sel > 0) else None
+    roi_sel = ((pnl_sel / deposit) * 100.0) if (deposit > 0 and n_sel > 0) else None
 
     return {
         "n_all": n_all,
