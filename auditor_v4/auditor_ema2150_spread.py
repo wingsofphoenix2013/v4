@@ -63,7 +63,7 @@ async def run_auditor_ema2150_spread():
         try:
             await _run_once()
         except asyncio.CancelledError:
-            log.debug("⏹️ AUD_EMА2150: остановлено по сигналу")
+            log.debug("⏹️ AUD_EMA2150: остановлено по сигналу")
             raise
         except Exception:
             log.exception("❌ AUD_EMA2150: ошибка прохода — пауза 5 секунд")
@@ -658,6 +658,29 @@ async def _insert_coverage_rows(run_id: int, sid: int, coverage: Dict[str, Dict[
                     rec["n_positions"], rec["first_closed_at"], rec["last_closed_at"]
                 )
 
+# 🔸 Выбор primary окна по покрытию
+def _choose_primary_window(cov_map: Dict[str, Dict[str, Any]]) -> str:
+    cov28 = cov_map.get("28d", {}).get("window_coverage_pct", 0.0)
+    cov14 = cov_map.get("14d", {}).get("window_coverage_pct", 0.0)
+    if cov28 >= PRIMARY_28D_COVERAGE * 100.0:
+        return "28d"
+    if cov14 >= PRIMARY_14D_COVERAGE * 100.0:
+        return "14d"
+    return "7d"
+
+# 🔸 Выбор secondary окна (для проверки знака)
+def _choose_secondary_window(cov_map: Dict[str, Dict[str, Any]], primary: str) -> Optional[str]:
+    if primary == "28d":
+        if cov_map.get("14d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
+            return "14d"
+        if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
+            return "7d"
+        return None
+    if primary == "14d":
+        if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
+            return "7d"
+        return None
+    return None  # primary=7d
 
 # 🔸 Классификация TF по бинам
 def _classify_tf(btot: Optional[Dict[int, Dict[str, float]]], dep_used_for_bins: float) -> str:
