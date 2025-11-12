@@ -55,12 +55,12 @@ MASK_QBOUNDS: Dict[str, Tuple[Optional[int], Optional[int]]] = {
 async def run_auditor_cross_strength():
     # условия достаточности
     if infra.pg_pool is None:
-        log.info("❌ Пропуск auditor_cross_strength: PG не инициализирован")
+        log.debug("❌ Пропуск auditor_cross_strength: PG не инициализирован")
         return
 
     # стартовая задержка (если нужна)
     if INITIAL_DELAY_SEC > 0:
-        log.info("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
+        log.debug("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
         await asyncio.sleep(int(INITIAL_DELAY_SEC))
 
     # основной цикл
@@ -68,13 +68,13 @@ async def run_auditor_cross_strength():
         try:
             await _run_once()
         except asyncio.CancelledError:
-            log.info("⏹️ AUD_XSTR: остановлено по сигналу")
+            log.debug("⏹️ AUD_XSTR: остановлено по сигналу")
             raise
         except Exception:
             log.exception("❌ AUD_XSTR: ошибка прохода — пауза 5 секунд")
             await asyncio.sleep(5)
 
-        log.info("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
+        log.debug("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
 
@@ -82,7 +82,7 @@ async def run_auditor_cross_strength():
 async def _run_once():
     # загрузка активных MW-стратегий
     strategies = await load_active_mw_strategies()
-    log.info("📦 AUD_XSTR: найдено активных MW-стратегий: %d", len(strategies))
+    log.debug("📦 AUD_XSTR: найдено активных MW-стратегий: %d", len(strategies))
     if not strategies:
         return
 
@@ -94,14 +94,14 @@ async def _run_once():
         "28d": now_utc - dt.timedelta(days=28),
         "total": None,
     }
-    log.info(
+    log.debug(
         "🕒 AUD_XSTR: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
         now_utc, win_bounds["7d"], win_bounds["14d"], win_bounds["28d"]
     )
 
     # создаём запись прогона
     run_id = await _create_run(now_utc, win_bounds)
-    log.info("🧾 AUD_XSTR: создан run_id=%s", run_id)
+    log.debug("🧾 AUD_XSTR: создан run_id=%s", run_id)
 
     # последовательный проход по стратегиям
     for sid, meta in strategies.items():
@@ -144,7 +144,7 @@ async def _process_strategy(
     # выбрать все закрытые позиции (total)
     positions = await _load_closed_positions_for_strategy(sid)
     if not positions:
-        log.info("ℹ️ AUD_XSTR: %s — закрытых позиций нет", title)
+        log.debug("ℹ️ AUD_XSTR: %s — закрытых позиций нет", title)
         return
 
     # пометить принадлежность окнам
@@ -239,7 +239,7 @@ async def _process_strategy(
 
                     # лог (как прежде)
                     warn = " (N<50)" if total_n < MIN_SAMPLE_PER_CELL else ""
-                    log.info('📈 AUD_XSTR | %s | TF=%s | dir=%s | window=%s — bins by cross_strength%s',
+                    log.debug('📈 AUD_XSTR | %s | TF=%s | dir=%s | window=%s — bins by cross_strength%s',
                              title, tf, direction, w, warn)
                     for idx in (1, 2, 3, 4, 5):
                         rec = btot[idx]
@@ -247,13 +247,13 @@ async def _process_strategy(
                         WR = (rec["wins"] / N * 100.0) if N > 0 else 0.0
                         pnl_sum = rec["pnl_sum"]
                         roi = (pnl_sum / dep_used_for_bins * 100.0) if dep_used_for_bins > 0 else 0.0
-                        log.info("  B%d: N=%d, WR=%.2f%%, ΣPnL=%.6f, ROI=%.4f%%", idx, N, WR, pnl_sum, roi)
+                        log.debug("  B%d: N=%d, WR=%.2f%%, ΣPnL=%.6f, ROI=%.4f%%", idx, N, WR, pnl_sum, roi)
 
                     # итоги по ячейке
                     first, last = btot[1], btot[5]
                     d_wr = _delta_wr(first, last)
                     d_roi = (last["pnl_sum"] - first["pnl_sum"]) / dep_used_for_bins * 100.0
-                    log.info("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
+                    log.debug("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
 
                     # запись в auditor_emacross_bin_stats — 5 строк
                     cov = coverage.get(direction, {}).get(w, None)
@@ -426,7 +426,7 @@ async def _record_mask_with_validation(
     d_roi_pp = 0.0
     if metrics_sel_primary["roi_selected_pct"] is not None and metrics_sel_primary["roi_all_pct"] is not None:
         d_roi_pp = metrics_sel_primary["roi_selected_pct"] - metrics_sel_primary["roi_all_pct"]
-    log.info(
+    log.debug(
         "✅ %s | sid=%s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | ΔROI=%.2f pp | ΔWR=%.2f pp",
         tag, sid, direction, primary_win, decision_class, decision_conf,
         mask_modes.get('m5','any'), mask_modes.get('m15','any'), mask_modes.get('h1','any'),
@@ -463,7 +463,7 @@ async def _publish_best_candidate(
 ):
     # условия достаточности
     if infra.redis_client is None:
-        log.info("ℹ️ AUD_XSTR: Redis не инициализирован — пропуск публикации кандидата")
+        log.debug("ℹ️ AUD_XSTR: Redis не инициализирован — пропуск публикации кандидата")
         return
 
     idea_key = "emacross_cs"
@@ -516,7 +516,7 @@ async def _publish_best_candidate(
     # публикация
     try:
         await infra.redis_client.xadd(stream, fields, id="*")
-        log.info("📨 AUD_XSTR → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
+        log.debug("📨 AUD_XSTR → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
                  sid, direction, label, fields["eligible"])
     except Exception:
         log.exception("❌ AUD_XSTR: ошибка публикации кандидата в %s", stream)

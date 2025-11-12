@@ -1,98 +1,94 @@
 # 🔸 auditor_best_selector.py — оркестратор витрины «лучшая идея по стратегии/направлению»
-#     Принимает результаты от воркеров-идей через Redis Stream и поддерживает таблицу auditor_current_best.
-#     Протокол сообщений (Stream: auditor:best:candidates, type="result"):
-#       { run_id, strategy_id, direction, idea_key, variant_key, primary_window, eligible: true|false,
-#         roi_selected_pct?, roi_all_pct?, wr_selected_pct?, wr_all_pct?, coverage_pct?, decision_confidence?,
-#         config_json?, source_table?, source_run_id?, event_uid? }
-#     Идея обязана прислать message ВСЕГДА. Если eligible=false — метрики не присылать.
-#     Оркестратор ждёт результаты от всех ACTIVE_IDEAS и:
-#       — выбирает ЛУЧШЕГО кандидата по delta_roi_pp (далее roi_selected, confidence, coverage) и UPSERT’ит в auditor_current_best;
-#       — если ни одной eligible=true → удаляет запись из auditor_current_best (стратегия на паузе).
+#     Простой событийный режим (НЕ ждёт других идей и НЕ ждёт «финала раунда»):
+#     — каждое сообщение обрабатывается сразу: сравнили с текущей витриной → обновили / удалили / пропустили.
+#     — если eligible=false и текущая витрина принадлежит той же идее → удаляем строку (стратегия на паузе).
+#     — если eligible=true → сравниваем с текущей по ΔROI (далее ROI_selected, confidence, coverage) → при лучшем апсертим.
+#
+#     Формат сообщения (Redis Stream: auditor:best:candidates, поле "data" НЕ используется — поля плоско):
+#       type="result"
+#       strategy_id, direction ('long'|'short'), idea_key, variant_key,
+#       primary_window ('7d'|'14d'|'28d'),
+#       eligible ('true'|'false'),
+#       roi_selected_pct?, roi_all_pct?, wr_selected_pct?, wr_all_pct?, coverage_pct?, decision_confidence?,
+#       config_json?, source_table?, source_run_id?, event_uid?
+#
+#     Требование к идеям: всегда присылать result по каждой (strategy_id, direction).
+#       eligible=true  → обязательно передать ROI/WR/coverage/conf/config_json.
+#       eligible=false → метрики можно не передавать.
+#
+#     Витрина БД: auditor_current_best (PRIMARY KEY(strategy_id, direction))
 
 # 🔸 Импорты
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, List
 
 import auditor_infra as infra
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_BEST")
 
-# 🔸 Константы / параметры (правим здесь, не через ENV)
+# 🔸 Константы / параметры (правим здесь)
 STREAM_NAME = "auditor:best:candidates"
 GROUP_NAME = "AUD_BEST_GROUP"
 CONSUMER_NAME = "AUD_BEST_SELECTOR"
 
-# список активных идей, от которых оркестратор ждёт сообщения result (eligible true/false)
+# активные идеи (добавляем сюда новые idea_key по мере подключения)
 ACTIVE_IDEAS = {"emacross_cs", "ema200_side"}
 
-# тайминги и TTL
+# XREAD params / TTL
 XREAD_BLOCK_MS = 30_000
 XREAD_COUNT = 128
-LOCK_TTL_SEC = 15
-EPOCH_TTL_SEC = 60 * 60
 SEEN_TTL_SEC = 24 * 60 * 60
 
-# ключи Redis
-def _k_lock(sid: int, direction: str) -> str:
-    return f"aud:best:lock:{sid}:{direction}"
-
-def _k_epoch(sid: int, direction: str) -> str:
-    return f"aud:best:epoch:{sid}:{direction}"
-
-def _k_done(sid: int, direction: str, run_id: int) -> str:
-    return f"aud:best:done:{sid}:{direction}:{run_id}"
-
+# dedupe set
 SEEN_SET = "aud:best:seen"
 
-# 🔸 Вспомогательные утилиты
+
+# 🔸 Утилиты
 def _as_bool(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in ("1", "true", "yes", "y", "t")
 
-def _safe_float(v: Any, default: float = 0.0) -> float:
+def _sf(v: Any, default: float = 0.0) -> float:
     try:
         return float(v)
     except Exception:
         return default
 
-def _safe_int(v: Any, default: int = 0) -> int:
+def _si(v: Any, default: int = 0) -> int:
     try:
         return int(v)
     except Exception:
         return default
 
-def _normalize_dir(v: Any) -> str:
+def _norm_dir(v: Any) -> str:
     s = str(v or "").strip().lower()
     return "long" if s == "long" else "short" if s == "short" else s
 
-def _rank_better(cur: Optional[Dict[str, Any]], cand: Dict[str, Any]) -> bool:
-    """
-    Возвращает True, если cand лучше cur по правилу:
-    eligible(1/0) → delta_roi_pp ↓ → roi_selected_pct ↓ → decision_confidence ↓ → coverage_pct ↓
-    """
+
+# 🔸 Сравнение кандидата с текущей витриной (True → кандидат лучше)
+def _is_better(cand: Dict[str, Any], cur: Optional[Dict[str, Any]]) -> bool:
     if cur is None:
         return True
-    # извлекаем с безопасной типизацией
+    # ключ ранжирования: ΔROI ↓ → ROI_selected ↓ → confidence ↓ → coverage ↓
+    c_key = (
+        _sf(cand.get("delta_roi_pp"), float("-inf")),
+        _sf(cand.get("roi_selected_pct"), float("-inf")),
+        _sf(cand.get("decision_confidence"), 0.0),
+        _sf(cand.get("coverage_pct"), 0.0),
+    )
     cur_key = (
-        1.0 if _as_bool(cur.get("eligible", "true")) else 0.0,
-        _safe_float(cur.get("delta_roi_pp"), float("-inf")),
-        _safe_float(cur.get("roi_selected_pct"), float("-inf")),
-        _safe_float(cur.get("decision_confidence"), 0.0),
-        _safe_float(cur.get("coverage_pct"), 0.0),
+        _sf(cur.get("delta_roi_pp"), float("-inf")),
+        _sf(cur.get("roi_selected_pct"), float("-inf")),
+        _sf(cur.get("decision_confidence"), 0.0),
+        _sf(cur.get("coverage_pct"), 0.0),
     )
-    cand_key = (
-        1.0 if _as_bool(cand.get("eligible", "true")) else 0.0,
-        _safe_float(cand.get("delta_roi_pp"), float("-inf")),
-        _safe_float(cand.get("roi_selected_pct"), float("-inf")),
-        _safe_float(cand.get("decision_confidence"), 0.0),
-        _safe_float(cand.get("coverage_pct"), 0.0),
-    )
-    return cand_key > cur_key
+    return c_key > cur_key
 
-# 🔸 Основной воркер
+
+# 🔸 Запуск воркера
 async def run_auditor_best_selector():
     # условия достаточности
     if infra.redis_client is None or infra.pg_pool is None:
@@ -112,7 +108,7 @@ async def run_auditor_best_selector():
 
     log.info("🚀 AUD_BEST: старт воркера (stream=%s, group=%s, consumer=%s)", STREAM_NAME, GROUP_NAME, CONSUMER_NAME)
 
-    # основной цикл чтения
+    # основной цикл
     while True:
         try:
             resp = await infra.redis_client.xreadgroup(
@@ -149,181 +145,112 @@ async def run_auditor_best_selector():
             log.exception("❌ AUD_BEST: ошибка цикла — пауза 5 секунд")
             await asyncio.sleep(5)
 
-# 🔸 Обработка одного сообщения type="result"
+
+# 🔸 Обработка одного сообщения type="result" (без ожиданий)
 async def _handle_message(fields: Dict[str, str]):
     # дедупликатор по event_uid (если прислан)
     event_uid = fields.get("event_uid", "")
     if event_uid:
         added = await infra.redis_client.sadd(SEEN_SET, event_uid)
         if added == 0:
-            # уже видели
             return
         await infra.redis_client.expire(SEEN_SET, SEEN_TTL_SEC)
 
-    # парсим обязательные поля
     msg_type = str(fields.get("type", "result")).lower()
     if msg_type != "result":
-        # игнорируем иные типы
         return
 
-    run_id = _safe_int(fields.get("run_id"))
-    sid = _safe_int(fields.get("strategy_id"))
-    direction = _normalize_dir(fields.get("direction"))
+    sid = _si(fields.get("strategy_id"))
+    direction = _norm_dir(fields.get("direction"))
     idea_key = str(fields.get("idea_key", "")).strip()
     variant_key = str(fields.get("variant_key", "")).strip()
     primary_window = str(fields.get("primary_window", "")).strip()
     eligible = _as_bool(fields.get("eligible", "false"))
 
-    if not run_id or not sid or direction not in ("long", "short") or not idea_key:
-        # неполное сообщение — пропускаем
-        log.info("ℹ️ AUD_BEST: пропуск некорректного сообщения (run_id=%s sid=%s dir=%s idea=%s)", run_id, sid, direction, idea_key)
+    if not sid or direction not in ("long", "short") or not idea_key:
+        log.info("ℹ️ AUD_BEST: пропуск некорректного сообщения (sid=%s dir=%s idea=%s)", sid, direction, idea_key)
+        return
+    if idea_key not in ACTIVE_IDEAS:
+        # игнорируем неизвестные идеи
         return
 
-    # последовательность по стратегии
-    lock_key = _k_lock(sid, direction)
-    got_lock = await infra.redis_client.set(lock_key, "1", nx=True, ex=LOCK_TTL_SEC)
-    if not got_lock:
-        # не получили лок — обработаем позже
+    # читаем текущую строку витрины по (sid,dir)
+    cur = await _read_current_best(sid, direction)
+
+    if not eligible:
+        # идея говорит «не годится»: если текущая витрина принадлежит этой идее — удаляем; иначе ничего не делаем
+        if cur and str(cur.get("idea_key")) == idea_key:
+            await _delete_current_best(sid, direction)
+            log.info("🗑️ AUD_BEST: sid=%s dir=%s — удалена витрина (ineligible от %s)", sid, direction, idea_key)
+        else:
+            log.info("ℹ️ AUD_BEST: sid=%s dir=%s — ineligible %s, витрина не тронута", sid, direction, idea_key)
         return
 
+    # eligible=true → готовим кандидат
+    roi_sel = _sf(fields.get("roi_selected_pct"))
+    roi_all = _sf(fields.get("roi_all_pct"))
+    delta_roi = roi_sel - roi_all
+    wr_sel = _sf(fields.get("wr_selected_pct"))
+    wr_all = _sf(fields.get("wr_all_pct"))
+    coverage = _sf(fields.get("coverage_pct"))
+    conf = _sf(fields.get("decision_confidence"))
+    cfg_raw = fields.get("config_json") or "{}"
     try:
-        # epoch и done-ключи
-        epoch_key = _k_epoch(sid, direction)
-        done_key = _k_done(sid, direction, run_id)
+        cfg_json = json.dumps(json.loads(cfg_raw))
+    except Exception:
+        cfg_json = "{}"
+    source_table = str(fields.get("source_table", "")).strip()
+    source_run_id = _si(fields.get("source_run_id"))
 
-        # если в epoch лежит другой run — обнуляем (начался новый раунд)
-        epoch = await infra.redis_client.hgetall(epoch_key)
-        if epoch and _safe_int(epoch.get("run_id")) != run_id:
-            # сравнение по номеру не критично — просто сброс
-            await infra.redis_client.delete(epoch_key)
+    cand = {
+        "strategy_id": sid,
+        "direction": direction,
+        "idea_key": idea_key,
+        "variant_key": variant_key,
+        "primary_window": primary_window or (cur.get("primary_window") if cur else "14d"),
+        "coverage_pct": coverage,
+        "roi_selected_pct": roi_sel,
+        "roi_all_pct": roi_all,
+        "delta_roi_pp": delta_roi,
+        "wr_selected_pct": wr_sel,
+        "wr_all_pct": wr_all,
+        "delta_wr_pp": (wr_sel - wr_all),
+        "decision_class": "green" if (delta_roi >= 5.0 and (wr_sel - wr_all) >= 3.0) else ("yellow" if delta_roi > 0.0 else "red"),
+        "decision_confidence": conf,
+        "config_json": cfg_json,
+        "source_table": source_table or "unknown",
+        "source_run_id": source_run_id or 0,
+    }
 
-        # отметить идею как завершившуюся (eligible true/false — неважно)
-        await infra.redis_client.hset(done_key, idea_key, "1")
-        await infra.redis_client.expire(done_key, EPOCH_TTL_SEC)
-
-        # если кандидат eligible=true — обновить «лучшего» при необходимости
-        if eligible:
-            roi_sel = _safe_float(fields.get("roi_selected_pct"))
-            roi_all = _safe_float(fields.get("roi_all_pct"))
-            delta_roi_pp = roi_sel - roi_all
-            wr_sel = _safe_float(fields.get("wr_selected_pct"))
-            wr_all = _safe_float(fields.get("wr_all_pct"))
-            coverage_pct = _safe_float(fields.get("coverage_pct"))
-            decision_confidence = _safe_float(fields.get("decision_confidence"))
-            source_table = str(fields.get("source_table", "")).strip()
-            source_run_id = _safe_int(fields.get("source_run_id"))
-            cfg_raw = fields.get("config_json")
-            try:
-                config_json = json.dumps(json.loads(cfg_raw)) if cfg_raw else "{}"
-            except Exception:
-                config_json = "{}"
-
-            cand = {
-                "eligible": "true",
-                "run_id": run_id,
-                "idea_key": idea_key,
-                "variant_key": variant_key,
-                "primary_window": primary_window,
-                "roi_selected_pct": roi_sel,
-                "roi_all_pct": roi_all,
-                "delta_roi_pp": delta_roi_pp,
-                "wr_selected_pct": wr_sel,
-                "wr_all_pct": wr_all,
-                "coverage_pct": coverage_pct,
-                "decision_confidence": decision_confidence,
-                "config_json": config_json,
-                "source_table": source_table,
-                "source_run_id": source_run_id,
-            }
-
-            cur = None
-            epoch = await infra.redis_client.hgetall(epoch_key)
-            if epoch:
-                cur = {
-                    "eligible": epoch.get("eligible", "true"),
-                    "run_id": _safe_int(epoch.get("run_id")),
-                    "idea_key": epoch.get("idea_key"),
-                    "variant_key": epoch.get("variant_key"),
-                    "primary_window": epoch.get("primary_window"),
-                    "roi_selected_pct": _safe_float(epoch.get("roi_selected_pct")),
-                    "roi_all_pct": _safe_float(epoch.get("roi_all_pct")),
-                    "delta_roi_pp": _safe_float(epoch.get("delta_roi_pp"), float("-inf")),
-                    "wr_selected_pct": _safe_float(epoch.get("wr_selected_pct")),
-                    "wr_all_pct": _safe_float(epoch.get("wr_all_pct")),
-                    "coverage_pct": _safe_float(epoch.get("coverage_pct")),
-                    "decision_confidence": _safe_float(epoch.get("decision_confidence")),
-                }
-
-            if _rank_better(cur, cand):
-                # перезаписываем лучшего кандидата
-                await infra.redis_client.hset(
-                    epoch_key,
-                    mapping={
-                        "eligible": "true",
-                        "run_id": str(run_id),
-                        "idea_key": idea_key,
-                        "variant_key": variant_key,
-                        "primary_window": primary_window,
-                        "roi_selected_pct": f"{roi_sel}",
-                        "roi_all_pct": f"{roi_all}",
-                        "delta_roi_pp": f"{delta_roi_pp}",
-                        "wr_selected_pct": f"{wr_sel}",
-                        "wr_all_pct": f"{wr_all}",
-                        "coverage_pct": f"{coverage_pct}",
-                        "decision_confidence": f"{decision_confidence}",
-                        "config_json": config_json,
-                        "source_table": source_table,
-                        "source_run_id": str(source_run_id),
-                        "updated_at": str(run_id),  # символическая отметка; при желании можно положить ISO-время
-                    },
-                )
-                await infra.redis_client.expire(epoch_key, EPOCH_TTL_SEC)
-
-        # проверка завершения всех активных идей
-        done_count = await infra.redis_client.hlen(done_key)
-        if done_count >= len(ACTIVE_IDEAS):
-            # финализация раунда: апдейт/очистка витрины
-            await _finalize_round(sid, direction, run_id, epoch_key)
-            # очистка состояния
-            await infra.redis_client.delete(epoch_key)
-            await infra.redis_client.delete(done_key)
-
-    finally:
-        # освобождаем лок
-        try:
-            await infra.redis_client.delete(lock_key)
-        except Exception:
-            pass
+    # сравнить и записать при улучшении
+    if _is_better(cand, cur):
+        await _upsert_current_best(cand)
+        log.info("🏁 AUD_BEST: sid=%s dir=%s → BEST [%s/%s] ΔROI=%.2fpp (ROI_sel=%.2f%%) cov=%.1f%%",
+                 sid, direction, idea_key, variant_key, delta_roi, roi_sel, coverage)
+    else:
+        log.info("ℹ️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] хуже текущего, пропуск",
+                 sid, direction, idea_key, variant_key)
 
 
-# 🔸 Финализация: апдейт/удаление строки в auditor_current_best
-async def _finalize_round(sid: int, direction: str, run_id: int, epoch_key: str):
-    epoch = await infra.redis_client.hgetall(epoch_key)
-    # если лучшего нет (или run_id другой) — удаляем витрину
-    if not epoch or _safe_int(epoch.get("run_id")) != run_id or not epoch.get("idea_key"):
-        log.info("🗑️ AUD_BEST: sid=%s dir=%s — кандидатов нет, витрина очищается", sid, direction)
-        await _delete_current_best(sid, direction)
-        return
+# 🔸 Чтение текущей витрины по (sid,dir)
+async def _read_current_best(sid: int, direction: str) -> Optional[Dict[str, Any]]:
+    async with infra.pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT strategy_id, direction, idea_key, variant_key, primary_window,
+                   coverage_pct, roi_selected_pct, roi_all_pct, delta_roi_pp,
+                   wr_selected_pct, wr_all_pct, delta_wr_pp,
+                   decision_class, decision_confidence, config_json, source_table, source_run_id, updated_at
+            FROM auditor_current_best
+            WHERE strategy_id=$1 AND direction=$2
+            """,
+            sid, direction
+        )
+        return dict(row) if row else None
 
-    # апсерт лучшего
-    idea_key = epoch.get("idea_key")
-    variant_key = epoch.get("variant_key")
-    primary_window = epoch.get("primary_window")
-    roi_sel = _safe_float(epoch.get("roi_selected_pct"))
-    roi_all = _safe_float(epoch.get("roi_all_pct"))
-    d_roi = _safe_float(epoch.get("delta_roi_pp"))
-    wr_sel = _safe_float(epoch.get("wr_selected_pct"))
-    wr_all = _safe_float(epoch.get("wr_all_pct"))
-    d_wr = wr_sel - wr_all
-    coverage_pct = _safe_float(epoch.get("coverage_pct"))
-    decision_confidence = _safe_float(epoch.get("decision_confidence"))
-    config_json = epoch.get("config_json") or "{}"
-    source_table = epoch.get("source_table") or ""
-    source_run_id = _safe_int(epoch.get("source_run_id"))
 
-    # простой класс по признаку положительного ROI; детальный класс оставляем от идеи при желании
-    decision_class = "green" if (d_roi >= 5.0 and wr_sel - wr_all >= 3.0) else ("yellow" if d_roi > 0.0 else "red")
-
+# 🔸 UPSERT витрины
+async def _upsert_current_best(cand: Dict[str, Any]):
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
             """
@@ -352,15 +279,11 @@ async def _finalize_round(sid: int, direction: str, run_id: int, epoch_key: str)
               source_run_id       = EXCLUDED.source_run_id,
               updated_at          = now()
             """,
-            sid, direction, idea_key, variant_key, primary_window,
-            float(coverage_pct), float(roi_sel), float(roi_all), float(d_roi),
-            float(wr_sel), float(wr_all), float(d_wr),
-            decision_class, float(decision_confidence), config_json, source_table, int(source_run_id)
+            cand["strategy_id"], cand["direction"], cand["idea_key"], cand["variant_key"], cand["primary_window"],
+            float(cand["coverage_pct"]), float(cand["roi_selected_pct"]), float(cand["roi_all_pct"]), float(cand["delta_roi_pp"]),
+            float(cand["wr_selected_pct"]), float(cand["wr_all_pct"]), float(cand["delta_wr_pp"]),
+            cand["decision_class"], float(cand["decision_confidence"]), cand["config_json"], cand["source_table"], int(cand["source_run_id"])
         )
-    log.info(
-        "🏁 AUD_BEST: sid=%s dir=%s → BEST [%s/%s] ΔROI=%.2fpp (ROI_sel=%.2f%%) cov=%.1f%%",
-        sid, direction, idea_key, variant_key, d_roi, roi_sel, coverage_pct
-    )
 
 
 # 🔸 Удаление строки витрины (пауза стратегии)

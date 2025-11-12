@@ -89,11 +89,11 @@ def _choose_secondary_window(cov_map: Dict[str, Dict[str, Any]], primary: str) -
 async def run_auditor_ema200_side():
     # условия достаточности
     if infra.pg_pool is None:
-        log.info("❌ Пропуск auditor_ema200_side: PG не инициализирован")
+        log.debug("❌ Пропуск auditor_ema200_side: PG не инициализирован")
         return
 
     if INITIAL_DELAY_SEC > 0:
-        log.info("⏳ AUD_EMA200: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
+        log.debug("⏳ AUD_EMA200: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
         await asyncio.sleep(int(INITIAL_DELAY_SEC))
 
     # основной цикл
@@ -101,20 +101,20 @@ async def run_auditor_ema200_side():
         try:
             await _run_once()
         except asyncio.CancelledError:
-            log.info("⏹️ AUD_EMA200: остановлено по сигналу")
+            log.debug("⏹️ AUD_EMA200: остановлено по сигналу")
             raise
         except Exception:
             log.exception("❌ AUD_EMA200: ошибка прохода — пауза 5 секунд")
             await asyncio.sleep(5)
 
-        log.info("😴 AUD_EMA200: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
+        log.debug("😴 AUD_EMA200: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
 
 # 🔸 Один проход: создать run, пройти по стратегиям, записать покрытие/статы/маски и опубликовать лучший вариант
 async def _run_once():
     strategies = await load_active_mw_strategies()
-    log.info("📦 AUD_EMA200: найдено активных MW-стратегий: %d", len(strategies))
+    log.debug("📦 AUD_EMA200: найдено активных MW-стратегий: %d", len(strategies))
     if not strategies:
         return
 
@@ -124,11 +124,11 @@ async def _run_once():
                   "14d": now_utc - dt.timedelta(days=14),
                   "28d": now_utc - dt.timedelta(days=28),
                   "total": None}
-    log.info("🕒 AUD_EMA200: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
+    log.debug("🕒 AUD_EMA200: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
              now_utc, win_bounds["7d"], win_bounds["14d"], win_bounds["28d"])
 
     run_id = await _create_run(now_utc, win_bounds)
-    log.info("🧾 AUD_EMA200: создан run_id=%s", run_id)
+    log.debug("🧾 AUD_EMA200: создан run_id=%s", run_id)
 
     for sid, meta in strategies.items():
         try:
@@ -169,7 +169,7 @@ async def _process_strategy(
     # закрытые позиции
     positions = await _load_closed_positions_for_strategy(sid)
     if not positions:
-        log.info("ℹ️ AUD_EMA200: %s — закрытых позиций нет", title)
+        log.debug("ℹ️ AUD_EMA200: %s — закрытых позиций нет", title)
         return
 
     # принадлежность окнам
@@ -276,13 +276,13 @@ async def _process_strategy(
 
                     # лог и запись side_stats
                     warn = " (N<50)" if total_n < MIN_SAMPLE_PER_CELL else ""
-                    log.info('📊 AUD_EMA200 | %s | TF=%s | dir=%s | window=%s — side_stats%s',
+                    log.debug('📊 AUD_EMA200 | %s | TF=%s | dir=%s | window=%s — side_stats%s',
                              title, tf, direction, w, warn)
                     for s_key in ("aligned", "opposite", "equal"):
                         ag = side_aggr[s_key]
                         N = int(ag["N"]); wins = int(ag["wins"]); pnl_sum = float(ag["pnl"])
                         roi_pct = (pnl_sum / float(deposit) * 100.0) if deposit > 0 and N > 0 else 0.0
-                        log.info("  side=%s: N=%d WR=%.2f%% ΣPnL=%.6f ROI=%.4f%%",
+                        log.debug("  side=%s: N=%d WR=%.2f%% ΣPnL=%.6f ROI=%.4f%%",
                                  s_key, N, (wins / N * 100.0) if N > 0 else 0.0, pnl_sum, roi_pct)
                         await conn.execute(
                             """
@@ -320,7 +320,7 @@ async def _process_strategy(
                         rec = btot[idx]
                         N = int(rec["N"]); wins = int(rec["wins"]); pnl_sum = float(rec["pnl"])
                         roi_pct = (pnl_sum / float(deposit) * 100.0) if deposit > 0 and N > 0 else 0.0
-                        log.info("  dist_bin B%d: N=%d WR=%.2f%% ΣPnL=%.6f ROI=%.4f%%",
+                        log.debug("  dist_bin B%d: N=%d WR=%.2f%% ΣPnL=%.6f ROI=%.4f%%",
                                  idx, N, (wins / N * 100.0) if N > 0 else 0.0, pnl_sum, roi_pct)
                         await conn.execute(
                             """
@@ -525,7 +525,7 @@ async def _record_mask_with_validation(
     d_roi_pp = 0.0
     if metrics_sel_primary["roi_selected_pct"] is not None and metrics_sel_primary["roi_all_pct"] is not None:
         d_roi_pp = metrics_sel_primary["roi_selected_pct"] - metrics_sel_primary["roi_all_pct"]
-    log.info(
+    log.debug(
         "✅ %s | sid=%s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: %s | ΔROI=%.2f pp | ΔWR=%.2f pp",
         tag, sid, direction, primary_win, decision_class, decision_conf,
         json.dumps(mask_modes), d_roi_pp,
@@ -734,7 +734,7 @@ async def _publish_best_candidate(
     decision_conf: float,
 ):
     if infra.redis_client is None:
-        log.info("ℹ️ AUD_EMA200: Redis не инициализирован — пропуск публикации кандидата")
+        log.debug("ℹ️ AUD_EMA200: Redis не инициализирован — пропуск публикации кандидата")
         return
 
     idea_key = "ema200_side"
@@ -785,7 +785,7 @@ async def _publish_best_candidate(
         })
     try:
         await infra.redis_client.xadd(stream, fields, id="*")
-        log.info("📨 AUD_EMA200 → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
+        log.debug("📨 AUD_EMA200 → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
                  sid, direction, label, fields["eligible"])
     except Exception:
         log.exception("❌ AUD_EMA200: ошибка публикации кандидата в %s", stream)
