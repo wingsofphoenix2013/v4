@@ -1,4 +1,6 @@
 # 🔸 auditor_cross_strength.py — аудит «силы кросса» EMA9/EMA21: запись в БД бинов (ROI/WR), покрытий окон и итоговых масок-вердиктов по стратегиям
+#     Теперь маски считаются в трёх вариантах, совместимых с твоим тестовым модулем:
+#     1) m5-only, 2) m5+m15, 3) m5+m15+h1 (комбинированная, помечается как primary)
 
 # 🔸 Импорты
 import asyncio
@@ -48,12 +50,12 @@ MASK_QBOUNDS: Dict[str, Tuple[Optional[int], Optional[int]]] = {
 async def run_auditor_cross_strength():
     # условия достаточности
     if infra.pg_pool is None:
-        log.info("❌ Пропуск auditor_cross_strength: PG не инициализирован")
+        log.debug("❌ Пропуск auditor_cross_strength: PG не инициализирован")
         return
 
     # стартовая задержка (контролируется из main, но поддержим константу)
     if INITIAL_DELAY_SEC > 0:
-        log.info("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
+        log.debug("⏳ AUD_XSTR: ожидание %d сек перед первым запуском", INITIAL_DELAY_SEC)
         await asyncio.sleep(int(INITIAL_DELAY_SEC))
 
     # основной цикл
@@ -61,14 +63,14 @@ async def run_auditor_cross_strength():
         try:
             await _run_once()
         except asyncio.CancelledError:
-            log.info("⏹️ AUD_XSTR: остановлено по сигналу")
+            log.debug("⏹️ AUD_XSTR: остановлено по сигналу")
             raise
         except Exception:
             log.exception("❌ AUD_XSTR: ошибка прохода — пауза 5 секунд")
             await asyncio.sleep(5)
 
         # сон до следующего запуска
-        log.info("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
+        log.debug("😴 AUD_XSTR: пауза %d сек до следующего запуска", SLEEP_BETWEEN_RUNS_SEC)
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
 
@@ -76,7 +78,7 @@ async def run_auditor_cross_strength():
 async def _run_once():
     # загрузка активных MW-стратегий
     strategies = await load_active_mw_strategies()
-    log.info("📦 AUD_XSTR: найдено активных MW-стратегий: %d", len(strategies))
+    log.debug("📦 AUD_XSTR: найдено активных MW-стратегий: %d", len(strategies))
     if not strategies:
         return
 
@@ -88,14 +90,14 @@ async def _run_once():
         "28d": now_utc - dt.timedelta(days=28),
         "total": None,
     }
-    log.info(
+    log.debug(
         "🕒 AUD_XSTR: окна — now=%s; 7d>=%s; 14d>=%s; 28d>=%s",
         now_utc, win_bounds["7d"], win_bounds["14d"], win_bounds["28d"]
     )
 
     # создаём запись прогона
     run_id = await _create_run(now_utc, win_bounds)
-    log.info("🧾 AUD_XSTR: создан run_id=%s", run_id)
+    log.debug("🧾 AUD_XSTR: создан run_id=%s", run_id)
 
     # последовательный проход по стратегиям
     for sid, meta in strategies.items():
@@ -135,13 +137,13 @@ async def _process_strategy(
     deposit = await _load_strategy_deposit(sid)
     deposit_valid = (deposit is not None and float(deposit) > 0.0)
     if not deposit_valid:
-        log.info('⚠️ AUD_XSTR: %s — депозит отсутствует или равен 0; ROI в mask_results будет n/a, в bin_stats — 0', title)
+        log.debug('⚠️ AUD_XSTR: %s — депозит отсутствует или равен 0; ROI в mask_results будет n/a, в bin_stats — 0', title)
     dep_used_for_bins = float(deposit) if deposit_valid else 1.0  # для bin_stats нужен not null
 
     # выбрать все закрытые позиции (total)
     positions = await _load_closed_positions_for_strategy(sid)
     if not positions:
-        log.info("ℹ️ AUD_XSTR: %s — закрытых позиций нет", title)
+        log.debug("ℹ️ AUD_XSTR: %s — закрытых позиций нет", title)
         return
 
     # пометить принадлежность окнам
@@ -240,7 +242,7 @@ async def _process_strategy(
 
                     # лог (как прежде)
                     warn = " (N<50)" if total_n < MIN_SAMPLE_PER_CELL else ""
-                    log.info('📈 AUD_XSTR | %s | TF=%s | dir=%s | window=%s — bins by cross_strength%s',
+                    log.debug('📈 AUD_XSTR | %s | TF=%s | dir=%s | window=%s — bins by cross_strength%s',
                              title, tf, direction, w, warn)
                     for idx in (1, 2, 3, 4, 5):
                         rec = btot[idx]
@@ -248,16 +250,15 @@ async def _process_strategy(
                         WR = (rec["wins"] / N * 100.0) if N > 0 else 0.0
                         pnl_sum = rec["pnl_sum"]
                         roi = (pnl_sum / dep_used_for_bins * 100.0) if dep_used_for_bins > 0 else 0.0
-                        log.info("  B%d: N=%d, WR=%.2f%%, ΣPnL=%.6f, ROI=%.4f%%", idx, N, WR, pnl_sum, roi)
+                        log.debug("  B%d: N=%d, WR=%.2f%%, ΣPnL=%.6f, ROI=%.4f%%", idx, N, WR, pnl_sum, roi)
 
                     # итоги по ячейке
                     first, last = btot[1], btot[5]
                     d_wr = _delta_wr(first, last)
                     d_roi = (last["pnl_sum"] - first["pnl_sum"]) / dep_used_for_bins * 100.0
-                    log.info("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
+                    log.debug("  ΔWR(B5−B1)=%.2f pp, ΔROI(B5−B1)=%.4f pp", d_wr, d_roi)
 
                     # запись в auditor_emacross_bin_stats — 5 строк
-                    # вычислим покрытие окна из coverage-таблицы в памяти
                     cov = coverage.get(direction, {}).get(w, None)
                     win_eff = cov["window_days_effective"] if cov else (0 if w == "total" else (7 if w == "7d" else 14 if w == "14d" else 28))
                     win_nom = cov["window_days_nominal"] if cov else (0 if w == "total" else (7 if w == "7d" else 14 if w == "14d" else 28))
@@ -282,14 +283,13 @@ async def _process_strategy(
                             False, None
                         )
 
-    # для каждого направления выбрать primary-окно, построить маску и записать вердикт
+    # для каждого направления выбрать primary-окно, построить маски и записать вердикты
     for direction in ("long", "short"):
-        # отберём все позиции этого направления
         dir_positions = [p for p in positions if p["direction"] == direction]
         if not dir_positions:
             continue
 
-        # выбор primary окна по покрытию
+        # выбор primary/secondary окна по покрытию
         primary_win = _choose_primary_window(coverage.get(direction, {}))
         secondary_win = _choose_secondary_window(coverage.get(direction, {}), primary_win)
 
@@ -299,76 +299,103 @@ async def _process_strategy(
             btot = bin_aggr.get(tf, {}).get(primary_win, {}).get(direction, None)
             tf_classes[tf] = _classify_tf(btot, dep_used_for_bins)
 
-        # построить маску по TF-классам
-        mask = _build_mask_from_tf_classes(tf_classes)
+        # формируем три маски в терминах твоего тест-модуля
+        masks: List[Tuple[str, Dict[str, str], bool, str]] = [
+            ("m5_only",      {"m5": tf_classes.get("m5", "any"),  "m15": "any",                         "h1": "any"},                         False, f"mask=m5_only"),
+            ("m5_m15",       {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": "any"},                         False, f"mask=m5_m15"),
+            ("m5_m15_h1",    {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": tf_classes.get("h1", "any")},  True,  f"mask=m5_m15_h1"),
+        ]
 
-        # оценить маску на primary окне
-        metrics_primary = _evaluate_mask_on_positions(
-            dir_positions, pos_bins, mask, primary_win, direction, deposit if deposit_valid else None
-        )
-        # оценить базу (все сделки) на primary окне
-        metrics_base_primary = _evaluate_mask_on_positions(
-            dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"},
-            primary_win, direction, deposit if deposit_valid else None
-        )
-
-        # если есть secondary — оценить знак
-        metrics_secondary = None
-        metrics_base_secondary = None
-        if secondary_win is not None:
-            metrics_secondary = _evaluate_mask_on_positions(
-                dir_positions, pos_bins, mask, secondary_win, direction, deposit if deposit_valid else None
+        # прогоняем каждую маску: primary + валидации на прочих окнах
+        for label, mask_modes, is_primary_mask, mask_note in masks:
+            await _record_mask_with_validation(
+                run_id=run_id,
+                sid=sid,
+                title=title,
+                direction=direction,
+                primary_win=primary_win,
+                secondary_win=secondary_win,
+                coverage_dir=coverage.get(direction, {}),
+                dir_positions=dir_positions,
+                pos_bins=pos_bins,
+                deposit=(deposit if deposit_valid else None),
+                mask_modes=mask_modes,
+                is_primary=is_primary_mask,
+                primary_note=mask_note
             )
-            metrics_base_secondary = _evaluate_mask_on_positions(
-                dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"},
-                secondary_win, direction, deposit if deposit_valid else None
+
+
+# 🔸 Запись одной маски (primary + валидация по другим окнам)
+async def _record_mask_with_validation(
+    run_id: int,
+    sid: int,
+    title: str,
+    direction: str,
+    primary_win: str,
+    secondary_win: Optional[str],
+    coverage_dir: Dict[str, Dict[str, Any]],
+    dir_positions: List[Dict[str, Any]],
+    pos_bins: Dict[str, Dict[str, Dict[str, Dict[str, int]]]],
+    deposit: Optional[float],
+    mask_modes: Dict[str, str],
+    is_primary: bool,
+    primary_note: str,
+):
+    # оценка на primary
+    metrics_sel_primary = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
+    metrics_all_primary = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, primary_win, direction, deposit)
+
+    # оценка на secondary (если есть)
+    metrics_sel_secondary = None
+    metrics_all_secondary = None
+    if secondary_win is not None:
+        metrics_sel_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
+        metrics_all_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, secondary_win, direction, deposit)
+
+    # принять решение
+    decision_class, decision_conf, rationale = _make_decision(
+        primary_window=primary_win,
+        cov_map_dir=coverage_dir,
+        metrics_primary=metrics_sel_primary,
+        metrics_base_primary=metrics_all_primary,
+        metrics_secondary=metrics_sel_secondary,
+        metrics_base_secondary=metrics_all_secondary
+    )
+
+    # записать primary строку
+    await _insert_mask_result(
+        run_id=run_id, sid=sid, direction=direction, window_tag=primary_win,
+        is_primary=is_primary, primary_window=primary_win,
+        mask_modes=mask_modes, metrics_sel=metrics_sel_primary, metrics_all=metrics_all_primary,
+        decision_class=decision_class, decision_confidence=decision_conf, rationale=(primary_note if primary_note else rationale)
+    )
+
+    # лог решения (для основной комбинированной маски — «DECISION», для остальных — «ALT»)
+    tag = "DECISION" if is_primary else "ALT"
+    d_roi_pp = 0.0
+    if metrics_sel_primary["roi_selected_pct"] is not None and metrics_sel_primary["roi_all_pct"] is not None:
+        d_roi_pp = metrics_sel_primary["roi_selected_pct"] - metrics_sel_primary["roi_all_pct"]
+    log.debug(
+        "✅ %s | %s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | ΔROI=%.2f pp | ΔWR=%.2f pp",
+        tag, title, direction, primary_win, decision_class, decision_conf,
+        mask_modes['m5'], mask_modes['m15'], mask_modes['h1'],
+        d_roi_pp, metrics_sel_primary["wr_selected_pct"] - metrics_sel_primary["wr_all_pct"]
+    )
+
+    # валидации на других окнах
+    for w, _ in WINDOWS:
+        if w == primary_win:
+            continue
+        m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, w, direction, deposit)
+        m_all = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, w, direction, deposit)
+        if m_all["n_all"] > 0:
+            await _insert_mask_result(
+                run_id=run_id, sid=sid, direction=direction, window_tag=w,
+                is_primary=False, primary_window=primary_win,
+                mask_modes=mask_modes, metrics_sel=m_sel, metrics_all=m_all,
+                decision_class=decision_class, decision_confidence=max(0.0, decision_conf - 0.1),
+                rationale=("validation-window; " + (primary_note or ""))
             )
-
-        # принять решение (class + confidence + rationale)
-        decision_class, decision_conf, rationale = _make_decision(
-            primary_win, coverage.get(direction, {}),
-            metrics_primary, metrics_base_primary,
-            metrics_secondary, metrics_base_secondary
-        )
-
-        # записать primary-строку в mask_results (is_primary=true)
-        await _insert_mask_result(
-            run_id=run_id, sid=sid, direction=direction, window_tag=primary_win,
-            is_primary=True, primary_window=primary_win,
-            mask_modes=mask, metrics_sel=metrics_primary, metrics_all=metrics_base_primary,
-            decision_class=decision_class, decision_confidence=decision_conf, rationale=rationale
-        )
-
-        # записать валидации на других окнах (если есть данные), is_primary=false
-        for w, _ in WINDOWS:
-            if w == primary_win:
-                continue
-            m_sel = _evaluate_mask_on_positions(
-                dir_positions, pos_bins, mask, w, direction, deposit if deposit_valid else None
-            )
-            m_all = _evaluate_mask_on_positions(
-                dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"},
-                w, direction, deposit if deposit_valid else None
-            )
-            if m_all["n_all"] > 0:
-                await _insert_mask_result(
-                    run_id=run_id, sid=sid, direction=direction, window_tag=w,
-                    is_primary=False, primary_window=primary_win,
-                    mask_modes=mask, metrics_sel=m_sel, metrics_all=m_all,
-                    decision_class=decision_class, decision_confidence=max(0.0, decision_conf - 0.1),
-                    rationale="validation-window"
-                )
-
-        # сводный лог по стратегии/направлению
-        log.info(
-            "✅ DECISION | %s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | cov=%.1f%% | ΔROI=%.2f pp | ΔWR=%.2f pp",
-            title, direction, primary_win, decision_class, decision_conf,
-            mask['m5'], mask['m15'], mask['h1'],
-            coverage.get(direction, {}).get(primary_win, {}).get("window_coverage_pct", 0.0),
-            (metrics_primary["roi_selected_pct"] or 0.0) - (metrics_primary["roi_all_pct"] or 0.0)
-            if (metrics_primary["roi_selected_pct"] is not None and metrics_primary["roi_all_pct"] is not None) else 0.0,
-            metrics_primary["wr_selected_pct"] - metrics_primary["wr_all_pct"]
-        )
 
 
 # 🔸 Загрузка депозита стратегии
@@ -457,10 +484,8 @@ def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> 
         if not dir_positions:
             continue
 
-        # общий список для быстрого фильтра по окнам
         for w, nominal_days in WINDOWS:
             if w == "total":
-                # total — «окно» 100%, номинал=0
                 n_positions = len(dir_positions)
                 first_closed = min((p["closed_at"] for p in dir_positions if p["closed_at"]), default=None)
                 last_closed = max((p["closed_at"] for p in dir_positions if p["closed_at"]), default=None)
@@ -474,7 +499,6 @@ def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> 
                 }
                 continue
 
-            # фильтрация по closed_at >= now - nominal
             cutoff = now_utc - dt.timedelta(days=int(nominal_days or 0))
             win_positions = [p for p in dir_positions if p["closed_at"] and p["closed_at"] >= cutoff]
             n_positions = len(win_positions)
@@ -482,9 +506,8 @@ def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> 
             if n_positions > 0:
                 first_closed = min(p["closed_at"] for p in win_positions if p["closed_at"])
                 last_closed = max(p["closed_at"] for p in win_positions if p["closed_at"])
-                # эффективные дни — от первого закрытия в окне до now, но не больше номинала
                 eff_days = (now_utc - first_closed).total_seconds() / 86400.0
-                eff_days = max(0.0, min(eff_days, float(nominal_days)))  # [0 .. nominal]
+                eff_days = max(0.0, min(eff_days, float(nominal_days)))
                 coverage_pct = (eff_days / float(nominal_days)) * 100.0 if nominal_days else 100.0
             else:
                 first_closed = None
@@ -527,7 +550,6 @@ async def _insert_coverage_rows(run_id: int, sid: int, coverage: Dict[str, Dict[
 
 # 🔸 Выбор primary окна по покрытию
 def _choose_primary_window(cov_map: Dict[str, Dict[str, Any]]) -> str:
-    # если 28d покрыт ≥ 80% → primary=28d; иначе если 14d ≥ 70% → 14d; иначе 7d
     cov28 = cov_map.get("28d", {}).get("window_coverage_pct", 0.0)
     cov14 = cov_map.get("14d", {}).get("window_coverage_pct", 0.0)
     if cov28 >= PRIMARY_28D_COVERAGE * 100.0:
@@ -539,7 +561,6 @@ def _choose_primary_window(cov_map: Dict[str, Dict[str, Any]]) -> str:
 
 # 🔸 Выбор secondary окна (для проверки знака)
 def _choose_secondary_window(cov_map: Dict[str, Dict[str, Any]], primary: str) -> Optional[str]:
-    # приоритет: если primary=28d → secondary=14d (если ≥50%), иначе 7d; если primary=14d → secondary=7d (если ≥50%)
     if primary == "28d":
         if cov_map.get("14d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
             return "14d"
@@ -550,15 +571,14 @@ def _choose_secondary_window(cov_map: Dict[str, Dict[str, Any]], primary: str) -
         if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
             return "7d"
         return None
-    # primary=7d → secondary отсутствует
-    return None
+    return None  # primary=7d
 
 
 # 🔸 Классификация TF по бинам (HIGH/LOW/MID/any) на окне
 def _classify_tf(btot: Optional[Dict[int, Dict[str, float]]], dep_used_for_bins: float) -> str:
     if not btot:
         return "any"
-    # ROI по бинам (в п.п.)
+
     def roi_pp(x: float) -> float:
         return (x / dep_used_for_bins * 100.0) if dep_used_for_bins > 0 else 0.0
 
@@ -566,25 +586,14 @@ def _classify_tf(btot: Optional[Dict[int, Dict[str, float]]], dep_used_for_bins:
     r3 = roi_pp(btot[3]["pnl_sum"])
     r5 = roi_pp(btot[5]["pnl_sum"])
     d_roi = r5 - r1
-    # U-форма?
+
     if (r3 - max(r1, r5)) >= U_SHAPE_MIN_GAIN:
         return "mid"
-    # монотонность по краям
     if d_roi >= DELTA_ROI_HIGH_PP:
         return "high"
     if d_roi <= DELTA_ROI_LOW_PP:
         return "low"
     return "any"
-
-
-# 🔸 Построить маску (m5/m15/h1 -> 'low'|'mid'|'high'|'any')
-def _build_mask_from_tf_classes(tf_classes: Dict[str, str]) -> Dict[str, str]:
-    # сохраняем порядок/ключи TF, значения — режимы
-    return {
-        "m5": tf_classes.get("m5", "any"),
-        "m15": tf_classes.get("m15", "any"),
-        "h1": tf_classes.get("h1", "any"),
-    }
 
 
 # 🔸 Оценить маску на позициях (пересечение условий по TF)
@@ -596,17 +605,14 @@ def _evaluate_mask_on_positions(
     direction: str,
     deposit: Optional[float],
 ) -> Dict[str, Any]:
-    # набор допустимых бинов по TF
     allowed = {tf: MASK_BINS.get(mask_modes.get(tf, "any"), MASK_BINS["any"]) for tf in TIMEFRAMES}
 
-    # базовые метрики «все сделки в окне»
     all_list = [p for p in dir_positions if p["in_window"][window_tag]]
     n_all = len(all_list)
     pnl_all = sum(p["pnl"] for p in all_list)
     wr_all = (sum(1 for p in all_list if p["pnl"] >= 0) / n_all * 100.0) if n_all > 0 else 0.0
     roi_all = ((pnl_all / deposit) * 100.0) if (deposit and deposit > 0 and n_all > 0) else None
 
-    # выбранные по маске — все TF должны удовлетворять
     selected = []
     for p in all_list:
         puid = p["position_uid"]
@@ -614,10 +620,7 @@ def _evaluate_mask_on_positions(
         for tf in TIMEFRAMES:
             bin_map = pos_bins.get(tf, {}).get(window_tag, {}).get(direction, {})
             b = bin_map.get(puid, None)
-            if b is None:
-                ok = False
-                break
-            if b not in allowed[tf]:
+            if b is None or (b not in allowed[tf]):
                 ok = False
                 break
         if ok:
@@ -650,45 +653,38 @@ def _make_decision(
     metrics_secondary: Optional[Dict[str, Any]],
     metrics_base_secondary: Optional[Dict[str, Any]],
 ) -> Tuple[str, float, str]:
-    # базовые дельты на primary
     if metrics_primary["n_all"] == 0 or metrics_base_primary["n_all"] == 0:
         return ("red", 0.0, "no-data")
-    # ΔWR
+
     d_wr = metrics_primary["wr_selected_pct"] - metrics_primary["wr_all_pct"]
-    # ΔROI (может быть None)
     d_roi = None
     if metrics_primary["roi_selected_pct"] is not None and metrics_primary["roi_all_pct"] is not None:
         d_roi = metrics_primary["roi_selected_pct"] - metrics_primary["roi_all_pct"]
 
-    # покрытие окна (days) как фактор уверенности
     cov_pct = cov_map_dir.get(primary_window, {}).get("window_coverage_pct", 0.0) / 100.0
-    conf = min(1.0, max(0.0, cov_pct))  # базовая уверенность [0..1]
+    conf = min(1.0, max(0.0, cov_pct))
 
-    # признак совпадения знака на secondary
     secondary_ok = False
-    if metrics_secondary and metrics_base_secondary:
-        if metrics_secondary["n_all"] > 0:
-            d_wr_s = metrics_secondary["wr_selected_pct"] - metrics_secondary["wr_all_pct"]
-            d_roi_s = None
-            if metrics_secondary["roi_selected_pct"] is not None and metrics_secondary["roi_all_pct"] is not None:
-                d_roi_s = metrics_secondary["roi_selected_pct"] - metrics_secondary["roi_all_pct"]
-            # правило: хотя бы по одному из WR/ROI знак совпадает и не противоречит
-            if (d_wr >= 0 and d_wr_s >= 0) or (d_wr <= 0 and d_wr_s <= 0):
+    if metrics_secondary and metrics_base_secondary and metrics_secondary["n_all"] > 0:
+        d_wr_s = metrics_secondary["wr_selected_pct"] - metrics_secondary["wr_all_pct"]
+        d_roi_s = None
+        if metrics_secondary["roi_selected_pct"] is not None and metrics_secondary["roi_all_pct"] is not None:
+            d_roi_s = metrics_secondary["roi_selected_pct"] - metrics_secondary["roi_all_pct"]
+        if (d_wr >= 0 and d_wr_s >= 0) or (d_wr <= 0 and d_wr_s <= 0):
+            secondary_ok = True
+        if d_roi is not None and d_roi_s is not None:
+            if (d_roi >= 0 and d_roi_s >= 0) or (d_roi <= 0 and d_roi_s <= 0):
                 secondary_ok = True
-            if d_roi is not None and d_roi_s is not None:
-                if (d_roi >= 0 and d_roi_s >= 0) or (d_roi <= 0 and d_roi_s <= 0):
-                    secondary_ok = True
     if secondary_ok:
         conf = min(1.0, conf + 0.1)
 
-    # классификация
     if d_roi is not None:
         if (d_roi >= 5.0 and d_wr >= 3.0 and cov_pct >= 0.7):
             return ("green", conf, f"primary={primary_window} ΔROI={d_roi:.2f}pp ΔWR={d_wr:.2f}pp")
         if d_roi >= 2.0 and d_wr >= 0.0:
             return ("yellow", conf, f"primary={primary_window} ΔROI={d_roi:.2f}pp ΔWR={d_wr:.2f}pp (weak)")
         return ("red", conf, f"primary={primary_window} ΔROI={d_roi:.2f}pp ΔWR={d_wr:.2f}pp (no gain)")
-    # ROI недоступен → ориентируемся на WR
+
     if d_wr >= 3.0 and cov_pct >= 0.7:
         return ("yellow", conf, f"primary={primary_window} ΔWR={d_wr:.2f}pp (ROI=n/a)")
     if d_wr >= 0.0:
@@ -761,10 +757,6 @@ async def _insert_mask_result(
 # 🔸 Утилиты квантилей/бинов/дельт/преобразований
 
 def _quantile_edges(values: List[float], probs: Iterable[float]) -> Tuple[float, float, float, float]:
-    """
-    Возвращает 4 квантильные границы по values для указанных probs (ожидаем 0.2,0.4,0.6,0.8).
-    Метод: "nearest-rank" по индексу round(p*(n-1)).
-    """
     arr = sorted(float(x) for x in values)
     n = len(arr)
     if n == 0:
@@ -774,7 +766,6 @@ def _quantile_edges(values: List[float], probs: Iterable[float]) -> Tuple[float,
         idx = int(round(p * (n - 1)))
         idx = min(max(idx, 0), n - 1)
         edges.append(arr[idx])
-    # монотонность границ (на случай одинаковых значений)
     e1, e2, e3, e4 = edges
     if e1 > e2: e2 = e1
     if e2 > e3: e3 = e2
@@ -783,9 +774,6 @@ def _quantile_edges(values: List[float], probs: Iterable[float]) -> Tuple[float,
 
 
 def _assign_bin(x: float, edges: Tuple[float, float, float, float]) -> int:
-    """
-    Присваивает бин 1..5 по значениям x и границам (q20,q40,q60,q80).
-    """
     q20, q40, q60, q80 = edges
     if x <= q20:
         return 1
