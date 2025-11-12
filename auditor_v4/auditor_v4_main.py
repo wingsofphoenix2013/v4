@@ -12,10 +12,19 @@ from auditor_infra import (
 )
 from auditor_config import load_active_mw_strategies
 import auditor_infra as infra
+from auditor_cross_strength import run_auditor_cross_strength
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
 
+# 🔸 Вспомогательная функция запуска с задержкой
+async def _start_with_delay(coro_func, delay_sec: int):
+    # условия достаточности
+    if delay_sec and delay_sec > 0:
+        log.info("⏳ Ожидание %d сек перед стартом задачи", delay_sec)
+        await asyncio.sleep(int(delay_sec))
+    # запуск целевой корутины
+    await coro_func()
 
 # 🔸 Обёртка с автоперезапуском воркера (на будущее, в этой базе не используется)
 async def run_safe_loop(coro, label: str):
@@ -109,7 +118,6 @@ async def run_one_shot_audit():
 
     log.info("✅ Одноразовый аудит закрытых сделок завершён")
 
-
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
@@ -124,13 +132,13 @@ async def main():
         log.exception("❌ Ошибка инициализации внешних сервисов")
         return
 
-    log.info("🚀 Запуск одноразового расчёта статистики")
-    await run_one_shot_audit()
-
-    # удерживаем процесс «в фоне», чтобы Render не перезапускал воркер
-    log.info("⏸️ Аудит выполнен. Остаёмся в фоне, чтобы Render не рестартил воркер")
-    await asyncio.Event().wait()
-
+    log.info("🚀 Запуск задач auditor_v4")
+    await asyncio.gather(
+        # фоновый воркер «сила кросса»: старт через 60 сек, далее цикл run→sleep(3h)
+        run_safe_loop(lambda: _start_with_delay(run_auditor_cross_strength, 60), "AUD_CROSS_STRENGTH"),
+        # одноразовый аудит закрытых сделок (выполняется и завершается)
+        run_one_shot_audit(),
+    )
 
 # 🔸 Запуск модуля
 if __name__ == "__main__":
