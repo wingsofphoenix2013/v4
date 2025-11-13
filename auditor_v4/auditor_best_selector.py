@@ -1,4 +1,9 @@
 # 🔸 auditor_best_selector.py — оркестратор витрины «лучшая идея по стратегии/направлению»
+#     Режим «только свежие прогоны» + READY-уведомления:
+#     — каждое сообщение обрабатывается сразу.
+#     — витрина всегда относится к ПОСЛЕДНЕМУ run_id: первая запись нового run очищает старую строку.
+#     — далее идеи текущего run соревнуются между собой по ключу: ΔROI → ROI_selected → confidence → coverage.
+#     — по завершении набора всех ACTIVE_IDEAS для (run_id, strategy_id, direction) — отправляем READY в stream.
 
 # 🔸 Импорты
 import asyncio
@@ -11,12 +16,12 @@ import auditor_infra as infra
 # 🔸 Логгер
 log = logging.getLogger("AUD_BEST")
 
-# 🔸 Константы / параметры (правим здесь)
+# 🔸 Константы / параметры
 STREAM_NAME = "auditor:best:candidates"
 GROUP_NAME = "AUD_BEST_GROUP"
 CONSUMER_NAME = "AUD_BEST_SELECTOR"
 
-# активные идеи (добавляем сюда новые idea_key по мере подключения)
+# активные идеи (добавляйте новые idea_key по мере подключения)
 ACTIVE_IDEAS = {"emacross_cs", "ema200_side", "atr_pct_regime", "emacross_2150_spread"}
 
 # XREAD params / TTL
@@ -26,6 +31,15 @@ SEEN_TTL_SEC = 24 * 60 * 60
 
 # dedupe set
 SEEN_SET = "aud:best:seen"
+
+# 🔸 Ready-уведомления
+READY_STREAM = "auditor:best:ready"
+RUN_PERIOD_SEC = 3 * 60 * 60          # период прогонов: 3 часа
+READY_TTL_BUFFER_SEC = 10 * 60        # запас на лаг: 10 минут
+IDEAS_SEEN_TTL_SEC = RUN_PERIOD_SEC + READY_TTL_BUFFER_SEC   # ~3ч10м
+READY_SENT_TTL_SEC = RUN_PERIOD_SEC + READY_TTL_BUFFER_SEC   # ~3ч10м
+IDEAS_SEEN_PREFIX = "aud:best:ideas"        # aud:best:ideas:{run}:{sid}:{dir}
+READY_SENT_PREFIX = "aud:best:ready:sent"   # aud:best:ready:sent:{run}:{sid}:{dir}
 
 
 # 🔸 Утилиты
@@ -68,6 +82,39 @@ def _is_better(cand: Dict[str, Any], cur: Optional[Dict[str, Any]]) -> bool:
         _sf(cur.get("coverage_pct"), 0.0),
     )
     return c_key > cur_key
+
+
+# 🔸 Возможно отправить READY (когда получены все ACTIVE_IDEAS для (run_id, sid, dir))
+async def _maybe_emit_ready(sid: int, direction: str, run_id: int, idea_key: str):
+    if infra.redis_client is None:
+        return
+    dir_tag = "long" if direction == "long" else "short"
+    ideas_key = f"{IDEAS_SEEN_PREFIX}:{run_id}:{sid}:{dir_tag}"
+    ready_key = f"{READY_SENT_PREFIX}:{run_id}:{sid}:{dir_tag}"
+
+    # учесть идею и TTL
+    await infra.redis_client.sadd(ideas_key, idea_key)
+    await infra.redis_client.expire(ideas_key, IDEAS_SEEN_TTL_SEC)
+
+    # все идеи получены?
+    try:
+        seen = await infra.redis_client.scard(ideas_key)
+    except Exception:
+        seen = 0
+    if seen < len(ACTIVE_IDEAS):
+        return
+
+    # дедуп отправки READY
+    try:
+        if await infra.redis_client.setnx(ready_key, "1"):
+            await infra.redis_client.expire(ready_key, READY_SENT_TTL_SEC)
+            await infra.redis_client.xadd(READY_STREAM, {
+                "strategy_id": str(sid),
+                "direction": str(direction),
+            })
+            log.info("📣 AUD_BEST: READY emitted (sid=%s dir=%s run=%s)", sid, direction, run_id)
+    except Exception:
+        log.exception("⚠️ AUD_BEST: ошибка при отправке READY (sid=%s dir=%s run=%s)", sid, direction, run_id)
 
 
 # 🔸 Запуск воркера
@@ -127,6 +174,7 @@ async def run_auditor_best_selector():
             log.exception("❌ AUD_BEST: ошибка цикла — пауза 5 секунд")
             await asyncio.sleep(5)
 
+
 # 🔸 Обработка одного сообщения type="result" (только свежие прогоны попадают в витрину)
 async def _handle_message(fields: Dict[str, str]):
     # дедуп по event_uid (если прислан)
@@ -156,14 +204,14 @@ async def _handle_message(fields: Dict[str, str]):
     if idea_key not in ACTIVE_IDEAS:
         return
 
-    # run текущего сообщения (используем ДЛЯ СВЕЖЕСТИ всегда run_id)
+    # run текущего сообщения (для свежести используем ВСЕГДА run_id)
     msg_run = _si(fields.get("run_id"))
 
     # читаем текущую витрину
     cur = await _read_current_best(sid, direction)
     cur_run = _si(cur.get("source_run_id", 0)) if cur else 0
 
-    # если пришёл БОЛЕЕ СВЕЖИЙ прогон — сразу удаляем строку витрины (без сравнения)
+    # если пришёл БОЛЕЕ СВЕЖИЙ прогон — удаляем строку витрины (без сравнения)
     if cur and msg_run > cur_run:
         await _delete_current_best(sid, direction)
         log.info("🧹 AUD_BEST: sid=%s dir=%s — очищена витрина (старый run=%s < новый=%s)",
@@ -171,10 +219,11 @@ async def _handle_message(fields: Dict[str, str]):
         cur = None
         cur_run = 0
 
-    # если кандидат ineligible — фиксируем и выходим (витрина уже очищена при необходимости)
+    # если кандидат ineligible — фиксируем и проверяем готовность по идеям этого run
     if not eligible:
         log.info("ℹ️ AUD_BEST: sid=%s dir=%s — ineligible %s (run=%s); витрина %s",
                  sid, direction, idea_key, msg_run, "пустая" if cur is None else "без изменений")
+        await _maybe_emit_ready(sid, direction, msg_run, idea_key)
         return
 
     # распаковка метрик кандидата
@@ -194,7 +243,7 @@ async def _handle_message(fields: Dict[str, str]):
     except Exception:
         cfg_json = "{}"
 
-    # source_run_id в витрине храним как source_run_id ИЛИ run_id, чтобы свежесть всегда работала
+    # source_run_id в витрине: используем source_run_id ИЛИ run_id
     cand_run = _si(fields.get("source_run_id")) or msg_run
 
     cand = {
@@ -217,17 +266,19 @@ async def _handle_message(fields: Dict[str, str]):
         "source_run_id": cand_run,
     }
 
-    # если витрина пуста (после очистки или изначально) — сразу ставим кандидата без сравнения
+    # если витрина пуста — сразу ставим кандидата
     if cur is None:
         await _upsert_current_best(cand)
         log.info("🏁 AUD_BEST: sid=%s dir=%s → BEST [%s/%s] (fresh run=%s) ΔROI=%.2fpp (ROI_sel=%.2f%%) cov=%.1f%%",
                  sid, direction, idea_key, variant_key, cand_run, delta_roi, roi_sel, coverage)
+        await _maybe_emit_ready(sid, direction, msg_run, idea_key)
         return
 
-    # защита от запоздавших сообщений старых прогонов
+    # защита от опоздавших сообщений старых прогонов
     if msg_run < cur_run:
         log.info("⏭️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] старее текущего (run=%s < %s), пропуск",
                  sid, direction, idea_key, variant_key, msg_run, cur_run)
+        await _maybe_emit_ready(sid, direction, msg_run, idea_key)
         return
 
     # msg_run == cur_run → сравнение только внутри свежего прогона
@@ -238,6 +289,10 @@ async def _handle_message(fields: Dict[str, str]):
     else:
         log.info("ℹ️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] хуже текущего в том же run, пропуск",
                  sid, direction, idea_key, variant_key)
+
+    # после обработки текущей идеи — проверяем, все ли идеи уже пришли для этого run
+    await _maybe_emit_ready(sid, direction, msg_run, idea_key)
+
 
 # 🔸 Чтение текущей витрины по (sid,dir)
 async def _read_current_best(sid: int, direction: str) -> Optional[Dict[str, Any]]:
@@ -293,7 +348,7 @@ async def _upsert_current_best(cand: Dict[str, Any]):
         )
 
 
-# 🔸 Удаление строки витрины (пауза стратегии)
+# 🔸 Удаление строки витрины (пауза стратегии / смена run)
 async def _delete_current_best(sid: int, direction: str):
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
