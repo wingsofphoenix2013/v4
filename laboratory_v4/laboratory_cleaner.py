@@ -15,10 +15,10 @@ log = logging.getLogger("LAB_CLEANER")
 # 🔸 Константы
 TRIGGER_STREAM = "oracle:pack_lists:reports_ready"
 CLEANER_CONSUMER_GROUP = "LAB_CLEANER_GROUP"
-CLEANER_CONSUMER_NAME  = "LAB_CLEANER_WORKER"
+CLEANER_CONSUMER_NAME = "LAB_CLEANER_WORKER"
 
 # ретенции данных
-RETENTION_DAYS = 8                 # держим аналитику/хиды/позиции N суток
+RETENTION_DAYS = 8                 # держим аналитику/хиты/позиции N суток
 STREAM_RETENTION_HOURS = 24        # ответы в стриме держим N часов
 
 # троттлинг и взаимное исключение
@@ -28,9 +28,8 @@ RUNNING_LOCK_KEY = "lab:cleaner:running"    # замок «очистка вып
 RUNNING_EX_SEC   = 3600                     # макс. длительность одной чистки
 
 # что чистим в БД (см. _cleanup_once):
-# 1) laboratory_bl_analysis, laboratory_wl_analysis — по computed_at
-# 2) laboratory_request_tf по head.finished_at; затем laboratory_request_head — по finished_at
-# 3) laboratory_positions_stat — по updated_at
+# 1) laboratory_request_tf по head.finished_at; затем laboratory_request_head — по finished_at
+# 2) laboratory_positions_stat — по updated_at
 # стрим laboratory:decision_response — XTRIM MINID < now-24h
 
 
@@ -168,9 +167,7 @@ async def _cleanup_once():
     # чистка БД в транзакции
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            bl_del   = await _exec_delete(conn, "DELETE FROM laboratory_bl_analysis WHERE computed_at < $1", cutoff_dt)
-            wl_del   = await _exec_delete(conn, "DELETE FROM laboratory_wl_analysis WHERE computed_at < $1", cutoff_dt)
-            tf_del   = await _exec_delete(
+            tf_del = await _exec_delete(
                 conn,
                 """
                 DELETE FROM laboratory_request_tf tf
@@ -178,14 +175,22 @@ async def _cleanup_once():
                 WHERE tf.req_id = h.req_id
                   AND h.finished_at < $1
                 """,
-                cutoff_dt
+                cutoff_dt,
             )
-            head_del = await _exec_delete(conn, "DELETE FROM laboratory_request_head WHERE finished_at < $1", cutoff_dt)
-            pos_del  = await _exec_delete(conn, "DELETE FROM laboratory_positions_stat WHERE updated_at < $1", cutoff_dt)
+            head_del = await _exec_delete(
+                conn,
+                "DELETE FROM laboratory_request_head WHERE finished_at < $1",
+                cutoff_dt,
+            )
+            pos_del = await _exec_delete(
+                conn,
+                "DELETE FROM laboratory_positions_stat WHERE updated_at < $1",
+                cutoff_dt,
+            )
 
     log.debug(
-        "🧹 LAB_CLEANER: DB cleanup done (older than %s) — bl=%d wl=%d tf=%d head=%d pos=%d",
-        cutoff_dt.isoformat(), bl_del, wl_del, tf_del, head_del, pos_del
+        "🧹 LAB_CLEANER: DB cleanup done (older than %s) — tf=%d head=%d pos=%d",
+        cutoff_dt.isoformat(), tf_del, head_del, pos_del
     )
 
     # чистим стрим ответов по MINID < now-24h
@@ -222,4 +227,7 @@ async def _trim_decision_response_stream():
         cnt = int(trimmed) if trimmed is not None else -1
     except Exception:
         cnt = -1
-    log.debug("🧽 LAB_CLEANER: stream trimmed (stream=%s, MINID<%s, removed=%s)", stream, minid, cnt if cnt >= 0 else "unknown")
+    log.debug(
+        "🧽 LAB_CLEANER: stream trimmed (stream=%s, MINID<%s, removed=%s)",
+        stream, minid, cnt if cnt >= 0 else "unknown"
+    )

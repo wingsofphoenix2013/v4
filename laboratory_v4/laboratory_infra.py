@@ -51,12 +51,6 @@ lab_pack_bl_detailed_exact: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, 
 #            "deposit_used": float, "computed_at": "ISO8601"}
 lab_bl_active: Dict[Tuple[int, str, str, str, str], Dict[str, Any]] = {}
 
-# 🔸 Активные пороги WL (winrate) по источникам (mw|pack) — для онлайн-фильтров
-# ключ: (master_sid, version, decision_mode, direction, tf, source)
-# значение: {"threshold": float, "best_roi": float, "roi_base": float, "positions_total": int,
-#            "deposit_used": float, "computed_at": "ISO8601"}
-lab_wl_active: Dict[Tuple[int, str, str, str, str, str], Dict[str, Any]] = {}
-
 # 🔸 Активные пороги MW-BL (аналог PACK-BL, но для MW)
 # ключ: (master_sid, version, decision_mode, direction, tf)
 # значение: {"threshold": int, "best_roi": float, "roi_base": float, "positions_total": int,
@@ -567,68 +561,3 @@ def get_mw_bl_threshold(
     if not rec:
         return int(default)
     return int(rec.get("threshold", default))
-
-
-# 🔸 WL Active (winrate): массовая установка, точечный upsert и быстрый доступ к порогу
-
-def set_wl_active_bulk(new_map: Dict[Tuple[int, str, str, str, str, str], Dict[str, Any]]):
-    """
-    Полная замена in-memory кэша активных порогов WL (winrate).
-    new_map: {(master_sid, version, decision_mode, direction, tf, source) -> {...}}
-    """
-    global lab_wl_active
-    lab_wl_active = new_map or {}
-    log.debug("LAB: WL active cache replaced (records=%d)", len(lab_wl_active))
-
-
-def upsert_wl_active(
-    master_sid: int,
-    version: str,
-    decision_mode: str,
-    direction: str,
-    tf: str,
-    source: str,                     # 'mw' | 'pack'
-    threshold: float,
-    *,
-    best_roi: float = 0.0,
-    roi_base: float = 0.0,
-    positions_total: int = 0,
-    deposit_used: float = 0.0,
-    computed_at: Optional[str] = None,
-):
-    """
-    Точечное обновление записи активного порога WL (winrate) в памяти.
-    """
-    key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf), str(source))
-    rec = {
-        "threshold": float(round(threshold, 2)),
-        "best_roi": float(best_roi),
-        "roi_base": float(roi_base),
-        "positions_total": int(positions_total),
-        "deposit_used": float(deposit_used),
-        "computed_at": computed_at or "",
-    }
-    lab_wl_active[key] = rec
-    log.debug(
-        "LAB: WL(%s) active upsert %s -> T=%.2f ROI=%.6f (base=%.6f, n=%d)",
-        source.upper(), key, rec["threshold"], rec["best_roi"], rec["roi_base"], rec["positions_total"]
-    )
-
-
-def get_wl_threshold(
-    master_sid: int,
-    version: str,
-    decision_mode: str,
-    direction: str,
-    tf: str,
-    source: str,                     # 'mw' | 'pack'
-    default: float = 0.60,
-) -> float:
-    """
-    Быстрый доступ к активному порогу WL (winrate). Если записи нет — возвращает default (по договорённости, 0.60).
-    """
-    key = (int(master_sid), str(version), str(decision_mode), str(direction), str(tf), str(source))
-    rec = lab_wl_active.get(key)
-    if not rec:
-        return float(round(default, 2))
-    return float(rec.get("threshold", default))

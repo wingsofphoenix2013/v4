@@ -1,4 +1,4 @@
-# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов, проверка TF (m5→m15→h1), новый слой Oracle-VETO (PACK-BL detailed + Active-пороги) поверх текущей WL/BL-логики
+# 🔸 laboratory_decision_maker.py — воркер «советчика»: параллельная обработка запросов, TF-логика, ORACLE-VETO (PACK/MW)
 
 # 🔸 Импорты
 import asyncio
@@ -42,7 +42,7 @@ MW_BASES = ("trend", "volatility", "momentum", "extremes", "mom_align")
 # 🔸 Режим для Active-порогов oracle (таблицы *_bl_active содержат пороги в «smoothed»)
 BL_ACTIVE_DECISION_MODE = "smoothed"
 
-# 🔸 Причины отказа (новые для VETO)
+# 🔸 Причины отказа (для VETO)
 REASON_VETO_EXACT = "pack_detailed_veto_exact"
 REASON_VETO_BYKEY = "pack_detailed_veto_by_key"
 
@@ -87,7 +87,7 @@ async def run_laboratory_decision_maker():
             if not resp:
                 continue
 
-            tasks = []
+            tasks: List[asyncio.Task] = []
             for _, msgs in resp:
                 for msg_id, fields in msgs:
                     tasks.append(_process_message_guard(sem, msg_id, fields))
@@ -170,7 +170,7 @@ def _indicator_from_pack_base(pack_base: str) -> Optional[str]:
     return None
 
 
-# 🔸 Чтение live-данных
+# 🔸 Чтение live-данных MW/PACK
 async def _get_live_mw_states(symbol: str, tf: str) -> Dict[str, str]:
     # считывает текущие состояния MW-баз из ind_mw_live:{symbol}:{tf}:{kind} (JSON)
     states: Dict[str, str] = {}
@@ -287,6 +287,7 @@ else
 end
 """
 
+
 async def _release_gate(req_uid: str, gate_key: Optional[str]):
     if not gate_key:
         return
@@ -313,8 +314,6 @@ async def _handle_request(payload: dict):
     direction = str(payload.get("direction") or "").lower()
     version = str(payload.get("version") or "").lower()
     decision_mode = str(payload.get("decision_mode") or "").lower()
-    use_bl = _parse_bool(payload.get("use_bl"))
-    use_wl = _parse_bool(payload.get("use_wl"))
     use_oracle_bl = _parse_bool(payload.get("use_oracle_bl"))
     timeframes_raw = str(payload.get("timeframes") or "")
     tfs = _parse_timeframes(timeframes_raw)
@@ -348,7 +347,6 @@ async def _handle_request(payload: dict):
             tfs_requested=timeframes_raw,
             decision_mode=decision_mode or "",
             oracle_version=version or "",
-            use_bl=use_bl,
             allow=False,
             reason="bad_request",
             t_recv=t_recv,
@@ -373,7 +371,6 @@ async def _handle_request(payload: dict):
             tfs_requested=timeframes_raw,
             decision_mode=decision_mode,
             oracle_version=version,
-            use_bl=use_bl,
             allow=False,
             reason="duplicated_entry",
             t_recv=t_recv,
@@ -454,6 +451,7 @@ async def _handle_request(payload: dict):
             by_base_wl: Dict[str, List[Tuple[str, str]]] = {}
             for (pack_base, agg_key, agg_value) in pack_wl_set:
                 by_base_wl.setdefault(pack_base, []).append((agg_key, agg_value))
+
             by_base_bl: Dict[str, List[Tuple[str, str]]] = {}
             for (pack_base, agg_key, agg_value) in pack_bl_set:
                 by_base_bl.setdefault(pack_base, []).append((agg_key, agg_value))
@@ -493,7 +491,9 @@ async def _handle_request(payload: dict):
                     if val_live == agg_value_need:
                         pack_wl_hits += 1
                         wr = float(pwl_wr_map.get((base, agg_key, agg_value_need), 0.0))
-                        pack_wl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
+                        pack_wl_matches.append(
+                            {"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr}
+                        )
 
             # BL (PACK)
             pack_bl_hits = 0
@@ -509,7 +509,9 @@ async def _handle_request(payload: dict):
                     if val_live == agg_value_need:
                         pack_bl_hits += 1
                         wr = float(pbl_wr_map.get((base, agg_key, agg_value_need), 0.0))
-                        pack_bl_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr})
+                        pack_bl_matches.append(
+                            {"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need, "wr": wr}
+                        )
 
             # ---- ORACLE-VETO (если включён): сначала DETAILED, затем Active-пороги
             tf_allow: Optional[bool] = None
@@ -533,7 +535,9 @@ async def _handle_request(payload: dict):
                             continue
                         if val_live == agg_value_need:
                             pack_det_exact_hits += 1
-                            det_exact_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need})
+                            det_exact_matches.append(
+                                {"pack_base": base, "agg_key": agg_key, "agg_value": agg_value_need}
+                            )
                     if pack_det_exact_hits > 0:
                         tf_allow = False
                         tf_reason = REASON_VETO_EXACT
@@ -547,9 +551,11 @@ async def _handle_request(payload: dict):
                             continue
                         val_live = _build_pack_agg_value(agg_key, obj)
                         if val_live is None:
-                            continue  # нет данных — не вето
+                            continue
                         pack_det_bykey_hits += 1
-                        det_bykey_matches.append({"pack_base": base, "agg_key": agg_key, "agg_value_live": val_live})
+                        det_bykey_matches.append(
+                            {"pack_base": base, "agg_key": agg_key, "agg_value_live": val_live}
+                        )
                     if pack_det_bykey_hits > 0:
                         tf_allow = False
                         tf_reason = REASON_VETO_BYKEY
@@ -563,7 +569,7 @@ async def _handle_request(payload: dict):
                         decision_mode=BL_ACTIVE_DECISION_MODE,
                         direction=direction,
                         tf=tf,
-                        default=0
+                        default=0,
                     )
                     T_mw_oracle = infra.get_mw_bl_threshold(
                         master_sid=strategy_id,
@@ -571,78 +577,27 @@ async def _handle_request(payload: dict):
                         decision_mode=BL_ACTIVE_DECISION_MODE,
                         direction=direction,
                         tf=tf,
-                        default=0
+                        default=0,
                     )
                     if (int(T_pack_oracle or 0) > 0 and pack_bl_hits >= int(T_pack_oracle)) or \
                        (int(T_mw_oracle or 0) > 0 and mw_bl_hits >= int(T_mw_oracle)):
                         tf_allow = False
                         tf_reason = "bl_threshold"
                         path_used = "bl_veto"
-                    # для прозрачности добавим в tf_results ниже фактически использованные oracle-пороги
-                # если после VETO tf_allow уже False — короткое замыкание запроса после формирования tf_rows
 
-            # ---- СТАРЫЙ BL-КОНТУР (если включён) — выполняется только если oracle не срезал TF
-            bl_threshold_used_pack = None
-            bl_threshold_used_mw = None
-            if tf_allow is None and use_bl:
-                T_pack = infra.get_bl_threshold(
-                    master_sid=strategy_id,
-                    version=version,
-                    decision_mode=decision_mode,   # как и раньше: используем decision_mode из запроса
-                    direction=direction,
-                    tf=tf,
-                    default=0
-                )
-                T_mw = infra.get_mw_bl_threshold(
-                    master_sid=strategy_id,
-                    version=version,
-                    decision_mode=decision_mode,
-                    direction=direction,
-                    tf=tf,
-                    default=0
-                )
-                bl_threshold_used_pack = int(T_pack or 0)
-                bl_threshold_used_mw = int(T_mw or 0)
-                if (bl_threshold_used_pack > 0 and pack_bl_hits >= bl_threshold_used_pack) or \
-                   (bl_threshold_used_mw   > 0 and mw_bl_hits   >= bl_threshold_used_mw):
-                    tf_allow = False
-                    tf_reason = "bl_threshold"
-                    path_used = "bl_veto"
-
-            # ---- WL-пороги (минимальный winrate), применяются если BL не «срезал» TF
+            # ---- WL-логика (без порогов: достаточно наличия WL-совпадения)
             mw_max_wr = max((float(m.get("wr", 0.0)) for m in mw_matches), default=0.0) if mw_matches else 0.0
             pack_max_wr = max((float(m.get("wr", 0.0)) for m in pack_wl_matches), default=0.0) if pack_wl_matches else 0.0
 
-            mw_wl_threshold_used: Optional[float] = None
-            pack_wl_threshold_used: Optional[float] = None
-            if tf_allow is None and use_wl:
-                mw_wl_threshold_used = infra.get_wl_threshold(
-                    master_sid=strategy_id,
-                    version=version,
-                    decision_mode=decision_mode,
-                    direction=direction,
-                    tf=tf,
-                    source="mw",
-                    default=0.55
-                )
-                pack_wl_threshold_used = infra.get_wl_threshold(
-                    master_sid=strategy_id,
-                    version=version,
-                    decision_mode=decision_mode,
-                    direction=direction,
-                    tf=tf,
-                    source="pack",
-                    default=0.55
-                )
-            else:
-                mw_wl_threshold_used = mw_wl_threshold_used or 0.0
-                pack_wl_threshold_used = pack_wl_threshold_used or 0.0
-
-            # итог по TF (если не задан VETO/BL отказ — решаем по decision_mode с учётом WL)
             if tf_allow is None:
-                mw_pass = (mw_hits > 0) and (not use_wl or mw_max_wr >= float(mw_wl_threshold_used or 0.0))
-                pack_pass = (pack_wl_hits > 0) and (not use_wl or pack_max_wr >= float(pack_wl_threshold_used or 0.0))
-                tf_allow, tf_reason, path_used = _decide_per_tf_with_wl(decision_mode, mw_pass, pack_pass, missing=(len(missing_live) > 0))
+                mw_pass = (mw_hits > 0)
+                pack_pass = (pack_wl_hits > 0)
+                tf_allow, tf_reason, path_used = _decide_per_tf_with_wl(
+                    decision_mode,
+                    mw_pass,
+                    pack_pass,
+                    missing=(len(missing_live) > 0),
+                )
 
             # аккумулируем сводки
             hits_by_tf_mw[tf] = mw_hits
@@ -664,7 +619,7 @@ async def _handle_request(payload: dict):
                     "bl_total": mw_bl_total,
                     "bl_hits": mw_bl_hits,
                     "bl_matches": mw_bl_matches,
-                    "wl_threshold": float(mw_wl_threshold_used or 0.0),
+                    "wl_threshold": 0.0,
                     "wl_max_wr": float(mw_max_wr),
                 },
                 "pack": {
@@ -674,7 +629,7 @@ async def _handle_request(payload: dict):
                     "bl_total": pack_bl_total,
                     "bl_hits": pack_bl_hits,
                     "bl_matches": pack_bl_matches,
-                    "wl_threshold": float(pack_wl_threshold_used or 0.0),
+                    "wl_threshold": 0.0,
                     "wl_max_wr": float(pack_max_wr),
                 },
                 "pack_detailed": {
@@ -688,28 +643,35 @@ async def _handle_request(payload: dict):
                 "live": {"mw_states": mw_states, "missing": missing_live},
             }
 
-            # добавим в tf_results пороговые значения
+            # добавим в tf_results oracle-пороги
             tf_results["bl_thresholds"] = {
-                "pack": int(bl_threshold_used_pack or 0),
-                "mw": int(bl_threshold_used_mw or 0),
-                "pack_oracle": int(infra.get_bl_threshold(strategy_id, version, BL_ACTIVE_DECISION_MODE, direction, tf, 0)) if use_oracle_bl else 0,
-                "mw_oracle": int(infra.get_mw_bl_threshold(strategy_id, version, BL_ACTIVE_DECISION_MODE, direction, tf, 0)) if use_oracle_bl else 0,
+                "pack": 0,
+                "mw": 0,
+                "pack_oracle": int(
+                    infra.get_bl_threshold(strategy_id, version, BL_ACTIVE_DECISION_MODE, direction, tf, 0)
+                ) if use_oracle_bl else 0,
+                "mw_oracle": int(
+                    infra.get_mw_bl_threshold(strategy_id, version, BL_ACTIVE_DECISION_MODE, direction, tf, 0)
+                ) if use_oracle_bl else 0,
             }
 
             # строка TF для БД
-            tf_rows.append((tf, {
-                "mw_wl_rules_total": mw_wl_total,
-                "mw_wl_hits": mw_hits,
-                "pack_wl_rules_total": pack_wl_total,
-                "pack_wl_hits": pack_wl_hits,
-                "pack_bl_rules_total": pack_bl_total,
-                "pack_bl_hits": pack_bl_hits,
-                "allow": tf_allow,
-                "reason": tf_reason,
-                "path_used": path_used,
-                "tf_results": tf_results,
-                "errors": None,
-            }))
+            tf_rows.append((
+                tf,
+                {
+                    "mw_wl_rules_total": mw_wl_total,
+                    "mw_wl_hits": mw_hits,
+                    "pack_wl_rules_total": pack_wl_total,
+                    "pack_wl_hits": pack_wl_hits,
+                    "pack_bl_rules_total": pack_bl_total,
+                    "pack_bl_hits": pack_bl_hits,
+                    "allow": tf_allow,
+                    "reason": tf_reason,
+                    "path_used": path_used,
+                    "tf_results": tf_results,
+                    "errors": None,
+                },
+            ))
 
             # короткое замыкание при срабатывании oracle-VETO (detailed/active)
             if use_oracle_bl and (tf_reason in (REASON_VETO_EXACT, REASON_VETO_BYKEY, "bl_threshold")):
@@ -737,7 +699,6 @@ async def _handle_request(payload: dict):
         tfs_requested=timeframes_raw,
         decision_mode=decision_mode,
         oracle_version=version,
-        use_bl=use_bl,
         allow=final_allow,
         reason=final_reason,
         t_recv=t_recv,
@@ -749,17 +710,23 @@ async def _handle_request(payload: dict):
     )
 
     # итоговый лог
-    # если был короткий выход из-за oracle-VETO — пометим это в логе
     log.info(
-        "LAB_DECISION: req=%s sid=%s %s %s ver=%s tfs=%s flags[oracle_bl=%s bl=%s wl=%s] -> allow=%s reason=%s duration_ms=%d%s",
-        req_uid, strategy_id, symbol, direction, version, timeframes_raw,
-        use_oracle_bl, use_bl, use_wl,
-        final_allow, final_reason, duration_ms,
-        " (oracle_veto_shortcut)" if oracle_short_circuit else ""
+        "LAB_DECISION: req=%s sid=%s %s %s ver=%s tfs=%s flags[oracle_bl=%s] -> allow=%s reason=%s duration_ms=%d%s",
+        req_uid,
+        strategy_id,
+        symbol,
+        direction,
+        version,
+        timeframes_raw,
+        use_oracle_bl,
+        final_allow,
+        final_reason,
+        duration_ms,
+        " (oracle_veto_shortcut)" if oracle_short_circuit else "",
     )
 
 
-# 🔸 Локальная логика решения по TF с учётом WL-порогов (уже сведённых в booleans)
+# 🔸 Локальная логика решения по TF (по уже свернутым mw_pass/pack_pass)
 def _decide_per_tf_with_wl(decision_mode: str, mw_pass: bool, pack_pass: bool, *, missing: bool) -> Tuple[bool, str, str]:
     """
     Возвращает (allow, reason, path_used) по одному TF.
@@ -822,7 +789,6 @@ async def _write_request_head_only(
     tfs_requested: str,
     decision_mode: str,
     oracle_version: str,
-    use_bl: bool,
     allow: bool,
     reason: str,
     t_recv: datetime,
@@ -831,7 +797,8 @@ async def _write_request_head_only(
     hits_summary: Dict[str, Dict[str, int]],
     used_path_by_tf: Optional[Dict[str, str]] = None,
 ):
-    mw_js  = json.dumps(hits_summary.get("mw",  {}), separators=(",", ":"))
+    # сериализация сводок
+    mw_js = json.dumps(hits_summary.get("mw", {}), separators=(",", ":"))
     pwl_js = json.dumps(hits_summary.get("pwl", {}), separators=(",", ":"))
     pbl_js = json.dumps(hits_summary.get("pbl", {}), separators=(",", ":"))
     upath_js = json.dumps(used_path_by_tf or {}, separators=(",", ":"))
@@ -842,13 +809,13 @@ async def _write_request_head_only(
             INSERT INTO laboratory_request_head (
                 req_id, log_uid, strategy_id, client_strategy_id,
                 direction, symbol, timeframes_requested,
-                decision_mode, oracle_version, use_bl,
+                decision_mode, oracle_version,
                 allow, reason,
                 mw_wl_hits_by_tf, pack_wl_hits_by_tf, pack_bl_hits_by_tf,
                 used_path_by_tf,
                 received_at, finished_at, duration_ms
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18,$19)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16,$17,$18)
             ON CONFLICT (req_id) DO UPDATE SET
                 log_uid = EXCLUDED.log_uid,
                 strategy_id = EXCLUDED.strategy_id,
@@ -858,7 +825,6 @@ async def _write_request_head_only(
                 timeframes_requested = EXCLUDED.timeframes_requested,
                 decision_mode = EXCLUDED.decision_mode,
                 oracle_version = EXCLUDED.oracle_version,
-                use_bl = EXCLUDED.use_bl,
                 allow = EXCLUDED.allow,
                 reason = EXCLUDED.reason,
                 mw_wl_hits_by_tf = EXCLUDED.mw_wl_hits_by_tf,
@@ -869,13 +835,24 @@ async def _write_request_head_only(
                 finished_at = EXCLUDED.finished_at,
                 duration_ms = EXCLUDED.duration_ms
             """,
-            req_id, log_uid, int(strategy_id), client_strategy_id,
-            direction, symbol, tfs_requested,
-            decision_mode, oracle_version, bool(use_bl),
-            bool(allow), reason or "",
-            mw_js, pwl_js, pbl_js,
+            req_id,
+            log_uid,
+            int(strategy_id),
+            client_strategy_id,
+            direction,
+            symbol,
+            tfs_requested,
+            decision_mode,
+            oracle_version,
+            bool(allow),
+            reason or "",
+            mw_js,
+            pwl_js,
+            pbl_js,
             upath_js,
-            t_recv, t_fin, int(duration_ms),
+            t_recv,
+            t_fin,
+            int(duration_ms),
         )
 
 
@@ -890,7 +867,6 @@ async def _write_request_full(
     tfs_requested: str,
     decision_mode: str,
     oracle_version: str,
-    use_bl: bool,
     allow: bool,
     reason: str,
     t_recv: datetime,
@@ -900,7 +876,8 @@ async def _write_request_full(
     hits_summary: Dict[str, Dict[str, int]],
     used_path_by_tf: Optional[Dict[str, str]] = None,
 ):
-    mw_js  = json.dumps(hits_summary.get("mw",  {}), separators=(",", ":"))
+    # сериализация сводок
+    mw_js = json.dumps(hits_summary.get("mw", {}), separators=(",", ":"))
     pwl_js = json.dumps(hits_summary.get("pwl", {}), separators=(",", ":"))
     pbl_js = json.dumps(hits_summary.get("pbl", {}), separators=(",", ":"))
     upath_js = json.dumps(used_path_by_tf or {}, separators=(",", ":"))
@@ -913,13 +890,13 @@ async def _write_request_full(
                 INSERT INTO laboratory_request_head (
                     req_id, log_uid, strategy_id, client_strategy_id,
                     direction, symbol, timeframes_requested,
-                    decision_mode, oracle_version, use_bl,
+                    decision_mode, oracle_version,
                     allow, reason,
                     mw_wl_hits_by_tf, pack_wl_hits_by_tf, pack_bl_hits_by_tf,
                     used_path_by_tf,
                     received_at, finished_at, duration_ms
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18,$19)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16,$17,$18)
                 ON CONFLICT (req_id) DO UPDATE SET
                     log_uid = EXCLUDED.log_uid,
                     strategy_id = EXCLUDED.strategy_id,
@@ -929,7 +906,6 @@ async def _write_request_full(
                     timeframes_requested = EXCLUDED.timeframes_requested,
                     decision_mode = EXCLUDED.decision_mode,
                     oracle_version = EXCLUDED.oracle_version,
-                    use_bl = EXCLUDED.use_bl,
                     allow = EXCLUDED.allow,
                     reason = EXCLUDED.reason,
                     mw_wl_hits_by_tf = EXCLUDED.mw_wl_hits_by_tf,
@@ -940,35 +916,57 @@ async def _write_request_full(
                     finished_at = EXCLUDED.finished_at,
                     duration_ms = EXCLUDED.duration_ms
                 """,
-                req_id, log_uid, int(strategy_id), client_strategy_id,
-                direction, symbol, tfs_requested,
-                decision_mode, oracle_version, bool(use_bl),
-                bool(allow), reason or "",
-                mw_js, pwl_js, pbl_js,
+                req_id,
+                log_uid,
+                int(strategy_id),
+                client_strategy_id,
+                direction,
+                symbol,
+                tfs_requested,
+                decision_mode,
+                oracle_version,
+                bool(allow),
+                reason or "",
+                mw_js,
+                pwl_js,
+                pbl_js,
                 upath_js,
-                t_recv, t_fin, int(duration_ms),
+                t_recv,
+                t_fin,
+                int(duration_ms),
             )
 
             # tf rows
             if tf_rows:
                 args = []
                 for tf, row in tf_rows:
-                    tf_results_js = json.dumps(row["tf_results"], ensure_ascii=False, separators=(",", ":")) if row.get("tf_results") is not None else None
-                    errors_js = json.dumps(row["errors"], ensure_ascii=False, separators=(",", ":")) if row.get("errors") is not None else None
-                    args.append((
-                        req_id, tf,
-                        int(row.get("mw_wl_rules_total", 0)),
-                        int(row.get("pack_wl_rules_total", 0)),
-                        int(row.get("pack_bl_rules_total", 0)),
-                        int(row.get("mw_wl_hits", 0)),
-                        int(row.get("pack_wl_hits", 0)),
-                        int(row.get("pack_bl_hits", 0)),
-                        bool(row.get("allow", False)),
-                        str(row.get("reason", "") or ""),
-                        str(row.get("path_used", "none") or "none"),
-                        tf_results_js,
-                        errors_js,
-                    ))
+                    tf_results_js = (
+                        json.dumps(row["tf_results"], ensure_ascii=False, separators=(",", ":"))
+                        if row.get("tf_results") is not None
+                        else None
+                    )
+                    errors_js = (
+                        json.dumps(row["errors"], ensure_ascii=False, separators=(",", ":"))
+                        if row.get("errors") is not None
+                        else None
+                    )
+                    args.append(
+                        (
+                            req_id,
+                            tf,
+                            int(row.get("mw_wl_rules_total", 0)),
+                            int(row.get("pack_wl_rules_total", 0)),
+                            int(row.get("pack_bl_rules_total", 0)),
+                            int(row.get("mw_wl_hits", 0)),
+                            int(row.get("pack_wl_hits", 0)),
+                            int(row.get("pack_bl_hits", 0)),
+                            bool(row.get("allow", False)),
+                            str(row.get("reason", "") or ""),
+                            str(row.get("path_used", "none") or "none"),
+                            tf_results_js,
+                            errors_js,
+                        )
+                    )
                 await conn.executemany(
                     """
                     INSERT INTO laboratory_request_tf (
@@ -991,5 +989,5 @@ async def _write_request_full(
                         tf_results = EXCLUDED.tf_results,
                         errors = EXCLUDED.errors
                     """,
-                    args
+                    args,
                 )
