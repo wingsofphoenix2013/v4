@@ -1,4 +1,4 @@
-# 🔸 laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск фоновых воркеров
+# laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск фоновых воркеров
 
 # 🔸 Импорты
 import asyncio
@@ -13,6 +13,7 @@ from laboratory_config import (
     load_initial_config,
     lists_stream_listener,
     config_event_listener,
+    auditor_ready_listener,
 )
 
 # 🔸 импорт воркера «советчика»
@@ -32,6 +33,7 @@ INITIAL_DELAY_CONFIG = 0
 INITIAL_DELAY_DECISION = 0
 INITIAL_DELAY_POSTPROC = 0
 INITIAL_DELAY_CLEANER = 0
+INITIAL_DELAY_AUDITOR_READY = 0
 
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
@@ -92,7 +94,7 @@ async def main():
 
     log.info("🚀 Запуск фоновых воркеров laboratory_v4")
 
-    # слушатели: списки (Streams) и конфиги (Pub/Sub)
+    # слушатели: списки (Streams), конфиги (Pub/Sub) и READY от auditor_v4
     await asyncio.gather(
         # слушатель обновлений WL/BL из oracle (Redis Streams)
         run_safe_loop(
@@ -103,6 +105,11 @@ async def main():
         run_safe_loop(
             lambda: _start_with_delay(config_event_listener, INITIAL_DELAY_CONFIG),
             "LAB_CONFIG_PUBSUB",
+        ),
+        # слушатель READY-событий от auditor_v4 (обновление витрины лучшей идеи)
+        run_safe_loop(
+            lambda: _start_with_delay(auditor_ready_listener, INITIAL_DELAY_AUDITOR_READY),
+            "LAB_AUDITOR_READY",
         ),
         # «советчик»: запрос → решение → ответ в стрим → запись в БД
         run_safe_loop(
