@@ -1,22 +1,4 @@
 # 🔸 auditor_best_selector.py — оркестратор витрины «лучшая идея по стратегии/направлению»
-#     Простой событийный режим (НЕ ждёт других идей и НЕ ждёт «финала раунда»):
-#     — каждое сообщение обрабатывается сразу: сравнили с текущей витриной → обновили / удалили / пропустили.
-#     — если eligible=false и текущая витрина принадлежит той же идее → удаляем строку (стратегия на паузе).
-#     — если eligible=true → сравниваем с текущей по ΔROI (далее ROI_selected, confidence, coverage) → при лучшем апсертим.
-#
-#     Формат сообщения (Redis Stream: auditor:best:candidates, поле "data" НЕ используется — поля плоско):
-#       type="result"
-#       strategy_id, direction ('long'|'short'), idea_key, variant_key,
-#       primary_window ('7d'|'14d'|'28d'),
-#       eligible ('true'|'false'),
-#       roi_selected_pct?, roi_all_pct?, wr_selected_pct?, wr_all_pct?, coverage_pct?, decision_confidence?,
-#       config_json?, source_table?, source_run_id?, event_uid?
-#
-#     Требование к идеям: всегда присылать result по каждой (strategy_id, direction).
-#       eligible=true  → обязательно передать ROI/WR/coverage/conf/config_json.
-#       eligible=false → метрики можно не передавать.
-#
-#     Витрина БД: auditor_current_best (PRIMARY KEY(strategy_id, direction))
 
 # 🔸 Импорты
 import asyncio
@@ -145,10 +127,9 @@ async def run_auditor_best_selector():
             log.exception("❌ AUD_BEST: ошибка цикла — пауза 5 секунд")
             await asyncio.sleep(5)
 
-
-# 🔸 Обработка одного сообщения type="result" (без ожиданий)
+# 🔸 Обработка одного сообщения type="result" (только свежие прогоны попадают в витрину)
 async def _handle_message(fields: Dict[str, str]):
-    # дедупликатор по event_uid (если прислан)
+    # дедуп по event_uid (если прислан)
     event_uid = fields.get("event_uid", "")
     if event_uid:
         added = await infra.redis_client.sadd(SEEN_SET, event_uid)
@@ -160,6 +141,7 @@ async def _handle_message(fields: Dict[str, str]):
     if msg_type != "result":
         return
 
+    # входные поля
     sid = _si(fields.get("strategy_id"))
     direction = _norm_dir(fields.get("direction"))
     idea_key = str(fields.get("idea_key", "")).strip()
@@ -167,26 +149,35 @@ async def _handle_message(fields: Dict[str, str]):
     primary_window = str(fields.get("primary_window", "")).strip()
     eligible = _as_bool(fields.get("eligible", "false"))
 
+    # валидации сообщения
     if not sid or direction not in ("long", "short") or not idea_key:
         log.info("ℹ️ AUD_BEST: пропуск некорректного сообщения (sid=%s dir=%s idea=%s)", sid, direction, idea_key)
         return
     if idea_key not in ACTIVE_IDEAS:
-        # игнорируем неизвестные идеи
         return
 
-    # читаем текущую строку витрины по (sid,dir)
+    # run текущего сообщения (используем ДЛЯ СВЕЖЕСТИ всегда run_id)
+    msg_run = _si(fields.get("run_id"))
+
+    # читаем текущую витрину
     cur = await _read_current_best(sid, direction)
+    cur_run = _si(cur.get("source_run_id", 0)) if cur else 0
 
+    # если пришёл БОЛЕЕ СВЕЖИЙ прогон — сразу удаляем строку витрины (без сравнения)
+    if cur and msg_run > cur_run:
+        await _delete_current_best(sid, direction)
+        log.info("🧹 AUD_BEST: sid=%s dir=%s — очищена витрина (старый run=%s < новый=%s)",
+                 sid, direction, cur_run, msg_run)
+        cur = None
+        cur_run = 0
+
+    # если кандидат ineligible — фиксируем и выходим (витрина уже очищена при необходимости)
     if not eligible:
-        # идея говорит «не годится»: если текущая витрина принадлежит этой идее — удаляем; иначе ничего не делаем
-        if cur and str(cur.get("idea_key")) == idea_key:
-            await _delete_current_best(sid, direction)
-            log.info("🗑️ AUD_BEST: sid=%s dir=%s — удалена витрина (ineligible от %s)", sid, direction, idea_key)
-        else:
-            log.info("ℹ️ AUD_BEST: sid=%s dir=%s — ineligible %s, витрина не тронута", sid, direction, idea_key)
+        log.info("ℹ️ AUD_BEST: sid=%s dir=%s — ineligible %s (run=%s); витрина %s",
+                 sid, direction, idea_key, msg_run, "пустая" if cur is None else "без изменений")
         return
 
-    # eligible=true → готовим кандидат
+    # распаковка метрик кандидата
     roi_sel = _sf(fields.get("roi_selected_pct"))
     roi_all = _sf(fields.get("roi_all_pct"))
     delta_roi = roi_sel - roi_all
@@ -194,13 +185,17 @@ async def _handle_message(fields: Dict[str, str]):
     wr_all = _sf(fields.get("wr_all_pct"))
     coverage = _sf(fields.get("coverage_pct"))
     conf = _sf(fields.get("decision_confidence"))
+    source_table = (fields.get("source_table") or "unknown").strip()
+
+    # нормализация config_json
     cfg_raw = fields.get("config_json") or "{}"
     try:
         cfg_json = json.dumps(json.loads(cfg_raw))
     except Exception:
         cfg_json = "{}"
-    source_table = str(fields.get("source_table", "")).strip()
-    source_run_id = _si(fields.get("source_run_id"))
+
+    # source_run_id в витрине храним как source_run_id ИЛИ run_id, чтобы свежесть всегда работала
+    cand_run = _si(fields.get("source_run_id")) or msg_run
 
     cand = {
         "strategy_id": sid,
@@ -218,19 +213,31 @@ async def _handle_message(fields: Dict[str, str]):
         "decision_class": "green" if (delta_roi >= 5.0 and (wr_sel - wr_all) >= 3.0) else ("yellow" if delta_roi > 0.0 else "red"),
         "decision_confidence": conf,
         "config_json": cfg_json,
-        "source_table": source_table or "unknown",
-        "source_run_id": source_run_id or 0,
+        "source_table": source_table,
+        "source_run_id": cand_run,
     }
 
-    # сравнить и записать при улучшении
+    # если витрина пуста (после очистки или изначально) — сразу ставим кандидата без сравнения
+    if cur is None:
+        await _upsert_current_best(cand)
+        log.info("🏁 AUD_BEST: sid=%s dir=%s → BEST [%s/%s] (fresh run=%s) ΔROI=%.2fpp (ROI_sel=%.2f%%) cov=%.1f%%",
+                 sid, direction, idea_key, variant_key, cand_run, delta_roi, roi_sel, coverage)
+        return
+
+    # защита от запоздавших сообщений старых прогонов
+    if msg_run < cur_run:
+        log.info("⏭️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] старее текущего (run=%s < %s), пропуск",
+                 sid, direction, idea_key, variant_key, msg_run, cur_run)
+        return
+
+    # msg_run == cur_run → сравнение только внутри свежего прогона
     if _is_better(cand, cur):
         await _upsert_current_best(cand)
         log.info("🏁 AUD_BEST: sid=%s dir=%s → BEST [%s/%s] ΔROI=%.2fpp (ROI_sel=%.2f%%) cov=%.1f%%",
                  sid, direction, idea_key, variant_key, delta_roi, roi_sel, coverage)
     else:
-        log.info("ℹ️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] хуже текущего, пропуск",
+        log.info("ℹ️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] хуже текущего в том же run, пропуск",
                  sid, direction, idea_key, variant_key)
-
 
 # 🔸 Чтение текущей витрины по (sid,dir)
 async def _read_current_best(sid: int, direction: str) -> Optional[Dict[str, Any]]:
