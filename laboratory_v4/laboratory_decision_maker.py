@@ -719,7 +719,7 @@ async def _handle_request(payload: dict):
     )
 
     # итоговый лог
-    log.info(
+    log.debug(
         "LAB_DECISION: req=%s sid=%s %s %s ver=%s tfs=%s flags[oracle_bl=%s] -> allow=%s reason=%s duration_ms=%d%s",
         req_uid,
         strategy_id,
