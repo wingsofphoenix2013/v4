@@ -1,5 +1,4 @@
-# laboratory_config.py — стартовая загрузка laboratory_v4: тикеры/стратегии, MW/PACK WL/BL (+winrate),
-# Active-пороги (MW-BL, PACK-BL), VETO-карты PACK-BL detailed (by_key/exact) и витрина auditor_v4 (auditor_current_best) + слушатели all_ready/auditor_ready и Pub/Sub конфигов
+# 🔸 laboratory_config.py — стартовая загрузка laboratory_v4: тикеры/стратегии, MW/PACK WL/BL (+winrate), Active-пороги (MW-BL, PACK-BL) и VETO-карты PACK-BL detailed (by_key/exact) + слушатель единого стрима all_ready
 
 # 🔸 Импорты
 import asyncio
@@ -25,23 +24,15 @@ from laboratory_infra import (
     # VETO-карты PACK-BL detailed
     replace_pack_bl_detailed,
     update_pack_bl_detailed_for_strategy,
-    # Витрина auditor_v4
-    set_lab_auditor_best_bulk,
-    upsert_lab_auditor_best,
 )
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_CONFIG")
 
-# 🔸 Константы потоков/групп для oracle PACK/MW
+# 🔸 Константы потоков/групп
 ALL_READY_STREAM = "oracle:pack_lists:all_ready"
 LAB_LISTS_GROUP = "LAB_LISTS_GROUP"
 LAB_LISTS_WORKER = "LAB_LISTS_WORKER"
-
-# 🔸 Константы потоков/групп для auditor_v4 READY
-AUDITOR_READY_STREAM = "auditor:best:ready"
-LAB_AUDITOR_GROUP = "LAB_AUDITOR_GROUP"
-LAB_AUDITOR_WORKER = "LAB_AUDITOR_WORKER"
 
 # 🔸 Константы каналов Pub/Sub
 PUBSUB_TICKERS = "bb:tickers_events"
@@ -53,7 +44,7 @@ ALLOWED_VERSIONS = ("v1", "v2", "v3", "v4", "v5")
 DECISION_MODE_SMOOTHED = "smoothed"  # для best_threshold_smoothed
 
 
-# 🔸 Первичная стартовая загрузка (тикеры, стратегии, WL/BL v1–v5 + Active-пороги + VETO-карты detailed + витрина auditor_v4)
+# 🔸 Первичная стартовая загрузка (тикеры, стратегии, WL/BL v1–v5 + Active-пороги + VETO-карты detailed)
 async def load_initial_config():
     # условия достаточности
     if infra.pg_pool is None or infra.redis_client is None:
@@ -76,8 +67,6 @@ async def load_initial_config():
     await _load_pack_bl_active_all()
     # PACK-BL Detailed Active → VETO-карты (by_key/exact, только status='active')
     await _load_pack_bl_detailed_active_all()
-    # Витрина auditor_v4: текущие победители по стратегиям/направлениям
-    await _load_auditor_current_best_all()
 
     # итог
     log.info(
@@ -87,8 +76,7 @@ async def load_initial_config():
         "mw_bl[v1]=%d, mw_bl[v2]=%d, mw_bl[v3]=%d, mw_bl[v4]=%d, mw_bl[v5]=%d, "
         "pack_wl[v1]=%d, pack_wl[v2]=%d, pack_wl[v3]=%d, pack_wl[v4]=%d, pack_wl[v5]=%d, "
         "pack_bl[v1]=%d, pack_bl[v2]=%d, pack_bl[v3]=%d, pack_bl[v4]=%d, pack_bl[v5]=%d, "
-        "mw_bl_active=%d, pack_bl_active=%d (version=%s, mode=%s), "
-        "auditor_best=%d",
+        "mw_bl_active=%d, pack_bl_active=%d (version=%s, mode=%s)",
         len(infra.lab_tickers),
         len(infra.lab_strategies),
         len(infra.lab_mw_wl.get("v1", {})),
@@ -115,7 +103,6 @@ async def load_initial_config():
         len(infra.lab_bl_active),
         ACTIVE_LISTS_VERSION,
         DECISION_MODE_SMOOTHED,
-        len(infra.lab_auditor_best),
     )
 
 
@@ -211,107 +198,6 @@ async def lists_stream_listener():
             raise
         except Exception:
             log.exception("❌ LAB: ошибка цикла lists_stream_listener — пауза 5 секунд")
-            await asyncio.sleep(5)
-
-
-# 🔸 Слушатель READY от auditor_v4: обновление in-memory витрины lab_auditor_best по auditor_current_best
-async def auditor_ready_listener():
-    # условия достаточности
-    if infra.redis_client is None:
-        log.info("❌ Пропуск auditor_ready_listener: Redis не инициализирован")
-        return
-
-    # создать consumer group (идемпотентно)
-    try:
-        await infra.redis_client.xgroup_create(
-            name=AUDITOR_READY_STREAM,
-            groupname=LAB_AUDITOR_GROUP,
-            id="$",
-            mkstream=True,
-        )
-        log.info("📡 LAB: создана consumer group для стрима %s", AUDITOR_READY_STREAM)
-    except Exception as e:
-        if "BUSYGROUP" in str(e):
-            pass
-        else:
-            log.exception("❌ LAB: ошибка создания consumer group для %s", AUDITOR_READY_STREAM)
-            return
-
-    log.info("🚀 LAB: старт auditor_ready_listener (stream=%s)", AUDITOR_READY_STREAM)
-
-    # основной цикл
-    while True:
-        try:
-            resp = await infra.redis_client.xreadgroup(
-                groupname=LAB_AUDITOR_GROUP,
-                consumername=LAB_AUDITOR_WORKER,
-                streams={AUDITOR_READY_STREAM: ">"},
-                count=128,
-                block=30_000,
-            )
-            if not resp:
-                continue
-
-            acks = []
-
-            for stream_name, msgs in resp:
-                for msg_id, fields in msgs:
-                    try:
-                        # READY может приходить либо плоскими полями, либо в JSON "data"
-                        payload_raw = fields.get("data")
-                        if isinstance(payload_raw, str):
-                            try:
-                                payload = json.loads(payload_raw)
-                            except Exception:
-                                payload = {}
-                        elif isinstance(payload_raw, dict):
-                            payload = payload_raw
-                        else:
-                            payload = {}
-
-                        # fallback: пробуем взять напрямую из fields, если чего-то нет
-                        sid_val = payload.get("strategy_id") or fields.get("strategy_id")
-                        dir_val = payload.get("direction") or fields.get("direction")
-
-                        try:
-                            sid = int(sid_val)
-                        except Exception:
-                            sid = 0
-                        direction = str(dir_val or "").lower()
-
-                        # валидация входа
-                        if not sid or direction not in ("long", "short"):
-                            log.info(
-                                "ℹ️ AUDITOR_READY: пропуск payload sid=%r direction=%r raw=%s",
-                                sid_val, dir_val, fields
-                            )
-                            acks.append(msg_id)
-                            continue
-
-                        # точечное обновление витрины по (sid, dir)
-                        updated = await _reload_auditor_best_for_strategy(sid, direction)
-
-                        log.info(
-                            "🔁 LAB: auditor_best обновлён из READY — sid=%d, dir=%s, updated=%d",
-                            sid, direction, updated
-                        )
-
-                        acks.append(msg_id)
-                    except Exception:
-                        log.exception("❌ LAB: ошибка обработки сообщения в %s", stream_name)
-                        acks.append(msg_id)
-
-            if acks:
-                try:
-                    await infra.redis_client.xack(AUDITOR_READY_STREAM, LAB_AUDITOR_GROUP, *acks)
-                except Exception:
-                    log.exception("⚠️ LAB: ошибка ACK (ids=%s)", acks)
-
-        except asyncio.CancelledError:
-            log.info("⏹️ LAB: auditor_ready_listener остановлен по сигналу")
-            raise
-        except Exception:
-            log.exception("❌ LAB: ошибка цикла auditor_ready_listener — пауза 5 секунд")
             await asyncio.sleep(5)
 
 
@@ -568,10 +454,8 @@ async def _load_mw_bl_active_all():
         }
 
     set_mw_bl_active_bulk(active_map)
-    log.info(
-        "✅ LAB: MW-BL Active загружены (initial): records=%d, version=%s, mode=%s",
-        len(infra.lab_mw_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED
-    )
+    log.info("✅ LAB: MW-BL Active загружены (initial): records=%d, version=%s, mode=%s",
+             len(infra.lab_mw_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED)
 
 
 # 🔸 Загрузка PACK-BL Active (smoothed) — initial-load
@@ -603,10 +487,8 @@ async def _load_pack_bl_active_all():
         }
 
     set_bl_active_bulk(active_map)
-    log.info(
-        "✅ LAB: PACK-BL Active загружены (initial): records=%d, version=%s, mode=%s",
-        len(infra.lab_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED
-    )
+    log.info("✅ LAB: PACK-BL Active загружены (initial): records=%d, version=%s, mode=%s",
+             len(infra.lab_bl_active), ACTIVE_LISTS_VERSION, DECISION_MODE_SMOOTHED)
 
 
 # 🔸 Загрузка PACK-BL Detailed Active → VETO-карты (by_key/exact, только status='active') — initial-load
@@ -656,8 +538,7 @@ async def _load_pack_bl_detailed_active_all():
         total_exact_entries += sum(len(s) for s in emap.values())
 
     log.info(
-        "✅ LAB: PACK-BL Detailed Active загружены: by_key[v5]=%d entries=%d; exact[v5]=%d entries=%d "
-        "(по всем версиям: slices_by_key=%d, entries_by_key=%d, slices_exact=%d, entries_exact=%d)",
+        "✅ LAB: PACK-BL Detailed Active загружены: by_key[v5]=%d entries=%d; exact[v5]=%d entries=%d (по всем версиям: slices_by_key=%d, entries_by_key=%d, slices_exact=%d, entries_exact=%d)",
         len(bykey_per_ver.get("v5", {})),
         sum(len(s) for s in bykey_per_ver.get("v5", {}).values()),
         len(exact_per_ver.get("v5", {})),
@@ -666,70 +547,7 @@ async def _load_pack_bl_detailed_active_all():
     )
 
 
-# 🔸 Загрузка витрины auditor_v4 (auditor_current_best) — initial-load
-async def _load_auditor_current_best_all():
-    best_map: Dict[Tuple[int, str], dict] = {}
-
-    async with infra.pg_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                strategy_id,
-                direction,
-                idea_key,
-                variant_key,
-                primary_window,
-                coverage_pct,
-                roi_selected_pct,
-                roi_all_pct,
-                delta_roi_pp,
-                wr_selected_pct,
-                wr_all_pct,
-                delta_wr_pp,
-                decision_class,
-                decision_confidence,
-                config_json,
-                source_table,
-                source_run_id,
-                updated_at
-            FROM auditor_current_best
-            """
-        )
-
-    for r in rows:
-        sid = int(r["strategy_id"])
-        direction = str(r["direction"]).lower()
-        key = (sid, direction)
-        best_map[key] = {
-            "strategy_id": sid,
-            "direction": direction,
-            "idea_key": str(r["idea_key"]),
-            "variant_key": str(r["variant_key"]),
-            "primary_window": str(r["primary_window"]),
-            "coverage_pct": float(r["coverage_pct"] or 0.0),
-            "roi_selected_pct": float(r["roi_selected_pct"] or 0.0),
-            "roi_all_pct": float(r["roi_all_pct"] or 0.0),
-            "delta_roi_pp": float(r["delta_roi_pp"] or 0.0),
-            "wr_selected_pct": float(r["wr_selected_pct"] or 0.0),
-            "wr_all_pct": float(r["wr_all_pct"] or 0.0),
-            "delta_wr_pp": float(r["delta_wr_pp"] or 0.0),
-            "decision_class": str(r["decision_class"]),
-            "decision_confidence": float(r["decision_confidence"] or 0.0),
-            "config_json": r["config_json"],
-            "source_table": str(r["source_table"]),
-            "source_run_id": int(r["source_run_id"]),
-            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-        }
-
-    set_lab_auditor_best_bulk(best_map)
-
-    log.info(
-        "✅ LAB: витрина auditor_current_best загружена: records=%d",
-        len(infra.lab_auditor_best),
-    )
-
-
-# 🔸 Точечные перезагрузки по сообщению единого стрима oracle PACK/MW
+# 🔸 Точечные перезагрузки по сообщению единого стрима
 
 async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
     slice_map: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
@@ -756,10 +574,8 @@ async def _reload_mw_wl_for_strategy(strategy_id: int, version: str):
         wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
 
     update_mw_whitelist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
-    log.info(
-        "🔁 LAB: MW WL обновлён из all_ready — sid=%d, version=%s, slices=%d",
-        strategy_id, version, sum(len(v) for v in slice_map.values())
-    )
+    log.info("🔁 LAB: MW WL обновлён из all_ready — sid=%d, version=%s, slices=%d",
+             strategy_id, version, sum(len(v) for v in slice_map.values()))
 
 
 async def _reload_mw_bl_for_strategy(strategy_id: int, version: str):
@@ -787,10 +603,8 @@ async def _reload_mw_bl_for_strategy(strategy_id: int, version: str):
         wr_map.setdefault((int(strategy_id), tf, direction), {})[(base, state)] = wr
 
     update_mw_blacklist_for_strategy(version, strategy_id, slice_map, wr_map=wr_map)
-    log.info(
-        "🔁 LAB: MW BL обновлён из all_ready — sid=%d, version=%s, slices=%d",
-        strategy_id, version, sum(len(v) for v in slice_map.values())
-    )
+    log.info("🔁 LAB: MW BL обновлён из all_ready — sid=%d, version=%s, slices=%d",
+             strategy_id, version, sum(len(v) for v in slice_map.values()))
 
 
 async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
@@ -831,8 +645,7 @@ async def _reload_pack_lists_for_strategy(strategy_id: int, version: str):
     update_pack_list_for_strategy("blacklist", version, strategy_id, bl_slice, wr_map=bl_wr)
     log.info(
         "🔁 LAB: PACK WL/BL обновлены из all_ready — sid=%d, version=%s, wl_slices=%d, bl_slices=%d",
-        strategy_id, version,
-        sum(len(v) for v in wl_slice.values()), sum(len(v) for v in bl_slice.values())
+        strategy_id, version, sum(len(v) for v in wl_slice.values()), sum(len(v) for v in bl_slice.values())
     )
 
 
@@ -864,10 +677,8 @@ async def _reload_mw_bl_active_for_strategy(strategy_id: int, version: str) -> i
             computed_at=(r["computed_at"].isoformat() if r["computed_at"] else ""),
         )
         updated += 1
-    log.info(
-        "🔁 LAB: MW-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
-        strategy_id, version, updated, DECISION_MODE_SMOOTHED
-    )
+    log.info("🔁 LAB: MW-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
+             strategy_id, version, updated, DECISION_MODE_SMOOTHED)
     return updated
 
 
@@ -899,10 +710,8 @@ async def _reload_pack_bl_active_for_strategy(strategy_id: int, version: str) ->
             computed_at=(r["computed_at"].isoformat() if r["computed_at"] else ""),
         )
         updated += 1
-    log.info(
-        "🔁 LAB: PACK-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
-        strategy_id, version, updated, DECISION_MODE_SMOOTHED
-    )
+    log.info("🔁 LAB: PACK-BL Active обновлён из all_ready — sid=%d, version=%s, updated=%d, mode=%s",
+             strategy_id, version, updated, DECISION_MODE_SMOOTHED)
     return updated
 
 
@@ -941,74 +750,7 @@ async def _reload_pack_bl_detailed_active_for_strategy(strategy_id: int, version
     exact_entries = sum(len(s) for s in exact_slice.values())
 
     log.info(
-        "🔁 LAB: PACK-BL Detailed VETO обновлены из all_ready — sid=%d, version=%s, "
-        "by_key_slices=%d entries=%d, exact_slices=%d entries=%d",
+        "🔁 LAB: PACK-BL Detailed VETO обновлены из all_ready — sid=%d, version=%s, by_key_slices=%d entries=%d, exact_slices=%d entries=%d",
         strategy_id, version, len(bykey_slice), bykey_entries, len(exact_slice), exact_entries
     )
     return bykey_entries, exact_entries
-
-
-# 🔸 Точечная перезагрузка витрины auditor_v4 по sid+direction
-async def _reload_auditor_best_for_strategy(strategy_id: int, direction: str) -> int:
-    async with infra.pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT
-                strategy_id,
-                direction,
-                idea_key,
-                variant_key,
-                primary_window,
-                coverage_pct,
-                roi_selected_pct,
-                roi_all_pct,
-                delta_roi_pp,
-                wr_selected_pct,
-                wr_all_pct,
-                delta_wr_pp,
-                decision_class,
-                decision_confidence,
-                config_json,
-                source_table,
-                source_run_id,
-                updated_at
-            FROM auditor_current_best
-            WHERE strategy_id = $1
-              AND direction = $2
-            """,
-            int(strategy_id),
-            str(direction),
-        )
-
-    if not row:
-        # витрина для (sid, dir) исчезла — убираем из кэша
-        upsert_lab_auditor_best(strategy_id, direction, None)
-        log.info(
-            "ℹ️ LAB: auditor_current_best пуст для sid=%d dir=%s — запись удалена из кэша",
-            strategy_id, direction,
-        )
-        return 0
-
-    rec = {
-        "strategy_id": int(row["strategy_id"]),
-        "direction": str(row["direction"]).lower(),
-        "idea_key": str(row["idea_key"]),
-        "variant_key": str(row["variant_key"]),
-        "primary_window": str(row["primary_window"]),
-        "coverage_pct": float(row["coverage_pct"] or 0.0),
-        "roi_selected_pct": float(row["roi_selected_pct"] or 0.0),
-        "roi_all_pct": float(row["roi_all_pct"] or 0.0),
-        "delta_roi_pp": float(row["delta_roi_pp"] or 0.0),
-        "wr_selected_pct": float(row["wr_selected_pct"] or 0.0),
-        "wr_all_pct": float(row["wr_all_pct"] or 0.0),
-        "delta_wr_pp": float(row["delta_wr_pp"] or 0.0),
-        "decision_class": str(row["decision_class"]),
-        "decision_confidence": float(row["decision_confidence"] or 0.0),
-        "config_json": row["config_json"],
-        "source_table": str(row["source_table"]),
-        "source_run_id": int(row["source_run_id"]),
-        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
-    }
-
-    upsert_lab_auditor_best(strategy_id, direction, rec)
-    return 1

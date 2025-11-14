@@ -21,6 +21,8 @@ from laboratory_auditor_config import (
 )
 # 🔸 импорт воркера «советчика» (oracle-контур)
 from laboratory_decision_maker import run_laboratory_decision_maker
+# 🔸 импорт воркера аудиторной ветки
+from laboratory_decision_auditor import run_laboratory_decision_auditor
 # 🔸 импорт воркера пост-процессинга
 from laboratory_postproc import run_laboratory_postproc
 # 🔸 импорт воркера CLEANER
@@ -37,6 +39,7 @@ INITIAL_DELAY_DECISION = 0
 INITIAL_DELAY_POSTPROC = 0
 INITIAL_DELAY_CLEANER = 0
 INITIAL_DELAY_AUDITOR_READY = 0
+INITIAL_DELAY_AUDITOR_DECISION = 0
 
 # пример периодичности для потенциальных периодических задач (сек) — не используется сейчас
 DEFAULT_INTERVAL_SEC = 6 * 60 * 60
@@ -121,6 +124,11 @@ async def main():
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_decision_maker, INITIAL_DELAY_DECISION),
             "LAB_DECISION",
+        ),
+        # «советчик» аудиторной ветки
+        run_safe_loop(
+            lambda: _start_with_delay(run_laboratory_decision_auditor, INITIAL_DELAY_AUDITOR_DECISION),
+            "LAB_DECISION_AUDITOR",
         ),
         # пост-процессинг закрытых позиций
         run_safe_loop(

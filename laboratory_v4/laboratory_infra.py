@@ -1,4 +1,4 @@
-# laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate), активные пороги и витрина auditor_v4
+# 🔸 laboratory_infra.py — инфраструктура laboratory_v4: логирование, PG/Redis, кэши конфигурации (+winrate), активные пороги и VETO-карты PACK-BL (by_key/exact)
 
 # 🔸 Импорты
 import os
@@ -40,8 +40,8 @@ lab_pack_wl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], 
 lab_pack_bl_wr: Dict[str, Dict[Tuple[int, str, str], Dict[Tuple[str, str, str], float]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 
 # 🔸 PACK-BL Detailed (VETO) — активные правила по версиям (v1–v5)
-#   by_key: версия -> {(sid, tf, dir) -> {(pack_base, agg_key), ...}}
-#   exact:  версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}
+#   by_key: версия -> {(sid, tf, dir) -> {(pack_base, agg_key), ...}}     # блокировать любые agg_value внутри пары (pack_base, agg_key)
+#   exact:  версия -> {(sid, tf, dir) -> {(pack_base, agg_key, agg_value), ...}}  # блокировать только конкретное значение
 lab_pack_bl_detailed_bykey: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 lab_pack_bl_detailed_exact: Dict[str, Dict[Tuple[int, str, str], Set[Tuple[str, str, str]]]] = {"v1": {}, "v2": {}, "v3": {}, "v4": {}, "v5": {}}
 
@@ -56,10 +56,6 @@ lab_bl_active: Dict[Tuple[int, str, str, str, str], Dict[str, Any]] = {}
 # значение: {"threshold": int, "best_roi": float, "roi_base": float, "positions_total": int,
 #            "deposit_used": float, "computed_at": "ISO8601"}
 lab_mw_bl_active: Dict[Tuple[int, str, str, str, str], Dict[str, Any]] = {}
-
-# 🔸 Победители auditor_v4 по стратегиям (витрина лучшей идеи)
-# ключ: (strategy_id, direction) -> row_dict из auditor_current_best
-lab_auditor_best: Dict[Tuple[int, str], dict] = {}
 
 # 🔸 Переменные окружения
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -565,45 +561,3 @@ def get_mw_bl_threshold(
     if not rec:
         return int(default)
     return int(rec.get("threshold", default))
-
-
-# 🔸 Управление кэшем победителей auditor_v4
-
-def set_lab_auditor_best_bulk(new_map: Dict[Tuple[int, str], dict]):
-    """
-    Полная замена кэша победителей auditor_v4 (auditor_current_best).
-    """
-    global lab_auditor_best
-    lab_auditor_best = new_map or {}
-    log.debug("LAB: auditor best cache replaced (records=%d)", len(lab_auditor_best))
-
-
-def upsert_lab_auditor_best(
-    strategy_id: int,
-    direction: str,
-    row: Optional[Dict[str, Any]],
-):
-    """
-    Точечное обновление записи победителя auditor_v4 в памяти.
-
-    Если row is None — запись удаляется из кэша.
-    """
-    key = (int(strategy_id), str(direction))
-    if row is None:
-        if key in lab_auditor_best:
-            lab_auditor_best.pop(key, None)
-            log.debug("LAB: auditor best removed — sid=%s dir=%s", key[0], key[1])
-        return
-
-    rec = dict(row or {})
-    lab_auditor_best[key] = rec
-
-    idea = rec.get("idea_key")
-    variant = rec.get("variant_key")
-    roi_sel = float(rec.get("roi_selected_pct") or 0.0)
-    cov = float(rec.get("coverage_pct") or 0.0)
-
-    log.debug(
-        "LAB: auditor best upsert — sid=%s dir=%s idea=%s variant=%s roi_sel=%.6f cov=%.2f",
-        key[0], key[1], idea, variant, roi_sel, cov
-    )
