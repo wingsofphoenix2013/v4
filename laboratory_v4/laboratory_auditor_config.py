@@ -283,13 +283,12 @@ def invalidate_thresholds_for(strategy_id: int, direction: str, old_run_id: int)
             sid, dir_norm, old_run, len(to_delete)
         )
 
-
 # 🔸 Воркер-слушатель READY стрима аудитора
 
 async def run_laboratory_auditor_ready_listener():
     """
-    Вечный воркер: слушает auditor:best:ready, при READY по (run_id, strategy_id, direction)
-    перезагружает витрину для пары (sid, dir) и очищает thresholds старого run_id.
+    Вечный воркер: слушает auditor:best:ready, при READY по (strategy_id, direction)
+    перезагружает витрину для пары (sid, dir) и очищает thresholds старого source_run_id.
     """
     # условия достаточности
     if infra.redis_client is None or infra.pg_pool is None:
@@ -332,12 +331,11 @@ async def run_laboratory_auditor_ready_listener():
             for stream_name, msgs in resp:
                 for msg_id, fields in msgs:
                     try:
-                        # ожидаем поля run_id, strategy_id, direction в READY-сообщении
-                        run_id_raw = fields.get("run_id")
+                        # ожидаем поля strategy_id и direction в READY-сообщении
                         sid_raw = fields.get("strategy_id")
                         direction_raw = fields.get("direction")
 
-                        if not run_id_raw or not sid_raw or not direction_raw:
+                        if not sid_raw or not direction_raw:
                             log.info(
                                 "ℹ️ LAB_AUDITOR_CFG: пропуск READY-сообщения (нехватает полей) id=%s payload=%s",
                                 msg_id, fields
@@ -345,22 +343,20 @@ async def run_laboratory_auditor_ready_listener():
                             acks.append(msg_id)
                             continue
 
-                        run_id = int(run_id_raw)
                         sid = int(sid_raw)
                         direction = str(direction_raw).lower().strip()
                         key = (sid, direction)
 
-                        old_run_id = None
+                        old_source_run_id = None
                         old = best_by_sid_dir.get(key)
                         if old is not None:
-                            old_run_id = old.source_run_id
+                            old_source_run_id = old.source_run_id
 
-                        # обновляем витрину по паре
-                        await _reload_best_for_pair(sid, direction, old_run_id)
-
-                        # очищаем thresholds по старому run_id (если отличался)
-                        if old_run_id is not None and old_run_id != run_id:
-                            invalidate_thresholds_for(sid, direction, old_run_id)
+                        # обновляем витрину по паре и получаем новую запись
+                        new_rec = await _reload_best_for_pair(sid, direction)
+                        if new_rec is not None and old_source_run_id is not None:
+                            if old_source_run_id != new_rec.source_run_id:
+                                invalidate_thresholds_for(sid, direction, old_source_run_id)
 
                         acks.append(msg_id)
                     except Exception:
@@ -384,15 +380,15 @@ async def run_laboratory_auditor_ready_listener():
 
 # 🔸 Вспомогательная функция перезагрузки пары (strategy_id, direction)
 
-async def _reload_best_for_pair(strategy_id: int, direction: str, old_run_id: Optional[int]):
+async def _reload_best_for_pair(strategy_id: int, direction: str) -> Optional[BestIdeaRecord]:
     """
     Перезагружает запись из auditor_current_best для пары (strategy_id, direction)
-    и обновляет in-memory кеш.
+    и обновляет in-memory кеш. Возвращает новую BestIdeaRecord или None, если записи нет.
     """
     # условия достаточности
     if infra.pg_pool is None:
         log.info("❌ LAB_AUDITOR_CFG: _reload_best_for_pair — PG не инициализирован")
-        return
+        return None
 
     sid = int(strategy_id)
     dir_norm = str(direction).lower().strip()
@@ -421,7 +417,7 @@ async def _reload_best_for_pair(strategy_id: int, direction: str, old_run_id: Op
             "ℹ️ LAB_AUDITOR_CFG: запись в витрине не найдена (sid=%d, dir=%s)",
             sid, dir_norm
         )
-        return
+        return None
 
     cfg = row["config_json"]
     if isinstance(cfg, str):
@@ -456,3 +452,4 @@ async def _reload_best_for_pair(strategy_id: int, direction: str, old_run_id: Op
         "✅ LAB_AUDITOR_CFG: витрина обновлена по READY (sid=%d, dir=%s, source_run_id=%d, idea=%s, variant=%s)",
         sid, dir_norm, rec.source_run_id, rec.idea_key, rec.variant_key
     )
+    return rec
