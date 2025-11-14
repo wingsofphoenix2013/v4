@@ -1,4 +1,4 @@
-# laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск фоновых воркеров (всех)
+# 🔸 laboratory_v4_main.py — entrypoint laboratory_v4: инициализация, загрузка конфигов, запуск фоновых воркеров
 
 # 🔸 Импорты
 import asyncio
@@ -13,10 +13,13 @@ from laboratory_config import (
     load_initial_config,
     lists_stream_listener,
     config_event_listener,
-    auditor_ready_listener,
 )
-
-# 🔸 импорт воркера «советчика»
+# 🔸 импорт состояния аудитора (витрина + thresholds + READY-воркер)
+from laboratory_auditor_config import (
+    load_initial_auditor_best,
+    run_laboratory_auditor_ready_listener,
+)
+# 🔸 импорт воркера «советчика» (oracle-контур)
 from laboratory_decision_maker import run_laboratory_decision_maker
 # 🔸 импорт воркера пост-процессинга
 from laboratory_postproc import run_laboratory_postproc
@@ -84,17 +87,25 @@ async def main():
         log.exception("❌ Ошибка инициализации внешних сервисов")
         return
 
-    # первичная загрузка конфигурации
+    # первичная загрузка конфигурации oracle-контуров
     try:
         await load_initial_config()
-        log.info("📦 Стартовая конфигурация загружена")
+        log.info("📦 Стартовая конфигурация oracle-контуров загружена")
     except Exception:
-        log.exception("❌ Ошибка первичной загрузки конфигурации")
+        log.exception("❌ Ошибка первичной загрузки конфигурации oracle-контуров")
+        return
+
+    # первичная загрузка витрины аудитора (auditor_current_best)
+    try:
+        await load_initial_auditor_best()
+        log.info("📦 Стартовая витрина аудитора загружена (auditor_current_best)")
+    except Exception:
+        log.exception("❌ Ошибка первичной загрузки витрины аудитора")
         return
 
     log.info("🚀 Запуск фоновых воркеров laboratory_v4")
 
-    # слушатели: списки (Streams), конфиги (Pub/Sub) и READY от auditor_v4
+    # слушатели: списки (Streams), конфиги (Pub/Sub), READY аудитора и остальные воркеры
     await asyncio.gather(
         # слушатель обновлений WL/BL из oracle (Redis Streams)
         run_safe_loop(
@@ -106,12 +117,7 @@ async def main():
             lambda: _start_with_delay(config_event_listener, INITIAL_DELAY_CONFIG),
             "LAB_CONFIG_PUBSUB",
         ),
-        # слушатель READY-событий от auditor_v4 (обновление витрины лучшей идеи)
-        run_safe_loop(
-            lambda: _start_with_delay(auditor_ready_listener, INITIAL_DELAY_AUDITOR_READY),
-            "LAB_AUDITOR_READY",
-        ),
-        # «советчик»: запрос → решение → ответ в стрим → запись в БД
+        # «советчик» oracle-контура: запрос → решение → ответ в стрим → запись в БД
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_decision_maker, INITIAL_DELAY_DECISION),
             "LAB_DECISION",
@@ -125,6 +131,11 @@ async def main():
         run_safe_loop(
             lambda: _start_with_delay(run_laboratory_cleaner, INITIAL_DELAY_CLEANER),
             "LAB_CLEANER",
+        ),
+        # воркер READY аудитора — обновляет in-memory витрину и thresholds-кеш
+        run_safe_loop(
+            lambda: _start_with_delay(run_laboratory_auditor_ready_listener, INITIAL_DELAY_AUDITOR_READY),
+            "LAB_AUDITOR_READY",
         ),
     )
 
