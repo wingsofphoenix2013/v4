@@ -22,12 +22,23 @@ GROUP_NAME = "AUD_BEST_GROUP"
 CONSUMER_NAME = "AUD_BEST_SELECTOR"
 
 # активные идеи (добавляйте новые idea_key по мере подключения)
-ACTIVE_IDEAS = {"emacross_cs", "ema200_side", "atr_pct_regime", "emacross_2150_spread", "rsimfi_energy", "bb_squeeze", "macd_hist",}
+ACTIVE_IDEAS = {
+    "emacross_cs",
+    "ema200_side",
+    "atr_pct_regime",
+    "emacross_2150_spread",
+    "rsimfi_energy",
+    "bb_squeeze",
+    "macd_hist",
+}
+
+# минимальное покрытие победителя по сделкам (coverage_pct), иначе кандидат не попадает в витрину
+MIN_WINNER_COVERAGE = 15.0
 
 # XREAD params / TTL
 XREAD_BLOCK_MS = 30_000
 XREAD_COUNT = 128
-SEEN_TTL_SEC = 24 * 60 * 60
+SEEN_TTL_SEC = 1 * 60 * 60
 
 # dedupe set
 SEEN_SET = "aud:best:seen"
@@ -47,17 +58,20 @@ def _as_bool(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in ("1", "true", "yes", "y", "t")
 
+
 def _sf(v: Any, default: float = 0.0) -> float:
     try:
         return float(v)
     except Exception:
         return default
 
+
 def _si(v: Any, default: int = 0) -> int:
     try:
         return int(v)
     except Exception:
         return default
+
 
 def _norm_dir(v: Any) -> str:
     s = str(v or "").strip().lower()
@@ -235,6 +249,15 @@ async def _handle_message(fields: Dict[str, str]):
     coverage = _sf(fields.get("coverage_pct"))
     conf = _sf(fields.get("decision_confidence"))
     source_table = (fields.get("source_table") or "unknown").strip()
+
+    # фильтр по минимальному coverage
+    if coverage < MIN_WINNER_COVERAGE:
+        log.info(
+            "ℹ️ AUD_BEST: sid=%s dir=%s — кандидат [%s/%s] отклонён по coverage=%.2f%% < %.2f%%",
+            sid, direction, idea_key, variant_key, coverage, MIN_WINNER_COVERAGE,
+        )
+        await _maybe_emit_ready(sid, direction, msg_run, idea_key)
+        return
 
     # нормализация config_json
     cfg_raw = fields.get("config_json") or "{}"
