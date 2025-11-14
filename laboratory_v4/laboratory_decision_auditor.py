@@ -19,6 +19,7 @@ from laboratory_auditor_emacross import evaluate_emacross_cs
 from laboratory_auditor_atrreg import evaluate_atr_pct_regime
 from laboratory_auditor_ema200_side import evaluate_ema200_side
 from laboratory_auditor_ema2150_spread import evaluate_emacross_2150_spread
+from laboratory_auditor_rsimfi import evaluate_rsimfi_energy
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_DECISION_AUDITOR")
@@ -52,6 +53,16 @@ IDEA_HANDLERS = {
     "atr_pct_regime": evaluate_atr_pct_regime,
     "ema200_side": evaluate_ema200_side,
     "emacross_2150_spread": evaluate_emacross_2150_spread,
+    "rsimfi_energy": evaluate_rsimfi_energy,
+}
+
+# 🔸 Мета-информация по идеям (нужны ли thresholds)
+IDEA_META = {
+    "emacross_cs": {"uses_thresholds": True},
+    "atr_pct_regime": {"uses_thresholds": True},
+    "ema200_side": {"uses_thresholds": True},
+    "emacross_2150_spread": {"uses_thresholds": True},
+    "rsimfi_energy": {"uses_thresholds": False},
 }
 
 # скрипт безопасного релиза «только если значение совпадает»
@@ -295,6 +306,10 @@ async def _handle_request_auditor(payload: dict):
             )
             return
 
+        # мета-информация по идее (нужны ли thresholds)
+        meta = IDEA_META.get(best.idea_key, {"uses_thresholds": True})
+        uses_thresholds = bool(meta.get("uses_thresholds", True))
+
         # проход по TF: m5 → m15 → h1, с учётом variant_key
         for tf in tfs:
             if not _tf_is_used_in_variant(tf, best.variant_key):
@@ -305,32 +320,78 @@ async def _handle_request_auditor(payload: dict):
             hits_by_tf_pwl[tf] = 0
             hits_by_tf_pbl[tf] = 0
 
-            # thresholds для этой идеи/символа/TF/окна
-            thr = await get_thresholds(
-                idea_key=best.idea_key,
-                run_id=best.source_run_id,
-                strategy_id=strategy_id,
-                direction=direction,
-                symbol=symbol,
-                timeframe=tf,
-                window_tag=best.primary_window,
-            )
+            thr = None
+            tf_allow: bool
+            tf_reason: str
+            tf_details: Dict[str, Any]
 
-            if thr is None:
-                tf_allow = False
-                tf_reason = "no_thresholds_for_symbol"
-                tf_details: Dict[str, Any] = {
-                    "auditor": {
-                        "idea_key": best.idea_key,
-                        "variant": best.variant_key,
-                        "primary_window": best.primary_window,
-                        "source_run_id": best.source_run_id,
-                        "allow": False,
-                        "reason": tf_reason,
-                        "thresholds": None,
+            if uses_thresholds:
+                # thresholds для этой идеи/символа/TF/окна
+                thr = await get_thresholds(
+                    idea_key=best.idea_key,
+                    run_id=best.source_run_id,
+                    strategy_id=strategy_id,
+                    direction=direction,
+                    symbol=symbol,
+                    timeframe=tf,
+                    window_tag=best.primary_window,
+                )
+
+                if thr is None:
+                    tf_allow = False
+                    tf_reason = "no_thresholds_for_symbol"
+                    tf_details = {
+                        "auditor": {
+                            "idea_key": best.idea_key,
+                            "variant": best.variant_key,
+                            "primary_window": best.primary_window,
+                            "source_run_id": best.source_run_id,
+                            "strategy_id": strategy_id,
+                            "client_strategy_id": client_sid,
+                            "symbol": symbol,
+                            "direction": direction,
+                            "timeframe": tf,
+                            "allow": False,
+                            "reason": tf_reason,
+                            "thresholds": None,
+                        }
                     }
-                }
+                else:
+                    try:
+                        tf_allow, tf_reason, tf_details = await handler(
+                            strategy_id=strategy_id,
+                            client_strategy_id=client_sid,
+                            symbol=symbol,
+                            direction=direction,
+                            timeframe=tf,
+                            best=best,
+                            thresholds=thr,
+                            redis_client=infra.redis_client,
+                        )
+                    except Exception:
+                        log.exception(
+                            "❌ LAB_DECISION_AUDITOR: ошибка обработчика идеи (idea=%s, sid=%s, symbol=%s, dir=%s, tf=%s)",
+                            best.idea_key, strategy_id, symbol, direction, tf
+                        )
+                        tf_allow = False
+                        tf_reason = "idea_handler_error"
+                        tf_details = {
+                            "auditor": {
+                                "idea_key": best.idea_key,
+                                "variant": best.variant_key,
+                                "primary_window": best.primary_window,
+                                "source_run_id": best.source_run_id,
+                                "strategy_id": strategy_id,
+                                "client_strategy_id": client_sid,
+                                "symbol": symbol,
+                                "direction": direction,
+                                "timeframe": tf,
+                                "allow": False,
+                                "reason": tf_reason,
+                            }
+                        }
             else:
+                # идея не использует thresholds (например, rsimfi_energy)
                 try:
                     tf_allow, tf_reason, tf_details = await handler(
                         strategy_id=strategy_id,
@@ -339,7 +400,7 @@ async def _handle_request_auditor(payload: dict):
                         direction=direction,
                         timeframe=tf,
                         best=best,
-                        thresholds=thr,
+                        thresholds=None,
                         redis_client=infra.redis_client,
                     )
                 except Exception:
@@ -355,6 +416,11 @@ async def _handle_request_auditor(payload: dict):
                             "variant": best.variant_key,
                             "primary_window": best.primary_window,
                             "source_run_id": best.source_run_id,
+                            "strategy_id": strategy_id,
+                            "client_strategy_id": client_sid,
+                            "symbol": symbol,
+                            "direction": direction,
+                            "timeframe": tf,
                             "allow": False,
                             "reason": tf_reason,
                         }
