@@ -16,6 +16,7 @@ from auditor_ema200_side import run_auditor_ema200_side
 from auditor_best_selector import run_auditor_best_selector
 from auditor_atrreg import run_auditor_atrreg
 from auditor_ema2150_spread import run_auditor_ema2150_spread
+from auditor_rsimfi import run_auditor_rsimfi
 import auditor_infra as infra
 
 # 🔸 Логгер
@@ -148,6 +149,8 @@ async def main():
         run_safe_loop(lambda: _start_with_delay(run_auditor_atrreg, 120), "AUD_ATRREG"),
         # фоновый воркер «EMA21/EMA50 spread»: старт через 150 сек, далее цикл run→sleep(3h)
         run_safe_loop(lambda: _start_with_delay(run_auditor_ema2150_spread, 150), "AUD_EMA2150_SPREAD"),
+        # фоновый воркер «RSI/MFI energy regime»: старт через 180 сек, далее цикл run→sleep(3h)
+        run_safe_loop(lambda: _start_with_delay(run_auditor_rsimfi, 180), "AUD_RSIMFI"),
         # фоновый оркестратор витрины «лучшая идея»
         run_safe_loop(lambda: _start_with_delay(run_auditor_best_selector, 0), "AUD_BEST_SELECTOR"),
         # одноразовый аудит закрытых сделок (выполняется и завершается)

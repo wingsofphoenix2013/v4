@@ -22,7 +22,7 @@ GROUP_NAME = "AUD_BEST_GROUP"
 CONSUMER_NAME = "AUD_BEST_SELECTOR"
 
 # активные идеи (добавляйте новые idea_key по мере подключения)
-ACTIVE_IDEAS = {"emacross_cs", "ema200_side", "atr_pct_regime", "emacross_2150_spread"}
+ACTIVE_IDEAS = {"emacross_cs", "ema200_side", "atr_pct_regime", "emacross_2150_spread", "rsimfi_energy",}
 
 # XREAD params / TTL
 XREAD_BLOCK_MS = 30_000
