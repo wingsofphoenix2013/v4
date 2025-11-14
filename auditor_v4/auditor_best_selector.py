@@ -82,18 +82,18 @@ def _norm_dir(v: Any) -> str:
 def _is_better(cand: Dict[str, Any], cur: Optional[Dict[str, Any]]) -> bool:
     if cur is None:
         return True
-    # ключ ранжирования: ΔROI ↓ → ROI_selected ↓ → confidence ↓ → coverage ↓
+    # ключ ранжирования: ROI_selected ↓ → confidence ↓ → coverage ↓ → ΔROI ↓
     c_key = (
-        _sf(cand.get("delta_roi_pp"), float("-inf")),
-        _sf(cand.get("roi_selected_pct"), float("-inf")),
-        _sf(cand.get("decision_confidence"), 0.0),
-        _sf(cand.get("coverage_pct"), 0.0),
+        _sf(cand.get("roi_selected_pct"), float("-inf")),   # 1. максимальный фактический ROI выбранной подвыборки
+        _sf(cand.get("decision_confidence"), 0.0),          # 2. более уверенное решение
+        _sf(cand.get("coverage_pct"), 0.0),                 # 3. больше сделок в выборке
+        _sf(cand.get("delta_roi_pp"), float("-inf")),       # 4. ΔROI как вспомогательный критерий
     )
     cur_key = (
-        _sf(cur.get("delta_roi_pp"), float("-inf")),
         _sf(cur.get("roi_selected_pct"), float("-inf")),
         _sf(cur.get("decision_confidence"), 0.0),
         _sf(cur.get("coverage_pct"), 0.0),
+        _sf(cur.get("delta_roi_pp"), float("-inf")),
     )
     return c_key > cur_key
 
