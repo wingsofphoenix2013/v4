@@ -20,6 +20,7 @@ from laboratory_auditor_atrreg import evaluate_atr_pct_regime
 from laboratory_auditor_ema200_side import evaluate_ema200_side
 from laboratory_auditor_ema2150_spread import evaluate_emacross_2150_spread
 from laboratory_auditor_rsimfi import evaluate_rsimfi_energy
+from laboratory_auditor_bb import evaluate_bb_squeeze
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_DECISION_AUDITOR")
@@ -54,6 +55,7 @@ IDEA_HANDLERS = {
     "ema200_side": evaluate_ema200_side,
     "emacross_2150_spread": evaluate_emacross_2150_spread,
     "rsimfi_energy": evaluate_rsimfi_energy,
+    "bb_squeeze": evaluate_bb_squeeze,
 }
 
 # 🔸 Мета-информация по идеям (нужны ли thresholds)
@@ -63,6 +65,7 @@ IDEA_META = {
     "ema200_side": {"uses_thresholds": True},
     "emacross_2150_spread": {"uses_thresholds": True},
     "rsimfi_energy": {"uses_thresholds": False},
+    "bb_squeeze": {"uses_thresholds": False},
 }
 
 # скрипт безопасного релиза «только если значение совпадает»
