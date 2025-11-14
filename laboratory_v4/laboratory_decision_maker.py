@@ -297,7 +297,6 @@ async def _release_gate(req_uid: str, gate_key: Optional[str]):
     except Exception:
         log.exception("⚠️ LAB_DECISION: release_gate error (key=%s)", gate_key)
 
-
 # 🔸 Логика обработки одного запроса (внутри запроса — последовательный проход по TF)
 async def _handle_request(payload: dict):
     # время начала
@@ -317,6 +316,16 @@ async def _handle_request(payload: dict):
     use_oracle_bl = _parse_bool(payload.get("use_oracle_bl"))
     timeframes_raw = str(payload.get("timeframes") or "")
     tfs = _parse_timeframes(timeframes_raw)
+    # флаг аудиторной ветки (может отсутствовать в payload)
+    use_auditor = _parse_bool(payload.get("use_auditor"))
+
+    # ранний выход: запрос помечен как аудиторный — oracle-ветка его не обрабатывает
+    if use_auditor:
+        log.debug(
+            "LAB_DECISION: пропуск запроса (req_uid=%s, sid=%s, symbol=%s, dir=%s) — use_auditor=true",
+            req_uid, strategy_id, symbol, direction,
+        )
+        return
 
     # валидация минимальная
     bad_reasons = []
@@ -710,7 +719,7 @@ async def _handle_request(payload: dict):
     )
 
     # итоговый лог
-    log.debug(
+    log.info(
         "LAB_DECISION: req=%s sid=%s %s %s ver=%s tfs=%s flags[oracle_bl=%s] -> allow=%s reason=%s duration_ms=%d%s",
         req_uid,
         strategy_id,
