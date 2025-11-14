@@ -33,7 +33,7 @@ ACTIVE_IDEAS = {
 }
 
 # минимальное покрытие победителя по сделкам (coverage_pct), иначе кандидат не попадает в витрину
-MIN_WINNER_COVERAGE = 15.0
+MIN_WINNER_COVERAGE = 10.0
 
 # XREAD params / TTL
 XREAD_BLOCK_MS = 30_000
