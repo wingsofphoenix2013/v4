@@ -18,6 +18,7 @@ from auditor_atrreg import run_auditor_atrreg
 from auditor_ema2150_spread import run_auditor_ema2150_spread
 from auditor_rsimfi import run_auditor_rsimfi
 from auditor_bb import run_auditor_bb
+from auditor_macd import run_auditor_macd
 import auditor_infra as infra
 
 # 🔸 Логгер
@@ -154,6 +155,8 @@ async def main():
         run_safe_loop(lambda: _start_with_delay(run_auditor_rsimfi, 120), "AUD_RSIMFI"),
         # фоновый воркер «BB Squeeze & Expansion»: старт через 210 сек, далее цикл run→sleep(3h)
         run_safe_loop(lambda: _start_with_delay(run_auditor_bb, 135), "AUD_BB"),
+        # фоновый воркер «MACD Histogram Regime»: старт через 240 сек, далее цикл run→sleep(3h)
+        run_safe_loop(lambda: _start_with_delay(run_auditor_macd, 150), "AUD_MACD"),
         # фоновый оркестратор витрины «лучшая идея»
         run_safe_loop(lambda: _start_with_delay(run_auditor_best_selector, 0), "AUD_BEST_SELECTOR"),
         # одноразовый аудит закрытых сделок (выполняется и завершается)
