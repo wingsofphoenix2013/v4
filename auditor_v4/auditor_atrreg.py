@@ -1,4 +1,9 @@
-# auditor_atrreg.py — аудит «ATR% режим волатильности»: биннинг atr14/entry_price по TF и окнам, маски и публикация best-of-three
+# 🔸 auditor_atrreg.py — аудит «ATR% режим волатильности»
+#     — для закрытых позиций по TF (m5/m15/h1) считает atr_pct = (ATR14 / entry_price) * 100%
+#     — по каждому TF/окну/направлению строит квантильные бины atr_pct (1..5) и bin-статистику
+#     — per-symbol квантильные границы atr_pct (Q20/40/60/80) сохраняет в auditor_atrreg_thresholds
+#     — формирует три маски (m5_only / m5_m15 / m5_m15_h1) и выбирает best-of-three по ΔROI/ROI/conf/coverage
+#     — публикует лучший вариант в оркестратор витрины (Redis Stream auditor:best:candidates, idea_key='atr_pct_regime')
 
 # 🔸 Импорты
 import asyncio
@@ -73,7 +78,7 @@ async def run_auditor_atrreg():
         await asyncio.sleep(int(SLEEP_BETWEEN_RUNS_SEC))
 
 
-# 🔸 Один проход: создать run, пройти по стратегиям, записать покрытия/бины/вердикты и опубликовать лучший вариант
+# 🔸 Один проход: создать run, пройти по стратегиям, записать coverage/bin_stats/thresholds/маски и опубликовать лучший вариант
 async def _run_once():
     # загрузка активных MW-стратегий
     strategies = await load_active_mw_strategies()
@@ -198,7 +203,7 @@ async def _process_strategy(
         tf: {w: {"long": {}, "short": {}} for w, _ in WINDOWS} for tf in TIMEFRAMES
     }
 
-    # пройти по всем ячейкам TF×window×direction: присвоить бины, посчитать агрегаты и записать в БД
+    # пройти по всем ячейкам TF×window×direction: присвоить бины, сохранить thresholds и записать bin_stats
     async with infra.pg_pool.acquire() as conn:
         for tf in TIMEFRAMES:
             for w, _days in WINDOWS:
@@ -216,12 +221,51 @@ async def _process_strategy(
                         5: {"N": 0, "wins": 0, "pnl_sum": 0.0},
                     }
 
-                    # квантильные границы по символу и присвоение бинов
+                    # квантильные границы по символу и присвоение бинов + сохранение thresholds
                     for symbol, triples in symbol_series.items():
                         if not triples:
                             continue
                         xs = [atr_pct for (_puid, atr_pct, _pnl) in triples]
                         edges = _quantile_edges(xs, (0.2, 0.4, 0.6, 0.8))
+
+                        # сохранение thresholds в auditor_atrreg_thresholds
+                        q20, q40, q60, q80 = edges
+                        n_samples = len(xs)
+                        try:
+                            await conn.execute(
+                                """
+                                INSERT INTO auditor_atrreg_thresholds
+                                (run_id, strategy_id, direction, symbol, timeframe, window_tag,
+                                 q20_value, q40_value, q60_value, q80_value, n_samples)
+                                VALUES ($1,$2,$3,$4,$5,$6, $7,$8,$9,$10,$11)
+                                ON CONFLICT (run_id, strategy_id, direction, symbol, timeframe, window_tag)
+                                DO UPDATE SET
+                                  q20_value  = EXCLUDED.q20_value,
+                                  q40_value  = EXCLUDED.q40_value,
+                                  q60_value  = EXCLUDED.q60_value,
+                                  q80_value  = EXCLUDED.q80_value,
+                                  n_samples  = EXCLUDED.n_samples,
+                                  created_at = now()
+                                """,
+                                run_id,
+                                sid,
+                                direction,
+                                symbol,
+                                tf,
+                                w,
+                                float(q20),
+                                float(q40),
+                                float(q60),
+                                float(q80),
+                                int(n_samples),
+                            )
+                        except Exception:
+                            log.exception(
+                                "⚠️ AUD_ATRREG: ошибка записи thresholds "
+                                "(run_id=%s sid=%s dir=%s symbol=%s tf=%s win=%s)",
+                                run_id, sid, direction, symbol, tf, w
+                            )
+
                         for puid, atr_pct, pnl in triples:
                             b = _assign_bin(atr_pct, edges)
                             pos_bins[tf][w][direction][puid] = b
@@ -235,8 +279,10 @@ async def _process_strategy(
 
                     # лог (как прежде)
                     warn = " (N<50)" if total_n < MIN_SAMPLE_PER_CELL else ""
-                    log.debug('📈 AUD_ATRREG | %s | TF=%s | dir=%s | window=%s — bins by atr_pct%s',
-                             title, tf, direction, w, warn)
+                    log.debug(
+                        '📈 AUD_ATRREG | %s | TF=%s | dir=%s | window=%s — bins by atr_pct%s',
+                        title, tf, direction, w, warn
+                    )
                     for idx in (1, 2, 3, 4, 5):
                         rec = btot[idx]
                         N = rec["N"]
@@ -259,7 +305,9 @@ async def _process_strategy(
 
                     for idx in (1, 2, 3, 4, 5):
                         rec = btot[idx]
-                        N = int(rec["N"]); wins = int(rec["wins"]); pnl_sum = float(rec["pnl_sum"])
+                        N = int(rec["N"])
+                        wins = int(rec["wins"])
+                        pnl_sum = float(rec["pnl_sum"])
                         roi_pct = (pnl_sum / dep_used_for_bins * 100.0) if dep_used_for_bins > 0 else 0.0
                         await conn.execute(
                             """
@@ -270,10 +318,22 @@ async def _process_strategy(
                              clip_applied, clip_p99)
                             VALUES ($1,$2,$3,$4,$5, $6,$7,$8, $9,$10,$11,$12,$13,$14, $15,$16)
                             """,
-                            run_id, sid, tf, direction, w,
-                            int(win_eff), int(win_nom), float(win_cov),
-                            int(idx), N, wins, pnl_sum, float(dep_used_for_bins), float(roi_pct),
-                            False, None
+                            run_id,
+                            sid,
+                            tf,
+                            direction,
+                            w,
+                            int(win_eff),
+                            int(win_nom),
+                            float(win_cov),
+                            int(idx),
+                            N,
+                            wins,
+                            pnl_sum,
+                            float(dep_used_for_bins),
+                            float(roi_pct),
+                            False,
+                            None,
                         )
 
     # для каждого направления: выбрать primary-окно, построить классы TF, сформировать 3 маски и выбрать «best-of-three»
@@ -286,43 +346,62 @@ async def _process_strategy(
         secondary_win = _choose_secondary_window(coverage.get(direction, {}), primary_win)
 
         # классификация по TF на primary окне
-        tf_classes = {}
+        tf_classes: Dict[str, str] = {}
         for tf in TIMEFRAMES:
             btot = bin_aggr.get(tf, {}).get(primary_win, {}).get(direction, None)
             tf_classes[tf] = _classify_tf(btot, dep_used_for_bins)
 
         # три маски под тест-модуль
         masks: List[Tuple[str, Dict[str, str], str]] = [
-            ("m5_only",     {"m5": tf_classes.get("m5", "any"),  "m15": "any",                         "h1": "any"},                         "mask=m5_only"),
-            ("m5_m15",      {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": "any"},                         "mask=m5_m15"),
-            ("m5_m15_h1",   {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": tf_classes.get("h1", "any")},  "mask=m5_m15_h1"),
+            ("m5_only",    {"m5": tf_classes.get("m5", "any"),  "m15": "any",                         "h1": "any"},                        "mask=m5_only"),
+            ("m5_m15",     {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": "any"},                        "mask=m5_m15"),
+            ("m5_m15_h1",  {"m5": tf_classes.get("m5", "any"),  "m15": tf_classes.get("m15", "any"), "h1": tf_classes.get("h1", "any")}, "mask=m5_m15_h1"),
         ]
 
         # оценим каждую маску на primary окне и выберем лучшую (best-of-three)
-        ranking: List[Tuple[float, float, float, float, int]] = []  # (eligible, delta_roi, roi_sel, conf, coverage, idx)
+        ranking: List[Tuple[float, float, float, float, float, int]] = []  # (eligible, delta_roi, roi_sel, conf, coverage, idx)
         mask_metrics_primary: List[Dict[str, Any]] = []
         mask_metrics_all_primary: List[Dict[str, Any]] = []
         mask_decision_cache: List[Tuple[str, float]] = []  # (class, conf)
 
         for idx, (_label, mask_modes, _note) in enumerate(masks):
             m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
-            m_all = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, primary_win, direction, deposit)
+            m_all = _evaluate_mask_on_positions(
+                dir_positions,
+                pos_bins,
+                {"m5": "any", "m15": "any", "h1": "any"},
+                primary_win,
+                direction,
+                deposit,
+            )
             mask_metrics_primary.append(m_sel)
             mask_metrics_all_primary.append(m_all)
 
             # предварительная оценка для confidence (как в решении)
-            m_sel_sec = None; m_all_sec = None
+            m_sel_sec = None
+            m_all_sec = None
             if secondary_win is not None:
                 m_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
-                m_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, secondary_win, direction, deposit)
+                m_all_sec = _evaluate_mask_on_positions(
+                    dir_positions,
+                    pos_bins,
+                    {"m5": "any", "m15": "any", "h1": "any"},
+                    secondary_win,
+                    direction,
+                    deposit,
+                )
             dec_class, dec_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), m_sel, m_all, m_sel_sec, m_all_sec)
             mask_decision_cache.append((dec_class, dec_conf))
 
-            roi_sel = m_sel["roi_selected_pct"]; roi_all = m_sel["roi_all_pct"]
+            roi_sel = m_sel["roi_selected_pct"]
+            roi_all = m_sel["roi_all_pct"]
             delta_roi = (roi_sel - roi_all) if (roi_sel is not None and roi_all is not None) else float("-inf")
             eligible = 1.0 if (roi_sel is not None and roi_sel > 0.0) else 0.0
-            ranking.append((eligible, delta_roi, (roi_sel or -1e9), dec_conf, m_sel["coverage_pct"], idx))
+            coverage_pct = m_sel["coverage_pct"]
+            # ранжирование: eligible (1/0) → ΔROI → ROI_selected → confidence → coverage
+            ranking.append((eligible, delta_roi, (roi_sel or -1e9), dec_conf, coverage_pct, idx))
 
+        # индекс лучшей маски
         ranking.sort(reverse=True, key=lambda t: (t[0], t[1], t[2], t[3], t[4]))
         best_idx = ranking[0][-1]
 
@@ -342,7 +421,7 @@ async def _process_strategy(
                 deposit=deposit,
                 mask_modes=mask_modes,
                 is_primary=is_primary_mask,
-                primary_note=note
+                primary_note=note,
             )
 
         # 🔸 Публикуем лучший вариант в оркестратор (всегда; если ROI<=0 — как ineligible)
@@ -353,7 +432,14 @@ async def _process_strategy(
         best_sel_sec = best_all_sec = None
         if secondary_win is not None:
             best_sel_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, best_mask, secondary_win, direction, deposit)
-            best_all_sec = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5":"any","m15":"any","h1":"any"}, secondary_win, direction, deposit)
+            best_all_sec = _evaluate_mask_on_positions(
+                dir_positions,
+                pos_bins,
+                {"m5": "any", "m15": "any", "h1": "any"},
+                secondary_win,
+                direction,
+                deposit,
+            )
         _, best_conf, _ = _make_decision(primary_win, coverage.get(direction, {}), best_sel, best_all, best_sel_sec, best_all_sec)
 
         await _publish_best_candidate(
@@ -374,12 +460,15 @@ async def _process_strategy(
             d_roi_pp = best_sel["roi_selected_pct"] - best_sel["roi_all_pct"]
         log.debug(
             "🏁 AUD_ATRREG | %s | dir=%s | primary=%s | best=%s | ΔROI=%.2f pp | ROI_sel=%.2f%% | WR_sel=%.2f%% | cov=%.1f%% | conf=%.2f",
-            title, direction, primary_win, best_label,
+            title,
+            direction,
+            primary_win,
+            best_label,
             d_roi_pp,
             best_sel["roi_selected_pct"] if best_sel["roi_selected_pct"] is not None else 0.0,
             best_sel["wr_selected_pct"],
             best_sel["coverage_pct"],
-            best_conf
+            best_conf,
         )
 
 
@@ -401,14 +490,28 @@ async def _record_mask_with_validation(
 ):
     # оценка на primary
     metrics_sel_primary = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, primary_win, direction, deposit)
-    metrics_all_primary = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, primary_win, direction, deposit)
+    metrics_all_primary = _evaluate_mask_on_positions(
+        dir_positions,
+        pos_bins,
+        {"m5": "any", "m15": "any", "h1": "any"},
+        primary_win,
+        direction,
+        deposit,
+    )
 
     # оценка на secondary (если есть)
     metrics_sel_secondary = None
     metrics_all_secondary = None
     if secondary_win is not None:
         metrics_sel_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, secondary_win, direction, deposit)
-        metrics_all_secondary = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, secondary_win, direction, deposit)
+        metrics_all_secondary = _evaluate_mask_on_positions(
+            dir_positions,
+            pos_bins,
+            {"m5": "any", "m15": "any", "h1": "any"},
+            secondary_win,
+            direction,
+            deposit,
+        )
 
     # принять решение
     decision_class, decision_conf, rationale = _make_decision(
@@ -417,15 +520,23 @@ async def _record_mask_with_validation(
         metrics_primary=metrics_sel_primary,
         metrics_base_primary=metrics_all_primary,
         metrics_secondary=metrics_sel_secondary,
-        metrics_base_secondary=metrics_all_secondary
+        metrics_base_secondary=metrics_all_secondary,
     )
 
     # запись primary строки в mask_results
     await _insert_mask_result(
-        run_id=run_id, sid=sid, direction=direction, window_tag=primary_win,
-        is_primary=is_primary, primary_window=primary_win,
-        mask_modes=mask_modes, metrics_sel=metrics_sel_primary, metrics_all=metrics_all_primary,
-        decision_class=decision_class, decision_confidence=decision_conf, rationale=(primary_note if primary_note else rationale)
+        run_id=run_id,
+        sid=sid,
+        direction=direction,
+        window_tag=primary_win,
+        is_primary=is_primary,
+        primary_window=primary_win,
+        mask_modes=mask_modes,
+        metrics_sel=metrics_sel_primary,
+        metrics_all=metrics_all_primary,
+        decision_class=decision_class,
+        decision_confidence=decision_conf,
+        rationale=(primary_note if primary_note else rationale),
     )
 
     # лог (DECISION для primary, ALT — для остальных)
@@ -435,9 +546,18 @@ async def _record_mask_with_validation(
         d_roi_pp = metrics_sel_primary["roi_selected_pct"] - metrics_sel_primary["roi_all_pct"]
     log.debug(
         "✅ %s | sid=%s | dir=%s | primary=%s | class=%s (conf=%.2f) | mask: m5=%s, m15=%s, h1=%s | ΔROI=%.2f pp | ΔWR=%.2f pp | cov=%.1f%%",
-        tag, sid, direction, primary_win, decision_class, decision_conf,
-        mask_modes.get('m5','any'), mask_modes.get('m15','any'), mask_modes.get('h1','any'),
-        d_roi_pp, metrics_sel_primary["wr_selected_pct"] - metrics_sel_primary["wr_all_pct"], metrics_sel_primary["coverage_pct"]
+        tag,
+        sid,
+        direction,
+        primary_win,
+        decision_class,
+        decision_conf,
+        mask_modes.get("m5", "any"),
+        mask_modes.get("m15", "any"),
+        mask_modes.get("h1", "any"),
+        d_roi_pp,
+        metrics_sel_primary["wr_selected_pct"] - metrics_sel_primary["wr_all_pct"],
+        metrics_sel_primary["coverage_pct"],
     )
 
     # валидации на других окнах
@@ -445,14 +565,28 @@ async def _record_mask_with_validation(
         if w == primary_win:
             continue
         m_sel = _evaluate_mask_on_positions(dir_positions, pos_bins, mask_modes, w, direction, deposit)
-        m_all = _evaluate_mask_on_positions(dir_positions, pos_bins, {"m5": "any", "m15": "any", "h1": "any"}, w, direction, deposit)
+        m_all = _evaluate_mask_on_positions(
+            dir_positions,
+            pos_bins,
+            {"m5": "any", "m15": "any", "h1": "any"},
+            w,
+            direction,
+            deposit,
+        )
         if m_all["n_all"] > 0:
             await _insert_mask_result(
-                run_id=run_id, sid=sid, direction=direction, window_tag=w,
-                is_primary=False, primary_window=primary_win,
-                mask_modes=mask_modes, metrics_sel=m_sel, metrics_all=m_all,
-                decision_class=decision_class, decision_confidence=max(0.0, decision_conf - 0.1),
-                rationale=("validation-window; " + (primary_note or ""))
+                run_id=run_id,
+                sid=sid,
+                direction=direction,
+                window_tag=w,
+                is_primary=False,
+                primary_window=primary_win,
+                mask_modes=mask_modes,
+                metrics_sel=m_sel,
+                metrics_all=m_all,
+                decision_class=decision_class,
+                decision_confidence=max(0.0, decision_conf - 0.1),
+                rationale=("validation-window; " + (primary_note or "")),
             )
 
 
@@ -497,34 +631,43 @@ async def _publish_best_candidate(
     # метрики и конфиг — только если eligible=true
     if eligible:
         delta_roi = roi_sel - roi_all
-        fields.update({
-            "roi_selected_pct": f"{roi_sel}",
-            "roi_all_pct": f"{roi_all}",
-            "delta_roi_pp": f"{delta_roi}",
-            "wr_selected_pct": f"{metrics_sel['wr_selected_pct']}",
-            "wr_all_pct": f"{metrics_sel['wr_all_pct']}",
-            "coverage_pct": f"{metrics_sel['coverage_pct']}",
-            "decision_confidence": f"{decision_conf}",
-            "config_json": json.dumps({
-                "m5_mode": mask_modes.get("m5","any"),
-                "m15_mode": mask_modes.get("m15","any"),
-                "h1_mode": mask_modes.get("h1","any"),
-                "m5_q_low":  MASK_QBOUNDS[mask_modes.get("m5","any")][0],
-                "m5_q_high": MASK_QBOUNDS[mask_modes.get("m5","any")][1],
-                "m15_q_low":  MASK_QBOUNDS[mask_modes.get("m15","any")][0],
-                "m15_q_high": MASK_QBOUNDS[mask_modes.get("m15","any")][1],
-                "h1_q_low":  MASK_QBOUNDS[mask_modes.get("h1","any")][0],
-                "h1_q_high": MASK_QBOUNDS[mask_modes.get("h1","any")][1],
-            }),
-            "source_table": "auditor_atrreg_mask_results",
-            "source_run_id": str(run_id),
-        })
+        fields.update(
+            {
+                "roi_selected_pct": f"{roi_sel}",
+                "roi_all_pct": f"{roi_all}",
+                "delta_roi_pp": f"{delta_roi}",
+                "wr_selected_pct": f"{metrics_sel['wr_selected_pct']}",
+                "wr_all_pct": f"{metrics_sel['wr_all_pct']}",
+                "coverage_pct": f"{metrics_sel['coverage_pct']}",
+                "decision_confidence": f"{decision_conf}",
+                "config_json": json.dumps(
+                    {
+                        "m5_mode": mask_modes.get("m5", "any"),
+                        "m15_mode": mask_modes.get("m15", "any"),
+                        "h1_mode": mask_modes.get("h1", "any"),
+                        "m5_q_low": MASK_QBOUNDS[mask_modes.get("m5", "any")][0],
+                        "m5_q_high": MASK_QBOUNDS[mask_modes.get("m5", "any")][1],
+                        "m15_q_low": MASK_QBOUNDS[mask_modes.get("m15", "any")][0],
+                        "m15_q_high": MASK_QBOUNDS[mask_modes.get("m15", "any")][1],
+                        "h1_q_low": MASK_QBOUNDS[mask_modes.get("h1", "any")][0],
+                        "h1_q_high": MASK_QBOUNDS[mask_modes.get("h1", "any")][1],
+                    }
+                ),
+                "source_table": "auditor_atrreg_mask_results",
+                "source_run_id": str(run_id),
+            }
+        )
 
     # публикация
     try:
         await infra.redis_client.xadd(stream, fields, id="*")
-        log.debug("📨 AUD_ATRREG → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
-                 sid, direction, label, fields["eligible"])
+        log.debug(
+            "📨 AUD_ATRREG → BEST_SELECTOR | sid=%s dir=%s | variant=%s | eligible=%s",
+            sid,
+            direction,
+            label,
+            fields["eligible"],
+        )
     except Exception:
         log.exception("❌ AUD_ATRREG: ошибка публикации кандидата в %s", stream)
 
@@ -549,20 +692,22 @@ async def _load_closed_positions_for_strategy(sid: int) -> List[Dict[str, Any]]:
               AND status = 'closed'
               AND direction IN ('long','short')
             """,
-            int(sid)
+            int(sid),
         )
     out: List[Dict[str, Any]] = []
     for r in rows:
-        out.append({
-            "position_uid": str(r["position_uid"]),
-            "symbol": str(r["symbol"]),
-            "direction": str(r["direction"]),
-            "entry_price": float(r["entry_price"] or 0.0),
-            "pnl": float(r["pnl"] or 0.0),
-            "notional_value": float(r["notional_value"] or 0.0),
-            "created_at": r["created_at"],
-            "closed_at": r["closed_at"],
-        })
+        out.append(
+            {
+                "position_uid": str(r["position_uid"]),
+                "symbol": str(r["symbol"]),
+                "direction": str(r["direction"]),
+                "entry_price": float(r["entry_price"] or 0.0),
+                "pnl": float(r["pnl"] or 0.0),
+                "notional_value": float(r["notional_value"] or 0.0),
+                "created_at": r["created_at"],
+                "closed_at": r["closed_at"],
+            }
+        )
     return out
 
 
@@ -584,7 +729,7 @@ async def _load_indicator_snapshots_for_positions(pos_uids: List[str]) -> Dict[T
               AND timeframe IN ('m5','m15','h1')
             GROUP BY position_uid, timeframe
             """,
-            pos_uids
+            pos_uids,
         )
 
     for r in rows:
@@ -610,8 +755,14 @@ def _compute_coverage(positions: List[Dict[str, Any]], now_utc: dt.datetime) -> 
         for w, nominal_days in WINDOWS:
             if w == "total":
                 n_positions = len(dir_positions)
-                first_closed = min((p["closed_at"] for p in dir_positions if p["closed_at"]), default=None)
-                last_closed = max((p["closed_at"] for p in dir_positions if p["closed_at"]), default=None)
+                first_closed = min(
+                    (p["closed_at"] for p in dir_positions if p["closed_at"]),
+                    default=None,
+                )
+                last_closed = max(
+                    (p["closed_at"] for p in dir_positions if p["closed_at"]),
+                    default=None,
+                )
                 out[direction][w] = {
                     "window_days_effective": 0,
                     "window_days_nominal": 0,
@@ -665,36 +816,17 @@ async def _insert_coverage_rows(run_id: int, sid: int, coverage: Dict[str, Dict[
                      n_positions, first_closed_at, last_closed_at)
                     VALUES ($1,$2,$3,$4, $5,$6,$7, $8,$9,$10)
                     """,
-                    run_id, sid, direction, w,
-                    rec["window_days_effective"], rec["window_days_nominal"], rec["window_coverage_pct"],
-                    rec["n_positions"], rec["first_closed_at"], rec["last_closed_at"]
+                    run_id,
+                    sid,
+                    direction,
+                    w,
+                    rec["window_days_effective"],
+                    rec["window_days_nominal"],
+                    rec["window_coverage_pct"],
+                    rec["n_positions"],
+                    rec["first_closed_at"],
+                    rec["last_closed_at"],
                 )
-
-
-# 🔸 Выбор primary окна по покрытию
-def _choose_primary_window(cov_map: Dict[str, Dict[str, Any]]) -> str:
-    cov28 = cov_map.get("28d", {}).get("window_coverage_pct", 0.0)
-    cov14 = cov_map.get("14d", {}).get("window_coverage_pct", 0.0)
-    if cov28 >= PRIMARY_28D_COVERAGE * 100.0:
-        return "28d"
-    if cov14 >= PRIMARY_14D_COVERAGE * 100.0:
-        return "14d"
-    return "7d"
-
-
-# 🔸 Выбор secondary окна (для проверки знака)
-def _choose_secondary_window(cov_map: Dict[str, Dict[str, Any]], primary: str) -> Optional[str]:
-    if primary == "28d":
-        if cov_map.get("14d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
-            return "14d"
-        if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
-            return "7d"
-        return None
-    if primary == "14d":
-        if cov_map.get("7d", {}).get("window_coverage_pct", 0.0) >= SECONDARY_MIN_COVER * 100.0:
-            return "7d"
-        return None
-    return None  # primary=7d
 
 
 # 🔸 Классификация TF по бинам (HIGH/LOW/MID/any) на окне
@@ -736,7 +868,7 @@ def _evaluate_mask_on_positions(
     wr_all = (sum(1 for p in all_list if p["pnl"] >= 0) / n_all * 100.0) if n_all > 0 else 0.0
     roi_all = ((pnl_all / deposit) * 100.0) if (deposit > 0 and n_all > 0) else None
 
-    selected = []
+    selected: List[Dict[str, Any]] = []
     for p in all_list:
         puid = p["position_uid"]
         ok = True
@@ -864,16 +996,33 @@ async def _insert_mask_result(
              $7,$8,$9, $10,$11,$12, $13,$14,$15,
              $16,$17,$18, $19,$20, $21,$22, $23,$24, $25,$26,$27)
             """,
-            run_id, sid, direction, window_tag,
-            is_primary, primary_window,
-            m5_mode, m5_l, m5_h,
-            m15_mode, m15_l, m15_h,
-            h1_mode, h1_l, h1_h,
-            n_sel, n_all, coverage_pct,
-            pnl_sel, pnl_all,
-            roi_sel, roi_all,
-            wr_sel, wr_all,
-            decision_class, float(decision_confidence), rationale
+            run_id,
+            sid,
+            direction,
+            window_tag,
+            is_primary,
+            primary_window,
+            m5_mode,
+            m5_l,
+            m5_h,
+            m15_mode,
+            m15_l,
+            m15_h,
+            h1_mode,
+            h1_l,
+            h1_h,
+            n_sel,
+            n_all,
+            coverage_pct,
+            pnl_sel,
+            pnl_all,
+            roi_sel,
+            roi_all,
+            wr_sel,
+            wr_all,
+            decision_class,
+            float(decision_confidence),
+            rationale,
         )
 
 
@@ -890,9 +1039,12 @@ def _quantile_edges(values: List[float], probs: Iterable[float]) -> Tuple[float,
         idx = min(max(idx, 0), n - 1)
         edges.append(arr[idx])
     e1, e2, e3, e4 = edges
-    if e1 > e2: e2 = e1
-    if e2 > e3: e3 = e2
-    if e3 > e4: e4 = e3
+    if e1 > e2:
+        e2 = e1
+    if e2 > e3:
+        e3 = e2
+    if e3 > e4:
+        e4 = e3
     return (e1, e2, e3, e4)
 
 
