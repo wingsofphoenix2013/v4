@@ -14,8 +14,11 @@ from laboratory_auditor_config import (
     get_thresholds,
 )
 
-# 🔸 Импорт обработчика идеи emacross_cs (остальные идеи будут добавляться аналогично)
+# 🔸 Импорт обработчиков идей
 from laboratory_auditor_emacross import evaluate_emacross_cs
+from laboratory_auditor_atrreg import evaluate_atr_pct_regime
+from laboratory_auditor_ema200_side import evaluate_ema200_side
+from laboratory_auditor_ema2150_spread import evaluate_emacross_2150_spread
 
 # 🔸 Логгер
 log = logging.getLogger("LAB_DECISION_AUDITOR")
@@ -46,7 +49,9 @@ ALLOWED_DIRECTIONS = ("long", "short")
 # 🔸 Маппинг idea_key → обработчик
 IDEA_HANDLERS = {
     "emacross_cs": evaluate_emacross_cs,
-    # последующие идеи будут добавляться сюда
+    "atr_pct_regime": evaluate_atr_pct_regime,
+    "ema200_side": evaluate_ema200_side,
+    "emacross_2150_spread": evaluate_emacross_2150_spread,
 }
 
 # скрипт безопасного релиза «только если значение совпадает»
