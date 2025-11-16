@@ -22,7 +22,6 @@ from indicator_mw_volatility import run_indicator_mw_volatility
 from indicator_mw_momentum import run_indicator_mw_momentum
 from indicator_mw_extremes import run_indicator_mw_extremes
 from indicator_mw_states import run_indicator_mw_states
-from indicator_mw_states_back import run_indicator_mw_states_back
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -439,7 +438,6 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_momentum(pg, redis), "MW_MOM"),
         run_safe_loop(lambda: run_indicator_mw_extremes(pg, redis), "MW_EXT"),
         run_safe_loop(lambda: run_indicator_mw_states(pg, redis), "MW_STATE"),
-        run_indicator_mw_states_back(pg, redis),
     )
 
 
