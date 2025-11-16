@@ -1,4 +1,4 @@
-# indicator_mw_states_back.py — разовый бэкофилл market_state за последние 12 суток из MW-состояний
+# indicator_mw_states_back.py — периодический бэкофилл/ремонт market_state из MW-состояний
 
 import asyncio
 import json
@@ -13,8 +13,9 @@ log = logging.getLogger("MW_STATE_BACK")
 
 # 🔸 Параметры бэкофилла
 BACKFILL_LOOKBACK_DAYS = 12             # глубина окна в днях
-BACKFILL_SKIP_RECENT_HOURS = 1          # не трогаем последний час (live-воркер сам всё сделает)
+BACKFILL_SKIP_RECENT_MINUTES = 10       # не трогаем последние N минут (оставляем live-воркеру)
 BACKFILL_BATCH_LIMIT = 50_000           # размер одной порции бэкофилла
+BACKFILL_INTERVAL_SEC = 900             # периодичность прохода (15 минут)
 
 # 🔸 Поддерживаемые TF
 VALID_TF = {"m5", "m15", "h1"}
@@ -186,37 +187,44 @@ async def run_backfill_window(pg, start_dt: datetime, end_dt: datetime):
     return written, per_tf
 
 
-# 🔸 Основной воркер бэкофилла: несколько проходов по окну, пока есть кандидаты
+# 🔸 Периодический воркер бэкофилла: проход по окну каждые BACKFILL_INTERVAL_SEC
 async def run_indicator_mw_states_back(pg, redis):
-    log.info("MW_STATE_BACK: воркер запущен (разовый бэкофилл market_state)")
-
-    # задаём окно по времени
-    now = datetime.utcnow()
-    end_dt = now - timedelta(hours=BACKFILL_SKIP_RECENT_HOURS)
-    start_dt = end_dt - timedelta(days=BACKFILL_LOOKBACK_DAYS)
-
-    log.info(
-        f"MW_STATE_BACK: старт бэкофилла market_state для окна "
-        f"{start_dt.isoformat()} .. {end_dt.isoformat()} "
-        f"(now={now.isoformat()}, skip_recent_hours={BACKFILL_SKIP_RECENT_HOURS})"
-    )
-
-    total_written = 0
-    per_tf_total = {tf: 0 for tf in VALID_TF}
+    log.info("MW_STATE_BACK: воркер запущен (периодический бэкофилл market_state)")
 
     while True:
-        # одна порция до BACKFILL_BATCH_LIMIT
-        written, per_tf = await run_backfill_window(pg, start_dt, end_dt)
-        total_written += written
-        for tf in VALID_TF:
-            per_tf_total[tf] = per_tf_total.get(tf, 0) + per_tf.get(tf, 0)
+        try:
+            now = datetime.utcnow()
+            # не трогаем самый свежий хвост — даём live-воркеру добежать
+            end_dt = now - timedelta(minutes=BACKFILL_SKIP_RECENT_MINUTES)
+            start_dt = end_dt - timedelta(days=BACKFILL_LOOKBACK_DAYS)
 
-        # если записали меньше лимита — это был последний batch
-        if written < BACKFILL_BATCH_LIMIT:
-            break
+            log.info(
+                f"MW_STATE_BACK: старт прохода по окну "
+                f"{start_dt.isoformat()} .. {end_dt.isoformat()} "
+                f"(now={now.isoformat()}, skip_recent_minutes={BACKFILL_SKIP_RECENT_MINUTES})"
+            )
 
-    log.info(
-        f"MW_STATE_BACK: бэкофилл завершён, всего записано={total_written} "
-        f"(m5={per_tf_total.get('m5',0)}, m15={per_tf_total.get('m15',0)}, h1={per_tf_total.get('h1',0)})"
-    )
-    # воркер завершается — его можно запускать как одноразовый
+            total_written = 0
+            per_tf_total = {tf: 0 for tf in VALID_TF}
+
+            while True:
+                # одна порция до BACKFILL_BATCH_LIMIT
+                written, per_tf = await run_backfill_window(pg, start_dt, end_dt)
+                total_written += written
+                for tf in VALID_TF:
+                    per_tf_total[tf] = per_tf_total.get(tf, 0) + per_tf.get(tf, 0)
+
+                # если записали меньше лимита — кандидатов в этом окне больше нет
+                if written < BACKFILL_BATCH_LIMIT:
+                    break
+
+            log.info(
+                f"MW_STATE_BACK: проход по окну завершён, всего записано={total_written} "
+                f"(m5={per_tf_total.get('m5',0)}, m15={per_tf_total.get('m15',0)}, h1={per_tf_total.get('h1',0)})"
+            )
+
+        except Exception as e:
+            log.error(f"MW_STATE_BACK loop error: {e}", exc_info=True)
+
+        # период ожидания до следующего прохода
+        await asyncio.sleep(BACKFILL_INTERVAL_SEC)

@@ -443,7 +443,7 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_states(pg, redis), "MW_STATE"),
         run_safe_loop(lambda: run_indicator_mw_auditor(pg, redis), "MW_MW_AUDITOR"),
         run_safe_loop(lambda: run_indicator_mw_healer(pg, redis), "MW_MW_HEALER"),
-        run_indicator_mw_states_back(pg, redis),
+        run_safe_loop(lambda: run_indicator_mw_states_back(pg, redis), "MW_STATE_BACK"),
     )
 
 
