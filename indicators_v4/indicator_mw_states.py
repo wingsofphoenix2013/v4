@@ -300,7 +300,7 @@ async def compute_market_state_for_bar(pg, redis, symbol: str, tf: str, open_tim
             await persist_market_state(pg, redis, symbol, tf, target_open, direction, quality, score, components)
 
             # логируем сводку на INFO
-            log.info(
+            log.debug(
                 f"MW_STATE OK {symbol}/{tf}@{target_open} "
                 f"direction={direction} quality={quality} score={score:.3f} "
                 f"trend={trend_state} vol={vol_state} mom={mom_state} ext={ext_state}"
@@ -311,7 +311,7 @@ async def compute_market_state_for_bar(pg, redis, symbol: str, tf: str, open_tim
         if attempts >= STATE_WAIT_RETRIES:
             # не дождались — фиксируем gap и выходим
             await mark_market_state_gap(pg, symbol, tf, target_open, missing)
-            log.info(
+            log.debug(
                 f"MW_STATE GAP {symbol}/{tf}@{target_open} "
                 f"missing={','.join(missing)} total_wait_sec={total_wait_sec}"
             )
