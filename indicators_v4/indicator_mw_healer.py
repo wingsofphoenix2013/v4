@@ -174,7 +174,7 @@ async def heal_single_mw_gap(pg, redis, gap: dict):
 
 # 🔸 Основной воркер healer'а MW
 async def run_indicator_mw_healer(pg, redis, pause_sec: int = 2):
-    log.debug("IND_MW_HEALER: воркер запущен")
+    log.info("IND_MW_HEALER: воркер запущен")
     sem = asyncio.Semaphore(4)
 
     while True:
