@@ -1,4 +1,4 @@
-# indicator_mw_states_back.py — бэкаповый расчёт market_state по истории indicator_marketwatch_values
+# indicator_mw_states_back.py — разовый бэкофилл market_state за последние 12 суток из MW-состояний
 
 import asyncio
 import json
@@ -8,93 +8,25 @@ from datetime import datetime, timedelta
 # 🔸 Импорт правил агрегирования из основного модуля состояний
 from indicator_mw_states import compute_direction_and_quality
 
-# 🔸 Константы стрима закрытых свечей (Bybit PG insert)
-CANDLE_STREAM = "bb:pg_candle_inserted"
-BACK_GROUP = "mw_state_back_group"
-BACK_CONSUMER = "mw_state_back_1"
+# 🔸 Логгер
+log = logging.getLogger("MW_STATE_BACK")
 
-# 🔸 Окно ожидания и бэкапа
-BACKFILL_START_DELAY_SEC = 60          # ждать после старта системы
-BACKFILL_LOOKBACK_DAYS = 10            # сколько суток назад смотреть
-BACKFILL_SKIP_RECENT_HOURS = 1         # не трогаем последние N часов (оставляем live-воркеру)
-BACKFILL_BATCH_LIMIT = 50_000          # страховочный лимит строк на один прогон
+# 🔸 Параметры бэкофилла
+BACKFILL_LOOKBACK_DAYS = 12             # глубина окна в днях
+BACKFILL_SKIP_RECENT_HOURS = 1          # не трогаем последний час (live-воркер сам всё сделает)
+BACKFILL_BATCH_LIMIT = 50_000           # страховочный лимит строк в один прогон
 
 # 🔸 Поддерживаемые TF
 VALID_TF = {"m5", "m15", "h1"}
 
-# 🔸 Логгер модуля
-log = logging.getLogger("MW_STATE_BACK")
 
-
-# 🔸 Конвертация timestamp(ms) → datetime UTC
-def ms_to_dt(ms: int) -> datetime:
-    return datetime.utcfromtimestamp(ms / 1000)
-
-
-# 🔸 Ожидание первого сообщения в bb:pg_candle_inserted для синхронизации старта
-async def wait_first_candle(redis) -> datetime:
-    """
-    Ждёт первое сообщение в CANDLE_STREAM через consumer-group BACK_GROUP.
-    Возвращает datetime(anchor) по полю timestamp (UTC), который потом
-    используется как опорное время для окна бэкапа.
-    """
-    # создаём consumer-group, если её ещё нет
-    try:
-        await redis.xgroup_create(CANDLE_STREAM, BACK_GROUP, id="$", mkstream=True)
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            log.warning(f"MW_STATE_BACK: xgroup_create error: {e}")
-
-    log.debug("MW_STATE_BACK: ожидание первого сообщения в bb:pg_candle_inserted")
-
-    while True:
-        try:
-            resp = await redis.xreadgroup(
-                groupname=BACK_GROUP,
-                consumername=BACK_CONSUMER,
-                streams={CANDLE_STREAM: ">"},
-                count=1,
-                block=10_000,  # 10 секунд
-            )
-            if not resp:
-                continue
-
-            to_ack = []
-            anchor_dt = None
-
-            for _, messages in resp:
-                for msg_id, data in messages:
-                    to_ack.append(msg_id)
-                    ts_raw = data.get("timestamp")
-                    try:
-                        ts_ms = int(ts_raw)
-                        anchor_dt = ms_to_dt(ts_ms)
-                    except Exception:
-                        # если timestamp кривой — просто игнорируем и ждём следующее
-                        anchor_dt = None
-
-            if to_ack:
-                try:
-                    await redis.xack(CANDLE_STREAM, BACK_GROUP, *to_ack)
-                except Exception as e:
-                    log.warning(f"MW_STATE_BACK: ack error: {e}")
-
-            if anchor_dt is not None:
-                log.info(f"MW_STATE_BACK: получен anchor из bb:pg_candle_inserted → {anchor_dt.isoformat()}")
-                return anchor_dt
-
-        except Exception as e:
-            log.error(f"MW_STATE_BACK: read error: {e}", exc_info=True)
-            await asyncio.sleep(1)
-
-
-# 🔸 Основная выборка кандидатов для бэкапа из indicator_marketwatch_values
+# 🔸 Выборка кандидатов для бэкофилла market_state
 async def fetch_backfill_candidates(pg, start_dt: datetime, end_dt: datetime):
     """
     Ищет бары, для которых есть все 4 MW-состояния (trend/volatility/momentum/extremes),
     но ещё нет kind='market_state'.
 
-    Возвращает список записей вида:
+    Возвращает список dict:
       {
         "symbol": str,
         "timeframe": str,
@@ -130,8 +62,8 @@ async def fetch_backfill_candidates(pg, start_dt: datetime, end_dt: datetime):
               AND kind IN ('trend','volatility','momentum','extremes','market_state')
             GROUP BY symbol, timeframe, open_time
             HAVING
-              bool_or(kind = 'market_state') = false
-              AND count(DISTINCT kind) >= 4
+              bool_or(kind = 'market_state') = false      -- не трогаем уже существующие market_state
+              AND count(DISTINCT kind) >= 4               -- есть все 4 MW-компоненты
             ORDER BY open_time ASC
             LIMIT $4
             """,
@@ -143,7 +75,6 @@ async def fetch_backfill_candidates(pg, start_dt: datetime, end_dt: datetime):
 
     candidates = []
     for r in rows:
-        # страховка от NULL-состояний
         if not (r["trend_state"] and r["vol_state"] and r["mom_state"] and r["ext_state"]):
             continue
         candidates.append(
@@ -168,7 +99,7 @@ async def write_backfilled_states(pg, records: list[dict]):
     пишет их в indicator_marketwatch_values с kind='market_state'.
 
     details содержит direction, quality, score, components, open_time_iso.
-    status ставим 'healed', source = 'backfill'.
+    status = 'healed', source = 'backfill'.
     """
     if not records:
         return 0
@@ -196,13 +127,7 @@ async def write_backfilled_states(pg, records: list[dict]):
                   (symbol, timeframe, open_time, kind, state, status, details, version, source, computed_at, updated_at)
                 VALUES ($1,$2,$3,'market_state',$4,'healed',$5,1,'backfill',NOW(),NOW())
                 ON CONFLICT (symbol, timeframe, open_time, kind)
-                DO UPDATE SET
-                  state   = EXCLUDED.state,
-                  status  = EXCLUDED.status,
-                  details = EXCLUDED.details,
-                  version = EXCLUDED.version,
-                  source  = EXCLUDED.source,
-                  updated_at = NOW()
+                DO NOTHING
                 """,
                 params,
             )
@@ -210,13 +135,12 @@ async def write_backfilled_states(pg, records: list[dict]):
     return len(records)
 
 
-# 🔸 Один прогон бэкапа по окну [start_dt .. end_dt]
+# 🔸 Один проход бэкофилла по окну [start_dt .. end_dt]
 async def run_backfill_window(pg, start_dt: datetime, end_dt: datetime):
-    # выбираем кандидатов
     candidates = await fetch_backfill_candidates(pg, start_dt, end_dt)
     if not candidates:
         log.info(
-            f"MW_STATE_BACK: кандидатов для бэкапа не найдено в окне "
+            f"MW_STATE_BACK: кандидатов для бэкофилла не найдено в окне "
             f"{start_dt.isoformat()} .. {end_dt.isoformat()}"
         )
         return 0, {}
@@ -261,34 +185,26 @@ async def run_backfill_window(pg, start_dt: datetime, end_dt: datetime):
     return written, per_tf
 
 
-# 🔸 Основной воркер бэкапа: однократный проход по истории за последние 10 суток
+# 🔸 Основной воркер бэкофилла: один проход по истории за последние BACKFILL_LOOKBACK_DAYS суток
 async def run_indicator_mw_states_back(pg, redis):
-    log.debug("MW_STATE_BACK: воркер запущен (ожидание старта)")
+    log.info("MW_STATE_BACK: воркер запущен (разовый бэкофилл market_state)")
 
-    # ждём стартовый лаг, чтобы не мешать живой инициализации
-    await asyncio.sleep(BACKFILL_START_DELAY_SEC)
-
-    # ждём первое сообщение от feed_bb, чтобы взять опорное время
-    anchor_dt = await wait_first_candle(redis)
-
-    # сдвигаем назад на BACKFILL_SKIP_RECENT_HOURS
-    effective_now = anchor_dt - timedelta(hours=BACKFILL_SKIP_RECENT_HOURS)
-    start_dt = effective_now - timedelta(days=BACKFILL_LOOKBACK_DAYS)
-    end_dt = effective_now
+    # задаём окно по времени
+    now = datetime.utcnow()
+    end_dt = now - timedelta(hours=BACKFILL_SKIP_RECENT_HOURS)
+    start_dt = end_dt - timedelta(days=BACKFILL_LOOKBACK_DAYS)
 
     log.info(
-        f"MW_STATE_BACK: старт бэкапа market_state для окна "
+        f"MW_STATE_BACK: старт бэкофилла market_state для окна "
         f"{start_dt.isoformat()} .. {end_dt.isoformat()} "
-        f"(anchor={anchor_dt.isoformat()}, skip_recent_hours={BACKFILL_SKIP_RECENT_HOURS})"
+        f"(now={now.isoformat()}, skip_recent_hours={BACKFILL_SKIP_RECENT_HOURS})"
     )
 
-    # один проход по окну; при необходимости можно будет сделать сегментацию по дням
     total_written, per_tf = await run_backfill_window(pg, start_dt, end_dt)
 
     log.info(
-        f"MW_STATE_BACK: бэкап завершён, всего записано={total_written} "
+        f"MW_STATE_BACK: бэкофилл завершён, всего записано={total_written} "
         f"(m5={per_tf.get('m5',0)}, m15={per_tf.get('m15',0)}, h1={per_tf.get('h1',0)})"
     )
 
-    # после этого воркер корректно завершается; если его запускать без run_safe_loop,
-    # он отработает один раз и больше не будет перезапускаться.
+    # воркер завершается — его можно запускать как одноразовый
