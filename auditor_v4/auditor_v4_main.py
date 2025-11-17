@@ -12,7 +12,8 @@ from auditor_infra import (
 )
 from auditor_config import load_active_mw_strategies
 import auditor_infra as infra
-from auditor_mw_state_worker import run_mw_state_worker
+# from auditor_mw_state_worker import run_mw_state_worker
+from auditor_ema21short_worker import run_ema21short_worker
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
@@ -138,8 +139,11 @@ async def main():
         # одноразовый аудит закрытых сделок (выполняется и завершается)
         run_one_shot_audit(),
 
+        # одноразовый запуск воркера анализа PACK ema21 для шортов через 120 секунд
+        _start_with_delay(run_ema21short_worker, 60),
+
         # одноразовый запуск воркера анализа market_state через 60 секунд
-        _start_with_delay(run_mw_state_worker, 60),
+#         _start_with_delay(run_mw_state_worker, 60),
     )
 
     log.info("😴 auditor_v4: задачи завершены, уходим в сон на 99 часов, чтобы сервис не перезапускался")
