@@ -4,7 +4,7 @@
 import logging
 import datetime as dt
 from collections import defaultdict
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import auditor_infra as infra
 
@@ -16,6 +16,7 @@ log = logging.getLogger("AUD_MW_STATE")
 # 🔸 Константы воркера
 TIMEFRAMES = ("m5", "m15", "h1")
 CHECK_TYPES = ("solo_straight", "solo_combo")
+BATCH_SIZE = 200
 
 
 # 🔸 Вспомогательные функции
@@ -29,7 +30,6 @@ def _is_passed(check_type: str, ms_direction: str, ms_quality: str | None, pos_d
     elif ms_direction == "short_only":
         allowed_dir = (pos_direction == "short")
     else:
-        # неизвестное состояние трактуем как запрет
         allowed_dir = False
 
     # простой режим: только направление
@@ -48,6 +48,94 @@ def _calc_winrate(wins: int, total: int) -> float | None:
     if total <= 0:
         return None
     return wins / total
+
+
+def _init_counters_for_strategy() -> Tuple[
+    Dict[tuple, Dict[str, Any]],
+    Dict[tuple, Dict[str, Any]],
+]:
+    # детальные счётчики: по варианту market_state
+    detailed_counters: dict[
+        tuple[int, str, str, str, str, str | None],
+        Dict[str, Any],
+    ] = defaultdict(lambda: {
+        "total": 0,
+        "passed": 0,
+        "sum_before": 0.0,
+        "sum_after": 0.0,
+        "wins_before": 0,
+        "wins_after": 0,
+    })
+
+    # агрегированные счётчики: по фильтру в целом (без разбиения на варианты)
+    aggregated_counters: dict[
+        tuple[int, str, str, str],
+        Dict[str, Any],
+    ] = defaultdict(lambda: {
+        "total": 0,
+        "passed": 0,
+        "sum_before": 0.0,
+        "sum_after": 0.0,
+        "wins_before": 0,
+        "wins_after": 0,
+    })
+
+    return detailed_counters, aggregated_counters
+
+
+def _update_stats_for_position(
+    pos: Dict[str, Any],
+    ms_by_tf: Dict[str, Dict[str, str]],
+    detailed_counters: Dict[tuple, Dict[str, Any]],
+    aggregated_counters: Dict[tuple, Dict[str, Any]],
+) -> None:
+    strategy_id = int(pos["strategy_id"])
+    pos_direction = str(pos["direction"])
+    pnl = pos["pnl"] if pos["pnl"] is not None else 0
+    is_win = pnl > 0
+
+    # обход по ТФ
+    for timeframe in TIMEFRAMES:
+        tf_ms = ms_by_tf.get(timeframe) or {}
+        ms_direction = tf_ms.get("direction")
+        ms_quality = tf_ms.get("quality")
+
+        # пропуск, если чего-то не хватает
+        if not ms_direction:
+            continue
+
+        # обход по типам проверки
+        for check_type in CHECK_TYPES:
+            passed = _is_passed(check_type, ms_direction, ms_quality, pos_direction)
+
+            # для solo_straight quality в детальной строке не фиксируем
+            eff_ms_quality = ms_quality if check_type == "solo_combo" else None
+
+            # ключ детальной статистики
+            det_key = (strategy_id, pos_direction, timeframe, check_type, ms_direction, eff_ms_quality)
+            det = detailed_counters[det_key]
+            det["total"] += 1
+            det["sum_before"] += pnl
+            if is_win:
+                det["wins_before"] += 1
+            if passed:
+                det["passed"] += 1
+                det["sum_after"] += pnl
+                if is_win:
+                    det["wins_after"] += 1
+
+            # ключ агрегированной статистики
+            agg_key = (strategy_id, pos_direction, timeframe, check_type)
+            agg = aggregated_counters[agg_key]
+            agg["total"] += 1
+            agg["sum_before"] += pnl
+            if is_win:
+                agg["wins_before"] += 1
+            if passed:
+                agg["passed"] += 1
+                agg["sum_after"] += pnl
+                if is_win:
+                    agg["wins_after"] += 1
 
 
 # 🔸 Загрузка MW-стратегий (deposit нужен для ROI)
@@ -74,176 +162,145 @@ async def _load_mw_strategies(conn) -> Dict[int, Dict[str, Any]]:
     return strategies
 
 
-# 🔸 Загрузка позиций с полным комплектом market_state (6 строк на позицию)
-async def _load_positions_with_market_state(conn, sid_list: list[int]) -> Dict[str, Dict[str, Any]]:
-    # условия достаточности
-    if not sid_list:
-        return {}
+# 🔸 Обработка позиций одной стратегии батчами
+async def _process_strategy_positions(
+    conn,
+    strategy_id: int,
+    detailed_counters: Dict[tuple, Dict[str, Any]],
+    aggregated_counters: Dict[tuple, Dict[str, Any]],
+) -> Tuple[int, int]:
+    last_id = 0
+    total_positions = 0
+    used_positions = 0
 
-    rows = await conn.fetch(
-        """
-        WITH base_pos AS (
-            SELECT
-                p.position_uid,
-                p.strategy_id,
-                p.direction,
-                p.pnl
-            FROM positions_v4 p
-            WHERE p.status = 'closed'
-              AND p.strategy_id = ANY($1::int4[])
-        ),
-        complete_pos AS (
-            SELECT
-                s.position_uid
-            FROM indicator_position_stat s
-            JOIN base_pos bp ON bp.position_uid = s.position_uid
-            WHERE s.param_type = 'marketwatch'
-              AND s.param_base = 'market_state'
-              AND s.status = 'ok'
-              AND s.timeframe IN ('m5','m15','h1')
-              AND s.param_name IN ('direction','quality')
-            GROUP BY s.position_uid
-            HAVING COUNT(*) = 6
+    # обработка батчами по id
+    while True:
+        rows = await conn.fetch(
+            """
+            SELECT id, position_uid, direction, pnl
+            FROM positions_v4
+            WHERE status = 'closed'
+              AND strategy_id = $1
+              AND id > $2
+            ORDER BY id
+            LIMIT $3
+            """,
+            strategy_id,
+            last_id,
+            BATCH_SIZE,
         )
-        SELECT
-            bp.position_uid,
-            bp.strategy_id,
-            bp.direction AS pos_direction,
-            bp.pnl,
-            s.timeframe,
-            s.param_name,
-            s.value_text
-        FROM base_pos bp
-        JOIN complete_pos cp ON cp.position_uid = bp.position_uid
-        JOIN indicator_position_stat s ON s.position_uid = bp.position_uid
-        WHERE s.param_type = 'marketwatch'
-          AND s.param_base = 'market_state'
-          AND s.status = 'ok'
-          AND s.timeframe IN ('m5','m15','h1')
-          AND s.param_name IN ('direction','quality')
-        ORDER BY bp.position_uid, s.timeframe, s.param_name
-        """,
-        sid_list,
+
+        if not rows:
+            break
+
+        positions_batch = []
+        position_uids: list[str] = []
+
+        # подготовка батча позиций
+        for r in rows:
+            pid = int(r["id"])
+            position_uid = str(r["position_uid"])
+            pos_direction = str(r["direction"])
+            pnl = r["pnl"]
+
+            positions_batch.append(
+                {
+                    "id": pid,
+                    "position_uid": position_uid,
+                    "direction": pos_direction,
+                    "pnl": pnl,
+                    "strategy_id": strategy_id,
+                }
+            )
+            position_uids.append(position_uid)
+
+            if pid > last_id:
+                last_id = pid
+
+        total_positions += len(positions_batch)
+
+        # защита от пустого батча
+        if not position_uids:
+            continue
+
+        # загрузка market_state по батчу позицій
+        ind_rows = await conn.fetch(
+            """
+            SELECT position_uid, timeframe, param_name, value_text
+            FROM indicator_position_stat
+            WHERE position_uid = ANY($1::text[])
+              AND param_type = 'marketwatch'
+              AND param_base = 'market_state'
+              AND status = 'ok'
+              AND timeframe IN ('m5','m15','h1')
+              AND param_name IN ('direction','quality')
+            """,
+            position_uids,
+        )
+
+        # укладка market_state в структуру {position_uid: {tf: {param_name: value}}}
+        ms_map: Dict[str, Dict[str, Dict[str, str]]] = {}
+
+        for r in ind_rows:
+            puid = str(r["position_uid"])
+            timeframe = str(r["timeframe"])
+            param_name = str(r["param_name"])
+            value_text = str(r["value_text"]) if r["value_text"] is not None else None
+
+            ms_map.setdefault(puid, {}).setdefault(timeframe, {})[param_name] = value_text
+
+        # обход позиций батча с проверкой полноты market_state
+        for pos in positions_batch:
+            puid = pos["position_uid"]
+            ms_by_tf = ms_map.get(puid)
+
+            # если нет вообще записей по этой позиции — пропуск
+            if not ms_by_tf:
+                continue
+
+            complete = True
+            for tf in TIMEFRAMES:
+                tf_ms = ms_by_tf.get(tf)
+                if not tf_ms or "direction" not in tf_ms or "quality" not in tf_ms:
+                    complete = False
+                    break
+
+            if not complete:
+                continue
+
+            # позиция с полным market_state — учитываем в статистике
+            used_positions += 1
+            _update_stats_for_position(pos, ms_by_tf, detailed_counters, aggregated_counters)
+
+    log.info(
+        "🔍 AUD_MW_STATE: стратегия %d — позиций всего=%d, с полным market_state=%d",
+        strategy_id,
+        total_positions,
+        used_positions,
     )
 
-    positions: Dict[str, Dict[str, Any]] = {}
-
-    for r in rows:
-        position_uid = str(r["position_uid"])
-        strategy_id = int(r["strategy_id"])
-        pos_direction = str(r["pos_direction"])
-        pnl = r["pnl"]
-
-        timeframe = str(r["timeframe"])
-        param_name = str(r["param_name"])
-        value_text = str(r["value_text"]) if r["value_text"] is not None else None
-
-        # инициализация записи позиции
-        if position_uid not in positions:
-            positions[position_uid] = {
-                "position_uid": position_uid,
-                "strategy_id": strategy_id,
-                "direction": pos_direction,
-                "pnl": pnl,
-                "market_state": {tf: {} for tf in TIMEFRAMES},
-            }
-
-        # запись market_state по ТФ
-        positions[position_uid]["market_state"][timeframe][param_name] = value_text
-
-    log.info("🔍 AUD_MW_STATE: найдено позиций с полным market_state: %d", len(positions))
-    return positions
+    return total_positions, used_positions
 
 
-# 🔸 Построение статистики (детальной и агрегированной)
-def _build_stats(
-    positions: Dict[str, Dict[str, Any]],
+# 🔸 Построение строк для вставки по одной стратегии
+def _build_rows_for_strategy(
+    strategy_id: int,
+    detailed_counters: Dict[tuple, Dict[str, Any]],
+    aggregated_counters: Dict[tuple, Dict[str, Any]],
     strategies: Dict[int, Dict[str, Any]],
     calc_at: dt.datetime,
 ) -> tuple[list[tuple], list[tuple]]:
-    # детальные счётчики: по варианту market_state
-    detailed_counters: dict[
-        tuple[int, str, str, str, str, str | None],
-        Dict[str, Any],
-    ] = defaultdict(lambda: {
-        "total": 0,
-        "passed": 0,
-        "sum_before": 0,
-        "sum_after": 0,
-        "wins_before": 0,
-        "wins_after": 0,
-    })
-
-    # агрегированные счётчики: по фильтру в целом (без разбиения на варианты)
-    aggregated_counters: dict[
-        tuple[int, str, str, str],
-        Dict[str, Any],
-    ] = defaultdict(lambda: {
-        "total": 0,
-        "passed": 0,
-        "sum_before": 0,
-        "sum_after": 0,
-        "wins_before": 0,
-        "wins_after": 0,
-    })
-
-    # обход всех позиций
-    for pos in positions.values():
-        strategy_id = int(pos["strategy_id"])
-        pos_direction = str(pos["direction"])
-        pnl = pos["pnl"] if pos["pnl"] is not None else 0
-        is_win = pnl > 0
-        ms_all = pos["market_state"]
-
-        # обход по ТФ
-        for timeframe in TIMEFRAMES:
-            ms = ms_all.get(timeframe) or {}
-            ms_direction = ms.get("direction")
-            ms_quality = ms.get("quality")
-
-            # пропуск, если чего-то не хватает (на всякий случай, хотя SQL уже отфильтровал)
-            if not ms_direction:
-                continue
-
-            # обход по типам проверки
-            for check_type in CHECK_TYPES:
-                passed = _is_passed(check_type, ms_direction, ms_quality, pos_direction)
-
-                # для solo_straight quality в детальной строке не фиксируем
-                eff_ms_quality = ms_quality if check_type == "solo_combo" else None
-
-                # ключ детальной статистики
-                det_key = (strategy_id, pos_direction, timeframe, check_type, ms_direction, eff_ms_quality)
-                det = detailed_counters[det_key]
-                det["total"] += 1
-                det["sum_before"] += pnl
-                if is_win:
-                    det["wins_before"] += 1
-                if passed:
-                    det["passed"] += 1
-                    det["sum_after"] += pnl
-                    if is_win:
-                        det["wins_after"] += 1
-
-                # ключ агрегированной статистики
-                agg_key = (strategy_id, pos_direction, timeframe, check_type)
-                agg = aggregated_counters[agg_key]
-                agg["total"] += 1
-                agg["sum_before"] += pnl
-                if is_win:
-                    agg["wins_before"] += 1
-                if passed:
-                    agg["passed"] += 1
-                    agg["sum_after"] += pnl
-                    if is_win:
-                        agg["wins_after"] += 1
-
     detailed_rows: list[tuple] = []
     aggregated_rows: list[tuple] = []
 
-    # формирование детальных строк
+    deposit = strategies.get(strategy_id, {}).get("deposit")
+
+    # формирование детальных строк только по этой стратегии
     for key, det in detailed_counters.items():
-        strategy_id, direction, timeframe, check_type, ms_direction, ms_quality = key
+        sid, direction, timeframe, check_type, ms_direction, ms_quality = key
+        if sid != strategy_id:
+            continue
+
         total = det["total"]
         passed = det["passed"]
         filtered = total - passed
@@ -256,8 +313,7 @@ def _build_stats(
         winrate_before = _calc_winrate(wins_before, total)
         winrate_after = _calc_winrate(wins_after, passed)
 
-        deposit = strategies.get(strategy_id, {}).get("deposit")
-        if deposit is None or deposit == 0:
+        if not deposit or deposit == 0:
             roi_before = None
             roi_after = None
         else:
@@ -285,9 +341,12 @@ def _build_stats(
             )
         )
 
-    # формирование агрегированных строк
+    # формирование агрегированных строк только по этой стратегии
     for key, agg in aggregated_counters.items():
-        strategy_id, direction, timeframe, check_type = key
+        sid, direction, timeframe, check_type = key
+        if sid != strategy_id:
+            continue
+
         total = agg["total"]
         passed = agg["passed"]
         filtered = total - passed
@@ -300,8 +359,7 @@ def _build_stats(
         winrate_before = _calc_winrate(wins_before, total)
         winrate_after = _calc_winrate(wins_after, passed)
 
-        deposit = strategies.get(strategy_id, {}).get("deposit")
-        if deposit is None or deposit == 0:
+        if not deposit or deposit == 0:
             roi_before = None
             roi_after = None
         else:
@@ -420,25 +478,59 @@ async def run_mw_state_worker():
             log.info("❌ AUD_MW_STATE: нет MW-стратегий для анализа — выход")
             return
 
-        sid_list = list(strategies.keys())
+        total_positions_all = 0
+        used_positions_all = 0
+        total_detailed_rows_all = 0
+        total_aggregated_rows_all = 0
 
-        # загрузка позиций с полным market_state
-        positions = await _load_positions_with_market_state(conn, sid_list)
-        if not positions:
-            log.info("❌ AUD_MW_STATE: нет позиций с полным market_state — выход")
-            return
+        # обход стратегий по одной
+        for strategy_id in sorted(strategies.keys()):
+            # инициализация счётчиков для стратегии
+            detailed_counters, aggregated_counters = _init_counters_for_strategy()
 
-        # расчёт статистики
-        detailed_rows, aggregated_rows = _build_stats(positions, strategies, calc_at)
+            log.info("🔧 AUD_MW_STATE: стратегия %d — старт обработки", strategy_id)
 
-        # запись в БД
-        await _insert_detailed_rows(conn, detailed_rows)
-        await _insert_aggregated_rows(conn, aggregated_rows)
+            total_pos, used_pos = await _process_strategy_positions(
+                conn,
+                strategy_id,
+                detailed_counters,
+                aggregated_counters,
+            )
+
+            # построение строк для конкретной стратегии
+            detailed_rows, aggregated_rows = _build_rows_for_strategy(
+                strategy_id,
+                detailed_counters,
+                aggregated_counters,
+                strategies,
+                calc_at,
+            )
+
+            # запись в БД
+            await _insert_detailed_rows(conn, detailed_rows)
+            await _insert_aggregated_rows(conn, aggregated_rows)
+
+            log.info(
+                "✅ AUD_MW_STATE: стратегия %d — позиций_всего=%d, позиций_с_полным_ms=%d, "
+                "детальных строк=%d, агрегированных строк=%d",
+                strategy_id,
+                total_pos,
+                used_pos,
+                len(detailed_rows),
+                len(aggregated_rows),
+            )
+
+            total_positions_all += total_pos
+            used_positions_all += used_pos
+            total_detailed_rows_all += len(detailed_rows)
+            total_aggregated_rows_all += len(aggregated_rows)
 
     log.info(
-        "✅ AUD_MW_STATE: завершено — стратегий=%d, позиций=%d, детальных строк=%d, агрегированных строк=%d",
+        "✅ AUD_MW_STATE: завершено — стратегий=%d, позиций_всего=%d, позиций_с_полным_ms=%d, "
+        "детальных строк=%d, агрегированных строк=%d",
         len(strategies),
-        len(positions),
-        len(detailed_rows),
-        len(aggregated_rows),
+        total_positions_all,
+        used_positions_all,
+        total_detailed_rows_all,
+        total_aggregated_rows_all,
     )
