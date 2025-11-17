@@ -25,7 +25,6 @@ from indicator_mw_states import run_indicator_mw_states
 from indicator_mw_auditor import run_indicator_mw_auditor
 from indicator_mw_healer import run_indicator_mw_healer
 from indicator_mw_states_back import run_indicator_mw_states_back
-from indicator_mw_states_positions_back import run_indicator_mw_states_positions_back
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -445,7 +444,6 @@ async def main():
         run_safe_loop(lambda: run_indicator_mw_auditor(pg, redis), "MW_MW_AUDITOR"),
         run_safe_loop(lambda: run_indicator_mw_healer(pg, redis), "MW_MW_HEALER"),
         run_safe_loop(lambda: run_indicator_mw_states_back(pg, redis), "MW_STATE_BACK"),
-        run_indicator_mw_states_positions_back(pg, redis),
     )
 
 

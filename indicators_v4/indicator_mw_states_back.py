@@ -12,8 +12,8 @@ from indicator_mw_states import compute_direction_and_quality
 log = logging.getLogger("MW_STATE_BACK")
 
 # 🔸 Параметры бэкофилла
-BACKFILL_LOOKBACK_DAYS = 12             # глубина окна в днях
-BACKFILL_SKIP_RECENT_MINUTES = 10       # не трогаем последние N минут (оставляем live-воркеру)
+BACKFILL_LOOKBACK_DAYS = 1             # глубина окна в днях
+BACKFILL_SKIP_RECENT_MINUTES = 15       # не трогаем последние N минут (оставляем live-воркеру)
 BACKFILL_BATCH_LIMIT = 50_000           # размер одной порции бэкофилла
 BACKFILL_INTERVAL_SEC = 900             # периодичность прохода (15 минут)
 

@@ -12,7 +12,7 @@ log = logging.getLogger("IND_MW_AUDITOR")
 STEP_MIN = {"m5": 5, "m15": 15, "h1": 60}
 
 # 🔸 Глубина окна проверки (в днях)
-MW_AUDIT_WINDOW_DAYS = 12
+MW_AUDIT_WINDOW_DAYS = 1
 
 # 🔸 Стрим закрытых свечей в PG (Bybit feed_bb)
 CANDLE_STREAM = "bb:pg_candle_inserted"
