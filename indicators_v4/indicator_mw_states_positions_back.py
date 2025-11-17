@@ -277,7 +277,6 @@ async def process_single_position(pg, position: dict):
 
     return written_tf
 
-
 # 🔸 Разовый воркер бэкофилла по позициям
 async def run_indicator_mw_states_positions_back(pg, redis):
     log.info("IPS_MW_BACK: воркер запущен (разовый бэкофилл market_state для позиций)")
@@ -288,48 +287,58 @@ async def run_indicator_mw_states_positions_back(pg, redis):
     end_dt = now - timedelta(minutes=POS_SKIP_RECENT_MINUTES)
     start_dt = end_dt - timedelta(days=POS_LOOKBACK_DAYS)
 
-    # выборка позиций, по которым ещё нет market_state-снимков
-    positions = await fetch_pending_positions(pg, start_dt, end_dt)
-    total = len(positions)
+    total_processed = 0
 
-    if not positions:
+    while True:
+        # выборка следующей порции позиций без market_state-снимков
+        positions = await fetch_pending_positions(pg, start_dt, end_dt)
+        batch = len(positions)
+
+        if not positions:
+            if total_processed == 0:
+                log.info(
+                    f"IPS_MW_BACK: нет позиций для бэкофилла в окне "
+                    f"{start_dt.isoformat()} .. {end_dt.isoformat()}"
+                )
+            else:
+                log.info(
+                    f"IPS_MW_BACK: бэкофилл завершён, всего обработано позиций={total_processed} "
+                    f"в окне {start_dt.isoformat()} .. {end_dt.isoformat()}"
+                )
+            return
+
         log.info(
-            f"IPS_MW_BACK: нет позиций для бэкофилла в окне "
-            f"{start_dt.isoformat()} .. {end_dt.isoformat()}"
+            f"IPS_MW_BACK: найдено позиций для обработки (порция)={batch} "
+            f"в окне {start_dt.isoformat()} .. {end_dt.isoformat()}"
         )
-        return
 
-    log.info(
-        f"IPS_MW_BACK: найдено позиций для обработки={total} "
-        f"в окне {start_dt.isoformat()} .. {end_dt.isoformat()}"
-    )
+        tasks = []
 
-    tasks = []
-
-    for pos in positions:
-        async def _run_position(p=pos):
-            async with sem:
-                try:
-                    tfs_written = await process_single_position(pg, p)
-                    if tfs_written:
-                        log.debug(
-                            f"IPS_MW_BACK: позиция {p['position_uid']} "
-                            f"{p['symbol']} created_at={p['created_at']} "
-                            f"→ записано TF={','.join(tfs_written)}"
+        for pos in positions:
+            async def _run_position(p=pos):
+                async with sem:
+                    try:
+                        tfs_written = await process_single_position(pg, p)
+                        if tfs_written:
+                            log.debug(
+                                f"IPS_MW_BACK: позиция {p['position_uid']} "
+                                f"{p['symbol']} created_at={p['created_at']} "
+                                f"→ записано TF={','.join(tfs_written)}"
+                            )
+                    except Exception as e:
+                        log.error(
+                            f"IPS_MW_BACK: ошибка при обработке позиции "
+                            f"{p['position_uid']} {p['symbol']}: {e}",
+                            exc_info=True,
                         )
-                except Exception as e:
-                    log.error(
-                        f"IPS_MW_BACK: ошибка при обработке позиции "
-                        f"{p['position_uid']} {p['symbol']}: {e}",
-                        exc_info=True,
-                    )
 
-        tasks.append(asyncio.create_task(_run_position()))
+            tasks.append(asyncio.create_task(_run_position()))
 
-    await asyncio.gather(*tasks, return_exceptions=False)
+        await asyncio.gather(*tasks, return_exceptions=False)
 
-    log.info(
-        f"IPS_MW_BACK: проход завершён, обработано позиций={total}"
-    )
-    # после этого воркер завершится; при подключении в indicators_v4_main
-    # его нужно вызывать БЕЗ run_safe_loop (одноразовый запуск)
+        total_processed += batch
+
+        log.info(
+            f"IPS_MW_BACK: порция завершена, обработано позиций={batch}, "
+            f"накопительно={total_processed}"
+        )
