@@ -11,15 +11,8 @@ from auditor_infra import (
     setup_redis_client,
 )
 from auditor_config import load_active_mw_strategies
-from auditor_cross_strength import run_auditor_cross_strength
-from auditor_ema200_side import run_auditor_ema200_side
-from auditor_best_selector import run_auditor_best_selector
-from auditor_atrreg import run_auditor_atrreg
-from auditor_ema2150_spread import run_auditor_ema2150_spread
-from auditor_rsimfi import run_auditor_rsimfi
-from auditor_bb import run_auditor_bb
-from auditor_macd import run_auditor_macd
 import auditor_infra as infra
+from auditor_mw_state_worker import run_mw_state_worker
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
@@ -143,24 +136,11 @@ async def main():
 
     log.info("🚀 Запуск задач auditor_v4")
     await asyncio.gather(
-        # фоновый воркер «сила кросса»: старт через 60 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_cross_strength, 60), "AUD_CROSS_STRENGTH"),
-        # фоновый воркер «ema200_side»: старт через 90 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_ema200_side, 75), "AUD_EMA200_SIDE"),
-        # фоновый воркер «ATR% режим волатильности»: старт через 120 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_atrreg, 90), "AUD_ATRREG"),
-        # фоновый воркер «EMA21/EMA50 spread»: старт через 150 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_ema2150_spread, 105), "AUD_EMA2150_SPREAD"),
-        # фоновый воркер «RSI/MFI energy regime»: старт через 180 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_rsimfi, 120), "AUD_RSIMFI"),
-        # фоновый воркер «BB Squeeze & Expansion»: старт через 210 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_bb, 135), "AUD_BB"),
-        # фоновый воркер «MACD Histogram Regime»: старт через 240 сек, далее цикл run→sleep(3h)
-        run_safe_loop(lambda: _start_with_delay(run_auditor_macd, 150), "AUD_MACD"),
-        # фоновый оркестратор витрины «лучшая идея»
-        run_safe_loop(lambda: _start_with_delay(run_auditor_best_selector, 0), "AUD_BEST_SELECTOR"),
         # одноразовый аудит закрытых сделок (выполняется и завершается)
         run_one_shot_audit(),
+        
+        # одноразовый запуск воркера анализа market_state через 60 секунд
+        _start_with_delay(run_mw_state_worker, 60),
     )
 
 
