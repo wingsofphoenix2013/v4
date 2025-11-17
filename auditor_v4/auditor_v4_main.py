@@ -13,7 +13,7 @@ from auditor_infra import (
 from auditor_config import load_active_mw_strategies
 import auditor_infra as infra
 
-from auditor_mwstat_worker import run_mwstat_worker
+from auditor_retrace_ema921_worker import run_retrace_ema921_worker
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
@@ -138,9 +138,9 @@ async def main():
     await asyncio.gather(
         # одноразовый аудит закрытых сделок (выполняется и завершается)
         run_one_shot_audit(),
-        
-        # одноразовый анализ MW-фильтров m5 (запуск через 60 секунд)
-        _start_with_delay(run_mwstat_worker, 60),
+
+        # одноразовый запуск аудитора качества отката EMA9/21 через 60 секунд
+        _start_with_delay(run_retrace_ema921_worker, 60),
         
     )
 
