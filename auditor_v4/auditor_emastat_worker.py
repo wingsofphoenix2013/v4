@@ -130,21 +130,18 @@ async def load_closed_positions_for_strategy(strategy_id: int):
 
     return rows
 
-
 # 🔸 Загрузка EMA50/EMA200 для батча позиций и TF
 async def fetch_ema_snapshot_batch(position_uids: List[str], tf: str) -> Dict[str, Tuple[Decimal, Decimal]]:
     """
-    Ожидается, что функция вернёт словарь:
+    Возвращает словарь:
         {position_uid: (ema50, ema200)}
 
-    Реализация зависит от фактической схемы indicator_position_stat.
-    Здесь оставлен каркас, который нужно адаптировать под реальную структуру данных.
-
-    Пример ожиданий:
-    - indicator_position_stat содержит снапшоты RAW по всем EMA,
-    - можно выбрать EMA50/EMA200 по position_uid и tf и свести в одну строку.
-
-    Сейчас функция реализована как заглушка и должна быть переписана под твою БД.
+    Берём только:
+    - param_type = 'indicator'
+    - param_base = 'ema'
+    - param_name IN ('ema50', 'ema200')
+    - status = 'ok'
+    - timeframe = tf
     """
     # условия достаточности
     if infra.pg_pool is None:
@@ -154,19 +151,57 @@ async def fetch_ema_snapshot_batch(position_uids: List[str], tf: str) -> Dict[st
     if not position_uids:
         return {}
 
-    # Здесь нужно заменить логику на реальный SELECT из indicator_position_stat
-    # Ниже — только структурный каркас, чтобы файл был рабочим, но не делает реальных выборок.
-    log.info(
-        "⚠️ fetch_ema_snapshot_batch: заглушка, необходимо реализовать выбор EMA50/EMA200 "
-        "из indicator_position_stat для tf=%s (uidов: %d)",
+    async with infra.pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                position_uid,
+                MAX(CASE
+                        WHEN param_name = 'ema50'
+                        THEN value_num
+                        ELSE NULL
+                    END) AS ema50,
+                MAX(CASE
+                        WHEN param_name = 'ema200'
+                        THEN value_num
+                        ELSE NULL
+                    END) AS ema200
+            FROM indicator_position_stat
+            WHERE position_uid = ANY($1)
+              AND timeframe = $2
+              AND param_type = 'indicator'
+              AND status = 'ok'
+              AND param_base = 'ema'
+              AND param_name IN ('ema50', 'ema200')
+            GROUP BY position_uid
+            """,
+            position_uids,
+            tf,
+        )
+
+    result: Dict[str, Tuple[Decimal, Decimal]] = {}
+
+    for r in rows:
+        uid = str(r["position_uid"])
+        ema50 = r["ema50"]
+        ema200 = r["ema200"]
+
+        # если хотя бы один из EMA отсутствует, пропускаем
+        if ema50 is None or ema200 is None:
+            continue
+
+        ema50_d = _to_decimal(ema50)
+        ema200_d = _to_decimal(ema200)
+        result[uid] = (ema50_d, ema200_d)
+
+    log.debug(
+        "📦 fetch_ema_snapshot_batch: tf=%s, uidов запрошено=%d, найдено снапшотов=%d",
         tf,
         len(position_uids),
+        len(result),
     )
 
-    # Возвращаем пустой словарь, чтобы воркер корректно отработал структуру,
-    # но фактически ничего не насчитает, пока не будет реализован SELECT.
-    return {}
-
+    return result
 
 # 🔸 Upsert агрегатов в auditor_emastat_details
 async def upsert_emastat_row(
