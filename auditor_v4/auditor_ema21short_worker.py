@@ -23,13 +23,14 @@ BATCH_SIZE = 200
 # 🔸 Вспомогательные функции
 
 def _calc_winrate(wins: int, total: int) -> float | None:
-    # защита от деления на ноль
+    # условия достаточности
     if total <= 0:
         return None
     return wins / total
 
 
 def _init_counters_for_strategy() -> Tuple[
+    Dict[tuple, Dict[str, Any]],
     Dict[tuple, Dict[str, Any]],
     Dict[tuple, Dict[str, Any]],
 ]:
@@ -59,7 +60,20 @@ def _init_counters_for_strategy() -> Tuple[
         "wins_after": 0,
     })
 
-    return detailed_counters, aggregated_counters
+    # суточные счётчики: по дате закрытия сделки
+    daily_counters: dict[
+        tuple[int, str, dt.date, str, str, str],
+        Dict[str, Any],
+    ] = defaultdict(lambda: {
+        "total": 0,
+        "passed": 0,
+        "sum_before": 0,
+        "sum_after": 0,
+        "wins_before": 0,
+        "wins_after": 0,
+    })
+
+    return detailed_counters, aggregated_counters, daily_counters
 
 
 def _is_short_allowed(side: str | None, dyn_smooth: str | None) -> bool:
@@ -69,8 +83,10 @@ def _is_short_allowed(side: str | None, dyn_smooth: str | None) -> bool:
 
     # разрешённые состояния:
     # side ∈ {'above', 'equal'}
-    # dynamic_smooth ∈ { 'above_approaching', 'above_stable',
-    #                    'equal_approaching', 'equal_stable' }
+    # dynamic_smooth ∈ {
+    #   'above_approaching', 'above_stable',
+    #   'equal_approaching', 'equal_stable'
+    # }
     if side not in ("above", "equal"):
         return False
 
@@ -87,8 +103,10 @@ def _is_short_allowed(side: str | None, dyn_smooth: str | None) -> bool:
 def _update_stats_for_position(
     pos: Dict[str, Any],
     ema_state: Dict[str, str],
+    trade_date: dt.date,
     detailed_counters: Dict[tuple, Dict[str, Any]],
     aggregated_counters: Dict[tuple, Dict[str, Any]],
+    daily_counters: Dict[tuple, Dict[str, Any]],
 ) -> None:
     strategy_id = int(pos["strategy_id"])
     pos_direction = str(pos["direction"])
@@ -108,7 +126,7 @@ def _update_stats_for_position(
 
     passed = _is_short_allowed(side, dyn_smooth)
 
-    # ключ детальной статистики
+    # 🔹 детальная статистика по состоянию ema21
     det_key = (strategy_id, pos_direction, TIMEFRAME, FILTER_TYPE, side, dyn_smooth)
     det = detailed_counters[det_key]
     det["total"] += 1
@@ -121,7 +139,7 @@ def _update_stats_for_position(
         if is_win:
             det["wins_after"] += 1
 
-    # ключ агрегированной статистики
+    # 🔹 агрегированная статистика по фильтру в целом
     agg_key = (strategy_id, pos_direction, TIMEFRAME, FILTER_TYPE, PACK_BASE)
     agg = aggregated_counters[agg_key]
     agg["total"] += 1
@@ -133,6 +151,19 @@ def _update_stats_for_position(
         agg["sum_after"] += pnl
         if is_win:
             agg["wins_after"] += 1
+
+    # 🔹 суточная статистика по дате закрытия
+    day_key = (strategy_id, pos_direction, trade_date, TIMEFRAME, FILTER_TYPE, PACK_BASE)
+    day = daily_counters[day_key]
+    day["total"] += 1
+    day["sum_before"] += pnl
+    if is_win:
+        day["wins_before"] += 1
+    if passed:
+        day["passed"] += 1
+        day["sum_after"] += pnl
+        if is_win:
+            day["wins_after"] += 1
 
 
 # 🔸 Загрузка MW-стратегий (используем те же market_watcher=true)
@@ -165,6 +196,7 @@ async def _process_strategy_positions(
     strategy_id: int,
     detailed_counters: Dict[tuple, Dict[str, Any]],
     aggregated_counters: Dict[tuple, Dict[str, Any]],
+    daily_counters: Dict[tuple, Dict[str, Any]],
 ) -> Tuple[int, int]:
     last_id = 0
     total_positions = 0
@@ -174,7 +206,7 @@ async def _process_strategy_positions(
     while True:
         rows = await conn.fetch(
             """
-            SELECT id, position_uid, direction, pnl
+            SELECT id, position_uid, direction, pnl, closed_at
             FROM positions_v4
             WHERE status = 'closed'
               AND strategy_id = $1
@@ -200,6 +232,7 @@ async def _process_strategy_positions(
             position_uid = str(r["position_uid"])
             pos_direction = str(r["direction"])
             pnl = r["pnl"]
+            closed_at = r["closed_at"]
 
             positions_batch.append(
                 {
@@ -208,6 +241,7 @@ async def _process_strategy_positions(
                     "direction": pos_direction,
                     "pnl": pnl,
                     "strategy_id": strategy_id,
+                    "closed_at": closed_at,
                 }
             )
             position_uids.append(position_uid)
@@ -260,9 +294,27 @@ async def _process_strategy_positions(
             if "side" not in ema_state or "dynamic_smooth" not in ema_state:
                 continue
 
+            closed_at = pos["closed_at"]
+            if not closed_at:
+                continue
+
+            # преобразование в date
+            if isinstance(closed_at, dt.datetime):
+                trade_date = closed_at.date()
+            else:
+                # на всякий случай, если уже date
+                trade_date = closed_at
+
             # позиция с полным PACK ema21 — учитываем в статистике
             used_positions += 1
-            _update_stats_for_position(pos, ema_state, detailed_counters, aggregated_counters)
+            _update_stats_for_position(
+                pos,
+                ema_state,
+                trade_date,
+                detailed_counters,
+                aggregated_counters,
+                daily_counters,
+            )
 
     log.info(
         "🔍 AUD_EMA21_SHORT: стратегия %d — шорт-позиций всего=%d, с полным PACK ema21=%d",
@@ -279,15 +331,17 @@ def _build_rows_for_strategy(
     strategy_id: int,
     detailed_counters: Dict[tuple, Dict[str, Any]],
     aggregated_counters: Dict[tuple, Dict[str, Any]],
+    daily_counters: Dict[tuple, Dict[str, Any]],
     strategies: Dict[int, Dict[str, Any]],
     calc_at: dt.datetime,
-) -> tuple[list[tuple], list[tuple]]:
+) -> tuple[list[tuple], list[tuple], list[tuple]]:
     detailed_rows: list[tuple] = []
     aggregated_rows: list[tuple] = []
+    daily_rows: list[tuple] = []
 
     deposit = strategies.get(strategy_id, {}).get("deposit")
 
-    # формирование детальных строк только по этой стратегии
+    # 🔹 детальные строки
     for key, det in detailed_counters.items():
         sid, direction, timeframe, filter_type, side, dyn_smooth = key
         if sid != strategy_id:
@@ -337,7 +391,7 @@ def _build_rows_for_strategy(
             )
         )
 
-    # формирование агрегированных строк только по этой стратегии
+    # 🔹 агрегированные строки
     for key, agg in aggregated_counters.items():
         sid, direction, timeframe, filter_type, pack_base = key
         if sid != strategy_id:
@@ -385,7 +439,56 @@ def _build_rows_for_strategy(
             )
         )
 
-    return detailed_rows, aggregated_rows
+    # 🔹 суточные строки
+    for key, day in daily_counters.items():
+        sid, direction, trade_date, timeframe, filter_type, pack_base = key
+        if sid != strategy_id:
+            continue
+
+        total = day["total"]
+        if total <= 0:
+            continue
+
+        passed = day["passed"]
+        filtered = total - passed
+
+        wins_before = day["wins_before"]
+        wins_after = day["wins_after"]
+        sum_before = day["sum_before"]
+        sum_after = day["sum_after"]
+
+        winrate_before = _calc_winrate(wins_before, total)
+        winrate_after = _calc_winrate(wins_after, passed)
+
+        if not deposit or deposit == 0:
+            roi_before = None
+            roi_after = None
+        else:
+            roi_before = sum_before / deposit
+            roi_after = sum_after / deposit
+
+        daily_rows.append(
+            (
+                calc_at,
+                strategy_id,
+                direction,
+                timeframe,
+                filter_type,
+                pack_base,
+                trade_date,
+                total,
+                filtered,
+                passed,
+                winrate_before,
+                winrate_after,
+                sum_before,
+                sum_after,
+                roi_before,
+                roi_after,
+            )
+        )
+
+    return detailed_rows, aggregated_rows, daily_rows
 
 
 # 🔸 Запись результатов в БД
@@ -463,6 +566,43 @@ async def _insert_aggregated_rows(conn, rows: list[tuple]) -> None:
     )
 
 
+async def _insert_daily_rows(conn, rows: list[tuple]) -> None:
+    # условия достаточности
+    if not rows:
+        return
+
+    await conn.executemany(
+        """
+        INSERT INTO auditor_ema21_state_daily (
+            calc_at,
+            strategy_id,
+            direction,
+            timeframe,
+            filter_type,
+            pack_base,
+            trade_date,
+            total_trades,
+            filtered_trades,
+            passed_trades,
+            winrate_before,
+            winrate_after,
+            sum_pnl_before,
+            sum_pnl_after,
+            roi_before,
+            roi_after
+        )
+        VALUES (
+            $1,$2,$3,$4,$5,$6,$7,
+            $8,$9,$10,
+            $11,$12,
+            $13,$14,
+            $15,$16
+        )
+        """,
+        rows,
+    )
+
+
 # 🔸 Основная корутина воркера
 async def run_ema21short_worker():
     # условия достаточности
@@ -484,11 +624,12 @@ async def run_ema21short_worker():
         used_positions_all = 0
         total_detailed_rows_all = 0
         total_aggregated_rows_all = 0
+        total_daily_rows_all = 0
 
         # обход стратегий по одной
         for strategy_id in sorted(strategies.keys()):
             # инициализация счётчиков для стратегии
-            detailed_counters, aggregated_counters = _init_counters_for_strategy()
+            detailed_counters, aggregated_counters, daily_counters = _init_counters_for_strategy()
 
             log.info("🔧 AUD_EMA21_SHORT: стратегия %d — старт обработки", strategy_id)
 
@@ -497,13 +638,15 @@ async def run_ema21short_worker():
                 strategy_id,
                 detailed_counters,
                 aggregated_counters,
+                daily_counters,
             )
 
             # построение строк для конкретной стратегии
-            detailed_rows, aggregated_rows = _build_rows_for_strategy(
+            detailed_rows, aggregated_rows, daily_rows = _build_rows_for_strategy(
                 strategy_id,
                 detailed_counters,
                 aggregated_counters,
+                daily_counters,
                 strategies,
                 calc_at,
             )
@@ -511,28 +654,32 @@ async def run_ema21short_worker():
             # запись в БД
             await _insert_detailed_rows(conn, detailed_rows)
             await _insert_aggregated_rows(conn, aggregated_rows)
+            await _insert_daily_rows(conn, daily_rows)
 
             log.info(
                 "✅ AUD_EMA21_SHORT: стратегия %d — шорт-позиций_всего=%d, шорт-позиций_с_ema21=%d, "
-                "детальных строк=%d, агрегированных строк=%d",
+                "детальных строк=%d, агрегированных строк=%d, суточных строк=%d",
                 strategy_id,
                 total_pos,
                 used_pos,
                 len(detailed_rows),
                 len(aggregated_rows),
+                len(daily_rows),
             )
 
             total_positions_all += total_pos
             used_positions_all += used_pos
             total_detailed_rows_all += len(detailed_rows)
             total_aggregated_rows_all += len(aggregated_rows)
+            total_daily_rows_all += len(daily_rows)
 
     log.info(
         "✅ AUD_EMA21_SHORT: завершено — стратегий=%d, шорт-позиций_всего=%d, шорт-позиций_с_ema21=%d, "
-        "детальных строк=%d, агрегированных строк=%d",
+        "детальных строк=%d, агрегированных строк=%d, суточных строк=%d",
         len(strategies),
         total_positions_all,
         used_positions_all,
         total_detailed_rows_all,
         total_aggregated_rows_all,
+        total_daily_rows_all,
     )
