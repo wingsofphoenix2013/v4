@@ -101,6 +101,8 @@ async def load_market_state_for_position(pg, symbol: str, tf: str, created_at: d
 
     Возвращает dict {"direction", "quality", "open_time"} или None.
     """
+    import json  # локальный импорт, чтобы не ломать остальной модуль
+
     step_min = STEP_MIN[tf]
     cutoff = last_closed_bar_cutoff(created_at, step_min)
 
@@ -124,7 +126,28 @@ async def load_market_state_for_position(pg, symbol: str, tf: str, created_at: d
     if not row:
         return None
 
-    details = row["details"] or {}
+    raw_details = row["details"]
+
+    # приводим details к dict, независимо от того, jsonb это или текст
+    details = {}
+    if isinstance(raw_details, dict):
+        details = raw_details
+    elif isinstance(raw_details, str):
+        try:
+            details = json.loads(raw_details)
+            if not isinstance(details, dict):
+                details = {}
+        except Exception:
+            details = {}
+    elif raw_details is not None:
+        # на всякий случай попробуем через str → json
+        try:
+            details = json.loads(str(raw_details))
+            if not isinstance(details, dict):
+                details = {}
+        except Exception:
+            details = {}
+
     direction = row["state"]  # state уже равен direction
     quality = details.get("quality", "ok")
 
@@ -133,7 +156,6 @@ async def load_market_state_for_position(pg, symbol: str, tf: str, created_at: d
         "quality": quality,
         "open_time": row["open_time"],
     }
-
 
 # 🔸 Запись двух параметров (direction/quality) в indicator_position_stat
 async def write_position_market_state(pg,
