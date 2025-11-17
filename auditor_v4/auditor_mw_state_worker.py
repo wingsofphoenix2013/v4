@@ -61,8 +61,8 @@ def _init_counters_for_strategy() -> Tuple[
     ] = defaultdict(lambda: {
         "total": 0,
         "passed": 0,
-        "sum_before": 0.0,
-        "sum_after": 0.0,
+        "sum_before": 0,   # int + Decimal -> Decimal, не конфликтует
+        "sum_after": 0,
         "wins_before": 0,
         "wins_after": 0,
     })
@@ -74,8 +74,8 @@ def _init_counters_for_strategy() -> Tuple[
     ] = defaultdict(lambda: {
         "total": 0,
         "passed": 0,
-        "sum_before": 0.0,
-        "sum_after": 0.0,
+        "sum_before": 0,
+        "sum_after": 0,
         "wins_before": 0,
         "wins_after": 0,
     })
