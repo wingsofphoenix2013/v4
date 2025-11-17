@@ -15,32 +15,83 @@ log = logging.getLogger("AUD_MW_STATE")
 
 # 🔸 Константы воркера
 TIMEFRAMES = ("m5", "m15", "h1")
-CHECK_TYPES = ("solo_straight", "solo_combo")
+SOLO_CHECK_TYPES = ("solo_straight", "solo_combo")
+MULTI_CHECK_TYPES = ("double_straight", "double_combo", "triple_straight", "triple_combo")
+CHECK_TYPES = SOLO_CHECK_TYPES + MULTI_CHECK_TYPES
 BATCH_SIZE = 200
 
 
 # 🔸 Вспомогательные функции
 
-def _is_passed(check_type: str, ms_direction: str, ms_quality: str | None, pos_direction: str) -> bool:
+def _dir_allowed(ms_direction: str | None, pos_direction: str) -> bool:
     # базовая проверка направления
+    if not ms_direction:
+        return False
     if ms_direction == "both":
-        allowed_dir = True
-    elif ms_direction == "long_only":
-        allowed_dir = (pos_direction == "long")
-    elif ms_direction == "short_only":
-        allowed_dir = (pos_direction == "short")
-    else:
-        allowed_dir = False
+        return True
+    if ms_direction == "long_only":
+        return pos_direction == "long"
+    if ms_direction == "short_only":
+        return pos_direction == "short"
+    return False
 
-    # простой режим: только направление
-    if check_type == "solo_straight":
-        return allowed_dir
 
-    # комбинированный режим: направление + вето quality
+def _qual_allowed(ms_quality: str | None) -> bool:
+    # quality = avoid всегда запрещает сделку
     if ms_quality == "avoid":
         return False
+    return True
 
-    return allowed_dir
+
+def _is_passed(check_type: str, timeframe: str, ms_by_tf: Dict[str, Dict[str, str]], pos_direction: str) -> bool:
+    # подготовка срезов по ТФ
+    ms_m5 = ms_by_tf.get("m5") or {}
+    ms_m15 = ms_by_tf.get("m15") or {}
+    ms_h1 = ms_by_tf.get("h1") or {}
+
+    # SOLO: одиночный фильтр по одному ТФ
+    if check_type == "solo_straight":
+        tf_ms = ms_by_tf.get(timeframe) or {}
+        return _dir_allowed(tf_ms.get("direction"), pos_direction)
+
+    if check_type == "solo_combo":
+        tf_ms = ms_by_tf.get(timeframe) or {}
+        return _dir_allowed(tf_ms.get("direction"), pos_direction) and _qual_allowed(tf_ms.get("quality"))
+
+    # DOUBLE: m5 + m15
+    if check_type == "double_straight":
+        return (
+            _dir_allowed(ms_m5.get("direction"), pos_direction)
+            and _dir_allowed(ms_m15.get("direction"), pos_direction)
+        )
+
+    if check_type == "double_combo":
+        return (
+            _dir_allowed(ms_m5.get("direction"), pos_direction)
+            and _dir_allowed(ms_m15.get("direction"), pos_direction)
+            and _qual_allowed(ms_m5.get("quality"))
+            and _qual_allowed(ms_m15.get("quality"))
+        )
+
+    # TRIPLE: m5 + m15 + h1
+    if check_type == "triple_straight":
+        return (
+            _dir_allowed(ms_m5.get("direction"), pos_direction)
+            and _dir_allowed(ms_m15.get("direction"), pos_direction)
+            and _dir_allowed(ms_h1.get("direction"), pos_direction)
+        )
+
+    if check_type == "triple_combo":
+        return (
+            _dir_allowed(ms_m5.get("direction"), pos_direction)
+            and _dir_allowed(ms_m15.get("direction"), pos_direction)
+            and _dir_allowed(ms_h1.get("direction"), pos_direction)
+            and _qual_allowed(ms_m5.get("quality"))
+            and _qual_allowed(ms_m15.get("quality"))
+            and _qual_allowed(ms_h1.get("quality"))
+        )
+
+    return False
 
 
 def _calc_winrate(wins: int, total: int) -> float | None:
@@ -94,21 +145,18 @@ def _update_stats_for_position(
     pnl = pos["pnl"] if pos["pnl"] is not None else 0
     is_win = pnl > 0
 
-    # обход по ТФ
+    # SOLO-фильтры: считаются отдельно для каждого ТФ
     for timeframe in TIMEFRAMES:
         tf_ms = ms_by_tf.get(timeframe) or {}
         ms_direction = tf_ms.get("direction")
         ms_quality = tf_ms.get("quality")
 
-        # пропуск, если чего-то не хватает
+        # пропуск, если неполный market_state
         if not ms_direction:
             continue
 
-        # обход по типам проверки
-        for check_type in CHECK_TYPES:
-            passed = _is_passed(check_type, ms_direction, ms_quality, pos_direction)
-
-            # для solo_straight quality в детальной строке не фиксируем
+        for check_type in SOLO_CHECK_TYPES:
+            passed = _is_passed(check_type, timeframe, ms_by_tf, pos_direction)
             eff_ms_quality = ms_quality if check_type == "solo_combo" else None
 
             # ключ детальной статистики
@@ -136,6 +184,48 @@ def _update_stats_for_position(
                 agg["sum_after"] += pnl
                 if is_win:
                     agg["wins_after"] += 1
+
+    # MULTI-фильтры (double/triple): якорим на m5, но учитываем m15 и h1
+    anchor_tf = "m5"
+    anchor_ms = ms_by_tf.get(anchor_tf) or {}
+    ms_direction_anchor = anchor_ms.get("direction")
+    ms_quality_anchor = anchor_ms.get("quality")
+
+    # если на m5 нет direction — дальше смысла нет
+    if not ms_direction_anchor:
+        return
+
+    for check_type in MULTI_CHECK_TYPES:
+        passed = _is_passed(check_type, anchor_tf, ms_by_tf, pos_direction)
+
+        # для combo-типов фиксируем quality, для straight — нет
+        eff_ms_quality = ms_quality_anchor if "combo" in check_type else None
+
+        # ключ детальной статистики (timeframe = m5 как якорь)
+        det_key = (strategy_id, pos_direction, anchor_tf, check_type, ms_direction_anchor, eff_ms_quality)
+        det = detailed_counters[det_key]
+        det["total"] += 1
+        det["sum_before"] += pnl
+        if is_win:
+            det["wins_before"] += 1
+        if passed:
+            det["passed"] += 1
+            det["sum_after"] += pnl
+            if is_win:
+                det["wins_after"] += 1
+
+        # ключ агрегированной статистики
+        agg_key = (strategy_id, pos_direction, anchor_tf, check_type)
+        agg = aggregated_counters[agg_key]
+        agg["total"] += 1
+        agg["sum_before"] += pnl
+        if is_win:
+            agg["wins_before"] += 1
+        if passed:
+            agg["passed"] += 1
+            agg["sum_after"] += pnl
+            if is_win:
+                agg["wins_after"] += 1
 
 
 # 🔸 Загрузка MW-стратегий (deposit нужен для ROI)
