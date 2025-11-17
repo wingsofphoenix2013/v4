@@ -17,14 +17,21 @@ EMA_EPS_PCT = Decimal("0.00025")  # 0.025% как доля
 TF_LIST = ("m5", "m15", "h1")
 
 
-# 🔸 Вспомогательные функции для EMA-паттернов
-def _to_decimal(value) -> Decimal:
+# 🔸 Вспомогательные функции для чисел и EMA-паттернов
+def _to_decimal(value) -> Decimal | None:
     # безопасное приведение к Decimal
     if value is None:
         return None
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def _round4(value: Decimal | None) -> Decimal | None:
+    # округление до 4 знаков после запятой
+    if value is None:
+        return None
+    return value.quantize(Decimal("0.0001"))
 
 
 def compute_ema_pattern(price, ema50, ema200) -> str:
@@ -102,7 +109,7 @@ async def load_strategy_deposit(strategy_id: int) -> Decimal:
     if row is None or row["deposit"] is None:
         return Decimal("0")
 
-    return _to_decimal(row["deposit"])
+    return _to_decimal(row["deposit"]) or Decimal("0")
 
 
 # 🔸 Загрузка закрытых позиций стратегии
@@ -129,6 +136,7 @@ async def load_closed_positions_for_strategy(strategy_id: int):
         )
 
     return rows
+
 
 # 🔸 Загрузка EMA50/EMA200 для батча позиций и TF
 async def fetch_ema_snapshot_batch(position_uids: List[str], tf: str) -> Dict[str, Tuple[Decimal, Decimal]]:
@@ -192,6 +200,9 @@ async def fetch_ema_snapshot_batch(position_uids: List[str], tf: str) -> Dict[st
 
         ema50_d = _to_decimal(ema50)
         ema200_d = _to_decimal(ema200)
+        if ema50_d is None or ema200_d is None:
+            continue
+
         result[uid] = (ema50_d, ema200_d)
 
     log.debug(
@@ -202,6 +213,7 @@ async def fetch_ema_snapshot_batch(position_uids: List[str], tf: str) -> Dict[st
     )
 
     return result
+
 
 # 🔸 Upsert агрегатов в auditor_emastat_details
 async def upsert_emastat_row(
@@ -220,9 +232,9 @@ async def upsert_emastat_row(
         log.info("❌ Пропуск upsert_emastat_row: PG не инициализирован")
         return
 
-    # вычисление winrate и ROI
-    if lose_count > 0:
-        winrate = Decimal(win_count) / Decimal(lose_count)
+    # вычисление winrate (wins / total) и ROI (pnl_total / deposit)
+    if trades_count > 0:
+        winrate = Decimal(win_count) / Decimal(trades_count)
     else:
         winrate = None
 
@@ -230,6 +242,11 @@ async def upsert_emastat_row(
         roi = pnl_total / deposit
     else:
         roi = None
+
+    # нормализация точности до 4 знаков
+    pnl_total = _round4(pnl_total) or Decimal("0.0000")
+    winrate = _round4(winrate) if winrate is not None else None
+    roi = _round4(roi) if roi is not None else None
 
     async with infra.pg_pool.acquire() as conn:
         await conn.execute(
@@ -385,7 +402,7 @@ async def process_strategy_tf(
         tf_stats_summary["trades_total"],
         tf_stats_summary["win_total"],
         tf_stats_summary["lose_total"],
-        str(tf_stats_summary["pnl_total"]),
+        str(_round4(tf_stats_summary["pnl_total"])),
     )
 
     return tf_stats_summary
@@ -409,7 +426,7 @@ async def process_strategy(strategy_id: int, strategy_meta: dict):
         "🚀 AUD_EMA: старт обработки стратегии %s — закрытых позиций: %d, депозит: %s",
         title,
         len(positions_rows),
-        str(deposit),
+        str(_round4(deposit)),
     )
 
     # параллельная обработка TF внутри стратегии
@@ -430,14 +447,17 @@ async def process_strategy(strategy_id: int, strategy_meta: dict):
     else:
         total_roi = None
 
+    total_pnl_rounded = _round4(total_pnl)
+    total_roi_rounded = _round4(total_roi) if total_roi is not None else None
+
     log.info(
         "📊 AUD_EMA SUMMARY: %s — trades=%d, win=%d, lose=%d, pnl_total=%s, roi=%s",
         title,
         total_trades,
         total_win,
         total_lose,
-        str(total_pnl),
-        str(total_roi) if total_roi is not None else "NULL",
+        str(total_pnl_rounded),
+        str(total_roi_rounded) if total_roi_rounded is not None else "NULL",
     )
 
 
