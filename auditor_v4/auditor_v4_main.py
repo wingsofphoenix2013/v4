@@ -14,6 +14,7 @@ from auditor_config import load_active_mw_strategies
 import auditor_infra as infra
 
 from auditor_retrace_ema921_worker import run_retrace_ema921_worker
+from auditor_retrace_ema921_grid_worker import run_retrace_ema921_grid_worker
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
@@ -141,6 +142,7 @@ async def main():
 
         # одноразовый запуск аудитора качества отката EMA9/21 через 60 секунд
         _start_with_delay(run_retrace_ema921_worker, 60),
+        _start_with_delay(run_retrace_ema921_grid_worker, 120), # грид-серч порогов
         
     )
 
