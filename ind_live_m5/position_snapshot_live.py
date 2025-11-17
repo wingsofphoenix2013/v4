@@ -289,6 +289,47 @@ async def process_tf_live(redis,
         mom_align, open_time_iso, status="ok"
     ))
 
+    # ----- MW (ind_mw) — market_state (direction/quality) -----
+    # читаем агрегированный ключ (не LIVE); пишем только два поля
+    ms_key = f"ind_mw:{symbol}:{tf}:market_state"
+    try:
+        ms_js = await redis.get(ms_key)
+    except Exception:
+        ms_js = None
+
+    if not ms_js:
+        # одна строка-ошибка на весь объект market_state
+        rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
+                                 "marketwatch", "market_state", "error",
+                                 None, open_time_iso, status="error", error_code="missing_live"))
+    else:
+        try:
+            ms_obj = json.loads(ms_js) if isinstance(ms_js, str) else {}
+        except Exception:
+            rows_err.append(make_row(position_uid, strategy_id, symbol, tf,
+                                     "marketwatch", "market_state", "error",
+                                     None, open_time_iso, status="error", error_code="json_parse"))
+            ms_obj = None
+
+        if isinstance(ms_obj, dict):
+            # условия достаточности
+            direction = ms_obj.get("direction")
+            quality = ms_obj.get("quality")
+
+            if direction is not None:
+                rows_ok.append(make_row(
+                    position_uid, strategy_id, symbol, tf,
+                    "marketwatch", "market_state", "direction",
+                    str(direction), open_time_iso, status="ok"
+                ))
+
+            if quality is not None:
+                rows_ok.append(make_row(
+                    position_uid, strategy_id, symbol, tf,
+                    "marketwatch", "market_state", "quality",
+                    str(quality), open_time_iso, status="ok"
+                ))
+
     # ----- PACK (pack_live) -----
     for ind in ("rsi","mfi","ema","atr","lr","adx_dmi"):  # без 'kama'
         for L in sorted(pack_bases.get(ind, set())):
@@ -387,7 +428,6 @@ async def process_tf_live(redis,
     )
 
     return rows_ok, rows_err
-
 
 # 🔸 Обработка одной позиции: TF последовательно (m5 → m15 → h1)
 async def process_position_live(redis,
