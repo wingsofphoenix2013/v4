@@ -12,6 +12,7 @@ from auditor_infra import (
 )
 from auditor_config import load_active_mw_strategies
 import auditor_infra as infra
+from auditor_emastat_worker import run_emastat_worker
 
 # 🔸 Логгер
 log = logging.getLogger("AUD_MAIN")
@@ -138,6 +139,7 @@ async def main():
         run_one_shot_audit(),
 
         # одноразовый запуск любого другого файла
+        _start_with_delay(run_emastat_worker, 60),
         
     )
 
