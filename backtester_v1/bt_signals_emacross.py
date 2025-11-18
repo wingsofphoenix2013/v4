@@ -209,11 +209,11 @@ async def _process_symbol_inner(
         )
         return 0, 0, 0
 
-    # epsilon = 2 * ticksize
+    # epsilon = 1 * ticksize
     ticker_info = get_ticker_info(symbol) or {}
     ticksize = ticker_info.get("ticksize")
     try:
-        epsilon = 2.0 * float(ticksize) if ticksize is not None else 0.0
+        epsilon = 1.0 * float(ticksize) if ticksize is not None else 0.0
     except Exception:
         epsilon = 0.0
 
