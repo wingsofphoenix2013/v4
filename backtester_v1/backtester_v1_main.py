@@ -13,6 +13,9 @@ from backtester_config import (
     load_initial_signals,
 )
 
+# 🔸 Оркестратор псевдо-сигналов
+from bt_signals_main import run_bt_signals_orchestrator
+
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
 
@@ -55,9 +58,10 @@ async def main():
         f"инстансов псевдо-сигналов={signals_count}, TF={BT_TIMEFRAMES}"
     )
 
-    # запуск базового воркера-наблюдателя в безопасном цикле
+    # запуск воркеров в безопасных циклах
     await asyncio.gather(
         run_safe_loop(lambda: run_backtester_supervisor(pg, redis), "BT_SUPERVISOR"),
+        run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
     )
 
 
