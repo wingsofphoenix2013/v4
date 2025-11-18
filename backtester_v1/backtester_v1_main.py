@@ -6,6 +6,12 @@ import logging
 # 🔸 Инфраструктура backtester_v1
 from backtester_infra import init_pg_pool, init_redis_client, setup_logging, run_safe_loop
 
+# 🔸 Конфигурация и кеш метаданных backtester_v1
+from backtester_config import load_initial_tickers, load_initial_indicators
+
+# 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов
+BT_TIMEFRAMES = ["m5", "m15", "h1"]
+
 
 # 🔸 Воркеры backtester_v1 (заглушки для базовой проверки инфраструктуры)
 async def run_backtester_supervisor(pg, redis):
@@ -33,6 +39,15 @@ async def main():
     redis = await init_redis_client()
 
     log.info("BT_MAIN: подключения к PostgreSQL и Redis успешно установлены для backtester_v1")
+
+    # 🔸 Загрузка кешей: тикеры и инстансы индикаторов
+    tickers_count = await load_initial_tickers(pg)
+    indicators_count = await load_initial_indicators(pg, timeframes=BT_TIMEFRAMES)
+
+    log.info(
+        f"BT_MAIN: инициализация конфигурации завершена — тикеров={tickers_count}, "
+        f"инстансов индикаторов={indicators_count}, TF={BT_TIMEFRAMES}"
+    )
 
     # запуск базового воркера-наблюдателя в безопасном цикле
     await asyncio.gather(
