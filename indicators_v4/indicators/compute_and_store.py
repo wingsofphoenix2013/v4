@@ -5,8 +5,8 @@ import asyncio
 import math
 from datetime import datetime
 
-# импорт индикаторов оставляем как было
-from indicators import ema, atr, lr, mfi, rsi, adx_dmi, macd, bb, kama
+# импорт индикаторов оставляем как было + supertrend
+from indicators import ema, atr, lr, mfi, rsi, adx_dmi, macd, bb, kama, supertrend
 
 # 🔸 Сопоставление имён индикаторов с функциями
 INDICATOR_DISPATCH = {
@@ -19,13 +19,16 @@ INDICATOR_DISPATCH = {
     "macd": macd.compute,
     "bb": bb.compute,
     "kama": kama.compute,
+    "supertrend": supertrend.compute,
 }
+
 
 def _is_finite_number(x) -> bool:
     try:
         return x is not None and isinstance(x, (int, float)) and math.isfinite(float(x))
     except Exception:
         return False
+
 
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
@@ -125,6 +128,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     await asyncio.gather(*tasks, return_exceptions=True)
 
+
 # 🔸 Генерация ожидаемых имён параметров для индикатора
 def get_expected_param_names(indicator: str, params: dict) -> list[str]:
     if indicator == "macd":
@@ -149,8 +153,18 @@ def get_expected_param_names(indicator: str, params: dict) -> list[str]:
     elif indicator in ("rsi", "mfi", "ema", "kama", "atr"):
         return [f"{indicator}{params['length']}"]
 
+    elif indicator == "supertrend":
+        # имена в стиле supertrend{length}_{mult}_...
+        length = params["length"]
+        mult_raw = round(float(params["mult"]), 2)
+        mult_str = str(mult_raw).replace(".", "_")
+        base = f"supertrend{length}_{mult_str}"
+        return [base, f"{base}_trend"]
+
     else:
         return [indicator]
+
+
 # 🔸 Чистый расчёт индикатора (без записи в Redis/PG/стримы)
 def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> dict[str, str]:
 
