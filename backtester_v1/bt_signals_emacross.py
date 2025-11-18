@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import uuid
+import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -296,7 +297,7 @@ async def _process_symbol_inner(
                 ts,
                 direction,
                 message,
-                raw_message,
+                json.dumps(raw_message),  # сериализуем dict в JSON-строку
             )
         )
 
