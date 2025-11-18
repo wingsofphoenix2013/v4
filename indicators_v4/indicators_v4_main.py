@@ -36,7 +36,7 @@ required_candles = {
 }
 active_strategies = {}      # стратегия id -> market_watcher: bool
 
-AUDIT_WINDOW_HOURS = 12
+AUDIT_WINDOW_HOURS = 480
 
 # 🔸 Константы источника данных (Bybit/feed_bb)
 BB_TS_PREFIX = "bb:ts"                  # bb:ts:{symbol}:{interval}:{field}
