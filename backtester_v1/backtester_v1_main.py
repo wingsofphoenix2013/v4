@@ -7,9 +7,13 @@ import logging
 from backtester_infra import init_pg_pool, init_redis_client, setup_logging, run_safe_loop
 
 # 🔸 Конфигурация и кеш метаданных backtester_v1
-from backtester_config import load_initial_tickers, load_initial_indicators
+from backtester_config import (
+    load_initial_tickers,
+    load_initial_indicators,
+    load_initial_signals,
+)
 
-# 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов
+# 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
 
 
@@ -40,13 +44,15 @@ async def main():
 
     log.info("BT_MAIN: подключения к PostgreSQL и Redis успешно установлены для backtester_v1")
 
-    # 🔸 Загрузка кешей: тикеры и инстансы индикаторов
+    # 🔸 Загрузка кешей: тикеры, инстансы индикаторов и инстансы псевдо-сигналов
     tickers_count = await load_initial_tickers(pg)
     indicators_count = await load_initial_indicators(pg, timeframes=BT_TIMEFRAMES)
+    signals_count = await load_initial_signals(pg, timeframes=BT_TIMEFRAMES, only_enabled=True)
 
     log.info(
-        f"BT_MAIN: инициализация конфигурации завершена — тикеров={tickers_count}, "
-        f"инстансов индикаторов={indicators_count}, TF={BT_TIMEFRAMES}"
+        f"BT_MAIN: инициализация конфигурации завершена — "
+        f"тикеров={tickers_count}, инстансов индикаторов={indicators_count}, "
+        f"инстансов псевдо-сигналов={signals_count}, TF={BT_TIMEFRAMES}"
     )
 
     # запуск базового воркера-наблюдателя в безопасном цикле
