@@ -1,4 +1,4 @@
-# bt_signals_main.py — оркестратор псевдо-сигналов backtester_v1 (пока только EMA-cross backfill)
+# bt_signals_main.py — оркестратор псевдо-сигналов backtester_v1
 
 import asyncio
 import logging
