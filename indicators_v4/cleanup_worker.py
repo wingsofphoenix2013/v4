@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 log = logging.getLogger("IND_CLEANUP")
 
 # 🔸 Константы политики
-TS_RETENTION_MS = 14 * 24 * 60 * 60 * 1000             # 14 суток
-DB_KEEP_DAYS    = 30                                   # 30 суток
+TS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000             # 60 суток
+DB_KEEP_DAYS    = 60                                   # 60 суток
 STREAM_LIMITS = {
     "indicator_stream_core": 10000,
     "indicator_stream":      10000,
