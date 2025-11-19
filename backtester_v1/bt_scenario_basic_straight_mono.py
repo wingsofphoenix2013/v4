@@ -27,7 +27,7 @@ async def run_basic_straight_mono_backfill(
     scenario: Dict[str, Any],
     signal_ctx: Dict[str, Any],
     pg,
-    redis,
+    redis,  # параметр не используется, но оставляем для совместимости сигнатур
 ) -> None:
     scenario_id = scenario.get("id")
     scenario_key = scenario.get("key")
@@ -62,10 +62,11 @@ async def run_basic_straight_mono_backfill(
         )
 
     if sl_type != "percent" or tp_type != "percent":
-        log.warning(
+        log.error(
             f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id} поддерживает только sl_type/tp_type='percent', "
-            f"получено sl_type='{sl_type}', tp_type='{tp_type}' — сигналы будут пропускаться"
+            f"получено sl_type='{sl_type}', tp_type='{tp_type}' — сценарий не будет выполнен"
         )
+        return
 
     signal_instance = get_signal_instance(signal_id)
     if not signal_instance:
@@ -98,41 +99,19 @@ async def run_basic_straight_mono_backfill(
         )
         return
 
-    # инициализация состояния по марже и последним позициям
-    # used_margin учитывает только позиции, открытые в рамках текущего прогона
-    used_margin = Decimal("0")
-
-    # последние позиции по символу/направлению — по данным БД (исторические)
-    last_exit_long = await _load_last_exit_times(pg, scenario_id, timeframe, "long")
-    last_exit_short = await _load_last_exit_times(pg, scenario_id, timeframe, "short")
-
-    # локальные обновления last_exit_* для позиций, открытых в текущем прогоне
-    local_last_exit_long: Dict[str, datetime] = {}
-    local_last_exit_short: Dict[str, datetime] = {}
-
     # списки для вставки позиций и логов
     positions_to_insert: List[Tuple[Any, ...]] = []
     logs_to_insert: List[Tuple[Any, ...]] = []
 
-    # обрабатываем сначала long, потом short (направления независимы, но общая маржа одна)
     total_signals_processed = 0
     total_positions_opened = 0
     total_skipped = 0
 
-    # обрабатываем только одно направление за проход, но для mono нам нужны оба (long и short)
+    # обрабатываем long и short как две независимые вселенные с ОТДЕЛЬНЫМ депозитом
     for direction in ("long", "short"):
-        # начальное состояние last_exit по направлению
-        if direction == "long":
-            last_exit = dict(last_exit_long)
-            local_last_exit = local_last_exit_long
-        else:
-            last_exit = dict(last_exit_short)
-            local_last_exit = local_last_exit_short
-
-        # обновим last_exit локальными изменениями из предыдущего направления, если они есть
-        # (на случай, если позже решим учитывать перекрытие между направлениями)
-        for sym, dt in local_last_exit.items():
-            last_exit[sym] = dt
+        # загружаем все исторические позиции по этому сценарию/TF/направлению
+        existing_positions = await _load_existing_positions(pg, scenario_id, timeframe, direction)
+        new_positions: List[Dict[str, Any]] = []
 
         # фильтруем сигналы по направлению
         dir_signals = [s for s in signals if s["direction"] == direction]
@@ -155,12 +134,12 @@ async def run_basic_straight_mono_backfill(
             signal_uuid = s_row["signal_uuid"]
             raw_message = s_row["raw_message"]
 
-            # проверка существующей позиции по этому символу/направлению (берём ТОЛЬКО последнюю)
-            # сначала из истории, затем из локальных данных текущего прогона
-            last_exit_time = local_last_exit.get(symbol) or last_exit.get(symbol)
+            # вычисляем активные позиции на момент сигнала T:
+            # entry_time <= T < exit_time
+            active_positions = _get_active_positions(existing_positions, new_positions, open_time)
 
-            if last_exit_time and open_time <= last_exit_time:
-                # тикер уже был/есть в позиции в момент этого сигнала — пропускаем
+            # проверка: тикер уже в позиции по этому направлению?
+            if any(p["symbol"] == symbol for p in active_positions):
                 logs_to_insert.append(
                     (
                         signal_uuid,
@@ -172,8 +151,10 @@ async def run_basic_straight_mono_backfill(
                 total_skipped += 1
                 continue
 
-            # проверка свободной маржи сценария
-            free_margin = deposit - used_margin
+            # маржа, занятая активными позициями (ТОЛЬКО по этому направлению)
+            used_margin_now = sum(p["margin_used"] for p in active_positions)
+            free_margin = deposit - used_margin_now
+
             if free_margin <= Decimal("0"):
                 logs_to_insert.append(
                     (
@@ -318,18 +299,6 @@ async def run_basic_straight_mono_backfill(
                 margin_used = _q4(max_margin_for_trade)
 
             # расчёт уровней SL/TP в процентах
-            if sl_type != "percent" or tp_type != "percent":
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: unsupported sl_type/tp_type for basic_straight_mono",
-                    )
-                )
-                total_skipped += 1
-                continue
-
             sl_price, tp_price = _calc_sl_tp_percent(
                 entry_price=entry_price,
                 sl_percent=sl_value,
@@ -427,9 +396,16 @@ async def run_basic_straight_mono_backfill(
                 )
             )
 
-            # обновляем состояние маржи и последнюю позицию для символа/направления
-            used_margin += margin_used
-            local_last_exit[symbol] = exit_time
+            # добавляем новую позицию в список для учёта маржи по будущим сигналам
+            new_positions.append(
+                {
+                    "symbol": symbol,
+                    "entry_time": open_time,
+                    "exit_time": exit_time,
+                    "margin_used": margin_used,
+                }
+            )
+
             total_positions_opened += 1
 
     # вставляем позиции и логи в БД
@@ -486,10 +462,11 @@ async def run_basic_straight_mono_backfill(
                 logs_to_insert,
             )
 
+    # тут уже нет смысла логировать "итоговую использованную маржу", потому что она динамическая по времени
     log.info(
         f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
         f"обработано сигналов={total_signals_processed}, позиций открыто={total_positions_opened}, "
-        f"пропущено={total_skipped}, итоговая использованная маржа={_q4(used_margin)}"
+        f"пропущено={total_skipped}"
     )
 
 
@@ -549,39 +526,63 @@ async def _load_signals_for_scenario(
     return signals
 
 
-# 🔸 Загрузка последних exit_time по символам/направлению для сценария
-async def _load_last_exit_times(
+# 🔸 Загрузка всех существующих позиций сценария по TF/направлению
+async def _load_existing_positions(
     pg,
     scenario_id: int,
     timeframe: str,
     direction: str,
-) -> Dict[str, datetime]:
+) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT DISTINCT ON (symbol)
-                symbol,
-                exit_time
+            SELECT symbol, entry_time, exit_time, margin_used
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND timeframe = $2
               AND direction = $3
-            ORDER BY symbol, entry_time DESC
+            ORDER BY entry_time
             """,
             scenario_id,
             timeframe,
             direction,
         )
 
-    result: Dict[str, datetime] = {}
+    positions: List[Dict[str, Any]] = []
     for r in rows:
-        result[r["symbol"]] = r["exit_time"]
+        positions.append(
+            {
+                "symbol": r["symbol"],
+                "entry_time": r["entry_time"],
+                "exit_time": r["exit_time"],
+                "margin_used": Decimal(str(r["margin_used"])),
+            }
+        )
 
     log.info(
-        f"BT_SCENARIO_BASIC_MONO: загружены последние позиции для scenario_id={scenario_id}, "
-        f"TF={timeframe}, direction={direction}: символов={len(result)}"
+        f"BT_SCENARIO_BASIC_MONO: загружены существующие позиции для scenario_id={scenario_id}, "
+        f"TF={timeframe}, direction={direction}: позиций={len(positions)}"
     )
-    return result
+    return positions
+
+
+# 🔸 Получение активных позиций на момент T (entry_time <= T < exit_time)
+def _get_active_positions(
+    existing_positions: List[Dict[str, Any]],
+    new_positions: List[Dict[str, Any]],
+    current_time: datetime,
+) -> List[Dict[str, Any]]:
+    active: List[Dict[str, Any]] = []
+
+    for p in existing_positions:
+        if p["entry_time"] <= current_time < p["exit_time"]:
+            active.append(p)
+
+    for p in new_positions:
+        if p["entry_time"] <= current_time < p["exit_time"]:
+            active.append(p)
+
+    return active
 
 
 # 🔸 Расчёт SL/TP в процентах от цены входа
@@ -672,7 +673,6 @@ async def _simulate_trade(
         close = Decimal(str(r["close"]))
 
         if direction == "long":
-            # обновляем MFE/MAE
             fav_move = high - entry_price
             adv_move = low - entry_price
             if fav_move > max_fav:
@@ -735,8 +735,6 @@ async def _simulate_trade(
         exit_price = last_close
         exit_reason = "timeout_closed"
 
-        # обновляем MFE/MAE для последнего бара, если ещё не учли
-        # (формально мы проходили все бары, но на всякий случай)
         if direction == "long":
             high = Decimal(str(last["high"]))
             low = Decimal(str(last["low"]))
@@ -772,7 +770,6 @@ async def _simulate_trade(
 
     duration = exit_time - entry_time
 
-    # MFE/MAE уже в дельтах цены; обрезаем до 4 знаков
     max_fav = _q4(max_fav)
     max_adv = _q4(max_adv)
 
