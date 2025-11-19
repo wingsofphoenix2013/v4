@@ -4,9 +4,9 @@ import asyncio
 import logging
 import uuid
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 # 🔸 Кеши backtester_v1
 from backtester_config import get_signal_instance, get_ticker_info
@@ -17,9 +17,41 @@ log = logging.getLogger("BT_SCENARIO_BASIC_MONO")
 getcontext().prec = 28
 
 
-# 🔸 Утилита: обрезка до 4 знаков после запятой
-def _q4(value: Decimal) -> Decimal:
+# 🔸 Утилита: обрезка денег/метрик до 4 знаков после запятой
+def _q_money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+
+
+# 🔸 Обрезка по precision_price (без глобального 0.0001)
+def _quant_price(value: Decimal, precision_price: Optional[int]) -> Decimal:
+    if precision_price is None:
+        # дефолтно 8 знаков, если почему-то нет precision_price
+        precision_price = 8
+    try:
+        p_dec = int(precision_price)
+    except Exception:
+        p_dec = 8
+    quant = Decimal("1").scaleb(-p_dec)
+    return value.quantize(quant, rounding=ROUND_DOWN)
+
+
+# 🔸 Приведение цены к precision_price и ticksize
+def _round_price(
+    price: Decimal,
+    precision_price: Optional[int],
+    ticksize: Optional[Decimal],
+) -> Decimal:
+    # сначала обрезка по precision_price
+    price = _quant_price(price, precision_price)
+
+    # затем обрезка по ticksize, если есть
+    if ticksize is not None and ticksize > Decimal("0"):
+        steps = (price / ticksize).to_integral_value(rounding=ROUND_DOWN)
+        price = steps * ticksize
+
+    # после снапа к тиксайзу ещё раз приводим к precision_price (на всякий случай)
+    price = _quant_price(price, precision_price)
+    return price
 
 
 # 🔸 Публичная точка входа: backfill для сценария basic_straight_mono по одному окну сигнала
@@ -27,7 +59,7 @@ async def run_basic_straight_mono_backfill(
     scenario: Dict[str, Any],
     signal_ctx: Dict[str, Any],
     pg,
-    redis,  # параметр не используется, но оставляем для совместимости сигнатур
+    redis,  # оставляем для совместимости сигнатур
 ) -> None:
     scenario_id = scenario.get("id")
     scenario_key = scenario.get("key")
@@ -99,17 +131,18 @@ async def run_basic_straight_mono_backfill(
         )
         return
 
-    # списки для вставки позиций и логов
     positions_to_insert: List[Tuple[Any, ...]] = []
     logs_to_insert: List[Tuple[Any, ...]] = []
+    affected_days: Set[date] = set()
 
     total_signals_processed = 0
     total_positions_opened = 0
     total_skipped = 0
+    total_alive = 0
 
-    # обрабатываем long и short как две независимые вселенные с ОТДЕЛЬНЫМ депозитом
+    # обрабатываем long и short как две независимые вселенные с одинаковым deposit
     for direction in ("long", "short"):
-        # загружаем все исторические позиции по этому сценарию/TF/направлению
+        # существующие исторические позиции по этому направлению
         existing_positions = await _load_existing_positions(pg, scenario_id, timeframe, direction)
         new_positions: List[Dict[str, Any]] = []
 
@@ -134,11 +167,10 @@ async def run_basic_straight_mono_backfill(
             signal_uuid = s_row["signal_uuid"]
             raw_message = s_row["raw_message"]
 
-            # вычисляем активные позиции на момент сигнала T:
-            # entry_time <= T < exit_time
+            # активные позиции на момент сигнала (entry_time <= T < exit_time)
             active_positions = _get_active_positions(existing_positions, new_positions, open_time)
 
-            # проверка: тикер уже в позиции по этому направлению?
+            # тикер уже в позиции по этому направлению?
             if any(p["symbol"] == symbol for p in active_positions):
                 logs_to_insert.append(
                     (
@@ -237,10 +269,13 @@ async def run_basic_straight_mono_backfill(
             except Exception:
                 ticksize = None
 
-            # вычисляем максимально допустимый notional под эту сделку
+            # выравниваем цену входа по тикеру
+            entry_price = _round_price(entry_price, precision_price, ticksize)
+
+            # максимально допустимый notional под эту сделку
             max_notional_for_trade = max_margin_for_trade * leverage
 
-            # считаем теоретическое количество и приводим к precision_qty
+            # теоретическое количество
             qty_raw = max_notional_for_trade / entry_price
 
             if precision_qty is not None:
@@ -277,10 +312,10 @@ async def run_basic_straight_mono_backfill(
                 total_skipped += 1
                 continue
 
-            entry_qty = _q4(qty)
+            entry_qty = qty  # количество уже приведено к precision_qty
 
-            # пересчитываем notional и маржу по итоговым qty/цене
-            entry_notional = _q4(entry_price * entry_qty)
+            # notional и маржа
+            entry_notional = entry_price * entry_qty
             if entry_notional <= Decimal("0"):
                 logs_to_insert.append(
                     (
@@ -293,10 +328,13 @@ async def run_basic_straight_mono_backfill(
                 total_skipped += 1
                 continue
 
-            margin_used = _q4(entry_notional / leverage)
+            margin_used = entry_notional / leverage
+            # обрезаем деньги
+            entry_notional = _q_money(entry_notional)
+            margin_used = _q_money(margin_used)
+
             if margin_used > max_margin_for_trade:
-                # теоретически не должно быть, т.к. мы режем вниз, но на всякий случай
-                margin_used = _q4(max_margin_for_trade)
+                margin_used = _q_money(max_margin_for_trade)
 
             # расчёт уровней SL/TP в процентах
             sl_price, tp_price = _calc_sl_tp_percent(
@@ -306,7 +344,7 @@ async def run_basic_straight_mono_backfill(
                 direction=direction,
             )
 
-            # приводим цены к precision_price и ticksize
+            # приводим цены SL/TP к precision_price и ticksize
             sl_price = _round_price(sl_price, precision_price, ticksize)
             tp_price = _round_price(tp_price, precision_price, ticksize)
 
@@ -322,7 +360,7 @@ async def run_basic_straight_mono_backfill(
                 total_skipped += 1
                 continue
 
-            # моделируем жизнь сделки: поиск первого касания TP/SL
+            # моделируем жизнь сделки ДО to_time: если TP/SL нет, позиция "жива"
             sim_result = await _simulate_trade(
                 pg=pg,
                 symbol=symbol,
@@ -334,18 +372,29 @@ async def run_basic_straight_mono_backfill(
                 entry_notional=entry_notional,
                 sl_price=sl_price,
                 tp_price=tp_price,
+                to_time=to_time,
             )
 
             if sim_result is None:
+                # позиция открыта и на момент to_time остаётся живой
                 logs_to_insert.append(
                     (
                         signal_uuid,
                         scenario_id,
                         None,
-                        "skipped: not enough ohlcv data for simulation",
+                        "position opened and still alive",
                     )
                 )
-                total_skipped += 1
+                # для учёта маржи внутри текущего прогона считаем, что она жива до to_time
+                new_positions.append(
+                    {
+                        "symbol": symbol,
+                        "entry_time": open_time,
+                        "exit_time": to_time,
+                        "margin_used": margin_used,
+                    }
+                )
+                total_alive += 1
                 continue
 
             (
@@ -371,19 +420,19 @@ async def run_basic_straight_mono_backfill(
                     timeframe,
                     direction,
                     open_time,
-                    _q4(entry_price),
-                    _q4(entry_qty),
-                    _q4(entry_notional),
-                    _q4(margin_used),
-                    _q4(sl_price),
-                    _q4(tp_price),
+                    entry_price,             # цена уже приведена к precision_price/ticksize
+                    entry_qty,               # qty уже приведено к precision_qty
+                    entry_notional,          # деньги обрезаны до 4 знаков
+                    margin_used,             # деньги обрезаны до 4 знаков
+                    sl_price,
+                    tp_price,
                     exit_time,
-                    _q4(exit_price),
+                    exit_price,
                     exit_reason,
-                    _q4(pnl_abs),
+                    pnl_abs,
                     duration,
-                    _q4(max_fav),
-                    _q4(max_adv),
+                    max_fav,
+                    max_adv,
                 )
             )
 
@@ -396,7 +445,6 @@ async def run_basic_straight_mono_backfill(
                 )
             )
 
-            # добавляем новую позицию в список для учёта маржи по будущим сигналам
             new_positions.append(
                 {
                     "symbol": symbol,
@@ -406,6 +454,7 @@ async def run_basic_straight_mono_backfill(
                 }
             )
 
+            affected_days.add(open_time.date())
             total_positions_opened += 1
 
     # вставляем позиции и логи в БД
@@ -462,15 +511,19 @@ async def run_basic_straight_mono_backfill(
                 logs_to_insert,
             )
 
-    # тут уже нет смысла логировать "итоговую использованную маржу", потому что она динамическая по времени
     log.info(
         f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
         f"обработано сигналов={total_signals_processed}, позиций открыто={total_positions_opened}, "
-        f"пропущено={total_skipped}"
+        f"пропущено={total_skipped}, живых позиций={total_alive}"
     )
 
+    # пересчёт суточной статистики и общей статистики по сценарию
+    if positions_to_insert:
+        await _recalc_daily_stats(pg, scenario_id, deposit, affected_days)
+        await _recalc_total_stats(pg, scenario_id, deposit)
 
-# 🔸 Загрузка сигналов для сценария (без уже залогированных)
+
+# 🔸 Загрузка сигналов для сценария (без уже обработанных)
 async def _load_signals_for_scenario(
     pg,
     scenario_id: int,
@@ -603,30 +656,7 @@ def _calc_sl_tp_percent(
     return sl_price, tp_price
 
 
-# 🔸 Приведение цены к precision_price и ticksize
-def _round_price(
-    price: Decimal,
-    precision_price: Optional[int],
-    ticksize: Optional[Decimal],
-) -> Decimal:
-    # сначала обрезка по precision_price
-    if precision_price is not None:
-        try:
-            p_dec = int(precision_price)
-        except Exception:
-            p_dec = 0
-        quant = Decimal("1").scaleb(-p_dec)
-        price = price.quantize(quant, rounding=ROUND_DOWN)
-
-    # затем обрезка по ticksize, если есть
-    if ticksize is not None and ticksize > Decimal("0"):
-        steps = (price / ticksize).to_integral_value(rounding=ROUND_DOWN)
-        price = steps * ticksize
-
-    return _q4(price)
-
-
-# 🔸 Симуляция сделки: поиск первого касания TP/SL + PnL, duration, MFE/MAE
+# 🔸 Симуляция сделки: поиск первого касания TP/SL до to_time + PnL, duration, MFE/MAE
 async def _simulate_trade(
     pg,
     symbol: str,
@@ -638,6 +668,7 @@ async def _simulate_trade(
     entry_notional: Decimal,
     sl_price: Decimal,
     tp_price: Decimal,
+    to_time: datetime,
 ) -> Optional[Tuple[datetime, Decimal, str, Decimal, timedelta, Decimal, Decimal]]:
     table_name = _ohlcv_table_for_timeframe(timeframe)
     if not table_name:
@@ -650,14 +681,20 @@ async def _simulate_trade(
             FROM {table_name}
             WHERE symbol = $1
               AND open_time > $2
+              AND open_time <= $3
             ORDER BY open_time
             """,
             symbol,
             entry_time,
+            to_time,
         )
 
     if not rows:
         return None
+
+    # определяем precision_price для MFE/MAE
+    ticker_info = get_ticker_info(symbol) or {}
+    precision_price = ticker_info.get("precision_price")
 
     max_fav = Decimal("0")
     max_adv = Decimal("0")
@@ -727,32 +764,9 @@ async def _simulate_trade(
                 exit_reason = "full_tp_hit"
                 break
 
-    # если ни TP, ни SL не были задеты — закрываем по последней свече (timeout_closed)
+    # если ни TP, ни SL не были задеты в окне до to_time — считаем позицию "живой"
     if exit_time is None or exit_price is None or exit_reason is None:
-        last = rows[-1]
-        exit_time = last["open_time"]
-        last_close = Decimal(str(last["close"]))
-        exit_price = last_close
-        exit_reason = "timeout_closed"
-
-        if direction == "long":
-            high = Decimal(str(last["high"]))
-            low = Decimal(str(last["low"]))
-            fav_move = high - entry_price
-            adv_move = low - entry_price
-            if fav_move > max_fav:
-                max_fav = fav_move
-            if adv_move < max_adv:
-                max_adv = adv_move
-        else:
-            high = Decimal(str(last["high"]))
-            low = Decimal(str(last["low"]))
-            fav_move = entry_price - low
-            adv_move = entry_price - high
-            if fav_move > max_fav:
-                max_fav = fav_move
-            if adv_move < max_adv:
-                max_adv = adv_move
+        return None
 
     # расчёт PnL и комиссии
     if direction == "long":
@@ -760,18 +774,19 @@ async def _simulate_trade(
     else:
         raw_pnl = (entry_price - exit_price) * entry_qty
 
-    raw_pnl = _q4(raw_pnl)
+    raw_pnl = _q_money(raw_pnl)
 
     commission_rate = Decimal("0.0015")  # 0.15% вход+выход
-    commission = _q4(entry_notional * commission_rate)
+    commission = _q_money(entry_notional * commission_rate)
 
     pnl_abs = raw_pnl - commission
-    pnl_abs = _q4(pnl_abs)
+    pnl_abs = _q_money(pnl_abs)
 
     duration = exit_time - entry_time
 
-    max_fav = _q4(max_fav)
-    max_adv = _q4(max_adv)
+    # MFE/MAE — как дельта цены, приводим к precision_price
+    max_fav = _quant_price(max_fav, precision_price)
+    max_adv = _quant_price(max_adv, precision_price)
 
     return exit_time, exit_price, exit_reason, pnl_abs, duration, max_fav, max_adv
 
@@ -785,3 +800,307 @@ def _ohlcv_table_for_timeframe(timeframe: str) -> Optional[str]:
     if timeframe == "h1":
         return "ohlcv_bb_h1"
     return None
+
+
+# 🔸 Пересчёт суточной статистики по затронутым дням
+async def _recalc_daily_stats(
+    pg,
+    scenario_id: int,
+    deposit: Decimal,
+    days: Set[date],
+) -> None:
+    if not days:
+        return
+
+    async with pg.acquire() as conn:
+        for d in sorted(days):
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*)                                         AS trades_total,
+                    COUNT(*) FILTER (WHERE direction = 'long')       AS trades_long,
+                    COUNT(*) FILTER (WHERE direction = 'short')      AS trades_short,
+
+                    COUNT(*) FILTER (WHERE pnl_abs > 0)              AS wins_total,
+                    COUNT(*) FILTER (WHERE pnl_abs < 0)              AS losses_total,
+                    COUNT(*) FILTER (WHERE direction='long'  AND pnl_abs > 0) AS wins_long,
+                    COUNT(*) FILTER (WHERE direction='short' AND pnl_abs > 0) AS wins_short,
+
+                    COALESCE(SUM(pnl_abs), 0)                        AS pnl_abs_total,
+                    COALESCE(SUM(pnl_abs) FILTER (WHERE direction='long'), 0)  AS pnl_abs_long,
+                    COALESCE(SUM(pnl_abs) FILTER (WHERE direction='short'), 0) AS pnl_abs_short,
+
+                    COALESCE(AVG(max_favorable_excursion), 0)        AS mfe_avg,
+                    COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg
+                FROM bt_scenario_positions
+                WHERE scenario_id = $1
+                  AND entry_time::date = $2
+                """,
+                scenario_id,
+                d,
+            )
+
+            if not row or row["trades_total"] == 0:
+                # можно удалить строку, если она была, но для простоты — просто пропустим
+                continue
+
+            trades_total = row["trades_total"]
+            trades_long = row["trades_long"]
+            trades_short = row["trades_short"]
+            wins_total = row["wins_total"]
+            losses_total = row["losses_total"]
+            wins_long = row["wins_long"]
+            wins_short = row["wins_short"]
+            pnl_abs_total = Decimal(str(row["pnl_abs_total"]))
+            pnl_abs_long = Decimal(str(row["pnl_abs_long"]))
+            pnl_abs_short = Decimal(str(row["pnl_abs_short"]))
+            mfe_avg = Decimal(str(row["mfe_avg"]))
+            mae_avg = Decimal(str(row["mae_avg"]))
+
+            winrate_total = Decimal("0")
+            winrate_long = Decimal("0")
+            winrate_short = Decimal("0")
+
+            if trades_total > 0:
+                winrate_total = _q_money(Decimal(wins_total) / Decimal(trades_total))
+            if trades_long > 0:
+                winrate_long = _q_money(Decimal(wins_long) / Decimal(trades_long))
+            if trades_short > 0:
+                winrate_short = _q_money(Decimal(wins_short) / Decimal(trades_short))
+
+            roi_total = _q_money(pnl_abs_total / deposit) if deposit != 0 else Decimal("0")
+            roi_long = _q_money(pnl_abs_long / deposit) if deposit != 0 else Decimal("0")
+            roi_short = _q_money(pnl_abs_short / deposit) if deposit != 0 else Decimal("0")
+
+            await conn.execute(
+                """
+                INSERT INTO bt_scenario_daily (
+                    scenario_id,
+                    day,
+                    trades_total,
+                    trades_long,
+                    trades_short,
+                    wins_total,
+                    losses_total,
+                    wins_long,
+                    wins_short,
+                    pnl_abs_total,
+                    pnl_abs_long,
+                    pnl_abs_short,
+                    winrate_total,
+                    winrate_long,
+                    winrate_short,
+                    roi_total,
+                    roi_long,
+                    roi_short,
+                    max_favorable_excursion_avg,
+                    max_adverse_excursion_avg,
+                    raw_stat,
+                    created_at
+                )
+                VALUES (
+                    $1, $2,
+                    $3, $4, $5,
+                    $6, $7, $8, $9,
+                    $10, $11, $12,
+                    $13, $14, $15,
+                    $16, $17, $18,
+                    $19, $20,
+                    NULL,
+                    now()
+                )
+                ON CONFLICT (scenario_id, day) DO UPDATE
+                SET
+                    trades_total                = EXCLUDED.trades_total,
+                    trades_long                 = EXCLUDED.trades_long,
+                    trades_short                = EXCLUDED.trades_short,
+                    wins_total                  = EXCLUDED.wins_total,
+                    losses_total                = EXCLUDED.losses_total,
+                    wins_long                   = EXCLUDED.wins_long,
+                    wins_short                  = EXCLUDED.wins_short,
+                    pnl_abs_total               = EXCLUDED.pnl_abs_total,
+                    pnl_abs_long                = EXCLUDED.pnl_abs_long,
+                    pnl_abs_short               = EXCLUDED.pnl_abs_short,
+                    winrate_total               = EXCLUDED.winrate_total,
+                    winrate_long                = EXCLUDED.winrate_long,
+                    winrate_short               = EXCLUDED.winrate_short,
+                    roi_total                   = EXCLUDED.roi_total,
+                    roi_long                    = EXCLUDED.roi_long,
+                    roi_short                   = EXCLUDED.roi_short,
+                    max_favorable_excursion_avg = EXCLUDED.max_favorable_excursion_avg,
+                    max_adverse_excursion_avg   = EXCLUDED.max_adverse_excursion_avg,
+                    updated_at                  = now()
+                """,
+                scenario_id,
+                d,
+                trades_total,
+                trades_long,
+                trades_short,
+                wins_total,
+                losses_total,
+                wins_long,
+                wins_short,
+                _q_money(pnl_abs_total),
+                _q_money(pnl_abs_long),
+                _q_money(pnl_abs_short),
+                winrate_total,
+                winrate_long,
+                winrate_short,
+                roi_total,
+                roi_long,
+                roi_short,
+                _quant_price(mfe_avg, None),
+                _quant_price(mae_avg, None),
+            )
+
+    log.info(
+        f"BT_SCENARIO_BASIC_MONO: пересчитана суточная статистика для scenario_id={scenario_id}, "
+        f"дней={len(days)}"
+    )
+
+
+# 🔸 Пересчёт общей статистики по сценарию
+async def _recalc_total_stats(
+    pg,
+    scenario_id: int,
+    deposit: Decimal,
+) -> None:
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)                                         AS trades_total,
+                COUNT(*) FILTER (WHERE direction = 'long')       AS trades_long,
+                COUNT(*) FILTER (WHERE direction = 'short')      AS trades_short,
+
+                COUNT(*) FILTER (WHERE pnl_abs > 0)              AS wins_total,
+                COUNT(*) FILTER (WHERE pnl_abs < 0)              AS losses_total,
+                COUNT(*) FILTER (WHERE direction='long'  AND pnl_abs > 0) AS wins_long,
+                COUNT(*) FILTER (WHERE direction='short' AND pnl_abs > 0) AS wins_short,
+
+                COALESCE(SUM(pnl_abs), 0)                        AS pnl_abs_total,
+                COALESCE(SUM(pnl_abs) FILTER (WHERE direction='long'), 0)  AS pnl_abs_long,
+                COALESCE(SUM(pnl_abs) FILTER (WHERE direction='short'), 0) AS pnl_abs_short,
+
+                COALESCE(AVG(max_favorable_excursion), 0)        AS mfe_avg,
+                COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg
+            FROM bt_scenario_positions
+            WHERE scenario_id = $1
+            """,
+            scenario_id,
+        )
+
+        if not row or row["trades_total"] == 0:
+            # пока нет сделок — можно ничего не писать/не обновлять
+            return
+
+        trades_total = row["trades_total"]
+        trades_long = row["trades_long"]
+        trades_short = row["trades_short"]
+        wins_total = row["wins_total"]
+        losses_total = row["losses_total"]
+        wins_long = row["wins_long"]
+        wins_short = row["wins_short"]
+        pnl_abs_total = Decimal(str(row["pnl_abs_total"]))
+        pnl_abs_long = Decimal(str(row["pnl_abs_long"]))
+        pnl_abs_short = Decimal(str(row["pnl_abs_short"]))
+        mfe_avg = Decimal(str(row["mfe_avg"]))
+        mae_avg = Decimal(str(row["mae_avg"]))
+
+        winrate_total = Decimal("0")
+        winrate_long = Decimal("0")
+        winrate_short = Decimal("0")
+
+        if trades_total > 0:
+            winrate_total = _q_money(Decimal(wins_total) / Decimal(trades_total))
+        if trades_long > 0:
+            winrate_long = _q_money(Decimal(wins_long) / Decimal(trades_long))
+        if trades_short > 0:
+            winrate_short = _q_money(Decimal(wins_short) / Decimal(trades_short))
+
+        roi_total = _q_money(pnl_abs_total / deposit) if deposit != 0 else Decimal("0")
+        roi_long = _q_money(pnl_abs_long / deposit) if deposit != 0 else Decimal("0")
+        roi_short = _q_money(pnl_abs_short / deposit) if deposit != 0 else Decimal("0")
+
+        await conn.execute(
+            """
+            INSERT INTO bt_scenario_stat (
+                scenario_id,
+                trades_total,
+                trades_long,
+                trades_short,
+                wins_total,
+                losses_total,
+                wins_long,
+                wins_short,
+                pnl_abs_total,
+                pnl_abs_long,
+                pnl_abs_short,
+                winrate_total,
+                winrate_long,
+                winrate_short,
+                roi_total,
+                roi_long,
+                roi_short,
+                max_favorable_excursion_avg,
+                max_adverse_excursion_avg,
+                raw_stat,
+                created_at
+            )
+            VALUES (
+                $1,
+                $2, $3, $4,
+                $5, $6, $7, $8,
+                $9, $10, $11,
+                $12, $13, $14,
+                $15, $16, $17,
+                $18, $19,
+                NULL,
+                now()
+            )
+            ON CONFLICT (scenario_id) DO UPDATE
+            SET
+                trades_total                = EXCLUDED.trades_total,
+                trades_long                 = EXCLUDED.trades_long,
+                trades_short                = EXCLUDED.trades_short,
+                wins_total                  = EXCLUDED.wins_total,
+                losses_total                = EXCLUDED.losses_total,
+                wins_long                   = EXCLUDED.wins_long,
+                wins_short                  = EXCLUDED.wins_short,
+                pnl_abs_total               = EXCLUDED.pnl_abs_total,
+                pnl_abs_long                = EXCLUDED.pnl_abs_long,
+                pnl_abs_short               = EXCLUDED.pnl_abs_short,
+                winrate_total               = EXCLUDED.winrate_total,
+                winrate_long                = EXCLUDED.winrate_long,
+                winrate_short               = EXCLUDED.winrate_short,
+                roi_total                   = EXCLUDED.roi_total,
+                roi_long                    = EXCLUDED.roi_long,
+                roi_short                   = EXCLUDED.roi_short,
+                max_favorable_excursion_avg = EXCLUDED.max_favorable_excursion_avg,
+                max_adverse_excursion_avg   = EXCLUDED.max_adverse_excursion_avg,
+                updated_at                  = now()
+            """,
+            scenario_id,
+            trades_total,
+            trades_long,
+            trades_short,
+            wins_total,
+            losses_total,
+            wins_long,
+            wins_short,
+            _q_money(pnl_abs_total),
+            _q_money(pnl_abs_long),
+            _q_money(pnl_abs_short),
+            winrate_total,
+            winrate_long,
+            winrate_short,
+            roi_total,
+            roi_long,
+            roi_short,
+            _quant_price(mfe_avg, None),
+            _quant_price(mae_avg, None),
+        )
+
+    log.info(
+        f"BT_SCENARIO_BASIC_MONO: пересчитана итоговая статистика для scenario_id={scenario_id}"
+    )
