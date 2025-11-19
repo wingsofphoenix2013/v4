@@ -6,10 +6,12 @@ from typing import Dict, Any, List, Optional
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_CONFIG")
 
-# 🔸 Глобальные кеши тикеров, индикаторов и псевдо-сигналов
+# 🔸 Глобальные кеши тикеров, индикаторов, псевдо-сигналов и сценариев
 bt_tickers: Dict[str, Dict[str, Any]] = {}                 # symbol -> {fields}
 bt_indicator_instances: Dict[int, Dict[str, Any]] = {}     # instance_id -> {indicator, timeframe, enabled_at, params}
 bt_signal_instances: Dict[int, Dict[str, Any]] = {}        # signal_id -> {key, name, timeframe, mode, backfill_days, type, enabled, params}
+bt_scenarios: Dict[int, Dict[str, Any]] = {}               # scenario_id -> {key, name, type, enabled, created_at, params}
+bt_scenario_signal_links: List[Dict[str, Any]] = []        # элементы: {id, scenario_id, signal_id, enabled, created_at}
 
 
 # 🔸 Загрузка активных тикеров (status = enabled, tradepermission = enabled)
@@ -52,7 +54,7 @@ async def load_initial_tickers(pg) -> int:
     return count
 
 
-# 🔸 Загрузка включенных инстансов индикаторов и их параметров
+# 🔸 Загрузка включённых инстансов индикаторов и их параметров
 async def load_initial_indicators(pg, timeframes: Optional[List[str]] = None) -> int:
     async with pg.acquire() as conn:
         if timeframes:
@@ -78,6 +80,8 @@ async def load_initial_indicators(pg, timeframes: Optional[List[str]] = None) ->
 
         for r in rows:
             iid = r["id"]
+
+            # грузим параметры конкретного инстанса индикатора
             params_rows = await conn.fetch(
                 """
                 SELECT param, value
@@ -105,9 +109,13 @@ async def load_initial_indicators(pg, timeframes: Optional[List[str]] = None) ->
 
 
 # 🔸 Загрузка инстансов псевдо-сигналов и их параметров
-async def load_initial_signals(pg, timeframes: Optional[List[str]] = None, only_enabled: bool = True) -> int:
+async def load_initial_signals(
+    pg,
+    timeframes: Optional[List[str]] = None,
+    only_enabled: bool = True,
+) -> int:
     async with pg.acquire() as conn:
-        conditions = []
+        conditions: List[str] = []
         params: List[Any] = []
 
         # формируем динамический WHERE
@@ -136,8 +144,7 @@ async def load_initial_signals(pg, timeframes: Optional[List[str]] = None, only_
                 updated_at
             FROM bt_signals_instances
             {where_clause}
-            """
-            ,
+            """,
             *params,
         )
 
@@ -198,6 +205,105 @@ async def load_initial_signals(pg, timeframes: Optional[List[str]] = None, only_
     return count
 
 
+# 🔸 Загрузка инстансов сценариев и их параметров
+async def load_initial_scenarios(pg) -> int:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, key, name, type, enabled, created_at
+            FROM bt_scenario_instances
+            WHERE enabled = true
+            """
+        )
+
+        scenarios: Dict[int, Dict[str, Any]] = {}
+        scenario_ids: List[int] = []
+
+        for r in rows:
+            sid = r["id"]
+            scenario_ids.append(sid)
+            scenarios[sid] = {
+                "id": sid,
+                "key": r["key"],
+                "name": r["name"],
+                "type": r["type"],
+                "enabled": r["enabled"],
+                "created_at": r["created_at"],
+                "params": {},  # заполним ниже
+            }
+
+        if scenario_ids:
+            params_rows = await conn.fetch(
+                """
+                SELECT scenario_id, param_name, param_type, param_value
+                FROM bt_scenario_parameters
+                WHERE scenario_id = ANY($1::int[])
+                """,
+                scenario_ids,
+            )
+        else:
+            params_rows = []
+
+    # наполняем params внутри каждого сценария
+    for p in params_rows:
+        sid = p["scenario_id"]
+        if sid not in scenarios:
+            continue
+        scenario = scenarios[sid]
+        scenario_params = scenario.setdefault("params", {})
+        param_name = p["param_name"]
+        scenario_params[param_name] = {
+            "type": p["param_type"],
+            "value": p["param_value"],
+        }
+
+    bt_scenarios.clear()
+    bt_scenarios.update(scenarios)
+
+    count = len(bt_scenarios)
+    log.info(f"BT_CONFIG: загружено инстансов сценариев: {count}")
+    return count
+
+
+# 🔸 Загрузка связок сценарий ↔ псевдо-сигнал
+async def load_initial_scenario_signals(pg, only_enabled: bool = True) -> int:
+    async with pg.acquire() as conn:
+        if only_enabled:
+            rows = await conn.fetch(
+                """
+                SELECT id, scenario_id, signal_id, enabled, created_at
+                FROM bt_scenario_signals
+                WHERE enabled = true
+                """
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, scenario_id, signal_id, enabled, created_at
+                FROM bt_scenario_signals
+                """
+            )
+
+    links: List[Dict[str, Any]] = []
+    for r in rows:
+        links.append(
+            {
+                "id": r["id"],
+                "scenario_id": r["scenario_id"],
+                "signal_id": r["signal_id"],
+                "enabled": r["enabled"],
+                "created_at": r["created_at"],
+            }
+        )
+
+    bt_scenario_signal_links.clear()
+    bt_scenario_signal_links.extend(links)
+
+    count = len(bt_scenario_signal_links)
+    log.info(f"BT_CONFIG: загружено связок сценарий-сигнал: {count}")
+    return count
+
+
 # 🔸 Геттеры для тикеров
 def get_all_ticker_symbols() -> List[str]:
     return list(bt_tickers.keys())
@@ -250,4 +356,54 @@ def get_enabled_signals() -> List[Dict[str, Any]]:
     return [
         s for s in bt_signal_instances.values()
         if s.get("enabled")
+    ]
+
+
+# 🔸 Геттеры для сценариев и связок сценарий ↔ сигнал
+def get_all_scenarios() -> Dict[int, Dict[str, Any]]:
+    return bt_scenarios
+
+
+def get_scenario_instance(scenario_id: int) -> Optional[Dict[str, Any]]:
+    return bt_scenarios.get(scenario_id)
+
+
+def get_all_scenario_signal_links() -> List[Dict[str, Any]]:
+    return bt_scenario_signal_links
+
+
+def get_scenario_signal_links_for_signal(signal_id: int) -> List[Dict[str, Any]]:
+    return [
+        link for link in bt_scenario_signal_links
+        if link.get("signal_id") == signal_id
+    ]
+
+
+def get_scenario_signal_links_for_scenario(scenario_id: int) -> List[Dict[str, Any]]:
+    return [
+        link for link in bt_scenario_signal_links
+        if link.get("scenario_id") == scenario_id
+    ]
+
+
+def get_scenarios_for_signal(signal_id: int) -> List[Dict[str, Any]]:
+    # сценарии, привязанные к данному сигналу
+    scenario_ids = {
+        link["scenario_id"]
+        for link in bt_scenario_signal_links
+        if link.get("signal_id") == signal_id
+    }
+    return [
+        bt_scenarios[sid]
+        for sid in scenario_ids
+        if sid in bt_scenarios
+    ]
+
+
+def get_signals_for_scenario(scenario_id: int) -> List[int]:
+    # signal_id, привязанные к данному сценарию
+    return [
+        link["signal_id"]
+        for link in bt_scenario_signal_links
+        if link.get("scenario_id") == scenario_id
     ]
