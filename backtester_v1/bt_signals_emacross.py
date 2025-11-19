@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Tuple, Optional
 # 🔸 Кеши backtester_v1
 from backtester_config import get_all_ticker_symbols, get_ticker_info
 
+# 🔸 Константы и логгер
+BT_SIGNALS_READY_STREAM = "bt:signals:ready"
 log = logging.getLogger("BT_SIG_EMA_CROSS")
 
 
@@ -105,6 +107,31 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         f"BT_SIG_EMA_CROSS: backfill завершён для сигнала id={signal_id} ('{name}'): "
         f"вставлено событий={total_inserted}, long={total_long}, short={total_short}"
     )
+
+    # отправляем уведомление в Redis Stream о готовности сигналов
+    finished_at = datetime.utcnow()
+
+    try:
+        await redis.xadd(
+            BT_SIGNALS_READY_STREAM,
+            {
+                "signal_id": str(signal_id),
+                "from_time": from_time.isoformat(),
+                "to_time": to_time.isoformat(),
+                "finished_at": finished_at.isoformat(),
+            },
+        )
+        log.info(
+            f"BT_SIG_EMA_CROSS: опубликовано событие готовности в стрим '{BT_SIGNALS_READY_STREAM}' "
+            f"для signal_id={signal_id}, окно=[{from_time} .. {to_time}], finished_at={finished_at}"
+        )
+    except Exception as e:
+        # ошибки стрима не должны ломать основной backfill
+        log.error(
+            f"BT_SIG_EMA_CROSS: не удалось опубликовать событие в стрим '{BT_SIGNALS_READY_STREAM}' "
+            f"для signal_id={signal_id}: {e}",
+            exc_info=True,
+        )
 
 
 # 🔸 Загрузка уже существующих событий сигнала в окне (для идемпотентности)
