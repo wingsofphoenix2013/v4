@@ -1,4 +1,4 @@
-# bt_scenarios_analysis.py — аналитика позиций сценариев (биновые фичи по ATR/ADX/Supertrend)
+# bt_scenarios_analysis.py — аналитика позиций сценариев (биновые фичи по ATR/ADX/Supertrend/EMA/RSI/LR)
 
 import asyncio
 import logging
@@ -12,7 +12,7 @@ log = logging.getLogger("BT_SCENARIOS_ANALYSIS")
 # 🔸 Настройки Decimal
 getcontext().prec = 28
 
-# 🔸 Константы стрима анализа
+# 🔸 Константы стрима аналитики
 ANALYSIS_STREAM_KEY = "bt:postproc:ready"
 ANALYSIS_CONSUMER_GROUP = "bt_scenarios_analysis"
 ANALYSIS_CONSUMER_NAME = "bt_scenarios_analysis_main"
@@ -37,6 +37,26 @@ ADX_BINS: List[Tuple[Optional[float], Optional[float], str]] = [
     (20.0, 30.0, "20-30"),
     (30.0, None, ">=30"),
 ]
+
+# 🔸 Бины для расстояния до EMA200 (в процентах)
+# dist = (price - ema200) / price * 100
+DIST_EMA_BINS: List[Tuple[Optional[float], Optional[float], str]] = [
+    (None, -2.0, "<=-2"),   # очень ниже EMA200
+    (-2.0, 0.0, "-2-0"),
+    (0.0, 2.0, "0-2"),
+    (2.0, None, ">=2"),     # сильно выше EMA200
+]
+
+# 🔸 Бины для RSI14
+RSI_BINS: List[Tuple[Optional[float], Optional[float], str]] = [
+    (0.0, 30.0, "0-30"),
+    (30.0, 50.0, "30-50"),
+    (50.0, 70.0, "50-70"),
+    (70.0, None, ">=70"),
+]
+
+# 🔸 Порог для классификации LR угла
+LR_ANGLE_EPS = 0.005  # небольшой порог для "flat"
 
 
 # 🔸 Публичная точка входа: оркестратор аналитики сценариев
@@ -319,7 +339,7 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
         m15_ind = m15_block.get("indicators") or {}
         h1_ind = h1_block.get("indicators") or {}
 
-        # ATR% m5
+        # 🔸 ATR% m5
         atr_agg = m5_ind.get("atr") or {}
         atr14_m5 = _safe_get_float(atr_agg, "atr14")
         if atr14_m5 is not None:
@@ -333,7 +353,7 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
                 pnl_abs=pnl_abs,
             )
 
-        # ADX14 m15
+        # 🔸 ADX14 m15
         adx_m15_agg = m15_ind.get("adx_dmi") or {}
         adx14_m15 = _safe_get_float(adx_m15_agg, "adx_dmi14_adx")
         if adx14_m15 is not None:
@@ -346,7 +366,7 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
                 pnl_abs=pnl_abs,
             )
 
-        # ADX14 h1
+        # 🔸 ADX14 h1
         adx_h1_agg = h1_ind.get("adx_dmi") or {}
         adx14_h1 = _safe_get_float(adx_h1_agg, "adx_dmi14_adx")
         if adx14_h1 is not None:
@@ -359,22 +379,22 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
                 pnl_abs=pnl_abs,
             )
 
-        # Тренд Supertrend m15
+        # 🔸 Тренд Supertrend m15
         super_m15_agg = m15_ind.get("supertrend") or {}
         super_m15_trend = _safe_get_float(super_m15_agg, "supertrend10_3_0_trend")
         if super_m15_trend is not None:
-            label = _trend_label(direction, super_m15_trend)
+            label_m15 = _trend_label(direction, super_m15_trend)
         else:
-            label = "none"
+            label_m15 = "none"
         _accumulate_categorical_feature(
             stats,
             direction=direction,
             feature_name="trend_super_m15",
-            bin_label=label,
+            bin_label=label_m15,
             pnl_abs=pnl_abs,
         )
 
-        # Тренд Supertrend h1
+        # 🔸 Тренд Supertrend h1
         super_h1_agg = h1_ind.get("supertrend") or {}
         super_h1_trend = _safe_get_float(super_h1_agg, "supertrend10_3_0_trend")
         if super_h1_trend is not None:
@@ -388,6 +408,99 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
             bin_label=label_h1,
             pnl_abs=pnl_abs,
         )
+
+        # 🔸 Distance to EMA200 (m5/m15/h1)
+        ema_m5_agg = m5_ind.get("ema") or {}
+        ema_m15_agg = m15_ind.get("ema") or {}
+        ema_h1_agg = h1_ind.get("ema") or {}
+
+        ema200_m5 = _safe_get_float(ema_m5_agg, "ema200")
+        ema200_m15 = _safe_get_float(ema_m15_agg, "ema200")
+        ema200_h1 = _safe_get_float(ema_h1_agg, "ema200")
+
+        if ema200_m5 is not None:
+            dist_m5 = float((Decimal(str(ema200_m5)) - entry_price) / entry_price * Decimal("100"))
+            _accumulate_numeric_feature(
+                stats,
+                direction=direction,
+                feature_name="dist_ema200_m5",
+                value=dist_m5,
+                bins=DIST_EMA_BINS,
+                pnl_abs=pnl_abs,
+            )
+
+        if ema200_m15 is not None:
+            dist_m15 = float((Decimal(str(ema200_m15)) - entry_price) / entry_price * Decimal("100"))
+            _accumulate_numeric_feature(
+                stats,
+                direction=direction,
+                feature_name="dist_ema200_m15",
+                value=dist_m15,
+                bins=DIST_EMA_BINS,
+                pnl_abs=pnl_abs,
+            )
+
+        if ema200_h1 is not None:
+            dist_h1 = float((Decimal(str(ema200_h1)) - entry_price) / entry_price * Decimal("100"))
+            _accumulate_numeric_feature(
+                stats,
+                direction=direction,
+                feature_name="dist_ema200_h1",
+                value=dist_h1,
+                bins=DIST_EMA_BINS,
+                pnl_abs=pnl_abs,
+            )
+
+        # 🔸 RSI14 (m5/m15)
+        rsi_m5_agg = m5_ind.get("rsi") or {}
+        rsi_m15_agg = m15_ind.get("rsi") or {}
+
+        rsi14_m5 = _safe_get_float(rsi_m5_agg, "rsi14")
+        if rsi14_m5 is not None:
+            _accumulate_numeric_feature(
+                stats,
+                direction=direction,
+                feature_name="rsi14_m5",
+                value=rsi14_m5,
+                bins=RSI_BINS,
+                pnl_abs=pnl_abs,
+            )
+
+        rsi14_m15 = _safe_get_float(rsi_m15_agg, "rsi14")
+        if rsi14_m15 is not None:
+            _accumulate_numeric_feature(
+                stats,
+                direction=direction,
+                feature_name="rsi14_m15",
+                value=rsi14_m15,
+                bins=RSI_BINS,
+                pnl_abs=pnl_abs,
+            )
+
+        # 🔸 LR50 angle (m15/h1) — категориально: flat / up / down
+        lr_m15_agg = m15_ind.get("lr") or {}
+        lr_m15_angle = _safe_get_float(lr_m15_agg, "lr50_angle")
+        if lr_m15_angle is not None:
+            label_lr_m15 = _lr_angle_label(lr_m15_angle)
+            _accumulate_categorical_feature(
+                stats,
+                direction=direction,
+                feature_name="lr50_angle_m15",
+                bin_label=label_lr_m15,
+                pnl_abs=pnl_abs,
+            )
+
+        lr_h1_agg = h1_ind.get("lr") or {}
+        lr_h1_angle = _safe_get_float(lr_h1_agg, "lr50_angle")
+        if lr_h1_angle is not None:
+            label_lr_h1 = _lr_angle_label(lr_h1_angle)
+            _accumulate_categorical_feature(
+                stats,
+                direction=direction,
+                feature_name="lr50_angle_h1",
+                bin_label=label_lr_h1,
+                pnl_abs=pnl_abs,
+            )
 
     log.info(
         "BT_SCENARIOS_ANALYSIS: анализ завершён для scenario_id=%s, signal_id=%s — "
@@ -474,6 +587,15 @@ def _trend_label(direction: str, trend_value: float) -> str:
     return "none"
 
 
+# 🔸 Метка LR-угла: flat / up / down
+def _lr_angle_label(angle: float) -> str:
+    if angle > LR_ANGLE_EPS:
+        return "up"
+    if angle < -LR_ANGLE_EPS:
+        return "down"
+    return "flat"
+
+
 # 🔸 Агрегация числовой фичи по бинам
 def _accumulate_numeric_feature(
     stats: Dict[Tuple[str, str, str], Dict[str, Any]],
@@ -488,10 +610,13 @@ def _accumulate_numeric_feature(
     bin_to: Optional[float] = None
 
     for b_from, b_to, label in bins:
+        # нижняя граница
         if b_from is not None and value < b_from:
             continue
+        # верхняя граница
         if b_to is not None and value >= b_to:
             continue
+
         bin_label = label
         bin_from = b_from
         bin_to = b_to
