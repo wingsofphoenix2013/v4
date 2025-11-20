@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import json
 
 # 🔸 Кеши backtester_v1 (инстансы индикаторов)
 from backtester_config import get_all_indicator_instances
@@ -350,7 +351,6 @@ async def _process_position_with_semaphore(
             )
             return "error"
 
-
 # 🔸 Постпроцессинг одной позиции: сбор индикаторов по трём TF и запись raw_stat
 async def _process_single_position(
     pg,
@@ -465,6 +465,9 @@ async def _process_single_position(
         "tf": tf_payload,
     }
 
+    # сериализуем в JSON-строку для jsonb
+    raw_stat_json = json.dumps(raw_stat)
+
     # записываем raw_stat и помечаем позицию как обработанную
     async with pg.acquire() as conn:
         await conn.execute(
@@ -474,7 +477,7 @@ async def _process_single_position(
                 postproc = true
             WHERE id = $2
             """,
-            raw_stat,
+            raw_stat_json,
             pos_id,
         )
 
@@ -484,7 +487,6 @@ async def _process_single_position(
         symbol,
     )
     return "processed"
-
 
 # 🔸 Определение open_time для позиции по всем TF
 async def _resolve_open_times_for_position(
