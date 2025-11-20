@@ -374,7 +374,8 @@ async def _process_single_position(
         return "skipped"
 
     # собираем значения индикаторов по всем TF
-    tf_payload: Dict[str, Dict[str, Dict[str, float]]] = {}
+    # структура: tf_payload[tf] = {"open_time": <iso>, "indicators": {family -> {param_name -> value}}}
+    tf_payload: Dict[str, Dict[str, Any]] = {}
 
     async with pg.acquire() as conn:
         for tf in ("m5", "m15", "h1"):
@@ -433,7 +434,7 @@ async def _process_single_position(
                 return "skipped"
 
             # наполняем данные по "семьям" внутри TF
-            tf_data: Dict[str, Dict[str, float]] = {}
+            tf_families: Dict[str, Dict[str, float]] = {}
 
             for iid, records in by_instance.items():
                 inst = instances_by_id.get(iid)
@@ -441,14 +442,17 @@ async def _process_single_position(
                     continue
 
                 family = inst.get("indicator") or "unknown"
+                family_dict = tf_families.setdefault(family, {})
 
-                family_dict = tf_data.setdefault(family, {})
                 for rec in records:
                     param_name = rec["param_name"]
                     value = rec["value"]
                     family_dict[param_name] = value
 
-            tf_payload[tf] = tf_data
+            tf_payload[tf] = {
+                "open_time": tf_open_time.isoformat(),
+                "indicators": tf_families,
+            }
 
     # если по какой-то причине нечего записывать — пропускаем
     if not tf_payload:
