@@ -16,6 +16,9 @@ POSTPROC_STREAM_KEY = "bt:scenarios:ready"
 POSTPROC_CONSUMER_GROUP = "bt_scenarios_postproc"
 POSTPROC_CONSUMER_NAME = "bt_scenarios_postproc_main"
 
+# 🔸 Стрим готовности постпроцессинга
+POSTPROC_READY_STREAM_KEY = "bt:postproc:ready"
+
 # 🔸 Настройки чтения стрима
 POSTPROC_STREAM_BATCH_SIZE = 10
 POSTPROC_STREAM_BLOCK_MS = 5000
@@ -30,7 +33,6 @@ TF_STEP_MINUTES = {
     "m15": 15,
     "h1": 60,
 }
-
 
 # 🔸 Публичная точка входа: оркестратор постпроцессинга сценариев
 async def run_bt_scenarios_postproc(pg, redis) -> None:
@@ -104,6 +106,40 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                         errors,
                     )
 
+                    # публикуем событие о завершении постпроцессинга в bt:postproc:ready
+                    finished_at_postproc = datetime.utcnow()
+                    try:
+                        await redis.xadd(
+                            POSTPROC_READY_STREAM_KEY,
+                            {
+                                "scenario_id": str(scenario_id),
+                                "signal_id": str(signal_id),
+                                "processed": str(processed),
+                                "skipped": str(skipped),
+                                "errors": str(errors),
+                                "finished_at": finished_at_postproc.isoformat(),
+                            },
+                        )
+                        log.info(
+                            "BT_SCENARIOS_POSTPROC: опубликовано событие готовности постпроцессинга "
+                            "в стрим '%s' для scenario_id=%s, signal_id=%s, finished_at=%s",
+                            POSTPROC_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            finished_at_postproc,
+                        )
+                    except Exception as e:
+                        # проблемы стрима не должны ломать основной воркер
+                        log.error(
+                            "BT_SCENARIOS_POSTPROC: не удалось опубликовать событие в стрим '%s' "
+                            "для scenario_id=%s, signal_id=%s: %s",
+                            POSTPROC_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            e,
+                            exc_info=True,
+                        )
+
                     # помечаем сообщение как обработанное
                     await redis.xack(POSTPROC_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
@@ -121,7 +157,6 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
             )
             # небольшая пауза перед повторной попыткой, чтобы не крутить CPU при постоянной ошибке
             await asyncio.sleep(2)
-
 
 # 🔸 Проверка/создание consumer group для стрима постпроцессинга
 async def _ensure_consumer_group(redis) -> None:
