@@ -1,5 +1,6 @@
 # bt_analysis_rsi.py — анализатор фич семейства RSI для backtester_v1
 
+import json
 import logging
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Tuple, Optional
@@ -45,6 +46,54 @@ def _find_bin(value: float, bins: List[Tuple[float, float, str]]) -> Optional[Tu
     return None
 
 
+# 🔸 Извлечение значения RSI из raw_stat с учётом TF и ключа
+def _extract_rsi_value(
+    raw_stat: Any,
+    timeframe: str,
+    source_key: str,
+) -> Optional[float]:
+    # если raw_stat пришёл как JSON-строка — разбираем
+    if isinstance(raw_stat, str):
+        try:
+            raw_stat = json.loads(raw_stat)
+        except Exception:
+            return None
+
+    if not isinstance(raw_stat, dict):
+        return None
+
+    tf_map = raw_stat.get("tf")
+    if not isinstance(tf_map, dict):
+        return None
+
+    # приводим ключи TF к lower()
+    tf_lower: Dict[str, Any] = {str(k).lower(): v for k, v in tf_map.items()}
+    tf_block = tf_lower.get(timeframe.lower())
+    if not isinstance(tf_block, dict):
+        return None
+
+    indicators = tf_block.get("indicators")
+    if not isinstance(indicators, dict):
+        return None
+
+    # приводим семьи индикаторов к lower()
+    indicators_lower: Dict[str, Any] = {str(k).lower(): v for k, v in indicators.items()}
+    rsi_block_raw = indicators_lower.get("rsi")
+    if not isinstance(rsi_block_raw, dict):
+        return None
+
+    # приводим ключи внутри RSI к lower()
+    rsi_block: Dict[str, Any] = {str(k).lower(): v for k, v in rsi_block_raw.items()}
+    rsi_val_raw = rsi_block.get(source_key.lower())
+    if rsi_val_raw is None:
+        return None
+
+    try:
+        return float(rsi_val_raw)
+    except Exception:
+        return None
+
+
 # 🔸 Публичная точка входа: анализ семейства RSI для одного сценария+сигнала
 async def run_analysis_rsi(
     scenario_id: int,
@@ -60,7 +109,7 @@ async def run_analysis_rsi(
     )
 
     if not analysis_instances:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI: для scenario_id=%s, signal_id=%s нет инстансов анализа RSI",
             scenario_id,
             signal_id,
@@ -100,7 +149,7 @@ async def run_analysis_rsi(
         )
 
     if not rows:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI: для scenario_id=%s, signal_id=%s нет позиций с postproc=true",
             scenario_id,
             signal_id,
@@ -116,14 +165,14 @@ async def run_analysis_rsi(
 
     # обрабатываем каждый инстанс анализа независимо
     for inst in analysis_instances:
-        key = inst.get("key")
         family_key = inst.get("family_key")
+        key = inst.get("key")
         inst_id = inst.get("id")
         params = inst.get("params") or {}
 
         # пока поддерживаем только rsi_value
         if family_key != "rsi" or key != "rsi_value":
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_RSI: inst_id=%s (family_key=%s, key=%s) пока не поддерживается",
                 inst_id,
                 family_key,
@@ -170,7 +219,7 @@ async def run_analysis_rsi(
             raw_stat = r["raw_stat"]
             pnl_abs_raw = r["pnl_abs"]
 
-            # защита от отсутствующих/битых данных
+            # условия достаточности
             if direction is None or raw_stat is None or pnl_abs_raw is None:
                 continue
 
@@ -180,20 +229,12 @@ async def run_analysis_rsi(
                 continue
 
             # извлекаем RSI из raw_stat по нужному TF и ключу
-            try:
-                tf_block = (raw_stat.get("tf") or {}).get(timeframe)
-                if not tf_block:
-                    continue
-
-                indicators = tf_block.get("indicators") or {}
-                rsi_block = indicators.get("rsi") or {}
-                rsi_val_raw = rsi_block.get(source_key)
-
-                if rsi_val_raw is None:
-                    continue
-
-                rsi_val = float(rsi_val_raw)
-            except Exception:
+            rsi_val = _extract_rsi_value(
+                raw_stat=raw_stat,
+                timeframe=timeframe,
+                source_key=source_key,
+            )
+            if rsi_val is None:
                 continue
 
             bin_def = _find_bin(rsi_val, bins)
@@ -222,21 +263,21 @@ async def run_analysis_rsi(
                 bin_stat["losses"] += 1
             bin_stat["pnl_abs_total"] += pnl_abs
 
-        # если по инстансу не набралось ни одного бина — пропускаем запись
+        # если по инстансу не набралось ни одного бина — очищаем старые и выходим
         if not agg:
             log.info(
-                "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s — нет данных для записи (agg пустой)",
+                "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s — нет данных для записи (agg пустой), "
+                "очищаем старые бины",
                 inst_id,
                 feature_name,
             )
-            # на всякий случай очищаем старые данные по этой фиче/TF
             async with pg.acquire() as conn:
                 await conn.execute(
                     """
                     DELETE FROM bt_scenario_feature_bins
-                    WHERE scenario_id = $1
-                      AND signal_id   = $2
-                      AND timeframe   = $3
+                    WHERE scenario_id  = $1
+                      AND signal_id    = $2
+                      AND timeframe    = $3
                       AND feature_name = $4
                     """,
                     scenario_id,
