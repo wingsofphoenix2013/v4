@@ -6,12 +6,14 @@ from typing import Dict, Any, List, Optional
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_CONFIG")
 
-# 🔸 Глобальные кеши тикеров, индикаторов, псевдо-сигналов и сценариев
+# 🔸 Глобальные кеши тикеров, индикаторов, псевдо-сигналов, сценариев и анализаторов
 bt_tickers: Dict[str, Dict[str, Any]] = {}                 # symbol -> {fields}
 bt_indicator_instances: Dict[int, Dict[str, Any]] = {}     # instance_id -> {indicator, timeframe, enabled_at, params}
 bt_signal_instances: Dict[int, Dict[str, Any]] = {}        # signal_id -> {key, name, timeframe, mode, backfill_days, type, enabled, params}
 bt_scenarios: Dict[int, Dict[str, Any]] = {}               # scenario_id -> {key, name, type, enabled, created_at, params}
 bt_scenario_signal_links: List[Dict[str, Any]] = []        # элементы: {id, scenario_id, signal_id, enabled, created_at}
+bt_analysis_instances: Dict[int, Dict[str, Any]] = {}      # analysis_id -> {family_key, key, name, enabled, params}
+bt_analysis_connections: List[Dict[str, Any]] = []         # элементы: {id, scenario_id, signal_id, analysis_id, enabled, created_at, updated_at}
 
 
 # 🔸 Загрузка активных тикеров (status = enabled, tradepermission = enabled)
@@ -264,6 +266,7 @@ async def load_initial_scenarios(pg) -> int:
     log.info(f"BT_CONFIG: загружено инстансов сценариев: {count}")
     return count
 
+
 # 🔸 Загрузка связок сценарий ↔ псевдо-сигнал
 async def load_initial_scenario_signals(pg, only_enabled: bool = True) -> int:
     async with pg.acquire() as conn:
@@ -307,6 +310,129 @@ async def load_initial_scenario_signals(pg, only_enabled: bool = True) -> int:
     count = len(bt_scenario_signal_links)
     log.info(f"BT_CONFIG: загружено связок сценарий-сигнал: {count}")
     return count
+
+
+# 🔸 Загрузка инстансов анализаторов и их параметров
+async def load_initial_analysis_instances(pg) -> int:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                id,
+                family_key,
+                key,
+                name,
+                enabled,
+                created_at,
+                updated_at
+            FROM bt_analysis_instances
+            """
+        )
+
+        instances: Dict[int, Dict[str, Any]] = {}
+        analysis_ids: List[int] = []
+
+        for r in rows:
+            aid = r["id"]
+            analysis_ids.append(aid)
+            instances[aid] = {
+                "id": aid,
+                "family_key": r["family_key"],
+                "key": r["key"],
+                "name": r["name"],
+                "enabled": r["enabled"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "params": {},  # заполним ниже
+            }
+
+        if analysis_ids:
+            params_rows = await conn.fetch(
+                """
+                SELECT analysis_id, param_name, param_type, param_value
+                FROM bt_analysis_parameters
+                WHERE analysis_id = ANY($1::int[])
+                """,
+                analysis_ids,
+            )
+        else:
+            params_rows = []
+
+    # наполняем params внутри каждого анализатора
+    for p in params_rows:
+        aid = p["analysis_id"]
+        if aid not in instances:
+            continue
+        inst = instances[aid]
+        inst_params = inst.setdefault("params", {})
+        param_name = p["param_name"]
+        inst_params[param_name] = {
+            "type": p["param_type"],
+            "value": p["param_value"],
+        }
+
+    bt_analysis_instances.clear()
+    bt_analysis_instances.update(instances)
+
+    count = len(bt_analysis_instances)
+    log.info(f"BT_CONFIG: загружено инстансов анализаторов: {count}")
+    return count
+
+
+# 🔸 Загрузка связок анализатор ↔ сценарий ↔ псевдо-сигнал
+async def load_initial_analysis_connections(pg, only_enabled: bool = True) -> int:
+    async with pg.acquire() as conn:
+        if only_enabled:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    scenario_id,
+                    signal_id,
+                    analysis_id,
+                    enabled,
+                    created_at,
+                    updated_at
+                FROM bt_analysis_connections
+                WHERE enabled = true
+                """
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    scenario_id,
+                    signal_id,
+                    analysis_id,
+                    enabled,
+                    created_at,
+                    updated_at
+                FROM bt_analysis_connections
+                """
+            )
+
+    links: List[Dict[str, Any]] = []
+    for r in rows:
+        links.append(
+            {
+                "id": r["id"],
+                "scenario_id": r["scenario_id"],
+                "signal_id": r["signal_id"],
+                "analysis_id": r["analysis_id"],
+                "enabled": r["enabled"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+        )
+
+    bt_analysis_connections.clear()
+    bt_analysis_connections.extend(links)
+
+    count = len(bt_analysis_connections)
+    log.info(f"BT_CONFIG: загружено связок анализатор-сценарий-сигнал: {count}")
+    return count
+
 
 # 🔸 Геттеры для тикеров
 def get_all_ticker_symbols() -> List[str]:
@@ -411,3 +537,47 @@ def get_signals_for_scenario(scenario_id: int) -> List[int]:
         for link in bt_scenario_signal_links
         if link.get("scenario_id") == scenario_id
     ]
+
+
+# 🔸 Геттеры для инстансов анализаторов и связок анализатор ↔ сценарий ↔ сигнал
+def get_all_analysis_instances() -> Dict[int, Dict[str, Any]]:
+    return bt_analysis_instances
+
+
+def get_analysis_instance(analysis_id: int) -> Optional[Dict[str, Any]]:
+    return bt_analysis_instances.get(analysis_id)
+
+
+def get_all_analysis_connections() -> List[Dict[str, Any]]:
+    return bt_analysis_connections
+
+
+def get_analysis_connections_for_scenario_signal(
+    scenario_id: int,
+    signal_id: int,
+) -> List[Dict[str, Any]]:
+    return [
+        link for link in bt_analysis_connections
+        if link.get("scenario_id") == scenario_id
+        and link.get("signal_id") == signal_id
+    ]
+
+
+def get_analysis_instances_for_scenario_signal(
+    scenario_id: int,
+    signal_id: int,
+) -> List[Dict[str, Any]]:
+    instances: List[Dict[str, Any]] = []
+
+    for link in bt_analysis_connections:
+        if (
+            link.get("scenario_id") == scenario_id
+            and link.get("signal_id") == signal_id
+            and link.get("enabled")
+        ):
+            aid = link.get("analysis_id")
+            inst = bt_analysis_instances.get(aid)
+            if inst and inst.get("enabled"):
+                instances.append(inst)
+
+    return instances
