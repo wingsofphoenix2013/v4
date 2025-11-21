@@ -25,18 +25,17 @@ def _safe_div(n: Decimal, d: Decimal) -> Decimal:
         return Decimal("0")
     return n / d
 
-
 # 🔸 Бины по абсолютному значению RSI (0–100)
 def _default_rsi_value_bins() -> List[Tuple[float, float, str]]:
     return [
         (0.0, 20.0, "RSI_0_20"),
         (20.0, 30.0, "RSI_20_30"),
         (30.0, 40.0, "RSI_30_40"),
-        (40.0, 60.0, "RSI_40_60"),
+        (40.0, 50.0, "RSI_40_50"),
+        (50.0, 60.0, "RSI_50_60"),
         (60.0, 70.0, "RSI_60_70"),
         (70.0, 100.0001, "RSI_70_100"),
     ]
-
 
 # 🔸 Поиск бина для конкретного значения RSI
 def _find_bin(value: float, bins: List[Tuple[float, float, str]]) -> Optional[Tuple[float, float, str]]:
