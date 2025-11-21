@@ -264,16 +264,21 @@ async def load_initial_scenarios(pg) -> int:
     log.info(f"BT_CONFIG: загружено инстансов сценариев: {count}")
     return count
 
-
 # 🔸 Загрузка связок сценарий ↔ псевдо-сигнал
 async def load_initial_scenario_signals(pg, only_enabled: bool = True) -> int:
     async with pg.acquire() as conn:
         if only_enabled:
+            # берём только те связки, где:
+            # - связка enabled = true
+            # - сам сценарий enabled = true
             rows = await conn.fetch(
                 """
-                SELECT id, scenario_id, signal_id, enabled, created_at
-                FROM bt_scenario_signals
-                WHERE enabled = true
+                SELECT s.id, s.scenario_id, s.signal_id, s.enabled, s.created_at
+                FROM bt_scenario_signals s
+                JOIN bt_scenario_instances si
+                  ON si.id = s.scenario_id
+                WHERE s.enabled = true
+                  AND si.enabled = true
                 """
             )
         else:
@@ -302,7 +307,6 @@ async def load_initial_scenario_signals(pg, only_enabled: bool = True) -> int:
     count = len(bt_scenario_signal_links)
     log.info(f"BT_CONFIG: загружено связок сценарий-сигнал: {count}")
     return count
-
 
 # 🔸 Геттеры для тикеров
 def get_all_ticker_symbols() -> List[str]:
