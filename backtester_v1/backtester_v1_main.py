@@ -34,7 +34,7 @@ BT_TIMEFRAMES = ["m5", "m15", "h1"]
 # 🔸 Воркеры backtester_v1 (заглушки для базовой проверки инфраструктуры)
 async def run_backtester_supervisor(pg, redis):
     log = logging.getLogger("BT_SUPERVISOR")
-    log.info("BT_SUPERVISOR: воркер запущен, backtester_v1 в режиме ожидания (без доменной логики)")
+    log.debug("BT_SUPERVISOR: воркер запущен, backtester_v1 в режиме ожидания (без доменной логики)")
 
     # здесь мы сознательно ничего не делаем с PG/Redis, только держим процесс живым
     while True:
@@ -48,7 +48,7 @@ async def main():
     setup_logging()
     log = logging.getLogger("BT_MAIN")
 
-    log.info("BT_MAIN: старт инициализации backtester_v1")
+    log.debug("BT_MAIN: старт инициализации backtester_v1")
 
     # подключение к PostgreSQL
     pg = await init_pg_pool()
@@ -56,7 +56,7 @@ async def main():
     # подключение к Redis
     redis = await init_redis_client()
 
-    log.info("BT_MAIN: подключения к PostgreSQL и Redis успешно установлены для backtester_v1")
+    log.debug("BT_MAIN: подключения к PostgreSQL и Redis успешно установлены для backtester_v1")
 
     # 🔸 Загрузка кешей: тикеры, инстансы индикаторов и инстансы псевдо-сигналов
     tickers_count = await load_initial_tickers(pg)

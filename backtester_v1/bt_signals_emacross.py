@@ -73,10 +73,10 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
     # список активных тикеров из кеша
     symbols = get_all_ticker_symbols()
     if not symbols:
-        log.info(f"BT_SIG_EMA_CROSS: нет активных тикеров для обработки, сигнал id={signal_id} ('{name}')")
+        log.debug(f"BT_SIG_EMA_CROSS: нет активных тикеров для обработки, сигнал id={signal_id} ('{name}')")
         return
 
-    log.info(
+    log.debug(
         f"BT_SIG_EMA_CROSS: старт backfill для сигнала id={signal_id} ('{name}', key={signal_key}), "
         f"TF={timeframe}, окно={backfill_days} дней, тикеров={len(symbols)}, "
         f"direction_mask={mask_val}"
@@ -120,7 +120,7 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         total_long += longs
         total_short += shorts
 
-    log.info(
+    log.debug(
         f"BT_SIG_EMA_CROSS: backfill завершён для сигнала id={signal_id} ('{name}'): "
         f"вставлено событий={total_inserted}, long={total_long}, short={total_short}, "
         f"direction_mask={mask_val}"
@@ -139,7 +139,7 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 "finished_at": finished_at.isoformat(),
             },
         )
-        log.info(
+        log.debug(
             f"BT_SIG_EMA_CROSS: опубликовано событие готовности в стрим '{BT_SIGNALS_READY_STREAM}' "
             f"для signal_id={signal_id}, окно=[{from_time} .. {to_time}], finished_at={finished_at}"
         )
@@ -376,7 +376,7 @@ async def _process_symbol_inner(
         )
 
     inserted = len(to_insert)
-    log.info(
+    log.debug(
         f"BT_SIG_EMA_CROSS: {symbol} → вставлено событий={inserted} (long={long_count}, short={short_count}) "
         f"для сигнала id={signal_id} ('{name}')"
     )

@@ -117,7 +117,7 @@ async def run_basic_straight_mono_backfill(
         )
         return
 
-    log.info(
+    log.debug(
         f"BT_SCENARIO_BASIC_MONO: старт обработки сценария id={scenario_id} (key={scenario_key}, type={scenario_type}) "
         f"для signal_id={signal_id}, TF={timeframe}, окно=[{from_time} .. {to_time}], "
         f"deposit={deposit}, leverage={leverage}, position_limit={position_limit}, "
@@ -127,7 +127,7 @@ async def run_basic_straight_mono_backfill(
     # грузим сигналы для данного signal_id/TF/окна, которые ещё не обрабатывались этим сценарием
     signals = await _load_signals_for_scenario(pg, scenario_id, signal_id, timeframe, from_time, to_time)
     if not signals:
-        log.info(
+        log.debug(
             f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
             f"актуальных сигналов для обработки не найдено"
         )
@@ -142,7 +142,7 @@ async def run_basic_straight_mono_backfill(
                     "finished_at": finished_at.isoformat(),
                 },
             )
-            log.info(
+            log.debug(
                 f"BT_SCENARIO_BASIC_MONO: опубликовано событие готовности сценария в стрим "
                 f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}, "
                 f"finished_at={finished_at}"
@@ -176,7 +176,7 @@ async def run_basic_straight_mono_backfill(
         if not dir_signals:
             continue
 
-        log.info(
+        log.debug(
             f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id}, direction={direction} — "
             f"для обработки сигналов={len(dir_signals)}"
         )
@@ -540,7 +540,7 @@ async def run_basic_straight_mono_backfill(
                 logs_to_insert,
             )
 
-    log.info(
+    log.debug(
         f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
         f"обработано сигналов={total_signals_processed}, позиций открыто={total_positions_opened}, "
         f"пропущено={total_skipped}, живых позиций={total_alive}"
@@ -562,7 +562,7 @@ async def run_basic_straight_mono_backfill(
                 "finished_at": finished_at.isoformat(),
             },
         )
-        log.info(
+        log.debug(
             f"BT_SCENARIO_BASIC_MONO: опубликовано событие готовности сценария в стрим "
             f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}, "
             f"finished_at={finished_at}"
@@ -624,7 +624,7 @@ async def _load_signals_for_scenario(
             }
         )
 
-    log.info(
+    log.debug(
         f"BT_SCENARIO_BASIC_MONO: загружено сигналов для scenario_id={scenario_id}, "
         f"signal_id={signal_id}, TF={timeframe} в окне [{from_time} .. {to_time}]: {len(signals)}"
     )
@@ -667,7 +667,7 @@ async def _load_existing_positions(
             }
         )
 
-    log.info(
+    log.debug(
         f"BT_SCENARIO_BASIC_MONO: загружены существующие позиции для scenario_id={scenario_id}, "
         f"signal_id={signal_id}, TF={timeframe}, direction={direction}: позиций={len(positions)}"
     )
@@ -951,7 +951,7 @@ async def _recalc_daily_stats(
                     _q_money(mae_avg),
                 )
 
-    log.info(
+    log.debug(
         f"BT_SCENARIO_BASIC_MONO: пересчитана суточная статистика для scenario_id={scenario_id}, "
         f"signal_id={signal_id}, дней={len(days)}"
     )
@@ -1043,7 +1043,7 @@ async def _recalc_total_stats(
                 _q_money(mae_avg),
             )
 
-    log.info(
+    log.debug(
         f"BT_SCENARIO_BASIC_MONO: пересчитана итоговая статистика для scenario_id={scenario_id}, "
         f"signal_id={signal_id}"
     )

@@ -20,7 +20,7 @@ async def init_pg_pool():
         raise RuntimeError("DATABASE_URL is not set")
 
     pool = await asyncpg.create_pool(DATABASE_URL)
-    log.info("BT_INFRA: пул соединений PostgreSQL инициализирован")
+    log.debug("BT_INFRA: пул соединений PostgreSQL инициализирован")
     return pool
 
 
@@ -43,7 +43,7 @@ async def init_redis_client():
     for attempt in range(3):
         try:
             await client.ping()
-            log.info("BT_INFRA: Redis клиент успешно инициализирован")
+            log.debug("BT_INFRA: Redis клиент успешно инициализирован")
             return client
         except Exception as e:
             # последняя попытка — пробрасываем ошибку
@@ -60,11 +60,11 @@ async def run_safe_loop(coro_fn, name: str, retry_delay: int = 5):
     log = logging.getLogger("BT_INFRA")
     while True:
         try:
-            log.info(f"[{name}] запуск воркера")
+            log.debug(f"[{name}] запуск воркера")
             await coro_fn()
         except Exception as e:
             log.error(f"[{name}] ошибка: {e}", exc_info=True)
-            log.info(f"[{name}] перезапуск через {retry_delay} секунд...")
+            log.debug(f"[{name}] перезапуск через {retry_delay} секунд...")
             await asyncio.sleep(retry_delay)
 
 
@@ -77,4 +77,4 @@ def setup_logging():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     log = logging.getLogger("BT_INFRA")
-    log.info(f"BT_INFRA: логирование настроено, уровень = {'DEBUG' if DEBUG_MODE else 'INFO'}")
+    log.debug(f"BT_INFRA: логирование настроено, уровень = {'DEBUG' if DEBUG_MODE else 'INFO'}")

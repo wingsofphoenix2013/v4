@@ -18,12 +18,12 @@ EMA_CROSS_PLAIN_INTERVAL_SEC = 3600       # повторный запуск ра
 # 🔸 Оркестратор ps-сигналов: поднимает планировщики для всех включённых инстансов
 async def run_bt_signals_orchestrator(pg, redis):
     log = logging.getLogger("BT_SIGNALS_MAIN")
-    log.info("BT_SIGNALS_MAIN: оркестратор псевдо-сигналов запущен")
+    log.debug("BT_SIGNALS_MAIN: оркестратор псевдо-сигналов запущен")
 
     # получаем все включённые инстансы псевдо-сигналов из кеша
     signals: List[Dict[str, Any]] = get_enabled_signals()
     if not signals:
-        log.info("BT_SIGNALS_MAIN: включённых псевдо-сигналов не найдено, оркестратор в режиме ожидания")
+        log.debug("BT_SIGNALS_MAIN: включённых псевдо-сигналов не найдено, оркестратор в режиме ожидания")
         # держим процесс живым, чтобы run_safe_loop не перезапускал без необходимости
         while True:
             await asyncio.sleep(60)
@@ -37,7 +37,7 @@ async def run_bt_signals_orchestrator(pg, redis):
         mode = signal.get("mode")
 
         # логируем обнаруженный сигнал
-        log.info(f"BT_SIGNALS_MAIN: найден сигнал id={sid}, key={key}, name={name}, mode={mode}")
+        log.debug(f"BT_SIGNALS_MAIN: найден сигнал id={sid}, key={key}, name={name}, mode={mode}")
 
         # пока обрабатываем только ema_cross_plain и только режимы, включающие backfill
         if key == "ema_cross_plain" and mode in ("backfill", "both"):
@@ -47,17 +47,17 @@ async def run_bt_signals_orchestrator(pg, redis):
                 name=f"BT_SIG_EMA_CROSS_{sid}",
             )
             tasks.append(task)
-            log.info(
+            log.debug(
                 f"BT_SIGNALS_MAIN: для сигнала id={sid} (ema_cross_plain) "
                 f"поднят планировщик backfill: старт через {EMA_CROSS_PLAIN_START_DELAY_SEC} сек, "
                 f"интервал {EMA_CROSS_PLAIN_INTERVAL_SEC} сек"
             )
         else:
             # остальные типы сигналов пока не реализованы
-            log.info(f"BT_SIGNALS_MAIN: сигнал id={sid} с key={key} пока не поддерживается оркестратором")
+            log.debug(f"BT_SIGNALS_MAIN: сигнал id={sid} с key={key} пока не поддерживается оркестратором")
 
     if not tasks:
-        log.info("BT_SIGNALS_MAIN: нет поддерживаемых сигналов для запуска планировщиков, оркестратор в режиме ожидания")
+        log.debug("BT_SIGNALS_MAIN: нет поддерживаемых сигналов для запуска планировщиков, оркестратор в режиме ожидания")
         while True:
             await asyncio.sleep(60)
 
@@ -74,7 +74,7 @@ async def _schedule_ema_cross_backfill(signal: Dict[str, Any], pg, redis):
 
     # начальная задержка перед первым запуском
     if EMA_CROSS_PLAIN_START_DELAY_SEC > 0:
-        log.info(
+        log.debug(
             f"BT_SIG_EMA_CROSS: сигнал id={sid} ('{name}') — ожидание перед стартом "
             f"{EMA_CROSS_PLAIN_START_DELAY_SEC} секунд"
         )
@@ -83,13 +83,13 @@ async def _schedule_ema_cross_backfill(signal: Dict[str, Any], pg, redis):
     # цикл периодического запуска backfill
     while True:
         try:
-            log.info(
+            log.debug(
                 f"BT_SIG_EMA_CROSS: запуск backfill для сигнала id={sid} ('{name}'), "
                 f"окно={backfill_days} дней"
             )
             # один прогон backfill по истории для данного сигнала
             await run_emacross_backfill(signal, pg, redis)
-            log.info(
+            log.debug(
                 f"BT_SIG_EMA_CROSS: backfill для сигнала id={sid} ('{name}') завершён, "
                 f"следующий запуск через {EMA_CROSS_PLAIN_INTERVAL_SEC} секунд"
             )

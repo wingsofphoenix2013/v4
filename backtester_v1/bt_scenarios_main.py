@@ -28,7 +28,7 @@ log = logging.getLogger("BT_SCENARIOS_MAIN")
 
 # 🔸 Публичная точка входа: оркестратор сценариев
 async def run_bt_scenarios_orchestrator(pg, redis):
-    log.info("BT_SCENARIOS_MAIN: оркестратор сценариев запущен")
+    log.debug("BT_SCENARIOS_MAIN: оркестратор сценариев запущен")
 
     await _ensure_consumer_group(redis)
 
@@ -65,7 +65,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                     # получаем все связки сценарий ↔ сигнал
                     links = get_scenario_signal_links_for_signal(signal_id)
                     if not links:
-                        log.info(
+                        log.debug(
                             f"BT_SCENARIOS_MAIN: для signal_id={signal_id} нет активных связок сценариев, "
                             f"сообщение {entry_id} будет помечено как обработанное"
                         )
@@ -85,7 +85,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                             continue
 
                         if not scenario.get("enabled"):
-                            log.info(
+                            log.debug(
                                 f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} отключён, "
                                 f"signal_id={signal_id}, сообщение {entry_id}"
                             )
@@ -108,12 +108,12 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                     # помечаем сообщение как обработанное
                     await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
 
-                    log.info(
+                    log.debug(
                         f"BT_SCENARIOS_MAIN: сообщение stream_id={entry_id} для signal_id={signal_id} "
                         f"обработано, сценариев запущено={started_for_message}"
                     )
 
-            log.info(
+            log.debug(
                 f"BT_SCENARIOS_MAIN: пакет обработан — сообщений={total_msgs}, сигналов={total_signals}, "
                 f"сценариев-запусков={total_scenarios}, задач создано={total_tasks_started}"
             )
@@ -137,7 +137,7 @@ async def _ensure_consumer_group(redis) -> None:
             id="$",
             mkstream=True,
         )
-        log.info(
+        log.debug(
             f"BT_SCENARIOS_MAIN: создана consumer group '{SCENARIO_CONSUMER_GROUP}' "
             f"для стрима '{SCENARIO_STREAM_KEY}'"
         )
@@ -145,7 +145,7 @@ async def _ensure_consumer_group(redis) -> None:
         # если группа уже существует — Redis вернёт ошибку BUSYGROUP, её игнорируем
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 f"BT_SCENARIOS_MAIN: consumer group '{SCENARIO_CONSUMER_GROUP}' "
                 f"для стрима '{SCENARIO_STREAM_KEY}' уже существует"
             )
@@ -243,7 +243,7 @@ async def _run_scenario_worker(
     from_time = signal_ctx.get("from_time")
     to_time = signal_ctx.get("to_time")
 
-    log.info(
+    log.debug(
         f"BT_SCENARIOS_MAIN: запуск сценарного воркера для scenario_id={scenario_id}, "
         f"key={scenario_key}, type={scenario_type}, signal_id={signal_id}, "
         f"окно=[{from_time} .. {to_time}]"
@@ -253,13 +253,13 @@ async def _run_scenario_worker(
     try:
         if scenario_key == "basic_straight_mono" and scenario_type == "straight":
             await run_basic_straight_mono_backfill(scenario, signal_ctx, pg, redis)
-            log.info(
+            log.debug(
                 f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} (basic_straight_mono) успешно отработал "
                 f"для signal_id={signal_id}, окно=[{from_time} .. {to_time}]"
             )
             return
 
-        log.info(
+        log.debug(
             f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} (key={scenario_key}, type={scenario_type}) "
             f"пока не поддерживается воркером сценариев"
         )
