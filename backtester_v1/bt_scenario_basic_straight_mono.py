@@ -131,6 +131,28 @@ async def run_basic_straight_mono_backfill(
             f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
             f"актуальных сигналов для обработки не найдено"
         )
+        # всё равно публикуем сообщение о готовности сценария, чтобы цепочка стримов была консистентной
+        finished_at = datetime.utcnow()
+        try:
+            await redis.xadd(
+                BT_SCENARIOS_READY_STREAM,
+                {
+                    "scenario_id": str(scenario_id),
+                    "signal_id": str(signal_id),
+                    "finished_at": finished_at.isoformat(),
+                },
+            )
+            log.info(
+                f"BT_SCENARIO_BASIC_MONO: опубликовано событие готовности сценария в стрим "
+                f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}, "
+                f"finished_at={finished_at}"
+            )
+        except Exception as e:
+            log.error(
+                f"BT_SCENARIO_BASIC_MONO: не удалось опубликовать событие в стрим "
+                f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}: {e}",
+                exc_info=True,
+            )
         return
 
     positions_to_insert: List[Tuple[Any, ...]] = []
@@ -143,9 +165,10 @@ async def run_basic_straight_mono_backfill(
     total_alive = 0
 
     # обрабатываем long и short как две независимые вселенные с одинаковым deposit
+    # и независимыми позициями в разрезе (scenario_id, signal_id, direction)
     for direction in ("long", "short"):
-        # существующие исторические позиции по этому направлению
-        existing_positions = await _load_existing_positions(pg, scenario_id, timeframe, direction)
+        # существующие исторические позиции по этому направлению и signal_id
+        existing_positions = await _load_existing_positions(pg, scenario_id, signal_id, timeframe, direction)
         new_positions: List[Dict[str, Any]] = []
 
         # фильтруем сигналы по направлению
@@ -185,7 +208,7 @@ async def run_basic_straight_mono_backfill(
                 total_skipped += 1
                 continue
 
-            # маржа, занятая активными позициями (ТОЛЬКО по этому направлению)
+            # маржа, занятая активными позициями (ТОЛЬКО по этому направлению и signal_id)
             used_margin_now = sum(p["margin_used"] for p in active_positions)
             free_margin = deposit - used_margin_now
 
@@ -523,10 +546,10 @@ async def run_basic_straight_mono_backfill(
         f"пропущено={total_skipped}, живых позиций={total_alive}"
     )
 
-    # пересчёт суточной статистики и общей статистики по сценарию
+    # пересчёт суточной статистики и общей статистики по сценарию+сигналу
     if positions_to_insert:
-        await _recalc_daily_stats(pg, scenario_id, deposit, affected_days)
-        await _recalc_total_stats(pg, scenario_id, deposit)
+        await _recalc_daily_stats(pg, scenario_id, signal_id, deposit, affected_days)
+        await _recalc_total_stats(pg, scenario_id, signal_id, deposit)
 
     # отправляем уведомление в Redis Stream о завершении обработки сценария
     finished_at = datetime.utcnow()
@@ -545,7 +568,6 @@ async def run_basic_straight_mono_backfill(
             f"finished_at={finished_at}"
         )
     except Exception as e:
-        # ошибки стрима не должны ломать основной сценарий
         log.error(
             f"BT_SCENARIO_BASIC_MONO: не удалось опубликовать событие в стрим "
             f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}: {e}",
@@ -609,10 +631,11 @@ async def _load_signals_for_scenario(
     return signals
 
 
-# 🔸 Загрузка всех существующих позиций сценария по TF/направлению
+# 🔸 Загрузка всех существующих позиций сценария+сигнала по TF/направлению
 async def _load_existing_positions(
     pg,
     scenario_id: int,
+    signal_id: int,
     timeframe: str,
     direction: str,
 ) -> List[Dict[str, Any]]:
@@ -622,11 +645,13 @@ async def _load_existing_positions(
             SELECT symbol, entry_time, exit_time, margin_used
             FROM bt_scenario_positions
             WHERE scenario_id = $1
-              AND timeframe = $2
-              AND direction = $3
+              AND signal_id   = $2
+              AND timeframe   = $3
+              AND direction   = $4
             ORDER BY entry_time
             """,
             scenario_id,
+            signal_id,
             timeframe,
             direction,
         )
@@ -644,7 +669,7 @@ async def _load_existing_positions(
 
     log.info(
         f"BT_SCENARIO_BASIC_MONO: загружены существующие позиции для scenario_id={scenario_id}, "
-        f"TF={timeframe}, direction={direction}: позиций={len(positions)}"
+        f"signal_id={signal_id}, TF={timeframe}, direction={direction}: позиций={len(positions)}"
     )
     return positions
 
@@ -679,7 +704,6 @@ def _calc_sl_tp_percent(
         sl_price = entry_price * (Decimal("1") - sl_percent / Decimal("100"))
         tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
     else:
-        # short
         sl_price = entry_price * (Decimal("1") + sl_percent / Decimal("100"))
         tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
 
@@ -722,7 +746,6 @@ async def _simulate_trade(
     if not rows:
         return None
 
-    # определяем фактическое движение в цене
     max_fav = Decimal("0")
     max_adv = Decimal("0")
 
@@ -749,7 +772,6 @@ async def _simulate_trade(
             touched_tp = high >= tp_price
 
             if touched_sl and touched_tp:
-                # консервативно считаем, что первым сработал SL
                 exit_time = otime
                 exit_price = sl_price
                 exit_reason = "sl_after_tp"
@@ -765,7 +787,6 @@ async def _simulate_trade(
                 exit_reason = "full_tp_hit"
                 break
         else:
-            # short
             fav_move = entry_price - low
             adv_move = entry_price - high
             if fav_move > max_fav:
@@ -796,7 +817,6 @@ async def _simulate_trade(
     if exit_time is None or exit_price is None or exit_reason is None:
         return None
 
-    # расчёт PnL и комиссии
     if direction == "long":
         raw_pnl = (exit_price - entry_price) * entry_qty
     else:
@@ -812,7 +832,6 @@ async def _simulate_trade(
 
     duration = exit_time - entry_time
 
-    # конвертируем MFE/MAE в проценты от цены входа
     if entry_price > Decimal("0"):
         max_fav_pct = (max_fav / entry_price) * Decimal("100")
         max_adv_pct = (max_adv / entry_price) * Decimal("100")
@@ -837,10 +856,11 @@ def _ohlcv_table_for_timeframe(timeframe: str) -> Optional[str]:
     return None
 
 
-# 🔸 Пересчёт суточной статистики по затронутым дням
+# 🔸 Пересчёт суточной статистики по затронутым дням (per scenario_id + signal_id + direction)
 async def _recalc_daily_stats(
     pg,
     scenario_id: int,
+    signal_id: int,
     deposit: Decimal,
     days: Set[date],
 ) -> None:
@@ -860,15 +880,16 @@ async def _recalc_daily_stats(
                         COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg
                     FROM bt_scenario_positions
                     WHERE scenario_id = $1
-                      AND entry_time::date = $2
-                      AND direction = $3
+                      AND signal_id   = $2
+                      AND entry_time::date = $3
+                      AND direction   = $4
                     """,
                     scenario_id,
+                    signal_id,
                     d,
                     direction,
                 )
 
-                # если по этому направлению в этот день нет сделок — пропускаем
                 if not row or row["trades"] == 0:
                     continue
 
@@ -878,7 +899,6 @@ async def _recalc_daily_stats(
                 mfe_avg = Decimal(str(row["mfe_avg"]))
                 mae_avg = Decimal(str(row["mae_avg"]))
 
-                # расчёт winrate и ROI
                 if trades > 0:
                     winrate = _q_money(Decimal(wins) / Decimal(trades))
                 else:
@@ -890,6 +910,7 @@ async def _recalc_daily_stats(
                     """
                     INSERT INTO bt_scenario_daily (
                         scenario_id,
+                        signal_id,
                         day,
                         direction,
                         trades,
@@ -902,13 +923,13 @@ async def _recalc_daily_stats(
                         created_at
                     )
                     VALUES (
-                        $1, $2, $3,
-                        $4, $5, $6, $7,
-                        $8, $9,
+                        $1, $2, $3, $4,
+                        $5, $6, $7, $8,
+                        $9, $10,
                         NULL,
                         now()
                     )
-                    ON CONFLICT (scenario_id, day, direction) DO UPDATE
+                    ON CONFLICT (scenario_id, signal_id, day, direction) DO UPDATE
                     SET
                         trades                      = EXCLUDED.trades,
                         pnl_abs                     = EXCLUDED.pnl_abs,
@@ -919,6 +940,7 @@ async def _recalc_daily_stats(
                         updated_at                  = now()
                     """,
                     scenario_id,
+                    signal_id,
                     d,
                     direction,
                     trades,
@@ -931,14 +953,15 @@ async def _recalc_daily_stats(
 
     log.info(
         f"BT_SCENARIO_BASIC_MONO: пересчитана суточная статистика для scenario_id={scenario_id}, "
-        f"дней={len(days)}"
+        f"signal_id={signal_id}, дней={len(days)}"
     )
 
 
-# 🔸 Пересчёт общей статистики по сценарию
+# 🔸 Пересчёт общей статистики по сценарию и сигналу
 async def _recalc_total_stats(
     pg,
     scenario_id: int,
+    signal_id: int,
     deposit: Decimal,
 ) -> None:
     async with pg.acquire() as conn:
@@ -953,13 +976,14 @@ async def _recalc_total_stats(
                     COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg
                 FROM bt_scenario_positions
                 WHERE scenario_id = $1
-                  AND direction = $2
+                  AND signal_id   = $2
+                  AND direction   = $3
                 """,
                 scenario_id,
+                signal_id,
                 direction,
             )
 
-            # если по этому направлению нет сделок — пропускаем
             if not row or row["trades"] == 0:
                 continue
 
@@ -969,7 +993,6 @@ async def _recalc_total_stats(
             mfe_avg = Decimal(str(row["mfe_avg"]))
             mae_avg = Decimal(str(row["mae_avg"]))
 
-            # расчёт winrate и ROI
             if trades > 0:
                 winrate = _q_money(Decimal(wins) / Decimal(trades))
             else:
@@ -981,6 +1004,7 @@ async def _recalc_total_stats(
                 """
                 INSERT INTO bt_scenario_stat (
                     scenario_id,
+                    signal_id,
                     direction,
                     trades,
                     pnl_abs,
@@ -992,13 +1016,13 @@ async def _recalc_total_stats(
                     created_at
                 )
                 VALUES (
-                    $1, $2,
-                    $3, $4, $5, $6,
-                    $7, $8,
+                    $1, $2, $3,
+                    $4, $5, $6, $7,
+                    $8, $9,
                     NULL,
                     now()
                 )
-                ON CONFLICT (scenario_id, direction) DO UPDATE
+                ON CONFLICT (scenario_id, signal_id, direction) DO UPDATE
                 SET
                     trades                      = EXCLUDED.trades,
                     pnl_abs                     = EXCLUDED.pnl_abs,
@@ -1009,6 +1033,7 @@ async def _recalc_total_stats(
                     updated_at                  = now()
                 """,
                 scenario_id,
+                signal_id,
                 direction,
                 trades,
                 _q_money(pnl_abs_total),
@@ -1019,5 +1044,6 @@ async def _recalc_total_stats(
             )
 
     log.info(
-        f"BT_SCENARIO_BASIC_MONO: пересчитана итоговая статистика для scenario_id={scenario_id}"
+        f"BT_SCENARIO_BASIC_MONO: пересчитана итоговая статистика для scenario_id={scenario_id}, "
+        f"signal_id={signal_id}"
     )
