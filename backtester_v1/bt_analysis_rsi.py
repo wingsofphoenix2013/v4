@@ -52,7 +52,7 @@ async def run_analysis_rsi(
     analysis_instances: List[Dict[str, Any]],
     pg,
 ) -> None:
-    log.debug(
+    log.info(
         "BT_ANALYSIS_RSI: старт анализа RSI для scenario_id=%s, signal_id=%s, инстансов=%s",
         scenario_id,
         signal_id,
@@ -60,7 +60,7 @@ async def run_analysis_rsi(
     )
 
     if not analysis_instances:
-        log.debug(
+        log.info(
             "BT_ANALYSIS_RSI: для scenario_id=%s, signal_id=%s нет инстансов анализа RSI",
             scenario_id,
             signal_id,
@@ -100,14 +100,14 @@ async def run_analysis_rsi(
         )
 
     if not rows:
-        log.debug(
+        log.info(
             "BT_ANALYSIS_RSI: для scenario_id=%s, signal_id=%s нет позиций с postproc=true",
             scenario_id,
             signal_id,
         )
         return
 
-    log.debug(
+    log.info(
         "BT_ANALYSIS_RSI: для scenario_id=%s, signal_id=%s загружено позиций=%s",
         scenario_id,
         signal_id,
@@ -123,7 +123,7 @@ async def run_analysis_rsi(
 
         # пока поддерживаем только rsi_value
         if family_key != "rsi" or key != "rsi_value":
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_RSI: inst_id=%s (family_key=%s, key=%s) пока не поддерживается",
                 inst_id,
                 family_key,
@@ -150,7 +150,7 @@ async def run_analysis_rsi(
 
         feature_name = f"rsi_value_{timeframe}_{source_key}"
 
-        log.debug(
+        log.info(
             "BT_ANALYSIS_RSI: inst_id=%s — старт расчёта feature_name=%s, timeframe=%s, source_key=%s",
             inst_id,
             feature_name,
@@ -224,7 +224,7 @@ async def run_analysis_rsi(
 
         # если по инстансу не набралось ни одного бина — пропускаем запись
         if not agg:
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s — нет данных для записи (agg пустой)",
                 inst_id,
                 feature_name,
@@ -327,7 +327,7 @@ async def run_analysis_rsi(
                     rows_to_insert,
                 )
 
-        log.debug(
+        log.info(
             "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s, timeframe=%s — бинов записано=%s",
             inst_id,
             feature_name,
@@ -335,7 +335,7 @@ async def run_analysis_rsi(
             len(rows_to_insert),
         )
 
-    log.debug(
+    log.info(
         "BT_ANALYSIS_RSI: анализ RSI завершён для scenario_id=%s, signal_id=%s",
         scenario_id,
         signal_id,

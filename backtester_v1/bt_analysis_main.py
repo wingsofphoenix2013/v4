@@ -27,7 +27,7 @@ log = logging.getLogger("BT_ANALYSIS_MAIN")
 
 # 🔸 Публичная точка входа: оркестратор анализа фич
 async def run_bt_analysis_orchestrator(pg, redis):
-    log.debug("BT_ANALYSIS_MAIN: оркестратор анализа запущен")
+    log.info("BT_ANALYSIS_MAIN: оркестратор анализа запущен")
 
     # подготавливаем consumer group для стрима bt:postproc:ready
     await _ensure_consumer_group(redis)
@@ -61,7 +61,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     scenario_id = ctx["scenario_id"]
                     signal_id = ctx["signal_id"]
 
-                    log.debug(
+                    log.info(
                         "BT_ANALYSIS_MAIN: получено сообщение о готовности постпроцессинга "
                         "scenario_id=%s, signal_id=%s, finished_at=%s, stream_id=%s",
                         scenario_id,
@@ -77,7 +77,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     )
 
                     if not analysis_instances:
-                        log.debug(
+                        log.info(
                             "BT_ANALYSIS_MAIN: для scenario_id=%s, signal_id=%s нет включённых анализаторов, "
                             "сообщение %s помечено как обработанное",
                             scenario_id,
@@ -115,7 +115,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     # помечаем сообщение как обработанное
                     await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
 
-                    log.debug(
+                    log.info(
                         "BT_ANALYSIS_MAIN: сообщение stream_id=%s для scenario_id=%s, signal_id=%s "
                         "обработано, семей анализаторов запущено=%s",
                         entry_id,
@@ -124,7 +124,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                         started_for_message,
                     )
 
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_MAIN: пакет сообщений обработан — сообщений=%s, семей_запусков=%s, "
                 "инстансов_анализаторов=%s",
                 total_msgs,
@@ -152,7 +152,7 @@ async def _ensure_consumer_group(redis) -> None:
             id="$",
             mkstream=True,
         )
-        log.debug(
+        log.info(
             "BT_ANALYSIS_MAIN: создана consumer group '%s' для стрима '%s'",
             ANALYSIS_CONSUMER_GROUP,
             ANALYSIS_STREAM_KEY,
@@ -160,7 +160,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_MAIN: consumer group '%s' для стрима '%s' уже существует",
                 ANALYSIS_CONSUMER_GROUP,
                 ANALYSIS_STREAM_KEY,
@@ -270,7 +270,7 @@ async def _run_family_worker(
     signal_id: int,
     pg,
 ) -> None:
-    log.debug(
+    log.info(
         "BT_ANALYSIS_MAIN: запуск семейного воркера для family_key=%s, "
         "scenario_id=%s, signal_id=%s, инстансов=%s",
         family_key,
@@ -287,7 +287,7 @@ async def _run_family_worker(
                 analysis_instances=instances,
                 pg=pg,
             )
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_MAIN: family_key=%s успешно отработал для scenario_id=%s, signal_id=%s",
                 family_key,
                 scenario_id,
@@ -295,7 +295,7 @@ async def _run_family_worker(
             )
             return
 
-        log.debug(
+        log.info(
             "BT_ANALYSIS_MAIN: family_key=%s пока не поддерживается воркером анализа "
             "(scenario_id=%s, signal_id=%s)",
             family_key,
