@@ -26,8 +26,8 @@ from bt_scenarios_main import run_bt_scenarios_orchestrator
 # 🔸 Постпроцессор сценариев
 from bt_scenarios_postproc import run_bt_scenarios_postproc
 
-# 🔸 Оркестратор аналитики сценариев (будущий модуль анализа фич)
-# from bt_analysis_main import run_bt_analysis_orchestrator
+# 🔸 Оркестратор аналитики сценариев (анализ фич по bt:postproc:ready)
+from bt_analysis_main import run_bt_analysis_orchestrator
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -89,7 +89,7 @@ async def main():
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
-        # run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
+        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
     )
 
 
