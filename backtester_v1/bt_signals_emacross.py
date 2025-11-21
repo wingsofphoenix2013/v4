@@ -5,7 +5,7 @@ import logging
 import uuid
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 # 🔸 Кеши backtester_v1
 from backtester_config import get_all_ticker_symbols, get_ticker_info
@@ -50,6 +50,21 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         return
 
+    # маска направлений: 'long' / 'short' / 'both' (по умолчанию both)
+    dir_mask_cfg = params.get("direction_mask")
+    if dir_mask_cfg:
+        mask_val_raw = dir_mask_cfg.get("value") or ""
+        mask_val = str(mask_val_raw).strip().lower()
+    else:
+        mask_val = "both"
+
+    if mask_val == "long":
+        allowed_directions: Set[str] = {"long"}
+    elif mask_val == "short":
+        allowed_directions = {"short"}
+    else:
+        allowed_directions = {"long", "short"}
+
     # рабочее окно по времени
     now = datetime.utcnow()
     from_time = now - timedelta(days=backfill_days)
@@ -63,7 +78,8 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.info(
         f"BT_SIG_EMA_CROSS: старт backfill для сигнала id={signal_id} ('{name}', key={signal_key}), "
-        f"TF={timeframe}, окно={backfill_days} дней, тикеров={len(symbols)}"
+        f"TF={timeframe}, окно={backfill_days} дней, тикеров={len(symbols)}, "
+        f"direction_mask={mask_val}"
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -86,6 +102,7 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 existing_events=existing_events,
                 pg=pg,
                 sema=sema,
+                allowed_directions=allowed_directions,
             )
         )
 
@@ -105,7 +122,8 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.info(
         f"BT_SIG_EMA_CROSS: backfill завершён для сигнала id={signal_id} ('{name}'): "
-        f"вставлено событий={total_inserted}, long={total_long}, short={total_short}"
+        f"вставлено событий={total_inserted}, long={total_long}, short={total_short}, "
+        f"direction_mask={mask_val}"
     )
 
     # отправляем уведомление в Redis Stream о готовности сигналов
@@ -180,6 +198,7 @@ async def _process_symbol(
     existing_events: set[Tuple[str, datetime, str]],
     pg,
     sema: asyncio.Semaphore,
+    allowed_directions: Set[str],
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
@@ -195,6 +214,7 @@ async def _process_symbol(
                 to_time,
                 existing_events,
                 pg,
+                allowed_directions,
             )
         except Exception as e:
             log.error(
@@ -217,6 +237,7 @@ async def _process_symbol_inner(
     to_time: datetime,
     existing_events: set[Tuple[str, datetime, str]],
     pg,
+    allowed_directions: Set[str],
 ) -> Tuple[int, int, int]:
     # загружаем серии EMA для fast и slow
     fast_series = await _load_ema_series(pg, fast_instance_id, symbol, from_time, to_time)
@@ -266,13 +287,21 @@ async def _process_symbol_inner(
             continue
 
         if state != prev_state:
-            # фиксируем кросс
+            # фиксируем кросс с учётом смены состояния
             if prev_state == "below" and state == "above":
                 direction = "long"
-                candidates.append((ts, direction))
             elif prev_state == "above" and state == "below":
                 direction = "short"
-                candidates.append((ts, direction))
+            else:
+                prev_state = state
+                continue
+
+            # фильтр по маске направлений
+            if direction not in allowed_directions:
+                prev_state = state
+                continue
+
+            candidates.append((ts, direction))
             prev_state = state
 
     if not candidates:
