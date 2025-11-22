@@ -13,12 +13,15 @@ from backtester_config import (
 # 🔸 Воркеры семей анализаторов
 from bt_analysis_rsi import run_analysis_rsi
 
-# 🔸 Константы стрима анализа
+# 🔸 Константы стримов анализа
 ANALYSIS_STREAM_KEY = "bt:postproc:ready"
 ANALYSIS_CONSUMER_GROUP = "bt_analysis"
 ANALYSIS_CONSUMER_NAME = "bt_analysis_main"
 
-# 🔸 Настройки чтения стрима
+# 🔸 Стрим готовности анализа (после всех анализаторов семьи)
+ANALYSIS_READY_STREAM_KEY = "bt:analysis:ready"
+
+# 🔸 Настройки чтения стрима bt:postproc:ready
 ANALYSIS_STREAM_BATCH_SIZE = 10      # сколько сообщений читаем за один заход
 ANALYSIS_STREAM_BLOCK_MS = 5000      # блокировка чтения (мс)
 
@@ -77,7 +80,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     )
 
                     if not analysis_instances:
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_MAIN: для scenario_id=%s, signal_id=%s нет включённых анализаторов, "
                             "сообщение %s помечено как обработанное",
                             scenario_id,
@@ -105,6 +108,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                                 scenario_id=scenario_id,
                                 signal_id=signal_id,
                                 pg=pg,
+                                redis=redis,
                             ),
                             name=f"BT_ANALYSIS_{family_key.upper()}_SC{scenario_id}_SIG{signal_id}",
                         )
@@ -152,7 +156,7 @@ async def _ensure_consumer_group(redis) -> None:
             id="$",
             mkstream=True,
         )
-        log.info(
+        log.debug(
             "BT_ANALYSIS_MAIN: создана consumer group '%s' для стрима '%s'",
             ANALYSIS_CONSUMER_GROUP,
             ANALYSIS_STREAM_KEY,
@@ -269,6 +273,7 @@ async def _run_family_worker(
     scenario_id: int,
     signal_id: int,
     pg,
+    redis,
 ) -> None:
     log.info(
         "BT_ANALYSIS_MAIN: запуск семейного воркера для family_key=%s, "
@@ -287,6 +292,43 @@ async def _run_family_worker(
                 analysis_instances=instances,
                 pg=pg,
             )
+
+            # все RSI-анализаторы по этой паре завершили работу — публикуем событие
+            finished_at = datetime.utcnow()
+            analysis_ids = [str(inst.get("id")) for inst in instances if inst.get("id") is not None]
+
+            try:
+                await redis.xadd(
+                    ANALYSIS_READY_STREAM_KEY,
+                    {
+                        "scenario_id": str(scenario_id),
+                        "signal_id": str(signal_id),
+                        "family_key": str(family_key),
+                        "analysis_ids": ",".join(analysis_ids),
+                        "finished_at": finished_at.isoformat(),
+                    },
+                )
+                log.info(
+                    "BT_ANALYSIS_MAIN: опубликовано событие готовности анализа в стрим '%s' "
+                    "для scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s",
+                    ANALYSIS_READY_STREAM_KEY,
+                    scenario_id,
+                    signal_id,
+                    family_key,
+                    analysis_ids,
+                )
+            except Exception as e:
+                log.error(
+                    "BT_ANALYSIS_MAIN: не удалось опубликовать событие в стрим '%s' "
+                    "для scenario_id=%s, signal_id=%s, family=%s: %s",
+                    ANALYSIS_READY_STREAM_KEY,
+                    scenario_id,
+                    signal_id,
+                    family_key,
+                    e,
+                    exc_info=True,
+                )
+
             log.info(
                 "BT_ANALYSIS_MAIN: family_key=%s успешно отработал для scenario_id=%s, signal_id=%s",
                 family_key,
@@ -295,7 +337,7 @@ async def _run_family_worker(
             )
             return
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_MAIN: family_key=%s пока не поддерживается воркером анализа "
             "(scenario_id=%s, signal_id=%s)",
             family_key,
