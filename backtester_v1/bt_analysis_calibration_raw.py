@@ -310,19 +310,21 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                     signal_id = ctx["signal_id"]
                     family_key = ctx["family_key"]
                     analysis_ids = ctx["analysis_ids"]
+                    version = ctx["version"]
 
                     log.info(
                         "BT_ANALYSIS_CALIB_RAW: получено сообщение о готовности анализа "
-                        "scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s, stream_id=%s",
+                        "scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
                         signal_id,
                         family_key,
+                        version,
                         analysis_ids,
                         entry_id,
                     )
 
-                    # пока работаем только с RSI
-                    if family_key != "rsi" or not analysis_ids:
+                    # пока работаем только с RSI и только для v1
+                    if family_key != "rsi" or not analysis_ids or version != "v1":
                         await redis.xack(ANALYSIS_READY_STREAM_KEY, CALIB_CONSUMER_GROUP, entry_id)
                         continue
 
@@ -476,6 +478,7 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         family_key = fields.get("family_key")
         analysis_ids_str = fields.get("analysis_ids") or ""
         finished_at_str = fields.get("finished_at")
+        version = fields.get("version") or "v1"  # <-- добавили
 
         if not (scenario_id_str and signal_id_str and family_key and finished_at_str):
             return None
@@ -497,6 +500,7 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
             "signal_id": signal_id,
             "family_key": family_key,
             "analysis_ids": analysis_ids,
+            "version": version,
             "finished_at": finished_at,
         }
     except Exception as e:
