@@ -26,7 +26,7 @@ from bt_scenarios_main import run_bt_scenarios_orchestrator
 # 🔸 Постпроцессор сценариев
 from bt_scenarios_postproc import run_bt_scenarios_postproc
 
-# 🔸 Оркестратор аналитики сценариев (анализ фич по bt:postproc:ready)
+# 🔸 Оркестратор аналитики сценариев (анализ фич по bt:postproc:ready) — v1
 from bt_analysis_main import run_bt_analysis_orchestrator
 
 # 🔸 Пост-процессор аналитики (оценка силы анализаторов по bt:analysis:ready)
@@ -34,6 +34,12 @@ from bt_analysis_postproc import run_bt_analysis_postproc
 
 # 🔸 Калибровочный воркер (сырые значения фич по bt:analysis:ready)
 from bt_analysis_calibration_raw import run_bt_analysis_calibration_raw
+
+# 🔸 Постпроцессор калибровки (бин-конфиги по bt:analysis:calibration:ready)
+from bt_analysis_calibration_processor import run_bt_analysis_calibration_processor
+
+# 🔸 Адаптивный анализатор RSI (слушает bt:analysis:adaptive:ready, пишет v2)
+from bt_analysis_rsi_adaptive import run_bt_analysis_rsi_adaptive_worker
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -95,9 +101,11 @@ async def main():
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
-        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
-        run_safe_loop(lambda: run_bt_analysis_postproc(pg, redis), "BT_ANALYSIS_POSTPROC"),
-        run_safe_loop(lambda: run_bt_analysis_calibration_raw(pg, redis), "BT_ANALYSIS_CALIB_RAW"),
+        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),              # v1 бины
+        run_safe_loop(lambda: run_bt_analysis_postproc(pg, redis), "BT_ANALYSIS_POSTPROC"),         # v1/v2 postproc
+        run_safe_loop(lambda: run_bt_analysis_calibration_raw(pg, redis), "BT_ANALYSIS_CALIB_RAW"), # сырые фичи
+        run_safe_loop(lambda: run_bt_analysis_calibration_processor(pg, redis), "BT_ANALYSIS_CALIB_PROC"),  # бин-конфиги
+        run_safe_loop(lambda: run_bt_analysis_rsi_adaptive_worker(pg, redis), "BT_ANALYSIS_RSI_ADAPTIVE"),  # v2 бины
     )
 
 

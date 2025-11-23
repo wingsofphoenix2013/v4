@@ -16,8 +16,9 @@ getcontext().prec = 28
 
 log = logging.getLogger("BT_ANALYSIS_CALIB_RAW")
 
-# 🔸 Константы стрима готовности анализа
+# 🔸 Константы стримов анализа
 ANALYSIS_READY_STREAM_KEY = "bt:analysis:ready"
+CALIB_READY_STREAM_KEY = "bt:analysis:calibration:ready"
 CALIB_CONSUMER_GROUP = "bt_analysis_calib_raw"
 CALIB_CONSUMER_NAME = "bt_analysis_calib_raw_main"
 
@@ -274,7 +275,6 @@ def _bin_bars_since_level(bars: int) -> str:
         return "Old"
     return "VeryOld"
 
-
 # 🔸 Публичная точка входа: воркер калибровки сырых фич
 async def run_bt_analysis_calibration_raw(pg, redis):
     log.info("BT_ANALYSIS_CALIB_RAW: воркер калибровки сырых фич запущен")
@@ -336,6 +336,43 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                     total_pairs += 1
                     total_rows_written += rows_written
 
+                    # 🔸 Публикуем событие готовности калибровки в bt:analysis:calibration:ready
+                    finished_at = datetime.utcnow()
+                    try:
+                        await redis.xadd(
+                            CALIB_READY_STREAM_KEY,
+                            {
+                                "scenario_id": str(scenario_id),
+                                "signal_id": str(signal_id),
+                                "family_key": str(family_key),
+                                "analysis_ids": ",".join(str(a) for a in analysis_ids),
+                                "rows_written": str(rows_written),
+                                "finished_at": finished_at.isoformat(),
+                            },
+                        )
+                        log.info(
+                            "BT_ANALYSIS_CALIB_RAW: опубликовано событие в '%s' для scenario_id=%s, signal_id=%s, "
+                            "family=%s, analysis_ids=%s, rows_written=%s, finished_at=%s",
+                            CALIB_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            family_key,
+                            analysis_ids,
+                            rows_written,
+                            finished_at,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "BT_ANALYSIS_CALIB_RAW: не удалось опубликовать событие в стрим '%s' "
+                            "для scenario_id=%s, signal_id=%s, family=%s: %s",
+                            CALIB_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            family_key,
+                            e,
+                            exc_info=True,
+                        )
+
                     await redis.xack(ANALYSIS_READY_STREAM_KEY, CALIB_CONSUMER_GROUP, entry_id)
 
                     log.info(
@@ -362,7 +399,6 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                 exc_info=True,
             )
             await asyncio.sleep(2)
-
 
 # 🔸 Проверка/создание consumer group для стрима bt:analysis:ready
 async def _ensure_consumer_group(redis) -> None:

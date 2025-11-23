@@ -77,13 +77,15 @@ async def run_bt_analysis_postproc(pg, redis):
                     signal_id = ctx["signal_id"]
                     family_key = ctx["family_key"]
                     analysis_ids = ctx["analysis_ids"]
+                    version = ctx["version"]
 
                     log.info(
                         "BT_ANALYSIS_POSTPROC: получено сообщение о готовности анализа "
-                        "scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s, stream_id=%s",
+                        "scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
                         signal_id,
                         family_key,
+                        version,
                         analysis_ids,
                         entry_id,
                     )
@@ -110,13 +112,14 @@ async def run_bt_analysis_postproc(pg, redis):
                         await redis.xack(ANALYSIS_READY_STREAM_KEY, ANALYSIS_POSTPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # выполняем пост-анализ для связки scenario+signal по всем указанным анализаторам семьи
+                    # выполняем пост-анализ для связки scenario+signal по всем указанным анализаторам семьи и версии
                     stats_written = await _process_analysis_family(
                         pg=pg,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         family_key=family_key,
                         analysis_ids=analysis_ids,
+                        version=version,
                     )
                     total_pairs += 1
                     total_stats_written += stats_written
@@ -125,11 +128,12 @@ async def run_bt_analysis_postproc(pg, redis):
                     await redis.xack(ANALYSIS_READY_STREAM_KEY, ANALYSIS_POSTPROC_CONSUMER_GROUP, entry_id)
 
                     log.info(
-                        "BT_ANALYSIS_POSTPROC: сообщение stream_id=%s для scenario_id=%s, signal_id=%s "
+                        "BT_ANALYSIS_POSTPROC: сообщение stream_id=%s для scenario_id=%s, signal_id=%s, version=%s "
                         "обработано, записано строк в bt_analysis_stat=%s",
                         entry_id,
                         scenario_id,
                         signal_id,
+                        version,
                         stats_written,
                     )
 
@@ -227,6 +231,8 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         family_key = fields.get("family_key")
         analysis_ids_str = fields.get("analysis_ids") or ""
         finished_at_str = fields.get("finished_at")
+        # если версия не передана (старый v1-пайплайн) — считаем версию v1
+        version = fields.get("version") or "v1"
 
         if not (scenario_id_str and signal_id_str and family_key and finished_at_str):
             return None
@@ -249,6 +255,7 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
             "signal_id": signal_id,
             "family_key": family_key,
             "analysis_ids": analysis_ids,
+            "version": version,
             "finished_at": finished_at,
         }
     except Exception as e:
@@ -268,6 +275,7 @@ async def _process_analysis_family(
     signal_id: int,
     family_key: str,
     analysis_ids: List[int],
+    version: str,
 ) -> int:
     stats_written = 0
 
@@ -306,7 +314,7 @@ async def _process_analysis_family(
     if not base_by_dir:
         return 0
 
-    # 🔸 Полная очистка старых записей для этой связки и этих анализаторов
+    # 🔸 Полная очистка старых записей для этой связки/версии и этих анализаторов
     async with pg.acquire() as conn:
         await conn.execute(
             """
@@ -314,10 +322,12 @@ async def _process_analysis_family(
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND analysis_id = ANY($3::int[])
+              AND version     = $4
             """,
             scenario_id,
             signal_id,
             analysis_ids,
+            version,
         )
 
     # обрабатываем каждый анализатор по каждому направлению отдельно
@@ -351,12 +361,13 @@ async def _process_analysis_family(
 
         log.info(
             "BT_ANALYSIS_POSTPROC: анализ postproc для analysis_id=%s, family=%s, key=%s, "
-            "feature_name=%s, timeframe=%s, scenario_id=%s, signal_id=%s",
+            "feature_name=%s, timeframe=%s, version=%s, scenario_id=%s, signal_id=%s",
             aid,
             family_key,
             key,
             feature_name,
             timeframe,
+            version,
             scenario_id,
             signal_id,
         )
@@ -370,7 +381,7 @@ async def _process_analysis_family(
             if base_trades <= 0:
                 continue
 
-            # загружаем все бины для этой фичи/TF/направления
+            # загружаем все бины для этой фичи/TF/направления/версии
             async with pg.acquire() as conn:
                 bin_rows = await conn.fetch(
                     """
@@ -381,12 +392,14 @@ async def _process_analysis_family(
                       AND direction    = $3
                       AND timeframe    = $4
                       AND feature_name = $5
+                      AND version      = $6
                     """,
                     scenario_id,
                     signal_id,
                     direction,
                     timeframe,
                     feature_name,
+                    version,
                 )
 
             if not bin_rows:
@@ -421,11 +434,12 @@ async def _process_analysis_family(
             if coverage < MIN_COVERAGE:
                 # фильтр слишком узкий — мало сделок
                 log.debug(
-                    "BT_ANALYSIS_POSTPROC: analysis_id=%s, feature=%s, direction=%s — coverage=%.4f < %.4f "
-                    "(selected_trades=%s, base_trades=%s)",
+                    "BT_ANALYSIS_POSTPROC: analysis_id=%s, feature=%s, direction=%s, version=%s — "
+                    "coverage=%.4f < %.4f (selected_trades=%s, base_trades=%s)",
                     aid,
                     feature_name,
                     direction,
+                    version,
                     float(coverage),
                     float(MIN_COVERAGE),
                     selected_trades,
@@ -452,12 +466,14 @@ async def _process_analysis_family(
                         base_winrate,
                         selected_trades,
                         selected_winrate,
+                        version,
                         created_at,
                         updated_at
                     )
                     VALUES (
                         $1, $2, $3, $4, $5,
                         $6, $7, $8, $9, $10, $11,
+                        $12,
                         now(), NULL
                     )
                     """,
@@ -472,19 +488,21 @@ async def _process_analysis_family(
                     _q4(base_winrate),
                     selected_trades,
                     _q4(selected_winrate),
+                    version,
                 )
 
             stats_written += 1
 
             log.info(
                 "BT_ANALYSIS_POSTPROC: записана строка в bt_analysis_stat: "
-                "scenario_id=%s, signal_id=%s, analysis_id=%s, direction=%s, timeframe=%s, "
+                "scenario_id=%s, signal_id=%s, analysis_id=%s, direction=%s, timeframe=%s, version=%s, "
                 "base_trades=%s, base_winrate=%.4f, selected_trades=%s, selected_winrate=%.4f, coverage=%.4f",
                 scenario_id,
                 signal_id,
                 aid,
                 direction,
                 timeframe,
+                version,
                 base_trades,
                 float(base_winrate),
                 selected_trades,
