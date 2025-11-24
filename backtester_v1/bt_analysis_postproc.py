@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional
 
-# 🔸 Кеши backtester_v1 (анализаторы)
+# 🔸 Кеши backtester_v1 (анализаторы и сценарии)
 from backtester_config import get_analysis_instance, get_scenario_instance
 
 # 🔸 Настройки Decimal
@@ -14,8 +14,9 @@ getcontext().prec = 28
 
 log = logging.getLogger("BT_ANALYSIS_POSTPROC")
 
-# 🔸 Константы стрима готовности анализа
+# 🔸 Константы стримов готовности анализа
 ANALYSIS_READY_STREAM_KEY = "bt:analysis:ready"
+ANALYSIS_POSTPROC_READY_STREAM_KEY = "bt:analysis:postproc:ready"
 ANALYSIS_POSTPROC_CONSUMER_GROUP = "bt_analysis_postproc"
 ANALYSIS_POSTPROC_CONSUMER_NAME = "bt_analysis_postproc_main"
 
@@ -123,6 +124,47 @@ async def run_bt_analysis_postproc(pg, redis):
                     )
                     total_pairs += 1
                     total_stats_written += stats_written
+
+                    # публикуем событие о завершении пост-анализа в bt:analysis:postproc:ready
+                    finished_at_postproc = datetime.utcnow()
+                    try:
+                        await redis.xadd(
+                            ANALYSIS_POSTPROC_READY_STREAM_KEY,
+                            {
+                                "scenario_id": str(scenario_id),
+                                "signal_id": str(signal_id),
+                                "family_key": str(family_key),
+                                "analysis_ids": ",".join(str(a) for a in analysis_ids),
+                                "version": str(version),
+                                "stats_written": str(stats_written),
+                                "finished_at": finished_at_postproc.isoformat(),
+                            },
+                        )
+                        log.info(
+                            "BT_ANALYSIS_POSTPROC: опубликовано событие готовности пост-анализа в стрим '%s' "
+                            "для scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, "
+                            "stats_written=%s, finished_at=%s",
+                            ANALYSIS_POSTPROC_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            family_key,
+                            version,
+                            analysis_ids,
+                            stats_written,
+                            finished_at_postproc,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "BT_ANALYSIS_POSTPROC: не удалось опубликовать событие в стрим '%s' "
+                            "для scenario_id=%s, signal_id=%s, family=%s, version=%s: %s",
+                            ANALYSIS_POSTPROC_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            family_key,
+                            version,
+                            e,
+                            exc_info=True,
+                        )
 
                     # помечаем сообщение как обработанное
                     await redis.xack(ANALYSIS_READY_STREAM_KEY, ANALYSIS_POSTPROC_CONSUMER_GROUP, entry_id)

@@ -19,27 +19,23 @@ from backtester_config import (
 
 # 🔸 Оркестратор псевдо-сигналов
 from bt_signals_main import run_bt_signals_orchestrator
-
 # 🔸 Оркестратор сценариев
 from bt_scenarios_main import run_bt_scenarios_orchestrator
-
 # 🔸 Постпроцессор сценариев
 from bt_scenarios_postproc import run_bt_scenarios_postproc
 
 # 🔸 Оркестратор аналитики сценариев (анализ фич по bt:postproc:ready) — v1
 from bt_analysis_main import run_bt_analysis_orchestrator
-
 # 🔸 Пост-процессор аналитики (оценка силы анализаторов по bt:analysis:ready)
 from bt_analysis_postproc import run_bt_analysis_postproc
-
 # 🔸 Калибровочный воркер (сырые значения фич по bt:analysis:ready)
 from bt_analysis_calibration_raw import run_bt_analysis_calibration_raw
-
 # 🔸 Постпроцессор калибровки (бин-конфиги по bt:analysis:calibration:ready)
 from bt_analysis_calibration_processor import run_bt_analysis_calibration_processor
-
 # 🔸 Адаптивный анализатор RSI (слушает bt:analysis:adaptive:ready, пишет v2)
 from bt_analysis_rsi_adaptive import run_bt_analysis_rsi_adaptive_worker
+# 🔸 Суточная аналитика анализаторов (слушает bt:analysis:postproc:ready)
+from bt_analysis_daily import run_bt_analysis_daily
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -106,6 +102,7 @@ async def main():
         run_safe_loop(lambda: run_bt_analysis_calibration_raw(pg, redis), "BT_ANALYSIS_CALIB_RAW"), # сырые фичи
         run_safe_loop(lambda: run_bt_analysis_calibration_processor(pg, redis), "BT_ANALYSIS_CALIB_PROC"),  # бин-конфиги
         run_safe_loop(lambda: run_bt_analysis_rsi_adaptive_worker(pg, redis), "BT_ANALYSIS_RSI_ADAPTIVE"),  # v2 бины
+        run_safe_loop(lambda: run_bt_analysis_daily(pg, redis), "BT_ANALYSIS_DAILY"),               # суточная аналитика
     )
 
 
