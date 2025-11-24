@@ -507,8 +507,8 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                         entry_id,
                     )
 
-                    # пока работаем только с RSI и только для v1
-                    if family_key != "rsi" or not analysis_ids or version != "v1":
+                    # калибровку делаем для v1 и для любых семейств (rsi, atr, ...)
+                    if version != "v1" or not analysis_ids:
                         await redis.xack(ANALYSIS_READY_STREAM_KEY, CALIB_CONSUMER_GROUP, entry_id)
                         continue
 
