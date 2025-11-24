@@ -317,6 +317,147 @@ def _find_rsi_value_bin_label(value: float) -> Optional[str]:
             return label
     return None
 
+# 🔸 Извлечение значения ATR из raw_stat с учётом TF и source_key (например atr14)
+def _extract_atr_value(
+    raw_stat: Any,
+    timeframe: str,
+    source_key: str,
+) -> Optional[float]:
+    # если raw_stat пришёл как JSON-строка — разбираем
+    if isinstance(raw_stat, str):
+        try:
+            raw_stat = json.loads(raw_stat)
+        except Exception:
+            return None
+
+    if not isinstance(raw_stat, dict):
+        return None
+
+    tf_map = raw_stat.get("tf")
+    if not isinstance(tf_map, dict):
+        return None
+
+    tf_lower: Dict[str, Any] = {str(k).lower(): v for k, v in tf_map.items()}
+    tf_block = tf_lower.get(timeframe.lower())
+    if not isinstance(tf_block, dict):
+        return None
+
+    indicators = tf_block.get("indicators")
+    if not isinstance(indicators, dict):
+        return None
+
+    indicators_lower: Dict[str, Any] = {str(k).lower(): v for k, v in indicators.items()}
+    atr_block_raw = indicators_lower.get("atr")
+    if not isinstance(atr_block_raw, dict):
+        return None
+
+    atr_block: Dict[str, Any] = {str(k).lower(): v for k, v in atr_block_raw.items()}
+    atr_val_raw = atr_block.get(source_key.lower())
+    if atr_val_raw is None:
+        return None
+
+    try:
+        return float(atr_val_raw)
+    except Exception:
+        return None
+
+
+# 🔸 Поиск instance_id для ATR по timeframe и source_key (atr14 → length=14)
+def _resolve_atr_instance_id(timeframe: str, source_key: str) -> Optional[int]:
+    all_instances = get_all_indicator_instances()
+    length = None
+
+    try:
+        if source_key.lower().startswith("atr"):
+            length = int(source_key[3:])
+    except Exception:
+        length = None
+
+    if length is None:
+        return None
+
+    for iid, inst in all_instances.items():
+        indicator = (inst.get("indicator") or "").lower()
+        tf = (inst.get("timeframe") or "").lower()
+        if indicator != "atr" or tf != timeframe.lower():
+            continue
+        params = inst.get("params") or {}
+        length_raw = params.get("length")
+        try:
+            length_inst = int(str(length_raw))
+        except Exception:
+            continue
+        if length_inst == length:
+            return iid
+
+    return None
+
+
+# 🔸 Загрузка исторического ряда ATR по instance_id для всех символов
+async def _load_atr_history_for_positions(
+    pg,
+    instance_id: int,
+    timeframe: str,
+    positions: List[Dict[str, Any]],
+    window_bars: int,
+) -> Dict[str, List[Tuple[Any, float]]]:
+    if window_bars <= 0:
+        window_bars = 1
+
+    step_min = TF_STEP_MINUTES.get(timeframe)
+    if not step_min:
+        step_min = 5
+
+    by_symbol: Dict[str, List[Any]] = defaultdict(list)
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        by_symbol[symbol].append(entry_time)
+
+    result: Dict[str, List[Tuple[Any, float]]] = {}
+
+    async with pg.acquire() as conn:
+        for symbol, times in by_symbol.items():
+            if not times:
+                continue
+
+            min_entry = min(times)
+            max_entry = max(times)
+
+            # запас по времени назад — window_bars баров
+            delta = timedelta(minutes=step_min * window_bars)
+            from_time = min_entry - delta
+            to_time = max_entry
+
+            rows = await conn.fetch(
+                """
+                SELECT open_time, value
+                FROM indicator_values_v4
+                WHERE instance_id = $1
+                  AND symbol      = $2
+                  AND open_time  BETWEEN $3 AND $4
+                ORDER BY open_time
+                """,
+                instance_id,
+                symbol,
+                from_time,
+                to_time,
+            )
+
+            if not rows:
+                continue
+
+            series: List[Tuple[Any, float]] = []
+            for r in rows:
+                try:
+                    series.append((r["open_time"], float(r["value"])))
+                except Exception:
+                    continue
+
+            if series:
+                result[symbol] = series
+
+    return result
 
 # 🔸 Публичная точка входа: воркер калибровки сырых фич
 async def run_bt_analysis_calibration_raw(pg, redis):
@@ -556,7 +697,6 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         )
         return None
 
-
 # 🔸 Обработка одного семейства анализаторов для пары scenario_id/signal_id
 async def _process_family_raw(
     pg,
@@ -575,6 +715,7 @@ async def _process_family_raw(
                 direction,
                 timeframe,
                 entry_time,
+                entry_price,
                 raw_stat,
                 pnl_abs
             FROM bt_scenario_positions
@@ -603,6 +744,7 @@ async def _process_family_raw(
                 "direction": r["direction"],
                 "timeframe": r["timeframe"],
                 "entry_time": r["entry_time"],
+                "entry_price": r["entry_price"],
                 "raw_stat": r["raw_stat"],
                 "pnl_abs": r["pnl_abs"],
             }
@@ -624,77 +766,140 @@ async def _process_family_raw(
 
     total_rows_written = 0
 
-    # загружаем историю RSI один раз для всех history-based фич по каждому (timeframe, source_key)
-    history_needed: Dict[Tuple[str, str], Dict[str, Any]] = {}
-
-    for aid in analysis_ids:
-        inst = get_analysis_instance(aid)
-        if not inst:
-            continue
-        if inst.get("family_key") != "rsi":
-            continue
-
-        key = inst.get("key")
-        params = inst.get("params") or {}
-        tf_cfg = params.get("timeframe")
-        source_cfg = params.get("source_key")
-
-        timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
-
-        if key in (
-            "rsi_zone_duration",
-            "rsi_slope",
-            "rsi_accel",
-            "rsi_volatility",
-            "rsi_avg_window",
-            "rsi_since_cross_30",
-            "rsi_since_cross_50",
-            "rsi_since_cross_70",
-            "rsi_vs_ma",
-            "rsi_extremum",
-        ):
-            cfg_key = (timeframe, source_key)
-            if cfg_key not in history_needed:
-                history_needed[cfg_key] = {
-                    "timeframe": timeframe,
-                    "source_key": source_key,
-                    "params": params,
-                }
-
+    # 🔸 Загружаем историю для history-based фич по каждому (timeframe, source_key) в зависимости от семейства
     rsi_history_by_key: Dict[Tuple[str, str], Dict[str, List[Tuple[Any, float]]]] = {}
+    atr_history_by_key: Dict[Tuple[str, str], Dict[str, List[Tuple[Any, float]]]] = {}
 
-    # загружаем историю для каждого (timeframe, source_key)
-    for (timeframe, source_key), info in history_needed.items():
-        params = info["params"]
+    # история для RSI
+    if family_key == "rsi":
+        history_needed: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-        def _get_int_param(name: str, default: int) -> int:
-            cfg = params.get(name)
-            if cfg is None:
-                return default
-            try:
-                return int(str(cfg.get("value")))
-            except Exception:
-                return default
+        for aid in analysis_ids:
+            inst = get_analysis_instance(aid)
+            if not inst:
+                continue
+            if inst.get("family_key") != "rsi":
+                continue
 
-        window_bars = _get_int_param("window_bars", 50)
-        instance_id = _resolve_rsi_instance_id(timeframe, source_key)
-        if instance_id is None:
-            log.warning(
-                "BT_ANALYSIS_CALIB_RAW: не найден instance_id RSI для timeframe=%s, source_key=%s",
-                timeframe,
-                source_key,
+            key = inst.get("key")
+            params = inst.get("params") or {}
+            tf_cfg = params.get("timeframe")
+            source_cfg = params.get("source_key")
+
+            timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
+            source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
+
+            if key in (
+                "rsi_zone_duration",
+                "rsi_slope",
+                "rsi_accel",
+                "rsi_volatility",
+                "rsi_avg_window",
+                "rsi_since_cross_30",
+                "rsi_since_cross_50",
+                "rsi_since_cross_70",
+                "rsi_vs_ma",
+                "rsi_extremum",
+            ):
+                cfg_key = (timeframe, source_key)
+                if cfg_key not in history_needed:
+                    history_needed[cfg_key] = {
+                        "timeframe": timeframe,
+                        "source_key": source_key,
+                        "params": params,
+                    }
+
+        # загружаем историю RSI
+        for (timeframe, source_key), info in history_needed.items():
+            params = info["params"]
+
+            def _get_int_param(name: str, default: int) -> int:
+                cfg = params.get(name)
+                if cfg is None:
+                    return default
+                try:
+                    return int(str(cfg.get("value")))
+                except Exception:
+                    return default
+
+            window_bars = _get_int_param("window_bars", 50)
+            instance_id = _resolve_rsi_instance_id(timeframe, source_key)
+            if instance_id is None:
+                log.warning(
+                    "BT_ANALYSIS_CALIB_RAW: не найден instance_id RSI для timeframe=%s, source_key=%s",
+                    timeframe,
+                    source_key,
+                )
+                continue
+
+            rsi_history = await _load_rsi_history_for_positions(
+                pg=pg,
+                instance_id=instance_id,
+                timeframe=timeframe,
+                positions=positions,
+                window_bars=window_bars,
             )
-            continue
+            rsi_history_by_key[(timeframe, source_key)] = rsi_history
 
-        rsi_history = await _load_rsi_history_for_positions(
-            pg=pg,
-            instance_id=instance_id,
-            timeframe=timeframe,
-            positions=positions,
-            window_bars=window_bars,
-        )
-        rsi_history_by_key[(timeframe, source_key)] = rsi_history
+    # история для ATR
+    if family_key == "atr":
+        atr_history_needed: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for aid in analysis_ids:
+            inst = get_analysis_instance(aid)
+            if not inst:
+                continue
+            if inst.get("family_key") != "atr":
+                continue
+
+            key = inst.get("key")
+            params = inst.get("params") or {}
+            tf_cfg = params.get("timeframe")
+            source_cfg = params.get("source_key")
+
+            timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
+            source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "atr14"
+
+            if key in ("atr_vs_ma", "atr_slope", "atr_volatility"):
+                cfg_key = (timeframe, source_key)
+                if cfg_key not in atr_history_needed:
+                    atr_history_needed[cfg_key] = {
+                        "timeframe": timeframe,
+                        "source_key": source_key,
+                        "params": params,
+                    }
+
+        # загружаем историю ATR
+        for (timeframe, source_key), info in atr_history_needed.items():
+            params = info["params"]
+
+            def _get_int_param(name: str, default: int) -> int:
+                cfg = params.get(name)
+                if cfg is None:
+                    return default
+                try:
+                    return int(str(cfg.get("value")))
+                except Exception:
+                    return default
+
+            window_bars = _get_int_param("window_bars", 50)
+            instance_id = _resolve_atr_instance_id(timeframe, source_key)
+            if instance_id is None:
+                log.warning(
+                    "BT_ANALYSIS_CALIB_RAW: не найден instance_id ATR для timeframe=%s, source_key=%s",
+                    timeframe,
+                    source_key,
+                )
+                continue
+
+            atr_history = await _load_atr_history_for_positions(
+                pg=pg,
+                instance_id=instance_id,
+                timeframe=timeframe,
+                positions=positions,
+                window_bars=window_bars,
+            )
+            atr_history_by_key[(timeframe, source_key)] = atr_history
 
     # 🔸 Обрабатываем каждый анализатор по всем позициям
     async with pg.acquire() as conn:
@@ -719,10 +924,14 @@ async def _process_family_raw(
             tf_cfg = params.get("timeframe")
             source_cfg = params.get("source_key")
 
-            timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-            source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
-
-            feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+            if inst_family == "rsi":
+                timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
+                source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
+                feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+            else:
+                timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
+                source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "atr14"
+                feature_name = f"{key}_{timeframe}_{source_key}"
 
             log.debug(
                 "BT_ANALYSIS_CALIB_RAW: сбор сырых фич для analysis_id=%s, family=%s, key=%s, "
@@ -738,7 +947,14 @@ async def _process_family_raw(
 
             # подготавливаем вспомогательные параметры для history-based
             slope_k = 3
-            if key in ("rsi_slope", "rsi_accel"):
+            if inst_family == "rsi" and key in ("rsi_slope", "rsi_accel"):
+                cfg = params.get("slope_k")
+                if cfg is not None:
+                    try:
+                        slope_k = int(str(cfg.get("value")))
+                    except Exception:
+                        slope_k = 3
+            if inst_family == "atr" and key in ("atr_slope",):
                 cfg = params.get("slope_k")
                 if cfg is not None:
                     try:
@@ -747,7 +963,7 @@ async def _process_family_raw(
                         slope_k = 3
 
             window_bars = 50
-            if key in (
+            if inst_family == "rsi" and key in (
                 "rsi_zone_duration",
                 "rsi_slope",
                 "rsi_accel",
@@ -766,10 +982,24 @@ async def _process_family_raw(
                     except Exception:
                         window_bars = 50
 
+            if inst_family == "atr" and key in (
+                "atr_vs_ma",
+                "atr_slope",
+                "atr_volatility",
+            ):
+                cfg = params.get("window_bars")
+                if cfg is not None:
+                    try:
+                        window_bars = int(str(cfg.get("value")))
+                    except Exception:
+                        window_bars = 50
+
             level_param = params.get("level")
 
-            history_series = None
-            if key in (
+            history_series_rsi = None
+            history_series_atr = None
+
+            if inst_family == "rsi" and key in (
                 "rsi_zone_duration",
                 "rsi_slope",
                 "rsi_accel",
@@ -781,10 +1011,26 @@ async def _process_family_raw(
                 "rsi_vs_ma",
                 "rsi_extremum",
             ):
-                history_series = rsi_history_by_key.get((timeframe, source_key))
-                if history_series is None:
+                history_series_rsi = rsi_history_by_key.get((timeframe, source_key))
+                if history_series_rsi is None:
                     log.debug(
                         "BT_ANALYSIS_CALIB_RAW: нет истории RSI для key=%s timeframe=%s source_key=%s "
+                        "— сырые значения фичи записаны не будут",
+                        key,
+                        timeframe,
+                        source_key,
+                    )
+                    continue
+
+            if inst_family == "atr" and key in (
+                "atr_vs_ma",
+                "atr_slope",
+                "atr_volatility",
+            ):
+                history_series_atr = atr_history_by_key.get((timeframe, source_key))
+                if history_series_atr is None:
+                    log.debug(
+                        "BT_ANALYSIS_CALIB_RAW: нет истории ATR для key=%s timeframe=%s source_key=%s "
                         "— сырые значения фичи записаны не будут",
                         key,
                         timeframe,
@@ -800,6 +1046,7 @@ async def _process_family_raw(
                 symbol = p["symbol"]
                 direction = p["direction"]
                 entry_time = p["entry_time"]
+                entry_price_raw = p["entry_price"]
                 raw_stat = p["raw_stat"]
                 pnl_abs_raw = p["pnl_abs"]
 
@@ -816,202 +1063,291 @@ async def _process_family_raw(
                 feature_value: Optional[float] = None
                 bin_label: Optional[str] = None
 
-                # расчёт feature_value и bin_label по ключу
-                if key == "rsi_value":
-                    rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
-                    if rsi_val is None:
-                        continue
-                    feature_value = rsi_val
-                    bin_label = _find_rsi_value_bin_label(rsi_val)
-
-                elif key == "rsi_dist_from_50":
-                    rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
-                    if rsi_val is None:
-                        continue
-                    feature_value = _rsi_dist_raw(rsi_val)
-                    bin_label = _bin_rsi_dist_from_50(rsi_val)
-
-                elif key == "rsi_zone":
-                    rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
-                    if rsi_val is None:
-                        continue
-                    feature_value = rsi_val
-                    zone_label, _, _ = _bin_rsi_zone(rsi_val)
-                    bin_label = zone_label
-
-                elif key in (
-                    "rsi_zone_duration",
-                    "rsi_slope",
-                    "rsi_accel",
-                    "rsi_volatility",
-                    "rsi_avg_window",
-                    "rsi_since_cross_30",
-                    "rsi_since_cross_50",
-                    "rsi_since_cross_70",
-                    "rsi_vs_ma",
-                    "rsi_extremum",
-                ):
-                    series_for_symbol = history_series.get(symbol) if history_series else None
-                    if not series_for_symbol:
-                        continue
-
-                    idx = _find_index_leq(series_for_symbol, entry_time)
-                    if idx is None:
-                        continue
-
-                    rsi_t = series_for_symbol[idx][1]
-
-                    if key == "rsi_zone_duration":
-                        zone_label, _, _ = _bin_rsi_zone(rsi_t)
-
-                        def _in_zone(val: float, label: str) -> bool:
-                            if label == "Z1_LT_30":
-                                return val < 30.0
-                            if label == "Z2_30_40":
-                                return 30.0 <= val < 40.0
-                            if label == "Z3_40_60":
-                                return 40.0 <= val <= 60.0
-                            if label == "Z4_60_70":
-                                return 60.0 < val <= 70.0
-                            if label == "Z5_GT_70":
-                                return val > 70.0
-                            return False
-
-                        duration = 1
-                        j = idx - 1
-                        while j >= 0 and duration < window_bars:
-                            rsi_prev = series_for_symbol[j][1]
-                            if not _in_zone(rsi_prev, zone_label):
-                                break
-                            duration += 1
-                            j -= 1
-
-                        feature_value = float(duration)
-
-                        if duration <= 3:
-                            dur_label = "D1_1_3"
-                        elif duration <= 10:
-                            dur_label = "D2_4_10"
-                        else:
-                            dur_label = "D3_GT_10"
-
-                        bin_label = f"{zone_label}_{dur_label}"
-
-                    elif key == "rsi_slope":
-                        if idx - slope_k < 0:
+                # расчёт feature_value и bin_label по ключу для RSI
+                if inst_family == "rsi":
+                    if key == "rsi_value":
+                        rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
+                        if rsi_val is None:
                             continue
-                        rsi_prev = series_for_symbol[idx - slope_k][1]
-                        slope = rsi_t - rsi_prev
-                        feature_value = slope
-                        bin_label = _bin_signed_value_5(slope)
+                        feature_value = rsi_val
+                        bin_label = _find_rsi_value_bin_label(rsi_val)
 
-                    elif key == "rsi_accel":
-                        if idx - 2 * slope_k < 0:
+                    elif key == "rsi_dist_from_50":
+                        rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
+                        if rsi_val is None:
                             continue
-                        rsi_prev = series_for_symbol[idx - slope_k][1]
-                        rsi_prev2 = series_for_symbol[idx - 2 * slope_k][1]
-                        slope1 = rsi_t - rsi_prev
-                        slope2 = rsi_prev - rsi_prev2
-                        accel = slope1 - slope2
-                        feature_value = accel
-                        bin_label = _bin_signed_value_5(accel)
+                        feature_value = _rsi_dist_raw(rsi_val)
+                        bin_label = _bin_rsi_dist_from_50(rsi_val)
 
-                    elif key == "rsi_volatility":
-                        start_idx = max(0, idx - window_bars + 1)
-                        window_vals = [v for _, v in series_for_symbol[start_idx : idx + 1]]
-                        if len(window_vals) < 2:
+                    elif key == "rsi_zone":
+                        rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
+                        if rsi_val is None:
                             continue
-                        mean = sum(window_vals) / len(window_vals)
-                        var = sum((v - mean) ** 2 for v in window_vals) / (len(window_vals) - 1)
-                        vol = var ** 0.5
-                        feature_value = vol
-                        bin_label = _bin_volatility(vol)
-
-                    elif key == "rsi_avg_window":
-                        start_idx = max(0, idx - window_bars + 1)
-                        window_vals = [v for _, v in series_for_symbol[start_idx : idx + 1]]
-                        if not window_vals:
-                            continue
-                        avg_val = sum(window_vals) / len(window_vals)
-                        feature_value = avg_val
-                        zone_label, _, _ = _bin_rsi_zone(avg_val)
+                        feature_value = rsi_val
+                        zone_label, _, _ = _bin_rsi_zone(rsi_val)
                         bin_label = zone_label
 
-                    elif key in ("rsi_since_cross_30", "rsi_since_cross_50", "rsi_since_cross_70"):
-                        if level_param is not None:
-                            try:
-                                level = float(level_param.get("value"))
-                            except Exception:
-                                level = float(key.split("_")[-1])
-                        else:
-                            level = float(key.split("_")[-1])
-
-                        bars_since = 0
-                        j = idx - 1
-                        while j >= 0 and bars_since < window_bars:
-                            rsi_prev = series_for_symbol[j][1]
-                            if (rsi_t >= level and rsi_prev <= level) or (rsi_t <= level and rsi_prev >= level):
-                                break
-                            bars_since += 1
-                            j -= 1
-
-                        feature_value = float(bars_since)
-                        try:
-                            bars_int = int(bars_since)
-                        except Exception:
-                            bars_int = 0
-                        bin_label = _bin_bars_since_level(bars_int)
-
-                    elif key == "rsi_vs_ma":
-                        start_idx = max(0, idx - window_bars + 1)
-                        window_vals = [v for _, v in series_for_symbol[start_idx : idx + 1]]
-                        if not window_vals:
-                            continue
-                        ma_val = sum(window_vals) / len(window_vals)
-                        delta = rsi_t - ma_val
-                        feature_value = delta
-                        bin_label = _bin_rsi_vs_ma(delta)
-
-                    elif key == "rsi_extremum":
-                        start_idx = max(0, idx - window_bars + 1)
-                        window_vals = [v for _, v in series_for_symbol[start_idx : idx + 1]]
-                        if len(window_vals) < 3:
+                    elif key in (
+                        "rsi_zone_duration",
+                        "rsi_slope",
+                        "rsi_accel",
+                        "rsi_volatility",
+                        "rsi_avg_window",
+                        "rsi_since_cross_30",
+                        "rsi_since_cross_50",
+                        "rsi_since_cross_70",
+                        "rsi_vs_ma",
+                        "rsi_extremum",
+                    ):
+                        series_for_symbol = history_series_rsi.get(symbol) if history_series_rsi else None
+                        if not series_for_symbol:
                             continue
 
-                        current = rsi_t
-                        feature_value = current
+                        idx = _find_index_leq(series_for_symbol, entry_time)
+                        if idx is None:
+                            continue
 
-                        local_min = current == min(window_vals)
-                        local_max = current == max(window_vals)
-                        spread = max(window_vals) - min(window_vals)
+                        rsi_t = series_for_symbol[idx][1]
 
-                        if not local_min and not local_max:
-                            ext_type = "Flat"
-                        else:
-                            if local_min:
-                                sorted_vals = sorted(window_vals)
-                                second = sorted_vals[1]
-                                diff = second - current
-                                if diff >= 5.0 and spread >= 10.0:
-                                    ext_type = "StrongMin"
-                                else:
-                                    ext_type = "WeakMin"
+                        if key == "rsi_zone_duration":
+                            zone_label, _, _ = _bin_rsi_zone(rsi_t)
+
+                            def _in_zone(val: float, label: str) -> bool:
+                                if label == "Z1_LT_30":
+                                    return val < 30.0
+                                if label == "Z2_30_40":
+                                    return 30.0 <= val < 40.0
+                                if label == "Z3_40_60":
+                                    return 40.0 <= val <= 60.0
+                                if label == "Z4_60_70":
+                                    return 60.0 < val <= 70.0
+                                if label == "Z5_GT_70":
+                                    return val > 70.0
+                                return False
+
+                            duration = 1
+                            j = idx - 1
+                            while j >= 0 and duration < window_bars:
+                                rsi_prev = series_for_symbol[j][1]
+                                if not _in_zone(rsi_prev, zone_label):
+                                    break
+                                duration += 1
+                                j -= 1
+
+                            feature_value = float(duration)
+
+                            if duration <= 3:
+                                dur_label = "D1_1_3"
+                            elif duration <= 10:
+                                dur_label = "D2_4_10"
                             else:
-                                sorted_vals = sorted(window_vals, reverse=True)
-                                second = sorted_vals[1]
-                                diff = current - second
-                                if diff >= 5.0 and spread >= 10.0:
-                                    ext_type = "StrongMax"
-                                else:
-                                    ext_type = "WeakMax"
+                                dur_label = "D3_GT_10"
 
-                        bin_label = ext_type
+                            bin_label = f"{zone_label}_{dur_label}"
+
+                        elif key == "rsi_slope":
+                            if idx - slope_k < 0:
+                                continue
+                            rsi_prev = series_for_symbol[idx - slope_k][1]
+                            slope = rsi_t - rsi_prev
+                            feature_value = slope
+                            bin_label = _bin_signed_value_5(slope)
+
+                        elif key == "rsi_accel":
+                            if idx - 2 * slope_k < 0:
+                                continue
+                            rsi_prev = series_for_symbol[idx - slope_k][1]
+                            rsi_prev2 = series_for_symbol[idx - 2 * slope_k][1]
+                            slope1 = rsi_t - rsi_prev
+                            slope2 = rsi_prev - rsi_prev2
+                            accel = slope1 - slope2
+                            feature_value = accel
+                            bin_label = _bin_signed_value_5(accel)
+
+                        elif key == "rsi_volatility":
+                            start_idx = max(0, idx - window_bars + 1)
+                            window_vals = [v for _, v in series_for_symbol[start_idx: idx + 1]]
+                            if len(window_vals) < 2:
+                                continue
+                            mean = sum(window_vals) / len(window_vals)
+                            var = sum((v - mean) ** 2 for v in window_vals) / (len(window_vals) - 1)
+                            vol = var ** 0.5
+                            feature_value = vol
+                            bin_label = _bin_volatility(vol)
+
+                        elif key == "rsi_avg_window":
+                            start_idx = max(0, idx - window_bars + 1)
+                            window_vals = [v for _, v in series_for_symbol[start_idx: idx + 1]]
+                            if not window_vals:
+                                continue
+                            avg_val = sum(window_vals) / len(window_vals)
+                            feature_value = avg_val
+                            zone_label, _, _ = _bin_rsi_zone(avg_val)
+                            bin_label = zone_label
+
+                        elif key in ("rsi_since_cross_30", "rsi_since_cross_50", "rsi_since_cross_70"):
+                            if level_param is not None:
+                                try:
+                                    level = float(level_param.get("value"))
+                                except Exception:
+                                    level = float(key.split("_")[-1])
+                            else:
+                                level = float(key.split("_")[-1])
+
+                            bars_since = 0
+                            j = idx - 1
+                            while j >= 0 and bars_since < window_bars:
+                                rsi_prev = series_for_symbol[j][1]
+                                if (rsi_t >= level and rsi_prev <= level) or (rsi_t <= level and rsi_prev >= level):
+                                    break
+                                bars_since += 1
+                                j -= 1
+
+                            feature_value = float(bars_since)
+                            try:
+                                bars_int = int(bars_since)
+                            except Exception:
+                                bars_int = 0
+                            bin_label = _bin_bars_since_level(bars_int)
+
+                        elif key == "rsi_vs_ma":
+                            start_idx = max(0, idx - window_bars + 1)
+                            window_vals = [v for _, v in series_for_symbol[start_idx: idx + 1]]
+                            if not window_vals:
+                                continue
+                            ma_val = sum(window_vals) / len(window_vals)
+                            delta = rsi_t - ma_val
+                            feature_value = delta
+                            bin_label = _bin_rsi_vs_ma(delta)
+
+                        elif key == "rsi_extremum":
+                            start_idx = max(0, idx - window_bars + 1)
+                            window_vals = [v for _, v in series_for_symbol[start_idx: idx + 1]]
+                            if len(window_vals) < 3:
+                                continue
+
+                            current = rsi_t
+                            feature_value = current
+
+                            local_min = current == min(window_vals)
+                            local_max = current == max(window_vals)
+                            spread = max(window_vals) - min(window_vals)
+
+                            if not local_min and not local_max:
+                                ext_type = "Flat"
+                            else:
+                                if local_min:
+                                    sorted_vals = sorted(window_vals)
+                                    second = sorted_vals[1]
+                                    diff = second - current
+                                    if diff >= 5.0 and spread >= 10.0:
+                                        ext_type = "StrongMin"
+                                    else:
+                                        ext_type = "WeakMin"
+                                else:
+                                    sorted_vals = sorted(window_vals, reverse=True)
+                                    second = sorted_vals[1]
+                                    diff = current - second
+                                    if diff >= 5.0 and spread >= 10.0:
+                                        ext_type = "StrongMax"
+                                    else:
+                                        ext_type = "WeakMax"
+
+                            bin_label = ext_type
+
+                        else:
+                            continue
 
                     else:
+                        # неизвестный key для RSI — пропускаем
+                        continue
+
+                # расчёт feature_value и bin_label по ключу для ATR
+                elif inst_family == "atr":
+                    # atr_value_pct и atr_multiscale_ratio работают без истории
+                    if key == "atr_value_pct":
+                        if entry_price_raw is None:
+                            continue
+                        try:
+                            entry_price = Decimal(str(entry_price_raw))
+                        except Exception:
+                            continue
+                        if entry_price <= 0:
+                            continue
+
+                        atr_val = _extract_atr_value(raw_stat, timeframe, source_key)
+                        if atr_val is None:
+                            continue
+
+                        atr_pct = float((Decimal(str(atr_val)) / entry_price) * Decimal("100"))
+                        feature_value = atr_pct
+                        # bin_label можно оставить None — калибровка всё равно работает по feature_value
+
+                    elif key == "atr_multiscale_ratio":
+                        other_tf_cfg = params.get("higher_timeframe") or params.get("other_timeframe")
+                        if other_tf_cfg is None:
+                            continue
+                        other_tf_val = other_tf_cfg.get("value") if isinstance(other_tf_cfg, dict) else other_tf_cfg
+                        other_tf = str(other_tf_val).strip()
+                        if other_tf not in ("m5", "m15", "h1"):
+                            continue
+
+                        atr_base = _extract_atr_value(raw_stat, timeframe, source_key)
+                        atr_other = _extract_atr_value(raw_stat, other_tf, source_key)
+                        if atr_base is None or atr_other is None or atr_other <= 0:
+                            continue
+
+                        ratio = float(atr_base / atr_other)
+                        feature_value = ratio
+
+                    elif key in ("atr_vs_ma", "atr_slope", "atr_volatility"):
+                        series_for_symbol = history_series_atr.get(symbol) if history_series_atr else None
+                        if not series_for_symbol:
+                            continue
+
+                        idx = _find_index_leq(series_for_symbol, entry_time)
+                        if idx is None:
+                            continue
+
+                        atr_t = series_for_symbol[idx][1]
+
+                        if key == "atr_vs_ma":
+                            start_idx = max(0, idx - window_bars + 1)
+                            window_vals = [v for _, v in series_for_symbol[start_idx: idx + 1]]
+                            if not window_vals:
+                                continue
+                            ma_val = sum(window_vals) / len(window_vals)
+                            if ma_val == 0:
+                                continue
+                            delta_pct = (atr_t - ma_val) / ma_val * 100.0
+                            feature_value = delta_pct
+
+                        elif key == "atr_slope":
+                            if idx - slope_k < 0:
+                                continue
+                            atr_prev = series_for_symbol[idx - slope_k][1]
+                            slope = atr_t - atr_prev
+                            feature_value = slope
+
+                        elif key == "atr_volatility":
+                            start_idx = max(0, idx - window_bars + 1)
+                            window_vals = [v for _, v in series_for_symbol[start_idx: idx + 1]]
+                            if len(window_vals) < 2:
+                                continue
+                            mean = sum(window_vals) / len(window_vals)
+                            var = sum((v - mean) ** 2 for v in window_vals) / (len(window_vals) - 1)
+                            vol = var ** 0.5
+                            feature_value = vol
+
+                        else:
+                            continue
+
+                    else:
+                        # неизвестный key для ATR — пропускаем
                         continue
 
                 else:
-                    # неизвестный key — пропускаем
+                    # неизвестное семейство — не обрабатываем
                     continue
 
                 if feature_value is None:
@@ -1024,8 +1360,8 @@ async def _process_family_raw(
                         signal_id,     # signal_id
                         direction,     # direction
                         timeframe,     # timeframe (анализатора)
-                        family_key,    # family_key ('rsi')
-                        key,           # key ('rsi_value', 'rsi_accel', ...)
+                        family_key,    # family_key ('rsi' или 'atr')
+                        key,           # key ('rsi_value', 'atr_value_pct', ...)
                         feature_name,  # feature_name как в бинах
                         bin_label,     # bin_label (может быть None)
                         feature_value, # feature_value (numeric)
@@ -1071,7 +1407,6 @@ async def _process_family_raw(
                 )
 
     return total_rows_written
-
 
 # 🔸 Разруливание feature_name для RSI по key/timeframe/source_key (как в bt_analysis_rsi)
 def _resolve_feature_name_for_rsi(key: str, timeframe: str, source_key: str) -> str:

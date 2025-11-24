@@ -91,7 +91,7 @@ async def run_bt_analysis_calibration_processor(pg, redis):
                         entry_id,
                     )
 
-                    if family_key != "rsi" or not analysis_ids:
+                    if not analysis_ids:
                         await redis.xack(CALIB_READY_STREAM_KEY, CALIB_PROC_CONSUMER_GROUP, entry_id)
                         continue
 
@@ -285,7 +285,6 @@ def _parse_calib_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         )
         return None
 
-
 # 🔸 Калибровка одного семейства анализаторов для пары scenario_id/signal_id
 async def _process_family_calibration(
     pg,
@@ -312,6 +311,7 @@ async def _process_family_calibration(
         key = inst.get("key")
         params = inst.get("params") or {}
 
+        # защитный фильтр: работаем только по тому семейству, по которому пришло сообщение
         if inst_family != family_key:
             continue
 
@@ -319,9 +319,19 @@ async def _process_family_calibration(
         source_cfg = params.get("source_key")
 
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
+        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else ""
 
-        feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+        # разруливаем feature_name:
+        # - для RSI сохраняем старую совместимость через _resolve_feature_name_for_rsi
+        # - для остальных (например, ATR) — общий формат
+        if inst_family == "rsi":
+            feature_name = _resolve_feature_name_for_rsi(
+                key=key,
+                timeframe=timeframe,
+                source_key=source_key or "rsi14",
+            )
+        else:
+            feature_name = f"{key}_{timeframe}_{source_key}"
 
         log.info(
             "BT_ANALYSIS_CALIB_PROC: калибровка фичи для analysis_id=%s, family=%s, key=%s, "
@@ -358,10 +368,11 @@ async def _process_family_calibration(
         if not rows:
             log.debug(
                 "BT_ANALYSIS_CALIB_PROC: нет сырых значений для feature_name=%s, "
-                "scenario_id=%s, signal_id=%s",
+                "scenario_id=%s, signal_id=%s, family=%s",
                 feature_name,
                 scenario_id,
                 signal_id,
+                family_key,
             )
             continue
 
@@ -393,10 +404,11 @@ async def _process_family_calibration(
         if not bins:
             log.info(
                 "BT_ANALYSIS_CALIB_PROC: не удалось построить бины для feature_name=%s "
-                "(scenario_id=%s, signal_id=%s)",
+                "(scenario_id=%s, signal_id=%s, family=%s)",
                 feature_name,
                 scenario_id,
                 signal_id,
+                family_key,
             )
             continue
 
@@ -481,9 +493,10 @@ async def _process_family_calibration(
 
         log.info(
             "BT_ANALYSIS_CALIB_PROC: записаны адаптивные бины для feature_name=%s "
-            "(analysis_id=%s, scenario_id=%s, signal_id=%s, version=%s, bins=%s)",
+            "(analysis_id=%s, family=%s, scenario_id=%s, signal_id=%s, version=%s, bins=%s)",
             feature_name,
             aid,
+            family_key,
             scenario_id,
             signal_id,
             ADAPTIVE_VERSION,
@@ -491,7 +504,6 @@ async def _process_family_calibration(
         )
 
     return features_calibrated
-
 
 # 🔸 Построение квантильных бинов для одной фичи
 def _build_quantile_bins(
