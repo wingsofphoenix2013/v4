@@ -14,8 +14,9 @@ getcontext().prec = 28
 
 log = logging.getLogger("BT_ANALYSIS_DAILY")
 
-# 🔸 Константы стрима готовности пост-анализа
+# 🔸 Константы стримов
 ANALYSIS_POSTPROC_READY_STREAM_KEY = "bt:analysis:postproc:ready"
+DAILY_READY_STREAM_KEY = "bt:analysis:daily:ready"
 ANALYSIS_DAILY_CONSUMER_GROUP = "bt_analysis_daily"
 ANALYSIS_DAILY_CONSUMER_NAME = "bt_analysis_daily_main"
 
@@ -811,6 +812,48 @@ async def run_bt_analysis_daily(pg, redis):
                     rows_written = rows_v1 + rows_v2
                     total_pairs += 1
                     total_rows_written += rows_written
+
+                    # 🔸 Публикуем событие о готовности суточной аналитики в bt:analysis:daily:ready
+                    finished_at_daily = datetime.utcnow()
+                    try:
+                        await redis.xadd(
+                            DAILY_READY_STREAM_KEY,
+                            {
+                                "scenario_id": str(scenario_id),
+                                "signal_id": str(signal_id),
+                                "family_key": str(family_key),
+                                "analysis_ids": ",".join(str(a) for a in analysis_ids),
+                                "rows_v1": str(rows_v1),
+                                "rows_v2": str(rows_v2),
+                                "rows_total": str(rows_written),
+                                "finished_at": finished_at_daily.isoformat(),
+                            },
+                        )
+                        log.info(
+                            "BT_ANALYSIS_DAILY: опубликовано событие готовности daily-аналитики в стрим '%s' "
+                            "для scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s, "
+                            "rows_v1=%s, rows_v2=%s, rows_total=%s, finished_at=%s",
+                            DAILY_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            family_key,
+                            analysis_ids,
+                            rows_v1,
+                            rows_v2,
+                            rows_written,
+                            finished_at_daily,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "BT_ANALYSIS_DAILY: не удалось опубликовать событие в стрим '%s' "
+                            "для scenario_id=%s, signal_id=%s, family=%s: %s",
+                            DAILY_READY_STREAM_KEY,
+                            scenario_id,
+                            signal_id,
+                            family_key,
+                            e,
+                            exc_info=True,
+                        )
 
                     # помечаем сообщение как обработанное
                     await redis.xack(ANALYSIS_POSTPROC_READY_STREAM_KEY, ANALYSIS_DAILY_CONSUMER_GROUP, entry_id)

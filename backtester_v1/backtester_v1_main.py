@@ -36,6 +36,8 @@ from bt_analysis_calibration_processor import run_bt_analysis_calibration_proces
 from bt_analysis_rsi_adaptive import run_bt_analysis_rsi_adaptive_worker
 # 🔸 Суточная аналитика анализаторов (слушает bt:analysis:postproc:ready)
 from bt_analysis_daily import run_bt_analysis_daily
+# 🔸 Воркер стабильности анализаторов (слушает bt:analysis:daily:ready)
+from bt_analysis_stability import run_bt_analysis_stability
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -103,6 +105,7 @@ async def main():
         run_safe_loop(lambda: run_bt_analysis_calibration_processor(pg, redis), "BT_ANALYSIS_CALIB_PROC"),  # бин-конфиги
         run_safe_loop(lambda: run_bt_analysis_rsi_adaptive_worker(pg, redis), "BT_ANALYSIS_RSI_ADAPTIVE"),  # v2 бины
         run_safe_loop(lambda: run_bt_analysis_daily(pg, redis), "BT_ANALYSIS_DAILY"),               # суточная аналитика
+        run_safe_loop(lambda: run_bt_analysis_stability(pg, redis), "BT_ANALYSIS_STABILITY"),       # индекс стабильности
     )
 
 
