@@ -159,12 +159,11 @@ def _parse_postproc_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         return None
 
 
-# 🔸 Проверка попадания значения feature_value в выбранные интервалы бинов
+# 🔸 Проверка попадания значения feature_value в выбранные интервалы бинов (для v2)
 def _value_in_selected_bins(
     value: float,
     bins: List[Tuple[Optional[float], Optional[float]]],
 ) -> bool:
-    # bins: список (from, to), None = минус/плюс бесконечность
     for b_from, b_to in bins:
         if b_from is not None and value < b_from:
             continue
@@ -261,7 +260,7 @@ async def _process_analysis_family_daily(
     if not base_daily_by_dir_day:
         return 0
 
-    # загружаем базовую статистику по сценарию+сигналу для всех направлений (общая, как в bt_analysis_postproc)
+    # загружаем базовую статистику по сценарию+сигналу для всех направлений
     async with pg.acquire() as conn:
         base_rows_overall = await conn.fetch(
             """
@@ -355,15 +354,15 @@ async def _process_analysis_family_daily(
             signal_id,
         )
 
-        # для каждого направления считаем суточную аналитику
+        # загружаем сырые фичи по позициям для этого анализатора (общие по направлениям)
         async with pg.acquire() as conn:
-            # загружаем сырьё фич по позициям для этого анализатора
             raw_rows = await conn.fetch(
                 """
                 SELECT
                     r.position_id,
                     r.direction,
                     r.feature_value,
+                    r.bin_label,
                     r.pnl_abs,
                     r.is_win,
                     p.entry_time::date AS day
@@ -397,7 +396,7 @@ async def _process_analysis_family_daily(
             )
             continue
 
-        # по направлениям будем считать отдельно
+        # по направлениям считаем отдельно
         for direction in ("long", "short"):
             base_overall = base_overall_by_dir.get(direction)
             if not base_overall:
@@ -413,7 +412,7 @@ async def _process_analysis_family_daily(
             async with pg.acquire() as conn:
                 bin_rows = await conn.fetch(
                     """
-                    SELECT bin_from, bin_to, trades, wins, winrate
+                    SELECT bin_from, bin_to, trades, wins, winrate, bin_label
                     FROM bt_scenario_feature_bins
                     WHERE scenario_id  = $1
                       AND signal_id    = $2
@@ -445,7 +444,8 @@ async def _process_analysis_family_daily(
                 continue
 
             # определяем "хорошие" бины по глобальной базовой линии
-            selected_bins: List[Tuple[Optional[float], Optional[float]]] = []
+            selected_bins_v2: List[Tuple[Optional[float], Optional[float]]] = []
+            selected_labels_v1: List[str] = []
             selected_trades_overall = 0
 
             for r in bin_rows:
@@ -462,6 +462,8 @@ async def _process_analysis_family_daily(
 
                 selected_trades_overall += bin_trades
 
+                bin_label = r["bin_label"]
+
                 bin_from_val = r["bin_from"]
                 bin_to_val = r["bin_to"]
 
@@ -475,10 +477,13 @@ async def _process_analysis_family_daily(
                 except Exception:
                     b_to = None
 
-                selected_bins.append((b_from, b_to))
+                if version == "v2":
+                    selected_bins_v2.append((b_from, b_to))
+                else:
+                    if bin_label:
+                        selected_labels_v1.append(str(bin_label))
 
-            if selected_trades_overall <= 0 or not selected_bins:
-                # нет глобально "хороших" бинов
+            if selected_trades_overall <= 0:
                 continue
 
             coverage_overall = _safe_div(Decimal(selected_trades_overall), Decimal(base_trades_overall))
@@ -494,6 +499,17 @@ async def _process_analysis_family_daily(
                     float(MIN_COVERAGE),
                     selected_trades_overall,
                     base_trades_overall,
+                )
+                continue
+
+            if version != "v2" and not selected_labels_v1:
+                log.debug(
+                    "BT_ANALYSIS_DAILY: analysis_id=%s, feature=%s, direction=%s, version=%s — "
+                    "нет выбранных bin_label для v1, суточная аналитика не будет посчитана",
+                    aid,
+                    feature_name,
+                    direction,
+                    version,
                 )
                 continue
 
@@ -519,7 +535,19 @@ async def _process_analysis_family_daily(
                 except Exception:
                     continue
 
-                if not _value_in_selected_bins(fv, selected_bins):
+                bin_label_raw = r["bin_label"]
+                bin_label_str = str(bin_label_raw) if bin_label_raw is not None else None
+
+                is_selected = False
+
+                if version == "v2":
+                    if _value_in_selected_bins(fv, selected_bins_v2):
+                        is_selected = True
+                else:
+                    if bin_label_str is not None and bin_label_str in selected_labels_v1:
+                        is_selected = True
+
+                if not is_selected:
                     continue
 
                 pnl_abs_raw = r["pnl_abs"]
@@ -547,7 +575,6 @@ async def _process_analysis_family_daily(
             # готовим строки для вставки в bt_analysis_daily
             rows_to_insert: List[Tuple[Any, ...]] = []
 
-            # проходим по всем дням для данного направления (даже если selected_trades=0)
             for (dir_key, d), base_daily in base_daily_by_dir_day.items():
                 if dir_key != direction:
                     continue

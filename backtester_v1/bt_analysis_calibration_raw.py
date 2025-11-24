@@ -206,12 +206,33 @@ def _find_index_leq(series: List[Tuple[Any, float]], entry_time) -> Optional[int
     return idx
 
 
-# 🔸 Биннинг для rsi_dist_from_50 (используем только для понимания диапазона, но не записываем бин)
+# 🔸 Биннинг для rsi_dist_from_50 (сырое значение dist для feature_value)
 def _rsi_dist_raw(rsi: float) -> float:
     return abs(rsi - 50.0)
 
 
-# 🔸 Биннинг для rsi_zone (возвращаем только метку, числа нас здесь не интересуют)
+# 🔸 Биннинг для rsi_dist_from_50 (категориальный label, как в bt_analysis_rsi)
+def _bin_rsi_dist_from_50(rsi: float) -> str:
+    dist = abs(rsi - 50.0)
+
+    if dist <= 5.0:
+        return "Near_50"
+
+    if rsi >= 50.0:
+        if dist <= 10.0:
+            return "Above_50_Weak"
+        if dist <= 20.0:
+            return "Above_50_Medium"
+        return "Above_50_Strong"
+
+    if dist <= 10.0:
+        return "Below_50_Weak"
+    if dist <= 20.0:
+        return "Below_50_Medium"
+    return "Below_50_Strong"
+
+
+# 🔸 Биннинг для rsi_zone (возвращаем метку и диапазон)
 def _bin_rsi_zone(rsi: float) -> Tuple[str, float, float]:
     if rsi < 30.0:
         return "Z1_LT_30", 0.0, 30.0
@@ -224,7 +245,7 @@ def _bin_rsi_zone(rsi: float) -> Tuple[str, float, float]:
     return "Z5_GT_70", 70.0, 100.0
 
 
-# 🔸 Биннинг для наклона/ускорения (используется для текущих бинов, но в raw мы пишем само значение)
+# 🔸 Биннинг для наклона/ускорения (используется и для label)
 def _bin_signed_value_5(v: float) -> str:
     if v >= 5.0:
         return "StrongUp"
@@ -237,7 +258,7 @@ def _bin_signed_value_5(v: float) -> str:
     return "StrongDown"
 
 
-# 🔸 Биннинг волатильности (для текущих бинов, в raw пишем vol)
+# 🔸 Биннинг волатильности
 def _bin_volatility(v: float) -> str:
     if v < 3.0:
         return "Vol_VeryLow"
@@ -250,7 +271,7 @@ def _bin_volatility(v: float) -> str:
     return "Vol_VeryHigh"
 
 
-# 🔸 Биннинг delta RSI vs MA(RSI) (для текущих бинов, в raw пишем delta)
+# 🔸 Биннинг delta RSI vs MA(RSI)
 def _bin_rsi_vs_ma(delta: float) -> str:
     if delta <= -10.0:
         return "StrongBelow"
@@ -274,6 +295,28 @@ def _bin_bars_since_level(bars: int) -> str:
     if 11 <= bars <= 30:
         return "Old"
     return "VeryOld"
+
+
+# 🔸 Бины по абсолютному значению RSI (0–100) для rsi_value
+def _default_rsi_value_bins() -> List[Tuple[float, float, str]]:
+    return [
+        (0.0, 20.0, "RSI_0_20"),
+        (20.0, 30.0, "RSI_20_30"),
+        (30.0, 40.0, "RSI_30_40"),
+        (40.0, 50.0, "RSI_40_50"),
+        (50.0, 60.0, "RSI_50_60"),
+        (60.0, 70.0, "RSI_60_70"),
+        (70.0, 100.0001, "RSI_70_100"),
+    ]
+
+
+# 🔸 Поиск bin_label для rsi_value
+def _find_rsi_value_bin_label(value: float) -> Optional[str]:
+    for b_from, b_to, label in _default_rsi_value_bins():
+        if b_from <= value < b_to:
+            return label
+    return None
+
 
 # 🔸 Публичная точка входа: воркер калибровки сырых фич
 async def run_bt_analysis_calibration_raw(pg, redis):
@@ -402,6 +445,7 @@ async def run_bt_analysis_calibration_raw(pg, redis):
             )
             await asyncio.sleep(2)
 
+
 # 🔸 Проверка/создание consumer group для стрима bt:analysis:ready
 async def _ensure_consumer_group(redis) -> None:
     try:
@@ -478,7 +522,7 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         family_key = fields.get("family_key")
         analysis_ids_str = fields.get("analysis_ids") or ""
         finished_at_str = fields.get("finished_at")
-        version = fields.get("version") or "v1"  # <-- добавили
+        version = fields.get("version") or "v1"
 
         if not (scenario_id_str and signal_id_str and family_key and finished_at_str):
             return None
@@ -581,7 +625,6 @@ async def _process_family_raw(
     total_rows_written = 0
 
     # загружаем историю RSI один раз для всех history-based фич по каждому (timeframe, source_key)
-    # сначала группируем analysis_instances по (timeframe, source_key)
     history_needed: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for aid in analysis_ids:
@@ -611,7 +654,6 @@ async def _process_family_raw(
             "rsi_vs_ma",
             "rsi_extremum",
         ):
-            # для history-based используем общее окно из params или дефолт
             cfg_key = (timeframe, source_key)
             if cfg_key not in history_needed:
                 history_needed[cfg_key] = {
@@ -726,7 +768,6 @@ async def _process_family_raw(
 
             level_param = params.get("level")
 
-            # извлекаем историю для этого (timeframe, source_key), если нужно
             history_series = None
             if key in (
                 "rsi_zone_duration",
@@ -773,27 +814,30 @@ async def _process_family_raw(
                 is_win = pnl_abs > 0
 
                 feature_value: Optional[float] = None
+                bin_label: Optional[str] = None
 
-                # расчёт feature_value по ключу
+                # расчёт feature_value и bin_label по ключу
                 if key == "rsi_value":
                     rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
                     if rsi_val is None:
                         continue
                     feature_value = rsi_val
+                    bin_label = _find_rsi_value_bin_label(rsi_val)
 
                 elif key == "rsi_dist_from_50":
                     rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
                     if rsi_val is None:
                         continue
                     feature_value = _rsi_dist_raw(rsi_val)
+                    bin_label = _bin_rsi_dist_from_50(rsi_val)
 
                 elif key == "rsi_zone":
                     rsi_val = _extract_rsi_value(raw_stat, timeframe, source_key)
                     if rsi_val is None:
                         continue
-                    zone_label, _, _ = _bin_rsi_zone(rsi_val)
-                    # для калибровки можно хранить числовой RSI, а зону восстанавливать при анализе
                     feature_value = rsi_val
+                    zone_label, _, _ = _bin_rsi_zone(rsi_val)
+                    bin_label = zone_label
 
                 elif key in (
                     "rsi_zone_duration",
@@ -818,7 +862,6 @@ async def _process_family_raw(
                     rsi_t = series_for_symbol[idx][1]
 
                     if key == "rsi_zone_duration":
-                        # длительность в барах, сколько RSI был в текущей зоне назад
                         zone_label, _, _ = _bin_rsi_zone(rsi_t)
 
                         def _in_zone(val: float, label: str) -> bool:
@@ -834,8 +877,6 @@ async def _process_family_raw(
                                 return val > 70.0
                             return False
 
-                            # здесь нельзя
-
                         duration = 1
                         j = idx - 1
                         while j >= 0 and duration < window_bars:
@@ -847,12 +888,22 @@ async def _process_family_raw(
 
                         feature_value = float(duration)
 
+                        if duration <= 3:
+                            dur_label = "D1_1_3"
+                        elif duration <= 10:
+                            dur_label = "D2_4_10"
+                        else:
+                            dur_label = "D3_GT_10"
+
+                        bin_label = f"{zone_label}_{dur_label}"
+
                     elif key == "rsi_slope":
                         if idx - slope_k < 0:
                             continue
                         rsi_prev = series_for_symbol[idx - slope_k][1]
                         slope = rsi_t - rsi_prev
                         feature_value = slope
+                        bin_label = _bin_signed_value_5(slope)
 
                     elif key == "rsi_accel":
                         if idx - 2 * slope_k < 0:
@@ -863,6 +914,7 @@ async def _process_family_raw(
                         slope2 = rsi_prev - rsi_prev2
                         accel = slope1 - slope2
                         feature_value = accel
+                        bin_label = _bin_signed_value_5(accel)
 
                     elif key == "rsi_volatility":
                         start_idx = max(0, idx - window_bars + 1)
@@ -873,6 +925,7 @@ async def _process_family_raw(
                         var = sum((v - mean) ** 2 for v in window_vals) / (len(window_vals) - 1)
                         vol = var ** 0.5
                         feature_value = vol
+                        bin_label = _bin_volatility(vol)
 
                     elif key == "rsi_avg_window":
                         start_idx = max(0, idx - window_bars + 1)
@@ -881,6 +934,8 @@ async def _process_family_raw(
                             continue
                         avg_val = sum(window_vals) / len(window_vals)
                         feature_value = avg_val
+                        zone_label, _, _ = _bin_rsi_zone(avg_val)
+                        bin_label = zone_label
 
                     elif key in ("rsi_since_cross_30", "rsi_since_cross_50", "rsi_since_cross_70"):
                         if level_param is not None:
@@ -901,6 +956,11 @@ async def _process_family_raw(
                             j -= 1
 
                         feature_value = float(bars_since)
+                        try:
+                            bars_int = int(bars_since)
+                        except Exception:
+                            bars_int = 0
+                        bin_label = _bin_bars_since_level(bars_int)
 
                     elif key == "rsi_vs_ma":
                         start_idx = max(0, idx - window_bars + 1)
@@ -910,14 +970,42 @@ async def _process_family_raw(
                         ma_val = sum(window_vals) / len(window_vals)
                         delta = rsi_t - ma_val
                         feature_value = delta
+                        bin_label = _bin_rsi_vs_ma(delta)
 
                     elif key == "rsi_extremum":
                         start_idx = max(0, idx - window_bars + 1)
                         window_vals = [v for _, v in series_for_symbol[start_idx : idx + 1]]
                         if len(window_vals) < 3:
                             continue
+
                         current = rsi_t
                         feature_value = current
+
+                        local_min = current == min(window_vals)
+                        local_max = current == max(window_vals)
+                        spread = max(window_vals) - min(window_vals)
+
+                        if not local_min and not local_max:
+                            ext_type = "Flat"
+                        else:
+                            if local_min:
+                                sorted_vals = sorted(window_vals)
+                                second = sorted_vals[1]
+                                diff = second - current
+                                if diff >= 5.0 and spread >= 10.0:
+                                    ext_type = "StrongMin"
+                                else:
+                                    ext_type = "WeakMin"
+                            else:
+                                sorted_vals = sorted(window_vals, reverse=True)
+                                second = sorted_vals[1]
+                                diff = current - second
+                                if diff >= 5.0 and spread >= 10.0:
+                                    ext_type = "StrongMax"
+                                else:
+                                    ext_type = "WeakMax"
+
+                        bin_label = ext_type
 
                     else:
                         continue
@@ -931,17 +1019,18 @@ async def _process_family_raw(
 
                 rows_to_insert.append(
                     (
-                        position_id,             # position_id
-                        scenario_id,             # scenario_id
-                        signal_id,               # signal_id
-                        direction,               # direction
-                        timeframe,               # timeframe (анализатора)
-                        family_key,              # family_key ('rsi')
-                        key,                     # key ('rsi_value', 'rsi_accel', ...)
-                        feature_name,            # feature_name как в бинах
-                        feature_value,           # feature_value (numeric)
-                        pnl_abs,                 # pnl_abs
-                        is_win,                  # is_win
+                        position_id,   # position_id
+                        scenario_id,   # scenario_id
+                        signal_id,     # signal_id
+                        direction,     # direction
+                        timeframe,     # timeframe (анализатора)
+                        family_key,    # family_key ('rsi')
+                        key,           # key ('rsi_value', 'rsi_accel', ...)
+                        feature_name,  # feature_name как в бинах
+                        bin_label,     # bin_label (может быть None)
+                        feature_value, # feature_value (numeric)
+                        pnl_abs,       # pnl_abs
+                        is_win,        # is_win
                     )
                 )
 
@@ -957,6 +1046,7 @@ async def _process_family_raw(
                         family_key,
                         key,
                         feature_name,
+                        bin_label,
                         feature_value,
                         pnl_abs,
                         is_win,
@@ -965,7 +1055,7 @@ async def _process_family_raw(
                     VALUES (
                         $1, $2, $3, $4, $5,
                         $6, $7, $8, $9, $10,
-                        $11, now()
+                        $11, $12, now()
                     )
                     """,
                     rows_to_insert,
