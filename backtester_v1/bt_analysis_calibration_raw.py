@@ -320,7 +320,7 @@ def _find_rsi_value_bin_label(value: float) -> Optional[str]:
 
 # 🔸 Публичная точка входа: воркер калибровки сырых фич
 async def run_bt_analysis_calibration_raw(pg, redis):
-    log.info("BT_ANALYSIS_CALIB_RAW: воркер калибровки сырых фич запущен")
+    log.debug("BT_ANALYSIS_CALIB_RAW: воркер калибровки сырых фич запущен")
 
     # подготавливаем consumer group для стрима bt:analysis:ready
     await _ensure_consumer_group(redis)
@@ -355,7 +355,7 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                     analysis_ids = ctx["analysis_ids"]
                     version = ctx["version"]
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_CALIB_RAW: получено сообщение о готовности анализа "
                         "scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
@@ -395,7 +395,7 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                                 "finished_at": finished_at.isoformat(),
                             },
                         )
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_CALIB_RAW: опубликовано событие в '%s' для scenario_id=%s, signal_id=%s, "
                             "family=%s, analysis_ids=%s, rows_written=%s, finished_at=%s",
                             CALIB_READY_STREAM_KEY,
@@ -420,7 +420,7 @@ async def run_bt_analysis_calibration_raw(pg, redis):
 
                     await redis.xack(ANALYSIS_READY_STREAM_KEY, CALIB_CONSUMER_GROUP, entry_id)
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_CALIB_RAW: сообщение stream_id=%s для scenario_id=%s, signal_id=%s "
                         "обработано, строк в bt_position_features_raw записано=%s",
                         entry_id,
@@ -429,7 +429,7 @@ async def run_bt_analysis_calibration_raw(pg, redis):
                         rows_written,
                     )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_RAW: пакет сообщений обработан — сообщений=%s, пар_сценарий_сигнал=%s, "
                 "строк_в_bt_position_features_raw=%s",
                 total_msgs,
@@ -463,7 +463,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_RAW: consumer group '%s' для стрима '%s' уже существует",
                 CALIB_CONSUMER_GROUP,
                 ANALYSIS_READY_STREAM_KEY,
@@ -724,7 +724,7 @@ async def _process_family_raw(
 
             feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_RAW: сбор сырых фич для analysis_id=%s, family=%s, key=%s, "
                 "feature_name=%s, timeframe=%s, scenario_id=%s, signal_id=%s",
                 aid,
@@ -1063,7 +1063,7 @@ async def _process_family_raw(
 
                 total_rows_written += len(rows_to_insert)
 
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_CALIB_RAW: для analysis_id=%s, feature_name=%s записано сырых строк=%s",
                     aid,
                     feature_name,

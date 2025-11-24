@@ -61,7 +61,7 @@ LR_ANGLE_EPS = 0.005  # небольшой порог для "flat"
 
 # 🔸 Публичная точка входа: оркестратор аналитики сценариев
 async def run_bt_scenarios_analysis(pg, redis) -> None:
-    log.info("BT_SCENARIOS_ANALYSIS: воркер аналитики сценариев запущен")
+    log.debug("BT_SCENARIOS_ANALYSIS: воркер аналитики сценариев запущен")
 
     await _ensure_consumer_group(redis)
 
@@ -97,7 +97,7 @@ async def run_bt_scenarios_analysis(pg, redis) -> None:
                     skipped = ctx.get("skipped")
                     errors = ctx.get("errors")
 
-                    log.info(
+                    log.debug(
                         "BT_SCENARIOS_ANALYSIS: получено сообщение о завершении постпроцессинга "
                         "scenario_id=%s, signal_id=%s, processed=%s, skipped=%s, errors=%s, finished_at=%s, stream_id=%s",
                         scenario_id,
@@ -116,7 +116,7 @@ async def run_bt_scenarios_analysis(pg, redis) -> None:
                     # помечаем сообщение как обработанное
                     await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
 
-            log.info(
+            log.debug(
                 "BT_SCENARIOS_ANALYSIS: пакет сообщений обработан — сообщений=%s, сценариев=%s",
                 total_msgs,
                 total_scenarios_processed,
@@ -141,7 +141,7 @@ async def _ensure_consumer_group(redis) -> None:
             id="$",
             mkstream=True,
         )
-        log.info(
+        log.debug(
             "BT_SCENARIOS_ANALYSIS: создана consumer group '%s' для стрима '%s'",
             ANALYSIS_CONSUMER_GROUP,
             ANALYSIS_STREAM_KEY,
@@ -149,7 +149,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_SCENARIOS_ANALYSIS: consumer group '%s' для стрима '%s' уже существует",
                 ANALYSIS_CONSUMER_GROUP,
                 ANALYSIS_STREAM_KEY,
@@ -241,7 +241,7 @@ def _parse_postproc_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
 
 # 🔸 Запуск анализа для одного сценария/сигнала
 async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> None:
-    log.info(
+    log.debug(
         "BT_SCENARIOS_ANALYSIS: старт анализа для scenario_id=%s, signal_id=%s",
         scenario_id,
         signal_id,
@@ -276,7 +276,7 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
         )
 
     if not rows:
-        log.info(
+        log.debug(
             "BT_SCENARIOS_ANALYSIS: нет позиций для анализа (scenario_id=%s, signal_id=%s)",
             scenario_id,
             signal_id,
@@ -284,7 +284,7 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
         return
 
     total_positions = len(rows)
-    log.info(
+    log.debug(
         "BT_SCENARIOS_ANALYSIS: загружено позиций для анализа: %s (scenario_id=%s, signal_id=%s)",
         total_positions,
         scenario_id,
@@ -502,7 +502,7 @@ async def _run_analysis_for_scenario(pg, scenario_id: int, signal_id: int) -> No
                 pnl_abs=pnl_abs,
             )
 
-    log.info(
+    log.debug(
         "BT_SCENARIOS_ANALYSIS: анализ завершён для scenario_id=%s, signal_id=%s — "
         "позиций всего=%s, пропущено=%s, бинов=%s",
         scenario_id,
@@ -686,7 +686,7 @@ async def _write_feature_bins(
     stats: Dict[Tuple[str, str, str], Dict[str, Any]],
 ) -> None:
     if not stats:
-        log.info(
+        log.debug(
             "BT_SCENARIOS_ANALYSIS: нет данных для записи в bt_scenario_feature_bins (scenario_id=%s, signal_id=%s)",
             scenario_id,
             signal_id,
@@ -774,7 +774,7 @@ async def _write_feature_bins(
             rows_to_insert,
         )
 
-    log.info(
+    log.debug(
         "BT_SCENARIOS_ANALYSIS: записано строк в bt_scenario_feature_bins=%s для scenario_id=%s, signal_id=%s",
         len(rows_to_insert),
         scenario_id,

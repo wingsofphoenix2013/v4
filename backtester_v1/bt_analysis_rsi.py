@@ -324,7 +324,7 @@ async def run_analysis_rsi(
     analysis_instances: List[Dict[str, Any]],
     pg,
 ) -> None:
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI: старт анализа RSI для scenario_id=%s, signal_id=%s, инстансов=%s",
         scenario_id,
         signal_id,
@@ -395,7 +395,7 @@ async def run_analysis_rsi(
             }
         )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI: для scenario_id=%s, signal_id=%s загружено позиций=%s",
         scenario_id,
         signal_id,
@@ -438,7 +438,7 @@ async def run_analysis_rsi(
             )
             continue
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI: inst_id=%s — старт расчёта key=%s, timeframe=%s, source_key=%s",
             inst_id,
             key,
@@ -511,7 +511,7 @@ async def run_analysis_rsi(
                 key,
             )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI: анализ RSI завершён для scenario_id=%s, signal_id=%s",
         scenario_id,
         signal_id,
@@ -1016,7 +1016,7 @@ async def _write_bins(
     inst_id: int,
 ) -> None:
     if not agg:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s — нет данных для записи (agg пустой), "
             "очищаем старые бины",
             inst_id,
@@ -1118,7 +1118,7 @@ async def _write_bins(
                 rows_to_insert,
             )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s, timeframe=%s — бинов записано=%s",
         inst_id,
         feature_name,

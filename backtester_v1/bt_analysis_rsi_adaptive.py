@@ -76,7 +76,7 @@ def _find_bin_for_value(
 
 # 🔸 Публичная точка входа: воркер адаптивного анализа RSI (слушает bt:analysis:adaptive:ready)
 async def run_bt_analysis_rsi_adaptive_worker(pg, redis):
-    log.info("BT_ANALYSIS_RSI_ADAPTIVE: воркер адаптивного анализа запущен")
+    log.debug("BT_ANALYSIS_RSI_ADAPTIVE: воркер адаптивного анализа запущен")
 
     # подготавливаем consumer group для стрима bt:analysis:adaptive:ready
     await _ensure_consumer_group(redis)
@@ -109,7 +109,7 @@ async def run_bt_analysis_rsi_adaptive_worker(pg, redis):
                     analysis_ids = ctx["analysis_ids"]
                     version = ctx["version"]
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_RSI_ADAPTIVE: получено сообщение о готовности бин-конфигов "
                         "scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
@@ -141,7 +141,7 @@ async def run_bt_analysis_rsi_adaptive_worker(pg, redis):
                         analysis_instances.append(inst)
 
                     if not analysis_instances:
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_RSI_ADAPTIVE: нет валидных инстансов анализа RSI для scenario_id=%s, signal_id=%s",
                             scenario_id,
                             signal_id,
@@ -174,7 +174,7 @@ async def run_bt_analysis_rsi_adaptive_worker(pg, redis):
                                 "finished_at": finished_at.isoformat(),
                             },
                         )
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_RSI_ADAPTIVE: опубликовано событие в '%s' для scenario_id=%s, signal_id=%s, "
                             "family=%s, version=%s, analysis_ids=%s, finished_at=%s",
                             ANALYSIS_READY_STREAM_KEY,
@@ -200,7 +200,7 @@ async def run_bt_analysis_rsi_adaptive_worker(pg, redis):
 
                     await redis.xack(ADAPTIVE_READY_STREAM_KEY, ADAPTIVE_CONSUMER_GROUP, entry_id)
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_RSI_ADAPTIVE: пакет сообщений обработан — сообщений=%s, пар_сценарий_сигнал=%s",
                 total_msgs,
                 total_pairs,
@@ -232,7 +232,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_RSI_ADAPTIVE: consumer group '%s' для стрима '%s' уже существует",
                 ADAPTIVE_CONSUMER_GROUP,
                 ADAPTIVE_READY_STREAM_KEY,
@@ -335,7 +335,7 @@ async def run_analysis_rsi_adaptive(
     pg,
     redis,  # оставляем для совместимости сигнатур, но здесь не используем
 ) -> None:
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI_ADAPTIVE: старт адаптивного анализа RSI для scenario_id=%s, signal_id=%s, "
         "инстансов=%s, version=%s",
         scenario_id,
@@ -383,7 +383,7 @@ async def run_analysis_rsi_adaptive(
 
         feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI_ADAPTIVE: inst_id=%s — анализ key=%s, timeframe=%s, source_key=%s, "
             "feature_name=%s, version=%s",
             inst_id,
@@ -418,7 +418,7 @@ async def run_analysis_rsi_adaptive(
             )
 
         if not bin_rows:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_RSI_ADAPTIVE: inst_id=%s, feature_name=%s — нет адаптивных бинов для version=%s, "
                 "scenario_id=%s, signal_id=%s",
                 inst_id,
@@ -523,7 +523,7 @@ async def run_analysis_rsi_adaptive(
             bin_stat["pnl_abs_total"] += pnl_abs
 
         if not agg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_RSI_ADAPTIVE: inst_id=%s, feature_name=%s, version=%s — нет данных для записи "
                 "(agg пустой)",
                 inst_id,
@@ -636,7 +636,7 @@ async def run_analysis_rsi_adaptive(
                     rows_to_insert,
                 )
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI_ADAPTIVE: inst_id=%s, feature_name=%s, timeframe=%s, version=%s — бинов записано=%s",
             inst_id,
             feature_name,
@@ -645,7 +645,7 @@ async def run_analysis_rsi_adaptive(
             len(rows_to_insert),
         )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI_ADAPTIVE: адаптивный анализ RSI завершён для scenario_id=%s, signal_id=%s, version=%s",
         scenario_id,
         signal_id,
