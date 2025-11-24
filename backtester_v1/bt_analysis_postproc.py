@@ -553,6 +553,7 @@ async def _process_analysis_family(
                 version,
                 base_trades,
                 float(base_winrate),
+                float(base_roi),
                 selected_trades,
                 float(selected_winrate),
                 float(selected_roi),
