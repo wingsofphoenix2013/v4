@@ -7,7 +7,7 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional
 
 # 🔸 Кеши backtester_v1 (анализаторы)
-from backtester_config import get_analysis_instance
+from backtester_config import get_analysis_instance, get_scenario_instance
 
 # 🔸 Настройки Decimal
 getcontext().prec = 28
@@ -283,7 +283,7 @@ async def _process_analysis_family(
     async with pg.acquire() as conn:
         base_rows = await conn.fetch(
             """
-            SELECT direction, trades, winrate
+            SELECT direction, trades, winrate, pnl_abs
             FROM bt_scenario_stat
             WHERE scenario_id = $1
               AND signal_id   = $2
@@ -309,10 +309,32 @@ async def _process_analysis_family(
         base_by_dir[direction] = {
             "trades": int(r["trades"]),
             "winrate": Decimal(str(r["winrate"])),
+            "pnl_abs": Decimal(str(r["pnl_abs"])),
         }
 
     if not base_by_dir:
         return 0
+
+    # загружаем депозит сценария для расчёта ROI
+    scenario = get_scenario_instance(scenario_id)
+    deposit: Optional[Decimal] = None
+
+    if scenario:
+        params = scenario.get("params") or {}
+        deposit_cfg = params.get("deposit")
+        if deposit_cfg is not None:
+            try:
+                deposit = Decimal(str(deposit_cfg.get("value")))
+            except Exception:
+                deposit = None
+
+    if deposit is None or deposit <= 0:
+        log.error(
+            "BT_ANALYSIS_POSTPROC: не удалось получить корректный deposit для scenario_id=%s, "
+            "ROI base/selected будет равен 0",
+            scenario_id,
+        )
+        deposit = None
 
     # 🔸 Полная очистка старых записей для этой связки/версии и этих анализаторов
     async with pg.acquire() as conn:
@@ -372,20 +394,27 @@ async def _process_analysis_family(
             signal_id,
         )
 
-        # по каждому направлению считаем uplift и coverage
+        # по каждому направлению считаем uplift, coverage и ROI
         for direction, base_stat in base_by_dir.items():
             base_trades = int(base_stat["trades"])
-            base_winrate = Decimal(base_stat["winrate"])
+            base_winrate = base_stat["winrate"]
+            base_pnl_abs = base_stat["pnl_abs"]
 
             # если нет базовых сделок — смысла нет
             if base_trades <= 0:
                 continue
 
+            # базовый ROI (по направлению) относительно депозита сценария
+            if deposit is not None and deposit != 0:
+                base_roi = _safe_div(base_pnl_abs, deposit)
+            else:
+                base_roi = Decimal("0")
+
             # загружаем все бины для этой фичи/TF/направления/версии
             async with pg.acquire() as conn:
                 bin_rows = await conn.fetch(
                     """
-                    SELECT trades, wins, winrate
+                    SELECT trades, wins, winrate, pnl_abs_total
                     FROM bt_scenario_feature_bins
                     WHERE scenario_id  = $1
                       AND signal_id    = $2
@@ -408,11 +437,13 @@ async def _process_analysis_family(
             # отбор бинов, winrate которых выше базовой линии + порог улучшения
             selected_trades = 0
             selected_wins = 0
+            selected_pnl_abs_total = Decimal("0")
 
             for r in bin_rows:
                 bin_trades = int(r["trades"])
                 bin_wins = int(r["wins"])
                 bin_winrate = Decimal(str(r["winrate"]))
+                bin_pnl_abs_total = Decimal(str(r["pnl_abs_total"]))
 
                 # условия достаточности и улучшения
                 if bin_trades <= 0:
@@ -424,6 +455,7 @@ async def _process_analysis_family(
 
                 selected_trades += bin_trades
                 selected_wins += bin_wins
+                selected_pnl_abs_total += bin_pnl_abs_total
 
             if selected_trades <= 0:
                 # нет бинов, которые дают заметное улучшение
@@ -450,6 +482,15 @@ async def _process_analysis_family(
             # считаем winrate по отобранным
             selected_winrate = _safe_div(Decimal(selected_wins), Decimal(selected_trades))
 
+            # считаем ROI по отобранным бинам
+            if deposit is not None and deposit != 0:
+                selected_roi = _safe_div(selected_pnl_abs_total, deposit)
+            else:
+                selected_roi = Decimal("0")
+
+            # пока окна анализа не реализованы — оставляем analysis_window = None (NULL в БД)
+            analysis_window: Optional[str] = None
+
             # пишем строку в bt_analysis_stat (старые мы уже удалили выше)
             async with pg.acquire() as conn:
                 await conn.execute(
@@ -466,14 +507,17 @@ async def _process_analysis_family(
                         base_winrate,
                         selected_trades,
                         selected_winrate,
+                        base_roi,
+                        selected_roi,
                         version,
+                        analysis_window,
                         created_at,
                         updated_at
                     )
                     VALUES (
                         $1, $2, $3, $4, $5,
                         $6, $7, $8, $9, $10, $11,
-                        $12,
+                        $12, $13, $14, $15,
                         now(), NULL
                     )
                     """,
@@ -488,7 +532,10 @@ async def _process_analysis_family(
                     _q4(base_winrate),
                     selected_trades,
                     _q4(selected_winrate),
+                    _q4(base_roi),
+                    _q4(selected_roi),
                     version,
+                    analysis_window,
                 )
 
             stats_written += 1
@@ -496,7 +543,8 @@ async def _process_analysis_family(
             log.info(
                 "BT_ANALYSIS_POSTPROC: записана строка в bt_analysis_stat: "
                 "scenario_id=%s, signal_id=%s, analysis_id=%s, direction=%s, timeframe=%s, version=%s, "
-                "base_trades=%s, base_winrate=%.4f, selected_trades=%s, selected_winrate=%.4f, coverage=%.4f",
+                "base_trades=%s, base_winrate=%.4f, base_roi=%.4f, "
+                "selected_trades=%s, selected_winrate=%.4f, selected_roi=%.4f, coverage=%.4f",
                 scenario_id,
                 signal_id,
                 aid,
@@ -507,6 +555,7 @@ async def _process_analysis_family(
                 float(base_winrate),
                 selected_trades,
                 float(selected_winrate),
+                float(selected_roi),
                 float(coverage),
             )
 
