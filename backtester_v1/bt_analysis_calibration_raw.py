@@ -924,13 +924,27 @@ async def _process_family_raw(
             tf_cfg = params.get("timeframe")
             source_cfg = params.get("source_key")
 
+            timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
+            source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else (
+                "rsi14" if inst_family == "rsi" else "atr14"
+            )
+
             if inst_family == "rsi":
-                timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-                source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
-                feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+                feature_name = _resolve_feature_name_for_rsi(
+                    key=key,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                )
+            elif inst_family == "atr" and key == "atr_multiscale_ratio":
+                higher_tf_cfg = params.get("higher_timeframe") or params.get("other_timeframe")
+                higher_tf_val = (
+                    higher_tf_cfg.get("value") if isinstance(higher_tf_cfg, dict) else higher_tf_cfg
+                )
+                higher_tf = str(higher_tf_val or "").strip() or "unknown"
+
+                # делаем feature_name уникальным по higher_timeframe
+                feature_name = f"{key}_{timeframe}_{higher_tf}_{source_key}"
             else:
-                timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-                source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "atr14"
                 feature_name = f"{key}_{timeframe}_{source_key}"
 
             log.debug(

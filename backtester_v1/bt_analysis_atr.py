@@ -758,7 +758,7 @@ async def run_analysis_atr(
         )
         return
 
-    # загружаем сценарий, чтобы взять deposit для расчёта ROI
+    # грузим сценарий, чтобы взять deposit для расчёта ROI
     scenario = get_scenario_instance(scenario_id)
     deposit: Optional[Decimal] = None
 
@@ -825,7 +825,7 @@ async def run_analysis_atr(
 
     # обрабатываем каждый инстанс анализа независимо
     for inst in analysis_instances:
-        family_key = inst.get("family_key")
+        family_key = (inst.get("family_key") or "").lower()
         key = inst.get("key")
         inst_id = inst.get("id")
         params = inst.get("params") or {}

@@ -323,13 +323,21 @@ async def _process_family_calibration(
 
         # разруливаем feature_name:
         # - для RSI сохраняем старую совместимость через _resolve_feature_name_for_rsi
-        # - для остальных (например, ATR) — общий формат
+        # - для ATR и остальных — общий формат, с отдельным кейсом для multiscale
         if inst_family == "rsi":
             feature_name = _resolve_feature_name_for_rsi(
                 key=key,
                 timeframe=timeframe,
                 source_key=source_key or "rsi14",
             )
+        elif inst_family == "atr" and key == "atr_multiscale_ratio":
+            higher_tf_cfg = params.get("higher_timeframe") or params.get("other_timeframe")
+            higher_tf_val = (
+                higher_tf_cfg.get("value") if isinstance(higher_tf_cfg, dict) else higher_tf_cfg
+            )
+            higher_tf = str(higher_tf_val or "").strip() or "unknown"
+
+            feature_name = f"{key}_{timeframe}_{higher_tf}_{source_key}"
         else:
             feature_name = f"{key}_{timeframe}_{source_key}"
 

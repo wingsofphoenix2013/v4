@@ -37,13 +37,13 @@ def _safe_div(n: Decimal, d: Decimal) -> Decimal:
         return Decimal("0")
     return n / d
 
-
 # 🔸 Разруливание feature_name по family/key/timeframe/source_key
 def _resolve_feature_name(
     family_key: str,
     key: str,
     timeframe: str,
     source_key: str,
+    higher_timeframe: Optional[str] = None,
 ) -> str:
     family_key_l = (family_key or "").lower()
     key_l = (key or "").lower()
@@ -58,9 +58,13 @@ def _resolve_feature_name(
             return f"rsi_zone_{timeframe}_{source_key}"
         return f"{key}_{timeframe}_{source_key}"
 
-    # для остальных семейств (например, ATR) используем общее правило
-    return f"{key}_{timeframe}_{source_key}"
+    # специальные кейсы для ATR
+    if family_key_l == "atr" and key_l == "atr_multiscale_ratio":
+        ht = (higher_timeframe or "").strip() or "unknown"
+        return f"{key}_{timeframe}_{ht}_{source_key}"
 
+    # для остальных семейств (например, ATR без multiscale) используем общее правило
+    return f"{key}_{timeframe}_{source_key}"
 
 # 🔸 Поиск бина для значения feature_value в списке [from_value, to_value)
 def _find_bin_for_value(
@@ -398,11 +402,20 @@ async def run_analysis_adaptive(
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
         source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else ""
 
+        higher_tf: Optional[str] = None
+        if (family_key or "").lower() == "atr" and (key or "").lower() == "atr_multiscale_ratio":
+            higher_tf_cfg = params.get("higher_timeframe") or params.get("other_timeframe")
+            higher_tf_val = (
+                higher_tf_cfg.get("value") if isinstance(higher_tf_cfg, dict) else higher_tf_cfg
+            )
+            higher_tf = str(higher_tf_val or "").strip() or "unknown"
+
         feature_name = _resolve_feature_name(
             family_key=family_key,
             key=key,
             timeframe=timeframe,
             source_key=source_key,
+            higher_timeframe=higher_tf,
         )
 
         log.debug(
