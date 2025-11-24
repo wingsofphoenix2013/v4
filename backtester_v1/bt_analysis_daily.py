@@ -184,7 +184,7 @@ def _resolve_feature_name_for_rsi(key: str, timeframe: str, source_key: str) -> 
     return f"{key}_{timeframe}_{source_key}"
 
 
-# 🔸 Суточный анализ одного семейства анализаторов для пары scenario_id/signal_id
+# 🔸 Суточный анализ одного семейства анализаторов для пары scenario_id/signal_id и версии
 async def _process_analysis_family_daily(
     pg,
     scenario_id: int,
@@ -387,12 +387,13 @@ async def _process_analysis_family_daily(
         if not raw_rows:
             log.debug(
                 "BT_ANALYSIS_DAILY: нет сырых значений фич для analysis_id=%s, feature_name=%s, "
-                "scenario_id=%s, signal_id=%s, timeframe=%s",
+                "scenario_id=%s, signal_id=%s, timeframe=%s, version=%s",
                 aid,
                 feature_name,
                 scenario_id,
                 signal_id,
                 timeframe,
+                version,
             )
             continue
 
@@ -540,10 +541,12 @@ async def _process_analysis_family_daily(
 
                 is_selected = False
 
+                # v2: по числовым интервалам
                 if version == "v2":
                     if _value_in_selected_bins(fv, selected_bins_v2):
                         is_selected = True
                 else:
+                    # v1: по bin_label из raw
                     if bin_label_str is not None and bin_label_str in selected_labels_v1:
                         is_selected = True
 
@@ -750,6 +753,7 @@ async def run_bt_analysis_daily(pg, redis):
                         entry_id,
                     )
 
+                    # работаем только с RSI
                     if family_key != "rsi":
                         log.debug(
                             "BT_ANALYSIS_DAILY: family_key=%s пока не поддерживается, "
@@ -771,15 +775,40 @@ async def run_bt_analysis_daily(pg, redis):
                         await redis.xack(ANALYSIS_POSTPROC_READY_STREAM_KEY, ANALYSIS_DAILY_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # считаем суточную аналитику для связки scenario+signal+analysis_ids+version
-                    rows_written = await _process_analysis_family_daily(
+                    # 🔸 Ключевое изменение:
+                    # daily запускаем ТОЛЬКО на v2-сообщении, и по нему считаем и v1, и v2
+                    if version != "v2":
+                        log.debug(
+                            "BT_ANALYSIS_DAILY: пропускаем сообщение version=%s "
+                            "(ожидаем 'v2' для запуска суточного анализа), scenario_id=%s, signal_id=%s",
+                            version,
+                            scenario_id,
+                            signal_id,
+                        )
+                        await redis.xack(ANALYSIS_POSTPROC_READY_STREAM_KEY, ANALYSIS_DAILY_CONSUMER_GROUP, entry_id)
+                        continue
+
+                    # сначала считаем daily для v1
+                    rows_v1 = await _process_analysis_family_daily(
                         pg=pg,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         family_key=family_key,
                         analysis_ids=analysis_ids,
-                        version=version,
+                        version="v1",
                     )
+
+                    # затем для v2
+                    rows_v2 = await _process_analysis_family_daily(
+                        pg=pg,
+                        scenario_id=scenario_id,
+                        signal_id=signal_id,
+                        family_key=family_key,
+                        analysis_ids=analysis_ids,
+                        version="v2",
+                    )
+
+                    rows_written = rows_v1 + rows_v2
                     total_pairs += 1
                     total_rows_written += rows_written
 
@@ -788,12 +817,14 @@ async def run_bt_analysis_daily(pg, redis):
 
                     log.info(
                         "BT_ANALYSIS_DAILY: сообщение stream_id=%s для scenario_id=%s, signal_id=%s, version=%s "
-                        "обработано, строк_в_bt_analysis_daily=%s",
+                        "обработано, строк_в_bt_analysis_daily=%s (v1=%s, v2=%s)",
                         entry_id,
                         scenario_id,
                         signal_id,
                         version,
                         rows_written,
+                        rows_v1,
+                        rows_v2,
                     )
 
             log.info(
