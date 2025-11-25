@@ -541,7 +541,7 @@ async def _process_analysis_stability_for_window(
 
         rows_written += 1
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_STABILITY: записана стабильность для scenario_id=%s, signal_id=%s, "
             "analysis_id=%s, dir=%s, tf=%s, version=%s, window_days=%s, score=%s",
             scenario_id,
@@ -648,7 +648,7 @@ async def run_bt_analysis_stability(pg, redis):
                     # помечаем сообщение как обработанное
                     await redis.xack(DAILY_READY_STREAM_KEY, STABILITY_CONSUMER_GROUP, entry_id)
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_STABILITY: сообщение stream_id=%s для scenario_id=%s, signal_id=%s "
                         "обработано, строк_в_bt_analysis_stability=%s",
                         entry_id,

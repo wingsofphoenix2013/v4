@@ -433,7 +433,7 @@ async def _process_analysis_family(
             source_key=source_key,
         )
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_POSTPROC: анализ postproc для analysis_id=%s, family=%s, key=%s, "
             "feature_name=%s, timeframe=%s, version=%s, scenario_id=%s, signal_id=%s",
             aid,
@@ -592,7 +592,7 @@ async def _process_analysis_family(
 
             stats_written += 1
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_POSTPROC: записана строка в bt_analysis_stat: "
                 "scenario_id=%s, signal_id=%s, analysis_id=%s, direction=%s, timeframe=%s, version=%s, "
                 "base_trades=%s, base_winrate=%.4f, base_roi=%.4f, "

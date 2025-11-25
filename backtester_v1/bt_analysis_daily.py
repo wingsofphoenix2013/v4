@@ -340,7 +340,7 @@ async def _process_analysis_family_daily(
             source_key=source_key,
         )
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_DAILY: старт суточного анализа для analysis_id=%s, family=%s, key=%s, "
             "feature_name=%s, timeframe=%s, version=%s, scenario_id=%s, signal_id=%s",
             aid,
@@ -443,9 +443,8 @@ async def _process_analysis_family_daily(
                 )
                 continue
 
-            # определяем "хорошие" бины по глобальной базовой линии
-            selected_bins_v2: List[Tuple[Optional[float], Optional[float]]] = []
-            selected_labels_v1: List[str] = []
+            # определяем "хорошие" бины по глобальной базовой линии (для v1 и v2 одинаково)
+            selected_ranges: List[Tuple[Optional[float], Optional[float]]] = []
             selected_trades_overall = 0
 
             for r in bin_rows:
@@ -462,8 +461,6 @@ async def _process_analysis_family_daily(
 
                 selected_trades_overall += bin_trades
 
-                bin_label = r["bin_label"]
-
                 bin_from_val = r["bin_from"]
                 bin_to_val = r["bin_to"]
 
@@ -477,13 +474,9 @@ async def _process_analysis_family_daily(
                 except Exception:
                     b_to = None
 
-                if version == "v2":
-                    selected_bins_v2.append((b_from, b_to))
-                else:
-                    if bin_label:
-                        selected_labels_v1.append(str(bin_label))
+                selected_ranges.append((b_from, b_to))
 
-            if selected_trades_overall <= 0:
+            if selected_trades_overall <= 0 or not selected_ranges:
                 continue
 
             coverage_overall = _safe_div(Decimal(selected_trades_overall), Decimal(base_trades_overall))
@@ -499,17 +492,6 @@ async def _process_analysis_family_daily(
                     float(MIN_COVERAGE),
                     selected_trades_overall,
                     base_trades_overall,
-                )
-                continue
-
-            if version != "v2" and not selected_labels_v1:
-                log.debug(
-                    "BT_ANALYSIS_DAILY: analysis_id=%s, feature=%s, direction=%s, version=%s — "
-                    "нет выбранных bin_label для v1, суточная аналитика не будет посчитана",
-                    aid,
-                    feature_name,
-                    direction,
-                    version,
                 )
                 continue
 
@@ -535,21 +517,8 @@ async def _process_analysis_family_daily(
                 except Exception:
                     continue
 
-                bin_label_raw = r["bin_label"]
-                bin_label_str = str(bin_label_raw) if bin_label_raw is not None else None
-
-                is_selected = False
-
-                # v2: по числовым интервалам
-                if version == "v2":
-                    if _value_in_selected_bins(fv, selected_bins_v2):
-                        is_selected = True
-                else:
-                    # v1: по bin_label из raw
-                    if bin_label_str is not None and bin_label_str in selected_labels_v1:
-                        is_selected = True
-
-                if not is_selected:
+                # выбор по числовым интервалам (для v1 и v2 одинаково)
+                if not _value_in_selected_bins(fv, selected_ranges):
                     continue
 
                 pnl_abs_raw = r["pnl_abs"]
@@ -689,7 +658,7 @@ async def _process_analysis_family_daily(
             rows_written = len(rows_to_insert)
             rows_written_total += rows_written
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_DAILY: записано строк в bt_analysis_daily=%s для "
                 "scenario_id=%s, signal_id=%s, analysis_id=%s, direction=%s, timeframe=%s, version=%s",
                 rows_written,
@@ -702,7 +671,6 @@ async def _process_analysis_family_daily(
             )
 
     return rows_written_total
-
 
 # 🔸 Публичная точка входа: воркер суточного анализа анализаторов
 async def run_bt_analysis_daily(pg, redis):
