@@ -331,7 +331,7 @@ async def _process_family_calibration(
             source_key=source_key,
         )
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_CALIB_PROC: калибровка фичи для analysis_id=%s, family=%s, key=%s, "
             "feature_name=%s, timeframe=%s, source_key=%s, scenario_id=%s, signal_id=%s",
             aid,
@@ -487,7 +487,7 @@ async def _process_family_calibration(
 
         features_calibrated += 1
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_CALIB_PROC: записаны адаптивные бины для feature_name=%s "
             "(analysis_id=%s, scenario_id=%s, signal_id=%s, version=%s, bins=%s)",
             feature_name,
