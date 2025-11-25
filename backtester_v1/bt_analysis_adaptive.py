@@ -27,8 +27,8 @@ ADAPTIVE_CONSUMER_NAME = "bt_analysis_adaptive_main"
 ADAPTIVE_STREAM_BATCH_SIZE = 10
 ADAPTIVE_STREAM_BLOCK_MS = 5000
 
-# 🔸 Поддерживаемые семейства для адаптивного анализа (пока только RSI)
-SUPPORTED_FAMILIES_ADAPTIVE = {"rsi"}
+# 🔸 Поддерживаемые семейства для адаптивного анализа
+SUPPORTED_FAMILIES_ADAPTIVE = {"rsi", "adx"}
 
 
 # 🔸 Квантование чисел до 4 знаков

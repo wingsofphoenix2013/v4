@@ -5,8 +5,9 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-# 🔸 Калибровщики семейств (Rsi и будущие)
+# 🔸 Импорты семейств калибровки сырых фич
 from bt_analysis_calibration_rsi import run_calibration_rsi_raw
+from bt_analysis_calibration_adx import run_calibration_adx_raw
 
 log = logging.getLogger("BT_ANALYSIS_CALIB_RAW")
 
@@ -20,9 +21,10 @@ CALIB_CONSUMER_NAME = "bt_analysis_calib_raw_main"
 CALIB_STREAM_BATCH_SIZE = 10
 CALIB_STREAM_BLOCK_MS = 5000
 
-# 🔸 Реестр калибровщиков по семействам
+# 🔸 Регистр обработчиков семей для калибровки
 FAMILY_CALIBRATION_HANDLERS = {
     "rsi": run_calibration_rsi_raw,
+    "adx": run_calibration_adx_raw,
 }
 
 
