@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # 🔸 Кеши backtester_v1 (анализаторы)
 from backtester_config import get_analysis_instance
 
+# 🔸 Утилиты анализа фич
+from bt_analysis_utils import resolve_feature_name
+
 # 🔸 Настройки Decimal
 getcontext().prec = 28
 
@@ -321,7 +324,12 @@ async def _process_family_calibration(
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
         source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
 
-        feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+        feature_name = resolve_feature_name(
+            family_key=family_key,
+            key=key,
+            timeframe=timeframe,
+            source_key=source_key,
+        )
 
         log.info(
             "BT_ANALYSIS_CALIB_PROC: калибровка фичи для analysis_id=%s, family=%s, key=%s, "
@@ -532,14 +540,3 @@ def _build_quantile_bins(
         )
 
     return bins
-
-
-# 🔸 Разруливание feature_name для RSI по key/timeframe/source_key (должно совпадать с bt_analysis_rsi)
-def _resolve_feature_name_for_rsi(key: str, timeframe: str, source_key: str) -> str:
-    if key == "rsi_value":
-        return f"rsi_value_{timeframe}_{source_key}"
-    if key == "rsi_dist_from_50":
-        return f"rsi_dist_from_50_{timeframe}_{source_key}"
-    if key == "rsi_zone":
-        return f"rsi_zone_{timeframe}_{source_key}"
-    return f"{key}_{timeframe}_{source_key}"

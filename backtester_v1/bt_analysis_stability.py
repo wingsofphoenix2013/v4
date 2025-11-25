@@ -38,6 +38,8 @@ MIN_BASE_TRADES_PER_WINDOW = {
     28: 400,
 }
 
+# 🔸 Поддерживаемые семейства анализаторов
+SUPPORTED_FAMILIES = {"rsi"}
 
 # 🔸 Квантование до 4 знаков
 def _q4(value: Decimal) -> Decimal:
@@ -601,8 +603,8 @@ async def run_bt_analysis_stability(pg, redis):
                         entry_id,
                     )
 
-                    # пока работаем только с RSI
-                    if family_key != "rsi":
+                    # пока работаем только с поддерживаемыми семействами
+                    if family_key not in SUPPORTED_FAMILIES:
                         log.debug(
                             "BT_ANALYSIS_STABILITY: family_key=%s пока не поддерживается, "
                             "scenario_id=%s, signal_id=%s",

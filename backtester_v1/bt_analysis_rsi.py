@@ -4,11 +4,14 @@ import json
 import logging
 from collections import defaultdict
 from datetime import timedelta
-from decimal import Decimal, ROUND_DOWN, getcontext
+from decimal import Decimal, getcontext
 from typing import Any, Dict, List, Tuple, Optional
 
 # 🔸 Кеши backtester_v1 (сценарии и индикаторы)
 from backtester_config import get_scenario_instance, get_all_indicator_instances
+
+# 🔸 Утилиты анализа фич
+from bt_analysis_utils import resolve_feature_name, write_feature_bins
 
 # 🔸 Настройки Decimal
 getcontext().prec = 28
@@ -21,39 +24,6 @@ TF_STEP_MINUTES = {
     "m15": 15,
     "h1": 60,
 }
-
-
-# 🔸 Квантование чисел до 4 знаков
-def _q4(value: Decimal) -> Decimal:
-    return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
-
-
-# 🔸 Безопасное деление
-def _safe_div(n: Decimal, d: Decimal) -> Decimal:
-    if d == 0:
-        return Decimal("0")
-    return n / d
-
-
-# 🔸 Бины по абсолютному значению RSI (0–100)
-def _default_rsi_value_bins() -> List[Tuple[float, float, str]]:
-    return [
-        (0.0, 20.0, "RSI_0_20"),
-        (20.0, 30.0, "RSI_20_30"),
-        (30.0, 40.0, "RSI_30_40"),
-        (40.0, 50.0, "RSI_40_50"),
-        (50.0, 60.0, "RSI_50_60"),
-        (60.0, 70.0, "RSI_60_70"),
-        (70.0, 100.0001, "RSI_70_100"),
-    ]
-
-
-# 🔸 Поиск бина для конкретного значения RSI
-def _find_bin(value: float, bins: List[Tuple[float, float, str]]) -> Optional[Tuple[float, float, str]]:
-    for b_from, b_to, label in bins:
-        if b_from <= value < b_to:
-            return b_from, b_to, label
-    return None
 
 
 # 🔸 Извлечение значения RSI из raw_stat с учётом TF и ключа
@@ -221,6 +191,27 @@ def _find_index_leq(series: List[Tuple[Any, float]], entry_time) -> Optional[int
             hi = mid - 1
 
     return idx
+
+
+# 🔸 Бины по абсолютному значению RSI (0–100)
+def _default_rsi_value_bins() -> List[Tuple[float, float, str]]:
+    return [
+        (0.0, 20.0, "RSI_0_20"),
+        (20.0, 30.0, "RSI_20_30"),
+        (30.0, 40.0, "RSI_30_40"),
+        (40.0, 50.0, "RSI_40_50"),
+        (50.0, 60.0, "RSI_50_60"),
+        (60.0, 70.0, "RSI_60_70"),
+        (70.0, 100.0001, "RSI_70_100"),
+    ]
+
+
+# 🔸 Поиск бина для конкретного значения RSI
+def _find_bin(value: float, bins: List[Tuple[float, float, str]]) -> Optional[Tuple[float, float, str]]:
+    for b_from, b_to, label in bins:
+        if b_from <= value < b_to:
+            return b_from, b_to, label
+    return None
 
 
 # 🔸 Биннинг для rsi_dist_from_50
@@ -529,7 +520,7 @@ async def _analyze_rsi_value(
     deposit: Optional[Decimal],
     inst_id: int,
 ) -> None:
-    feature_name = f"rsi_value_{timeframe}_{source_key}"
+    feature_name = resolve_feature_name("rsi", "rsi_value", timeframe, source_key)
     bins = _default_rsi_value_bins()
     agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -576,8 +567,8 @@ async def _analyze_rsi_value(
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
 
-    await _write_bins(
-        pg=pg,
+    await write_feature_bins(
+        pg,
         scenario_id=scenario_id,
         signal_id=signal_id,
         timeframe=timeframe,
@@ -585,6 +576,7 @@ async def _analyze_rsi_value(
         agg=agg,
         deposit=deposit,
         inst_id=inst_id,
+        logger=log,
     )
 
 
@@ -599,7 +591,7 @@ async def _analyze_rsi_dist_from_50(
     deposit: Optional[Decimal],
     inst_id: int,
 ) -> None:
-    feature_name = f"rsi_dist_from_50_{timeframe}_{source_key}"
+    feature_name = resolve_feature_name("rsi", "rsi_dist_from_50", timeframe, source_key)
     agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for p in positions:
@@ -641,8 +633,8 @@ async def _analyze_rsi_dist_from_50(
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
 
-    await _write_bins(
-        pg=pg,
+    await write_feature_bins(
+        pg,
         scenario_id=scenario_id,
         signal_id=signal_id,
         timeframe=timeframe,
@@ -650,6 +642,7 @@ async def _analyze_rsi_dist_from_50(
         agg=agg,
         deposit=deposit,
         inst_id=inst_id,
+        logger=log,
     )
 
 
@@ -664,7 +657,7 @@ async def _analyze_rsi_zone(
     deposit: Optional[Decimal],
     inst_id: int,
 ) -> None:
-    feature_name = f"rsi_zone_{timeframe}_{source_key}"
+    feature_name = resolve_feature_name("rsi", "rsi_zone", timeframe, source_key)
     agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for p in positions:
@@ -706,8 +699,8 @@ async def _analyze_rsi_zone(
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
 
-    await _write_bins(
-        pg=pg,
+    await write_feature_bins(
+        pg,
         scenario_id=scenario_id,
         signal_id=signal_id,
         timeframe=timeframe,
@@ -715,6 +708,7 @@ async def _analyze_rsi_zone(
         agg=agg,
         deposit=deposit,
         inst_id=inst_id,
+        logger=log,
     )
 
 
@@ -766,14 +760,13 @@ async def _analyze_rsi_history_based(
         window_bars=window_bars,
     )
 
-    feature_name = f"{key}_{timeframe}_{source_key}"
+    feature_name = resolve_feature_name("rsi", key, timeframe, source_key)
     agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for p in positions:
         symbol = p["symbol"]
         direction = p["direction"]
         entry_time = p["entry_time"]
-        raw_stat = p["raw_stat"]
         pnl_abs_raw = p["pnl_abs"]
 
         if direction is None or pnl_abs_raw is None:
@@ -806,6 +799,7 @@ async def _analyze_rsi_history_based(
 
             # считаем длительность (баров подряд) в этой зоне назад
             duration = 1
+
             # условия зоны — по rsi_t
             z1_low, z1_high = 0.0, 30.0
             z2_low, z2_high = 30.0, 40.0
@@ -992,8 +986,8 @@ async def _analyze_rsi_history_based(
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
 
-    await _write_bins(
-        pg=pg,
+    await write_feature_bins(
+        pg,
         scenario_id=scenario_id,
         signal_id=signal_id,
         timeframe=timeframe,
@@ -1001,127 +995,5 @@ async def _analyze_rsi_history_based(
         agg=agg,
         deposit=deposit,
         inst_id=inst_id,
-    )
-
-
-# 🔸 Универсальная запись агрегатов в bt_scenario_feature_bins
-async def _write_bins(
-    pg,
-    scenario_id: int,
-    signal_id: int,
-    timeframe: str,
-    feature_name: str,
-    agg: Dict[Tuple[str, str], Dict[str, Any]],
-    deposit: Optional[Decimal],
-    inst_id: int,
-) -> None:
-    if not agg:
-        log.debug(
-            "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s — нет данных для записи (agg пустой), "
-            "очищаем старые бины",
-            inst_id,
-            feature_name,
-        )
-        async with pg.acquire() as conn:
-            await conn.execute(
-                """
-                DELETE FROM bt_scenario_feature_bins
-                WHERE scenario_id  = $1
-                  AND signal_id    = $2
-                  AND timeframe    = $3
-                  AND feature_name = $4
-                """,
-                scenario_id,
-                signal_id,
-                timeframe,
-                feature_name,
-            )
-        return
-
-    rows_to_insert: List[Tuple[Any, ...]] = []
-
-    for (direction, bin_label), stat in agg.items():
-        trades = stat["trades"]
-        wins = stat["wins"]
-        losses = stat["losses"]
-        pnl_abs_total = stat["pnl_abs_total"]
-
-        if trades <= 0:
-            continue
-
-        winrate = _safe_div(Decimal(wins), Decimal(trades))
-        if deposit is not None and deposit != 0:
-            roi = _safe_div(pnl_abs_total, deposit)
-        else:
-            roi = Decimal("0")
-
-        rows_to_insert.append(
-            (
-                scenario_id,                 # scenario_id
-                signal_id,                   # signal_id
-                direction,                   # direction
-                timeframe,                   # timeframe
-                feature_name,                # feature_name
-                bin_label,                   # bin_label
-                stat["bin_from"],            # bin_from
-                stat["bin_to"],              # bin_to
-                trades,                      # trades
-                wins,                        # wins
-                losses,                      # losses
-                _q4(pnl_abs_total),          # pnl_abs_total
-                _q4(winrate),                # winrate
-                _q4(roi),                    # roi
-            )
-        )
-
-    async with pg.acquire() as conn:
-        # сначала удаляем старые бины по этой фиче/TF для данного сценария/сигнала
-        await conn.execute(
-            """
-            DELETE FROM bt_scenario_feature_bins
-            WHERE scenario_id  = $1
-              AND signal_id    = $2
-              AND timeframe    = $3
-              AND feature_name = $4
-            """,
-            scenario_id,
-            signal_id,
-            timeframe,
-            feature_name,
-        )
-
-        if rows_to_insert:
-            await conn.executemany(
-                """
-                INSERT INTO bt_scenario_feature_bins (
-                    scenario_id,
-                    signal_id,
-                    direction,
-                    timeframe,
-                    feature_name,
-                    bin_label,
-                    bin_from,
-                    bin_to,
-                    trades,
-                    wins,
-                    losses,
-                    pnl_abs_total,
-                    winrate,
-                    roi
-                )
-                VALUES (
-                    $1, $2, $3, $4, $5,
-                    $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14
-                )
-                """,
-                rows_to_insert,
-            )
-
-    log.debug(
-        "BT_ANALYSIS_RSI: inst_id=%s, feature_name=%s, timeframe=%s — бинов записано=%s",
-        inst_id,
-        feature_name,
-        timeframe,
-        len(rows_to_insert),
+        logger=log,
     )

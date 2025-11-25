@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # 🔸 Кеши backtester_v1
 from backtester_config import get_analysis_instance, get_scenario_instance
 
+# 🔸 Утилиты анализа фич
+from bt_analysis_utils import resolve_feature_name
+
 # 🔸 Настройки Decimal
 getcontext().prec = 28
 
@@ -28,6 +31,8 @@ ANALYSIS_DAILY_STREAM_BLOCK_MS = 5000
 MIN_COVERAGE = Decimal("0.20")              # минимальная доля сделок (20% от базовых)
 MIN_WINRATE_IMPROVEMENT = Decimal("0.01")   # минимальное улучшение winrate (1%)
 
+# 🔸 Поддерживаемые семейства анализаторов
+SUPPORTED_FAMILIES = {"rsi"}
 
 # 🔸 Квантование до 4 знаков
 def _q4(value: Decimal) -> Decimal:
@@ -172,18 +177,6 @@ def _value_in_selected_bins(
             continue
         return True
     return False
-
-
-# 🔸 Разруливание feature_name для RSI по key/timeframe/source_key (как в bt_analysis_rsi)
-def _resolve_feature_name_for_rsi(key: str, timeframe: str, source_key: str) -> str:
-    if key == "rsi_value":
-        return f"rsi_value_{timeframe}_{source_key}"
-    if key == "rsi_dist_from_50":
-        return f"rsi_dist_from_50_{timeframe}_{source_key}"
-    if key == "rsi_zone":
-        return f"rsi_zone_{timeframe}_{source_key}"
-    return f"{key}_{timeframe}_{source_key}"
-
 
 # 🔸 Суточный анализ одного семейства анализаторов для пары scenario_id/signal_id и версии
 async def _process_analysis_family_daily(
@@ -340,7 +333,12 @@ async def _process_analysis_family_daily(
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
         source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
 
-        feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+        feature_name = resolve_feature_name(
+            family_key=family_key,
+            key=key,
+            timeframe=timeframe,
+            source_key=source_key,
+        )
 
         log.info(
             "BT_ANALYSIS_DAILY: старт суточного анализа для analysis_id=%s, family=%s, key=%s, "
@@ -754,8 +752,8 @@ async def run_bt_analysis_daily(pg, redis):
                         entry_id,
                     )
 
-                    # работаем только с RSI
-                    if family_key != "rsi":
+                    # работаем только с поддерживаемыми семействами
+                    if family_key not in SUPPORTED_FAMILIES:
                         log.debug(
                             "BT_ANALYSIS_DAILY: family_key=%s пока не поддерживается, "
                             "scenario_id=%s, signal_id=%s",

@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Tuple, Optional
 # 🔸 Кеши backtester_v1
 from backtester_config import get_scenario_instance, get_analysis_instance
 
+# 🔸 Утилиты анализа фич
+from bt_analysis_utils import resolve_feature_name
+
 # 🔸 Настройки Decimal
 getcontext().prec = 28
 
@@ -35,18 +38,6 @@ def _safe_div(n: Decimal, d: Decimal) -> Decimal:
     if d == 0:
         return Decimal("0")
     return n / d
-
-
-# 🔸 Разруливание feature_name для RSI по key/timeframe/source_key (совпадает с bt_analysis_rsi)
-def _resolve_feature_name_for_rsi(key: str, timeframe: str, source_key: str) -> str:
-    if key == "rsi_value":
-        return f"rsi_value_{timeframe}_{source_key}"
-    if key == "rsi_dist_from_50":
-        return f"rsi_dist_from_50_{timeframe}_{source_key}"
-    if key == "rsi_zone":
-        return f"rsi_zone_{timeframe}_{source_key}"
-    return f"{key}_{timeframe}_{source_key}"
-
 
 # 🔸 Поиск бина для значения feature_value в списке [from_value, to_value)
 def _find_bin_for_value(
@@ -381,7 +372,12 @@ async def run_analysis_rsi_adaptive(
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
         source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
 
-        feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
+        feature_name = resolve_feature_name(
+            family_key=family_key,
+            key=key,
+            timeframe=timeframe,
+            source_key=source_key,
+        )
 
         log.debug(
             "BT_ANALYSIS_RSI_ADAPTIVE: inst_id=%s — анализ key=%s, timeframe=%s, source_key=%s, "
