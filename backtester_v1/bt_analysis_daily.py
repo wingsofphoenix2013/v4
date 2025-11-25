@@ -323,10 +323,6 @@ async def _process_analysis_family_daily(
         if inst_family != family_key:
             continue
 
-        # только RSI пока поддерживаем
-        if inst_family != "rsi":
-            continue
-
         tf_cfg = params.get("timeframe")
         source_cfg = params.get("source_key")
 
