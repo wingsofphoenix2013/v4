@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+import asyncio
 
 # 🔸 Асинхронный воркер для чтения из Redis Stream и записи в PG
 async def run_core_io(pg, redis):

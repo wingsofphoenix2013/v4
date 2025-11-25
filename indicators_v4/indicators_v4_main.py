@@ -1,4 +1,4 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (единый on-demand через indicator_gateway)
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4
 
 import asyncio
 import json
@@ -14,17 +14,6 @@ from indicator_ts_filler import run_indicator_ts_filler
 from core_io import run_core_io
 from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
 from cleanup_worker import run_indicators_cleanup
-from indicator_gateway import run_indicator_gateway
-
-# 🔸 Воркеры MarketWatch
-from indicator_mw_trend import run_indicator_mw_trend
-from indicator_mw_volatility import run_indicator_mw_volatility
-from indicator_mw_momentum import run_indicator_mw_momentum
-from indicator_mw_extremes import run_indicator_mw_extremes
-from indicator_mw_states import run_indicator_mw_states
-from indicator_mw_auditor import run_indicator_mw_auditor
-from indicator_mw_healer import run_indicator_mw_healer
-from indicator_mw_states_back import run_indicator_mw_states_back
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -435,15 +424,6 @@ async def main():
         run_safe_loop(lambda: run_indicator_healer(pg, redis), "IND_HEALER"),
         run_safe_loop(lambda: run_indicator_ts_filler(pg, redis), "IND_TS_FILLER"),
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
-        run_safe_loop(lambda: run_indicator_gateway(pg, redis, get_instances_by_tf, get_precision, compute_snapshot_values_async), "IND_GATEWAY"),
-        run_safe_loop(lambda: run_indicator_mw_trend(pg, redis), "MW_TREND"),
-        run_safe_loop(lambda: run_indicator_mw_volatility(pg, redis), "MW_VOL"),
-        run_safe_loop(lambda: run_indicator_mw_momentum(pg, redis), "MW_MOM"),
-        run_safe_loop(lambda: run_indicator_mw_extremes(pg, redis), "MW_EXT"),
-        run_safe_loop(lambda: run_indicator_mw_states(pg, redis), "MW_STATE"),
-        run_safe_loop(lambda: run_indicator_mw_auditor(pg, redis), "MW_MW_AUDITOR"),
-        run_safe_loop(lambda: run_indicator_mw_healer(pg, redis), "MW_MW_HEALER"),
-        run_safe_loop(lambda: run_indicator_mw_states_back(pg, redis), "MW_STATE_BACK"),
     )
 
 
