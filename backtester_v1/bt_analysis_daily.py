@@ -173,27 +173,15 @@ def _value_in_selected_bins(
         return True
     return False
 
-# 🔸 Разруливание feature_name для индикаторов (семейства RSI/ATR и прочие)
-def _resolve_feature_name(
-    family_key: str,
-    key: str,
-    timeframe: str,
-    source_key: str,
-) -> str:
-    family = (family_key or "").lower()
-    k = (key or "").lower()
 
-    # специальные кейсы для RSI (совместимость с bt_analysis_rsi)
-    if family == "rsi":
-        if k == "rsi_value":
-            return f"rsi_value_{timeframe}_{source_key}"
-        if k == "rsi_dist_from_50":
-            return f"rsi_dist_from_50_{timeframe}_{source_key}"
-        if k == "rsi_zone":
-            return f"rsi_zone_{timeframe}_{source_key}"
-        return f"{key}_{timeframe}_{source_key}"
-
-    # для остальных семейств (например, ATR) используем общее правило
+# 🔸 Разруливание feature_name для RSI по key/timeframe/source_key (как в bt_analysis_rsi)
+def _resolve_feature_name_for_rsi(key: str, timeframe: str, source_key: str) -> str:
+    if key == "rsi_value":
+        return f"rsi_value_{timeframe}_{source_key}"
+    if key == "rsi_dist_from_50":
+        return f"rsi_dist_from_50_{timeframe}_{source_key}"
+    if key == "rsi_zone":
+        return f"rsi_zone_{timeframe}_{source_key}"
     return f"{key}_{timeframe}_{source_key}"
 
 
@@ -342,18 +330,17 @@ async def _process_analysis_family_daily(
         if inst_family != family_key:
             continue
 
+        # только RSI пока поддерживаем
+        if inst_family != "rsi":
+            continue
+
         tf_cfg = params.get("timeframe")
         source_cfg = params.get("source_key")
 
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else ""
+        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
 
-        feature_name = _resolve_feature_name(
-            family_key=family_key,
-            key=key,
-            timeframe=timeframe,
-            source_key=source_key,
-        )
+        feature_name = _resolve_feature_name_for_rsi(key=key, timeframe=timeframe, source_key=source_key)
 
         log.info(
             "BT_ANALYSIS_DAILY: старт суточного анализа для analysis_id=%s, family=%s, key=%s, "
@@ -718,6 +705,7 @@ async def _process_analysis_family_daily(
 
     return rows_written_total
 
+
 # 🔸 Публичная точка входа: воркер суточного анализа анализаторов
 async def run_bt_analysis_daily(pg, redis):
     log.info("BT_ANALYSIS_DAILY: воркер суточного анализа запущен")
@@ -766,6 +754,18 @@ async def run_bt_analysis_daily(pg, redis):
                         entry_id,
                     )
 
+                    # работаем только с RSI
+                    if family_key != "rsi":
+                        log.debug(
+                            "BT_ANALYSIS_DAILY: family_key=%s пока не поддерживается, "
+                            "scenario_id=%s, signal_id=%s",
+                            family_key,
+                            scenario_id,
+                            signal_id,
+                        )
+                        await redis.xack(ANALYSIS_POSTPROC_READY_STREAM_KEY, ANALYSIS_DAILY_CONSUMER_GROUP, entry_id)
+                        continue
+
                     if not analysis_ids:
                         log.debug(
                             "BT_ANALYSIS_DAILY: для scenario_id=%s, signal_id=%s, family=%s нет analysis_ids",
@@ -776,7 +776,8 @@ async def run_bt_analysis_daily(pg, redis):
                         await redis.xack(ANALYSIS_POSTPROC_READY_STREAM_KEY, ANALYSIS_DAILY_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # 🔸 Ключевое: daily запускаем ТОЛЬКО на v2-сообщении, и по нему считаем и v1, и v2
+                    # 🔸 Ключевое изменение:
+                    # daily запускаем ТОЛЬКО на v2-сообщении, и по нему считаем и v1, и v2
                     if version != "v2":
                         log.debug(
                             "BT_ANALYSIS_DAILY: пропускаем сообщение version=%s "

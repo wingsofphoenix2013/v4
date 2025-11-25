@@ -1,6 +1,5 @@
 # backtester_v1_main.py — управляющий модуль backtester_v1
 
-# 🔸 Импорты
 import asyncio
 import logging
 
@@ -25,7 +24,7 @@ from bt_scenarios_main import run_bt_scenarios_orchestrator
 # 🔸 Постпроцессор сценариев
 from bt_scenarios_postproc import run_bt_scenarios_postproc
 
-# 🔸 Оркестратор аналитики сценариев (анализ фич по bt:postproc:ready) — v1 (RSI, ATR, ...)
+# 🔸 Оркестратор аналитики сценариев (анализ фич по bt:postproc:ready) — v1
 from bt_analysis_main import run_bt_analysis_orchestrator
 # 🔸 Пост-процессор аналитики (оценка силы анализаторов по bt:analysis:ready)
 from bt_analysis_postproc import run_bt_analysis_postproc
@@ -33,8 +32,8 @@ from bt_analysis_postproc import run_bt_analysis_postproc
 from bt_analysis_calibration_raw import run_bt_analysis_calibration_raw
 # 🔸 Постпроцессор калибровки (бин-конфиги по bt:analysis:calibration:ready)
 from bt_analysis_calibration_processor import run_bt_analysis_calibration_processor
-# 🔸 Адаптивный анализатор бин-фич (слушает bt:analysis:adaptive:ready, пишет v2)
-from bt_analysis_adaptive import run_bt_analysis_adaptive_worker
+# 🔸 Адаптивный анализатор RSI (слушает bt:analysis:adaptive:ready, пишет v2)
+from bt_analysis_rsi_adaptive import run_bt_analysis_rsi_adaptive_worker
 # 🔸 Суточная аналитика анализаторов (слушает bt:analysis:postproc:ready)
 from bt_analysis_daily import run_bt_analysis_daily
 # 🔸 Воркер стабильности анализаторов (слушает bt:analysis:daily:ready)
@@ -100,19 +99,13 @@ async def main():
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
-        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),                 # v1 (RSI/ATR)
-        run_safe_loop(lambda: run_bt_analysis_postproc(pg, redis), "BT_ANALYSIS_POSTPROC"),            # v1/v2 postproc
-        run_safe_loop(lambda: run_bt_analysis_calibration_raw(pg, redis), "BT_ANALYSIS_CALIB_RAW"),    # сырые фичи
-        run_safe_loop(
-            lambda: run_bt_analysis_calibration_processor(pg, redis),
-            "BT_ANALYSIS_CALIB_PROC",
-        ),  # бин-конфиги v2
-        run_safe_loop(
-            lambda: run_bt_analysis_adaptive_worker(pg, redis),
-            "BT_ANALYSIS_ADAPTIVE",
-        ),  # адаптивные бины → v2
-        run_safe_loop(lambda: run_bt_analysis_daily(pg, redis), "BT_ANALYSIS_DAILY"),                  # суточная аналитика
-        run_safe_loop(lambda: run_bt_analysis_stability(pg, redis), "BT_ANALYSIS_STABILITY"),          # индекс стабильности
+        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),              # v1 бины
+        run_safe_loop(lambda: run_bt_analysis_postproc(pg, redis), "BT_ANALYSIS_POSTPROC"),         # v1/v2 postproc
+        run_safe_loop(lambda: run_bt_analysis_calibration_raw(pg, redis), "BT_ANALYSIS_CALIB_RAW"), # сырые фичи
+        run_safe_loop(lambda: run_bt_analysis_calibration_processor(pg, redis), "BT_ANALYSIS_CALIB_PROC"),  # бин-конфиги
+        run_safe_loop(lambda: run_bt_analysis_rsi_adaptive_worker(pg, redis), "BT_ANALYSIS_RSI_ADAPTIVE"),  # v2 бины
+        run_safe_loop(lambda: run_bt_analysis_daily(pg, redis), "BT_ANALYSIS_DAILY"),               # суточная аналитика
+        run_safe_loop(lambda: run_bt_analysis_stability(pg, redis), "BT_ANALYSIS_STABILITY"),       # индекс стабильности
     )
 
 

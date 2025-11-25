@@ -554,6 +554,7 @@ async def _process_analysis_stability_for_window(
 
     return rows_written
 
+
 # 🔸 Публичная точка входа: воркер стабильности анализаторов
 async def run_bt_analysis_stability(pg, redis):
     log.info("BT_ANALYSIS_STABILITY: воркер расчёта стабильности запущен")
@@ -599,6 +600,18 @@ async def run_bt_analysis_stability(pg, redis):
                         analysis_ids,
                         entry_id,
                     )
+
+                    # пока работаем только с RSI
+                    if family_key != "rsi":
+                        log.debug(
+                            "BT_ANALYSIS_STABILITY: family_key=%s пока не поддерживается, "
+                            "scenario_id=%s, signal_id=%s",
+                            family_key,
+                            scenario_id,
+                            signal_id,
+                        )
+                        await redis.xack(DAILY_READY_STREAM_KEY, STABILITY_CONSUMER_GROUP, entry_id)
+                        continue
 
                     if not analysis_ids:
                         log.debug(

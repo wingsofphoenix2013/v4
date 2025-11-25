@@ -40,6 +40,7 @@ def _safe_div(n: Decimal, d: Decimal) -> Decimal:
         return Decimal("0")
     return n / d
 
+
 # 🔸 Публичная точка входа: оркестратор пост-анализа bt_scenario_feature_bins
 async def run_bt_analysis_postproc(pg, redis):
     log.info("BT_ANALYSIS_POSTPROC: воркер пост-анализа запущен")
@@ -89,6 +90,18 @@ async def run_bt_analysis_postproc(pg, redis):
                         analysis_ids,
                         entry_id,
                     )
+
+                    # пост-анализ только для известных семей; пока используем 'rsi'
+                    if family_key != "rsi":
+                        log.debug(
+                            "BT_ANALYSIS_POSTPROC: family_key=%s пока не поддерживается, "
+                            "scenario_id=%s, signal_id=%s",
+                            family_key,
+                            scenario_id,
+                            signal_id,
+                        )
+                        await redis.xack(ANALYSIS_READY_STREAM_KEY, ANALYSIS_POSTPROC_CONSUMER_GROUP, entry_id)
+                        continue
 
                     if not analysis_ids:
                         log.debug(
@@ -182,6 +195,7 @@ async def run_bt_analysis_postproc(pg, redis):
             )
             # небольшая пауза перед повторной попыткой, чтобы не крутить CPU при постоянной ошибке
             await asyncio.sleep(2)
+
 
 # 🔸 Проверка/создание consumer group для стрима bt:analysis:ready
 async def _ensure_consumer_group(redis) -> None:
