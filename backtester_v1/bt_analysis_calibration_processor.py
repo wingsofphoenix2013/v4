@@ -34,6 +34,9 @@ ADAPTIVE_VERSION = "v2"
 NUM_BINS = 5                # сколько бинов строим по квантилям
 MIN_TRADES_FOR_CALIB = 100  # минимальное количество сделок для попытки калибровки
 
+# 🔸 Поддерживаемые семейства для калибровки адаптивных бинов
+SUPPORTED_FAMILIES_CALIB = {"rsi", "adx"}
+
 # 🔸 Квантование до 4 знаков
 def _q4(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
@@ -94,7 +97,7 @@ async def run_bt_analysis_calibration_processor(pg, redis):
                         entry_id,
                     )
 
-                    if family_key != "rsi" or not analysis_ids:
+                    if family_key not in SUPPORTED_FAMILIES_CALIB or not analysis_ids:
                         await redis.xack(CALIB_READY_STREAM_KEY, CALIB_PROC_CONSUMER_GROUP, entry_id)
                         continue
 
@@ -322,7 +325,7 @@ async def _process_family_calibration(
         source_cfg = params.get("source_key")
 
         timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "rsi14"
+        source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else ""
 
         feature_name = resolve_feature_name(
             family_key=family_key,
