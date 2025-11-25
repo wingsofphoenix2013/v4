@@ -12,7 +12,6 @@ from backtester_config import (
 
 # 🔸 Воркеры семей анализаторов
 from bt_analysis_rsi import run_analysis_rsi
-from bt_analysis_atr import run_analysis_atr
 
 # 🔸 Константы стримов анализа
 ANALYSIS_STREAM_KEY = "bt:postproc:ready"
@@ -266,6 +265,7 @@ def _parse_analysis_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         )
         return None
 
+
 # 🔸 Диспетчер воркеров семей анализаторов по family_key
 async def _run_family_worker(
     family_key: str,
@@ -294,58 +294,6 @@ async def _run_family_worker(
             )
 
             # все RSI-анализаторы по этой паре завершили работу — публикуем событие
-            finished_at = datetime.utcnow()
-            analysis_ids = [str(inst.get("id")) for inst in instances if inst.get("id") is not None]
-
-            try:
-                await redis.xadd(
-                    ANALYSIS_READY_STREAM_KEY,
-                    {
-                        "scenario_id": str(scenario_id),
-                        "signal_id": str(signal_id),
-                        "family_key": str(family_key),
-                        "analysis_ids": ",".join(analysis_ids),
-                        "finished_at": finished_at.isoformat(),
-                    },
-                )
-                log.info(
-                    "BT_ANALYSIS_MAIN: опубликовано событие готовности анализа в стрим '%s' "
-                    "для scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s",
-                    ANALYSIS_READY_STREAM_KEY,
-                    scenario_id,
-                    signal_id,
-                    family_key,
-                    analysis_ids,
-                )
-            except Exception as e:
-                log.error(
-                    "BT_ANALYSIS_MAIN: не удалось опубликовать событие в стрим '%s' "
-                    "для scenario_id=%s, signal_id=%s, family=%s: %s",
-                    ANALYSIS_READY_STREAM_KEY,
-                    scenario_id,
-                    signal_id,
-                    family_key,
-                    e,
-                    exc_info=True,
-                )
-
-            log.info(
-                "BT_ANALYSIS_MAIN: family_key=%s успешно отработал для scenario_id=%s, signal_id=%s",
-                family_key,
-                scenario_id,
-                signal_id,
-            )
-            return
-
-        if family_key == "atr":
-            await run_analysis_atr(
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                analysis_instances=instances,
-                pg=pg,
-            )
-
-            # все ATR-анализаторы по этой паре завершили работу — публикуем событие
             finished_at = datetime.utcnow()
             analysis_ids = [str(inst.get("id")) for inst in instances if inst.get("id") is not None]
 
