@@ -412,7 +412,6 @@ async def run_analysis_supertrend(
 
             # выбор вычислителя по ключу фичи
             if key == "align_mtf":
-                # align_mtf использует m5/m15/h1 независимо от timeframe инстанса
                 bins = await _compute_bins_align_mtf(
                     conn=conn,
                     positions=positions,
@@ -487,7 +486,7 @@ async def run_analysis_supertrend(
 
             # 🔸 Запись агрегатов в bt_scenario_feature_bins через утилиту
             await write_feature_bins(
-                conn=conn,
+                pg,
                 scenario_id=scenario_id,
                 signal_id=signal_id,
                 feature_name=feature_name,
@@ -536,7 +535,6 @@ async def _compute_bins_align_mtf(
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    # условия расчёта: нужен ST для m5/m15/h1
     i_m5 = _resolve_supertrend_instance_id("m5", source_key)
     i_m15 = _resolve_supertrend_instance_id("m15", source_key)
     i_h1 = _resolve_supertrend_instance_id("h1", source_key)
@@ -550,7 +548,6 @@ async def _compute_bins_align_mtf(
         )
         return bins
 
-    # история тренда для трёх TF
     hist_m5 = await _load_st_history_for_positions(
         conn=conn,
         instance_id=i_m5,
@@ -659,7 +656,7 @@ async def _compute_bins_cushion_stop_units(
         sl_price = p["sl_price"]
         pnl_abs = p["pnl_abs"]
 
-        if direction is None or pnl_abs is None:
+        if direction is None or pnl_abs is None or entry_price is None or sl_price is None:
             continue
 
         series = line_history.get(symbol)
@@ -878,7 +875,7 @@ async def _compute_bins_pullback_depth(
         entry_price = p["entry_price"]
         pnl_abs = p["pnl_abs"]
 
-        if direction is None or pnl_abs is None:
+        if direction is None or pnl_abs is None or entry_price is None:
             continue
 
         series_trend = trend_history.get(symbol)
@@ -896,7 +893,6 @@ async def _compute_bins_pullback_depth(
 
         closes_in_trend: List[float] = []
 
-        # выравнивание по индексу назад
         j_trend = idx_trend
         j_close = idx_close
 
@@ -905,7 +901,6 @@ async def _compute_bins_pullback_depth(
             t_trend, v_trend = series_trend[j_trend]
             t_close, v_close = series_close[j_close]
             if t_trend != t_close:
-                # в реальном коде можно аккуратно совместить по времени; тут ожидается совпадение сетки TF
                 break
             if v_trend != trend_now:
                 break
@@ -976,7 +971,7 @@ async def _compute_bins_slope_pct(
         entry_price = p["entry_price"]
         pnl_abs = p["pnl_abs"]
 
-        if direction is None or pnl_abs is None or entry_price == 0:
+        if direction is None or pnl_abs is None or entry_price is None or entry_price == 0:
             continue
 
         series = line_history.get(symbol)
@@ -1045,7 +1040,7 @@ async def _compute_bins_accel_pct(
         entry_price = p["entry_price"]
         pnl_abs = p["pnl_abs"]
 
-        if direction is None or pnl_abs is None or entry_price == 0:
+        if direction is None or pnl_abs is None or entry_price is None or entry_price == 0:
             continue
 
         series = line_history.get(symbol)
