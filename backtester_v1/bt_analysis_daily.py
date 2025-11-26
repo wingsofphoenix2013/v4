@@ -28,8 +28,8 @@ ANALYSIS_DAILY_STREAM_BATCH_SIZE = 10
 ANALYSIS_DAILY_STREAM_BLOCK_MS = 5000
 
 # 🔸 Параметры отбора бинов (должны совпадать с bt_analysis_postproc)
-MIN_COVERAGE = Decimal("0.20")              # минимальная доля сделок (20% от базовых)
-MIN_WINRATE_IMPROVEMENT = Decimal("0.01")   # минимальное улучшение winrate (1%)
+MIN_COVERAGE = Decimal("0.30")              # минимальная доля сделок (20% от базовых)
+MIN_WINRATE_IMPROVEMENT = Decimal("0.05")   # минимальное улучшение winrate (1%)
 
 # 🔸 Поддерживаемые семейства анализаторов
 SUPPORTED_FAMILIES = {"rsi", "adx", "ema", "atr", "supertrend"}
