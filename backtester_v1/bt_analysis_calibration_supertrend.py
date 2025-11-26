@@ -38,7 +38,7 @@ DEFAULT_ST_SLOPE_K: int = 3
 DEFAULT_ST_ACCEL_K: int = 3
 
 
-# 🔸 Вспомогательный парсер source_key → (length, mult_float)
+# 🔸 Вспомогательный парсер source_key → (length, mult)
 def _parse_supertrend_source_key(source_key: str) -> Tuple[Optional[int], Optional[float]]:
     length: Optional[int] = None
     mult: Optional[float] = None
@@ -91,7 +91,7 @@ def _resolve_supertrend_instance_id(timeframe: str, source_key: str) -> Optional
         except Exception:
             continue
 
-        # небольшая допуск по сравнению float
+        # небольшой допуск по сравнению float
         if length_inst == length_cfg and abs(mult_inst - mult_cfg) < 1e-9:
             return iid
 
@@ -247,9 +247,12 @@ def _find_index_leq(series: List[Tuple[Any, float]], entry_time) -> Optional[int
     return idx
 
 
-# 🔸 Знак направления сделки
 def _dir_sign(direction: str) -> int:
     return 1 if (direction or "").lower() == "long" else -1
+
+
+def _is_win(pnl_abs: float) -> bool:
+    return pnl_abs > 0
 
 
 # 🔸 Публичная точка входа: калибровка сырых фич для семейства Supertrend
@@ -306,10 +309,10 @@ async def run_calibration_supertrend_raw(
                 continue
 
             tf_cfg = params.get("timeframe")
-            source_cfg = params.get("source_key")
+            src_cfg = params.get("source_key")
 
             timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
-            source_key = str(source_cfg.get("value")).strip() if source_cfg is not None else "supertrend10_3_0"
+            source_key = str(src_cfg.get("value")).strip() if src_cfg is not None else "supertrend10_3_0"
 
             feature_name = resolve_feature_name(
                 family_key="supertrend",
@@ -329,16 +332,6 @@ async def run_calibration_supertrend_raw(
                 signal_id,
             )
 
-            # фильтруем позиции по TF анализатора
-            positions_tf = [p for p in positions if p.get("timeframe") == timeframe]
-            if not positions_tf:
-                log.debug(
-                    "BT_ANALYSIS_CALIB_SUPERTREND: нет позиций для timeframe=%s, analysis_id=%s",
-                    timeframe,
-                    aid,
-                )
-                continue
-
             def _get_int_param(name: str, default: int) -> int:
                 cfg = params.get(name)
                 if cfg is None:
@@ -354,18 +347,17 @@ async def run_calibration_supertrend_raw(
 
             rows_to_insert: List[Tuple[Any, ...]] = []
 
-            # 🔸 Вычисление фич по ключам семейства supertrend
+            # 🔸 Расчёт фич по ключам семейства supertrend
             if key == "align_mtf":
-                # align_mtf: нужен тренд ST на m5/m15/h1
                 rows_to_insert.extend(
                     await _calib_align_mtf(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
+                        timeframe=timeframe,
                         source_key=source_key,
-                        eps=eps,
                     )
                 )
 
@@ -373,7 +365,7 @@ async def run_calibration_supertrend_raw(
                 rows_to_insert.extend(
                     await _calib_cushion_stop_units(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
@@ -387,7 +379,7 @@ async def run_calibration_supertrend_raw(
                 rows_to_insert.extend(
                     await _calib_age_bars(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
@@ -401,7 +393,7 @@ async def run_calibration_supertrend_raw(
                 rows_to_insert.extend(
                     await _calib_whipsaw_index(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
@@ -415,7 +407,7 @@ async def run_calibration_supertrend_raw(
                 rows_to_insert.extend(
                     await _calib_pullback_depth(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
@@ -429,7 +421,7 @@ async def run_calibration_supertrend_raw(
                 rows_to_insert.extend(
                     await _calib_slope_pct(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
@@ -444,7 +436,7 @@ async def run_calibration_supertrend_raw(
                 rows_to_insert.extend(
                     await _calib_accel_pct(
                         pg=pg,
-                        positions=positions_tf,
+                        positions=positions,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                         feature_name=feature_name,
@@ -517,8 +509,8 @@ async def _calib_align_mtf(
     scenario_id: int,
     signal_id: int,
     feature_name: str,
+    timeframe: str,
     source_key: str,
-    eps: float,
 ) -> List[Tuple[Any, ...]]:
     rows_to_insert: List[Tuple[Any, ...]] = []
 
@@ -529,14 +521,13 @@ async def _calib_align_mtf(
 
     if i_m5 is None or i_m15 is None or i_h1 is None:
         log.warning(
-            "BT_ANALYSIS_CALIB_SUPERTREND: align_mtf — не найдены instance_id для всех TF (m5=%s, m15=%s, h1=%s)",
+            "BT_ANALYSIS_CALIB_SUPERTREND: align_mtf — не найдены instance_id ST для всех TF (m5=%s, m15=%s, h1=%s)",
             i_m5,
             i_m15,
             i_h1,
         )
         return rows_to_insert
 
-    # загружаем тренды по всем TF
     hist_m5 = await _load_st_history_for_positions(
         pg=pg,
         instance_id=i_m5,
@@ -600,7 +591,6 @@ async def _calib_align_mtf(
         align_h1 = trend_h1 * dir_sign
 
         st_align_mtf_sum = (align_m5 + align_m15 + align_h1) / 3.0
-
         bin_label, _, _ = _bin_st_align_mtf(st_align_mtf_sum)
 
         feature_value = float(st_align_mtf_sum)
@@ -611,8 +601,7 @@ async def _calib_align_mtf(
                 scenario_id,
                 signal_id,
                 direction,
-                # timeframe для align_mtf мы берём как TF сценария (в позиции)
-                p["timeframe"],
+                timeframe,  # TF фичи — из параметров анализатора
                 "supertrend",
                 "align_mtf",
                 feature_name,
@@ -648,8 +637,7 @@ async def _calib_cushion_stop_units(
         )
         return rows_to_insert
 
-    # линия ST по TF
-    st_history = await _load_st_history_for_positions(
+    line_history = await _load_st_history_for_positions(
         pg=pg,
         instance_id=instance_id,
         param_name=source_key,
@@ -667,15 +655,15 @@ async def _calib_cushion_stop_units(
         sl_price = p["sl_price"]
         pnl_abs_raw = p["pnl_abs"]
 
-        if direction is None or pnl_abs_raw is None:
+        if direction is None or pnl_abs_raw is None or entry_price is None or sl_price is None:
             continue
 
-        series = st_history.get(symbol)
-        if not series:
+        series = line_history.get(symbol)
+        if not series or entry_price == 0:
             continue
 
         idx = _find_index_leq(series, entry_time)
-        if idx is None or entry_price == 0:
+        if idx is None:
             continue
 
         try:
@@ -683,18 +671,14 @@ async def _calib_cushion_stop_units(
         except Exception:
             continue
 
-        dir_sign = _dir_sign(direction)
-
         st_line = series[idx][1]
+        dir_sign = _dir_sign(direction)
 
         stop_pct = abs(entry_price - sl_price) / entry_price * 100.0 if abs(entry_price) > eps else 0.0
         if stop_pct <= 0:
             continue
 
         dist_pct_signed = (entry_price - st_line) / entry_price * 100.0 * dir_sign
-        if dist_pct_signed == 0 and stop_pct == 0:
-            continue
-
         cushion_units = dist_pct_signed / stop_pct
 
         bin_label, _, _ = _bin_st_cushion(cushion_units, dist_pct_signed)
@@ -775,10 +759,10 @@ async def _calib_age_bars(
             continue
 
         trend_now = series[idx][1]
-        age_bars = 1
 
-        # условия подсчёта возраста
+        age_bars = 1
         j = idx - 1
+        # условия подсчёта возраста
         while j >= 0 and age_bars < window_bars:
             if series[j][1] != trend_now:
                 break
@@ -943,7 +927,7 @@ async def _calib_pullback_depth(
         entry_price = p["entry_price"]
         pnl_abs_raw = p["pnl_abs"]
 
-        if direction is None or pnl_abs_raw is None:
+        if direction is None or pnl_abs_raw is None or entry_price is None:
             continue
 
         series_trend = trend_history.get(symbol)
@@ -961,20 +945,18 @@ async def _calib_pullback_depth(
         except Exception:
             continue
 
-        trend_now = series_trend[idx_trend][1]
+        _, trend_now = series_trend[idx_trend]
 
         closes_in_trend: List[float] = []
 
-        # выравниваем по индексу назад
+        # выравнивание по индексу назад
         j_trend = idx_trend
         j_close = idx_close
 
-        # условия накопления
         while j_trend >= 0 and j_close >= 0 and len(closes_in_trend) < window_bars:
             t_trend, v_trend = series_trend[j_trend]
             t_close, v_close = series_close[j_close]
             if t_trend != t_close:
-                # сетка по идее совпадает; если нет — выходим
                 break
             if v_trend != trend_now:
                 break
@@ -1059,11 +1041,11 @@ async def _calib_slope_pct(
         entry_price = p["entry_price"]
         pnl_abs_raw = p["pnl_abs"]
 
-        if direction is None or pnl_abs_raw is None:
+        if direction is None or pnl_abs_raw is None or entry_price is None or entry_price == 0:
             continue
 
         series = line_history.get(symbol)
-        if not series or entry_price == 0:
+        if not series:
             continue
 
         idx = _find_index_leq(series, entry_time)
@@ -1146,11 +1128,11 @@ async def _calib_accel_pct(
         entry_price = p["entry_price"]
         pnl_abs_raw = p["pnl_abs"]
 
-        if direction is None or pnl_abs_raw is None:
+        if direction is None or pnl_abs_raw is None or entry_price is None or entry_price == 0:
             continue
 
         series = line_history.get(symbol)
-        if not series or entry_price == 0:
+        if not series:
             continue
 
         idx = _find_index_leq(series, entry_time)
@@ -1195,7 +1177,7 @@ async def _calib_accel_pct(
     return rows_to_insert
 
 
-# 🔸 Биннеры для значений Supertrend (должны быть согласованы с V1-анализом)
+# 🔸 Биннеры для значений Supertrend (должны быть согласованы с V1-анализатором)
 
 
 def _bin_st_align_mtf(value: float) -> Tuple[str, float, float]:

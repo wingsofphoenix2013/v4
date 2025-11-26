@@ -1,335 +1,256 @@
-# bt_analysis_supertrend.py — V1-анализатор семейства supertrend (агрегаты в bt_scenario_feature_bins)
+# bt_analysis_supertrend.py — V1-анализатор семейства Supertrend (агрегаты в bt_scenario_feature_bins)
 
 # 🔸 Импорты стандартной библиотеки
 import logging
+from collections import defaultdict
+from datetime import timedelta
+from decimal import Decimal, getcontext
 from typing import Any, Dict, List, Tuple, Optional
 
-from decimal import Decimal
+# 🔸 Кеши backtester_v1 (индикаторы/анализаторы)
+from backtester_config import get_all_indicator_instances
 
-# 🔸 Импорты внутренних утилит
+# 🔸 Утилиты анализа фич
 from bt_analysis_utils import resolve_feature_name, write_feature_bins
 
-log = logging.getLogger(__name__)
+# 🔸 Настройки Decimal
+getcontext().prec = 28
 
+log = logging.getLogger("BT_ANALYSIS_SUPERTREND")
 
-# 🔸 Константы семейства supertrend
+# 🔸 Таймшаги TF (в минутах) для расчёта окон по барам
+TF_STEP_MINUTES: Dict[str, int] = {
+    "m5": 5,
+    "m15": 15,
+    "h1": 60,
+}
+
+# 🔸 Таблицы OHLCV по TF
+TF_TO_OHLCV_TABLE: Dict[str, str] = {
+    "m5": "ohlcv_bb_m5",
+    "m15": "ohlcv_bb_m15",
+    "h1": "ohlcv_bb_h1",
+}
+
+# 🔸 Значения по умолчанию для окон Supertrend
 DEFAULT_ST_LOOKBACK_BARS: int = 200
 DEFAULT_ST_SLOPE_K: int = 3
 DEFAULT_ST_ACCEL_K: int = 3
-
 
 # 🔸 Типы данных
 PositionRow = Dict[str, Any]
 BinKey = Tuple[str, str]  # (direction, bin_label)
 
 
-# 🔸 Публичный вход V1-анализа supertrend
-async def run_analysis_supertrend(
-    scenario_id: int,
-    signal_id: int,
-    analysis_instances: List[Dict[str, Any]],
-    pg,
-) -> None:
-    """
-    V1-анализатор семейства supertrend:
-    считает агрегаты фич в bt_scenario_feature_bins для пары (scenario_id, signal_id).
-    """
-    # фильтруем только supertrend-анализаторы на всякий случай
-    st_instances = [inst for inst in analysis_instances if inst.get("family_key") == "supertrend"]
-    if not st_instances:
-        log.info(
-            "run_analysis_supertrend: нет активных инстансов семейства supertrend для scenario_id=%s, signal_id=%s",
-            scenario_id,
-            signal_id,
-        )
-        return
+# 🔸 Парсер source_key → (length, mult)
+def _parse_supertrend_source_key(source_key: str) -> Tuple[Optional[int], Optional[float]]:
+    length: Optional[int] = None
+    mult: Optional[float] = None
 
-    async with pg.acquire() as conn:
-        # 🔸 Загрузка позиций для анализа
-        positions: List[PositionRow] = await _load_positions_for_pair(conn, scenario_id, signal_id)
-        if not positions:
-            log.info(
-                "run_analysis_supertrend: нет позиций для анализа (scenario_id=%s, signal_id=%s)",
-                scenario_id,
-                signal_id,
-            )
-            return
+    try:
+        sk = source_key.strip().lower()
+        if not sk.startswith("supertrend"):
+            return None, None
+        core = sk[len("supertrend") :]
+        # ожидаем формат "10_3_0"
+        parts = core.split("_")
+        if not parts:
+            return None, None
+        length = int(parts[0])
+        if len(parts) >= 2:
+            mult_str = ".".join(parts[1:])
+            mult = float(mult_str)
+    except Exception:
+        return None, None
 
-        total_bins_written = 0
-        total_features_processed = 0
-
-        for inst in st_instances:
-            key = inst.get("key")
-            params = inst.get("params") or {}
-            timeframe = params.get("timeframe") or inst.get("timeframe")
-            source_key = params.get("source_key")
-
-            if not timeframe or not source_key:
-                log.info(
-                    "run_analysis_supertrend: пропуск инстанса id=%s — нет timeframe/source_key",
-                    inst.get("id"),
-                )
-                continue
-
-            # позиции данного TF
-            positions_tf = [p for p in positions if p["timeframe"] == timeframe]
-            if not positions_tf:
-                log.info(
-                    "run_analysis_supertrend: нет позиций для timeframe=%s (scenario_id=%s, signal_id=%s)",
-                    timeframe,
-                    scenario_id,
-                    signal_id,
-                )
-                continue
-
-            feature_name = resolve_feature_name("supertrend", key, timeframe, source_key)
-
-            # выбор вычислителя по ключу фичи
-            if key == "align_mtf":
-                bins = await _compute_bins_align_mtf(conn, positions_tf, timeframe, source_key)
-            elif key == "cushion_stop_units":
-                bins = await _compute_bins_cushion_stop_units(conn, positions_tf, timeframe, source_key)
-            elif key == "age_bars":
-                bins = await _compute_bins_age_bars(conn, positions_tf, timeframe, source_key)
-            elif key == "whipsaw_index":
-                bins = await _compute_bins_whipsaw_index(conn, positions_tf, timeframe, source_key)
-            elif key == "pullback_depth":
-                bins = await _compute_bins_pullback_depth(conn, positions_tf, timeframe, source_key)
-            elif key == "slope_pct":
-                bins = await _compute_bins_slope_pct(conn, positions_tf, timeframe, source_key)
-            elif key == "accel_pct":
-                bins = await _compute_bins_accel_pct(conn, positions_tf, timeframe, source_key)
-            else:
-                log.info(
-                    "run_analysis_supertrend: неизвестный key='%s' для семейства supertrend, пропуск",
-                    key,
-                )
-                continue
-
-            if not bins:
-                log.info(
-                    "run_analysis_supertrend: не удалось посчитать фичу '%s' (feature_name=%s) — пустые бины",
-                    key,
-                    feature_name,
-                )
-                continue
-
-            # 🔸 Запись агрегатов в bt_scenario_feature_bins через утилиту
-            # ожидается, что write_feature_bins знает формат records (см. RSI-реализацию)
-            await write_feature_bins(
-                conn=conn,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                feature_name=feature_name,
-                timeframe=timeframe,
-                version="v1",
-                records=list(bins.values()),
-            )
-
-            total_bins_written += len(bins)
-            # оценки количества позиций в фиче (по сумме trades)
-            total_features_processed += sum(rec["trades"] for rec in bins.values())
-
-            log.info(
-                "run_analysis_supertrend: feature '%s' (feature_name=%s, tf=%s, src=%s) — bins=%s, trades=%s",
-                key,
-                feature_name,
-                timeframe,
-                source_key,
-                len(bins),
-                sum(rec["trades"] for rec in bins.values()),
-            )
-
-        log.info(
-            "run_analysis_supertrend: завершено для scenario_id=%s, signal_id=%s — всего фич обработано=%s, всего бинов=%s",
-            scenario_id,
-            signal_id,
-            total_features_processed,
-            total_bins_written,
-        )
+    return length, mult
 
 
-# 🔸 Загрузка позиций для пары (scenario, signal)
-async def _load_positions_for_pair(conn, scenario_id: int, signal_id: int) -> List[PositionRow]:
-    # выбираем только постпроцесснутые позиции
-    rows = await conn.fetch(
-        """
-        SELECT
-            id,
-            symbol,
-            timeframe,
-            direction,
-            entry_time,
-            entry_price,
-            sl_price,
-            pnl_abs
-        FROM bt_scenario_positions
-        WHERE scenario_id = $1
-          AND signal_id = $2
-          AND postproc = TRUE
-        """,
-        scenario_id,
-        signal_id,
-    )
-
-    positions: List[PositionRow] = []
-    for r in rows:
-        positions.append(
-            {
-                "id": r["id"],
-                "symbol": r["symbol"],
-                "timeframe": r["timeframe"],
-                "direction": r["direction"],
-                "entry_time": r["entry_time"],
-                "entry_price": float(r["entry_price"]),
-                "sl_price": float(r["sl_price"]),
-                "pnl_abs": float(r["pnl_abs"]),
-            }
-        )
-    return positions
-
-
-# 🔸 Вспомогательные функции для загрузки supertrend и OHLCV
-
-
-async def _load_last_trend_point(
-    conn,
-    symbol: str,
-    timeframe: str,
-    source_key: str,
-    entry_time,
-) -> Optional[int]:
-    # загружаем тренд supertrend для символа/TF на баре входа
-    param_name = f"{source_key}_trend"
-    row = await conn.fetchrow(
-        """
-        SELECT value
-        FROM indicator_values_v4
-        WHERE symbol = $1
-          AND timeframe = $2
-          AND param_name = $3
-          AND open_time <= $4
-        ORDER BY open_time DESC
-        LIMIT 1
-        """,
-        symbol,
-        timeframe,
-        param_name,
-        entry_time,
-    )
-    if not row:
+# 🔸 Поиск instance_id для Supertrend по timeframe и source_key (supertrend10_3_0 → length=10, mult=3.0)
+def _resolve_supertrend_instance_id(timeframe: str, source_key: str) -> Optional[int]:
+    all_instances = get_all_indicator_instances()
+    length_cfg, mult_cfg = _parse_supertrend_source_key(source_key)
+    if length_cfg is None or mult_cfg is None:
         return None
-    return int(row["value"])
+
+    tf_lower = timeframe.lower()
+
+    for iid, inst in all_instances.items():
+        indicator = (inst.get("indicator") or "").lower()
+        tf = (inst.get("timeframe") or "").lower()
+        if indicator != "supertrend" or tf != tf_lower:
+            continue
+
+        params = inst.get("params") or {}
+        length_raw = params.get("length")
+        mult_raw = params.get("mult")
+
+        try:
+            length_inst = int(str(length_raw))
+        except Exception:
+            continue
+
+        try:
+            mult_inst = float(str(mult_raw))
+        except Exception:
+            continue
+
+        # небольшой допуск по сравнению float
+        if length_inst == length_cfg and abs(mult_inst - mult_cfg) < 1e-9:
+            return iid
+
+    return None
 
 
-async def _load_trend_history(
+# 🔸 Загрузка исторического ряда Supertrend (trend/line) по instance_id и param_name
+async def _load_st_history_for_positions(
     conn,
-    symbol: str,
+    instance_id: int,
+    param_name: str,
     timeframe: str,
-    source_key: str,
-    entry_time,
-    limit_bars: int,
-) -> List[Tuple]:
-    # загружаем историю тренда supertrend до бара входа
-    param_name = f"{source_key}_trend"
-    rows = await conn.fetch(
-        """
-        SELECT open_time, value
-        FROM indicator_values_v4
-        WHERE symbol = $1
-          AND timeframe = $2
-          AND param_name = $3
-          AND open_time <= $4
-        ORDER BY open_time DESC
-        LIMIT $5
-        """,
-        symbol,
-        timeframe,
-        param_name,
-        entry_time,
-        limit_bars,
-    )
-    # переворачиваем в прямо-временной порядок
-    series = [(r["open_time"], float(r["value"])) for r in reversed(rows)]
-    return series
+    positions: List[PositionRow],
+    window_bars: int,
+) -> Dict[str, List[Tuple[Any, float]]]:
+    if window_bars <= 0:
+        window_bars = 1
+
+    step_min = TF_STEP_MINUTES.get(timeframe.lower()) or 5
+
+    by_symbol: Dict[str, List[Any]] = defaultdict(list)
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        by_symbol[symbol].append(entry_time)
+
+    result: Dict[str, List[Tuple[Any, float]]] = {}
+
+    for symbol, times in by_symbol.items():
+        if not times:
+            continue
+
+        min_entry = min(times)
+        max_entry = max(times)
+
+        delta = timedelta(minutes=step_min * window_bars)
+        from_time = min_entry - delta
+        to_time = max_entry
+
+        rows = await conn.fetch(
+            """
+            SELECT open_time, value
+            FROM indicator_values_v4
+            WHERE instance_id = $1
+              AND symbol      = $2
+              AND param_name  = $3
+              AND open_time  BETWEEN $4 AND $5
+            ORDER BY open_time
+            """,
+            instance_id,
+            symbol,
+            param_name,
+            from_time,
+            to_time,
+        )
+
+        if not rows:
+            continue
+
+        series: List[Tuple[Any, float]] = []
+        for r in rows:
+            try:
+                series.append((r["open_time"], float(r["value"])))
+            except Exception:
+                continue
+
+        if series:
+            result[symbol] = series
+
+    return result
 
 
-async def _load_line_history(
+# 🔸 Загрузка истории OHLCV (close) по TF для всех символов
+async def _load_ohlcv_history_for_positions(
     conn,
-    symbol: str,
     timeframe: str,
-    source_key: str,
-    entry_time,
-    limit_bars: int,
-) -> List[Tuple]:
-    # загружаем историю линии supertrend до бара входа
-    param_name = source_key
-    rows = await conn.fetch(
-        """
-        SELECT open_time, value
-        FROM indicator_values_v4
-        WHERE symbol = $1
-          AND timeframe = $2
-          AND param_name = $3
-          AND open_time <= $4
-        ORDER BY open_time DESC
-        LIMIT $5
-        """,
-        symbol,
-        timeframe,
-        param_name,
-        entry_time,
-        limit_bars,
-    )
-    series = [(r["open_time"], float(r["value"])) for r in reversed(rows)]
-    return series
+    positions: List[PositionRow],
+    window_bars: int,
+) -> Dict[str, List[Tuple[Any, float]]]:
+    if window_bars <= 0:
+        window_bars = 1
+
+    step_min = TF_STEP_MINUTES.get(timeframe.lower()) or 5
+    table = TF_TO_OHLCV_TABLE.get(timeframe.lower())
+    if not table:
+        return {}
+
+    by_symbol: Dict[str, List[Any]] = defaultdict(list)
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        by_symbol[symbol].append(entry_time)
+
+    result: Dict[str, List[Tuple[Any, float]]] = {}
+
+    for symbol, times in by_symbol.items():
+        if not times:
+            continue
+
+        min_entry = min(times)
+        max_entry = max(times)
+
+        delta = timedelta(minutes=step_min * window_bars)
+        from_time = min_entry - delta
+        to_time = max_entry
+
+        rows = await conn.fetch(
+            f"""
+            SELECT open_time, "close"
+            FROM {table}
+            WHERE symbol = $1
+              AND open_time BETWEEN $2 AND $3
+            ORDER BY open_time
+            """,
+            symbol,
+            from_time,
+            to_time,
+        )
+
+        if not rows:
+            continue
+
+        series: List[Tuple[Any, float]] = []
+        for r in rows:
+            try:
+                series.append((r["open_time"], float(r["close"])))
+            except Exception:
+                continue
+
+        if series:
+            result[symbol] = series
+
+    return result
 
 
-async def _load_close_history(
-    conn,
-    symbol: str,
-    timeframe: str,
-    entry_time,
-    limit_bars: int,
-) -> List[Tuple]:
-    # загружаем историю close по TF до бара входа
-    table = _ohlcv_table_for_tf(timeframe)
-    rows = await conn.fetch(
-        f"""
-        SELECT open_time, "close"
-        FROM {table}
-        WHERE symbol = $1
-          AND open_time <= $2
-        ORDER BY open_time DESC
-        LIMIT $3
-        """,
-        symbol,
-        entry_time,
-        limit_bars,
-    )
-    series = [(r["open_time"], float(r["close"])) for r in reversed(rows)]
-    return series
+# 🔸 Поиск индекса последнего бара с open_time <= entry_time
+def _find_index_leq(series: List[Tuple[Any, float]], entry_time) -> Optional[int]:
+    lo = 0
+    hi = len(series) - 1
+    idx: Optional[int] = None
 
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        t = series[mid][0]
+        if t <= entry_time:
+            idx = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
 
-def _ohlcv_table_for_tf(timeframe: str) -> str:
-    tf = timeframe.lower()
-    if tf == "m5":
-        return "ohlcv_bb_m5"
-    if tf == "m15":
-        return "ohlcv_bb_m15"
-    if tf == "h1":
-        return "ohlcv_bb_h1"
-    # дефолт на m5, чтобы не падать
-    return "ohlcv_bb_m5"
+    return idx
 
 
 def _dir_sign(direction: str) -> int:
-    return 1 if direction.lower() == "long" else -1
-
-
-def _is_win(pnl_abs: float) -> bool:
-    # считаем, что pnl_abs > 0 — выигрыш, остальное — не выигрыш
-    return pnl_abs > 0
+    return 1 if (direction or "").lower() == "long" else -1
 
 
 def _init_bin_record(
@@ -363,49 +284,338 @@ def _update_bin_record(
         rec["losses"] += 1
 
 
-# 🔸 Реализации фич семейства supertrend
+def _is_win(pnl_abs: float) -> bool:
+    return pnl_abs > 0
+
+
+# 🔸 Публичная точка входа V1-анализа семейства Supertrend
+async def run_analysis_supertrend(
+    scenario_id: int,
+    signal_id: int,
+    analysis_instances: List[Dict[str, Any]],
+    pg,
+) -> None:
+    """
+    V1-анализатор семейства supertrend:
+    считает агрегаты фич в bt_scenario_feature_bins для пары (scenario_id, signal_id).
+    Позиции (сигнал m5) анализируются симметрично по TF m5/m15/h1.
+    """
+    st_instances = [inst for inst in analysis_instances if inst.get("family_key") == "supertrend"]
+    if not st_instances:
+        log.info(
+            "BT_ANALYSIS_SUPERTREND: нет активных инстансов семейства supertrend для scenario_id=%s, signal_id=%s",
+            scenario_id,
+            signal_id,
+        )
+        return
+
+    async with pg.acquire() as conn:
+        # 🔸 Загрузка позиций для анализа
+        rows = await conn.fetch(
+            """
+            SELECT
+                id,
+                symbol,
+                timeframe,
+                direction,
+                entry_time,
+                entry_price,
+                sl_price,
+                pnl_abs
+            FROM bt_scenario_positions
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND postproc    = TRUE
+            """,
+            scenario_id,
+            signal_id,
+        )
+
+        if not rows:
+            log.info(
+                "BT_ANALYSIS_SUPERTREND: нет позиций с postproc=true для scenario_id=%s, signal_id=%s",
+                scenario_id,
+                signal_id,
+            )
+            return
+
+        positions: List[PositionRow] = []
+        for r in rows:
+            try:
+                positions.append(
+                    {
+                        "id": r["id"],
+                        "symbol": r["symbol"],
+                        "timeframe": r["timeframe"],
+                        "direction": r["direction"],
+                        "entry_time": r["entry_time"],
+                        "entry_price": float(r["entry_price"]),
+                        "sl_price": float(r["sl_price"]),
+                        "pnl_abs": float(r["pnl_abs"]),
+                    }
+                )
+            except Exception:
+                continue
+
+        if not positions:
+            log.info(
+                "BT_ANALYSIS_SUPERTREND: после преобразования нет валидных позиций для scenario_id=%s, signal_id=%s",
+                scenario_id,
+                signal_id,
+            )
+            return
+
+        total_bins_written = 0
+        total_trades_covered = 0
+
+        # 🔸 Обработка каждого инстанса семейства supertrend
+        for inst in st_instances:
+            key = inst.get("key")
+            params = inst.get("params") or {}
+
+            tf_cfg = params.get("timeframe")
+            src_cfg = params.get("source_key")
+
+            timeframe = str(tf_cfg.get("value")).strip() if tf_cfg is not None else "m5"
+            source_key = str(src_cfg.get("value")).strip() if src_cfg is not None else "supertrend10_3_0"
+
+            if not timeframe or not source_key:
+                log.info(
+                    "BT_ANALYSIS_SUPERTREND: пропуск inst_id=%s — нет timeframe/source_key (key=%s)",
+                    inst.get("id"),
+                    key,
+                )
+                continue
+
+            feature_name = resolve_feature_name(
+                family_key="supertrend",
+                key=key,
+                timeframe=timeframe,
+                source_key=source_key,
+            )
+
+            # параметры окон
+            def _get_int_param(name: str, default: int) -> int:
+                cfg = params.get(name)
+                if cfg is None:
+                    return default
+                try:
+                    return int(str(cfg.get("value")))
+                except Exception:
+                    return default
+
+            window_bars = _get_int_param("window_bars", DEFAULT_ST_LOOKBACK_BARS)
+            slope_k = _get_int_param("slope_k", DEFAULT_ST_SLOPE_K)
+            accel_k = _get_int_param("accel_k", DEFAULT_ST_ACCEL_K)
+
+            bins: Dict[BinKey, Dict[str, Any]] = {}
+
+            # выбор вычислителя по ключу фичи
+            if key == "align_mtf":
+                # align_mtf использует m5/m15/h1 независимо от timeframe инстанса
+                bins = await _compute_bins_align_mtf(
+                    conn=conn,
+                    positions=positions,
+                    feature_timeframe=timeframe,
+                    source_key=source_key,
+                )
+            elif key == "cushion_stop_units":
+                bins = await _compute_bins_cushion_stop_units(
+                    conn=conn,
+                    positions=positions,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                )
+            elif key == "age_bars":
+                bins = await _compute_bins_age_bars(
+                    conn=conn,
+                    positions=positions,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                    window_bars=window_bars,
+                )
+            elif key == "whipsaw_index":
+                bins = await _compute_bins_whipsaw_index(
+                    conn=conn,
+                    positions=positions,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                    window_bars=window_bars,
+                )
+            elif key == "pullback_depth":
+                bins = await _compute_bins_pullback_depth(
+                    conn=conn,
+                    positions=positions,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                    window_bars=window_bars,
+                )
+            elif key == "slope_pct":
+                bins = await _compute_bins_slope_pct(
+                    conn=conn,
+                    positions=positions,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                    slope_k=slope_k,
+                    window_bars=window_bars,
+                )
+            elif key == "accel_pct":
+                bins = await _compute_bins_accel_pct(
+                    conn=conn,
+                    positions=positions,
+                    timeframe=timeframe,
+                    source_key=source_key,
+                    accel_k=accel_k,
+                    window_bars=window_bars,
+                )
+            else:
+                log.info(
+                    "BT_ANALYSIS_SUPERTREND: неизвестный key='%s' для семейства supertrend, inst_id=%s — пропуск",
+                    key,
+                    inst.get("id"),
+                )
+                continue
+
+            if not bins:
+                log.info(
+                    "BT_ANALYSIS_SUPERTREND: inst_id=%s, key=%s, feature_name=%s — пустые бины, пропуск",
+                    inst.get("id"),
+                    key,
+                    feature_name,
+                )
+                continue
+
+            # 🔸 Запись агрегатов в bt_scenario_feature_bins через утилиту
+            await write_feature_bins(
+                conn=conn,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                feature_name=feature_name,
+                timeframe=timeframe,
+                version="v1",
+                records=list(bins.values()),
+            )
+
+            trades_for_inst = sum(rec["trades"] for rec in bins.values())
+            total_bins_written += len(bins)
+            total_trades_covered += trades_for_inst
+
+            log.info(
+                "BT_ANALYSIS_SUPERTREND: inst_id=%s, key=%s, feature_name=%s, tf=%s, src=%s — "
+                "bins=%s, trades=%s",
+                inst.get("id"),
+                key,
+                feature_name,
+                timeframe,
+                source_key,
+                len(bins),
+                trades_for_inst,
+            )
+
+        log.info(
+            "BT_ANALYSIS_SUPERTREND: завершено для scenario_id=%s, signal_id=%s — всего_бинов=%s, всего_сделок_охвачено=%s",
+            scenario_id,
+            signal_id,
+            total_bins_written,
+            total_trades_covered,
+        )
+
+
+# 🔸 Реализации фич семейства supertrend (V1-агрегаты)
 
 
 async def _compute_bins_align_mtf(
     conn,
     positions: List[PositionRow],
-    timeframe: str,
+    feature_timeframe: str,
     source_key: str,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
     st_align_mtf_sum — MTF-конфлюэнс тренда supertrend на m5/m15/h1.
-    Для feature_name таймфрейм берётся из анализа, но сам расчёт
-    использует все три TF (m5/m15/h1).
+    Позиции одни и те же, TF анализа (feature_timeframe) используется только в feature_name/timeframe.
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        dir_sign = _dir_sign(direction)
-        pnl_abs = pos["pnl_abs"]
-        win = _is_win(pnl_abs)
+    # условия расчёта: нужен ST для m5/m15/h1
+    i_m5 = _resolve_supertrend_instance_id("m5", source_key)
+    i_m15 = _resolve_supertrend_instance_id("m15", source_key)
+    i_h1 = _resolve_supertrend_instance_id("h1", source_key)
 
-        # тренды на трёх TF
-        m5_trend = await _load_last_trend_point(conn, symbol, "m5", source_key, entry_time)
-        m15_trend = await _load_last_trend_point(conn, symbol, "m15", source_key, entry_time)
-        h1_trend = await _load_last_trend_point(conn, symbol, "h1", source_key, entry_time)
+    if i_m5 is None or i_m15 is None or i_h1 is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: align_mtf — не найдены instance_id ST для всех TF (m5=%s, m15=%s, h1=%s)",
+            i_m5,
+            i_m15,
+            i_h1,
+        )
+        return bins
 
-        if m5_trend is None or m15_trend is None or h1_trend is None:
+    # история тренда для трёх TF
+    hist_m5 = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=i_m5,
+        param_name=f"{source_key}_trend",
+        timeframe="m5",
+        positions=positions,
+        window_bars=10,
+    )
+    hist_m15 = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=i_m15,
+        param_name=f"{source_key}_trend",
+        timeframe="m15",
+        positions=positions,
+        window_bars=10,
+    )
+    hist_h1 = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=i_h1,
+        param_name=f"{source_key}_trend",
+        timeframe="h1",
+        positions=positions,
+        window_bars=10,
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None:
             continue
 
-        align_m5 = m5_trend * dir_sign
-        align_m15 = m15_trend * dir_sign
-        align_h1 = h1_trend * dir_sign
+        series_m5 = hist_m5.get(symbol)
+        series_m15 = hist_m15.get(symbol)
+        series_h1 = hist_h1.get(symbol)
+        if not series_m5 or not series_m15 or not series_h1:
+            continue
+
+        idx_m5 = _find_index_leq(series_m5, entry_time)
+        idx_m15 = _find_index_leq(series_m15, entry_time)
+        idx_h1 = _find_index_leq(series_h1, entry_time)
+        if idx_m5 is None or idx_m15 is None or idx_h1 is None:
+            continue
+
+        dir_sign = _dir_sign(direction)
+        win = _is_win(pnl_abs)
+
+        trend_m5 = series_m5[idx_m5][1]
+        trend_m15 = series_m15[idx_m15][1]
+        trend_h1 = series_h1[idx_h1][1]
+
+        align_m5 = trend_m5 * dir_sign
+        align_m15 = trend_m15 * dir_sign
+        align_h1 = trend_h1 * dir_sign
 
         st_align_mtf_sum = (align_m5 + align_m15 + align_h1) / 3.0
 
-        # бин по st_align_mtf_sum
         bin_label, bin_from, bin_to = _bin_st_align_mtf(st_align_mtf_sum)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
@@ -418,40 +628,65 @@ async def _compute_bins_cushion_stop_units(
     source_key: str,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
-    st_cushion_stop_units — расстояние до линии supertrend в единицах стопа.
+    st_cushion_stop_units — расстояние до линии Supertrend в единицах стопа.
+    TF анализа задаётся параметром timeframe.
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        entry_price = pos["entry_price"]
-        sl_price = pos["sl_price"]
-        pnl_abs = pos["pnl_abs"]
-        win = _is_win(pnl_abs)
-        dir_sign = _dir_sign(direction)
+    instance_id = _resolve_supertrend_instance_id(timeframe, source_key)
+    if instance_id is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: cushion_stop_units — не найден instance_id для timeframe=%s, source_key=%s",
+            timeframe,
+            source_key,
+        )
+        return bins
 
-        stop_pct = abs(entry_price - sl_price) / entry_price * 100 if entry_price != 0 else 0.0
+    line_history = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=instance_id,
+        param_name=source_key,
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=10,
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        entry_price = p["entry_price"]
+        sl_price = p["sl_price"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None:
+            continue
+
+        series = line_history.get(symbol)
+        if not series or entry_price == 0:
+            continue
+
+        idx = _find_index_leq(series, entry_time)
+        if idx is None:
+            continue
+
+        st_line = series[idx][1]
+        dir_sign = _dir_sign(direction)
+        win = _is_win(pnl_abs)
+
+        stop_pct = abs(entry_price - sl_price) / entry_price * 100.0 if entry_price != 0 else 0.0
         if stop_pct <= 0:
             continue
 
-        # линия ST на TF позиции
-        line_series = await _load_line_history(conn, symbol, timeframe, source_key, entry_time, 1)
-        if not line_series:
-            continue
-        _, st_line = line_series[-1]
-
-        dist_pct_signed = (entry_price - st_line) / entry_price * 100 * dir_sign if entry_price != 0 else 0.0
-        if dist_pct_signed == 0 and stop_pct == 0:
-            continue
-
+        dist_pct_signed = (entry_price - st_line) / entry_price * 100.0 * dir_sign
         cushion_units = dist_pct_signed / stop_pct
 
         bin_label, bin_from, bin_to = _bin_st_cushion(cushion_units, dist_pct_signed)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
@@ -462,44 +697,66 @@ async def _compute_bins_age_bars(
     positions: List[PositionRow],
     timeframe: str,
     source_key: str,
+    window_bars: int,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
-    st_age_bars — возраст текущего тренда supertrend в барах.
+    st_age_bars — возраст текущего ST-тренда в барах (на TF анализа).
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        pnl_abs = pos["pnl_abs"]
-        win = _is_win(pnl_abs)
-
-        series = await _load_trend_history(
-            conn=conn,
-            symbol=symbol,
-            timeframe=timeframe,
-            source_key=source_key,
-            entry_time=entry_time,
-            limit_bars=DEFAULT_ST_LOOKBACK_BARS,
+    instance_id = _resolve_supertrend_instance_id(timeframe, source_key)
+    if instance_id is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: age_bars — не найден instance_id для timeframe=%s, source_key=%s",
+            timeframe,
+            source_key,
         )
+        return bins
+
+    trend_history = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=instance_id,
+        param_name=f"{source_key}_trend",
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=window_bars,
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None:
+            continue
+
+        series = trend_history.get(symbol)
         if not series:
             continue
 
-        # текущий тренд — последний элемент
-        _, trend_now = series[-1]
+        idx = _find_index_leq(series, entry_time)
+        if idx is None:
+            continue
+
+        trend_now = series[idx][1]
+        win = _is_win(pnl_abs)
 
         age_bars = 1
+        j = idx - 1
         # условия подсчёта возраста
-        for _, v in reversed(series[:-1]):
-            if v != trend_now:
+        while j >= 0 and age_bars < window_bars:
+            if series[j][1] != trend_now:
                 break
             age_bars += 1
+            j -= 1
 
         bin_label, bin_from, bin_to = _bin_st_age(age_bars)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
@@ -510,44 +767,69 @@ async def _compute_bins_whipsaw_index(
     positions: List[PositionRow],
     timeframe: str,
     source_key: str,
+    window_bars: int,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
-    st_whipsaw_index — доля флипов тренда supertrend за окно.
+    st_whipsaw_index — доля флипов ST-тренда за окно на TF анализа.
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        pnl_abs = pos["pnl_abs"]
-        win = _is_win(pnl_abs)
-
-        series = await _load_trend_history(
-            conn=conn,
-            symbol=symbol,
-            timeframe=timeframe,
-            source_key=source_key,
-            entry_time=entry_time,
-            limit_bars=DEFAULT_ST_LOOKBACK_BARS,
+    instance_id = _resolve_supertrend_instance_id(timeframe, source_key)
+    if instance_id is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: whipsaw_index — не найден instance_id для timeframe=%s, source_key=%s",
+            timeframe,
+            source_key,
         )
-        if len(series) < 2:
+        return bins
+
+    trend_history = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=instance_id,
+        param_name=f"{source_key}_trend",
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=window_bars,
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None:
             continue
 
-        # считаем флипы
+        series = trend_history.get(symbol)
+        if not series or len(series) < 2:
+            continue
+
+        idx = _find_index_leq(series, entry_time)
+        if idx is None or idx < 1:
+            continue
+
+        win = _is_win(pnl_abs)
+
+        # берём окно до idx включительно
+        window = series[max(0, idx - window_bars + 1) : idx + 1]
+        if len(window) < 2:
+            continue
+
         flips = 0
-        last = series[0][1]
-        for _, val in series[1:]:
-            if val != last:
+        last = window[0][1]
+        for _, v in window[1:]:
+            if v != last:
                 flips += 1
-                last = val
+                last = v
 
-        whipsaw_index = flips / (len(series) - 1)
-
+        whipsaw_index = flips / (len(window) - 1)
         bin_label, bin_from, bin_to = _bin_st_whipsaw(whipsaw_index)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
@@ -558,53 +840,78 @@ async def _compute_bins_pullback_depth(
     positions: List[PositionRow],
     timeframe: str,
     source_key: str,
+    window_bars: int,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
     st_pullback_depth_pct — глубина отката от экстремума внутри текущего ST-тренда.
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        entry_price = pos["entry_price"]
-        pnl_abs = pos["pnl_abs"]
-        win = _is_win(pnl_abs)
-
-        trend_series = await _load_trend_history(
-            conn=conn,
-            symbol=symbol,
-            timeframe=timeframe,
-            source_key=source_key,
-            entry_time=entry_time,
-            limit_bars=DEFAULT_ST_LOOKBACK_BARS,
+    instance_id = _resolve_supertrend_instance_id(timeframe, source_key)
+    if instance_id is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: pullback_depth — не найден instance_id для timeframe=%s, source_key=%s",
+            timeframe,
+            source_key,
         )
-        close_series = await _load_close_history(
-            conn=conn,
-            symbol=symbol,
-            timeframe=timeframe,
-            entry_time=entry_time,
-            limit_bars=DEFAULT_ST_LOOKBACK_BARS,
-        )
+        return bins
 
-        if not trend_series or not close_series:
+    trend_history = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=instance_id,
+        param_name=f"{source_key}_trend",
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=window_bars,
+    )
+    close_history = await _load_ohlcv_history_for_positions(
+        conn=conn,
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=window_bars,
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        entry_price = p["entry_price"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None:
             continue
 
-        # выравниваем по времени (простая версия: берём последние N, предполагая совпадение сетки)
-        # текущий тренд
-        _, trend_now = trend_series[-1]
+        series_trend = trend_history.get(symbol)
+        series_close = close_history.get(symbol)
+        if not series_trend or not series_close:
+            continue
 
-        # собираем close внутри текущего тренда
+        idx_trend = _find_index_leq(series_trend, entry_time)
+        idx_close = _find_index_leq(series_close, entry_time)
+        if idx_trend is None or idx_close is None:
+            continue
+
+        _, trend_now = series_trend[idx_trend]
+        win = _is_win(pnl_abs)
+
         closes_in_trend: List[float] = []
+
+        # выравнивание по индексу назад
+        j_trend = idx_trend
+        j_close = idx_close
+
         # условия накопления
-        for (t_trend, v_trend), (t_close, v_close) in zip(reversed(trend_series), reversed(close_series)):
+        while j_trend >= 0 and j_close >= 0 and len(closes_in_trend) < window_bars:
+            t_trend, v_trend = series_trend[j_trend]
+            t_close, v_close = series_close[j_close]
             if t_trend != t_close:
-                # в реальном коде тут лучше аккуратно совместить по времени; сейчас предполагаем совпадение
-                continue
+                # в реальном коде можно аккуратно совместить по времени; тут ожидается совпадение сетки TF
+                break
             if v_trend != trend_now:
                 break
             closes_in_trend.append(v_close)
+            j_trend -= 1
+            j_close -= 1
 
         if not closes_in_trend:
             continue
@@ -613,17 +920,19 @@ async def _compute_bins_pullback_depth(
             swing_high = max(closes_in_trend)
             if swing_high == 0:
                 continue
-            depth_pct = (swing_high - entry_price) / swing_high * 100
+            depth_pct = (swing_high - entry_price) / swing_high * 100.0
         else:
             swing_low = min(closes_in_trend)
             if swing_low == 0:
                 continue
-            depth_pct = (entry_price - swing_low) / swing_low * 100
+            depth_pct = (entry_price - swing_low) / swing_low * 100.0
 
         bin_label, bin_from, bin_to = _bin_st_pullback_depth(depth_pct)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
@@ -634,43 +943,63 @@ async def _compute_bins_slope_pct(
     positions: List[PositionRow],
     timeframe: str,
     source_key: str,
+    slope_k: int,
+    window_bars: int,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
-    st_slope_pct — наклон линии supertrend за K баров, в %% от цены входа.
+    st_slope_pct — наклон линии ST за slope_k баров, в %% от цены входа (TF анализа).
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    K = DEFAULT_ST_SLOPE_K
+    instance_id = _resolve_supertrend_instance_id(timeframe, source_key)
+    if instance_id is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: slope_pct — не найден instance_id для timeframe=%s, source_key=%s",
+            timeframe,
+            source_key,
+        )
+        return bins
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        entry_price = pos["entry_price"]
-        pnl_abs = pos["pnl_abs"]
+    line_history = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=instance_id,
+        param_name=source_key,
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=max(window_bars, slope_k + 1),
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        entry_price = p["entry_price"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None or entry_price == 0:
+            continue
+
+        series = line_history.get(symbol)
+        if not series:
+            continue
+
+        idx = _find_index_leq(series, entry_time)
+        if idx is None or idx - slope_k < 0:
+            continue
+
         win = _is_win(pnl_abs)
         dir_sign = _dir_sign(direction)
 
-        line_series = await _load_line_history(
-            conn=conn,
-            symbol=symbol,
-            timeframe=timeframe,
-            source_key=source_key,
-            entry_time=entry_time,
-            limit_bars=K + 1,
-        )
-        if len(line_series) <= K or entry_price == 0:
-            continue
+        st_now = series[idx][1]
+        st_prev = series[idx - slope_k][1]
 
-        st_now = line_series[-1][1]
-        st_prev = line_series[-1 - K][1]
-
-        slope_pct = (st_now - st_prev) / entry_price * 100 * dir_sign
-
+        slope_pct = (st_now - st_prev) / entry_price * 100.0 * dir_sign
         bin_label, bin_from, bin_to = _bin_st_slope(slope_pct)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
@@ -681,57 +1010,79 @@ async def _compute_bins_accel_pct(
     positions: List[PositionRow],
     timeframe: str,
     source_key: str,
+    accel_k: int,
+    window_bars: int,
 ) -> Dict[BinKey, Dict[str, Any]]:
     """
-    st_accel_pct — изменение наклона supertrend (ускорение/замедление).
+    st_accel_pct — изменение наклона ST (ускорение/замедление) за 2*accel_k баров (TF анализа).
     """
     bins: Dict[BinKey, Dict[str, Any]] = {}
 
-    K = DEFAULT_ST_ACCEL_K
+    instance_id = _resolve_supertrend_instance_id(timeframe, source_key)
+    if instance_id is None:
+        log.warning(
+            "BT_ANALYSIS_SUPERTREND: accel_pct — не найден instance_id для timeframe=%s, source_key=%s",
+            timeframe,
+            source_key,
+        )
+        return bins
 
-    for pos in positions:
-        symbol = pos["symbol"]
-        entry_time = pos["entry_time"]
-        direction = pos["direction"]
-        entry_price = pos["entry_price"]
-        pnl_abs = pos["pnl_abs"]
+    need_bars = max(window_bars, 2 * accel_k + 1)
+
+    line_history = await _load_st_history_for_positions(
+        conn=conn,
+        instance_id=instance_id,
+        param_name=source_key,
+        timeframe=timeframe,
+        positions=positions,
+        window_bars=need_bars,
+    )
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry_time = p["entry_time"]
+        direction = p["direction"]
+        entry_price = p["entry_price"]
+        pnl_abs = p["pnl_abs"]
+
+        if direction is None or pnl_abs is None or entry_price == 0:
+            continue
+
+        series = line_history.get(symbol)
+        if not series:
+            continue
+
+        idx = _find_index_leq(series, entry_time)
+        if idx is None or idx - 2 * accel_k < 0:
+            continue
+
         win = _is_win(pnl_abs)
         dir_sign = _dir_sign(direction)
 
-        line_series = await _load_line_history(
-            conn=conn,
-            symbol=symbol,
-            timeframe=timeframe,
-            source_key=source_key,
-            entry_time=entry_time,
-            limit_bars=2 * K + 1,
-        )
-        if len(line_series) <= 2 * K or entry_price == 0:
-            continue
+        st_t = series[idx][1]
+        st_t_k = series[idx - accel_k][1]
+        st_t_2k = series[idx - 2 * accel_k][1]
 
-        st_t = line_series[-1][1]
-        st_t_k = line_series[-1 - K][1]
-        st_t_2k = line_series[-1 - 2 * K][1]
-
-        slope1 = (st_t - st_t_k) / entry_price * 100 * dir_sign
-        slope2 = (st_t_k - st_t_2k) / entry_price * 100 * dir_sign
+        slope1 = (st_t - st_t_k) / entry_price * 100.0 * dir_sign
+        slope2 = (st_t_k - st_t_2k) / entry_price * 100.0 * dir_sign
 
         accel_pct = slope1 - slope2
-
         bin_label, bin_from, bin_to = _bin_st_accel(accel_pct)
         key: BinKey = (direction, bin_label)
+
         if key not in bins:
             bins[key] = _init_bin_record(direction, bin_label, bin_from, bin_to)
+
         _update_bin_record(bins[key], pnl_abs, win)
 
     return bins
 
 
-# 🔸 Биннеры для каждой фичи
+# 🔸 Биннеры для значений Supertrend (должны быть согласованы с калибровкой)
 
 
 def _bin_st_align_mtf(value: float) -> Tuple[str, float, float]:
-    # условия биннинга MTF-конфлюэнса
+    # биннинг MTF-конфлюэнса
     if value <= -0.5:
         return "ST_MTF_AllAgainst", -1.0, -0.5
     if value < 0.0:
@@ -742,7 +1093,7 @@ def _bin_st_align_mtf(value: float) -> Tuple[str, float, float]:
 
 
 def _bin_st_cushion(cushion_units: float, dist_pct_signed: float) -> Tuple[str, Optional[float], Optional[float]]:
-    # биннинг по запасу до ST в стопах
+    # биннинг запаса до ST в единицах стопа
     if dist_pct_signed <= 0:
         return "ST_Cushion_Negative", None, 0.0
     if cushion_units <= 0.5:
@@ -755,7 +1106,7 @@ def _bin_st_cushion(cushion_units: float, dist_pct_signed: float) -> Tuple[str, 
 
 
 def _bin_st_age(age_bars: int) -> Tuple[str, int, Optional[int]]:
-    # биннинг возраста тренда
+    # биннинг возраста ST-тренда
     if age_bars <= 3:
         return "ST_Age_VeryFresh", 1, 3
     if age_bars <= 10:
