@@ -13,11 +13,14 @@ from backtester_config import (
 # 🔸 Воркеры семей анализаторов
 from bt_analysis_rsi import run_analysis_rsi
 from bt_analysis_adx import run_analysis_adx
+from bt_analysis_ema import run_analysis_ema
 
 # 🔸 Реестр обработчиков семейств анализаторов
 FAMILY_ANALYSIS_HANDLERS = {
     "rsi": run_analysis_rsi,
     "adx": run_analysis_adx,
+    "ema": run_analysis_ema,
+
 }
 
 # 🔸 Константы стримов анализа

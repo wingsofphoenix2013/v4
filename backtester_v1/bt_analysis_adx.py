@@ -614,7 +614,7 @@ async def _analyze_adx_strength(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(stat["trades"] for stat in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ADX: inst_id=%s key=strength timeframe=%s source_key=%s bins=%s trades=%s",
         inst_id,
         timeframe,
@@ -733,7 +733,7 @@ async def _analyze_dmi_dominance(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(stat["trades"] for stat in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ADX: inst_id=%s key=dominance timeframe=%s source_key=%s bins=%s trades=%s",
         inst_id,
         timeframe,
@@ -845,7 +845,7 @@ async def _analyze_adx_slope(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(stat["trades"] for stat in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ADX: inst_id=%s key=slope timeframe=%s source_key=%s bins=%s trades=%s",
         inst_id,
         timeframe,
@@ -973,7 +973,7 @@ async def _analyze_dmi_trend_age(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(stat["trades"] for stat in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ADX: inst_id=%s key=trend_age timeframe=%s source_key=%s bins=%s trades=%s",
         inst_id,
         timeframe,
@@ -1112,7 +1112,7 @@ async def _analyze_dmi_chop(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(stat["trades"] for stat in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ADX: inst_id=%s key=chop timeframe=%s source_key=%s bins=%s trades=%s",
         inst_id,
         timeframe,
@@ -1239,7 +1239,7 @@ async def _analyze_adx_fast_slow_diff(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(stat["trades"] for stat in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ADX: inst_id=%s key=fast_slow_diff timeframe=%s source_key=%s bins=%s trades=%s",
         inst_id,
         timeframe,

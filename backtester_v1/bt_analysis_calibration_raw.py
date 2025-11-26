@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 # 🔸 Импорты семейств калибровки сырых фич
 from bt_analysis_calibration_rsi import run_calibration_rsi_raw
 from bt_analysis_calibration_adx import run_calibration_adx_raw
+from bt_analysis_calibration_ema import run_calibration_ema_raw
 
 log = logging.getLogger("BT_ANALYSIS_CALIB_RAW")
 
@@ -25,6 +26,7 @@ CALIB_STREAM_BLOCK_MS = 5000
 FAMILY_CALIBRATION_HANDLERS = {
     "rsi": run_calibration_rsi_raw,
     "adx": run_calibration_adx_raw,
+    "ema": run_calibration_ema_raw,
 }
 
 
