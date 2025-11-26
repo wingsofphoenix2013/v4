@@ -1,5 +1,6 @@
 # bt_analysis_calibration_raw.py — оркестратор калибровки сырых фич анализаторов
 
+# 🔸 Импорты стандартной библиотеки
 import asyncio
 import logging
 from datetime import datetime
@@ -24,7 +25,7 @@ CALIB_CONSUMER_NAME = "bt_analysis_calib_raw_main"
 CALIB_STREAM_BATCH_SIZE = 10
 CALIB_STREAM_BLOCK_MS = 5000
 
-# 🔸 Регистр обработчиков семей для калибровки
+# 🔸 Регистр обработчиков семейств для калибровки
 FAMILY_CALIBRATION_HANDLERS = {
     "rsi": run_calibration_rsi_raw,
     "adx": run_calibration_adx_raw,
@@ -34,7 +35,7 @@ FAMILY_CALIBRATION_HANDLERS = {
 }
 
 
-# 🔸 Публичная точка входа: воркер калибровки сырых фич (оркерестратор семейств)
+# 🔸 Публичная точка входа: воркер калибровки сырых фич (оркестратор семейств)
 async def run_bt_analysis_calibration_raw(pg, redis):
     log.debug("BT_ANALYSIS_CALIB_RAW: воркер калибровки сырых фич запущен")
 
@@ -305,7 +306,9 @@ async def _process_family_raw(
                 timeframe,
                 entry_time,
                 raw_stat,
-                pnl_abs
+                pnl_abs,
+                entry_price,
+                sl_price
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
@@ -334,6 +337,8 @@ async def _process_family_raw(
                 "entry_time": r["entry_time"],
                 "raw_stat": r["raw_stat"],
                 "pnl_abs": r["pnl_abs"],
+                "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else None,
+                "sl_price": float(r["sl_price"]) if r["sl_price"] is not None else None,
             }
         )
 
