@@ -39,7 +39,7 @@ MIN_BASE_TRADES_PER_WINDOW = {
 }
 
 # 🔸 Поддерживаемые семейства анализаторов
-SUPPORTED_FAMILIES = {"rsi", "adx", "ema", "atr"}
+SUPPORTED_FAMILIES_CALIB = {"rsi", "adx", "ema", "atr", "supertrend"}
 
 # 🔸 Квантование до 4 знаков
 def _q4(value: Decimal) -> Decimal:

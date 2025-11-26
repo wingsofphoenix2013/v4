@@ -570,7 +570,7 @@ async def _analyze_atr_pct(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ATR: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -705,7 +705,7 @@ async def _analyze_atr_tf_ratio(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ATR: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -860,7 +860,7 @@ async def _analyze_atr_stop_units(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ATR: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -1075,7 +1075,7 @@ async def _analyze_atr_history_based(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ATR: inst_id=%s, feature=%s, key=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
