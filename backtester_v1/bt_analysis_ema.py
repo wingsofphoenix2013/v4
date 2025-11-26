@@ -557,7 +557,7 @@ async def _analyze_ema_trend_alignment(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -656,7 +656,7 @@ async def _analyze_ema_stack_spread(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -764,7 +764,7 @@ async def _analyze_ema_overextension(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -862,7 +862,7 @@ async def _analyze_ema_band_9_21(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -967,7 +967,7 @@ async def _analyze_ema_inner_outer_ratio(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -1276,7 +1276,7 @@ async def _analyze_ema_history_based(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, key=%s, bins=%s, trades=%s",
         inst_id,
         feature_name,
@@ -1464,7 +1464,7 @@ async def _analyze_ema_tf_confluence(
         bin_stat["pnl_abs_total"] += pnl_abs
 
     total_trades = sum(b["trades"] for b in agg.values())
-    log.info(
+    log.debug(
         "BT_ANALYSIS_EMA: inst_id=%s, feature=%s, key=ema_tf_confluence, bins=%s, trades=%s",
         inst_id,
         feature_name,

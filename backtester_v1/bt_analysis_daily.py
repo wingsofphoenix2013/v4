@@ -32,7 +32,7 @@ MIN_COVERAGE = Decimal("0.20")              # минимальная доля с
 MIN_WINRATE_IMPROVEMENT = Decimal("0.01")   # минимальное улучшение winrate (1%)
 
 # 🔸 Поддерживаемые семейства анализаторов
-SUPPORTED_FAMILIES = {"rsi", "adx", "ema"}
+SUPPORTED_FAMILIES = {"rsi", "adx", "ema", "atr"}
 
 # 🔸 Квантование до 4 знаков
 def _q4(value: Decimal) -> Decimal:
