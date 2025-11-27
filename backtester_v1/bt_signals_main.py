@@ -304,7 +304,7 @@ async def _schedule_ema_cross_backfill(
             )
             # один прогон backfill по истории для данного сигнала
             await run_emacross_backfill(signal, pg, redis)
-            log.info(
+            log.debug(
                 "BT_SIG_EMA_CROSS: backfill для сигнала id=%s ('%s') завершён, следующий запуск через %s секунд",
                 sid,
                 name,

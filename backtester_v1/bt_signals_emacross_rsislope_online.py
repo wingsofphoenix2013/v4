@@ -391,7 +391,7 @@ async def _compute_live_signals_for_bar(
     slow_val = await _get_indicator_value_ts(redis, symbol, timeframe, slow_name, open_time)
 
     if fast_val is None or slow_val is None:
-        log.debug(
+        log.info(
             "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: недостаточно данных EMA для %s на баре %s (fast=%s, slow=%s), "
             "signal_id=%s",
             symbol,
@@ -544,7 +544,7 @@ async def _compute_rsi_slope_for_bar(
         # после ретраев ещё может не быть свежего бара — тогда просто скипаем
         rows = await _ts_range(redis, ts_key, ts_ms, ts_ms)
         if not rows:
-            log.debug(
+            log.info(
                 "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: для symbol=%s, time=%s, rsi_tf=%s, rsi_name=%s "
                 "после ожидания нет нового h1-бара, сигнал скипнут",
                 symbol,
@@ -664,7 +664,7 @@ async def _load_rsi_slope_candidate_ranges(
             except Exception:
                 continue
 
-    log.debug(
+    log.info(
         "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: загружено кандидатов rsi_slope=%s для scenario_id=%s, base_signal_id=%s, "
         "analysis_id=%s, direction=%s, timeframe=%s",
         len(ranges),

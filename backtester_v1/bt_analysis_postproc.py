@@ -52,7 +52,7 @@ def _safe_div(n: Decimal, d: Decimal) -> Decimal:
 
 # 🔸 Публичная точка входа: оркестратор пост-анализа bt_scenario_feature_bins
 async def run_bt_analysis_postproc(pg, redis):
-    log.info("BT_ANALYSIS_POSTPROC: воркер пост-анализа запущен")
+    log.debug("BT_ANALYSIS_POSTPROC: воркер пост-анализа запущен")
 
     # подготавливаем consumer group для стрима bt:analysis:ready
     await _ensure_consumer_group(redis)
@@ -94,7 +94,7 @@ async def run_bt_analysis_postproc(pg, redis):
                     analysis_ids = ctx["analysis_ids"]
                     version = ctx["version"]
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_POSTPROC: получено сообщение о готовности анализа "
                         "scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
@@ -164,7 +164,7 @@ async def run_bt_analysis_postproc(pg, redis):
                                 "finished_at": finished_at_postproc.isoformat(),
                             },
                         )
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_POSTPROC: опубликовано событие готовности пост-анализа в стрим '%s' "
                             "для scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, "
                             "stats_written=%s, candidates_written=%s, finished_at=%s",
@@ -198,7 +198,7 @@ async def run_bt_analysis_postproc(pg, redis):
                         entry_id,
                     )
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_POSTPROC: сообщение stream_id=%s для scenario_id=%s, signal_id=%s, version=%s "
                         "обработано, записано строк в bt_analysis_stat=%s, кандидатов=%s",
                         entry_id,
@@ -209,7 +209,7 @@ async def run_bt_analysis_postproc(pg, redis):
                         candidates_written,
                     )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_POSTPROC: пакет сообщений обработан — сообщений=%s, пар_сценарий_сигнал=%s, "
                 "строк_в_bt_analysis_stat=%s, строк_в_bt_analysis_candidates=%s",
                 total_msgs,
@@ -245,7 +245,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_POSTPROC: consumer group '%s' для стрима '%s' уже существует",
                 ANALYSIS_POSTPROC_CONSUMER_GROUP,
                 ANALYSIS_READY_STREAM_KEY,
@@ -679,7 +679,7 @@ async def _process_analysis_family(
                 candidates_written = len(candidates_to_insert)
                 candidates_written_total += candidates_written
 
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_POSTPROC: записаны кандидаты в %s: scenario_id=%s, signal_id=%s, "
                     "analysis_id=%s, direction=%s, timeframe=%s, version=%s, feature=%s, "
                     "кандидатных_бинов=%s, base_trades=%s, coverage=%.4f",
@@ -765,7 +765,7 @@ async def _process_analysis_family(
                 float(coverage),
             )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_POSTPROC: итог по семье=%s, scenario_id=%s, signal_id=%s, version=%s — "
         "строк_в_bt_analysis_stat=%s, строк_в_bt_analysis_candidates=%s",
         family_key,

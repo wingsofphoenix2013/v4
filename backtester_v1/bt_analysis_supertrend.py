@@ -302,7 +302,7 @@ async def run_analysis_supertrend(
     """
     st_instances = [inst for inst in analysis_instances if inst.get("family_key") == "supertrend"]
     if not st_instances:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_SUPERTREND: нет активных инстансов семейства supertrend для scenario_id=%s, signal_id=%s",
             scenario_id,
             signal_id,
@@ -332,7 +332,7 @@ async def run_analysis_supertrend(
         )
 
         if not rows:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_SUPERTREND: нет позиций с postproc=true для scenario_id=%s, signal_id=%s",
                 scenario_id,
                 signal_id,
@@ -358,7 +358,7 @@ async def run_analysis_supertrend(
                 continue
 
         if not positions:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_SUPERTREND: после преобразования нет валидных позиций для scenario_id=%s, signal_id=%s",
                 scenario_id,
                 signal_id,
@@ -380,7 +380,7 @@ async def run_analysis_supertrend(
             source_key = str(src_cfg.get("value")).strip() if src_cfg is not None else "supertrend10_3_0"
 
             if not timeframe or not source_key:
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_SUPERTREND: пропуск inst_id=%s — нет timeframe/source_key (key=%s)",
                     inst.get("id"),
                     key,
@@ -468,7 +468,7 @@ async def run_analysis_supertrend(
                     window_bars=window_bars,
                 )
             else:
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_SUPERTREND: неизвестный key='%s' для семейства supertrend, inst_id=%s — пропуск",
                     key,
                     inst.get("id"),
@@ -476,7 +476,7 @@ async def run_analysis_supertrend(
                 continue
 
             if not bins:
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_SUPERTREND: inst_id=%s, key=%s, feature_name=%s — пустые бины, пропуск",
                     inst.get("id"),
                     key,
@@ -499,7 +499,7 @@ async def run_analysis_supertrend(
             total_bins_written += len(bins)
             total_trades_covered += trades_for_inst
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_SUPERTREND: inst_id=%s, key=%s, feature_name=%s, tf=%s, src=%s — "
                 "bins=%s, trades=%s",
                 inst.get("id"),
@@ -511,7 +511,7 @@ async def run_analysis_supertrend(
                 trades_for_inst,
             )
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_SUPERTREND: завершено для scenario_id=%s, signal_id=%s — всего_бинов=%s, всего_сделок_охвачено=%s",
             scenario_id,
             signal_id,

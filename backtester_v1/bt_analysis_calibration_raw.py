@@ -365,7 +365,7 @@ async def _process_family_raw(
         positions=positions,
     )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_CALIB_RAW: семейство=%s, scenario_id=%s, signal_id=%s — сырых строк записано=%s",
         family_key,
         scenario_id,

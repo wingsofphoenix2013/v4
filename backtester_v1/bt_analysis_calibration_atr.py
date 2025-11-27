@@ -711,7 +711,7 @@ async def run_calibration_atr_raw(
                     len(rows_to_insert),
                 )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_CALIB_ATR: калибровка ATR завершена для scenario_id=%s, signal_id=%s, "
         "analysis_ids=%s, всего_строк=%s",
         scenario_id,

@@ -63,7 +63,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_DAILY: consumer group '%s' для стрима '%s' уже существует",
                 ANALYSIS_DAILY_CONSUMER_GROUP,
                 ANALYSIS_POSTPROC_READY_STREAM_KEY,
@@ -604,7 +604,7 @@ async def _process_analysis_family_daily(
                 )
 
             if not rows_to_insert:
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_DAILY: для analysis_id=%s, direction=%s, timeframe=%s, version=%s "
                     "нет данных для записи в bt_analysis_daily",
                     aid,
@@ -670,7 +670,7 @@ async def _process_analysis_family_daily(
 
 # 🔸 Публичная точка входа: воркер суточного анализа анализаторов
 async def run_bt_analysis_daily(pg, redis):
-    log.info("BT_ANALYSIS_DAILY: воркер суточного анализа запущен")
+    log.debug("BT_ANALYSIS_DAILY: воркер суточного анализа запущен")
 
     # подготавливаем consumer group для стрима bt:analysis:postproc:ready
     await _ensure_consumer_group(redis)
@@ -705,7 +705,7 @@ async def run_bt_analysis_daily(pg, redis):
                     analysis_ids = ctx["analysis_ids"]
                     version = ctx["version"]
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_DAILY: получено сообщение о завершении пост-анализа "
                         "scenario_id=%s, signal_id=%s, family=%s, version=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
@@ -791,7 +791,7 @@ async def run_bt_analysis_daily(pg, redis):
                                 "finished_at": finished_at_daily.isoformat(),
                             },
                         )
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_DAILY: опубликовано событие готовности daily-аналитики в стрим '%s' "
                             "для scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s, "
                             "rows_v1=%s, rows_v2=%s, rows_total=%s, finished_at=%s",
@@ -820,7 +820,7 @@ async def run_bt_analysis_daily(pg, redis):
                     # помечаем сообщение как обработанное
                     await redis.xack(ANALYSIS_POSTPROC_READY_STREAM_KEY, ANALYSIS_DAILY_CONSUMER_GROUP, entry_id)
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_DAILY: сообщение stream_id=%s для scenario_id=%s, signal_id=%s, version=%s "
                         "обработано, строк_в_bt_analysis_daily=%s (v1=%s, v2=%s)",
                         entry_id,
@@ -832,7 +832,7 @@ async def run_bt_analysis_daily(pg, redis):
                         rows_v2,
                     )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_DAILY: пакет сообщений обработан — сообщений=%s, пар_сценарий_сигнал=%s, "
                 "строк_в_bt_analysis_daily=%s",
                 total_msgs,

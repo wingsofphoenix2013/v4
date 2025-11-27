@@ -51,7 +51,7 @@ def _safe_div(n: Decimal, d: Decimal) -> Decimal:
 
 # 🔸 Публичная точка входа: воркер построения адаптивных бин-конфигов
 async def run_bt_analysis_calibration_processor(pg, redis):
-    log.info("BT_ANALYSIS_CALIB_PROC: воркер построения адаптивных бин-конфигов запущен")
+    log.debug("BT_ANALYSIS_CALIB_PROC: воркер построения адаптивных бин-конфигов запущен")
 
     # подготавливаем consumer group для стрима bt:analysis:calibration:ready
     await _ensure_consumer_group(redis)
@@ -86,7 +86,7 @@ async def run_bt_analysis_calibration_processor(pg, redis):
                     analysis_ids = ctx["analysis_ids"]
                     rows_written = ctx["rows_written"]
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_CALIB_PROC: получено сообщение о готовности сырых фич "
                         "scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s, rows_written=%s, stream_id=%s",
                         scenario_id,
@@ -125,7 +125,7 @@ async def run_bt_analysis_calibration_processor(pg, redis):
                                 "finished_at": finished_at.isoformat(),
                             },
                         )
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_CALIB_PROC: опубликовано событие в '%s' для scenario_id=%s, signal_id=%s, "
                             "family=%s, analysis_ids=%s, version=%s, finished_at=%s",
                             ADAPTIVE_READY_STREAM_KEY,
@@ -150,7 +150,7 @@ async def run_bt_analysis_calibration_processor(pg, redis):
 
                     await redis.xack(CALIB_READY_STREAM_KEY, CALIB_PROC_CONSUMER_GROUP, entry_id)
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_CALIB_PROC: сообщение stream_id=%s для scenario_id=%s, signal_id=%s "
                         "обработано, фич откалибровано=%s",
                         entry_id,
@@ -159,7 +159,7 @@ async def run_bt_analysis_calibration_processor(pg, redis):
                         features_calibrated,
                     )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_PROC: пакет сообщений обработан — сообщений=%s, пар_сценарий_сигнал=%s, "
                 "фич_откалибровано=%s",
                 total_msgs,
@@ -193,7 +193,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_PROC: consumer group '%s' для стрима '%s' уже существует",
                 CALIB_PROC_CONSUMER_GROUP,
                 CALIB_READY_STREAM_KEY,
@@ -389,7 +389,7 @@ async def _process_family_calibration(
 
         total_trades = len(values)
         if total_trades < max(NUM_BINS, MIN_TRADES_FOR_CALIB):
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_PROC: недостаточно данных для калибровки feature_name=%s "
                 "(trades=%s, min_required=%s)",
                 feature_name,
@@ -402,7 +402,7 @@ async def _process_family_calibration(
         bins = _build_quantile_bins(values, wins, num_bins=NUM_BINS)
 
         if not bins:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_CALIB_PROC: не удалось построить бины для feature_name=%s "
                 "(scenario_id=%s, signal_id=%s)",
                 feature_name,

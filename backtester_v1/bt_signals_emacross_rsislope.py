@@ -209,7 +209,7 @@ async def run_emacross_rsislope_backfill(
     )
 
     if not candidate_ranges:
-        log.info(
+        log.debug(
             "BT_SIG_EMA_CROSS_RSISLOPE: для сигнала id=%s ('%s') нет кандидатов в %s по направлению=%s, "
             "работа зависимого сигнала пропущена",
             sid,
@@ -229,7 +229,7 @@ async def run_emacross_rsislope_backfill(
         )
         return
 
-    log.info(
+    log.debug(
         "BT_SIG_EMA_CROSS_RSISLOPE: старт backfill для сигнала id=%s ('%s', key=%s), "
         "TF=%s, окно=%s дней, тикеров=%s, direction_mask=%s, rsi_timeframe=%s, rsi_source_key=%s, "
         "slope_k=%s, кандидатов_диапазонов=%s",
@@ -295,7 +295,7 @@ async def run_emacross_rsislope_backfill(
         total_long += longs
         total_short += shorts
 
-    log.info(
+    log.debug(
         "BT_SIG_EMA_CROSS_RSISLOPE: backfill завершён для сигнала id=%s ('%s'): "
         "вставлено событий=%s, long=%s, short=%s",
         sid,

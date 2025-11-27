@@ -105,7 +105,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_STABILITY: consumer group '%s' для стрима '%s' уже существует",
                 STABILITY_CONSUMER_GROUP,
                 DAILY_READY_STREAM_KEY,
@@ -559,7 +559,7 @@ async def _process_analysis_stability_for_window(
 
 # 🔸 Публичная точка входа: воркер стабильности анализаторов
 async def run_bt_analysis_stability(pg, redis):
-    log.info("BT_ANALYSIS_STABILITY: воркер расчёта стабильности запущен")
+    log.debug("BT_ANALYSIS_STABILITY: воркер расчёта стабильности запущен")
 
     # подготавливаем consumer group для стрима bt:analysis:daily:ready
     await _ensure_consumer_group(redis)
@@ -593,7 +593,7 @@ async def run_bt_analysis_stability(pg, redis):
                     family_key = ctx["family_key"]
                     analysis_ids = ctx["analysis_ids"]
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_STABILITY: получено сообщение о готовности daily-аналитики "
                         "scenario_id=%s, signal_id=%s, family=%s, analysis_ids=%s, stream_id=%s",
                         scenario_id,
@@ -657,7 +657,7 @@ async def run_bt_analysis_stability(pg, redis):
                         rows_written_pair,
                     )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_STABILITY: пакет сообщений обработан — сообщений=%s, пар_сценарий_сигнал=%s, "
                 "строк_в_bt_analysis_stability=%s",
                 total_msgs,
