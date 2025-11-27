@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 # 🔸 Конфиг и кеши backtester_v1
 from backtester_config import get_enabled_signals
