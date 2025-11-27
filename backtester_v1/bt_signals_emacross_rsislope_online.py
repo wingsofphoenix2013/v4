@@ -419,10 +419,27 @@ async def _compute_live_signals_for_bar(
 
     # зона неопределённости — состояние не меняем, сигнала нет
     if state == "neutral":
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: расчёт выполнен, но EMA-кросса нет (neutral), "
+            "symbol=%s, time=%s, diff=%.8f, epsilon=%.8f, signal_id=%s",
+            symbol,
+            open_time,
+            diff,
+            epsilon,
+            cfg["signal_id"],
+        )
         return []
 
     # первая инициализация состояния
     if prev_state is None:
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: первая инициализация состояния EMA, "
+            "symbol=%s, time=%s, state=%s, signal_id=%s",
+            symbol,
+            open_time,
+            state,
+            cfg["signal_id"],
+        )
         ema_prev_state[symbol] = state
         return []
 
@@ -436,12 +453,41 @@ async def _compute_live_signals_for_bar(
             direction = "short"
         else:
             ema_prev_state[symbol] = state
+            log.info(
+                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: изменение состояния EMA без валидного кросса "
+                "(symbol=%s, time=%s, prev_state=%s, state=%s, signal_id=%s)",
+                symbol,
+                open_time,
+                prev_state,
+                state,
+                cfg["signal_id"],
+            )
             return []
+
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: найден EMA-кросс, symbol=%s, time=%s, direction=%s, "
+            "diff=%.8f, epsilon=%.8f, signal_id=%s",
+            symbol,
+            open_time,
+            direction,
+            diff,
+            epsilon,
+            cfg["signal_id"],
+        )
 
         # фильтр по маске направлений
         allowed_directions: Set[str] = cfg["allowed_directions"]
         if direction not in allowed_directions:
             ema_prev_state[symbol] = state
+            log.info(
+                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но направление не разрешено маской "
+                "(symbol=%s, time=%s, direction=%s, allowed=%s, signal_id=%s)",
+                symbol,
+                open_time,
+                direction,
+                ",".join(sorted(allowed_directions)),
+                cfg["signal_id"],
+            )
             return []
 
         # расчитываем RSI-slope для этого бара
@@ -449,6 +495,14 @@ async def _compute_live_signals_for_bar(
         if rsi_pair is None:
             # либо RSI ещё не готов (особенно на начале часа), либо недостаточно истории
             ema_prev_state[symbol] = state
+            log.info(
+                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но RSI-slope ещё не готов или недостаточно истории "
+                "(symbol=%s, time=%s, direction=%s, signal_id=%s)",
+                symbol,
+                open_time,
+                direction,
+                cfg["signal_id"],
+            )
             return []
 
         rsi_t, rsi_prev, slope = rsi_pair
@@ -457,12 +511,28 @@ async def _compute_live_signals_for_bar(
         candidate_ranges: List[Tuple[float, float]] = cfg["candidate_ranges"]
         if not _slope_in_ranges(slope, candidate_ranges):
             ema_prev_state[symbol] = state
+            log.info(
+                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но не прошёл по RSI-slope "
+                "(symbol=%s, time=%s, direction=%s, slope=%.5f, signal_id=%s)",
+                symbol,
+                open_time,
+                direction,
+                slope,
+                cfg["signal_id"],
+            )
             return []
 
         # достаём цену close на m5
         price = await _get_close_price_ts(redis, symbol, timeframe, open_time)
         if price is None:
             ema_prev_state[symbol] = state
+            log.info(
+                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс + RSI-slope прошли, но нет цены close "
+                "(symbol=%s, time=%s, signal_id=%s)",
+                symbol,
+                open_time,
+                cfg["signal_id"],
+            )
             return []
 
         # формируем live-сигнал для публикации
@@ -495,6 +565,17 @@ async def _compute_live_signals_for_bar(
                 {"from": r[0], "to": r[1]} for r in candidate_ranges
             ],
         }
+
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс и RSI-slope прошли все фильтры, "
+            "готовим live-сигнал symbol=%s, time=%s, direction=%s, price=%.8f, slope=%.5f, signal_id=%s",
+            symbol,
+            open_time,
+            direction,
+            price,
+            slope,
+            signal_id,
+        )
 
         live_signals.append(
             {
@@ -532,21 +613,17 @@ async def _compute_rsi_slope_for_bar(
     # особый случай: rsi_timeframe = h1 и начало часа — ждём новый бар до 3 раз по 20сек
     if rsi_tf.lower() == "h1" and open_time.minute == 0:
         for attempt in range(3):
-            # пытаемся взять бар ровно с open_time == ts
             rows = await _ts_range(redis, ts_key, ts_ms, ts_ms)
             if rows:
-                # нашли свежий h1-бар
                 break
-            # нет свежего бара — ждём и пробуем ещё
             if attempt < 2:
                 await asyncio.sleep(20)
 
-        # после ретраев ещё может не быть свежего бара — тогда просто скипаем
         rows = await _ts_range(redis, ts_key, ts_ms, ts_ms)
         if not rows:
             log.info(
                 "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: для symbol=%s, time=%s, rsi_tf=%s, rsi_name=%s "
-                "после ожидания нет нового h1-бара, сигнал скипнут",
+                "после ожидания нет нового h1-бара, RSI-slope не считается",
                 symbol,
                 open_time,
                 rsi_tf,
@@ -554,12 +631,20 @@ async def _compute_rsi_slope_for_bar(
             )
             return None
 
-        # текущий RSI на этом ts
         rsi_t = float(rows[0][1])
 
         # теперь получаем k баров назад (включая текущий) через REVRANGE
         rows_prev = await _ts_revrange(redis, ts_key, 0, ts_ms, slope_k + 1)
         if not rows_prev or len(rows_prev) < slope_k + 1:
+            log.info(
+                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: недостаточно истории RSI для slope_k=%s "
+                "(symbol=%s, time=%s, rsi_tf=%s, rsi_name=%s)",
+                slope_k,
+                symbol,
+                open_time,
+                rsi_tf,
+                rsi_name,
+            )
             return None
 
         rsi_prev = float(rows_prev[slope_k][1])

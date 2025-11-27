@@ -247,7 +247,7 @@ async def run_bt_signals_orchestrator(pg, redis):
                 name="BT_SIG_EMA_CROSS_RSISLOPE_LIVE",
             )
             tasks.append(task)
-            log.info(
+            log.debug(
                 "BT_SIGNALS_MAIN: поднят live-диспетчер EMA-cross+RSI-slope, сигналов=%s",
                 len(live_rsislope_signals),
             )
@@ -331,7 +331,7 @@ async def _run_analysis_postproc_stream_dispatcher(
     redis,
 ):
     log = logging.getLogger("BT_SIGNALS_STREAM")
-    log.info(
+    log.debug(
         "BT_SIGNALS_STREAM: диспетчер для стрима '%s' (backfill) запущен, сигналов=%s",
         ANALYSIS_POSTPROC_STREAM_KEY,
         len(signals_for_stream),
@@ -421,7 +421,7 @@ async def _run_analysis_postproc_stream_dispatcher(
                             name = signal.get("name")
                             key = signal.get("key")
 
-                            log.info(
+                            log.debug(
                                 "BT_SIGNALS_STREAM: сработал триггер для stream-сигнала id=%s (key=%s, name=%s) "
                                 "по сообщению stream_id=%s (scenario_id=%s, base_signal_id=%s, analysis_ids=%s, version=%s)",
                                 sid,
@@ -456,7 +456,7 @@ async def _run_analysis_postproc_stream_dispatcher(
                         triggers_for_msg,
                     )
 
-            log.info(
+            log.debug(
                 "BT_SIGNALS_STREAM: пакет сообщений обработан — сообщений=%s, триггеров_по_сигналам=%s",
                 total_msgs,
                 total_triggers,
@@ -480,7 +480,7 @@ async def _run_indicator_stream_live_dispatcher(
     redis,
 ):
     log = logging.getLogger("BT_SIGNALS_LIVE")
-    log.info(
+    log.debug(
         "BT_SIGNALS_LIVE: live-диспетчер по стриму '%s' запущен",
         INDICATOR_STREAM_KEY,
     )
@@ -556,7 +556,7 @@ async def _run_indicator_stream_live_dispatcher(
                         msg_id,
                     )
 
-            log.info(
+            log.debug(
                 "BT_SIGNALS_LIVE: пакет сообщений обработан — сообщений=%s, сгенерировано_live_сигналов=%s",
                 total_msgs,
                 total_signals,
@@ -672,7 +672,7 @@ async def _publish_live_signal(
             },
         )
 
-        log.info(
+        log.debug(
             "BT_SIGNALS_LIVE: опубликован live-сигнал signal_id=%s, symbol=%s, direction=%s, bar_time=%s",
             signal_id,
             symbol,
