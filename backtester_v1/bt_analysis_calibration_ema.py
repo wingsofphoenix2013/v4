@@ -27,6 +27,30 @@ TF_STEP_MINUTES: Dict[str, int] = {
 }
 
 
+# 🔸 Вспомогательная функция: длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if step_min is not None:
+        return timedelta(minutes=step_min)
+    if tf.startswith("m"):
+        try:
+            return timedelta(minutes=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("h"):
+        try:
+            return timedelta(hours=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("d"):
+        try:
+            return timedelta(days=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    return timedelta(0)
+
+
 # 🔸 Извлечение блока EMA из raw_stat с учётом TF
 def _extract_ema_block(
     raw_stat: Any,
@@ -401,7 +425,6 @@ async def run_calibration_ema_raw(
             )
             tf_confluence_needed = False
         else:
-            # используем фиксированное окно для загрузки, точные window_bars возьмём из params
             ema200_m5 = await _load_ema_history_for_positions(
                 pg=pg,
                 instance_id=iid_m5,
@@ -484,12 +507,10 @@ async def run_calibration_ema_raw(
             slope_k = _get_int_param("slope_k", 3)
             window_bars = _get_int_param("window_bars", 50)
 
-            # определяем, нужен ли generic history для этого ключа
             history_series = None
             if key in ("ema200_slope", "ema_pullback_depth", "ema_pullback_duration", "ema_cross_count_window"):
                 history_series = ema_history_by_key.get((timeframe, source_key))
 
-            # собираем batch вставок для этого analysis_id
             rows_to_insert: List[Tuple[Any, ...]] = []
 
             for p in positions:
@@ -499,6 +520,7 @@ async def run_calibration_ema_raw(
                 entry_time = p["entry_time"]
                 raw_stat = p["raw_stat"]
                 pnl_abs_raw = p["pnl_abs"]
+                pos_tf = str(p["timeframe"] or "").lower()
 
                 if direction is None or pnl_abs_raw is None:
                     continue
@@ -513,9 +535,7 @@ async def run_calibration_ema_raw(
                 feature_value: Optional[float] = None
                 bin_label: Optional[str] = None
 
-                # расчёт feature_value и bin_label по ключу
-
-                # снапшотные фичи
+                # снапшотные фичи (через raw_stat)
                 if key in (
                     "ema_trend_alignment",
                     "ema_stack_spread",
@@ -526,6 +546,8 @@ async def run_calibration_ema_raw(
                     ema_block = _extract_ema_block(raw_stat, timeframe)
                     if not ema_block:
                         continue
+
+                    eps = 1e-9
 
                     if key == "ema_trend_alignment":
                         ema9 = ema_block.get("ema9")
@@ -575,7 +597,6 @@ async def run_calibration_ema_raw(
                         ema200 = ema_block.get("ema200")
                         if ema9 is None or ema200 is None:
                             continue
-                        eps = 1e-9
                         denom = abs(ema200) if abs(ema200) > eps else eps
                         spread_pct = abs(ema9 - ema200) / denom * 100.0
                         feature_value = spread_pct
@@ -598,7 +619,6 @@ async def run_calibration_ema_raw(
                         ema200 = ema_block.get("ema200")
                         if None in (ema9, ema50, ema100, ema200):
                             continue
-                        eps = 1e-9
                         denom50 = abs(ema50) if abs(ema50) > eps else eps
                         denom100 = abs(ema100) if abs(ema100) > eps else eps
                         denom200 = abs(ema200) if abs(ema200) > eps else eps
@@ -626,7 +646,6 @@ async def run_calibration_ema_raw(
                         ema21 = ema_block.get("ema21")
                         if ema9 is None or ema21 is None:
                             continue
-                        eps = 1e-9
                         denom = abs(ema21) if abs(ema21) > eps else eps
                         band_pct = abs(ema9 - ema21) / denom * 100.0
                         feature_value = band_pct
@@ -648,12 +667,12 @@ async def run_calibration_ema_raw(
                         ema50 = ema_block.get("ema50")
                         if None in (ema9, ema21, ema50):
                             continue
-                        eps = 1e-9
                         denom21 = abs(ema21) if abs(ema21) > eps else eps
                         denom50 = abs(ema50) if abs(ema50) > eps else eps
 
                         band_9_21 = abs(ema9 - ema21) / denom21 * 100.0
                         band_21_50 = abs(ema21 - ema50) / denom50 * 100.0
+
                         denom_ratio = band_21_50 if band_21_50 > eps else eps
                         ratio = band_9_21 / denom_ratio
                         feature_value = ratio
@@ -672,23 +691,34 @@ async def run_calibration_ema_raw(
                     else:
                         continue
 
-                # history-based по одному EMA (ema200_slope)
+                # ema200_slope (history-based по одной EMA)
                 elif key == "ema200_slope":
                     series = history_series.get(symbol) if history_series else None
                     if not series:
                         continue
-                    idx = _find_index_leq(series, entry_time)
+
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    ema_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and ema_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - ema_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
                     if idx is None or idx - slope_k < 0:
                         continue
+
                     v_now = series[idx][1]
                     v_prev = series[idx - slope_k][1]
                     if v_prev == 0:
                         continue
+
                     slope_pct = (v_now - v_prev) / v_prev * 100.0
                     feature_value = slope_pct
                     bin_label = _bin_signed_value_5(slope_pct)
 
-                # history-based по EMA9/EMA21 (pullback / cross_count)
+                # ema_pullback_* и ema_cross_count_window (history-based по EMA9/EMA21)
                 elif key in ("ema_pullback_depth", "ema_pullback_duration", "ema_cross_count_window"):
                     series9_map = ema9_history_by_tf.get(timeframe)
                     series21_map = ema21_history_by_tf.get(timeframe)
@@ -700,13 +730,17 @@ async def run_calibration_ema_raw(
                     if not series9 or not series21:
                         continue
 
-                    idx9 = _find_index_leq(series9, entry_time)
-                    idx21 = _find_index_leq(series21, entry_time)
-                    if idx9 is None or idx21 is None:
-                        continue
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    ema_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and ema_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - ema_delta
+                    else:
+                        cutoff_time = entry_time
 
-                    # условия достаточности
-                    if idx9 < 0 or idx21 < 0:
+                    idx9 = _find_index_leq(series9, cutoff_time)
+                    idx21 = _find_index_leq(series21, cutoff_time)
+                    if idx9 is None or idx21 is None:
                         continue
 
                     start_idx9 = max(0, idx9 - window_bars + 1)
@@ -820,7 +854,7 @@ async def run_calibration_ema_raw(
                     else:
                         continue
 
-                # ema_tf_confluence
+                # ema_tf_confluence (history-based по EMA200 на m5/m15/h1)
                 elif key == "ema_tf_confluence" and tf_confluence_needed:
                     series_m5 = ema200_m5.get(symbol)
                     series_m15 = ema200_m15.get(symbol)
@@ -828,17 +862,48 @@ async def run_calibration_ema_raw(
                     if not series_m5 or not series_m15 or not series_h1:
                         continue
 
-                    idx_m5 = _find_index_leq(series_m5, entry_time)
-                    idx_m15 = _find_index_leq(series_m15, entry_time)
-                    idx_h1 = _find_index_leq(series_h1, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    delta_m5 = _get_timeframe_timedelta("m5")
+                    delta_m15 = _get_timeframe_timedelta("m15")
+                    delta_h1 = _get_timeframe_timedelta("h1")
+
+                    if sig_delta.total_seconds() > 0 and delta_m5.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_m5 = decision_time - delta_m5
+                    else:
+                        cutoff_m5 = entry_time
+
+                    if sig_delta.total_seconds() > 0 and delta_m15.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_m15 = decision_time - delta_m15
+                    else:
+                        cutoff_m15 = entry_time
+
+                    if sig_delta.total_seconds() > 0 and delta_h1.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_h1 = decision_time - delta_h1
+                    else:
+                        cutoff_h1 = entry_time
+
+                    idx_m5 = _find_index_leq(series_m5, cutoff_m5)
+                    idx_m15 = _find_index_leq(series_m15, cutoff_m15)
+                    idx_h1 = _find_index_leq(series_h1, cutoff_h1)
                     if idx_m5 is None or idx_m15 is None or idx_h1 is None:
                         continue
 
-                    window_bars_m5 = _get_int_param("window_bars_m5", 20)
-                    window_bars_m15 = _get_int_param("window_bars_m15", 20)
-                    window_bars_h1 = _get_int_param("window_bars_h1", 20)
+                    def _get_int_param_local(name: str, default: int) -> int:
+                        cfg = params.get(name)
+                        if cfg is None:
+                            return default
+                        try:
+                            return int(str(cfg.get("value")))
+                        except Exception:
+                            return default
 
-                    # вычисляем slope% по каждому TF
+                    window_bars_m5 = _get_int_param_local("window_bars_m5", 20)
+                    window_bars_m15 = _get_int_param_local("window_bars_m15", 20)
+                    window_bars_h1 = _get_int_param_local("window_bars_h1", 20)
+
                     def _compute_slope(series: List[Tuple[Any, float]], idx: int, window: int) -> Optional[float]:
                         if idx - window < 0:
                             return None
@@ -888,10 +953,9 @@ async def run_calibration_ema_raw(
                         bin_label = "TFConf_AllOpposite"
 
                 else:
-                    # неизвестный key или отсутствует необходимая история — пропускаем
                     continue
 
-                if feature_value is None:
+                if feature_value is None or bin_label is None:
                     continue
 
                 rows_to_insert.append(
@@ -902,10 +966,10 @@ async def run_calibration_ema_raw(
                         direction,      # direction
                         feature_tf,     # timeframe (анализатора / фичи)
                         "ema",          # family_key
-                        key,            # key ('ema_trend_alignment', 'ema200_slope', ...)
-                        feature_name,   # feature_name как в бинах
-                        bin_label,      # bin_label (может быть None)
-                        feature_value,  # feature_value (numeric)
+                        key,            # key
+                        feature_name,   # feature_name
+                        bin_label,      # bin_label
+                        feature_value,  # feature_value
                         pnl_abs,        # pnl_abs
                         is_win,         # is_win
                     )

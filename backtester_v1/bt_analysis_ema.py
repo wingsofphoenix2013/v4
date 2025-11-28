@@ -27,6 +27,30 @@ TF_STEP_MINUTES: Dict[str, int] = {
 }
 
 
+# 🔸 Вспомогательная функция: длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if step_min is not None:
+        return timedelta(minutes=step_min)
+    if tf.startswith("m"):
+        try:
+            return timedelta(minutes=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("h"):
+        try:
+            return timedelta(hours=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("d"):
+        try:
+            return timedelta(days=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    return timedelta(0)
+
+
 # 🔸 Извлечение блока EMA из raw_stat с учётом TF
 def _extract_ema_block(
     raw_stat: Any,
@@ -457,7 +481,7 @@ async def run_analysis_ema(
     )
 
 
-# 🔸 Анализ ema_trend_alignment
+# 🔸 Анализ ema_trend_alignment (снапшот из raw_stat)
 async def _analyze_ema_trend_alignment(
     pg,
     scenario_id: int,
@@ -578,7 +602,7 @@ async def _analyze_ema_trend_alignment(
     )
 
 
-# 🔸 Анализ ema_stack_spread
+# 🔸 Анализ ema_stack_spread (снапшот из raw_stat)
 async def _analyze_ema_stack_spread(
     pg,
     scenario_id: int,
@@ -677,7 +701,7 @@ async def _analyze_ema_stack_spread(
     )
 
 
-# 🔸 Анализ ema_overextension
+# 🔸 Анализ ema_overextension (снапшот из raw_stat)
 async def _analyze_ema_overextension(
     pg,
     scenario_id: int,
@@ -785,7 +809,7 @@ async def _analyze_ema_overextension(
     )
 
 
-# 🔸 Анализ ema_band_9_21
+# 🔸 Анализ ema_band_9_21 (снапшот из raw_stat)
 async def _analyze_ema_band_9_21(
     pg,
     scenario_id: int,
@@ -883,7 +907,7 @@ async def _analyze_ema_band_9_21(
     )
 
 
-# 🔸 Анализ ema_inner_outer_ratio
+# 🔸 Анализ ema_inner_outer_ratio (снапшот из raw_stat)
 async def _analyze_ema_inner_outer_ratio(
     pg,
     scenario_id: int,
@@ -994,7 +1018,7 @@ async def _analyze_ema_history_based(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF EMA
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -1075,6 +1099,7 @@ async def _analyze_ema_history_based(
         direction = p["direction"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -1083,7 +1108,16 @@ async def _analyze_ema_history_based(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те EMA-бары, которые могли быть известны к моменту решения по сделке
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        ema_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and ema_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - ema_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -1109,20 +1143,19 @@ async def _analyze_ema_history_based(
             bin_from = float(slope_pct)
             bin_to = float(slope_pct)
 
-        # ema_pullback_depth и ema_pullback_duration: глубина и длительность отката по отношению ema9/ema21
+        # ema_pullback_* и ema_cross_count_window: глубина/длительность отката или количество кроссов ema9/ema21
         elif key in ("ema_pullback_depth", "ema_pullback_duration", "ema_cross_count_window"):
             series9 = ema9_history.get(symbol)
             series21 = ema21_history.get(symbol)
             if not series9 or not series21:
                 continue
 
-            idx9 = _find_index_leq(series9, entry_time)
-            idx21 = _find_index_leq(series21, entry_time)
+            # те же cutoff_time применяем и к EMA9/EMA21, чтобы не заходить в будущее
+            idx9 = _find_index_leq(series9, cutoff_time)
+            idx21 = _find_index_leq(series21, cutoff_time)
             if idx9 is None or idx21 is None:
                 continue
 
-            # выравнивание по времени (предполагаем одинаковую сетку open_time)
-            # условия достаточности
             if idx9 < 0 or idx21 < 0:
                 continue
 
@@ -1191,7 +1224,6 @@ async def _analyze_ema_history_based(
                 if ext_idx_rel is None:
                     continue
 
-                # индекс экстремума относительно текущего
                 duration_bars = window_len - 1 - ext_idx_rel
 
                 if duration_bars == 0:
@@ -1208,7 +1240,6 @@ async def _analyze_ema_history_based(
 
             # ema_cross_count_window
             elif key == "ema_cross_count_window":
-                # считаем знаки разности ema9 - ema21
                 signs: List[int] = []
                 for j in range(window_len):
                     v9 = series9[start_idx9 + j][1]
@@ -1361,7 +1392,7 @@ async def _analyze_ema_tf_confluence(
     feature_name = resolve_feature_name("ema", "ema_tf_confluence", "m5", source_key)
     agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    # вспомогательная функция для вычисления slope% и знака
+    # вспомогательная функция для вычисления slope% между t и t-window
     def _compute_slope(series: List[Tuple[Any, float]], idx: int, window: int) -> Optional[float]:
         if idx - window < 0:
             return None
@@ -1376,6 +1407,7 @@ async def _analyze_ema_tf_confluence(
         direction = p["direction"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -1387,9 +1419,33 @@ async def _analyze_ema_tf_confluence(
         if not series_m5 or not series_m15 or not series_h1:
             continue
 
-        idx_m5 = _find_index_leq(series_m5, entry_time)
-        idx_m15 = _find_index_leq(series_m15, entry_time)
-        idx_h1 = _find_index_leq(series_h1, entry_time)
+        # учитываем только те EMA200-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        delta_m5 = _get_timeframe_timedelta("m5")
+        delta_m15 = _get_timeframe_timedelta("m15")
+        delta_h1 = _get_timeframe_timedelta("h1")
+
+        if sig_delta.total_seconds() > 0 and delta_m5.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_m5 = decision_time - delta_m5
+        else:
+            cutoff_m5 = entry_time
+
+        if sig_delta.total_seconds() > 0 and delta_m15.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_m15 = decision_time - delta_m15
+        else:
+            cutoff_m15 = entry_time
+
+        if sig_delta.total_seconds() > 0 and delta_h1.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_h1 = decision_time - delta_h1
+        else:
+            cutoff_h1 = entry_time
+
+        idx_m5 = _find_index_leq(series_m5, cutoff_m5)
+        idx_m15 = _find_index_leq(series_m15, cutoff_m15)
+        idx_h1 = _find_index_leq(series_h1, cutoff_h1)
 
         if idx_m5 is None or idx_m15 is None or idx_h1 is None:
             continue
@@ -1434,7 +1490,7 @@ async def _analyze_ema_tf_confluence(
             bin_label = "TFConf_MostlyAligned"
         elif -0.33 <= confluence <= 0.33:
             bin_label = "TFConf_Mixed"
-        elif confluence >= -1.0 and confluence > -1.0:
+        elif confluence > -1.0:
             # -1 < confluence < -0.33
             bin_label = "TFConf_MostlyOpposite"
         else:
