@@ -370,7 +370,7 @@ async def run_analysis_adx(
     if scenario:
         params = scenario.get("params") or {}
         deposit_cfg = params.get("deposit")
-        if deposit_cfg is неt None:
+        if deposit_cfg is not None:
             try:
                 deposit = Decimal(str(deposit_cfg.get("value")))
             except Exception:
