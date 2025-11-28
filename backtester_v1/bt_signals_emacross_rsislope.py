@@ -180,7 +180,6 @@ async def run_emacross_rsislope_backfill(
         source_key=rsi_source_key,
     )
 
-    # читаем good-бинчики из bt_analysis_candidates для текущего направления
     # direction здесь = направление самого сигнала (long-only / short-only)
     signal_direction = "long" if "long" in allowed_directions and "short" not in allowed_directions else \
         "short" if "short" in allowed_directions and "long" not in allowed_directions else None
@@ -303,6 +302,16 @@ async def run_emacross_rsislope_backfill(
         total_inserted,
         total_long,
         total_short,
+    )
+    log.info(
+        "BT_SIG_EMA_CROSS_RSISLOPE: итог backfill для signal_id=%s ('%s'): events=%s, long=%s, short=%s, window=[%s .. %s]",
+        sid,
+        name,
+        total_inserted,
+        total_long,
+        total_short,
+        from_time,
+        to_time,
     )
 
     # отправляем уведомление в Redis Stream о готовности сигналов
@@ -620,9 +629,18 @@ async def _process_symbol_rsislope_inner(
         )
         return 0, 0, 0
 
+    # длительности таймфреймов сигнала и RSI
+    sig_delta = _get_timeframe_timedelta(timeframe)
+    rsi_delta = _get_timeframe_timedelta(rsi_timeframe)
+
+    # для slope_k баров назад нужен запас по времени в ряду RSI
+    # берём from_time с запасом в slope_k баров RSI
+    if rsi_delta.total_seconds() > 0:
+        rsi_from_time = from_time - rsi_delta * slope_k
+    else:
+        rsi_from_time = from_time
+
     # загружаем ряд RSI для расчёта slope
-    # для slope_k баров назад нужен небольшой запас по времени
-    rsi_from_time = from_time - timedelta(minutes=60 * slope_k) if rsi_timeframe.lower() == "h1" else from_time
     rsi_series_list = await _load_indicator_series_list(
         pg,
         rsi_instance_id,
@@ -659,8 +677,15 @@ async def _process_symbol_rsislope_inner(
         if key_tuple in existing_events:
             continue
 
-        # ищем индекс RSI-бара <= ts
-        idx = _find_index_leq(rsi_series_list, ts)
+        # учитываем только те RSI-бары, которые реально могли быть известны
+        # к моменту закрытия сигнального бара: open_time_RSI + Δ_RSI <= ts + Δ_sig
+        if rsi_delta.total_seconds() > 0:
+            ts_cutoff_for_rsi = ts + sig_delta - rsi_delta
+        else:
+            ts_cutoff_for_rsi = ts
+
+        # ищем индекс RSI-бара с open_time_RSI <= ts_cutoff_for_rsi
+        idx = _find_index_leq(rsi_series_list, ts_cutoff_for_rsi)
         if idx is None:
             continue
 
@@ -899,3 +924,32 @@ def _get_int_param_from_analysis(params: Dict[str, Any], name: str, default: int
         return int(str(cfg.get("value")))
     except Exception:
         return default
+
+
+# 🔸 Вспомогательная функция: длительность таймфрейма
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+
+    # простая поддержка форматов вида m5, m15, h1, h4, d1 и т.п.
+    if tf.startswith("m"):
+        try:
+            minutes = int(tf[1:])
+            return timedelta(minutes=minutes)
+        except Exception:
+            return timedelta(0)
+
+    if tf.startswith("h"):
+        try:
+            hours = int(tf[1:])
+            return timedelta(hours=hours)
+        except Exception:
+            return timedelta(0)
+
+    if tf.startswith("d"):
+        try:
+            days = int(tf[1:])
+            return timedelta(days=days)
+        except Exception:
+            return timedelta(0)
+
+    return timedelta(0)
