@@ -29,6 +29,30 @@ EPS_DMI = 1e-6
 SLOPE_BARS = 3  # N=3 бара назад, как договорено
 
 
+# 🔸 Вспомогательная функция: длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if step_min is not None:
+        return timedelta(minutes=step_min)
+    if tf.startswith("m"):
+        try:
+            return timedelta(minutes=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("h"):
+        try:
+            return timedelta(hours=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("d"):
+        try:
+            return timedelta(days=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    return timedelta(0)
+
+
 # 🔸 Поиск индекса последнего бара с open_time <= entry_time
 def _find_index_leq(series: List[Tuple[Any, Any]], entry_time) -> Optional[int]:
     # series отсортирован по времени
@@ -62,7 +86,6 @@ def _get_int_param(params: Dict[str, Any], name: str, default: int) -> int:
 # 🔸 Парсим длину ADX/DMI из source_key (например, "adx14" → 14)
 def _parse_adx_length_from_source_key(source_key: str) -> Optional[int]:
     sk = (source_key or "").strip().lower()
-    # ожидаем что-то вроде "adx14" / "adx21"
     if sk.startswith("adx"):
         tail = sk[3:]
         try:
@@ -105,7 +128,6 @@ async def _load_adx_history_for_positions(
 
     step_min = TF_STEP_MINUTES.get(timeframe.lower()) or 5
 
-    # группируем позиции по символу и вычисляем диапазоны времени
     by_symbol: Dict[str, List[Any]] = defaultdict(list)
     for p in positions:
         symbol = p["symbol"]
@@ -122,7 +144,6 @@ async def _load_adx_history_for_positions(
             min_entry = min(times)
             max_entry = max(times)
 
-            # запас по времени в прошлом — window_bars баров
             delta = timedelta(minutes=step_min * window_bars)
             from_time = min_entry - delta
             to_time = max_entry
@@ -511,6 +532,7 @@ async def run_calibration_adx_raw(
                 direction = p["direction"]
                 entry_time = p["entry_time"]
                 pnl_abs_raw = p["pnl_abs"]
+                pos_tf = str(p["timeframe"] or "").lower()
 
                 if direction is None or pnl_abs_raw is None:
                     continue
@@ -525,13 +547,21 @@ async def run_calibration_adx_raw(
                 feature_value: Optional[float] = None
                 bin_label: Optional[str] = None
 
-                # условия для разных ключей
+                # strength
                 if key == "strength":
                     series = adx_history.get(symbol) if adx_history else None
                     if not series:
                         continue
 
-                    idx = _find_index_leq(series, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    adx_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and adx_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - adx_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
                     if idx is None:
                         continue
 
@@ -540,12 +570,21 @@ async def run_calibration_adx_raw(
                     label, _, _ = _bin_adx_strength(adx_val)
                     bin_label = label
 
+                # dominance
                 elif key == "dominance":
                     series = dmi_history.get(symbol) if dmi_history else None
                     if not series:
                         continue
 
-                    idx = _find_index_leq(series, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    dmi_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and dmi_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - dmi_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
                     if idx is None:
                         continue
 
@@ -567,12 +606,21 @@ async def run_calibration_adx_raw(
                     label, _, _ = _bin_dmi_dominance(effective_dom)
                     bin_label = label
 
+                # slope
                 elif key == "slope":
                     series = adx_history.get(symbol) if adx_history else None
                     if not series:
                         continue
 
-                    idx = _find_index_leq(series, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    adx_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and adx_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - adx_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
                     if idx is None or idx - SLOPE_BARS < 0:
                         continue
 
@@ -584,12 +632,21 @@ async def run_calibration_adx_raw(
                     label, _, _ = _bin_adx_slope(slope)
                     bin_label = label
 
+                # trend_age
                 elif key == "trend_age":
                     series = dmi_history.get(symbol) if dmi_history else None
                     if not series:
                         continue
 
-                    idx = _find_index_leq(series, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    dmi_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and dmi_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - dmi_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
                     if idx is None:
                         continue
 
@@ -604,8 +661,9 @@ async def run_calibration_adx_raw(
                         sign_entry = 1 if diff_now > 0 else -1
                         age_bars = 0
 
+                        window_bars_trend = _get_int_param(params, "window_bars", 50)
                         j = idx - 1
-                        while j >= 0 and age_bars < _get_int_param(params, "window_bars", 50):
+                        while j >= 0 and age_bars < window_bars_trend:
                             _, plus_j, minus_j = series[j]
                             diff_j = plus_j - minus_j
                             if abs(diff_j) <= EPS_DMI:
@@ -620,12 +678,21 @@ async def run_calibration_adx_raw(
                     label, _, _ = _bin_dmi_trend_age(age_bars, has_trend)
                     bin_label = label
 
+                # chop
                 elif key == "chop":
                     series = dmi_history.get(symbol) if dmi_history else None
                     if not series:
                         continue
 
-                    idx = _find_index_leq(series, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    dmi_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and dmi_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - dmi_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
                     if idx is None:
                         continue
 
@@ -668,14 +735,23 @@ async def run_calibration_adx_raw(
                     label, _, _ = _bin_dmi_chop(chop_index)
                     bin_label = label
 
+                # fast_slow_diff
                 elif key == "fast_slow_diff":
                     series_fast = fast_history.get(symbol) if fast_history else None
                     series_slow = slow_history.get(symbol) if slow_history else None
                     if not series_fast or not series_slow:
                         continue
 
-                    idx_fast = _find_index_leq(series_fast, entry_time)
-                    idx_slow = _find_index_leq(series_slow, entry_time)
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    adx_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and adx_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - adx_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx_fast = _find_index_leq(series_fast, cutoff_time)
+                    idx_slow = _find_index_leq(series_slow, cutoff_time)
                     if idx_fast is None or idx_slow is None:
                         continue
 
@@ -688,10 +764,9 @@ async def run_calibration_adx_raw(
                     bin_label = label
 
                 else:
-                    # неизвестный key — пропускаем
                     continue
 
-                if feature_value is None:
+                if feature_value is None or bin_label is None:
                     continue
 
                 rows_to_insert.append(
@@ -702,10 +777,10 @@ async def run_calibration_adx_raw(
                         direction,     # direction
                         timeframe,     # timeframe (анализатора)
                         "adx",         # family_key
-                        key,           # key ('strength', 'slope', ...)
-                        feature_name,  # feature_name как в бинах
-                        bin_label,     # bin_label (может быть None)
-                        feature_value, # feature_value (numeric)
+                        key,           # key
+                        feature_name,  # feature_name
+                        bin_label,     # bin_label
+                        feature_value, # feature_value
                         pnl_abs,       # pnl_abs
                         is_win,        # is_win
                     )

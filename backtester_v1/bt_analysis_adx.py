@@ -29,6 +29,30 @@ EPS_DMI = 1e-6
 SLOPE_BARS = 3  # N=3 для всех TF, как договорились
 
 
+# 🔸 Вспомогательная функция: длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if step_min is not None:
+        return timedelta(minutes=step_min)
+    if tf.startswith("m"):
+        try:
+            return timedelta(minutes=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("h"):
+        try:
+            return timedelta(hours=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("d"):
+        try:
+            return timedelta(days=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    return timedelta(0)
+
+
 # 🔸 Поиск индекса последнего бара с open_time <= entry_time
 def _find_index_leq(series: List[Tuple[Any, Any]], entry_time) -> Optional[int]:
     # series отсортирован по времени
@@ -346,7 +370,7 @@ async def run_analysis_adx(
     if scenario:
         params = scenario.get("params") or {}
         deposit_cfg = params.get("deposit")
-        if deposit_cfg is not None:
+        if deposit_cfg is неt None:
             try:
                 deposit = Decimal(str(deposit_cfg.get("value")))
             except Exception:
@@ -536,7 +560,7 @@ async def _analyze_adx_strength(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ADX
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -573,6 +597,7 @@ async def _analyze_adx_strength(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -586,7 +611,16 @@ async def _analyze_adx_strength(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те ADX-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        adx_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and adx_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - adx_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -622,6 +656,13 @@ async def _analyze_adx_strength(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ADX: strength inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -642,7 +683,7 @@ async def _analyze_dmi_dominance(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF DMI
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -678,6 +719,7 @@ async def _analyze_dmi_dominance(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -695,7 +737,16 @@ async def _analyze_dmi_dominance(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те DMI-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        dmi_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and dmi_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - dmi_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -741,6 +792,13 @@ async def _analyze_dmi_dominance(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ADX: dominance inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -761,7 +819,7 @@ async def _analyze_adx_slope(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ADX
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -801,6 +859,7 @@ async def _analyze_adx_slope(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -814,7 +873,16 @@ async def _analyze_adx_slope(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те ADX-бары, которые могли быть известны к моменту решения по сделке
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        adx_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and adx_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - adx_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None or idx - SLOPE_BARS < 0:
             continue
 
@@ -853,6 +921,13 @@ async def _analyze_adx_slope(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ADX: slope inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -873,7 +948,7 @@ async def _analyze_dmi_trend_age(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF DMI
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -909,6 +984,7 @@ async def _analyze_dmi_trend_age(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -922,7 +998,16 @@ async def _analyze_dmi_trend_age(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те DMI-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        dmi_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and dmi_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - dmi_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -981,6 +1066,13 @@ async def _analyze_dmi_trend_age(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ADX: trend_age inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -1001,7 +1093,7 @@ async def _analyze_dmi_chop(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF DMI
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -1039,6 +1131,7 @@ async def _analyze_dmi_chop(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -1052,7 +1145,16 @@ async def _analyze_dmi_chop(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те DMI-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        dmi_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and dmi_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - dmi_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -1120,6 +1222,13 @@ async def _analyze_dmi_chop(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ADX: chop inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -1140,7 +1249,7 @@ async def _analyze_adx_fast_slow_diff(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ADX
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -1193,6 +1302,7 @@ async def _analyze_adx_fast_slow_diff(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -1207,8 +1317,17 @@ async def _analyze_adx_fast_slow_diff(
         if not series_fast or not series_slow:
             continue
 
-        idx_fast = _find_index_leq(series_fast, entry_time)
-        idx_slow = _find_index_leq(series_slow, entry_time)
+        # учитываем только те ADX-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        adx_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and adx_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - adx_delta
+        else:
+            cutoff_time = entry_time
+
+        idx_fast = _find_index_leq(series_fast, cutoff_time)
+        idx_slow = _find_index_leq(series_slow, cutoff_time)
         if idx_fast is None or idx_slow is None:
             continue
 
@@ -1246,6 +1365,13 @@ async def _analyze_adx_fast_slow_diff(
         source_key,
         len(agg),
         total_trades,
+    )
+    log.info(
+        "BT_ANALYSIS_ADX: fast_slow_diff inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
     )
 
     await write_feature_bins(
