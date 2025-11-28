@@ -33,6 +33,30 @@ TF_TO_OHLCV_TABLE: Dict[str, str] = {
 }
 
 
+# 🔸 Вспомогательная функция: длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if step_min is not None:
+        return timedelta(minutes=step_min)
+    if tf.startswith("m"):
+        try:
+            return timedelta(minutes=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("h"):
+        try:
+            return timedelta(hours=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("d"):
+        try:
+            return timedelta(days=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    return timedelta(0)
+
+
 # 🔸 Поиск instance_id для ATR по timeframe и source_key (atr14 → length=14)
 def _resolve_atr_instance_id(timeframe: str, source_key: str) -> Optional[int]:
     all_instances = get_all_indicator_instances()
@@ -277,8 +301,9 @@ async def run_calibration_atr_raw(
     )
 
     total_rows_written = 0
+    eps = 1e-9
 
-    # 🔸 Обрабатываем каждый анализатор по всем позициям (без попыток "экономить" запросы)
+    # обрабатываем каждый анализатор по всем позициям
     async with pg.acquire() as conn:
         for aid in analysis_ids:
             inst = get_analysis_instance(aid)
@@ -336,12 +361,6 @@ async def run_calibration_atr_raw(
             slope_k = _get_int_param("slope_k", 5)
 
             rows_to_insert: List[Tuple[Any, ...]] = []
-            eps = 1e-9
-
-            # history / OHLCV для конкретного ключа
-            atr_history: Dict[str, List[Tuple[Any, float]]] = {}
-            ohlcv_history: Dict[str, List[Tuple[Any, float, float, float]]] = {}
-            ohlcv_lookup: Dict[str, Dict[Any, Tuple[float, float, float]]] = {}
 
             # sl_pct — размер стопа в процентах (для atr_stop_units)
             sl_pct = 1.0
@@ -353,327 +372,340 @@ async def run_calibration_atr_raw(
                     except Exception:
                         sl_pct = 1.0
 
-            # atr_pct / atr_stop_units / atr_slope / atr_normalized_range / atr_regime_persistence / atr_tf_ratio
-            if key in (
-                "atr_pct",
-                "atr_stop_units",
-                "atr_slope",
-                "atr_normalized_range",
-                "atr_regime_persistence",
-                "atr_tf_ratio",
-            ):
-                # atr_tf_ratio использует TF анализатора и базовый TF m5
-                if key == "atr_tf_ratio":
-                    inst_tf = _resolve_atr_instance_id(timeframe, source_key)
-                    inst_base = _resolve_atr_instance_id("m5", source_key)
-                    if inst_tf is None or inst_base is None:
-                        log.warning(
-                            "BT_ANALYSIS_CALIB_ATR: analysis_id=%s, key=atr_tf_ratio — "
-                            "не найдены instance_id ATR для timeframe=%s или base_tf=%s, source_key=%s",
-                            aid,
-                            timeframe,
-                            "m5",
-                            source_key,
-                        )
-                        # перейти к следующему analysis_id
+            # atr_tf_ratio использует TF анализатора и базовый TF m5
+            if key == "atr_tf_ratio":
+                inst_tf = _resolve_atr_instance_id(timeframe, source_key)
+                inst_base = _resolve_atr_instance_id("m5", source_key)
+                if inst_tf is None or inst_base is None:
+                    log.warning(
+                        "BT_ANALYSIS_CALIB_ATR: analysis_id=%s, key=atr_tf_ratio — "
+                        "не найдены instance_id ATR для timeframe=%s или base_tf=%s, source_key=%s",
+                        aid,
+                        timeframe,
+                        "m5",
+                        source_key,
+                    )
+                    continue
+
+                atr_tf_history = await _load_atr_history_for_positions(
+                    pg=pg,
+                    instance_id=inst_tf,
+                    timeframe=timeframe,
+                    positions=positions,
+                    window_bars=10,
+                )
+                atr_base_history = await _load_atr_history_for_positions(
+                    pg=pg,
+                    instance_id=inst_base,
+                    timeframe="m5",
+                    positions=positions,
+                    window_bars=10,
+                )
+
+                for p in positions:
+                    position_id = p["id"]
+                    symbol = p["symbol"]
+                    direction = p["direction"]
+                    entry_time = p["entry_time"]
+                    pnl_abs_raw = p["pnl_abs"]
+                    pos_tf = str(p["timeframe"] or "").lower()
+
+                    if direction is None or pnl_abs_raw is None:
                         continue
 
-                    atr_tf_history = await _load_atr_history_for_positions(
-                        pg=pg,
-                        instance_id=inst_tf,
-                        timeframe=timeframe,
-                        positions=positions,
-                        window_bars=10,
-                    )
-                    atr_base_history = await _load_atr_history_for_positions(
-                        pg=pg,
-                        instance_id=inst_base,
-                        timeframe="m5",
-                        positions=positions,
-                        window_bars=10,
-                    )
+                    series_tf = atr_tf_history.get(symbol)
+                    series_base = atr_base_history.get(symbol)
+                    if not series_tf or not series_base:
+                        continue
 
-                    # расчёт feature_value как в анализаторе
-                    for p in positions:
-                        position_id = p["id"]
-                        symbol = p["symbol"]
-                        direction = p["direction"]
-                        entry_time = p["entry_time"]
-                        pnl_abs_raw = p["pnl_abs"]
+                    # учитываем только те ATR-бары, которые могли быть известны к моменту решения
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    tf_delta = _get_timeframe_timedelta(timeframe)
+                    base_delta = _get_timeframe_timedelta("m5")
 
-                        if direction is None or pnl_abs_raw is None:
-                            continue
+                    if sig_delta.total_seconds() > 0 and tf_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_tf = decision_time - tf_delta
+                    else:
+                        cutoff_tf = entry_time
 
-                        series_tf = atr_tf_history.get(symbol)
-                        series_base = atr_base_history.get(symbol)
-                        if not series_tf or not series_base:
-                            continue
+                    if sig_delta.total_seconds() > 0 and base_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_base = decision_time - base_delta
+                    else:
+                        cutoff_base = entry_time
 
-                        idx_tf = _find_index_leq(series_tf, entry_time)
-                        idx_base = _find_index_leq(series_base, entry_time)
-                        if idx_tf is None or idx_base is None:
-                            continue
+                    idx_tf = _find_index_leq(series_tf, cutoff_tf)
+                    idx_base = _find_index_leq(series_base, cutoff_base)
+                    if idx_tf is None or idx_base is None:
+                        continue
 
-                        atr_tf_now = series_tf[idx_tf][1]
-                        atr_base_now = series_base[idx_base][1]
+                    atr_tf_now = series_tf[idx_tf][1]
+                    atr_base_now = series_base[idx_base][1]
+                    denom = atr_base_now if abs(atr_base_now) > eps else eps
+                    ratio = atr_tf_now / denom
 
-                        denom = atr_base_now if abs(atr_base_now) > eps else eps
-                        ratio = atr_tf_now / denom
+                    try:
+                        pnl_abs = Decimal(str(pnl_abs_raw))
+                    except Exception:
+                        continue
 
-                        try:
-                            pnl_abs = Decimal(str(pnl_abs_raw))
-                        except Exception:
-                            continue
+                    if ratio < 0.5:
+                        bin_label = "ATR_TF_Ratio_MuchLower"
+                    elif ratio < 0.8:
+                        bin_label = "ATR_TF_Ratio_Lower"
+                    elif ratio < 1.2:
+                        bin_label = "ATR_TF_Ratio_Similar"
+                    elif ratio < 2.0:
+                        bin_label = "ATR_TF_Ratio_Higher"
+                    else:
+                        bin_label = "ATR_TF_Ratio_MuchHigher"
 
-                        if ratio < 0.5:
-                            bin_label = "ATR_TF_Ratio_MuchLower"
-                        elif ratio < 0.8:
-                            bin_label = "ATR_TF_Ratio_Lower"
-                        elif ratio < 1.2:
-                            bin_label = "ATR_TF_Ratio_Similar"
-                        elif ratio < 2.0:
-                            bin_label = "ATR_TF_Ratio_Higher"
-                        else:
-                            bin_label = "ATR_TF_Ratio_MuchHigher"
+                    feature_value = float(ratio)
 
-                        feature_value = float(ratio)
-
-                        rows_to_insert.append(
-                            (
-                                position_id,
-                                scenario_id,
-                                signal_id,
-                                direction,
-                                timeframe,
-                                "atr",
-                                key,
-                                feature_name,
-                                bin_label,
-                                feature_value,
-                                pnl_abs,
-                                pnl_abs > 0,
-                            )
-                        )
-
-                else:
-                    # все остальные ключи используют TF analysis_id
-                    instance_id = _resolve_atr_instance_id(timeframe, source_key)
-                    if instance_id is None:
-                        log.warning(
-                            "BT_ANALYSIS_CALIB_ATR: analysis_id=%s, key=%s — не найден instance_id ATR "
-                            "для timeframe=%s, source_key=%s",
-                            aid,
+                    rows_to_insert.append(
+                        (
+                            position_id,
+                            scenario_id,
+                            signal_id,
+                            direction,
+                            timeframe,
+                            "atr",
                             key,
-                            timeframe,
-                            source_key,
+                            feature_name,
+                            bin_label,
+                            feature_value,
+                            pnl_abs,
+                            pnl_abs > 0,
                         )
-                        continue
+                    )
 
-                    # для atr_pct и atr_stop_units и regime_persistence нужна цена (OHLCV)
-                    need_price = key in ("atr_pct", "atr_stop_units", "atr_regime_persistence")
+            # все остальные ключи используют TF анализатора, history + (опционально) OHLCV
+            else:
+                instance_id = _resolve_atr_instance_id(timeframe, source_key)
+                if instance_id is None:
+                    log.warning(
+                        "BT_ANALYSIS_CALIB_ATR: analysis_id=%s, key=%s — не найден instance_id ATR "
+                        "для timeframe=%s, source_key=%s",
+                        aid,
+                        key,
+                        timeframe,
+                        source_key,
+                    )
+                    continue
 
-                    atr_history = await _load_atr_history_for_positions(
+                need_price = key in ("atr_pct", "atr_stop_units", "atr_regime_persistence")
+
+                atr_history = await _load_atr_history_for_positions(
+                    pg=pg,
+                    instance_id=instance_id,
+                    timeframe=timeframe,
+                    positions=positions,
+                    window_bars=window_bars,
+                )
+
+                ohlcv_lookup: Dict[str, Dict[Any, Tuple[float, float, float]]] = {}
+                if need_price:
+                    ohlcv_history = await _load_ohlcv_history_for_positions(
                         pg=pg,
-                        instance_id=instance_id,
                         timeframe=timeframe,
                         positions=positions,
                         window_bars=window_bars,
                     )
+                    for sym, series in ohlcv_history.items():
+                        local: Dict[Any, Tuple[float, float, float]] = {}
+                        for ot, cl, hi, lo in series:
+                            local[ot] = (cl, hi, lo)
+                        ohlcv_lookup[sym] = local
 
-                    if need_price:
-                        ohlcv_history = await _load_ohlcv_history_for_positions(
-                            pg=pg,
-                            timeframe=timeframe,
-                            positions=positions,
-                            window_bars=window_bars,
-                        )
-                        for sym, series in ohlcv_history.items():
-                            local: Dict[Any, Tuple[float, float, float]] = {}
-                            for ot, cl, hi, lo in series:
-                                local[ot] = (cl, hi, lo)
-                            ohlcv_lookup[sym] = local
+                for p in positions:
+                    position_id = p["id"]
+                    symbol = p["symbol"]
+                    direction = p["direction"]
+                    entry_time = p["entry_time"]
+                    pnl_abs_raw = p["pnl_abs"]
+                    pos_tf = str(p["timeframe"] or "").lower()
 
-                    # расчёт feature_value как в анализаторе
-                    for p in positions:
-                        position_id = p["id"]
-                        symbol = p["symbol"]
-                        direction = p["direction"]
-                        entry_time = p["entry_time"]
-                        pnl_abs_raw = p["pnl_abs"]
+                    if direction is None or pnl_abs_raw is None:
+                        continue
 
-                        if direction is None or pnl_abs_raw is None:
+                    series = atr_history.get(symbol)
+                    if not series:
+                        continue
+
+                    # учитываем только те ATR-бары, которые могли быть известны к моменту решения
+                    sig_delta = _get_timeframe_timedelta(pos_tf)
+                    atr_delta = _get_timeframe_timedelta(timeframe)
+                    if sig_delta.total_seconds() > 0 and atr_delta.total_seconds() > 0:
+                        decision_time = entry_time + sig_delta
+                        cutoff_time = decision_time - atr_delta
+                    else:
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series, cutoff_time)
+                    if idx is None:
+                        continue
+
+                    try:
+                        pnl_abs = Decimal(str(pnl_abs_raw))
+                    except Exception:
+                        continue
+
+                    feature_value: Optional[float] = None
+                    bin_label: Optional[str] = None
+
+                    # atr_pct
+                    if key == "atr_pct":
+                        ot = series[idx][0]
+                        atr_now = series[idx][1]
+                        sym_ohlcv = ohlcv_lookup.get(symbol)
+                        if not sym_ohlcv:
+                            continue
+                        cl_tuple = sym_ohlcv.get(ot)
+                        if cl_tuple is None:
+                            continue
+                        close_now, _, _ = cl_tuple
+                        if close_now == 0:
                             continue
 
-                        series = atr_history.get(symbol)
-                        if not series:
-                            continue
+                        atr_pct = atr_now / close_now * 100.0
+                        feature_value = float(atr_pct)
 
-                        idx = _find_index_leq(series, entry_time)
-                        if idx is None:
-                            continue
-
-                        try:
-                            pnl_abs = Decimal(str(pnl_abs_raw))
-                        except Exception:
-                            continue
-
-                        feature_value: Optional[float] = None
-                        bin_label: Optional[str] = None
-
-                        # atr_pct
-                        if key == "atr_pct":
-                            ot = series[idx][0]
-                            atr_now = series[idx][1]
-                            sym_ohlcv = ohlcv_lookup.get(symbol)
-                            if not sym_ohlcv:
-                                continue
-                            cl_tuple = sym_ohlcv.get(ot)
-                            if cl_tuple is None:
-                                continue
-                            close_now, _, _ = cl_tuple
-                            if close_now == 0:
-                                continue
-
-                            atr_pct = atr_now / close_now * 100.0
-                            feature_value = float(atr_pct)
-
-                            if atr_pct < 0.3:
-                                bin_label = "ATR_Low_VeryLow"
-                            elif atr_pct < 0.8:
-                                bin_label = "ATR_Low"
-                            elif atr_pct < 1.5:
-                                bin_label = "ATR_Medium"
-                            elif atr_pct < 3.0:
-                                bin_label = "ATR_High"
-                            else:
-                                bin_label = "ATR_VeryHigh"
-
-                        # atr_stop_units
-                        elif key == "atr_stop_units":
-                            ot = series[idx][0]
-                            atr_now = series[idx][1]
-                            sym_ohlcv = ohlcv_lookup.get(symbol)
-                            if not sym_ohlcv:
-                                continue
-                            cl_tuple = sym_ohlcv.get(ot)
-                            if cl_tuple is None:
-                                continue
-                            close_now, _, _ = cl_tuple
-                            if close_now == 0:
-                                continue
-
-                            atr_pct = atr_now / close_now * 100.0
-                            denom = atr_pct if atr_pct > eps else eps
-                            stop_units = sl_pct / denom
-                            feature_value = float(stop_units)
-
-                            if stop_units < 0.5:
-                                bin_label = "StopUnits_VeryTight"
-                            elif stop_units < 1.0:
-                                bin_label = "StopUnits_Tight"
-                            elif stop_units < 2.0:
-                                bin_label = "StopUnits_Normal"
-                            elif stop_units < 4.0:
-                                bin_label = "StopUnits_Wide"
-                            else:
-                                bin_label = "StopUnits_VeryWide"
-
-                        # atr_slope
-                        elif key == "atr_slope":
-                            if idx - slope_k < 0:
-                                continue
-                            atr_now = series[idx][1]
-                            atr_prev = series[idx - slope_k][1]
-                            if atr_prev == 0:
-                                continue
-                            slope_pct = (atr_now - atr_prev) / atr_prev * 100.0
-                            feature_value = float(slope_pct)
-                            bin_label = _bin_signed_value_5(slope_pct)
-
-                        # atr_normalized_range: ATR_now / mean(ATR_window)
-                        elif key == "atr_normalized_range":
-                            start_idx = max(0, idx - window_bars + 1)
-                            window_vals = [v for _, v in series[start_idx : idx + 1]]
-                            if not window_vals:
-                                continue
-                            atr_now = series[idx][1]
-                            mean_atr = sum(window_vals) / len(window_vals)
-                            if mean_atr == 0:
-                                continue
-                            ratio = atr_now / mean_atr
-                            feature_value = float(ratio)
-                            bin_label = "ATR_Range"
-
-                        # atr_regime_persistence: длительность текущего режима ATR% (ATR/close*100)
-                        elif key == "atr_regime_persistence":
-                            sym_ohlcv = ohlcv_lookup.get(symbol)
-                            if not sym_ohlcv:
-                                continue
-
-                            ot_now = series[idx][0]
-                            atr_now = series[idx][1]
-                            cl_tuple = sym_ohlcv.get(ot_now)
-                            if cl_tuple is None:
-                                continue
-                            close_now, _, _ = cl_tuple
-                            if close_now == 0:
-                                continue
-
-                            atr_pct_now = atr_now / close_now * 100.0
-                            current_regime = _atr_regime_from_pct(atr_pct_now)
-
-                            persistence = 1
-                            j = idx - 1
-                            while j >= 0 and persistence < window_bars:
-                                ot_prev = series[j][0]
-                                atr_prev_val = series[j][1]
-                                cl_prev_tuple = sym_ohlcv.get(ot_prev)
-                                if cl_prev_tuple is None:
-                                    break
-                                close_prev, _, _ = cl_prev_tuple
-                                if close_prev == 0:
-                                    break
-                                atr_prev_pct = atr_prev_val / close_prev * 100.0
-                                prev_regime = _atr_regime_from_pct(atr_prev_pct)
-                                if prev_regime != current_regime:
-                                    break
-                                persistence += 1
-                                j -= 1
-
-                            feature_value = float(persistence)
-                            if persistence <= 3:
-                                bin_label = f"Regime_{current_regime}_Short"
-                            elif persistence <= 10:
-                                bin_label = f"Regime_{current_regime}_Medium"
-                            else:
-                                bin_label = f"Regime_{current_regime}_Long"
-
+                        if atr_pct < 0.3:
+                            bin_label = "ATR_Low_VeryLow"
+                        elif atr_pct < 0.8:
+                            bin_label = "ATR_Low"
+                        elif atr_pct < 1.5:
+                            bin_label = "ATR_Medium"
+                        elif atr_pct < 3.0:
+                            bin_label = "ATR_High"
                         else:
+                            bin_label = "ATR_VeryHigh"
+
+                    # atr_stop_units
+                    elif key == "atr_stop_units":
+                        ot = series[idx][0]
+                        atr_now = series[idx][1]
+                        sym_ohlcv = ohlcv_lookup.get(symbol)
+                        if not sym_ohlcv:
+                            continue
+                        cl_tuple = sym_ohlcv.get(ot)
+                        if cl_tuple is None:
+                            continue
+                        close_now, _, _ = cl_tuple
+                        if close_now == 0:
                             continue
 
-                        if feature_value is None:
+                        atr_pct = atr_now / close_now * 100.0
+                        denom = atr_pct if atr_pct > eps else eps
+                        stop_units = sl_pct / denom
+                        feature_value = float(stop_units)
+
+                        if stop_units < 0.5:
+                            bin_label = "StopUnits_VeryTight"
+                        elif stop_units < 1.0:
+                            bin_label = "StopUnits_Tight"
+                        elif stop_units < 2.0:
+                            bin_label = "StopUnits_Normal"
+                        elif stop_units < 4.0:
+                            bin_label = "StopUnits_Wide"
+                        else:
+                            bin_label = "StopUnits_VeryWide"
+
+                    # atr_slope
+                    elif key == "atr_slope":
+                        if idx - slope_k < 0:
+                            continue
+                        atr_now = series[idx][1]
+                        atr_prev = series[idx - slope_k][1]
+                        if atr_prev == 0:
+                            continue
+                        slope_pct = (atr_now - atr_prev) / atr_prev * 100.0
+                        feature_value = float(slope_pct)
+                        bin_label = _bin_signed_value_5(slope_pct)
+
+                    # atr_normalized_range: ATR_now / mean(ATR_window)
+                    elif key == "atr_normalized_range":
+                        start_idx = max(0, idx - window_bars + 1)
+                        window_vals = [v for _, v in series[start_idx : idx + 1]]
+                        if not window_vals:
+                            continue
+                        atr_now = series[idx][1]
+                        mean_atr = sum(window_vals) / len(window_vals)
+                        if mean_atr == 0:
+                            continue
+                        ratio = atr_now / mean_atr
+                        feature_value = float(ratio)
+                        bin_label = "ATR_Range"
+
+                    # atr_regime_persistence: длительность текущего режима ATR% (ATR/close*100)
+                    elif key == "atr_regime_persistence":
+                        sym_ohlcv = ohlcv_lookup.get(symbol)
+                        if not sym_ohlcv:
                             continue
 
-                        rows_to_insert.append(
-                            (
-                                position_id,
-                                scenario_id,
-                                signal_id,
-                                direction,
-                                timeframe,
-                                "atr",
-                                key,
-                                feature_name,
-                                bin_label,
-                                feature_value,
-                                pnl_abs,
-                                pnl_abs > 0,
-                            )
+                        ot_now = series[idx][0]
+                        atr_now = series[idx][1]
+                        cl_tuple = sym_ohlcv.get(ot_now)
+                        if cl_tuple is None:
+                            continue
+                        close_now, _, _ = cl_tuple
+                        if close_now == 0:
+                            continue
+
+                        atr_pct_now = atr_now / close_now * 100.0
+                        current_regime = _atr_regime_from_pct(atr_pct_now)
+
+                        persistence = 1
+                        j = idx - 1
+                        # считаем назад длительность в этом же режиме
+                        while j >= 0 and persistence < window_bars:
+                            ot_prev = series[j][0]
+                            atr_prev_val = series[j][1]
+                            cl_prev_tuple = sym_ohlcv.get(ot_prev)
+                            if cl_prev_tuple is None:
+                                break
+                            close_prev, _, _ = cl_prev_tuple
+                            if close_prev == 0:
+                                break
+                            atr_prev_pct = atr_prev_val / close_prev * 100.0
+                            prev_regime = _atr_regime_from_pct(atr_prev_pct)
+                            if prev_regime != current_regime:
+                                break
+                            persistence += 1
+                            j -= 1
+
+                        feature_value = float(persistence)
+                        if persistence <= 3:
+                            bin_label = f"Regime_{current_regime}_Short"
+                        elif persistence <= 10:
+                            bin_label = f"Regime_{current_regime}_Medium"
+                        else:
+                            bin_label = f"Regime_{current_regime}_Long"
+
+                    else:
+                        # неизвестный key — пропускаем
+                        continue
+
+                    if feature_value is None or bin_label is None:
+                        continue
+
+                    rows_to_insert.append(
+                        (
+                            position_id,
+                            scenario_id,
+                            signal_id,
+                            direction,
+                            timeframe,
+                            "atr",
+                            key,
+                            feature_name,
+                            bin_label,
+                            feature_value,
+                            pnl_abs,
+                            pnl_abs > 0,
                         )
-
-            else:
-                # неизвестный key — пропускаем
-                continue
+                    )
 
             if rows_to_insert:
                 await conn.executemany(
@@ -717,6 +749,12 @@ async def run_calibration_atr_raw(
         scenario_id,
         signal_id,
         analysis_ids,
+        total_rows_written,
+    )
+    log.info(
+        "BT_ANALYSIS_CALIB_ATR: итог калибровки ATR для scenario_id=%s, signal_id=%s — сырых строк=%s",
+        scenario_id,
+        signal_id,
         total_rows_written,
     )
 

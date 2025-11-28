@@ -33,6 +33,31 @@ TF_TO_OHLCV_TABLE: Dict[str, str] = {
 }
 
 
+# 🔸 Вспомогательная функция: длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if step_min is not None:
+        return timedelta(minutes=step_min)
+    # быстрый разбор форматов вида m5/m15/h1/h4/d1 (на будущее)
+    if tf.startswith("m"):
+        try:
+            return timedelta(minutes=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("h"):
+        try:
+            return timedelta(hours=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    if tf.startswith("d"):
+        try:
+            return timedelta(days=int(tf[1:]))
+        except Exception:
+            return timedelta(0)
+    return timedelta(0)
+
+
 # 🔸 Поиск instance_id для ATR по timeframe и source_key (atr14 → length=14)
 def _resolve_atr_instance_id(timeframe: str, source_key: str) -> Optional[int]:
     all_instances = get_all_indicator_instances()
@@ -97,7 +122,7 @@ async def _load_atr_history_for_positions(
             min_entry = min(times)
             max_entry = max(times)
 
-            # запас по времени в прошлом — window_bars баров
+            # запас по времени в прошлом — window_bars баров ATR
             delta = timedelta(minutes=step_min * window_bars)
             from_time = min_entry - delta
             to_time = max_entry
@@ -449,7 +474,7 @@ async def _analyze_atr_pct(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ATR
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -500,6 +525,7 @@ async def _analyze_atr_pct(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -508,7 +534,16 @@ async def _analyze_atr_pct(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те ATR-бары, которые могли быть известны к моменту решения по сделке
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        atr_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and atr_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - atr_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -577,6 +612,13 @@ async def _analyze_atr_pct(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ATR: atr_pct inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -597,7 +639,7 @@ async def _analyze_atr_tf_ratio(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ATR анализатора
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -645,6 +687,7 @@ async def _analyze_atr_tf_ratio(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -654,8 +697,25 @@ async def _analyze_atr_tf_ratio(
         if not series_tf or not series_base:
             continue
 
-        idx_tf = _find_index_leq(series_tf, entry_time)
-        idx_base = _find_index_leq(series_base, entry_time)
+        # учитываем только те ATR-бары, которые могли быть известны к моменту решения
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        tf_delta = _get_timeframe_timedelta(timeframe)
+        base_delta = _get_timeframe_timedelta(base_tf)
+
+        if sig_delta.total_seconds() > 0 and tf_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_tf = decision_time - tf_delta
+        else:
+            cutoff_tf = entry_time
+
+        if sig_delta.total_seconds() > 0 and base_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_base = decision_time - base_delta
+        else:
+            cutoff_base = entry_time
+
+        idx_tf = _find_index_leq(series_tf, cutoff_tf)
+        idx_base = _find_index_leq(series_base, cutoff_base)
         if idx_tf is None or idx_base is None:
             continue
 
@@ -712,6 +772,13 @@ async def _analyze_atr_tf_ratio(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ATR: atr_tf_ratio inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -732,7 +799,7 @@ async def _analyze_atr_stop_units(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ATR
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -789,6 +856,7 @@ async def _analyze_atr_stop_units(
         symbol = p["symbol"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -797,7 +865,16 @@ async def _analyze_atr_stop_units(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те ATR-бары, которые могли быть известны к моменту решения по сделке
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        atr_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and atr_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - atr_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -867,6 +944,13 @@ async def _analyze_atr_stop_units(
         len(agg),
         total_trades,
     )
+    log.info(
+        "BT_ANALYSIS_ATR: atr_stop_units inst_id=%s, feature=%s — trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -887,7 +971,7 @@ async def _analyze_atr_history_based(
     scenario_id: int,
     signal_id: int,
     positions: List[Dict[str, Any]],
-    timeframe: str,
+    timeframe: str,  # TF ATR
     source_key: str,
     deposit: Optional[Decimal],
     inst_id: int,
@@ -950,6 +1034,7 @@ async def _analyze_atr_history_based(
         direction = p["direction"]
         entry_time = p["entry_time"]
         pnl_abs_raw = p["pnl_abs"]
+        pos_tf = str(p["timeframe"] or "").lower()
 
         if direction is None or pnl_abs_raw is None:
             continue
@@ -958,7 +1043,16 @@ async def _analyze_atr_history_based(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # учитываем только те ATR-бары, которые могли быть известны к моменту решения по сделке
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+        atr_delta = _get_timeframe_timedelta(timeframe)
+        if sig_delta.total_seconds() > 0 and atr_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - atr_delta
+        else:
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
@@ -1082,6 +1176,14 @@ async def _analyze_atr_history_based(
         key,
         len(agg),
         total_trades,
+    )
+    log.info(
+        "BT_ANALYSIS_ATR: %s inst_id=%s, feature=%s — trades=%s, bins=%s",
+        key,
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
     )
 
     await write_feature_bins(
