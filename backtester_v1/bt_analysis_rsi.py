@@ -26,6 +26,15 @@ TF_STEP_MINUTES = {
 }
 
 
+# 🔸 Длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if not step_min:
+        return timedelta(0)
+    return timedelta(minutes=step_min)
+
+
 # 🔸 Извлечение значения RSI из raw_stat с учётом TF и ключа
 def _extract_rsi_value(
     raw_stat: Any,
@@ -117,7 +126,7 @@ async def _load_rsi_history_for_positions(
     if window_bars <= 0:
         window_bars = 1
 
-    step_min = TF_STEP_MINUTES.get(timeframe)
+    step_min = TF_STEP_MINUTES.get(timeframe.lower())
     if not step_min:
         step_min = 5
 
@@ -507,6 +516,13 @@ async def run_analysis_rsi(
         scenario_id,
         signal_id,
     )
+    log.info(
+        "BT_ANALYSIS_RSI: завершён анализ RSI для scenario_id=%s, signal_id=%s, позиций=%s, инстансов=%s",
+        scenario_id,
+        signal_id,
+        len(positions),
+        len(analysis_instances),
+    )
 
 
 # 🔸 Анализ rsi_value (текущее значение RSI по бинам)
@@ -566,6 +582,15 @@ async def _analyze_rsi_value(
         elif pnl_abs < 0:
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
+
+    total_trades = sum(stat["trades"] for stat in agg.values())
+    log.info(
+        "BT_ANALYSIS_RSI: rsi_value inst_id=%s, feature=%s, trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
@@ -633,6 +658,15 @@ async def _analyze_rsi_dist_from_50(
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
 
+    total_trades = sum(stat["trades"] for stat in agg.values())
+    log.info(
+        "BT_ANALYSIS_RSI: rsi_dist_from_50 inst_id=%s, feature=%s, trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
+
     await write_feature_bins(
         pg,
         scenario_id=scenario_id,
@@ -699,6 +733,15 @@ async def _analyze_rsi_zone(
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
 
+    total_trades = sum(stat["trades"] for stat in agg.values())
+    log.info(
+        "BT_ANALYSIS_RSI: rsi_zone inst_id=%s, feature=%s, trades=%s, bins=%s",
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
+
     await write_feature_bins(
         pg,
         scenario_id=scenario_id,
@@ -763,6 +806,9 @@ async def _analyze_rsi_history_based(
     feature_name = resolve_feature_name("rsi", key, timeframe, source_key)
     agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+    # длительность TF индикатора (RSI)
+    ind_delta = _get_timeframe_timedelta(timeframe)
+
     for p in positions:
         symbol = p["symbol"]
         direction = p["direction"]
@@ -776,11 +822,26 @@ async def _analyze_rsi_history_based(
         if not series:
             continue
 
-        idx = _find_index_leq(series, entry_time)
+        # длительность TF позиции: используем timeframe самой позиции
+        pos_tf_raw = p.get("timeframe")
+        pos_tf = str(pos_tf_raw or "").lower()
+        sig_delta = _get_timeframe_timedelta(pos_tf)
+
+        # учитываем только те RSI-бары, которые реально могли быть известны
+        # к моменту закрытия бара позиции:
+        # open_time_RSI + Δ_RSI <= entry_time + Δ_sig
+        if ind_delta.total_seconds() > 0 and sig_delta.total_seconds() > 0:
+            decision_time = entry_time + sig_delta
+            cutoff_time = decision_time - ind_delta
+        else:
+            # неизвестный TF — возвращаемся к старому поведению (<= entry_time)
+            cutoff_time = entry_time
+
+        idx = _find_index_leq(series, cutoff_time)
         if idx is None:
             continue
 
-        # текущий RSI
+        # текущий RSI (на последнем баре, доступном к моменту cutoff_time)
         rsi_t = series[idx][1]
 
         try:
@@ -985,6 +1046,16 @@ async def _analyze_rsi_history_based(
         elif pnl_abs < 0:
             bin_stat["losses"] += 1
         bin_stat["pnl_abs_total"] += pnl_abs
+
+    total_trades = sum(stat["trades"] for stat in agg.values())
+    log.info(
+        "BT_ANALYSIS_RSI: %s inst_id=%s, feature=%s, trades=%s, bins=%s",
+        key,
+        inst_id,
+        feature_name,
+        total_trades,
+        len(agg),
+    )
 
     await write_feature_bins(
         pg,
