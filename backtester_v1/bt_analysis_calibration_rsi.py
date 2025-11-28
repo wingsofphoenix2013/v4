@@ -571,7 +571,24 @@ async def run_calibration_rsi_raw(
                     if not series_for_symbol:
                         continue
 
-                    idx = _find_index_leq(series_for_symbol, entry_time)
+                    # TF позиции (по которой открыта сделка)
+                    pos_tf_raw = p.get("timeframe")
+                    pos_tf = str(pos_tf_raw or "").lower()
+
+                    # длительность TF индикатора (RSI) и TF позиции
+                    ind_step_min = TF_STEP_MINUTES.get(timeframe.lower())
+                    sig_step_min = TF_STEP_MINUTES.get(pos_tf)
+
+                    # учитываем только те RSI-бары, которые могли быть известны
+                    # к моменту решения по сделке: open_time_RSI + Δ_RSI <= entry_time + Δ_sig
+                    if ind_step_min and sig_step_min:
+                        decision_time = entry_time + timedelta(minutes=sig_step_min)
+                        cutoff_time = decision_time - timedelta(minutes=ind_step_min)
+                    else:
+                        # fallback — старое поведение (<= entry_time), если TF неизвестен
+                        cutoff_time = entry_time
+
+                    idx = _find_index_leq(series_for_symbol, cutoff_time)
                     if idx is None:
                         continue
 

@@ -34,6 +34,7 @@ TF_STEP_MINUTES = {
     "h1": 60,
 }
 
+
 # 🔸 Публичная точка входа: оркестратор постпроцессинга сценариев
 async def run_bt_scenarios_postproc(pg, redis) -> None:
     log.debug("BT_SCENARIOS_POSTPROC: воркер постпроцессинга сценариев запущен")
@@ -58,6 +59,9 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
 
             total_msgs = 0
             total_scenarios_processed = 0
+            total_positions_processed = 0
+            total_positions_skipped = 0
+            total_positions_errors = 0
 
             for stream_key, entries in messages:
                 if stream_key != POSTPROC_STREAM_KEY:
@@ -95,10 +99,22 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                         instances_by_id=instances_by_id,
                     )
                     total_scenarios_processed += 1
+                    total_positions_processed += processed
+                    total_positions_skipped += skipped
+                    total_positions_errors += errors
 
                     log.debug(
                         "BT_SCENARIOS_POSTPROC: сценарий scenario_id=%s, signal_id=%s — "
                         "позиций обработано=%s, пропущено=%s, ошибок=%s",
+                        scenario_id,
+                        signal_id,
+                        processed,
+                        skipped,
+                        errors,
+                    )
+                    log.info(
+                        "BT_SCENARIOS_POSTPROC: summary для scenario_id=%s, signal_id=%s — "
+                        "processed=%s, skipped=%s, errors=%s",
                         scenario_id,
                         signal_id,
                         processed,
@@ -148,6 +164,15 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                 total_msgs,
                 total_scenarios_processed,
             )
+            log.info(
+                "BT_SCENARIOS_POSTPROC: итог по пакету — сообщений=%s, сценариев=%s, "
+                "positions processed=%s, skipped=%s, errors=%s",
+                total_msgs,
+                total_scenarios_processed,
+                total_positions_processed,
+                total_positions_skipped,
+                total_positions_errors,
+            )
 
         except Exception as e:
             log.error(
@@ -157,6 +182,7 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
             )
             # небольшая пауза перед повторной попыткой, чтобы не крутить CPU при постоянной ошибке
             await asyncio.sleep(2)
+
 
 # 🔸 Проверка/создание consumer group для стрима постпроцессинга
 async def _ensure_consumer_group(redis) -> None:
@@ -333,7 +359,7 @@ async def _process_scenario_positions(
         total_positions,
     )
 
-    # обрабатываем позицию батчами, внутри батча до POSTPROC_MAX_CONCURRENCY задач параллельно
+    # обрабатываем позиции батчами, внутри батча до POSTPROC_MAX_CONCURRENCY задач параллельно
     for i in range(0, total_positions, POSTPROC_BATCH_SIZE):
         batch = positions[i : i + POSTPROC_BATCH_SIZE]
         sema = asyncio.Semaphore(POSTPROC_MAX_CONCURRENCY)
@@ -386,6 +412,7 @@ async def _process_position_with_semaphore(
             )
             return "error"
 
+
 # 🔸 Постпроцессинг одной позиции: сбор индикаторов по трём TF и запись raw_stat
 async def _process_single_position(
     pg,
@@ -398,7 +425,7 @@ async def _process_single_position(
     base_tf = position["timeframe"]
     entry_time: datetime = position["entry_time"]
 
-    # вычисляем опорные open_time для всех TF
+    # вычисляем опорные open_time для всех TF по единому правилу "что известно к моменту решения"
     open_times = await _resolve_open_times_for_position(pg, symbol, base_tf, entry_time)
     if not open_times:
         log.debug(
@@ -527,7 +554,8 @@ async def _process_single_position(
     )
     return "processed"
 
-# 🔸 Определение open_time для позиции по всем TF
+
+# 🔸 Определение open_time для позиции по всем TF (единая логика доступности данных)
 async def _resolve_open_times_for_position(
     pg,
     symbol: str,
@@ -536,9 +564,10 @@ async def _resolve_open_times_for_position(
 ) -> Optional[Dict[str, datetime]]:
     open_times: Dict[str, datetime] = {}
 
-    # вычисляем open_time для основного TF (TF позиции)
-    base_table = _ohlcv_table_for_timeframe(base_tf)
-    if not base_table:
+    base_tf_lower = (base_tf or "").lower()
+    base_step_min = TF_STEP_MINUTES.get(base_tf_lower)
+
+    if not base_step_min:
         log.warning(
             "BT_SCENARIOS_POSTPROC: неизвестный базовый TF '%s' для позиции symbol=%s",
             base_tf,
@@ -546,29 +575,13 @@ async def _resolve_open_times_for_position(
         )
         return None
 
+    # момент принятия решения по сделке: закрытие бара позиции
+    decision_time = entry_time + timedelta(minutes=base_step_min)
+
     async with pg.acquire() as conn:
-        # для основного TF берём бар с максимальным open_time <= entry_time
-        row = await conn.fetchrow(
-            f"""
-            SELECT max(open_time) AS open_time
-            FROM {base_table}
-            WHERE symbol = $1
-              AND open_time <= $2
-            """,
-            symbol,
-            entry_time,
-        )
-
-        if not row or row["open_time"] is None:
-            return None
-
-        open_times[base_tf] = row["open_time"]
-
-        # для остальных TF используем последнюю ПОЛНУЮ свечу до момента входа
+        # для всех TF используем единое правило:
+        # open_time_TF + Δ_TF <= decision_time (бар полностью закрыт к моменту решения)
         for tf in ("m5", "m15", "h1"):
-            if tf == base_tf:
-                continue
-
             table_name = _ohlcv_table_for_timeframe(tf)
             if not table_name:
                 continue
@@ -587,10 +600,16 @@ async def _resolve_open_times_for_position(
                   AND open_time + interval '{interval_str}' <= $2
                 """,
                 symbol,
-                entry_time,
+                decision_time,
             )
 
             if not tf_row or tf_row["open_time"] is None:
+                log.debug(
+                    "BT_SCENARIOS_POSTPROC: symbol=%s — не найден подходящий бар для TF=%s до decision_time=%s",
+                    symbol,
+                    tf,
+                    decision_time,
+                )
                 return None
 
             open_times[tf] = tf_row["open_time"]
@@ -598,6 +617,12 @@ async def _resolve_open_times_for_position(
     # убеждаемся, что у нас есть все три TF
     required_tfs = {"m5", "m15", "h1"}
     if not required_tfs.issubset(open_times.keys()):
+        log.debug(
+            "BT_SCENARIOS_POSTPROC: symbol=%s — не удалось получить open_time для всех TF=%s (есть=%s)",
+            symbol,
+            required_tfs,
+            open_times.keys(),
+        )
         return None
 
     return open_times
