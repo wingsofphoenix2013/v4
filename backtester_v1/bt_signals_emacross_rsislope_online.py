@@ -1,8 +1,7 @@
 # bt_signals_emacross_rsislope_online.py — live EMA-cross + RSI-slope сигналы
 
-import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
 
 # 🔸 Кеши backtester_v1
@@ -11,9 +10,6 @@ from backtester_config import (
     get_indicator_instance,
     get_analysis_instance,
 )
-
-# 🔸 Анализатор RSI (резолв RSI-инстанса)
-from bt_analysis_rsi import _resolve_rsi_instance_id
 
 # 🔸 Утилиты анализа фич (для feature_name)
 from bt_analysis_utils import resolve_feature_name
@@ -152,19 +148,6 @@ async def init_emacross_rsislope_live(
         # slope_k (шаг по RSI) читаем так же, как в анализаторе: из params или дефолт 3
         slope_k = _get_int_param_from_analysis(analysis_params, "slope_k", default=3)
 
-        # резолвим instance_id RSI через ту же функцию, что и анализатор
-        rsi_instance_id = _resolve_rsi_instance_id(rsi_timeframe, rsi_source_key)
-        if rsi_instance_id is None:
-            log.error(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: не удалось найти RSI instance_id для timeframe=%s, source_key=%s "
-                "(analysis_id=%s, signal_id=%s)",
-                rsi_timeframe,
-                rsi_source_key,
-                trigger_analysis_id,
-                sid,
-            )
-            continue
-
         # имя фичи для кандидатов (строго так же, как в анализаторе)
         feature_name = resolve_feature_name(
             family_key="rsi",
@@ -246,6 +229,8 @@ async def init_emacross_rsislope_live(
             "ema_prev_state": {},        # symbol -> "above"/"below"/None
             "ema_ready": {},             # (symbol, open_time_iso) -> {"fast": bool, "slow": bool}
             "processed_bars": set(),     # (symbol, open_time_iso) для защиты от дублей
+            # ожидание RSI на границе часа: (symbol, anchor_h1_iso) -> set(open_time_m5_iso)
+            "pending_rsi": {},
         }
 
         configs.append(config)
@@ -278,6 +263,7 @@ async def handle_emacross_rsislope_indicator_event(
     """
     Обработка одного сообщения из indicator_stream.
     На выходе — список live-сигналов, готовых к публикации.
+    Одновременно логируется bt_signals_live по каждому обработанному bar/symbol.
     """
     configs: List[Dict[str, Any]] = live_ctx.get("configs") or []
     if not configs:
@@ -303,104 +289,201 @@ async def handle_emacross_rsislope_indicator_event(
         # некорректный формат времени, пропускаем
         return []
 
-    # реагируем только на m5, потому что триггер по EMA на m5
-    if timeframe != "m5":
-        return []
-
     live_signals: List[Dict[str, Any]] = []
 
     # пробегаем по всем live-конфигам rsislope
     for cfg in configs:
-        # для данного конфига интересны только его fast/slow EMA
         fast_name = cfg["fast_indicator"]
         slow_name = cfg["slow_indicator"]
+        rsi_name = cfg["rsi_indicator"]
+        rsi_tf = cfg["rsi_timeframe"]
+        signal_id = cfg["signal_id"]
+        tf_m5 = cfg["timeframe"]
 
-        if indicator not in (fast_name, slow_name):
-            # это не тот индикатор, который участвует в EMA-кроссе для данного конфига
+        # ветка EMA m5
+        if timeframe == tf_m5 and indicator in (fast_name, slow_name):
+            # помечаем готовность EMA
+            bar_key = (symbol, open_time_str)
+            ema_ready = cfg["ema_ready"].setdefault(bar_key, {"fast": False, "slow": False})
+
+            if indicator == fast_name:
+                ema_ready["fast"] = True
+            elif indicator == slow_name:
+                ema_ready["slow"] = True
+
+            # пока не готовы оба — дальше не идём
+            if not (ema_ready["fast"] and ema_ready["slow"]):
+                continue
+
+            # EMA по этому бару m5 готова (оба значения)
+            # решаем, считаем сразу или ждём RSI (граница часа)
+            minute = open_time.minute
+
+            # вычисляем "часовой контекст" для определения якорного часа
+            # для m5 open_time используем open_time + 5 минут → floor_to_hour → anchor_h1 = hour - 1
+            dt_for_hour = open_time + timedelta(minutes=5)
+            floor_hour = dt_for_hour.replace(minute=0, second=0, microsecond=0)
+            anchor_h1 = floor_hour - timedelta(hours=1)
+            anchor_h1_iso = anchor_h1.isoformat()
+
+            # защита от повторных вычислений
+            processed_bars: Set[Tuple[str, str]] = cfg["processed_bars"]
+            if bar_key in processed_bars:
+                continue
+
+            # bar не закрывает час → RSI прошлого часа уже должен быть,
+            # считаем сразу
+            if minute != 55:
+                result_status, details, lsigs = await _compute_live_result_for_bar(
+                    cfg,
+                    symbol,
+                    open_time,
+                    anchor_h1,
+                    pg,
+                    redis,
+                )
+                # логируем результат, если был статус
+                if result_status is not None:
+                    await _log_live_result(
+                        pg,
+                        signal_id=signal_id,
+                        symbol=symbol,
+                        timeframe=tf_m5,
+                        open_time=open_time,
+                        status=result_status,
+                        details=details,
+                    )
+                if lsigs:
+                    live_signals.extend(lsigs)
+                # помечаем бар обработанным
+                processed_bars.add(bar_key)
+                # удаляем готовность по EMA для этого бара
+                try:
+                    del cfg["ema_ready"][bar_key]
+                except KeyError:
+                    pass
+            else:
+                # bar закрывает час (минуты == 55) → ждём RSI(h1) ready
+                pending_rsi: Dict[Tuple[str, str], Set[str]] = cfg["pending_rsi"]
+                pend_key = (symbol, anchor_h1_iso)
+                bar_set = pending_rsi.setdefault(pend_key, set())
+                bar_set.add(open_time_str)
+                log.debug(
+                    "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: m5-бар на границе часа, откладываем до готовности RSI "
+                    "(symbol=%s, open_time_m5=%s, anchor_h1=%s, signal_id=%s)",
+                    symbol,
+                    open_time,
+                    anchor_h1,
+                    signal_id,
+                )
+                # здесь пока не считаем, просто ждём RSI
             continue
 
-        bar_key = (symbol, open_time_str)
-        ema_ready = cfg["ema_ready"].setdefault(bar_key, {"fast": False, "slow": False})
+        # ветка RSI h1
+        if timeframe == rsi_tf and indicator == rsi_name:
+            # это сигнал о готовности RSI(h1) для некоторого часа
+            anchor_h1 = open_time
+            anchor_h1_iso = anchor_h1.isoformat()
+            pending_rsi: Dict[Tuple[str, str], Set[str]] = cfg["pending_rsi"]
+            pend_key = (symbol, anchor_h1_iso)
 
-        # помечаем готовность fast/slow
-        if indicator == fast_name:
-            ema_ready["fast"] = True
-        elif indicator == slow_name:
-            ema_ready["slow"] = True
+            if pend_key not in pending_rsi:
+                # нет отложенных m5-баров, которым нужен этот RSI
+                continue
 
-        # пока не готовы оба — дальше не идём
-        if not (ema_ready["fast"] and ema_ready["slow"]):
-            continue
+            # есть список m5-баров, которые ждали этот RSI
+            open_times_m5_str = list(pending_rsi[pend_key])
+            del pending_rsi[pend_key]
 
-        # защита от повторной обработки этого бара для данного конфига
-        processed_bars: Set[Tuple[str, str]] = cfg["processed_bars"]
-        if bar_key in processed_bars:
-            # уже обработан этот бар для этого конфига
-            continue
+            for ot_str in open_times_m5_str:
+                try:
+                    ot_m5 = datetime.fromisoformat(ot_str)
+                except Exception:
+                    continue
 
-        # отмечаем бар как обработанный
-        processed_bars.add(bar_key)
+                bar_key = (symbol, ot_str)
+                processed_bars: Set[Tuple[str, str]] = cfg["processed_bars"]
+                if bar_key in processed_bars:
+                    continue
 
-        # кросс считаем только один раз для этого бара и конфига
-        try:
-            lsigs = await _compute_live_signals_for_bar(
-                cfg,
-                symbol,
-                open_time,
-                pg,
-                redis,
-            )
-        except Exception as e:
-            log.error(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: ошибка расчёта live-сигнала для symbol=%s, time=%s, signal_id=%s: %s",
-                symbol,
-                open_time,
-                cfg["signal_id"],
-                e,
-                exc_info=True,
-            )
-            lsigs = []
+                result_status, details, lsigs = await _compute_live_result_for_bar(
+                    cfg,
+                    symbol,
+                    ot_m5,
+                    anchor_h1,
+                    pg,
+                    redis,
+                )
+                if result_status is not None:
+                    await _log_live_result(
+                        pg,
+                        signal_id=signal_id,
+                        symbol=symbol,
+                        timeframe=tf_m5,
+                        open_time=ot_m5,
+                        status=result_status,
+                        details=details,
+                    )
+                if lsigs:
+                    live_signals.extend(lsigs)
 
-        # очищаем состояние ready по этому бару
-        try:
-            del cfg["ema_ready"][bar_key]
-        except KeyError:
-            # уже удалено — не страшно
-            pass
-
-        if lsigs:
-            live_signals.extend(lsigs)
+                processed_bars.add(bar_key)
+                try:
+                    del cfg["ema_ready"][bar_key]
+                except KeyError:
+                    pass
 
     return live_signals
 
 
-# 🔸 Расчёт live-сигналов по одному бару m5 для конкретного конфига
-async def _compute_live_signals_for_bar(
+# 🔸 Расчёт результата (статуса и, возможно, live-сигнала) по одному m5-бару
+async def _compute_live_result_for_bar(
     cfg: Dict[str, Any],
     symbol: str,
-    open_time: datetime,
+    open_time_m5: datetime,
+    anchor_h1: datetime,
     pg,
     redis,
-) -> List[Dict[str, Any]]:
-    # читаем EMA fast/slow из Redis TS
+) -> Tuple[Optional[str], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Возвращает:
+      - status (строка для bt_signals_live или None, если лог не нужен),
+      - details (dict для JSON),
+      - список live-сигналов (0 или 1 элемент).
+    """
+    signal_id = cfg["signal_id"]
+    timeframe = cfg["timeframe"]  # ожидается 'm5'
     fast_name = cfg["fast_indicator"]
     slow_name = cfg["slow_indicator"]
-    timeframe = cfg["timeframe"]  # ожидается 'm5'
 
-    fast_val = await _get_indicator_value_ts(redis, symbol, timeframe, fast_name, open_time)
-    slow_val = await _get_indicator_value_ts(redis, symbol, timeframe, slow_name, open_time)
+    details: Dict[str, Any] = {
+        "signal_id": signal_id,
+        "signal_key": cfg.get("key"),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "open_time_m5": open_time_m5.isoformat(),
+        "anchor_h1": anchor_h1.isoformat(),
+    }
+
+    # читаем EMA fast/slow из Redis TS
+    fast_val = await _get_indicator_value_ts(redis, symbol, timeframe, fast_name, open_time_m5)
+    slow_val = await _get_indicator_value_ts(redis, symbol, timeframe, slow_name, open_time_m5)
+
+    details["ema_fast"] = fast_val
+    details["ema_slow"] = slow_val
 
     if fast_val is None or slow_val is None:
+        status = "cross_rejected_rsi_not_ready"
+        details["reason"] = "no_ema_values"
         log.info(
-            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: недостаточно данных EMA для %s на баре %s (fast=%s, slow=%s), "
-            "signal_id=%s",
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: нет EMA-значений для %s на баре %s (fast=%s, slow=%s), signal_id=%s",
             symbol,
-            open_time,
+            open_time_m5,
             fast_val,
             slow_val,
-            cfg["signal_id"],
+            signal_id,
         )
-        return []
+        return status, details, []
 
     # epsilon = 1 * ticksize (как в обычном emacross)
     ticker_info = get_ticker_info(symbol) or {}
@@ -410,196 +493,278 @@ async def _compute_live_signals_for_bar(
     except Exception:
         epsilon = 0.0
 
-    # классификация состояний и поиск кросса EMA для этого конфига и символа
+    details["ticksize"] = ticksize
+    details["epsilon"] = epsilon
+
     ema_prev_state: Dict[str, Optional[str]] = cfg["ema_prev_state"]
     prev_state = ema_prev_state.get(symbol)
 
     diff = fast_val - slow_val
     state = _classify_state(diff, epsilon)
 
+    details["ema_diff"] = diff
+    details["ema_state_new"] = state
+    details["ema_state_prev"] = prev_state
+
     # зона неопределённости — состояние не меняем, сигнала нет
     if state == "neutral":
+        status = "no_cross_neutral_zone"
+        details["reason"] = "neutral_zone"
         log.info(
             "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: расчёт выполнен, но EMA-кросса нет (neutral), "
             "symbol=%s, time=%s, diff=%.8f, epsilon=%.8f, signal_id=%s",
             symbol,
-            open_time,
+            open_time_m5,
             diff,
             epsilon,
-            cfg["signal_id"],
+            signal_id,
         )
-        return []
+        ema_prev_state[symbol] = prev_state  # не меняем
+        return status, details, []
 
     # первая инициализация состояния
     if prev_state is None:
+        status = "no_cross_state_unchanged"
+        details["reason"] = "initial_state"
         log.info(
             "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: первая инициализация состояния EMA, "
             "symbol=%s, time=%s, state=%s, signal_id=%s",
             symbol,
-            open_time,
+            open_time_m5,
             state,
-            cfg["signal_id"],
+            signal_id,
         )
         ema_prev_state[symbol] = state
-        return []
+        return status, details, []
 
-    live_signals: List[Dict[str, Any]] = []
-
-    if state != prev_state:
-        # фиксируем кросс с учётом смены состояния
-        if prev_state == "below" and state == "above":
-            direction = "long"
-        elif prev_state == "above" and state == "below":
-            direction = "short"
-        else:
-            ema_prev_state[symbol] = state
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: изменение состояния EMA без валидного кросса "
-                "(symbol=%s, time=%s, prev_state=%s, state=%s, signal_id=%s)",
-                symbol,
-                open_time,
-                prev_state,
-                state,
-                cfg["signal_id"],
-            )
-            return []
-
+    # состояние не изменилось
+    if state == prev_state:
+        status = "no_cross_state_unchanged"
+        details["reason"] = "state_not_changed"
         log.info(
-            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: найден EMA-кросс, symbol=%s, time=%s, direction=%s, "
-            "diff=%.8f, epsilon=%.8f, signal_id=%s",
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросса нет — состояние не изменилось "
+            "(symbol=%s, time=%s, state=%s, signal_id=%s)",
             symbol,
-            open_time,
-            direction,
-            diff,
-            epsilon,
-            cfg["signal_id"],
+            open_time_m5,
+            state,
+            signal_id,
         )
+        ema_prev_state[symbol] = state
+        return status, details, []
 
-        # фильтр по маске направлений
-        allowed_directions: Set[str] = cfg["allowed_directions"]
-        if direction not in allowed_directions:
-            ema_prev_state[symbol] = state
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но направление не разрешено маской "
-                "(symbol=%s, time=%s, direction=%s, allowed=%s, signal_id=%s)",
-                symbol,
-                open_time,
-                direction,
-                ",".join(sorted(allowed_directions)),
-                cfg["signal_id"],
-            )
-            return []
-
-        # расчитываем RSI-slope для этого бара
-        rsi_pair = await _compute_rsi_slope_for_bar(cfg, symbol, open_time, redis)
-        if rsi_pair is None:
-            # либо RSI ещё не готов (особенно на начале часа), либо недостаточно истории
-            ema_prev_state[symbol] = state
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но RSI-slope ещё не готов или недостаточно истории "
-                "(symbol=%s, time=%s, direction=%s, signal_id=%s)",
-                symbol,
-                open_time,
-                direction,
-                cfg["signal_id"],
-            )
-            return []
-
-        rsi_t, rsi_prev, slope = rsi_pair
-
-        # проверяем попадание slope в кандидатные диапазоны
-        candidate_ranges: List[Tuple[float, float]] = cfg["candidate_ranges"]
-        if not _slope_in_ranges(slope, candidate_ranges):
-            ema_prev_state[symbol] = state
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но не прошёл по RSI-slope "
-                "(symbol=%s, time=%s, direction=%s, slope=%.5f, signal_id=%s)",
-                symbol,
-                open_time,
-                direction,
-                slope,
-                cfg["signal_id"],
-            )
-            return []
-
-        # достаём цену close на m5
-        price = await _get_close_price_ts(redis, symbol, timeframe, open_time)
-        if price is None:
-            ema_prev_state[symbol] = state
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс + RSI-slope прошли, но нет цены close "
-                "(symbol=%s, time=%s, signal_id=%s)",
-                symbol,
-                open_time,
-                cfg["signal_id"],
-            )
-            return []
-
-        # формируем live-сигнал для публикации
-        signal_id = cfg["signal_id"]
-        signal = cfg["signal"]
-        long_message = cfg.get("long_message")
-        short_message = cfg.get("short_message")
-
-        if direction == "long":
-            message = long_message or "EMA_CROSS_RSISLOPE_LONG"
-        else:
-            message = short_message or "EMA_CROSS_RSISLOPE_SHORT"
-
-        raw_message = {
-            "mode": "live",
-            "signal_key": signal.get("key"),
-            "signal_id": signal_id,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "open_time": open_time.isoformat(),
-            "direction": direction,
-            "price": float(price),
-            "rsi_timeframe": cfg["rsi_timeframe"],
-            "rsi_source_key": cfg["rsi_indicator"],
-            "slope_k": cfg["slope_k"],
-            "rsi_t": float(rsi_t),
-            "rsi_prev": float(rsi_prev),
-            "slope": float(slope),
-            "candidate_ranges": [
-                {"from": r[0], "to": r[1]} for r in candidate_ranges
-            ],
-        }
-
+    # фиксируем кросс с учётом смены состояния
+    if prev_state == "below" and state == "above":
+        direction = "long"
+    elif prev_state == "above" and state == "below":
+        direction = "short"
+    else:
+        status = "error"
+        details["reason"] = "invalid_state_transition"
         log.info(
-            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс и RSI-slope прошли все фильтры, "
-            "готовим live-сигнал symbol=%s, time=%s, direction=%s, price=%.8f, slope=%.5f, signal_id=%s",
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: изменение состояния EMA без валидного кросса "
+            "(symbol=%s, time=%s, prev_state=%s, state=%s, signal_id=%s)",
             symbol,
-            open_time,
+            open_time_m5,
+            prev_state,
+            state,
+            signal_id,
+        )
+        ema_prev_state[symbol] = state
+        return status, details, []
+
+    details["direction"] = direction
+    log.info(
+        "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: найден EMA-кросс, symbol=%s, time=%s, direction=%s, "
+        "diff=%.8f, epsilon=%.8f, signal_id=%s",
+        symbol,
+        open_time_m5,
+        direction,
+        diff,
+        epsilon,
+        signal_id,
+    )
+
+    # фильтр по маске направлений
+    allowed_directions: Set[str] = cfg["allowed_directions"]
+    if direction not in allowed_directions:
+        status = "cross_rejected_direction_mask"
+        details["reason"] = "direction_mask"
+        details["allowed_directions"] = sorted(allowed_directions)
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но направление не разрешено маской "
+            "(symbol=%s, time=%s, direction=%s, allowed=%s, signal_id=%s)",
+            symbol,
+            open_time_m5,
             direction,
-            price,
+            ",".join(sorted(allowed_directions)),
+            signal_id,
+        )
+        ema_prev_state[symbol] = state
+        return status, details, []
+
+    # расчитываем RSI-slope для этого бара
+    rsi_pair = await _compute_rsi_slope_for_bar_ts(cfg, symbol, open_time_m5, anchor_h1, redis)
+    if rsi_pair is None:
+        status = "cross_rejected_rsi_not_ready"
+        details["reason"] = "rsi_not_ready_or_insufficient_history"
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но RSI-slope ещё не готов или недостаточно истории "
+            "(symbol=%s, time=%s, direction=%s, signal_id=%s)",
+            symbol,
+            open_time_m5,
+            direction,
+            signal_id,
+        )
+        ema_prev_state[symbol] = state
+        return status, details, []
+
+    rsi_t, rsi_prev, slope = rsi_pair
+    details["rsi_t"] = rsi_t
+    details["rsi_prev"] = rsi_prev
+    details["rsi_slope"] = slope
+
+    # проверяем попадание slope в кандидатные диапазоны
+    candidate_ranges: List[Tuple[float, float]] = cfg["candidate_ranges"]
+    details["candidate_ranges"] = [{"from": r[0], "to": r[1]} for r in candidate_ranges]
+
+    if not _slope_in_ranges(slope, candidate_ranges):
+        status = "cross_rejected_rsi_slope"
+        details["reason"] = "slope_not_in_good_ranges"
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс есть, но не прошёл по RSI-slope "
+            "(symbol=%s, time=%s, direction=%s, slope=%.5f, signal_id=%s)",
+            symbol,
+            open_time_m5,
+            direction,
             slope,
             signal_id,
         )
+        ema_prev_state[symbol] = state
+        return status, details, []
 
-        live_signals.append(
-            {
-                "signal": signal,
-                "signal_id": signal_id,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "direction": direction,
-                "open_time": open_time,
-                "message": message,
-                "raw_message": raw_message,
-            }
+    # достаём цену close на m5
+    price = await _get_close_price_ts(redis, symbol, timeframe, open_time_m5)
+    details["close_price"] = price
+
+    if price is None:
+        status = "cross_rejected_rsi_not_ready"
+        details["reason"] = "no_close_price"
+        log.info(
+            "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс + RSI-slope прошли, но нет цены close "
+            "(symbol=%s, time=%s, signal_id=%s)",
+            symbol,
+            open_time_m5,
+            signal_id,
+        )
+        ema_prev_state[symbol] = state
+        return status, details, []
+
+    # формируем live-сигнал для публикации
+    signal = cfg["signal"]
+    long_message = cfg.get("long_message")
+    short_message = cfg.get("short_message")
+
+    if direction == "long":
+        message = long_message or "EMA_CROSS_RSISLOPE_LONG"
+    else:
+        message = short_message or "EMA_CROSS_RSISLOPE_SHORT"
+
+    raw_message = {
+        "mode": "live",
+        "signal_key": signal.get("key"),
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "open_time": open_time_m5.isoformat(),
+        "direction": direction,
+        "price": float(price),
+        "rsi_timeframe": cfg["rsi_timeframe"],
+        "rsi_source_key": cfg["rsi_indicator"],
+        "slope_k": cfg["slope_k"],
+        "rsi_t": float(rsi_t),
+        "rsi_prev": float(rsi_prev),
+        "slope": float(slope),
+        "candidate_ranges": details["candidate_ranges"],
+    }
+
+    log.info(
+        "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: EMA-кросс и RSI-slope прошли все фильтры, "
+        "готовим live-сигнал symbol=%s, time=%s, direction=%s, price=%.8f, slope=%.5f, signal_id=%s",
+        symbol,
+        open_time_m5,
+        direction,
+        price,
+        slope,
+        signal_id,
+    )
+
+    details["reason"] = "signal_sent"
+
+    live_signal = {
+        "signal": signal,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "open_time": open_time_m5,
+        "message": message,
+        "raw_message": raw_message,
+    }
+
+    ema_prev_state[symbol] = state
+    return "signal_sent", details, [live_signal]
+
+
+# 🔸 Логирование результата в bt_signals_live
+async def _log_live_result(
+    pg,
+    signal_id: int,
+    symbol: str,
+    timeframe: str,
+    open_time: datetime,
+    status: str,
+    details: Dict[str, Any],
+) -> None:
+    log_db = logging.getLogger("BT_SIGNALS_LIVE_DB")
+    try:
+        async with pg.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, status, details)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (signal_id, symbol, timeframe, open_time)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    details = EXCLUDED.details,
+                    created_at = now()
+                """,
+                signal_id,
+                symbol,
+                timeframe,
+                open_time,
+                status,
+                details,
+            )
+    except Exception as e:
+        log_db.error(
+            "BT_SIGNALS_LIVE_DB: ошибка при вставке bt_signals_live "
+            "(signal_id=%s, symbol=%s, timeframe=%s, open_time=%s, status=%s): %s",
+            signal_id,
+            symbol,
+            timeframe,
+            open_time,
+            status,
+            e,
+            exc_info=True,
         )
 
-    # обновляем состояние EMA
-    ema_prev_state[symbol] = state
-    return live_signals
 
-
-# 🔸 Расчёт RSI-slope для бара (учитываем особый случай начала часа)
-async def _compute_rsi_slope_for_bar(
+# 🔸 Расчёт RSI-slope по Redis TS с учётом якорного часа
+async def _compute_rsi_slope_for_bar_ts(
     cfg: Dict[str, Any],
     symbol: str,
-    open_time: datetime,
+    open_time_m5: datetime,
+    anchor_h1: datetime,
     redis,
 ) -> Optional[Tuple[float, float, float]]:
     rsi_tf = cfg["rsi_timeframe"]
@@ -608,57 +773,20 @@ async def _compute_rsi_slope_for_bar(
 
     # ключ Redis TS для RSI
     ts_key = f"ts_ind:{symbol}:{rsi_tf}:{rsi_name}"
-    ts_ms = int(open_time.timestamp() * 1000)
+    anchor_ts = int(anchor_h1.timestamp() * 1000)
 
-    # особый случай: rsi_timeframe = h1 и начало часа — ждём новый бар до 3 раз по 20сек
-    if rsi_tf.lower() == "h1" and open_time.minute == 0:
-        for attempt in range(3):
-            rows = await _ts_range(redis, ts_key, ts_ms, ts_ms)
-            if rows:
-                break
-            if attempt < 2:
-                await asyncio.sleep(20)
-
-        rows = await _ts_range(redis, ts_key, ts_ms, ts_ms)
-        if not rows:
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: для symbol=%s, time=%s, rsi_tf=%s, rsi_name=%s "
-                "после ожидания нет нового h1-бара, RSI-slope не считается",
-                symbol,
-                open_time,
-                rsi_tf,
-                rsi_name,
-            )
-            return None
-
-        rsi_t = float(rows[0][1])
-
-        # теперь получаем k баров назад (включая текущий) через REVRANGE
-        rows_prev = await _ts_revrange(redis, ts_key, 0, ts_ms, slope_k + 1)
-        if not rows_prev or len(rows_prev) < slope_k + 1:
-            log.info(
-                "BT_SIG_EMA_CROSS_RSISLOPE_LIVE: недостаточно истории RSI для slope_k=%s "
-                "(symbol=%s, time=%s, rsi_tf=%s, rsi_name=%s)",
-                slope_k,
-                symbol,
-                open_time,
-                rsi_tf,
-                rsi_name,
-            )
-            return None
-
-        rsi_prev = float(rows_prev[slope_k][1])
-        slope = rsi_t - rsi_prev
-        return rsi_t, rsi_prev, slope
-
-    # общий случай: берём последний бар <= ts и k баров назад
-    rows = await _ts_revrange(redis, ts_key, 0, ts_ms, slope_k + 1)
+    # берём slope_k+1 последних баров ≤ anchor_h1
+    rows = await _ts_revrange(redis, ts_key, 0, anchor_ts, slope_k + 1)
     if not rows or len(rows) < slope_k + 1:
         return None
 
-    # rows отсортирован в обратном порядке по времени: [текущий/последний<=ts, предыдущий, ...]
-    rsi_t = float(rows[0][1])
-    rsi_prev = float(rows[slope_k][1])
+    # rows отсортирован в обратном порядке по времени: [anchor_h1, предыдущий, ...]
+    try:
+        rsi_t = float(rows[0][1])
+        rsi_prev = float(rows[slope_k][1])
+    except Exception:
+        return None
+
     slope = rsi_t - rsi_prev
     return rsi_t, rsi_prev, slope
 
