@@ -715,7 +715,6 @@ async def _compute_live_result_for_bar(
     ema_prev_state[symbol] = state
     return "signal_sent", details, [live_signal]
 
-
 # 🔸 Логирование результата в bt_signals_live
 async def _log_live_result(
     pg,
@@ -744,7 +743,7 @@ async def _log_live_result(
                 timeframe,
                 open_time,
                 status,
-               json.dumps(details),
+                json.dumps(details, default=str),
             )
     except Exception as e:
         log_db.error(
@@ -758,7 +757,6 @@ async def _log_live_result(
             e,
             exc_info=True,
         )
-
 
 # 🔸 Расчёт RSI-slope по Redis TS с учётом якорного часа
 async def _compute_rsi_slope_for_bar_ts(
