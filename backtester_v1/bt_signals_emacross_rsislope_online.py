@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
+import json
 
 # 🔸 Кеши backtester_v1
 from backtester_config import (
@@ -743,7 +744,7 @@ async def _log_live_result(
                 timeframe,
                 open_time,
                 status,
-                details,
+               json.dumps(details),
             )
     except Exception as e:
         log_db.error(
