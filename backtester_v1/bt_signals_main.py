@@ -5,14 +5,15 @@ import logging
 import uuid
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable, Awaitable
 
 # 🔸 Конфиг и кеши backtester_v1
 from backtester_config import get_enabled_signals
 
-# 🔸 Воркеры семейств псевдо-сигналов (backfill)
+# 🔸 Воркеры семейств псевдо-сигналов (backfill, timer/stream)
 from bt_signals_emacross import run_emacross_backfill
 from bt_signals_emacross_rsislope import run_emacross_rsislope_backfill
+from bt_signals_bbrsi import run_bbrsi_backfill
 
 # 🔸 Live-бизнес-логика EMA-cross + RSI-slope (online)
 from bt_signals_emacross_rsislope_online import (
@@ -20,9 +21,9 @@ from bt_signals_emacross_rsislope_online import (
     handle_emacross_rsislope_indicator_event,
 )
 
-# 🔸 Дефолтные настройки расписания для ema_cross_plain (используются, если нет параметров)
-EMA_CROSS_PLAIN_DEFAULT_START_DELAY_SEC = 60     # старт через минуту после запуска backtester_v1
-EMA_CROSS_PLAIN_DEFAULT_INTERVAL_SEC = 3600      # повторный запуск раз в час
+# 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
+BT_TIMER_BACKFILL_START_DELAY_SEC = 60   # старт через минуту после запуска backtester_v1
+BT_TIMER_BACKFILL_INTERVAL_SEC = 3600    # повторный запуск полного цикла раз в час
 
 # 🔸 Константы стримов для стримовых backfill-сигналов
 ANALYSIS_POSTPROC_STREAM_KEY = "bt:analysis:postproc:ready"
@@ -39,6 +40,15 @@ INDICATOR_STREAM_BATCH_SIZE = 100
 INDICATOR_STREAM_BLOCK_MS = 5000
 
 
+# 🔸 Реестр обработчиков таймерных backfill-сигналов (key → async handler(signal, pg, redis))
+TimerBackfillHandler = Callable[[Dict[str, Any], Any, Any], Awaitable[None]]
+
+TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
+    "ema_cross_plain": run_emacross_backfill,
+    "bb_rsi_reversion": run_bbrsi_backfill,
+}
+
+
 # 🔸 Оркестратор псевдо-сигналов: поднимает backfill и live-воркеры для всех включённых инстансов
 async def run_bt_signals_orchestrator(pg, redis):
     log = logging.getLogger("BT_SIGNALS_MAIN")
@@ -47,12 +57,17 @@ async def run_bt_signals_orchestrator(pg, redis):
     # получаем все включённые инстансы псевдо-сигналов из кеша
     signals: List[Dict[str, Any]] = get_enabled_signals()
     if not signals:
-        log.debug("BT_SIGNALS_MAIN: включённых псевдо-сигналов не найдено, оркестратор в режиме ожидания")
+        log.debug(
+            "BT_SIGNALS_MAIN: включённых псевдо-сигналов не найдено, оркестратор в режиме ожидания"
+        )
         # держим процесс живым, чтобы run_safe_loop не перезапускал без необходимости
         while True:
             await asyncio.sleep(60)
 
     tasks: List[asyncio.Task] = []
+
+    # 🔸 Коллекции сигналов по типам расписания / режимам
+    timer_signals: List[Dict[str, Any]] = []
     stream_to_signals: Dict[str, List[Dict[str, Any]]] = {}
     live_rsislope_signals: List[Dict[str, Any]] = []
 
@@ -85,60 +100,17 @@ async def run_bt_signals_orchestrator(pg, redis):
         else:
             schedule_type = "timer"
 
-        # 🔹 Backfill-режимы (timer / stream) — только если режим сигнала включает backfill
+        # backfill-режимы (timer / stream)
         if is_backfill_enabled:
-            # сигналы с таймерным расписанием
+            # таймерные backfill-сигналы — будут запускаться в одном общем планировщике
             if schedule_type == "timer":
-                # пока обрабатываем только ema_cross_plain и только режимы, включающие backfill
-                if key == "ema_cross_plain":
-                    start_delay_sec = _get_int_param(
-                        params,
-                        "start_delay_sec",
-                        EMA_CROSS_PLAIN_DEFAULT_START_DELAY_SEC,
-                    )
-                    interval_sec = _get_int_param(
-                        params,
-                        "interval_sec",
-                        EMA_CROSS_PLAIN_DEFAULT_INTERVAL_SEC,
-                    )
-
-                    if interval_sec <= 0:
-                        log.error(
-                            "BT_SIGNALS_MAIN: сигнал id=%s (key=%s, name=%s) имеет interval_sec=%s (<=0), "
-                            "планировщик backfill запущен не будет",
-                            sid,
-                            key,
-                            name,
-                            interval_sec,
-                        )
-                    else:
-                        task = asyncio.create_task(
-                            _schedule_ema_cross_backfill(
-                                signal,
-                                pg,
-                                redis,
-                                start_delay_sec,
-                                interval_sec,
-                            ),
-                            name=f"BT_SIG_EMA_CROSS_{sid}",
-                        )
-                        tasks.append(task)
-                        log.debug(
-                            "BT_SIGNALS_MAIN: для сигнала id=%s (ema_cross_plain) поднят планировщик backfill: "
-                            "schedule_type=%s, старт через %s сек, интервал %s сек",
-                            sid,
-                            schedule_type,
-                            start_delay_sec,
-                            interval_sec,
-                        )
-                else:
-                    # остальные типы таймерных сигналов пока не реализованы
-                    log.debug(
-                        "BT_SIGNALS_MAIN: таймерный backfill для сигнала id=%s с key=%s (name=%s) пока не поддерживается",
-                        sid,
-                        key,
-                        name,
-                    )
+                timer_signals.append(signal)
+                log.debug(
+                    "BT_SIGNALS_MAIN: сигнал id=%s (key=%s, name=%s) зарегистрирован как timer-backfill сигнал",
+                    sid,
+                    key,
+                    name,
+                )
 
             # сигналы с расписанием по стриму (backfill по анализу)
             elif schedule_type == "stream":
@@ -202,7 +174,7 @@ async def run_bt_signals_orchestrator(pg, redis):
                 mode,
             )
 
-        # 🔹 Live-режим (online EMA-cross + RSI-slope)
+        # live-режим (online EMA-cross + RSI-slope)
         if is_live_enabled and key == "ema_cross_rsislope":
             live_rsislope_signals.append(signal)
             log.debug(
@@ -213,18 +185,37 @@ async def run_bt_signals_orchestrator(pg, redis):
                 mode,
             )
 
-    # 🔹 Поднимаем воркеры для стримов backfill, если есть stream-сигналы
+    # 🔸 Поднимаем общий таймерный планировщик backfill для всех timer-сигналов
+    if timer_signals:
+        # упорядочиваем timer-сигналы по id, чтобы обеспечить детерминированную последовательность
+        timer_signals_sorted = sorted(timer_signals, key=lambda s: s.get("id") or 0)
+        task = asyncio.create_task(
+            _run_timer_backfill_scheduler(timer_signals_sorted, pg, redis),
+            name="BT_SIG_TIMER_BACKFILL",
+        )
+        tasks.append(task)
+        log.debug(
+            "BT_SIGNALS_MAIN: поднят общий таймерный планировщик backfill, сигналов=%s",
+            len(timer_signals_sorted),
+        )
+
+    # 🔸 Поднимаем воркеры для стримов backfill, если есть stream-сигналы
     for stream_key, signals_for_stream in stream_to_signals.items():
         if stream_key == ANALYSIS_POSTPROC_STREAM_KEY:
+            # сортируем stream-сигналы по id для детерминированного порядка
+            signals_for_stream_sorted = sorted(
+                signals_for_stream,
+                key=lambda s: s.get("id") or 0,
+            )
             task = asyncio.create_task(
-                _run_analysis_postproc_stream_dispatcher(signals_for_stream, pg, redis),
+                _run_analysis_postproc_stream_dispatcher(signals_for_stream_sorted, pg, redis),
                 name="BT_SIG_STREAM_ANALYSIS_POSTPROC",
             )
             tasks.append(task)
             log.debug(
                 "BT_SIGNALS_MAIN: поднят stream-диспетчер backfill для '%s', сигналов=%s",
                 stream_key,
-                len(signals_for_stream),
+                len(signals_for_stream_sorted),
             )
         else:
             log.debug(
@@ -232,10 +223,9 @@ async def run_bt_signals_orchestrator(pg, redis):
                 stream_key,
             )
 
-    # 🔹 Поднимаем live-диспетчер EMA-cross+RSI-slope, если есть live-сигналы
+    # 🔸 Поднимаем live-диспетчер EMA-cross+RSI-slope, если есть live-сигналы
     live_rsislope_ctx: Optional[Any] = None
     if live_rsislope_signals:
-        # инициализация live-контекста в модуле бизнес-логики
         try:
             live_rsislope_ctx = await init_emacross_rsislope_live(
                 live_rsislope_signals,
@@ -266,62 +256,100 @@ async def run_bt_signals_orchestrator(pg, redis):
         while True:
             await asyncio.sleep(60)
 
+    log.info(
+        "BT_SIGNALS_MAIN: оркестратор готов — timer_signals=%s, stream_groups=%s, live_rsislope_signals=%s",
+        len(timer_signals),
+        len(stream_to_signals),
+        len(live_rsislope_signals),
+    )
+
     # ждём завершения всех планировщиков и воркеров (они, по идее, живут бесконечно)
     await asyncio.gather(*tasks)
 
 
-# 🔸 Планировщик backfill для ema_cross_plain: старт с задержкой, затем периодический запуск
-async def _schedule_ema_cross_backfill(
-    signal: Dict[str, Any],
+# 🔸 Таймерный планировщик backfill для всех timer-сигналов (последовательный)
+async def _run_timer_backfill_scheduler(
+    timer_signals: List[Dict[str, Any]],
     pg,
     redis,
-    start_delay_sec: int,
-    interval_sec: int,
 ):
-    log = logging.getLogger("BT_SIG_EMA_CROSS")
-    sid = signal.get("id")
-    name = signal.get("name")
-    backfill_days = signal.get("backfill_days")
+    log = logging.getLogger("BT_SIGNALS_TIMER")
+    log.debug(
+        "BT_SIGNALS_TIMER: таймерный планировщик backfill запущен, сигналов=%s",
+        len(timer_signals),
+    )
 
-    # начальная задержка перед первым запуском
-    if start_delay_sec > 0:
+    # глобальная начальная задержка перед первым циклом
+    if BT_TIMER_BACKFILL_START_DELAY_SEC > 0:
         log.debug(
-            "BT_SIG_EMA_CROSS: сигнал id=%s ('%s') — ожидание перед стартом %s секунд",
-            sid,
-            name,
-            start_delay_sec,
+            "BT_SIGNALS_TIMER: ожидание перед первым циклом backfill %s секунд",
+            BT_TIMER_BACKFILL_START_DELAY_SEC,
         )
-        await asyncio.sleep(start_delay_sec)
+        await asyncio.sleep(BT_TIMER_BACKFILL_START_DELAY_SEC)
 
-    # цикл периодического запуска backfill
+    # основной цикл последовательного запуска всех timer-сигналов
     while True:
-        try:
+        cycle_started_at = datetime.utcnow()
+        total_signals = len(timer_signals)
+        processed_signals = 0
+
+        for signal in timer_signals:
+            sid = signal.get("id")
+            key = signal.get("key")
+            name = signal.get("name")
+            timeframe = signal.get("timeframe")
+            mode = signal.get("mode")
+
             log.debug(
-                "BT_SIG_EMA_CROSS: запуск backfill для сигнала id=%s ('%s'), окно=%s дней",
+                "BT_SIGNALS_TIMER: старт backfill для timer-сигнала id=%s, key=%s, name=%s, timeframe=%s, mode=%s",
                 sid,
+                key,
                 name,
-                backfill_days,
-            )
-            # один прогон backfill по истории для данного сигнала
-            await run_emacross_backfill(signal, pg, redis)
-            log.debug(
-                "BT_SIG_EMA_CROSS: backfill для сигнала id=%s ('%s') завершён, следующий запуск через %s секунд",
-                sid,
-                name,
-                interval_sec,
-            )
-        except Exception as e:
-            # защищаемся от падений конкретного воркера, чтобы планировщик не умер
-            log.error(
-                "BT_SIG_EMA_CROSS: ошибка при выполнении backfill сигнала id=%s ('%s'): %s",
-                sid,
-                name,
-                e,
-                exc_info=True,
+                timeframe,
+                mode,
             )
 
-        # ожидание до следующего запуска
-        await asyncio.sleep(interval_sec)
+            handler = TIMER_BACKFILL_HANDLERS.get(str(key or "").strip().lower())
+            if handler is None:
+                log.debug(
+                    "BT_SIGNALS_TIMER: timer-backfill для сигнала id=%s с key=%s (name=%s) пока не поддерживается",
+                    sid,
+                    key,
+                    name,
+                )
+            else:
+                try:
+                    await handler(signal, pg, redis)
+                except Exception as e:
+                    log.error(
+                        "BT_SIGNALS_TIMER: ошибка при выполнении backfill для timer-сигнала id=%s (key=%s, name=%s): %s",
+                        sid,
+                        key,
+                        name,
+                        e,
+                        exc_info=True,
+                    )
+
+            processed_signals += 1
+
+        cycle_finished_at = datetime.utcnow()
+        duration_sec = (cycle_finished_at - cycle_started_at).total_seconds()
+
+        log.info(
+            "BT_SIGNALS_TIMER: цикл timer-backfill завершён: сигналов=%s, обработано=%s, длительность=%.2f сек, "
+            "следующий запуск через %s сек",
+            total_signals,
+            processed_signals,
+            duration_sec,
+            BT_TIMER_BACKFILL_INTERVAL_SEC,
+        )
+
+        # ожидание до следующего цикла backfill
+        if BT_TIMER_BACKFILL_INTERVAL_SEC > 0:
+            await asyncio.sleep(BT_TIMER_BACKFILL_INTERVAL_SEC)
+        else:
+            # защита от нулевого интервала
+            await asyncio.sleep(1)
 
 
 # 🔸 Воркёр-диспетчер по стриму bt:analysis:postproc:ready для stream-сигналов backfill
@@ -434,14 +462,22 @@ async def _run_analysis_postproc_stream_dispatcher(
                                 version,
                             )
 
-                            # запускаем зависимый воркер EMA+RSI-slope (backfill)
-                            asyncio.create_task(
-                                run_emacross_rsislope_backfill(signal, pg, redis, ctx),
-                                name=f"BT_SIG_EMA_CROSS_RSISLOPE_{sid}",
-                            )
-
-                            triggers_for_msg += 1
-                            total_triggers += 1
+                            # запускаем зависимый воркер EMA+RSI-slope (backfill) последовательно
+                            try:
+                                await run_emacross_rsislope_backfill(signal, pg, redis, ctx)
+                                triggers_for_msg += 1
+                                total_triggers += 1
+                            except Exception as e:
+                                log.error(
+                                    "BT_SIGNALS_STREAM: ошибка при выполнении backfill для stream-сигнала id=%s "
+                                    "(key=%s, name=%s) по сообщению stream_id=%s: %s",
+                                    sid,
+                                    key,
+                                    name,
+                                    msg_id,
+                                    e,
+                                    exc_info=True,
+                                )
 
                     # помечаем сообщение как обработанное
                     await redis.xack(
@@ -461,6 +497,13 @@ async def _run_analysis_postproc_stream_dispatcher(
                 total_msgs,
                 total_triggers,
             )
+
+            if total_triggers > 0:
+                log.info(
+                    "BT_SIGNALS_STREAM: обработан пакет stream-backfill: сообщений=%s, запущено backfill-сигналов=%s",
+                    total_msgs,
+                    total_triggers,
+                )
 
         except Exception as e:
             log.error(
@@ -561,6 +604,13 @@ async def _run_indicator_stream_live_dispatcher(
                 total_msgs,
                 total_signals,
             )
+
+            if total_signals > 0:
+                log.info(
+                    "BT_SIGNALS_LIVE: обработан пакет live-сообщений: сообщений=%s, live-сигналов=%s",
+                    total_msgs,
+                    total_signals,
+                )
 
         except Exception as e:
             log.error(
@@ -831,16 +881,3 @@ def _should_trigger_rsislope_signal(
             return False
 
     return True
-
-
-# 🔸 Вспомогательная функция: безопасное чтение int-параметров сигнала
-def _get_int_param(params: Dict[str, Any], name: str, default: int) -> int:
-    cfg = params.get(name)
-    if cfg is None:
-        return default
-
-    raw = cfg.get("value")
-    try:
-        return int(str(raw))
-    except Exception:
-        return default
