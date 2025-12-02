@@ -16,6 +16,7 @@ from bt_signals_emacross_rsislope import run_emacross_rsislope_backfill
 from bt_signals_bbrsi import run_bbrsi_backfill
 from bt_signals_bbadx import run_bbadx_backfill
 from bt_signals_rsimfi import run_rsimfi_backfill
+from bt_signals_rsiatr import run_rsiatr_backfill
 
 # 🔸 Live-бизнес-логика EMA-cross + RSI-slope (online)
 from bt_signals_emacross_rsislope_online import (
@@ -50,6 +51,7 @@ TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
     "bb_rsi_reversion": run_bbrsi_backfill,
     "bb_adx_breakout": run_bbadx_backfill,
     "rsi_mfi_range": run_rsimfi_backfill,
+    "rsi_atr_momentum": run_rsiatr_backfill,
 }
 
 
