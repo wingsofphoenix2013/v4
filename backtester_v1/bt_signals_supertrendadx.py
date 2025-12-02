@@ -185,7 +185,7 @@ async def run_supertrendadx_backfill(signal: Dict[str, Any], pg, redis) -> None:
     # порог ADX
     adx_min = _get_float_param(params, "adx_min", 0.0)
 
-    # флаг использования DI-фильтра
+    # флаг использования DI-фильтра (на будущее, сейчас мы его ставили в false)
     use_di_cfg = params.get("use_di_filter")
     if use_di_cfg is not None:
         use_di_raw = str(use_di_cfg.get("value") or "").strip().lower()
@@ -481,6 +481,9 @@ async def _process_symbol_inner(
     long_count = 0
     short_count = 0
 
+    # заранее готовим "серии" для _find_index_leq
+    adx_time_series = [(t, None) for t in adx_times]
+
     # перебираем пары (prev_ts, ts) для поиска flip Supertrend
     for i in range(1, len(times)):
         prev_ts = times[i - 1]
@@ -505,7 +508,7 @@ async def _process_symbol_inner(
             cutoff_time = ts
 
         # ищем последний ADX-бар, который успел закрыться к decision_time
-        adx_idx = _find_index_leq([(t, None) for t in adx_times], cutoff_time)
+        adx_idx = _find_index_leq(adx_time_series, cutoff_time)
         if adx_idx is None:
             continue
 
@@ -533,7 +536,7 @@ async def _process_symbol_inner(
 
         # flip вниз→вверх → LONG
         if "long" in allowed_directions and prev_trend <= 0 and curr_trend > 0:
-            # фильтр по DI
+            # фильтр по DI (если включён)
             if use_di_filter and plus_di_f <= minus_di_f:
                 pass
             else:
@@ -587,4 +590,188 @@ async def _process_symbol_inner(
             (
                 str(signal_uuid),
                 signal_id,
-            ])
+                symbol,
+                timeframe,
+                ts,
+                direction,
+                message,
+                json.dumps(raw_message),
+            )
+        )
+
+        if direction == "long":
+            long_count += 1
+        else:
+            short_count += 1
+
+    if not to_insert:
+        log.debug(
+            "BT_SIG_SUPERTREND_ADX: сигналов не найдено для %s в окне [%s..%s], сигнал id=%s ('%s')",
+            symbol,
+            from_time,
+            to_time,
+            signal_id,
+            name,
+        )
+        return 0, 0, 0
+
+    async with pg.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO bt_signals_values
+                (signal_uuid, signal_id, symbol, timeframe, open_time, direction, message, raw_message)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+            to_insert,
+        )
+
+    inserted = len(to_insert)
+    log.debug(
+        "BT_SIG_SUPERTREND_ADX: %s → вставлено событий=%s (long=%s, short=%s) для сигнала id=%s ('%s')",
+        symbol,
+        inserted,
+        long_count,
+        short_count,
+        signal_id,
+        name,
+    )
+    return inserted, long_count, short_count
+
+
+# 🔸 Загрузка серии Supertrend-тренда для одного инстанса / символа / окна
+async def _load_supertrend_trend_series(
+    pg,
+    instance_id: int,
+    symbol: str,
+    from_time: datetime,
+    to_time: datetime,
+) -> Dict[datetime, float]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT open_time, param_name, value
+            FROM indicator_values_v4
+            WHERE instance_id = $1
+              AND symbol      = $2
+              AND open_time  BETWEEN $3 AND $4
+            ORDER BY open_time
+            """,
+            instance_id,
+            symbol,
+            from_time,
+            to_time,
+        )
+
+    series: Dict[datetime, float] = {}
+    for r in rows:
+        pname = str(r["param_name"] or "")
+        # ищем тренд по суффиксу "_trend"
+        if pname.endswith("_trend"):
+            try:
+                series[r["open_time"]] = float(r["value"])
+            except Exception:
+                continue
+    return series
+
+
+# 🔸 Загрузка серии ADX/DMI для одного инстанса / символа / окна
+async def _load_adx_series(
+    pg,
+    instance_id: int,
+    symbol: str,
+    from_time: datetime,
+    to_time: datetime,
+) -> Dict[datetime, Dict[str, float]]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT open_time, param_name, value
+            FROM indicator_values_v4
+            WHERE instance_id = $1
+              AND symbol      = $2
+              AND open_time  BETWEEN $3 AND $4
+            ORDER BY open_time
+            """,
+            instance_id,
+            symbol,
+            from_time,
+            to_time,
+        )
+
+    series: Dict[datetime, Dict[str, float]] = {}
+    for r in rows:
+        ts = r["open_time"]
+        pname = str(r["param_name"] or "")
+        val = r["value"]
+
+        entry = series.setdefault(ts, {})
+
+        # ожидаемые суффиксы: _adx, _plus_di, _minus_di
+        pname_l = pname.lower()
+        try:
+            fval = float(val)
+        except Exception:
+            continue
+
+        if pname_l.endswith("_adx"):
+            entry["adx"] = fval
+        elif pname_l.endswith("_plus_di"):
+            entry["plus_di"] = fval
+        elif pname_l.endswith("_minus_di"):
+            entry["minus_di"] = fval
+
+    return series
+
+
+# 🔸 Загрузка OHLCV-серии для одного символа / TF / окна
+async def _load_ohlcv_series(
+    pg,
+    symbol: str,
+    timeframe: str,
+    from_time: datetime,
+    to_time: datetime,
+) -> Dict[datetime, Tuple[float, float, float, float]]:
+    if timeframe != "m5":
+        return {}
+
+    table_name = "ohlcv_bb_m5"
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT open_time, open, high, low, close
+            FROM {table_name}
+            WHERE symbol = $1
+              AND open_time BETWEEN $2 AND $3
+            ORDER BY open_time
+            """,
+            symbol,
+            from_time,
+            to_time,
+        )
+
+    series: Dict[datetime, Tuple[float, float, float, float]] = {}
+    for r in rows:
+        try:
+            series[r["open_time"]] = (
+                float(r["open"]),
+                float(r["high"]),
+                float(r["low"]),
+                float(r["close"]),
+            )
+        except Exception:
+            continue
+    return series
+
+
+# 🔸 Вспомогательная функция: безопасное чтение float-параметров сигнала
+def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float:
+    cfg = params.get(name)
+    if cfg is None:
+        return default
+
+    raw = cfg.get("value")
+    try:
+        return float(str(raw))
+    except Exception:
+        return default
