@@ -1,4 +1,4 @@
-# bt_signals_lratr.py — воркер backfill для псевдо-сигналов семейства LR+ATR (канал + режим волатильности)
+# bt_signals_lratr.py — воркер backfill для псевдо-сигналов семейства LR+ATR (bounce + согласованность по TF)
 
 import asyncio
 import logging
@@ -17,6 +17,8 @@ log = logging.getLogger("BT_SIG_LR_ATR")
 # 🔸 Таймшаги TF (в минутах) для расчёта окон по барам
 TF_STEP_MINUTES = {
     "m5": 5,
+    "m15": 15,
+    "h1": 60,
 }
 
 
@@ -66,20 +68,37 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         return
 
-    # считываем инстанс LR (обязательный)
+    # считываем инстанс LR на m5 (обязательный)
     try:
         lr_cfg = params["lr_instance_id"]
-        lr_instance_id = int(lr_cfg["value"])
+        lr_m5_instance_id = int(lr_cfg["value"])
     except Exception as e:
         log.error(
-            "BT_SIG_LR_ATR: сигнал id=%s ('%s') — некорректные параметры lr_instance_id: %s",
+            "BT_SIG_LR_ATR: сигнал id=%s ('%s') — некорректные параметры lr_instance_id (m5): %s",
             signal_id,
             name,
             e,
         )
         return
 
-    # считываем инстанс ATR (обязательный)
+    # считываем инстансы LR на m15 и h1 (для согласованности по TF, опционально)
+    lr_m15_instance_id: Optional[int] = None
+    lr_m15_cfg = params.get("lr_m15_instance_id")
+    if lr_m15_cfg is not None:
+        try:
+            lr_m15_instance_id = int(lr_m15_cfg["value"])
+        except Exception:
+            lr_m15_instance_id = None
+
+    lr_h1_instance_id: Optional[int] = None
+    lr_h1_cfg = params.get("lr_h1_instance_id")
+    if lr_h1_cfg is not None:
+        try:
+            lr_h1_instance_id = int(lr_h1_cfg["value"])
+        except Exception:
+            lr_h1_instance_id = None
+
+    # считываем инстанс ATR на m5 (обязателен, даже если фильтры выключены)
     try:
         atr_cfg = params["atr_instance_id"]
         atr_instance_id = int(atr_cfg["value"])
@@ -116,29 +135,36 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
     else:
         allowed_directions = {"long", "short"}
 
-    # паттерн: breakout / bounce
-    pattern_cfg = params.get("pattern")
-    if pattern_cfg:
-        pattern_raw = pattern_cfg.get("value") or ""
-        pattern = str(pattern_raw).strip().lower()
-    else:
-        pattern = "breakout"
+    # Паттерн: сейчас поддерживаем только bounce, breakout убран
+    pattern = "bounce"
 
-    if pattern not in ("breakout", "bounce"):
-        log.warning(
-            "BT_SIG_LR_ATR: сигнал id=%s ('%s') — pattern=%s пока не поддерживается, будет использован 'breakout'",
-            signal_id,
-            name,
-            pattern,
-        )
-        pattern = "breakout"
-
-    # минимальный модуль угла (наклон LR), чтобы отсеять совсем плоские каналы
+    # минимальный модуль угла на m5 (наклон LR), чтобы отсеять совсем плоские каналы
     angle_min_abs = _get_float_param(params, "angle_min_abs", 0.0)
 
-    # ATR-фильтры по нормализованному ATR (опциональны)
+    # ATR-фильтры по нормализованному ATR (опциональны, сейчас можно держать 0.0)
     atr_min_norm = _get_float_param(params, "atr_min_norm", 0.0)   # 0.0 → без нижнего фильтра
     atr_max_norm = _get_float_param(params, "atr_max_norm", 0.0)   # 0.0 → без верхнего фильтра
+
+    # Флаги согласованности по TF
+    require_m15 = _get_bool_param(params, "require_m15", False)
+    require_h1 = _get_bool_param(params, "require_h1", False)
+
+    # проверка, что LR m15/h1 заданы, если требуем согласованность
+    if require_m15 and lr_m15_instance_id is None:
+        log.error(
+            "BT_SIG_LR_ATR: сигнал id=%s ('%s') требует require_m15=true, но lr_m15_instance_id не задан",
+            signal_id,
+            name,
+        )
+        return
+
+    if require_h1 and lr_h1_instance_id is None:
+        log.error(
+            "BT_SIG_LR_ATR: сигнал id=%s ('%s') требует require_h1=true, но lr_h1_instance_id не задан",
+            signal_id,
+            name,
+        )
+        return
 
     # рабочее окно по времени
     now = datetime.utcnow()
@@ -157,8 +183,8 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.debug(
         "BT_SIG_LR_ATR: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, "
-        "тикеров=%s, direction_mask=%s, lr_instance_id=%s, atr_instance_id=%s, "
-        "pattern=%s, angle_min_abs=%.5f, atr_min_norm=%.5f, atr_max_norm=%.5f",
+        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, lr_m15_instance_id=%s, lr_h1_instance_id=%s, "
+        "pattern=%s, angle_min_abs=%.5f, atr_min_norm=%.5f, atr_max_norm=%.5f, require_m15=%s, require_h1=%s",
         signal_id,
         name,
         signal_key,
@@ -166,12 +192,15 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
         backfill_days,
         len(symbols),
         mask_val,
-        lr_instance_id,
-        atr_instance_id,
+        lr_m5_instance_id,
+        lr_m15_instance_id,
+        lr_h1_instance_id,
         pattern,
         angle_min_abs,
         atr_min_norm,
         atr_max_norm,
+        require_m15,
+        require_h1,
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -187,7 +216,9 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 name=name,
                 timeframe=timeframe,
                 symbol=symbol,
-                lr_instance_id=lr_instance_id,
+                lr_m5_instance_id=lr_m5_instance_id,
+                lr_m15_instance_id=lr_m15_instance_id,
+                lr_h1_instance_id=lr_h1_instance_id,
                 atr_instance_id=atr_instance_id,
                 from_time=from_time,
                 to_time=to_time,
@@ -199,6 +230,8 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 angle_min_abs=angle_min_abs,
                 atr_min_norm=atr_min_norm,
                 atr_max_norm=atr_max_norm,
+                require_m15=require_m15,
+                require_h1=require_h1,
             )
         )
 
@@ -299,14 +332,16 @@ async def _load_existing_events(
     return existing
 
 
-# 🔸 Обработка одного символа: поиск LR+ATR сигналов и запись в bt_signals_values
+# 🔸 Обработка одного символа: поиск LR+ATR bounce-сигналов и запись в bt_signals_values
 async def _process_symbol(
     signal_id: int,
     signal_key: str,
     name: str,
     timeframe: str,
     symbol: str,
-    lr_instance_id: int,
+    lr_m5_instance_id: int,
+    lr_m15_instance_id: Optional[int],
+    lr_h1_instance_id: Optional[int],
     atr_instance_id: int,
     from_time: datetime,
     to_time: datetime,
@@ -318,6 +353,8 @@ async def _process_symbol(
     angle_min_abs: float,
     atr_min_norm: float,
     atr_max_norm: float,
+    require_m15: bool,
+    require_h1: bool,
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
@@ -327,7 +364,9 @@ async def _process_symbol(
                 name=name,
                 timeframe=timeframe,
                 symbol=symbol,
-                lr_instance_id=lr_instance_id,
+                lr_m5_instance_id=lr_m5_instance_id,
+                lr_m15_instance_id=lr_m15_instance_id,
+                lr_h1_instance_id=lr_h1_instance_id,
                 atr_instance_id=atr_instance_id,
                 from_time=from_time,
                 to_time=to_time,
@@ -338,6 +377,8 @@ async def _process_symbol(
                 angle_min_abs=angle_min_abs,
                 atr_min_norm=atr_min_norm,
                 atr_max_norm=atr_max_norm,
+                require_m15=require_m15,
+                require_h1=require_h1,
             )
         except Exception as e:
             log.error(
@@ -358,7 +399,9 @@ async def _process_symbol_inner(
     name: str,
     timeframe: str,
     symbol: str,
-    lr_instance_id: int,
+    lr_m5_instance_id: int,
+    lr_m15_instance_id: Optional[int],
+    lr_h1_instance_id: Optional[int],
     atr_instance_id: int,
     from_time: datetime,
     to_time: datetime,
@@ -369,17 +412,45 @@ async def _process_symbol_inner(
     angle_min_abs: float,
     atr_min_norm: float,
     atr_max_norm: float,
+    require_m15: bool,
+    require_h1: bool,
 ) -> Tuple[int, int, int]:
     # загружаем LR-канал на m5
-    lr_series = await _load_lr_series(pg, lr_instance_id, symbol, from_time, to_time)
-    if not lr_series or len(lr_series) < 2:
+    lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
+    if not lr_m5_series or len(lr_m5_series) < 2:
         log.debug(
-            "BT_SIG_LR_ATR: недостаточно данных LR для %s, сигнал id=%s ('%s')",
+            "BT_SIG_LR_ATR: недостаточно данных LR m5 для %s, сигнал id=%s ('%s')",
             symbol,
             signal_id,
             name,
         )
         return 0, 0, 0
+
+    # загружаем LR-углы на m15/h1, если требуется согласованность
+    lr_m15_series: Dict[datetime, Dict[str, float]] = {}
+    lr_h1_series: Dict[datetime, Dict[str, float]] = {}
+
+    if require_m15 and lr_m15_instance_id is not None:
+        lr_m15_series = await _load_lr_series(pg, lr_m15_instance_id, symbol, from_time, to_time)
+        if not lr_m15_series:
+            log.debug(
+                "BT_SIG_LR_ATR: нет данных LR m15 для %s при require_m15=true, сигнал id=%s ('%s')",
+                symbol,
+                signal_id,
+                name,
+            )
+            return 0, 0, 0
+
+    if require_h1 and lr_h1_instance_id is not None:
+        lr_h1_series = await _load_lr_series(pg, lr_h1_instance_id, symbol, from_time, to_time)
+        if not lr_h1_series:
+            log.debug(
+                "BT_SIG_LR_ATR: нет данных LR h1 для %s при require_h1=true, сигнал id=%s ('%s')",
+                symbol,
+                signal_id,
+                name,
+            )
+            return 0, 0, 0
 
     # загружаем ATR на m5
     atr_series = await _load_atr_series(pg, atr_instance_id, symbol, from_time, to_time)
@@ -408,8 +479,8 @@ async def _process_symbol_inner(
         )
         return 0, 0, 0
 
-    # работаем по общим временным точкам LR + ATR + OHLCV
-    times = sorted(set(lr_series.keys()) & set(atr_series.keys()) & set(ohlcv_series.keys()))
+    # работаем по общим временным точкам LR m5 + ATR + OHLCV
+    times = sorted(set(lr_m5_series.keys()) & set(atr_series.keys()) & set(ohlcv_series.keys()))
     if len(times) < 2:
         log.debug(
             "BT_SIG_LR_ATR: нет достаточного пересечения LR/ATR/OHLCV для %s, сигнал id=%s ('%s')",
@@ -430,19 +501,24 @@ async def _process_symbol_inner(
     long_count = 0
     short_count = 0
 
-    # длительность TF (для возможного расширения, пока ATR и LR на m5)
+    # подготовим series для m15/h1, если надо
+    lr_m15_times: List[datetime] = sorted(lr_m15_series.keys()) if lr_m15_series else []
+    lr_h1_times: List[datetime] = sorted(lr_h1_series.keys()) if lr_h1_series else []
+
+    lr_m15_time_series = [(t, None) for t in lr_m15_times]
+    lr_h1_time_series = [(t, None) for t in lr_h1_times]
+
     sig_tf_delta = _get_timeframe_timedelta(timeframe)
+    m15_delta = _get_timeframe_timedelta("m15")
+    h1_delta = _get_timeframe_timedelta("h1")
 
-    # подготовим серию для поиска по времени (если понадобится расширение)
-    time_series = [(t, None) for t in times]
-
-    # перебираем пары (prev_ts, ts) для поиска паттерна
+    # перебираем пары (prev_ts, ts) для поиска bounce-паттерна
     for i in range(1, len(times)):
         prev_ts = times[i - 1]
         ts = times[i]
 
-        lr_prev = lr_series.get(prev_ts)
-        lr_curr = lr_series.get(ts)
+        lr_prev = lr_m5_series.get(prev_ts)
+        lr_curr = lr_m5_series.get(ts)
         if lr_prev is None or lr_curr is None:
             continue
 
@@ -458,17 +534,17 @@ async def _process_symbol_inner(
         if close_curr is None or close_curr == 0:
             continue
 
-        angle = lr_curr.get("angle")
+        angle_m5 = lr_curr.get("angle")
         upper_curr = lr_curr.get("upper")
         lower_curr = lr_curr.get("lower")
         upper_prev = lr_prev.get("upper")
         lower_prev = lr_prev.get("lower")
 
-        if angle is None or upper_curr is None or lower_curr is None or upper_prev is None or lower_prev is None:
+        if angle_m5 is None or upper_curr is None or lower_curr is None or upper_prev is None or lower_prev is None:
             continue
 
         try:
-            angle_f = float(angle)
+            angle_m5_f = float(angle_m5)
             upper_curr_f = float(upper_curr)
             lower_curr_f = float(lower_curr)
             upper_prev_f = float(upper_prev)
@@ -480,7 +556,7 @@ async def _process_symbol_inner(
             continue
 
         # фильтр по наклону (если задан модуль)
-        if angle_min_abs > 0.0 and abs(angle_f) < angle_min_abs:
+        if angle_min_abs > 0.0 and abs(angle_m5_f) < angle_min_abs:
             continue
 
         # нормализованный ATR
@@ -495,30 +571,67 @@ async def _process_symbol_inner(
         if atr_max_norm > 0.0 and atr_norm > atr_max_norm:
             continue
 
+        # согласованность по m15
+        if require_m15:
+            # момент принятия решения — закрытие m5-бара
+            decision_time = ts + sig_tf_delta
+            cutoff_time_m15 = decision_time - m15_delta
+            idx_m15 = _find_index_leq(lr_m15_time_series, cutoff_time_m15)
+            if idx_m15 is None:
+                continue
+            t_m15 = lr_m15_times[idx_m15]
+            lr_m15_entry = lr_m15_series.get(t_m15) or {}
+            angle_m15 = lr_m15_entry.get("angle")
+            if angle_m15 is None:
+                continue
+            try:
+                angle_m15_f = float(angle_m15)
+            except Exception:
+                continue
+        else:
+            angle_m15_f = 0.0  # не используется
+
+        # согласованность по h1
+        if require_h1:
+            decision_time = ts + sig_tf_delta
+            cutoff_time_h1 = decision_time - h1_delta
+            idx_h1 = _find_index_leq(lr_h1_time_series, cutoff_time_h1)
+            if idx_h1 is None:
+                continue
+            t_h1 = lr_h1_times[idx_h1]
+            lr_h1_entry = lr_h1_series.get(t_h1) or {}
+            angle_h1 = lr_h1_entry.get("angle")
+            if angle_h1 is None:
+                continue
+            try:
+                angle_h1_f = float(angle_h1)
+            except Exception:
+                continue
+        else:
+            angle_h1_f = 0.0  # не используется
+
         direction: Optional[str] = None
 
-        # паттерн breakout: выход за канал по направлению наклона
-        if pattern == "breakout":
-            # LONG breakout: тренд вверх, пробой верха
-            if "long" in allowed_directions and angle_f > 0.0:
-                if close_prev_f <= upper_prev_f and close_curr_f > upper_curr_f:
-                    direction = "long"
-
-            # SHORT breakout: тренд вниз, пробой низа
-            if direction is None and "short" in allowed_directions and angle_f < 0.0:
-                if close_prev_f >= lower_prev_f and close_curr_f < lower_curr_f:
-                    direction = "short"
-
         # паттерн bounce: отскок от границы канала по направлению наклона
-        elif pattern == "bounce":
-            # LONG bounce: тренд вверх, отскок от нижней границы
-            if "long" in allowed_directions and angle_f > 0.0:
+        # LONG bounce: тренд вверх, отскок от нижней границы
+        if "long" in allowed_directions and angle_m5_f > 0.0:
+            # согласованность по TF для long
+            if require_m15 and angle_m15_f <= 0.0:
+                pass
+            elif require_h1 and angle_h1_f <= 0.0:
+                pass
+            else:
                 # предыдущий close был ниже/у lower, текущий поднялся выше lower
                 if close_prev_f <= lower_prev_f and close_curr_f > lower_prev_f:
                     direction = "long"
 
-            # SHORT bounce: тренд вниз, отскок от верхней границы
-            if direction is None and "short" in allowed_directions and angle_f < 0.0:
+        # SHORT bounce: тренд вниз, отскок от верхней границы
+        if direction is None and "short" in allowed_directions and angle_m5_f < 0.0:
+            if require_m15 and angle_m15_f >= 0.0:
+                pass
+            elif require_h1 and angle_h1_f >= 0.0:
+                pass
+            else:
                 if close_prev_f >= upper_prev_f and close_curr_f < upper_prev_f:
                     direction = "short"
 
@@ -536,7 +649,7 @@ async def _process_symbol_inner(
             price_rounded = close_curr_f
 
         signal_uuid = uuid.uuid4()
-        message = "LR_ATR_LONG" if direction == "long" else "LR_ATR_SHORT"
+        message = "LR_ATR_BOUNCE_LONG" if direction == "long" else "LR_ATR_BOUNCE_SHORT"
 
         raw_message = {
             "signal_key": signal_key,
@@ -547,7 +660,7 @@ async def _process_symbol_inner(
             "direction": direction,
             "price": price_rounded,
             "pattern": pattern,
-            "angle": angle_f,
+            "angle_m5": angle_m5_f,
             "upper_prev": upper_prev_f,
             "lower_prev": lower_prev_f,
             "upper_curr": upper_curr_f,
@@ -557,9 +670,17 @@ async def _process_symbol_inner(
             "atr_min_norm": float(atr_min_norm),
             "atr_max_norm": float(atr_max_norm),
             "angle_min_abs": float(angle_min_abs),
-            "lr_instance_id": lr_instance_id,
-            "atr_instance_id": atr_instance_id,
+            "lr_m5_instance_id": lr_m5_instance_id,
+            "lr_m15_instance_id": lr_m15_instance_id,
+            "lr_h1_instance_id": lr_h1_instance_id,
+            "require_m15": require_m15,
+            "require_h1": require_h1,
         }
+
+        if require_m15:
+            raw_message["angle_m15"] = angle_m15_f
+        if require_h1:
+            raw_message["angle_h1"] = angle_h1_f
 
         to_insert.append(
             (
@@ -748,3 +869,17 @@ def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float
         return float(str(raw))
     except Exception:
         return default
+
+
+# 🔸 Вспомогательная функция: безопасное чтение bool-параметров сигнала
+def _get_bool_param(params: Dict[str, Any], name: str, default: bool) -> bool:
+    cfg = params.get(name)
+    if cfg is None:
+        return default
+
+    raw = str(cfg.get("value") or "").strip().lower()
+    if raw in ("1", "true", "yes", "y"):
+        return True
+    if raw in ("0", "false", "no", "n"):
+        return False
+    return default
