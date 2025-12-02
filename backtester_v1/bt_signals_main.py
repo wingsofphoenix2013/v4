@@ -25,7 +25,7 @@ from bt_signals_emacross_rsislope_online import (
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60   # старт через минуту после запуска backtester_v1
-BT_TIMER_BACKFILL_INTERVAL_SEC = 7200    # повторный запуск полного цикла раз в час
+BT_TIMER_BACKFILL_INTERVAL_SEC = 28800    # повторный запуск полного цикла раз в Х часов
 
 # 🔸 Константы стримов для стримовых backfill-сигналов
 ANALYSIS_POSTPROC_STREAM_KEY = "bt:analysis:postproc:ready"
