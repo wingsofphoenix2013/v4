@@ -1,4 +1,4 @@
-# bt_signals_lratr.py — воркер backfill для псевдо-сигналов семейства LR+ATR (bounce с зоной у границы канала)
+# bt_signals_lratr.py — воркер backfill для псевдо-сигналов семейства LR+ATR (bounce с асимметричной зоной у границы канала)
 
 import asyncio
 import logging
@@ -29,9 +29,8 @@ def _get_timeframe_timedelta(timeframe: str) -> timedelta:
     return timedelta(minutes=step_min)
 
 
-# 🔸 Поиск индекса последнего бара с open_time <= cutoff_time
+# 🔸 Поиск индекса последнего бара с open_time <= cutoff_time (пока не используется, но оставим как утилиту)
 def _find_index_leq(series: List[Tuple[datetime, Any]], cutoff_time: datetime) -> Optional[int]:
-    # series отсортирован по времени
     lo = 0
     hi = len(series) - 1
     idx = None
@@ -428,10 +427,6 @@ async def _process_symbol_inner(
     long_count = 0
     short_count = 0
 
-    # подготовим серию для поиска по времени (на будущее, если понадобится привязка по TF)
-    time_series = [(t, None) for t in times]
-    sig_tf_delta = _get_timeframe_timedelta(timeframe)
-
     # перебираем пары (prev_ts, ts) для поиска bounce-паттерна
     for i in range(1, len(times)):
         prev_ts = times[i - 1]
@@ -475,12 +470,10 @@ async def _process_symbol_inner(
         except Exception:
             continue
 
-        # высота канала и зона у границы
+        # высота канала
         H = upper_prev_f - lower_prev_f
         if H <= 0:
             continue
-
-        zone_half = zone_k * H
 
         # фильтр по наклону (если задан модуль)
         if angle_min_abs > 0.0 and abs(angle_m5_f) < angle_min_abs:
@@ -500,21 +493,30 @@ async def _process_symbol_inner(
 
         direction: Optional[str] = None
 
-        # паттерн bounce: отскок от границы канала по направлению наклона
-        # LONG bounce: тренд вверх, отскок от нижней границы (с зоной)
+        # LONG bounce: тренд вверх, отскок от нижней границы
         if "long" in allowed_directions and angle_m5_f > 0.0:
-            zone_low = lower_prev_f - zone_half
-            zone_high = lower_prev_f + zone_half
-            in_zone_prev = (zone_low <= close_prev_f <= zone_high)
+            if zone_k == 0.0:
+                # старое поведение: любой close_prev ниже/на границе
+                in_zone_prev = (close_prev_f <= lower_prev_f)
+            else:
+                zone_up = zone_k * H
+                threshold = lower_prev_f + zone_up
+                # позволяем глубокие выносы ниже lower_prev, но не слишком далеко выше
+                in_zone_prev = (close_prev_f <= threshold)
 
             if in_zone_prev and close_curr_f > lower_prev_f:
                 direction = "long"
 
-        # SHORT bounce: тренд вниз, отскок от верхней границы (с зоной)
+        # SHORT bounce: тренд вниз, отскок от верхней границы
         if direction is None and "short" in allowed_directions and angle_m5_f < 0.0:
-            zone_low = upper_prev_f - zone_half
-            zone_high = upper_prev_f + zone_half
-            in_zone_prev = (zone_low <= close_prev_f <= zone_high)
+            if zone_k == 0.0:
+                # старое поведение: любой close_prev выше/на границе
+                in_zone_prev = (close_prev_f >= upper_prev_f)
+            else:
+                zone_down = zone_k * H
+                threshold = upper_prev_f - zone_down
+                # позволяем глубокие выносы выше upper_prev, но не слишком далеко ниже
+                in_zone_prev = (close_prev_f >= threshold)
 
             if in_zone_prev and close_curr_f < upper_prev_f:
                 direction = "short"
