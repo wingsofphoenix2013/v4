@@ -32,7 +32,7 @@ MIN_COVERAGE = Decimal("0.20")              # минимальная доля с
 MIN_WINRATE_IMPROVEMENT = Decimal("0.02")   # минимальное улучшение winrate (2%)
 
 # 🔸 Поддерживаемые семейства анализаторов
-SUPPORTED_FAMILIES = {"rsi", "adx", "ema", "atr", "supertrend"}
+SUPPORTED_FAMILIES = {"rsi", "adx", "ema", "atr", "supertrend", "lr"}
 
 # 🔸 Имя таблицы кандидатов
 BT_ANALYSIS_CANDIDATES_TABLE = "bt_analysis_candidates"

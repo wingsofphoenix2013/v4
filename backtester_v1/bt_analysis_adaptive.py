@@ -28,7 +28,7 @@ ADAPTIVE_STREAM_BATCH_SIZE = 10
 ADAPTIVE_STREAM_BLOCK_MS = 5000
 
 # 🔸 Поддерживаемые семейства для адаптивного анализа
-SUPPORTED_FAMILIES_ADAPTIVE = {"rsi", "adx", "ema", "atr", "supertrend"}
+SUPPORTED_FAMILIES_ADAPTIVE = {"rsi", "adx", "ema", "atr", "supertrend", "lr"}
 
 
 # 🔸 Квантование чисел до 4 знаков

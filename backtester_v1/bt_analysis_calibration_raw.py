@@ -12,6 +12,7 @@ from bt_analysis_calibration_adx import run_calibration_adx_raw
 from bt_analysis_calibration_ema import run_calibration_ema_raw
 from bt_analysis_calibration_atr import run_calibration_atr_raw
 from bt_analysis_calibration_supertrend import run_calibration_supertrend_raw
+from bt_analysis_calibration_lr import run_calibration_lr_raw
 
 log = logging.getLogger("BT_ANALYSIS_CALIB_RAW")
 
@@ -32,6 +33,7 @@ FAMILY_CALIBRATION_HANDLERS = {
     "ema": run_calibration_ema_raw,
     "atr": run_calibration_atr_raw,
     "supertrend": run_calibration_supertrend_raw,
+    "lr": run_calibration_lr_raw,
 }
 
 

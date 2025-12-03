@@ -16,6 +16,7 @@ from bt_analysis_adx import run_analysis_adx
 from bt_analysis_ema import run_analysis_ema
 from bt_analysis_atr import run_analysis_atr
 from bt_analysis_supertrend import run_analysis_supertrend
+from bt_analysis_lr import run_analysis_lr
 
 # 🔸 Реестр обработчиков семейств анализаторов
 FAMILY_ANALYSIS_HANDLERS = {
@@ -24,6 +25,7 @@ FAMILY_ANALYSIS_HANDLERS = {
     "ema": run_analysis_ema,
     "atr": run_analysis_atr,
     "supertrend": run_analysis_supertrend,
+    "lr": run_analysis_lr,
 }
 
 # 🔸 Константы стримов анализа
