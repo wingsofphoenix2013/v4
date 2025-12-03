@@ -6,11 +6,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal, getcontext
 from typing import Any, Dict, List, Optional, Tuple
 
-# 🔸 Кеши backtester_v1 (анализаторы, сценарии и индикаторы)
+# 🔸 Кеши backtester_v1 (анализаторы и индикаторы)
 from backtester_config import (
     get_analysis_instance,
     get_all_indicator_instances,
-    get_scenario_instance,
 )
 
 # 🔸 Утилиты анализа фич
@@ -381,25 +380,7 @@ async def run_calibration_lr_raw(
 
     total_rows_written = 0
 
-    # 🔸 Достаём scenario, чтобы взять TP-процент (для RoomToOppositeBoundary)
-    scenario = get_scenario_instance(scenario_id)
-    tp_percent: Optional[Decimal] = None
-
-    if scenario:
-        params = scenario.get("params") or {}
-        tp_type_cfg = params.get("tp_type")
-        tp_value_cfg = params.get("tp_value")
-        try:
-            tp_type = (tp_type_cfg.get("value") or "").strip().lower() if tp_type_cfg else ""
-        except Exception:
-            tp_type = ""
-        if tp_type == "percent" and tp_value_cfg is not None:
-            try:
-                tp_percent = Decimal(str(tp_value_cfg.get("value")))
-            except Exception:
-                tp_percent = None
-
-    # 🔸 Дополняем позиции ценой входа (entry_price) по их id
+    # дополняем позиции ценой входа (entry_price) по их id
     position_ids = [p["id"] for p in positions]
     if not position_ids:
         return 0
@@ -425,7 +406,7 @@ async def run_calibration_lr_raw(
         pid = p["id"]
         p["entry_price"] = price_by_id.get(pid, Decimal("0"))
 
-    # 🔸 Основной цикл по анализаторам
+    # основной цикл по анализаторам
     async with pg.acquire() as conn:
         for aid in analysis_ids:
             inst = get_analysis_instance(aid)
@@ -469,9 +450,22 @@ async def run_calibration_lr_raw(
                 signal_id,
             )
 
+            # очищаем старые сырые значения для этой фичи (идемпотентность)
+            await conn.execute(
+                """
+                DELETE FROM bt_position_features_raw
+                WHERE scenario_id  = $1
+                  AND signal_id    = $2
+                  AND feature_name = $3
+                """,
+                scenario_id,
+                signal_id,
+                feature_name,
+            )
+
             rows_to_insert: List[Tuple[Any, ...]] = []
 
-            # 🔸 Фича 1: lr_angle_strength
+            # фича 1: lr_angle_strength
             if key == "lr_angle_strength":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -573,7 +567,7 @@ async def run_calibration_lr_raw(
                             )
                         )
 
-            # 🔸 Фича 2: lr_channel_width_rel
+            # фича 2: lr_channel_width_rel
             elif key == "lr_channel_width_rel":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -668,7 +662,7 @@ async def run_calibration_lr_raw(
                             )
                         )
 
-            # 🔸 Фича 3: lr_angle_stability
+            # фича 3: lr_angle_stability
             elif key == "lr_angle_stability":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -748,7 +742,7 @@ async def run_calibration_lr_raw(
                             )
                         )
 
-            # 🔸 Фича 4: lr_channel_width_trend
+            # фича 4: lr_channel_width_trend
             elif key == "lr_channel_width_trend":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -839,7 +833,7 @@ async def run_calibration_lr_raw(
                             )
                         )
 
-            # 🔸 Фича 5: lr_entry_distance_to_boundary
+            # фича 5: lr_entry_distance_to_boundary
             elif key == "lr_entry_distance_to_boundary":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -941,7 +935,7 @@ async def run_calibration_lr_raw(
                             )
                         )
 
-            # 🔸 Фича 6: lr_room_to_opposite_boundary
+            # фича 6: lr_room_to_opposite_boundary
             elif key == "lr_room_to_opposite_boundary":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -961,6 +955,8 @@ async def run_calibration_lr_raw(
                         window_bars=5,
                     )
 
+                    # TP % берётся из сценария в анализаторе; здесь считаем только геометрию:
+                    # нормируем либо на высоту канала, либо оставляем "в канале" — калибровка сама разложит по квантилям
                     for p in positions:
                         position_id = p["id"]
                         symbol = p["symbol"]
@@ -1014,25 +1010,18 @@ async def run_calibration_lr_raw(
                         if room <= 0:
                             continue
 
-                        if tp_percent is not None and tp_percent > 0:
-                            base_move = entry_f * float(tp_percent) / 100.0
-                            if base_move > 0:
-                                ratio = room / base_move
-                            else:
-                                ratio = room
+                        H = upper_f - lower_f
+                        if H > 0:
+                            ratio = room / H
                         else:
-                            H = upper_f - lower_f
-                            if H > 0:
-                                ratio = room / H
-                            else:
-                                ratio = room
+                            ratio = room
 
                         if ratio < 1.0:
-                            bin_label = "RoomLess1R"
+                            bin_label = "RoomLess1H"
                         elif ratio <= 2.0:
-                            bin_label = "Room1to2R"
+                            bin_label = "Room1to2H"
                         else:
-                            bin_label = "RoomMore2R"
+                            bin_label = "RoomMore2H"
 
                         feature_value = ratio
 
@@ -1053,118 +1042,8 @@ async def run_calibration_lr_raw(
                             )
                         )
 
-            # 🔸 Фича 7: lr_multitf_alignment
-            elif key == "lr_multitf_alignment":
-                higher_tf_cfg = params.get("higher_timeframe")
-                higher_tf = str(higher_tf_cfg.get("value")).strip() if higher_tf_cfg is not None else "m15"
-
-                higher_src_cfg = params.get("higher_source_key")
-                higher_source_key = str(higher_src_cfg.get("value")).strip() if higher_src_cfg is not None else source_key
-
-                base_lr_id = _resolve_lr_instance_id(timeframe, source_key)
-                higher_lr_id = _resolve_lr_instance_id(higher_tf, higher_source_key)
-
-                if base_lr_id is None or higher_lr_id is None:
-                    log.warning(
-                        "BT_ANALYSIS_CALIB_LR: analysis_id=%s (lr_multitf_alignment) — не удалось найти LR instance_id "
-                        "для base_tf=%s (%s) или higher_tf=%s (%s)",
-                        aid,
-                        timeframe,
-                        source_key,
-                        higher_tf,
-                        higher_source_key,
-                    )
-                else:
-                    base_history = await _load_lr_history_for_positions(
-                        pg=pg,
-                        instance_id=base_lr_id,
-                        timeframe=timeframe,
-                        positions=positions,
-                        window_bars=5,
-                    )
-                    higher_history = await _load_lr_history_for_positions(
-                        pg=pg,
-                        instance_id=higher_lr_id,
-                        timeframe=higher_tf,
-                        positions=positions,
-                        window_bars=5,
-                    )
-
-                    for p in positions:
-                        position_id = p["id"]
-                        symbol = p["symbol"]
-                        direction = p["direction"]
-                        entry_time = p["entry_time"]
-                        pos_tf_raw = p.get("timeframe")
-                        pos_tf = str(pos_tf_raw or "").lower()
-                        pnl_abs_raw = p["pnl_abs"]
-
-                        if not direction or pnl_abs_raw is None:
-                            continue
-
-                        try:
-                            pnl_abs = Decimal(str(pnl_abs_raw))
-                        except Exception:
-                            continue
-
-                        is_win = pnl_abs > 0
-
-                        base_series = base_history.get(symbol)
-                        higher_series = higher_history.get(symbol)
-                        if not base_series or not higher_series:
-                            continue
-
-                        cutoff_base = _compute_cutoff_time(entry_time, pos_tf, timeframe)
-                        cutoff_high = _compute_cutoff_time(entry_time, pos_tf, higher_tf)
-
-                        idx_base = _find_index_leq(base_series, cutoff_base)
-                        idx_high = _find_index_leq(higher_series, cutoff_high)
-
-                        if idx_base is None or idx_high is None:
-                            continue
-
-                        angle_base = base_series[idx_base][1].get("angle")
-                        angle_high = higher_series[idx_high][1].get("angle")
-                        if angle_base is None or angle_high is None:
-                            continue
-
-                        try:
-                            a_b = float(angle_base)
-                            a_h = float(angle_high)
-                        except Exception:
-                            continue
-
-                        if abs(a_h) < 1e-9:
-                            ratio = 0.0
-                            bin_label = "HigherFlat"
-                        else:
-                            ratio = a_b / a_h
-                            same_sign = (a_b > 0 and a_h > 0) or (a_b < 0 and a_h < 0)
-                            if same_sign:
-                                bin_label = "Aligned"
-                            else:
-                                bin_label = "Opposite"
-
-                        feature_value = ratio
-
-                        rows_to_insert.append(
-                            (
-                                position_id,
-                                scenario_id,
-                                signal_id,
-                                direction,
-                                timeframe,  # используем TF базы
-                                "lr",
-                                key,
-                                feature_name,
-                                bin_label,
-                                feature_value,
-                                pnl_abs,
-                                is_win,
-                            )
-                        )
-
-            # 🔸 Фича 8: lr_vs_ema_slope
+            # фича 7: lr_multitf_alignment (мульти-ТФ — обрабатывается другим анализатором, здесь не трогаем)
+            # фича 8: lr_vs_ema_slope
             elif key == "lr_vs_ema_slope":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -1288,7 +1167,7 @@ async def run_calibration_lr_raw(
                                 )
                             )
 
-            # 🔸 Фича 9: lr_channel_width_vs_atr
+            # фича 9: lr_channel_width_vs_atr
             elif key == "lr_channel_width_vs_atr":
                 lr_instance_id = _resolve_lr_instance_id(timeframe, source_key)
                 if lr_instance_id is None:
@@ -1400,7 +1279,7 @@ async def run_calibration_lr_raw(
                                 )
                             )
 
-            # 🔸 Вставка собранного batch для analysis_id
+            # вставка собранного batch для analysis_id
             if rows_to_insert:
                 await conn.executemany(
                     """
