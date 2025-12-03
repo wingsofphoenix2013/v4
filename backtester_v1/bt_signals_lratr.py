@@ -1,4 +1,4 @@
-# bt_signals_lratr.py — воркер backfill для псевдо-сигналов семейства LR+ATR (bounce + согласованность по TF)
+# bt_signals_lratr.py — воркер backfill для псевдо-сигналов семейства LR+ATR (bounce с зоной у границы канала)
 
 import asyncio
 import logging
@@ -17,8 +17,6 @@ log = logging.getLogger("BT_SIG_LR_ATR")
 # 🔸 Таймшаги TF (в минутах) для расчёта окон по барам
 TF_STEP_MINUTES = {
     "m5": 5,
-    "m15": 15,
-    "h1": 60,
 }
 
 
@@ -81,23 +79,6 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         return
 
-    # считываем инстансы LR на m15 и h1 (для согласованности по TF, опционально)
-    lr_m15_instance_id: Optional[int] = None
-    lr_m15_cfg = params.get("lr_m15_instance_id")
-    if lr_m15_cfg is not None:
-        try:
-            lr_m15_instance_id = int(lr_m15_cfg["value"])
-        except Exception:
-            lr_m15_instance_id = None
-
-    lr_h1_instance_id: Optional[int] = None
-    lr_h1_cfg = params.get("lr_h1_instance_id")
-    if lr_h1_cfg is not None:
-        try:
-            lr_h1_instance_id = int(lr_h1_cfg["value"])
-        except Exception:
-            lr_h1_instance_id = None
-
     # считываем инстанс ATR на m5 (обязателен, даже если фильтры выключены)
     try:
         atr_cfg = params["atr_instance_id"]
@@ -135,36 +116,22 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
     else:
         allowed_directions = {"long", "short"}
 
-    # Паттерн: сейчас поддерживаем только bounce, breakout убран
+    # Паттерн: сейчас поддерживаем только bounce
     pattern = "bounce"
 
     # минимальный модуль угла на m5 (наклон LR), чтобы отсеять совсем плоские каналы
     angle_min_abs = _get_float_param(params, "angle_min_abs", 0.0)
 
-    # ATR-фильтры по нормализованному ATR (опциональны, сейчас можно держать 0.0)
+    # параметр зоны у границы канала: доля высоты канала (0.0, 0.1, 0.2)
+    zone_k = _get_float_param(params, "zone_k", 0.0)
+    if zone_k < 0.0:
+        zone_k = 0.0
+    if zone_k > 0.5:
+        zone_k = 0.5
+
+    # ATR-фильтры по нормализованному ATR (опциональны)
     atr_min_norm = _get_float_param(params, "atr_min_norm", 0.0)   # 0.0 → без нижнего фильтра
     atr_max_norm = _get_float_param(params, "atr_max_norm", 0.0)   # 0.0 → без верхнего фильтра
-
-    # Флаги согласованности по TF
-    require_m15 = _get_bool_param(params, "require_m15", False)
-    require_h1 = _get_bool_param(params, "require_h1", False)
-
-    # проверка, что LR m15/h1 заданы, если требуем согласованность
-    if require_m15 and lr_m15_instance_id is None:
-        log.error(
-            "BT_SIG_LR_ATR: сигнал id=%s ('%s') требует require_m15=true, но lr_m15_instance_id не задан",
-            signal_id,
-            name,
-        )
-        return
-
-    if require_h1 and lr_h1_instance_id is None:
-        log.error(
-            "BT_SIG_LR_ATR: сигнал id=%s ('%s') требует require_h1=true, но lr_h1_instance_id не задан",
-            signal_id,
-            name,
-        )
-        return
 
     # рабочее окно по времени
     now = datetime.utcnow()
@@ -183,8 +150,8 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.debug(
         "BT_SIG_LR_ATR: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, "
-        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, lr_m15_instance_id=%s, lr_h1_instance_id=%s, "
-        "pattern=%s, angle_min_abs=%.5f, atr_min_norm=%.5f, atr_max_norm=%.5f, require_m15=%s, require_h1=%s",
+        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, atr_instance_id=%s, "
+        "pattern=%s, angle_min_abs=%.5f, atr_min_norm=%.5f, atr_max_norm=%.5f, zone_k=%.3f",
         signal_id,
         name,
         signal_key,
@@ -193,14 +160,12 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
         len(symbols),
         mask_val,
         lr_m5_instance_id,
-        lr_m15_instance_id,
-        lr_h1_instance_id,
+        atr_instance_id,
         pattern,
         angle_min_abs,
         atr_min_norm,
         atr_max_norm,
-        require_m15,
-        require_h1,
+        zone_k,
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -217,8 +182,6 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 timeframe=timeframe,
                 symbol=symbol,
                 lr_m5_instance_id=lr_m5_instance_id,
-                lr_m15_instance_id=lr_m15_instance_id,
-                lr_h1_instance_id=lr_h1_instance_id,
                 atr_instance_id=atr_instance_id,
                 from_time=from_time,
                 to_time=to_time,
@@ -230,8 +193,7 @@ async def run_lratr_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 angle_min_abs=angle_min_abs,
                 atr_min_norm=atr_min_norm,
                 atr_max_norm=atr_max_norm,
-                require_m15=require_m15,
-                require_h1=require_h1,
+                zone_k=zone_k,
             )
         )
 
@@ -340,8 +302,6 @@ async def _process_symbol(
     timeframe: str,
     symbol: str,
     lr_m5_instance_id: int,
-    lr_m15_instance_id: Optional[int],
-    lr_h1_instance_id: Optional[int],
     atr_instance_id: int,
     from_time: datetime,
     to_time: datetime,
@@ -353,8 +313,7 @@ async def _process_symbol(
     angle_min_abs: float,
     atr_min_norm: float,
     atr_max_norm: float,
-    require_m15: bool,
-    require_h1: bool,
+    zone_k: float,
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
@@ -365,8 +324,6 @@ async def _process_symbol(
                 timeframe=timeframe,
                 symbol=symbol,
                 lr_m5_instance_id=lr_m5_instance_id,
-                lr_m15_instance_id=lr_m15_instance_id,
-                lr_h1_instance_id=lr_h1_instance_id,
                 atr_instance_id=atr_instance_id,
                 from_time=from_time,
                 to_time=to_time,
@@ -377,8 +334,7 @@ async def _process_symbol(
                 angle_min_abs=angle_min_abs,
                 atr_min_norm=atr_min_norm,
                 atr_max_norm=atr_max_norm,
-                require_m15=require_m15,
-                require_h1=require_h1,
+                zone_k=zone_k,
             )
         except Exception as e:
             log.error(
@@ -400,8 +356,6 @@ async def _process_symbol_inner(
     timeframe: str,
     symbol: str,
     lr_m5_instance_id: int,
-    lr_m15_instance_id: Optional[int],
-    lr_h1_instance_id: Optional[int],
     atr_instance_id: int,
     from_time: datetime,
     to_time: datetime,
@@ -412,8 +366,7 @@ async def _process_symbol_inner(
     angle_min_abs: float,
     atr_min_norm: float,
     atr_max_norm: float,
-    require_m15: bool,
-    require_h1: bool,
+    zone_k: float,
 ) -> Tuple[int, int, int]:
     # загружаем LR-канал на m5
     lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
@@ -425,32 +378,6 @@ async def _process_symbol_inner(
             name,
         )
         return 0, 0, 0
-
-    # загружаем LR-углы на m15/h1, если требуется согласованность
-    lr_m15_series: Dict[datetime, Dict[str, float]] = {}
-    lr_h1_series: Dict[datetime, Dict[str, float]] = {}
-
-    if require_m15 and lr_m15_instance_id is not None:
-        lr_m15_series = await _load_lr_series(pg, lr_m15_instance_id, symbol, from_time, to_time)
-        if not lr_m15_series:
-            log.debug(
-                "BT_SIG_LR_ATR: нет данных LR m15 для %s при require_m15=true, сигнал id=%s ('%s')",
-                symbol,
-                signal_id,
-                name,
-            )
-            return 0, 0, 0
-
-    if require_h1 and lr_h1_instance_id is not None:
-        lr_h1_series = await _load_lr_series(pg, lr_h1_instance_id, symbol, from_time, to_time)
-        if not lr_h1_series:
-            log.debug(
-                "BT_SIG_LR_ATR: нет данных LR h1 для %s при require_h1=true, сигнал id=%s ('%s')",
-                symbol,
-                signal_id,
-                name,
-            )
-            return 0, 0, 0
 
     # загружаем ATR на m5
     atr_series = await _load_atr_series(pg, atr_instance_id, symbol, from_time, to_time)
@@ -501,16 +428,9 @@ async def _process_symbol_inner(
     long_count = 0
     short_count = 0
 
-    # подготовим series для m15/h1, если надо
-    lr_m15_times: List[datetime] = sorted(lr_m15_series.keys()) if lr_m15_series else []
-    lr_h1_times: List[datetime] = sorted(lr_h1_series.keys()) if lr_h1_series else []
-
-    lr_m15_time_series = [(t, None) for t in lr_m15_times]
-    lr_h1_time_series = [(t, None) for t in lr_h1_times]
-
+    # подготовим серию для поиска по времени (на будущее, если понадобится привязка по TF)
+    time_series = [(t, None) for t in times]
     sig_tf_delta = _get_timeframe_timedelta(timeframe)
-    m15_delta = _get_timeframe_timedelta("m15")
-    h1_delta = _get_timeframe_timedelta("h1")
 
     # перебираем пары (prev_ts, ts) для поиска bounce-паттерна
     for i in range(1, len(times)):
@@ -555,6 +475,13 @@ async def _process_symbol_inner(
         except Exception:
             continue
 
+        # высота канала и зона у границы
+        H = upper_prev_f - lower_prev_f
+        if H <= 0:
+            continue
+
+        zone_half = zone_k * H
+
         # фильтр по наклону (если задан модуль)
         if angle_min_abs > 0.0 and abs(angle_m5_f) < angle_min_abs:
             continue
@@ -571,69 +498,26 @@ async def _process_symbol_inner(
         if atr_max_norm > 0.0 and atr_norm > atr_max_norm:
             continue
 
-        # согласованность по m15
-        if require_m15:
-            # момент принятия решения — закрытие m5-бара
-            decision_time = ts + sig_tf_delta
-            cutoff_time_m15 = decision_time - m15_delta
-            idx_m15 = _find_index_leq(lr_m15_time_series, cutoff_time_m15)
-            if idx_m15 is None:
-                continue
-            t_m15 = lr_m15_times[idx_m15]
-            lr_m15_entry = lr_m15_series.get(t_m15) or {}
-            angle_m15 = lr_m15_entry.get("angle")
-            if angle_m15 is None:
-                continue
-            try:
-                angle_m15_f = float(angle_m15)
-            except Exception:
-                continue
-        else:
-            angle_m15_f = 0.0  # не используется
-
-        # согласованность по h1
-        if require_h1:
-            decision_time = ts + sig_tf_delta
-            cutoff_time_h1 = decision_time - h1_delta
-            idx_h1 = _find_index_leq(lr_h1_time_series, cutoff_time_h1)
-            if idx_h1 is None:
-                continue
-            t_h1 = lr_h1_times[idx_h1]
-            lr_h1_entry = lr_h1_series.get(t_h1) or {}
-            angle_h1 = lr_h1_entry.get("angle")
-            if angle_h1 is None:
-                continue
-            try:
-                angle_h1_f = float(angle_h1)
-            except Exception:
-                continue
-        else:
-            angle_h1_f = 0.0  # не используется
-
         direction: Optional[str] = None
 
         # паттерн bounce: отскок от границы канала по направлению наклона
-        # LONG bounce: тренд вверх, отскок от нижней границы
+        # LONG bounce: тренд вверх, отскок от нижней границы (с зоной)
         if "long" in allowed_directions and angle_m5_f > 0.0:
-            # согласованность по TF для long
-            if require_m15 and angle_m15_f <= 0.0:
-                pass
-            elif require_h1 and angle_h1_f <= 0.0:
-                pass
-            else:
-                # предыдущий close был ниже/у lower, текущий поднялся выше lower
-                if close_prev_f <= lower_prev_f and close_curr_f > lower_prev_f:
-                    direction = "long"
+            zone_low = lower_prev_f - zone_half
+            zone_high = lower_prev_f + zone_half
+            in_zone_prev = (zone_low <= close_prev_f <= zone_high)
 
-        # SHORT bounce: тренд вниз, отскок от верхней границы
+            if in_zone_prev and close_curr_f > lower_prev_f:
+                direction = "long"
+
+        # SHORT bounce: тренд вниз, отскок от верхней границы (с зоной)
         if direction is None and "short" in allowed_directions and angle_m5_f < 0.0:
-            if require_m15 and angle_m15_f >= 0.0:
-                pass
-            elif require_h1 and angle_h1_f >= 0.0:
-                pass
-            else:
-                if close_prev_f >= upper_prev_f and close_curr_f < upper_prev_f:
-                    direction = "short"
+            zone_low = upper_prev_f - zone_half
+            zone_high = upper_prev_f + zone_half
+            in_zone_prev = (zone_low <= close_prev_f <= zone_high)
+
+            if in_zone_prev and close_curr_f < upper_prev_f:
+                direction = "short"
 
         if direction is None:
             continue
@@ -670,17 +554,10 @@ async def _process_symbol_inner(
             "atr_min_norm": float(atr_min_norm),
             "atr_max_norm": float(atr_max_norm),
             "angle_min_abs": float(angle_min_abs),
+            "zone_k": float(zone_k),
             "lr_m5_instance_id": lr_m5_instance_id,
-            "lr_m15_instance_id": lr_m15_instance_id,
-            "lr_h1_instance_id": lr_h1_instance_id,
-            "require_m15": require_m15,
-            "require_h1": require_h1,
+            "atr_instance_id": atr_instance_id,
         }
-
-        if require_m15:
-            raw_message["angle_m15"] = angle_m15_f
-        if require_h1:
-            raw_message["angle_h1"] = angle_h1_f
 
         to_insert.append(
             (
@@ -869,17 +746,3 @@ def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float
         return float(str(raw))
     except Exception:
         return default
-
-
-# 🔸 Вспомогательная функция: безопасное чтение bool-параметров сигнала
-def _get_bool_param(params: Dict[str, Any], name: str, default: bool) -> bool:
-    cfg = params.get(name)
-    if cfg is None:
-        return default
-
-    raw = str(cfg.get("value") or "").strip().lower()
-    if raw in ("1", "true", "yes", "y"):
-        return True
-    if raw in ("0", "false", "no", "n"):
-        return False
-    return default
