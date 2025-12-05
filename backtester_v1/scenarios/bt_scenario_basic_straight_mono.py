@@ -540,7 +540,7 @@ async def run_basic_straight_mono_backfill(
                 logs_to_insert,
             )
 
-    log.debug(
+    log.info(
         f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
         f"обработано сигналов={total_signals_processed}, позиций открыто={total_positions_opened}, "
         f"пропущено={total_skipped}, живых позиций={total_alive}"
