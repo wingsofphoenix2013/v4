@@ -24,14 +24,14 @@ OPTIMIZER_SIGNAL_IDS: Set[int] = {72, 73}
 SL_PERCENT = Decimal("1.0")   # -1%
 TP2_PERCENT = Decimal("1.0")  # +1%
 
-# 🔸 Сетка значений TP1 и долей на TP1
+# 🔸 Сетка значений TP1 и долей на TP1 (в процентах)
 TP1_VALUES = [
     Decimal("0.5"),
     Decimal("0.6"),
     Decimal("0.7"),
     Decimal("0.8"),
     Decimal("0.9"),
-]  # проценты движения цены
+]
 
 TP1_SHARE_PERCENTS = [
     Decimal("50"),
@@ -39,17 +39,10 @@ TP1_SHARE_PERCENTS = [
     Decimal("70"),
     Decimal("80"),
     Decimal("90"),
-]  # проценты от позиции
+]
 
 # 🔸 Комиссия (упрощённо, как в сценариях)
 COMMISSION_RATE = Decimal("0.0015")  # 0.15% вход+выход
-
-# 🔸 Таймшаги TF (в минутах) — на будущее, если пригодится
-TF_STEP_MINUTES = {
-    "m5": 5,
-    "m15": 15,
-    "h1": 60,
-}
 
 # 🔸 Параллелизм загрузки OHLC по позициям
 OPTIMIZER_LOAD_CONCURRENCY = 10
@@ -267,7 +260,6 @@ async def _run_optimizer_for_pair(
     for timeframe, tf_positions in positions_by_tf.items():
         sema = asyncio.Semaphore(OPTIMIZER_LOAD_CONCURRENCY)
 
-        # для загрузки OHLC используем пул pg, каждый таск берёт свой conn
         tasks = [
             _load_ohlcv_for_position_with_semaphore(
                 pg=pg,
@@ -279,17 +271,17 @@ async def _run_optimizer_for_pair(
         ]
         await asyncio.gather(*tasks)
 
-        # оставляем только те позиции, для которых удалось загрузить OHLC
-        tf_positions_effective = [p for p in tf_positions if p.get("ohlc")]
-        if not tf_positions_effective:
-            log.debug(
+        # не выбрасываем позиции без OHLC, но логируем
+        missing_ohlc = [p for p in tf_positions if not p.get("ohlc")]
+        if missing_ohlc:
+            log.error(
                 "BT_SCENARIO_TP_OPT: base_scenario_id=%s, signal_id=%s, TF=%s — "
-                "нет позиций с доступными OHLC, оптимизация по TF пропущена",
+                "для %s позиций не удалось загрузить OHLC (они будут учтены с PnL=0)",
                 base_scenario_id,
                 signal_id,
                 timeframe,
+                len(missing_ohlc),
             )
-            continue
 
         # перебираем все комбинации TP1 и долей
         async with pg.acquire() as conn:
@@ -303,12 +295,20 @@ async def _run_optimizer_for_pair(
                     mfe_sum = Decimal("0")
                     mae_sum = Decimal("0")
 
-                    # считаем PnL для каждой сделки по новой схеме (чисто в памяти)
-                    for pos in tf_positions_effective:
+                    # trades = количество позиций (по факту закрытых базовым сценарием)
+                    trades = len(tf_positions)
+
+                    # считаем PnL по каждой позиции; если OHLC нет — считаем PnL=0, но сделку не выбрасываем
+                    for pos in tf_positions:
+                        rows = pos.get("ohlc") or []
+
+                        if not rows:
+                            # данных нет — считаем, что эта сделка даёт 0, но участвует в trades
+                            continue
+
                         sim_result = _simulate_trade_double_on_rows(
-                            rows=pos["ohlc"],
+                            rows=rows,
                             direction=pos["direction"],
-                            entry_time=pos["entry_time"],
                             entry_price=pos["entry_price"],
                             entry_qty=pos["entry_qty"],
                             entry_notional=pos["entry_notional"],
@@ -318,12 +318,8 @@ async def _run_optimizer_for_pair(
                             tp1_share_frac=tp1_share_frac,
                         )
 
-                        if sim_result is None:
-                            continue
-
                         pnl_abs, max_fav_pct, max_adv_pct = sim_result
 
-                        trades += 1
                         if pnl_abs > Decimal("0"):
                             wins += 1
                         pnl_total += pnl_abs
@@ -333,7 +329,7 @@ async def _run_optimizer_for_pair(
                     if trades == 0:
                         log.debug(
                             "BT_SCENARIO_TP_OPT: base_scenario_id=%s, signal_id=%s, TF=%s, tp1=%s, share=%s%% — "
-                            "подходящих сделок нет (trades=0), строка не будет записана",
+                            "trades=0, строка не будет записана",
                             base_scenario_id,
                             signal_id,
                             timeframe,
@@ -344,8 +340,8 @@ async def _run_optimizer_for_pair(
 
                     winrate = _q_money(Decimal(wins) / Decimal(trades))
                     roi = _q_money(pnl_total / deposit)
-                    mfe_avg = _q_money(mfe_sum / Decimal(trades))
-                    mae_avg = _q_money(mae_sum / Decimal(trades))
+                    mfe_avg = _q_money(mfe_sum / Decimal(trades)) if trades > 0 else Decimal("0")
+                    mae_avg = _q_money(mae_sum / Decimal(trades)) if trades > 0 else Decimal("0")
 
                     await conn.execute(
                         """
@@ -572,11 +568,10 @@ async def _load_ohlcv_for_position(
     return ohlc_rows
 
 
-# 🔸 Симуляция сделки с двумя тейками для одного входа по заранее загруженным OHLC
+# 🔸 Симуляция сделки с двумя тейками по заранее загруженным OHLC
 def _simulate_trade_double_on_rows(
     rows: List[Tuple[datetime, Decimal, Decimal, Decimal]],
     direction: str,
-    entry_time: datetime,
     entry_price: Decimal,
     entry_qty: Decimal,
     entry_notional: Decimal,
@@ -584,10 +579,7 @@ def _simulate_trade_double_on_rows(
     tp2_percent: Decimal,
     sl_percent: Decimal,
     tp1_share_frac: Decimal,
-) -> Optional[Tuple[Decimal, Decimal, Decimal]]:
-    if not rows:
-        return None
-
+) -> Tuple[Decimal, Decimal, Decimal]:
     # уровни SL/TP1/TP2
     if direction == "long":
         sl_price = entry_price * (Decimal("1") - sl_percent / Decimal("100"))
@@ -603,20 +595,26 @@ def _simulate_trade_double_on_rows(
     qty1 = qty1_raw.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     qty2 = entry_qty - qty1
 
-    if qty1 <= Decimal("0") or qty2 <= Decimal("0"):
-        return None
+    # если из-за округления одна из ног ~0 — трактуем как одноногую позицию
+    if qty1 <= Decimal("0"):
+        qty1 = Decimal("0")
+    if qty2 <= Decimal("0"):
+        qty2 = Decimal("0")
+
+    if qty1 == Decimal("0") and qty2 == Decimal("0"):
+        # на всякий случай (не должно происходить при entry_qty > 0)
+        qty2 = entry_qty
 
     max_fav = Decimal("0")
     max_adv = Decimal("0")
 
-    leg1_open = True
-    leg2_open = True
+    leg1_open = qty1 > 0
+    leg2_open = qty2 > 0
 
     pnl_leg1 = Decimal("0")
     pnl_leg2 = Decimal("0")
 
-    # логика конфликтов такая же, как в double-сценарии:
-    # TP1+SL → full_sl_hit, TP2+SL → sl_after_tp, TP1+TP2 → full_tp_hit
+    # TP1+SL → полный SL, TP2+SL → SL после TP, TP1+TP2 → полный TP
     for otime, high, low, close in rows:
         if direction == "long":
             fav_move = high - entry_price
@@ -639,7 +637,7 @@ def _simulate_trade_double_on_rows(
             touched_tp1 = low <= tp1_price
             touched_tp2 = low <= tp2_price
 
-        # оба плеча ещё открыты
+        # оба плеча открыты
         if leg1_open and leg2_open:
             # чистый SL
             if touched_sl and not touched_tp2 and not touched_tp1:
@@ -649,9 +647,11 @@ def _simulate_trade_double_on_rows(
                     pnl_full = (entry_price - sl_price) * (qty1 + qty2)
                 pnl_leg1 = pnl_full
                 pnl_leg2 = Decimal("0")
+                leg1_open = False
+                leg2_open = False
                 break
 
-            # TP1 + SL на одной свече — считаем, что TP1 не было, полный SL
+            # TP1 + SL на одной свече — худший исход: полный SL
             if touched_sl and touched_tp1 and not touched_tp2:
                 if direction == "long":
                     pnl_full = (sl_price - entry_price) * (qty1 + qty2)
@@ -659,6 +659,8 @@ def _simulate_trade_double_on_rows(
                     pnl_full = (entry_price - sl_price) * (qty1 + qty2)
                 pnl_leg1 = pnl_full
                 pnl_leg2 = Decimal("0")
+                leg1_open = False
+                leg2_open = False
                 break
 
             # TP1 + TP2 без SL — полный TP
@@ -669,6 +671,8 @@ def _simulate_trade_double_on_rows(
                 else:
                     pnl_leg1 = (entry_price - tp1_price) * qty1
                     pnl_leg2 = (entry_price - tp2_price) * qty2
+                leg1_open = False
+                leg2_open = False
                 break
 
             # TP2 + SL на одной свече — SL после TP
@@ -679,6 +683,8 @@ def _simulate_trade_double_on_rows(
                 else:
                     pnl_leg1 = (entry_price - tp1_price) * qty1
                     pnl_leg2 = (entry_price - sl_price) * qty2
+                leg1_open = False
+                leg2_open = False
                 break
 
             # только TP1 — закрывается первая часть, вторая живёт дальше
@@ -690,29 +696,46 @@ def _simulate_trade_double_on_rows(
                     pnl_leg1 = (entry_price - tp1_price) * qty1
                 continue
 
-        # первая нога уже закрыта по TP1, жива только вторая
+        # первая нога уже закрыта, жива только вторая
         if not leg1_open and leg2_open:
-            # SL по остаточной позиции
             if touched_sl:
                 if direction == "long":
                     pnl_leg2 = (sl_price - entry_price) * qty2
                 else:
                     pnl_leg2 = (entry_price - sl_price) * qty2
+                leg2_open = False
                 break
 
-            # TP2 по остаточной позиции
             if touched_tp2:
                 if direction == "long":
                     pnl_leg2 = (tp2_price - entry_price) * qty2
                 else:
                     pnl_leg2 = (entry_price - tp2_price) * qty2
+                leg2_open = False
                 break
 
-    # если ни TP2, ни SL не были задеты — считаем позицию "живой", optimizer её не учитывает
-    raw_pnl = pnl_leg1 + pnl_leg2
-    if raw_pnl == Decimal("0"):
-        return None
+        # если открыта только одна нога с самого начала
+        if leg1_open and not leg2_open:
+            if touched_sl and not touched_tp1:
+                if direction == "long":
+                    pnl_leg1 = (sl_price - entry_price) * qty1
+                else:
+                    pnl_leg1 = (entry_price - sl_price) * qty1
+                leg1_open = False
+                break
+            if touched_tp1:
+                if direction == "long":
+                    pnl_leg1 = (tp1_price - entry_price) * qty1
+                else:
+                    pnl_leg1 = (entry_price - tp1_price) * qty1
+                leg1_open = False
+                break
 
+        if not leg1_open and not leg2_open:
+            break
+
+    # raw_pnl может быть и 0 — это нормальный кейс, сделка всё равно считается
+    raw_pnl = pnl_leg1 + pnl_leg2
     raw_pnl = _q_money(raw_pnl)
 
     commission = _q_money(entry_notional * COMMISSION_RATE)
