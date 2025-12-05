@@ -11,13 +11,13 @@ from typing import Dict, Any, List, Optional, Callable, Awaitable
 from backtester_config import get_enabled_signals
 
 # 🔸 Воркеры таймерных backfill-сигналов
-from bt_signals_emacross import run_emacross_backfill
-from bt_signals_bbrsi import run_bbrsi_backfill
-from bt_signals_bbadx import run_bbadx_backfill
-from bt_signals_rsimfi import run_rsimfi_backfill
-from bt_signals_rsiatr import run_rsiatr_backfill
-from bt_signals_supertrendadx import run_supertrendadx_backfill
-from bt_signals_lratr import run_lratr_backfill
+from signals.bt_signals_emacross import run_emacross_backfill
+from signals.bt_signals_bbrsi import run_bbrsi_backfill
+from signals.bt_signals_bbadx import run_bbadx_backfill
+from signals.bt_signals_rsimfi import run_rsimfi_backfill
+from signals.bt_signals_rsiatr import run_rsiatr_backfill
+from signals.bt_signals_supertrendadx import run_supertrendadx_backfill
+from signals.bt_signals_lratr import run_lratr_backfill
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60      # старт через минуту после запуска backtester_v1
