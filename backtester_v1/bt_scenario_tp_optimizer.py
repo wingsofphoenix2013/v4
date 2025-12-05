@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -25,18 +25,34 @@ SL_PERCENT = Decimal("1.0")   # -1%
 TP2_PERCENT = Decimal("1.0")  # +1%
 
 # 🔸 Сетка значений TP1 и долей на TP1
-TP1_VALUES = [Decimal("0.4"), Decimal("0.6"), Decimal("0.8")]  # в процентах
-TP1_SHARE_PERCENTS = [Decimal("30"), Decimal("40"), Decimal("50"), Decimal("60"), Decimal("70")]  # в процентах
+TP1_VALUES = [
+    Decimal("0.5"),
+    Decimal("0.6"),
+    Decimal("0.7"),
+    Decimal("0.8"),
+    Decimal("0.9"),
+]  # проценты движения цены
+
+TP1_SHARE_PERCENTS = [
+    Decimal("50"),
+    Decimal("60"),
+    Decimal("70"),
+    Decimal("80"),
+    Decimal("90"),
+]  # проценты от позиции
 
 # 🔸 Комиссия (упрощённо, как в сценариях)
 COMMISSION_RATE = Decimal("0.0015")  # 0.15% вход+выход
 
-# 🔸 Таймшаги TF (в минутах) — на случай использования в будущем
+# 🔸 Таймшаги TF (в минутах) — на будущее, если пригодится
 TF_STEP_MINUTES = {
     "m5": 5,
     "m15": 15,
     "h1": 60,
 }
+
+# 🔸 Параллелизм загрузки OHLC по позициям
+OPTIMIZER_LOAD_CONCURRENCY = 10
 
 
 # 🔸 Обрезка денег/метрик до 4 знаков после запятой
@@ -88,8 +104,8 @@ async def run_bt_scenario_tp_optimizer(pg, redis) -> None:
                         await redis.xack(POSTPROC_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    log.debug(
-                        "BT_SCENARIO_TP_OPT: запуск оптимизации для base_scenario_id=%s, signal_id=%s, stream_id=%s",
+                    log.info(
+                        "BT_SCENARIO_TP_OPT: старт оптимизации для base_scenario_id=%s, signal_id=%s, stream_id=%s",
                         scenario_id,
                         signal_id,
                         entry_id,
@@ -100,11 +116,12 @@ async def run_bt_scenario_tp_optimizer(pg, redis) -> None:
 
                     await redis.xack(POSTPROC_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
-            log.info(
-                "BT_SCENARIO_TP_OPT: пакет сообщений обработан — сообщений=%s, пар scenario/signal=%s",
-                total_msgs,
-                total_pairs_processed,
-            )
+            if total_pairs_processed > 0:
+                log.info(
+                    "BT_SCENARIO_TP_OPT: пакет сообщений обработан — сообщений=%s, пар scenario/signal=%s",
+                    total_msgs,
+                    total_pairs_processed,
+                )
 
         except Exception as e:
             log.error(
@@ -218,7 +235,7 @@ async def _run_optimizer_for_pair(
     base_scenario_id: int,
     signal_id: int,
 ) -> None:
-    # грузим все позиции базового сценария для данного сигналa
+    # грузим все позиции базового сценария для данного сигнала
     positions = await _load_base_positions(pg, base_scenario_id, signal_id)
     if not positions:
         log.debug(
@@ -238,7 +255,7 @@ async def _run_optimizer_for_pair(
         )
         return
 
-    # группируем позиции по TF (на случай, если один сигнал когда-нибудь будет на нескольких TF)
+    # группируем позиции по TF
     positions_by_tf: Dict[str, List[Dict[str, Any]]] = {}
     for p in positions:
         tf = p["timeframe"]
@@ -247,7 +264,32 @@ async def _run_optimizer_for_pair(
     total_rows_written = 0
 
     async with pg.acquire() as conn:
+        # сначала загружаем OHLC для всех позиций (один раз на позицию), с параллелизмом
         for timeframe, tf_positions in positions_by_tf.items():
+            sema = asyncio.Semaphore(OPTIMIZER_LOAD_CONCURRENCY)
+            tasks = [
+                _load_ohlcv_for_position_with_semaphore(
+                    conn=conn,
+                    position=p,
+                    timeframe=timeframe,
+                    sema=sema,
+                )
+                for p in tf_positions
+            ]
+            await asyncio.gather(*tasks)
+
+            # оставляем только те позиции, для которых удалось загрузить OHLC
+            tf_positions_effective = [p for p in tf_positions if p.get("ohlc")]
+            if not tf_positions_effective:
+                log.debug(
+                    "BT_SCENARIO_TP_OPT: base_scenario_id=%s, signal_id=%s, TF=%s — "
+                    "нет позиций с доступными OHLC, оптимизация по TF пропущена",
+                    base_scenario_id,
+                    signal_id,
+                    timeframe,
+                )
+                continue
+
             # перебираем все комбинации TP1 и долей
             for tp1_percent in TP1_VALUES:
                 for tp1_share_percent in TP1_SHARE_PERCENTS:
@@ -259,12 +301,15 @@ async def _run_optimizer_for_pair(
                     mfe_sum = Decimal("0")
                     mae_sum = Decimal("0")
 
-                    # считаем PnL для каждой сделки по новой схеме
-                    for pos in tf_positions:
-                        sim_result = await _simulate_trade_double_for_position(
-                            conn=conn,
-                            position=pos,
-                            timeframe=timeframe,
+                    # считаем PnL для каждой сделки по новой схеме (чисто в памяти)
+                    for pos in tf_positions_effective:
+                        sim_result = _simulate_trade_double_on_rows(
+                            rows=pos["ohlc"],
+                            direction=pos["direction"],
+                            entry_time=pos["entry_time"],
+                            entry_price=pos["entry_price"],
+                            entry_qty=pos["entry_qty"],
+                            entry_notional=pos["entry_notional"],
                             tp1_percent=tp1_percent,
                             tp2_percent=TP2_PERCENT,
                             sl_percent=SL_PERCENT,
@@ -300,7 +345,6 @@ async def _run_optimizer_for_pair(
                     mfe_avg = _q_money(mfe_sum / Decimal(trades))
                     mae_avg = _q_money(mae_sum / Decimal(trades))
 
-                    # записываем/обновляем результат в bt_scenario_tp_optimizer
                     await conn.execute(
                         """
                         INSERT INTO bt_scenario_tp_optimizer (
@@ -332,29 +376,29 @@ async def _run_optimizer_for_pair(
                         )
                         ON CONFLICT (base_scenario_id, signal_id, timeframe, tp1_value, tp1_share_percent) DO UPDATE
                         SET
-                            trades   = EXCLUDED.trades,
-                            wins     = EXCLUDED.wins,
-                            pnl_abs  = EXCLUDED.pnl_abs,
-                            roi      = EXCLUDED.roi,
-                            winrate  = EXCLUDED.winrate,
-                            mfe_avg  = EXCLUDED.mfe_avg,
-                            mae_avg  = EXCLUDED.mae_avg,
+                            trades    = EXCLUDED.trades,
+                            wins      = EXCLUDED.wins,
+                            pnl_abs   = EXCLUDED.pnl_abs,
+                            roi       = EXCLUDED.roi,
+                            winrate   = EXCLUDED.winrate,
+                            mfe_avg   = EXCLUDED.mfe_avg,
+                            mae_avg   = EXCLUDED.mae_avg,
                             updated_at = now()
                         """,
                         base_scenario_id,
                         signal_id,
                         timeframe,
-                        float(tp1_percent),
-                        float(tp1_share_percent),
-                        float(TP2_PERCENT),
-                        float(SL_PERCENT),
+                        tp1_percent,
+                        tp1_share_percent,
+                        TP2_PERCENT,
+                        SL_PERCENT,
                         trades,
-                        trades,  # wins записываем числом, но см. ниже: wins уже в переменной wins
-                        float(_q_money(pnl_total)),
-                        float(roi),
-                        float(winrate),
-                        float(mfe_avg),
-                        float(mae_avg),
+                        wins,
+                        _q_money(pnl_total),
+                        roi,
+                        winrate,
+                        mfe_avg,
+                        mae_avg,
                     )
                     total_rows_written += 1
 
@@ -409,6 +453,7 @@ async def _load_base_positions(
                 "entry_qty": Decimal(str(r["entry_qty"])),
                 "entry_notional": Decimal(str(r["entry_notional"])),
                 "exit_time": r["exit_time"],
+                "ohlc": [],  # будет заполнено позже
             }
         )
 
@@ -459,26 +504,85 @@ async def _get_deposit_for_scenario(pg, base_scenario_id: int) -> Decimal:
     return deposit
 
 
-# 🔸 Симуляция сделки с двумя тейками для одного входа (на основе OHLC)
-async def _simulate_trade_double_for_position(
+# 🔸 Обёртка загрузки OHLC с семафором
+async def _load_ohlcv_for_position_with_semaphore(
     conn,
     position: Dict[str, Any],
     timeframe: str,
+    sema: asyncio.Semaphore,
+) -> None:
+    async with sema:
+        try:
+            position["ohlc"] = await _load_ohlcv_for_position(conn, position, timeframe)
+        except Exception as e:
+            log.error(
+                "BT_SCENARIO_TP_OPT: ошибка загрузки OHLC для позиции id=%s: %s",
+                position.get("id"),
+                e,
+                exc_info=True,
+            )
+            position["ohlc"] = []
+
+
+# 🔸 Загрузка OHLC для одной позиции (один раз)
+async def _load_ohlcv_for_position(
+    conn,
+    position: Dict[str, Any],
+    timeframe: str,
+) -> List[Tuple[datetime, Decimal, Decimal, Decimal]]:
+    symbol = position["symbol"]
+    entry_time = position["entry_time"]
+    exit_time_limit = position["exit_time"]
+
+    table_name = _ohlcv_table_for_timeframe(timeframe)
+    if not table_name:
+        return []
+
+    rows = await conn.fetch(
+        f"""
+        SELECT open_time, high, low, close
+        FROM {table_name}
+        WHERE symbol = $1
+          AND open_time > $2
+          AND open_time <= $3
+        ORDER BY open_time
+        """,
+        symbol,
+        entry_time,
+        exit_time_limit,
+    )
+
+    ohlc_rows: List[Tuple[datetime, Decimal, Decimal, Decimal]] = []
+    for r in rows:
+        try:
+            ohlc_rows.append(
+                (
+                    r["open_time"],
+                    Decimal(str(r["high"])),
+                    Decimal(str(r["low"])),
+                    Decimal(str(r["close"])),
+                )
+            )
+        except Exception:
+            continue
+
+    return ohlc_rows
+
+
+# 🔸 Симуляция сделки с двумя тейками для одного входа по заранее загруженным OHLC
+def _simulate_trade_double_on_rows(
+    rows: List[Tuple[datetime, Decimal, Decimal, Decimal]],
+    direction: str,
+    entry_time: datetime,
+    entry_price: Decimal,
+    entry_qty: Decimal,
+    entry_notional: Decimal,
     tp1_percent: Decimal,
     tp2_percent: Decimal,
     sl_percent: Decimal,
     tp1_share_frac: Decimal,
 ) -> Optional[Tuple[Decimal, Decimal, Decimal]]:
-    symbol = position["symbol"]
-    direction = position["direction"]
-    entry_time = position["entry_time"]
-    entry_price = position["entry_price"]
-    entry_qty = position["entry_qty"]
-    entry_notional = position["entry_notional"]
-    exit_time_limit = position["exit_time"]
-
-    table_name = _ohlcv_table_for_timeframe(timeframe)
-    if not table_name:
+    if not rows:
         return None
 
     # уровни SL/TP1/TP2
@@ -499,40 +603,18 @@ async def _simulate_trade_double_for_position(
     if qty1 <= Decimal("0") or qty2 <= Decimal("0"):
         return None
 
-    rows = await conn.fetch(
-        f"""
-        SELECT open_time, high, low, close
-        FROM {table_name}
-        WHERE symbol = $1
-          AND open_time > $2
-          AND open_time <= $3
-        ORDER BY open_time
-        """,
-        symbol,
-        entry_time,
-        exit_time_limit,
-    )
-
-    if not rows:
-        return None
-
     max_fav = Decimal("0")
     max_adv = Decimal("0")
 
-    # состояние ног
     leg1_open = True
     leg2_open = True
 
     pnl_leg1 = Decimal("0")
     pnl_leg2 = Decimal("0")
 
-    # логика такая же, как в double-сценарии: худший исход при конфликте SL/TP1, TP2+SL → sl_after_tp
-    for r in rows:
-        otime = r["open_time"]
-        high = Decimal(str(r["high"]))
-        low = Decimal(str(r["low"]))
-        close = Decimal(str(r["close"]))
-
+    # логика конфликтов такая же, как в double-сценарии:
+    # TP1+SL → full_sl_hit, TP2+SL → sl_after_tp, TP1+TP2 → full_tp_hit
+    for otime, high, low, close in rows:
         if direction == "long":
             fav_move = high - entry_price
             adv_move = low - entry_price
@@ -556,6 +638,7 @@ async def _simulate_trade_double_for_position(
 
         # оба плеча ещё открыты
         if leg1_open and leg2_open:
+            # чистый SL
             if touched_sl and not touched_tp2 and not touched_tp1:
                 if direction == "long":
                     pnl_full = (sl_price - entry_price) * (qty1 + qty2)
@@ -565,6 +648,7 @@ async def _simulate_trade_double_for_position(
                 pnl_leg2 = Decimal("0")
                 break
 
+            # TP1 + SL на одной свече — считаем, что TP1 не было, полный SL
             if touched_sl and touched_tp1 and not touched_tp2:
                 if direction == "long":
                     pnl_full = (sl_price - entry_price) * (qty1 + qty2)
@@ -574,6 +658,7 @@ async def _simulate_trade_double_for_position(
                 pnl_leg2 = Decimal("0")
                 break
 
+            # TP1 + TP2 без SL — полный TP
             if not touched_sl and touched_tp2:
                 if direction == "long":
                     pnl_leg1 = (tp1_price - entry_price) * qty1
@@ -583,6 +668,7 @@ async def _simulate_trade_double_for_position(
                     pnl_leg2 = (entry_price - tp2_price) * qty2
                 break
 
+            # TP2 + SL на одной свече — SL после TP
             if touched_sl and touched_tp2:
                 if direction == "long":
                     pnl_leg1 = (tp1_price - entry_price) * qty1
@@ -592,6 +678,7 @@ async def _simulate_trade_double_for_position(
                     pnl_leg2 = (entry_price - sl_price) * qty2
                 break
 
+            # только TP1 — закрывается первая часть, вторая живёт дальше
             if touched_tp1 and not touched_sl and not touched_tp2:
                 leg1_open = False
                 if direction == "long":
@@ -600,8 +687,9 @@ async def _simulate_trade_double_for_position(
                     pnl_leg1 = (entry_price - tp1_price) * qty1
                 continue
 
-        # первая нога закрыта по TP1, жива только вторая
+        # первая нога уже закрыта по TP1, жива только вторая
         if not leg1_open and leg2_open:
+            # SL по остаточной позиции
             if touched_sl:
                 if direction == "long":
                     pnl_leg2 = (sl_price - entry_price) * qty2
@@ -609,6 +697,7 @@ async def _simulate_trade_double_for_position(
                     pnl_leg2 = (entry_price - sl_price) * qty2
                 break
 
+            # TP2 по остаточной позиции
             if touched_tp2:
                 if direction == "long":
                     pnl_leg2 = (tp2_price - entry_price) * qty2
@@ -616,7 +705,12 @@ async def _simulate_trade_double_for_position(
                     pnl_leg2 = (entry_price - tp2_price) * qty2
                 break
 
+    # если ни TP2, ни SL не были задеты — считаем позицию "живой", optimizer её не учитывает
     raw_pnl = pnl_leg1 + pnl_leg2
+    if raw_pnl == Decimal("0"):
+        # позиция могла так и остаться полностью живой (или оба плеча не закрылись)
+        return None
+
     raw_pnl = _q_money(raw_pnl)
 
     commission = _q_money(entry_notional * COMMISSION_RATE)
