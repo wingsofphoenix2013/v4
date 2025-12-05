@@ -263,34 +263,36 @@ async def _run_optimizer_for_pair(
 
     total_rows_written = 0
 
-    async with pg.acquire() as conn:
-        # сначала загружаем OHLC для всех позиций (один раз на позицию), с параллелизмом
-        for timeframe, tf_positions in positions_by_tf.items():
-            sema = asyncio.Semaphore(OPTIMIZER_LOAD_CONCURRENCY)
-            tasks = [
-                _load_ohlcv_for_position_with_semaphore(
-                    conn=conn,
-                    position=p,
-                    timeframe=timeframe,
-                    sema=sema,
-                )
-                for p in tf_positions
-            ]
-            await asyncio.gather(*tasks)
+    # сначала загружаем OHLC для всех позиций (один раз на позицию), с параллелизмом
+    for timeframe, tf_positions in positions_by_tf.items():
+        sema = asyncio.Semaphore(OPTIMIZER_LOAD_CONCURRENCY)
 
-            # оставляем только те позиции, для которых удалось загрузить OHLC
-            tf_positions_effective = [p for p in tf_positions if p.get("ohlc")]
-            if not tf_positions_effective:
-                log.debug(
-                    "BT_SCENARIO_TP_OPT: base_scenario_id=%s, signal_id=%s, TF=%s — "
-                    "нет позиций с доступными OHLC, оптимизация по TF пропущена",
-                    base_scenario_id,
-                    signal_id,
-                    timeframe,
-                )
-                continue
+        # для загрузки OHLC используем пул pg, каждый таск берёт свой conn
+        tasks = [
+            _load_ohlcv_for_position_with_semaphore(
+                pg=pg,
+                position=p,
+                timeframe=timeframe,
+                sema=sema,
+            )
+            for p in tf_positions
+        ]
+        await asyncio.gather(*tasks)
 
-            # перебираем все комбинации TP1 и долей
+        # оставляем только те позиции, для которых удалось загрузить OHLC
+        tf_positions_effective = [p for p in tf_positions if p.get("ohlc")]
+        if not tf_positions_effective:
+            log.debug(
+                "BT_SCENARIO_TP_OPT: base_scenario_id=%s, signal_id=%s, TF=%s — "
+                "нет позиций с доступными OHLC, оптимизация по TF пропущена",
+                base_scenario_id,
+                signal_id,
+                timeframe,
+            )
+            continue
+
+        # перебираем все комбинации TP1 и долей
+        async with pg.acquire() as conn:
             for tp1_percent in TP1_VALUES:
                 for tp1_share_percent in TP1_SHARE_PERCENTS:
                     tp1_share_frac = tp1_share_percent / Decimal("100")
@@ -504,16 +506,17 @@ async def _get_deposit_for_scenario(pg, base_scenario_id: int) -> Decimal:
     return deposit
 
 
-# 🔸 Обёртка загрузки OHLC с семафором
+# 🔸 Обёртка загрузки OHLC с семафором (каждая задача сама берёт conn из пула)
 async def _load_ohlcv_for_position_with_semaphore(
-    conn,
+    pg,
     position: Dict[str, Any],
     timeframe: str,
     sema: asyncio.Semaphore,
 ) -> None:
     async with sema:
         try:
-            position["ohlc"] = await _load_ohlcv_for_position(conn, position, timeframe)
+            async with pg.acquire() as conn:
+                position["ohlc"] = await _load_ohlcv_for_position(conn, position, timeframe)
         except Exception as e:
             log.error(
                 "BT_SCENARIO_TP_OPT: ошибка загрузки OHLC для позиции id=%s: %s",
@@ -708,7 +711,6 @@ def _simulate_trade_double_on_rows(
     # если ни TP2, ни SL не были задеты — считаем позицию "живой", optimizer её не учитывает
     raw_pnl = pnl_leg1 + pnl_leg2
     if raw_pnl == Decimal("0"):
-        # позиция могла так и остаться полностью живой (или оба плеча не закрылись)
         return None
 
     raw_pnl = _q_money(raw_pnl)
