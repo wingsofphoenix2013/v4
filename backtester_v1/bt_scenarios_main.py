@@ -1,9 +1,7 @@
-# bt_scenarios_main.py — оркестратор сценариев backtester_v1
-
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable, Awaitable, Tuple
 
 # 🔸 Конфиг и кеши backtester_v1
 from backtester_config import (
@@ -11,8 +9,19 @@ from backtester_config import (
     get_scenario_instance,
 )
 
-# 🔸 Воркеры сценариев
-from bt_scenario_basic_straight_mono import run_basic_straight_mono_backfill
+# 🔸 Тип обработчика сценария:
+#    (scenario, signal_ctx, pg_pool, redis_client) -> None
+ScenarioHandler = Callable[[Dict[str, Any], Dict[str, Any], Any, Any], Awaitable[None]]
+
+# 🔸 Воркеры сценариев (из пакета scenarios/)
+from scenarios.bt_scenario_basic_straight_mono import run_basic_straight_mono_backfill
+
+# 🔸 Реестр сценарных воркеров: (key, type) → handler
+SCENARIO_HANDLERS: Dict[Tuple[str, str], ScenarioHandler] = {
+    ("basic_straight_mono", "straight"): run_basic_straight_mono_backfill,
+    # сюда же будут добавляться новые сценарии:
+    # ("my_scenario_key", "my_type"): run_my_scenario_backfill,
+}
 
 # 🔸 Константы стрима сценариев
 SCENARIO_STREAM_KEY = "bt:signals:ready"
@@ -66,8 +75,10 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                     links = get_scenario_signal_links_for_signal(signal_id)
                     if not links:
                         log.debug(
-                            f"BT_SCENARIOS_MAIN: для signal_id={signal_id} нет активных связок сценариев, "
-                            f"сообщение {entry_id} будет помечено как обработанное"
+                            "BT_SCENARIOS_MAIN: для signal_id=%s нет активных связок сценариев, "
+                            "сообщение %s будет помечено как обработанное",
+                            signal_id,
+                            entry_id,
                         )
                         await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
                         continue
@@ -79,15 +90,21 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                         scenario = get_scenario_instance(scenario_id)
                         if not scenario:
                             log.warning(
-                                f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} не найден в кеше, "
-                                f"signal_id={signal_id}, сообщение {entry_id}"
+                                "BT_SCENARIOS_MAIN: сценарий id=%s не найден в кеше, "
+                                "signal_id=%s, сообщение %s",
+                                scenario_id,
+                                signal_id,
+                                entry_id,
                             )
                             continue
 
                         if not scenario.get("enabled"):
                             log.debug(
-                                f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} отключён, "
-                                f"signal_id={signal_id}, сообщение {entry_id}"
+                                "BT_SCENARIOS_MAIN: сценарий id=%s отключён, "
+                                "signal_id=%s, сообщение %s",
+                                scenario_id,
+                                signal_id,
+                                entry_id,
                             )
                             continue
 
@@ -109,18 +126,26 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                     await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
 
                     log.debug(
-                        f"BT_SCENARIOS_MAIN: сообщение stream_id={entry_id} для signal_id={signal_id} "
-                        f"обработано, сценариев запущено={started_for_message}"
+                        "BT_SCENARIOS_MAIN: сообщение stream_id=%s для signal_id=%s "
+                        "обработано, сценариев запущено=%s",
+                        entry_id,
+                        signal_id,
+                        started_for_message,
                     )
 
             log.debug(
-                f"BT_SCENARIOS_MAIN: пакет обработан — сообщений={total_msgs}, сигналов={total_signals}, "
-                f"сценариев-запусков={total_scenarios}, задач создано={total_tasks_started}"
+                "BT_SCENARIOS_MAIN: пакет обработан — сообщений=%s, сигналов=%s, "
+                "сценариев-запусков=%s, задач создано=%s",
+                total_msgs,
+                total_signals,
+                total_scenarios,
+                total_tasks_started,
             )
 
         except Exception as e:
             log.error(
-                f"BT_SCENARIOS_MAIN: ошибка в основном цикле оркестратора: {e}",
+                "BT_SCENARIOS_MAIN: ошибка в основном цикле оркестратора: %s",
+                e,
                 exc_info=True,
             )
             # небольшая пауза перед повторной попыткой, чтобы не крутить CPU при постоянной ошибке
@@ -138,20 +163,24 @@ async def _ensure_consumer_group(redis) -> None:
             mkstream=True,
         )
         log.debug(
-            f"BT_SCENARIOS_MAIN: создана consumer group '{SCENARIO_CONSUMER_GROUP}' "
-            f"для стрима '{SCENARIO_STREAM_KEY}'"
+            "BT_SCENARIOS_MAIN: создана consumer group '%s' для стрима '%s'",
+            SCENARIO_CONSUMER_GROUP,
+            SCENARIO_STREAM_KEY,
         )
     except Exception as e:
         # если группа уже существует — Redis вернёт ошибку BUSYGROUP, её игнорируем
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.debug(
-                f"BT_SCENARIOS_MAIN: consumer group '{SCENARIO_CONSUMER_GROUP}' "
-                f"для стрима '{SCENARIO_STREAM_KEY}' уже существует"
+                "BT_SCENARIOS_MAIN: consumer group '%s' для стрима '%s' уже существует",
+                SCENARIO_CONSUMER_GROUP,
+                SCENARIO_STREAM_KEY,
             )
         else:
             log.error(
-                f"BT_SCENARIOS_MAIN: ошибка при создании consumer group '{SCENARIO_CONSUMER_GROUP}': {e}",
+                "BT_SCENARIOS_MAIN: ошибка при создании consumer group '%s': %s",
+                SCENARIO_CONSUMER_GROUP,
+                e,
                 exc_info=True,
             )
             raise
@@ -222,13 +251,15 @@ def _parse_signal_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         }
     except Exception as e:
         log.error(
-            f"BT_SCENARIOS_MAIN: ошибка разбора сообщения стрима bt:signals:ready: {e}, fields={fields}",
+            "BT_SCENARIOS_MAIN: ошибка разбора сообщения стрима bt:signals:ready: %s, fields=%s",
+            e,
+            fields,
             exc_info=True,
         )
         return None
 
 
-# 🔸 Диспетчер воркеров сценариев по типу/ключу
+# 🔸 Диспетчер воркеров сценариев по key/type через реестр
 async def _run_scenario_worker(
     scenario: Dict[str, Any],
     signal_ctx: Dict[str, Any],
@@ -236,36 +267,53 @@ async def _run_scenario_worker(
     redis,
 ) -> None:
     scenario_id = scenario.get("id")
-    scenario_key = scenario.get("key")
-    scenario_type = scenario.get("type")
+    scenario_key = str(scenario.get("key") or "").strip()
+    scenario_type = str(scenario.get("type") or "").strip()
 
     signal_id = signal_ctx.get("signal_id")
     from_time = signal_ctx.get("from_time")
     to_time = signal_ctx.get("to_time")
 
     log.debug(
-        f"BT_SCENARIOS_MAIN: запуск сценарного воркера для scenario_id={scenario_id}, "
-        f"key={scenario_key}, type={scenario_type}, signal_id={signal_id}, "
-        f"окно=[{from_time} .. {to_time}]"
+        "BT_SCENARIOS_MAIN: запуск сценарного воркера для scenario_id=%s, "
+        "key=%s, type=%s, signal_id=%s, окно=[%s .. %s]",
+        scenario_id,
+        scenario_key,
+        scenario_type,
+        signal_id,
+        from_time,
+        to_time,
     )
 
-    # маршрутизация по ключу/типу сценария
-    try:
-        if scenario_key == "basic_straight_mono" and scenario_type == "straight":
-            await run_basic_straight_mono_backfill(scenario, signal_ctx, pg, redis)
-            log.debug(
-                f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} (basic_straight_mono) успешно отработал "
-                f"для signal_id={signal_id}, окно=[{from_time} .. {to_time}]"
-            )
-            return
-
+    handler = SCENARIO_HANDLERS.get((scenario_key, scenario_type))
+    if handler is None:
         log.debug(
-            f"BT_SCENARIOS_MAIN: сценарий id={scenario_id} (key={scenario_key}, type={scenario_type}) "
-            f"пока не поддерживается воркером сценариев"
+            "BT_SCENARIOS_MAIN: сценарий id=%s (key=%s, type=%s) пока не поддерживается реестром сценариев",
+            scenario_id,
+            scenario_key,
+            scenario_type,
+        )
+        return
+
+    try:
+        await handler(scenario, signal_ctx, pg, redis)
+        log.debug(
+            "BT_SCENARIOS_MAIN: сценарий id=%s (key=%s, type=%s) успешно отработал для signal_id=%s, "
+            "окно=[%s .. %s]",
+            scenario_id,
+            scenario_key,
+            scenario_type,
+            signal_id,
+            from_time,
+            to_time,
         )
     except Exception as e:
         log.error(
-            f"BT_SCENARIOS_MAIN: ошибка при выполнении сценария id={scenario_id} "
-            f"(key={scenario_key}, type={scenario_type}, signal_id={signal_id}): {e}",
+            "BT_SCENARIOS_MAIN: ошибка при выполнении сценария id=%s (key=%s, type=%s, signal_id=%s): %s",
+            scenario_id,
+            scenario_key,
+            scenario_type,
+            signal_id,
+            e,
             exc_info=True,
         )
