@@ -52,7 +52,6 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                 continue
 
             total_msgs = 0
-            total_tasks_started = 0
             total_signals = 0
             total_scenarios = 0
 
@@ -87,6 +86,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
 
                     started_for_message = 0
 
+                    # последовательный запуск всех сценариев для данного сообщения
                     for link in links:
                         scenario_id = link.get("scenario_id")
                         scenario = get_scenario_instance(scenario_id)
@@ -110,21 +110,17 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                             )
                             continue
 
-                        # запускаем обработку окна сигнала сценарием в отдельной задаче
-                        asyncio.create_task(
-                            _run_scenario_worker(
-                                scenario=scenario,
-                                signal_ctx=signal_ctx,
-                                pg=pg,
-                                redis=redis,
-                            ),
-                            name=f"BT_SCENARIO_{scenario_id}_SIG_{signal_id}",
+                        # выполняем сценарий синхронно (последовательно)
+                        await _run_scenario_worker(
+                            scenario=scenario,
+                            signal_ctx=signal_ctx,
+                            pg=pg,
+                            redis=redis,
                         )
                         started_for_message += 1
-                        total_tasks_started += 1
                         total_scenarios += 1
 
-                    # помечаем сообщение как обработанное
+                    # помечаем сообщение как обработанное после выполнения всех сценариев
                     await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
 
                     log.debug(
@@ -137,11 +133,17 @@ async def run_bt_scenarios_orchestrator(pg, redis):
 
             log.debug(
                 "BT_SCENARIOS_MAIN: пакет обработан — сообщений=%s, сигналов=%s, "
-                "сценариев-запусков=%s, задач создано=%s",
+                "сценариев-запусков=%s",
                 total_msgs,
                 total_signals,
                 total_scenarios,
-                total_tasks_started,
+            )
+            log.info(
+                "BT_SCENARIOS_MAIN: итог по пакету — сообщений=%s, сигналов=%s, "
+                "запусков сценариев=%s (последовательный режим)",
+                total_msgs,
+                total_signals,
+                total_scenarios,
             )
 
         except Exception as e:
