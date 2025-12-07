@@ -3,7 +3,7 @@
 import logging
 import json
 from typing import Dict, Any, List, Optional
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_RSI_BIN")
@@ -81,25 +81,21 @@ async def run_rsi_bin_analysis(
         raw_stat = p["raw_stat"]
 
         # извлекаем значение RSI из raw_stat по TF и param_name
-        rsi_value = _extract_rsi_from_raw_stat(raw_stat, tf, rsi_param_name)
-        if rsi_value is None:
-            positions_skipped += 1
-            continue
-
-        # преобразуем к float
-        try:
-            rsi_float = float(rsi_value)
-        except (TypeError, ValueError):
+        rsi_dec = _extract_rsi_from_raw_stat(raw_stat, tf, rsi_param_name)
+        if rsi_dec is None:
             positions_skipped += 1
             continue
 
         # клипуем RSI в диапазон [0, 100]
-        if rsi_float < 0.0:
-            rsi_float = 0.0
-        if rsi_float > 100.0:
-            rsi_float = 100.0
+        if rsi_dec < Decimal("0"):
+            rsi_dec = Decimal("0")
+        if rsi_dec > Decimal("100"):
+            rsi_dec = Decimal("100")
 
-        bin_name = _assign_bin(bins, rsi_float)
+        # квантизация до разумной точности (4 знака после запятой)
+        rsi_dec = _q_decimal(rsi_dec)
+
+        bin_name = _assign_bin(bins, rsi_dec)
         if bin_name is None:
             # если по какой-то причине не нашли бин — считаем позицию пропущенной
             positions_skipped += 1
@@ -111,8 +107,8 @@ async def run_rsi_bin_analysis(
                 "timeframe": tf,
                 "direction": direction,
                 "bin_name": bin_name,
-                "value": rsi_float,
-                "pnl_abs": pnl_abs,
+                "value": rsi_dec,   # Decimal -> numeric без хвостов
+                "pnl_abs": pnl_abs, # уже Decimal
             }
         )
         positions_used += 1
@@ -202,7 +198,7 @@ def _extract_rsi_from_raw_stat(
     raw_stat: Any,
     tf: str,
     rsi_param_name: str,
-) -> Optional[float]:
+) -> Optional[Decimal]:
     # если raw_stat пришёл строкой из jsonb — парсим
     if isinstance(raw_stat, str):
         try:
@@ -226,14 +222,11 @@ def _extract_rsi_from_raw_stat(
     if value is None:
         return None
 
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return _safe_decimal(value)
 
 
 # 🔸 Загрузка конфигурации биннов из параметров анализатора
-def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, float]]:
+def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, Decimal]]:
     bins_cfg = params.get("bins")
     if not bins_cfg:
         return []
@@ -248,7 +241,7 @@ def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, float]]:
         log.warning("BT_ANALYSIS_RSI_BIN: не удалось распарсить JSON в параметре 'bins', используется дефолтная схема")
         return []
 
-    bins: List[Dict[str, float]] = []
+    bins: List[Dict[str, Decimal]] = []
     for item in data:
         # ожидаемый формат элемента: {"name": "0-10", "min": 0, "max": 10}
         if not isinstance(item, dict):
@@ -261,17 +254,14 @@ def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, float]]:
         if name is None or min_v is None or max_v is None:
             continue
 
-        try:
-            min_f = float(min_v)
-            max_f = float(max_v)
-        except (TypeError, ValueError):
-            continue
+        min_d = _safe_decimal(min_v)
+        max_d = _safe_decimal(max_v)
 
         bins.append(
             {
                 "name": str(name),
-                "min": min_f,
-                "max": max_f,
+                "min": min_d,
+                "max": max_d,
             }
         )
 
@@ -280,14 +270,14 @@ def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, float]]:
 
 
 # 🔸 Дефолтные бины RSI: 0-10, 10-20, ..., 90-100
-def _default_rsi_bins() -> List[Dict[str, float]]:
-    bins: List[Dict[str, float]] = []
-    step = 10.0
+def _default_rsi_bins() -> List[Dict[str, Decimal]]:
+    bins: List[Dict[str, Decimal]] = []
+    step = Decimal("10")
 
     # первые 9 бинов [0,10), [10,20), ..., [80,90)
     for i in range(9):
-        lo = i * step
-        hi = (i + 1) * step
+        lo = step * Decimal(i)
+        hi = step * Decimal(i + 1)
         name = f"{int(lo)}-{int(hi)}"
         bins.append(
             {
@@ -301,8 +291,8 @@ def _default_rsi_bins() -> List[Dict[str, float]]:
     bins.append(
         {
             "name": "90-100",
-            "min": 90.0,
-            "max": 100.0,
+            "min": Decimal("90"),
+            "max": Decimal("100"),
         }
     )
 
@@ -311,8 +301,8 @@ def _default_rsi_bins() -> List[Dict[str, float]]:
 
 # 🔸 Определение имени бина для значения RSI
 def _assign_bin(
-    bins: List[Dict[str, float]],
-    value: float,
+    bins: List[Dict[str, Decimal]],
+    value: Decimal,
 ) -> Optional[str]:
     # все бины кроме последнего: [min, max)
     # последний бин: [min, max] (включая верхнюю границу)
@@ -323,16 +313,10 @@ def _assign_bin(
 
     for idx, b in enumerate(bins):
         name = b.get("name")
-        b_min = b.get("min")
-        b_max = b.get("max")
+        lo = b.get("min")
+        hi = b.get("max")
 
-        if b_min is None or b_max is None or name is None:
-            continue
-
-        try:
-            lo = float(b_min)
-            hi = float(b_max)
-        except (TypeError, ValueError):
+        if lo is None or hi is None or name is None:
             continue
 
         if idx < last_index:
@@ -367,3 +351,9 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
+
+
+# 🔸 Вспомогательная функция: квантизация Decimal до 4 знаков
+def _q_decimal(value: Decimal) -> Decimal:
+    # 4 знака после запятой, округление вниз для предсказуемости
+    return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
