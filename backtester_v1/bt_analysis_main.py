@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from decimal import Decimal
 from typing import Dict, Any, List, Optional, Callable, Awaitable, Tuple
 
 # 🔸 Конфиг и кеши backtester_v1
@@ -20,7 +21,7 @@ AnalysisHandler = Callable[
 
 # 🔸 Воркеры анализаторов (из пакета analysis/)
 # пример: семья rsi, ключ rsi_bin
-from analysis.bt_analysis_rsi_bin import run_rsi_bin_analysis  # будет реализован отдельно
+from analysis.bt_analysis_rsi_bin import run_rsi_bin_analysis  # первый анализатор (RSI/bin)
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
@@ -71,6 +72,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
             total_analyses_ok = 0
             total_analyses_failed = 0
             total_rows_inserted = 0
+            total_bins_rows = 0
 
             for stream_key, entries in messages:
                 if stream_key != ANALYSIS_STREAM_KEY:
@@ -137,6 +139,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                             analyses_ok=0,
                             analyses_failed=0,
                             rows_inserted=0,
+                            bins_rows=0,
                         )
                         await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
                         continue
@@ -186,6 +189,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                             analyses_ok=0,
                             analyses_failed=0,
                             rows_inserted=0,
+                            bins_rows=0,
                         )
                         await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
                         continue
@@ -212,6 +216,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     analyses_ok = 0
                     analyses_failed = 0
                     rows_inserted = 0
+                    bins_rows_for_pair = 0
 
                     for res in results:
                         if isinstance(res, Exception):
@@ -220,28 +225,35 @@ async def run_bt_analysis_orchestrator(pg, redis):
 
                         status = res.get("status")
                         inserted = res.get("rows_inserted", 0)
+                        bins_rows = res.get("bins_rows", 0)
 
                         if status == "ok":
+                            analyses_ok += 1
+                        elif status == "skipped":
+                            # считаем как "успешно, но без данных"
                             analyses_ok += 1
                         else:
                             analyses_failed += 1
 
                         rows_inserted += inserted
+                        bins_rows_for_pair += bins_rows
 
                     total_analyses_planned += analyses_total
                     total_analyses_ok += analyses_ok
                     total_analyses_failed += analyses_failed
                     total_rows_inserted += rows_inserted
+                    total_bins_rows += bins_rows_for_pair
 
                     log.info(
                         "BT_ANALYSIS_MAIN: scenario_id=%s, signal_id=%s — анализаторов всего=%s, "
-                        "успешно=%s, с ошибками=%s, строк вставлено=%s",
+                        "успешно=%s, с ошибками=%s, строк в raw=%s, строк в bins_stat=%s",
                         scenario_id,
                         signal_id,
                         analyses_total,
                         analyses_ok,
                         analyses_failed,
                         rows_inserted,
+                        bins_rows_for_pair,
                     )
 
                     # публикуем агрегированное событие готовности анализа в bt:analysis:ready
@@ -253,6 +265,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                         analyses_ok=analyses_ok,
                         analyses_failed=analyses_failed,
                         rows_inserted=rows_inserted,
+                        bins_rows=bins_rows_for_pair,
                     )
 
                     # помечаем сообщение как обработанное после завершения всех анализаторов
@@ -260,23 +273,25 @@ async def run_bt_analysis_orchestrator(pg, redis):
 
             log.debug(
                 "BT_ANALYSIS_MAIN: пакет сообщений обработан — сообщений=%s, пар=%s, "
-                "анализаторов_планировалось=%s, успехов=%s, ошибок=%s, строк_вставлено=%s",
+                "анализаторов_планировалось=%s, успехов=%s, ошибок=%s, строк_raw=%s, строк_bins=%s",
                 total_msgs,
                 total_pairs,
                 total_analyses_planned,
                 total_analyses_ok,
                 total_analyses_failed,
                 total_rows_inserted,
+                total_bins_rows,
             )
             log.info(
                 "BT_ANALYSIS_MAIN: итог по пакету — сообщений=%s, пар=%s, "
-                "анализаторов всего=%s, успешно=%s, с ошибками=%s, строк вставлено=%s",
+                "анализаторов всего=%s, успешно=%s, с ошибками=%s, строк в raw=%s, строк в bins_stat=%s",
                 total_msgs,
                 total_pairs,
                 total_analyses_planned,
                 total_analyses_ok,
                 total_analyses_failed,
                 total_rows_inserted,
+                total_bins_rows,
             )
 
         except Exception as e:
@@ -426,10 +441,11 @@ async def _run_analysis_with_semaphore(
                 "analysis_id": analysis_id,
                 "status": "error",
                 "rows_inserted": 0,
+                "bins_rows": 0,
             }
 
 
-# 🔸 Запуск одного анализатора: очистка результатов, запуск воркера, запись в bt_analysis_positions_raw
+# 🔸 Запуск одного анализатора: очистка результатов, запуск воркера, запись raw и пересчёт bin-статистики
 async def _run_single_analysis(
     analysis: Dict[str, Any],
     scenario_id: int,
@@ -441,6 +457,7 @@ async def _run_single_analysis(
     family_key = str(analysis.get("family_key") or "").strip()
     analysis_key = str(analysis.get("key") or "").strip()
     name = analysis.get("name")
+    params = analysis.get("params") or {}
 
     handler = ANALYSIS_HANDLERS.get((family_key, analysis_key))
     if handler is None:
@@ -455,15 +472,24 @@ async def _run_single_analysis(
             "analysis_id": analysis_id,
             "status": "skipped",
             "rows_inserted": 0,
+            "bins_rows": 0,
         }
 
+    # indicator_param — например rsi14 / rsi21 / lr50_angle и т.п.
+    indicator_param_cfg = params.get("param_name")
+    if indicator_param_cfg is not None:
+        indicator_param = str(indicator_param_cfg.get("value") or "").strip() or None
+    else:
+        indicator_param = None
+
     log.debug(
-        "BT_ANALYSIS_MAIN: запуск анализатора id=%s (family=%s, key=%s, name=%s) "
+        "BT_ANALYSIS_MAIN: запуск анализатора id=%s (family=%s, key=%s, name=%s, indicator_param=%s) "
         "для scenario_id=%s, signal_id=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
+        indicator_param,
         scenario_id,
         signal_id,
     )
@@ -473,6 +499,17 @@ async def _run_single_analysis(
         await conn.execute(
             """
             DELETE FROM bt_analysis_positions_raw
+            WHERE analysis_id = $1
+              AND scenario_id = $2
+              AND signal_id = $3
+            """,
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+        await conn.execute(
+            """
+            DELETE FROM bt_analysis_bins_stat
             WHERE analysis_id = $1
               AND scenario_id = $2
               AND signal_id = $3
@@ -495,7 +532,7 @@ async def _run_single_analysis(
     if not rows:
         log.debug(
             "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s) для scenario_id=%s, signal_id=%s "
-            "не вернул строк для вставки",
+            "не вернул строк для вставки (raw)",
             analysis_id,
             family_key,
             analysis_key,
@@ -506,9 +543,10 @@ async def _run_single_analysis(
             "analysis_id": analysis_id,
             "status": "ok",
             "rows_inserted": 0,
+            "bins_rows": 0,
         }
 
-    # подготовка данных для массовой вставки
+    # подготовка данных для массовой вставки в bt_analysis_positions_raw
     to_insert: List[Tuple[Any, ...]] = []
     for row in rows:
         position_uid = row.get("position_uid")
@@ -547,6 +585,8 @@ async def _run_single_analysis(
         )
 
     inserted = 0
+    bins_rows = 0
+
     if to_insert:
         async with pg.acquire() as conn:
             await conn.executemany(
@@ -574,23 +614,171 @@ async def _run_single_analysis(
             )
         inserted = len(to_insert)
 
-    log.debug(
-        "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s, name=%s) для scenario_id=%s, signal_id=%s "
-        "записал строк=%s в bt_analysis_positions_raw",
-        analysis_id,
-        family_key,
-        analysis_key,
-        name,
-        scenario_id,
-        signal_id,
-        inserted,
-    )
+        # пересчёт статистики по биннам для данного анализатора и пары
+        bins_rows, trades_total = await _recalc_bins_stat(
+            pg=pg,
+            analysis_id=analysis_id,
+            scenario_id=scenario_id,
+            signal_id=signal_id,
+            indicator_param=indicator_param,
+        )
+
+        log.info(
+            "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s, name=%s) "
+            "для scenario_id=%s, signal_id=%s записал raw строк=%s и bins строк=%s (trades_total=%s)",
+            analysis_id,
+            family_key,
+            analysis_key,
+            name,
+            scenario_id,
+            signal_id,
+            inserted,
+            bins_rows,
+            trades_total,
+        )
+    else:
+        log.debug(
+            "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s, name=%s) для scenario_id=%s, signal_id=%s "
+            "не сформировал валидных строк raw после фильтрации",
+            analysis_id,
+            family_key,
+            analysis_key,
+            name,
+            scenario_id,
+            signal_id,
+        )
 
     return {
         "analysis_id": analysis_id,
         "status": "ok",
         "rows_inserted": inserted,
+        "bins_rows": bins_rows,
     }
+
+
+# 🔸 Пересчёт статистики по биннам в bt_analysis_bins_stat
+async def _recalc_bins_stat(
+    pg,
+    analysis_id: int,
+    scenario_id: int,
+    signal_id: int,
+    indicator_param: Optional[str],
+) -> Tuple[int, int]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                timeframe,
+                direction,
+                bin_name,
+                COUNT(*)                                         AS trades,
+                COUNT(*) FILTER (WHERE pnl_abs > 0)              AS wins,
+                COALESCE(SUM(pnl_abs), 0)                        AS pnl_abs_total
+            FROM bt_analysis_positions_raw
+            WHERE analysis_id = $1
+              AND scenario_id = $2
+              AND signal_id   = $3
+            GROUP BY timeframe, direction, bin_name
+            """,
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+
+        if not rows:
+            log.debug(
+                "BT_ANALYSIS_MAIN: для анализа id=%s, scenario_id=%s, signal_id=%s нет строк raw для пересчёта bins_stat",
+                analysis_id,
+                scenario_id,
+                signal_id,
+            )
+            return 0, 0
+
+        # удаляем старые строки bins_stat для этого анализа и пары
+        await conn.execute(
+            """
+            DELETE FROM bt_analysis_bins_stat
+            WHERE analysis_id = $1
+              AND scenario_id = $2
+              AND signal_id   = $3
+            """,
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+
+        to_insert: List[Tuple[Any, ...]] = []
+        total_trades = 0
+
+        for r in rows:
+            timeframe = r["timeframe"]
+            direction = r["direction"]
+            bin_name = r["bin_name"]
+            trades = int(r["trades"])
+            wins = int(r["wins"])
+            pnl_abs_total = Decimal(str(r["pnl_abs_total"]))
+
+            total_trades += trades
+
+            if trades > 0:
+                winrate = Decimal(wins) / Decimal(trades)
+            else:
+                winrate = Decimal("0")
+
+            # лёгкая квантизация для предсказуемой точности
+            pnl_abs_q = pnl_abs_total.quantize(Decimal("0.0001"))
+            winrate_q = winrate.quantize(Decimal("0.0001"))
+
+            to_insert.append(
+                (
+                    analysis_id,
+                    scenario_id,
+                    signal_id,
+                    indicator_param,
+                    timeframe,
+                    direction,
+                    bin_name,
+                    trades,
+                    pnl_abs_q,
+                    winrate_q,
+                )
+            )
+
+        await conn.executemany(
+            """
+            INSERT INTO bt_analysis_bins_stat (
+                analysis_id,
+                scenario_id,
+                signal_id,
+                indicator_param,
+                timeframe,
+                direction,
+                bin_name,
+                trades,
+                pnl_abs,
+                winrate
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10
+            )
+            """,
+            to_insert,
+        )
+
+    bins_count = len(to_insert)
+
+    log.debug(
+        "BT_ANALYSIS_MAIN: пересчитана статистика bins_stat для analysis_id=%s, scenario_id=%s, signal_id=%s — "
+        "бинов=%s, trades_total=%s",
+        analysis_id,
+        scenario_id,
+        signal_id,
+        bins_count,
+        total_trades,
+    )
+    return bins_count, total_trades
 
 
 # 🔸 Публикация агрегированного события готовности анализа в bt:analysis:ready
@@ -602,6 +790,7 @@ async def _publish_analysis_ready(
     analyses_ok: int,
     analyses_failed: int,
     rows_inserted: int,
+    bins_rows: int,
 ) -> None:
     finished_at = datetime.utcnow()
 
@@ -614,14 +803,15 @@ async def _publish_analysis_ready(
                 "analyses_total": str(analyses_total),
                 "analyses_ok": str(analyses_ok),
                 "analyses_failed": str(analyses_failed),
-                "rows_inserted": str(rows_inserted),
+                "rows_raw": str(rows_inserted),
+                "rows_bins": str(bins_rows),
                 "finished_at": finished_at.isoformat(),
             },
         )
         log.debug(
             "BT_ANALYSIS_MAIN: опубликовано событие готовности анализа в стрим '%s' "
             "для scenario_id=%s, signal_id=%s, analyses_total=%s, analyses_ok=%s, "
-            "analyses_failed=%s, rows_inserted=%s, finished_at=%s",
+            "analyses_failed=%s, rows_raw=%s, rows_bins=%s, finished_at=%s",
             ANALYSIS_READY_STREAM_KEY,
             scenario_id,
             signal_id,
@@ -629,6 +819,7 @@ async def _publish_analysis_ready(
             analyses_ok,
             analyses_failed,
             rows_inserted,
+            bins_rows,
             finished_at,
         )
     except Exception as e:
