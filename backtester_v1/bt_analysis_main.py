@@ -20,12 +20,13 @@ AnalysisHandler = Callable[
 ]
 
 # 🔸 Воркеры анализаторов (из пакета analysis/)
-# пример: семья rsi, ключ rsi_bin
-from analysis.bt_analysis_rsi_bin import run_rsi_bin_analysis  # первый анализатор (RSI/bin)
+from analysis.bt_analysis_rsi_bin import run_rsi_bin_analysis
+from analysis.bt_analysis_mfi_bin import run_mfi_bin_analysis
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("rsi", "rsi_bin"): run_rsi_bin_analysis,
+    ("mfi", "mfi_bin"): run_mfi_bin_analysis,
 }
 
 # 🔸 Константы стрима анализа
