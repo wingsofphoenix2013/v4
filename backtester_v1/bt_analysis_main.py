@@ -22,11 +22,13 @@ AnalysisHandler = Callable[
 # 🔸 Воркеры анализаторов (из пакета analysis/)
 from analysis.bt_analysis_rsi_bin import run_rsi_bin_analysis
 from analysis.bt_analysis_mfi_bin import run_mfi_bin_analysis
+from analysis.bt_analysis_adx_bin import run_adx_bin_analysis
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("rsi", "rsi_bin"): run_rsi_bin_analysis,
     ("mfi", "mfi_bin"): run_mfi_bin_analysis,
+    ("adx_dmi", "adx_bin"): run_adx_bin_analysis,
 }
 
 # 🔸 Константы стрима анализа
