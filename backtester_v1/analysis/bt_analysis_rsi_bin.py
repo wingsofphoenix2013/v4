@@ -3,7 +3,6 @@
 import logging
 import json
 from typing import Dict, Any, List, Optional
-
 from decimal import Decimal, InvalidOperation
 
 # 🔸 Логгер модуля
@@ -27,8 +26,8 @@ async def run_rsi_bin_analysis(
     signal_id = analysis_ctx.get("signal_id")
 
     # базовые параметры анализатора
-    tf = _get_str_param(params, "tf", default="m5")               # TF из raw_stat.tf[tf]
-    rsi_param_name = _get_str_param(params, "param_name", "rsi14")  # например rsi14 / rsi21
+    tf = _get_str_param(params, "tf", default="m5")                  # TF из raw_stat["tf"][tf]
+    rsi_param_name = _get_str_param(params, "param_name", "rsi14")   # например rsi14 / rsi21
 
     # загружаем конфигурацию биннов
     bins = _load_bins_from_params(params)
@@ -170,13 +169,22 @@ async def _load_positions_for_analysis(
 
     positions: List[Dict[str, Any]] = []
     for r in rows:
+        raw = r["raw_stat"]
+
+        # приводим jsonb к dict, если он пришёл строкой
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = None
+
         positions.append(
             {
                 "position_uid": r["position_uid"],
                 "timeframe": r["timeframe"],
                 "direction": r["direction"],
                 "pnl_abs": _safe_decimal(r["pnl_abs"]),
-                "raw_stat": r["raw_stat"],
+                "raw_stat": raw,
             }
         )
 
@@ -195,6 +203,13 @@ def _extract_rsi_from_raw_stat(
     tf: str,
     rsi_param_name: str,
 ) -> Optional[float]:
+    # если raw_stat пришёл строкой из jsonb — парсим
+    if isinstance(raw_stat, str):
+        try:
+            raw_stat = json.loads(raw_stat)
+        except Exception:
+            return None
+
     if not isinstance(raw_stat, dict):
         return None
 
