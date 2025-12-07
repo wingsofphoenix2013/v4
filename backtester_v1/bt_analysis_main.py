@@ -1,0 +1,643 @@
+# bt_analysis_main.py — оркестратор анализаторов backtester_v1
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Callable, Awaitable, Tuple
+
+# 🔸 Конфиг и кеши backtester_v1
+from backtester_config import (
+    get_analysis_connections_for_scenario_signal,
+    get_analysis_instance,
+)
+
+# 🔸 Тип обработчика анализатора:
+#    (analysis_cfg, analysis_ctx, pg_pool, redis_client) -> {"rows": [...], "summary": {...}}
+AnalysisHandler = Callable[
+    [Dict[str, Any], Dict[str, Any], Any, Any],
+    Awaitable[Dict[str, Any]]
+]
+
+# 🔸 Воркеры анализаторов (из пакета analysis/)
+# пример: семья rsi, ключ rsi_bin
+from analysis.bt_analysis_rsi_bin import run_rsi_bin_analysis  # будет реализован отдельно
+
+# 🔸 Реестр анализаторов: (family_key, key) → handler
+ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
+    ("rsi", "rsi_bin"): run_rsi_bin_analysis,
+}
+
+# 🔸 Константы стрима анализа
+ANALYSIS_STREAM_KEY = "bt:postproc:ready"
+ANALYSIS_CONSUMER_GROUP = "bt_analysis"
+ANALYSIS_CONSUMER_NAME = "bt_analysis_main"
+
+# 🔸 Стрим готовности анализа
+ANALYSIS_READY_STREAM_KEY = "bt:analysis:ready"
+
+# 🔸 Настройки чтения стрима
+ANALYSIS_STREAM_BATCH_SIZE = 10
+ANALYSIS_STREAM_BLOCK_MS = 5000
+
+# 🔸 Ограничение параллелизма анализаторов
+ANALYSIS_MAX_CONCURRENCY = 12
+
+# 🔸 Кеш последних finished_at по (scenario_id, signal_id) для отсечки дублей
+_last_postproc_finished_at: Dict[Tuple[int, int], datetime] = {}
+
+log = logging.getLogger("BT_ANALYSIS_MAIN")
+
+
+# 🔸 Публичная точка входа: оркестратор анализаторов
+async def run_bt_analysis_orchestrator(pg, redis):
+    log.debug("BT_ANALYSIS_MAIN: оркестратор анализаторов запущен")
+
+    await _ensure_consumer_group(redis)
+
+    # общий семафор для всех анализаторов
+    analysis_sema = asyncio.Semaphore(ANALYSIS_MAX_CONCURRENCY)
+
+    # основной цикл чтения стрима и запуска анализаторов
+    while True:
+        try:
+            messages = await _read_from_stream(redis)
+
+            if not messages:
+                continue
+
+            total_msgs = 0
+            total_pairs = 0
+            total_analyses_planned = 0
+            total_analyses_ok = 0
+            total_analyses_failed = 0
+            total_rows_inserted = 0
+
+            for stream_key, entries in messages:
+                if stream_key != ANALYSIS_STREAM_KEY:
+                    # на всякий случай игнорируем чужие стримы
+                    continue
+
+                for entry_id, fields in entries:
+                    total_msgs += 1
+
+                    ctx = _parse_postproc_message(fields)
+                    if not ctx:
+                        # если не удалось корректно распарсить поля — ACK и пропускаем
+                        await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
+                        continue
+
+                    scenario_id = ctx["scenario_id"]
+                    signal_id = ctx["signal_id"]
+                    finished_at = ctx["finished_at"]
+
+                    pair_key = (scenario_id, signal_id)
+                    last_finished = _last_postproc_finished_at.get(pair_key)
+
+                    # отсечка дублей по равному finished_at
+                    if last_finished is not None and last_finished == finished_at:
+                        log.debug(
+                            "BT_ANALYSIS_MAIN: дубликат сообщения для scenario_id=%s, signal_id=%s, "
+                            "finished_at=%s, stream_id=%s — анализаторы не запускаются",
+                            scenario_id,
+                            signal_id,
+                            finished_at,
+                            entry_id,
+                        )
+                        await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
+                        continue
+
+                    _last_postproc_finished_at[pair_key] = finished_at
+                    total_pairs += 1
+
+                    log.debug(
+                        "BT_ANALYSIS_MAIN: получено сообщение постпроцессинга "
+                        "scenario_id=%s, signal_id=%s, finished_at=%s, stream_id=%s",
+                        scenario_id,
+                        signal_id,
+                        finished_at,
+                        entry_id,
+                    )
+
+                    # получаем все связки сценарий ↔ сигнал ↔ анализатор
+                    links = get_analysis_connections_for_scenario_signal(scenario_id, signal_id)
+                    if not links:
+                        log.debug(
+                            "BT_ANALYSIS_MAIN: для scenario_id=%s, signal_id=%s нет активных связок анализаторов, "
+                            "сообщение %s будет помечено как обработанное",
+                            scenario_id,
+                            signal_id,
+                            entry_id,
+                        )
+                        # публикуем пустое событие готовности анализа
+                        await _publish_analysis_ready(
+                            redis=redis,
+                            scenario_id=scenario_id,
+                            signal_id=signal_id,
+                            analyses_total=0,
+                            analyses_ok=0,
+                            analyses_failed=0,
+                            rows_inserted=0,
+                        )
+                        await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
+                        continue
+
+                    # формируем список анализаторов для запуска
+                    analyses_to_run: List[Dict[str, Any]] = []
+                    for link in links:
+                        analysis_id = link.get("analysis_id")
+                        analysis_cfg = get_analysis_instance(analysis_id)
+                        if not analysis_cfg:
+                            log.warning(
+                                "BT_ANALYSIS_MAIN: анализатор id=%s не найден в кеше, "
+                                "scenario_id=%s, signal_id=%s, сообщение=%s",
+                                analysis_id,
+                                scenario_id,
+                                signal_id,
+                                entry_id,
+                            )
+                            continue
+
+                        if not analysis_cfg.get("enabled"):
+                            log.debug(
+                                "BT_ANALYSIS_MAIN: анализатор id=%s отключён, "
+                                "scenario_id=%s, signal_id=%s, сообщение=%s",
+                                analysis_id,
+                                scenario_id,
+                                signal_id,
+                                entry_id,
+                            )
+                            continue
+
+                        analyses_to_run.append(analysis_cfg)
+
+                    if not analyses_to_run:
+                        log.debug(
+                            "BT_ANALYSIS_MAIN: для scenario_id=%s, signal_id=%s нет активных анализаторов "
+                            "(после фильтра по кешу), сообщение %s будет помечено как обработанное",
+                            scenario_id,
+                            signal_id,
+                            entry_id,
+                        )
+                        await _publish_analysis_ready(
+                            redis=redis,
+                            scenario_id=scenario_id,
+                            signal_id=signal_id,
+                            analyses_total=0,
+                            analyses_ok=0,
+                            analyses_failed=0,
+                            rows_inserted=0,
+                        )
+                        await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
+                        continue
+
+                    # запускаем все анализаторы для данной пары с ограничением по семафору
+                    tasks: List[asyncio.Task] = []
+                    for analysis in analyses_to_run:
+                        task = asyncio.create_task(
+                            _run_analysis_with_semaphore(
+                                analysis=analysis,
+                                scenario_id=scenario_id,
+                                signal_id=signal_id,
+                                pg=pg,
+                                redis=redis,
+                                sema=analysis_sema,
+                            ),
+                            name=f"BT_ANALYSIS_{analysis.get('id')}_SC_{scenario_id}_SIG_{signal_id}",
+                        )
+                        tasks.append(task)
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    analyses_total = len(analyses_to_run)
+                    analyses_ok = 0
+                    analyses_failed = 0
+                    rows_inserted = 0
+
+                    for res in results:
+                        if isinstance(res, Exception):
+                            analyses_failed += 1
+                            continue
+
+                        status = res.get("status")
+                        inserted = res.get("rows_inserted", 0)
+
+                        if status == "ok":
+                            analyses_ok += 1
+                        else:
+                            analyses_failed += 1
+
+                        rows_inserted += inserted
+
+                    total_analyses_planned += analyses_total
+                    total_analyses_ok += analyses_ok
+                    total_analyses_failed += analyses_failed
+                    total_rows_inserted += rows_inserted
+
+                    log.info(
+                        "BT_ANALYSIS_MAIN: scenario_id=%s, signal_id=%s — анализаторов всего=%s, "
+                        "успешно=%s, с ошибками=%s, строк вставлено=%s",
+                        scenario_id,
+                        signal_id,
+                        analyses_total,
+                        analyses_ok,
+                        analyses_failed,
+                        rows_inserted,
+                    )
+
+                    # публикуем агрегированное событие готовности анализа в bt:analysis:ready
+                    await _publish_analysis_ready(
+                        redis=redis,
+                        scenario_id=scenario_id,
+                        signal_id=signal_id,
+                        analyses_total=analyses_total,
+                        analyses_ok=analyses_ok,
+                        analyses_failed=analyses_failed,
+                        rows_inserted=rows_inserted,
+                    )
+
+                    # помечаем сообщение как обработанное после завершения всех анализаторов
+                    await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
+
+            log.debug(
+                "BT_ANALYSIS_MAIN: пакет сообщений обработан — сообщений=%s, пар=%s, "
+                "анализаторов_планировалось=%s, успехов=%s, ошибок=%s, строк_вставлено=%s",
+                total_msgs,
+                total_pairs,
+                total_analyses_planned,
+                total_analyses_ok,
+                total_analyses_failed,
+                total_rows_inserted,
+            )
+            log.info(
+                "BT_ANALYSIS_MAIN: итог по пакету — сообщений=%s, пар=%s, "
+                "анализаторов всего=%s, успешно=%s, с ошибками=%s, строк вставлено=%s",
+                total_msgs,
+                total_pairs,
+                total_analyses_planned,
+                total_analyses_ok,
+                total_analyses_failed,
+                total_rows_inserted,
+            )
+
+        except Exception as e:
+            log.error(
+                "BT_ANALYSIS_MAIN: ошибка в основном цикле оркестратора: %s",
+                e,
+                exc_info=True,
+            )
+            # небольшая пауза перед повторной попыткой, чтобы не крутить CPU при постоянной ошибке
+            await asyncio.sleep(2)
+
+
+# 🔸 Проверка/создание consumer group для стрима анализа
+async def _ensure_consumer_group(redis) -> None:
+    try:
+        # пытаемся создать группу; MKSTREAM создаст стрим, если его ещё нет
+        await redis.xgroup_create(
+            name=ANALYSIS_STREAM_KEY,
+            groupname=ANALYSIS_CONSUMER_GROUP,
+            id="$",
+            mkstream=True,
+        )
+        log.debug(
+            "BT_ANALYSIS_MAIN: создана consumer group '%s' для стрима '%s'",
+            ANALYSIS_CONSUMER_GROUP,
+            ANALYSIS_STREAM_KEY,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "BUSYGROUP" in msg:
+            log.debug(
+                "BT_ANALYSIS_MAIN: consumer group '%s' для стрима '%s' уже существует",
+                ANALYSIS_CONSUMER_GROUP,
+                ANALYSIS_STREAM_KEY,
+            )
+        else:
+            log.error(
+                "BT_ANALYSIS_MAIN: ошибка при создании consumer group '%s': %s",
+                ANALYSIS_CONSUMER_GROUP,
+                e,
+                exc_info=True,
+            )
+            raise
+
+
+# 🔸 Чтение сообщений из стрима bt:postproc:ready
+async def _read_from_stream(redis) -> List[Any]:
+    entries = await redis.xreadgroup(
+        groupname=ANALYSIS_CONSUMER_GROUP,
+        consumername=ANALYSIS_CONSUMER_NAME,
+        streams={ANALYSIS_STREAM_KEY: ">"},
+        count=ANALYSIS_STREAM_BATCH_SIZE,
+        block=ANALYSIS_STREAM_BLOCK_MS,
+    )
+
+    if not entries:
+        return []
+
+    parsed: List[Any] = []
+    for stream_key, messages in entries:
+        if isinstance(stream_key, bytes):
+            stream_key = stream_key.decode("utf-8")
+
+        stream_entries: List[Any] = []
+        for msg_id, fields in messages:
+            if isinstance(msg_id, bytes):
+                msg_id = msg_id.decode("utf-8")
+
+            str_fields: Dict[str, str] = {}
+            for k, v in fields.items():
+                key_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                val_str = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                str_fields[key_str] = val_str
+
+            stream_entries.append((msg_id, str_fields))
+
+        parsed.append((stream_key, stream_entries))
+
+    return parsed
+
+
+# 🔸 Разбор одного сообщения из стрима bt:postproc:ready
+def _parse_postproc_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    try:
+        scenario_id_str = fields.get("scenario_id")
+        signal_id_str = fields.get("signal_id")
+        finished_at_str = fields.get("finished_at")
+
+        if not (scenario_id_str and signal_id_str and finished_at_str):
+            # не хватает обязательных полей
+            return None
+
+        scenario_id = int(scenario_id_str)
+        signal_id = int(signal_id_str)
+        finished_at = datetime.fromisoformat(finished_at_str)
+
+        # дополнительные поля (processed/skipped/errors) сейчас не используем, но можем залогировать при необходимости
+        return {
+            "scenario_id": scenario_id,
+            "signal_id": signal_id,
+            "finished_at": finished_at,
+        }
+    except Exception as e:
+        log.error(
+            "BT_ANALYSIS_MAIN: ошибка разбора сообщения стрима bt:postproc:ready: %s, fields=%s",
+            e,
+            fields,
+            exc_info=True,
+        )
+        return None
+
+
+# 🔸 Обёртка для запуска одного анализатора с семафором
+async def _run_analysis_with_semaphore(
+    analysis: Dict[str, Any],
+    scenario_id: int,
+    signal_id: int,
+    pg,
+    redis,
+    sema: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    async with sema:
+        try:
+            return await _run_single_analysis(
+                analysis=analysis,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                pg=pg,
+                redis=redis,
+            )
+        except Exception as e:
+            analysis_id = analysis.get("id")
+            family_key = analysis.get("family_key")
+            key = analysis.get("key")
+            log.error(
+                "BT_ANALYSIS_MAIN: ошибка выполнения анализатора id=%s (family=%s, key=%s) "
+                "для scenario_id=%s, signal_id=%s: %s",
+                analysis_id,
+                family_key,
+                key,
+                scenario_id,
+                signal_id,
+                e,
+                exc_info=True,
+            )
+            return {
+                "analysis_id": analysis_id,
+                "status": "error",
+                "rows_inserted": 0,
+            }
+
+
+# 🔸 Запуск одного анализатора: очистка результатов, запуск воркера, запись в bt_analysis_positions_raw
+async def _run_single_analysis(
+    analysis: Dict[str, Any],
+    scenario_id: int,
+    signal_id: int,
+    pg,
+    redis,
+) -> Dict[str, Any]:
+    analysis_id = analysis.get("id")
+    family_key = str(analysis.get("family_key") or "").strip()
+    analysis_key = str(analysis.get("key") or "").strip()
+    name = analysis.get("name")
+
+    handler = ANALYSIS_HANDLERS.get((family_key, analysis_key))
+    if handler is None:
+        log.debug(
+            "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s, name=%s) пока не поддерживается реестром анализаторов",
+            analysis_id,
+            family_key,
+            analysis_key,
+            name,
+        )
+        return {
+            "analysis_id": analysis_id,
+            "status": "skipped",
+            "rows_inserted": 0,
+        }
+
+    log.debug(
+        "BT_ANALYSIS_MAIN: запуск анализатора id=%s (family=%s, key=%s, name=%s) "
+        "для scenario_id=%s, signal_id=%s",
+        analysis_id,
+        family_key,
+        analysis_key,
+        name,
+        scenario_id,
+        signal_id,
+    )
+
+    # очистка предыдущих результатов для данного анализатора и пары (сценарий, сигнал)
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            DELETE FROM bt_analysis_positions_raw
+            WHERE analysis_id = $1
+              AND scenario_id = $2
+              AND signal_id = $3
+            """,
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+
+    # контекст для анализатора
+    analysis_ctx: Dict[str, Any] = {
+        "scenario_id": scenario_id,
+        "signal_id": signal_id,
+    }
+
+    # запускаем бизнес-логику анализатора
+    result: Dict[str, Any] = await handler(analysis, analysis_ctx, pg, redis)
+    rows: List[Dict[str, Any]] = (result or {}).get("rows") or []
+
+    if not rows:
+        log.debug(
+            "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s) для scenario_id=%s, signal_id=%s "
+            "не вернул строк для вставки",
+            analysis_id,
+            family_key,
+            analysis_key,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "analysis_id": analysis_id,
+            "status": "ok",
+            "rows_inserted": 0,
+        }
+
+    # подготовка данных для массовой вставки
+    to_insert: List[Tuple[Any, ...]] = []
+    for row in rows:
+        position_uid = row.get("position_uid")
+        timeframe = row.get("timeframe")
+        direction = row.get("direction")
+        bin_name = row.get("bin_name")
+        value = row.get("value")
+        pnl_abs = row.get("pnl_abs")
+
+        if not position_uid or timeframe is None or direction is None or bin_name is None:
+            # пропускаем некорректные строки
+            log.debug(
+                "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s) вернул некорректную строку, "
+                "она будет пропущена: %s",
+                analysis_id,
+                family_key,
+                analysis_key,
+                row,
+            )
+            continue
+
+        to_insert.append(
+            (
+                analysis_id,
+                position_uid,
+                scenario_id,
+                signal_id,
+                family_key,
+                analysis_key,
+                timeframe,
+                direction,
+                bin_name,
+                value,
+                pnl_abs,
+            )
+        )
+
+    inserted = 0
+    if to_insert:
+        async with pg.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO bt_analysis_positions_raw (
+                    analysis_id,
+                    position_uid,
+                    scenario_id,
+                    signal_id,
+                    family_key,
+                    "key",
+                    timeframe,
+                    direction,
+                    bin_name,
+                    value,
+                    pnl_abs
+                )
+                VALUES (
+                    $1, $2, $3, $4,
+                    $5, $6, $7, $8,
+                    $9, $10, $11
+                )
+                """,
+                to_insert,
+            )
+        inserted = len(to_insert)
+
+    log.debug(
+        "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s, name=%s) для scenario_id=%s, signal_id=%s "
+        "записал строк=%s в bt_analysis_positions_raw",
+        analysis_id,
+        family_key,
+        analysis_key,
+        name,
+        scenario_id,
+        signal_id,
+        inserted,
+    )
+
+    return {
+        "analysis_id": analysis_id,
+        "status": "ok",
+        "rows_inserted": inserted,
+    }
+
+
+# 🔸 Публикация агрегированного события готовности анализа в bt:analysis:ready
+async def _publish_analysis_ready(
+    redis,
+    scenario_id: int,
+    signal_id: int,
+    analyses_total: int,
+    analyses_ok: int,
+    analyses_failed: int,
+    rows_inserted: int,
+) -> None:
+    finished_at = datetime.utcnow()
+
+    try:
+        await redis.xadd(
+            ANALYSIS_READY_STREAM_KEY,
+            {
+                "scenario_id": str(scenario_id),
+                "signal_id": str(signal_id),
+                "analyses_total": str(analyses_total),
+                "analyses_ok": str(analyses_ok),
+                "analyses_failed": str(analyses_failed),
+                "rows_inserted": str(rows_inserted),
+                "finished_at": finished_at.isoformat(),
+            },
+        )
+        log.debug(
+            "BT_ANALYSIS_MAIN: опубликовано событие готовности анализа в стрим '%s' "
+            "для scenario_id=%s, signal_id=%s, analyses_total=%s, analyses_ok=%s, "
+            "analyses_failed=%s, rows_inserted=%s, finished_at=%s",
+            ANALYSIS_READY_STREAM_KEY,
+            scenario_id,
+            signal_id,
+            analyses_total,
+            analyses_ok,
+            analyses_failed,
+            rows_inserted,
+            finished_at,
+        )
+    except Exception as e:
+        log.error(
+            "BT_ANALYSIS_MAIN: не удалось опубликовать событие в стрим '%s' "
+            "для scenario_id=%s, signal_id=%s: %s",
+            ANALYSIS_READY_STREAM_KEY,
+            scenario_id,
+            signal_id,
+            e,
+            exc_info=True,
+        )
