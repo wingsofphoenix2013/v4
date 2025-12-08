@@ -25,6 +25,7 @@ from analysis.bt_analysis_mfi_bin import run_mfi_bin_analysis
 from analysis.bt_analysis_adx_bin import run_adx_bin_analysis
 from analysis.bt_analysis_bb_band_bin import run_bb_band_bin_analysis
 from analysis.bt_analysis_lr_band_bin import run_lr_band_bin_analysis
+from analysis.bt_analysis_lr_angle_bin import run_lr_angle_bin_analysis
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
@@ -33,6 +34,7 @@ ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("adx_dmi", "adx_bin"): run_adx_bin_analysis,
     ("bb", "bb_band_bin"): run_bb_band_bin_analysis,
     ("lr", "lr_band_bin"): run_lr_band_bin_analysis,
+    ("lr", "lr_angle_bin"): run_lr_angle_bin_analysis,
 }
 
 # 🔸 Константы стрима анализа
