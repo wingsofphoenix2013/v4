@@ -103,7 +103,7 @@ async def run_lr_angle_quantile_bin_analysis(
     min_angle = min(valid_angles)
     max_angle = max(valid_angles)
 
-    bins_count = 20
+    bins_count = 10
     rows: List[Dict[str, Any]] = []
     positions_used = 0
     positions_skipped = positions_total - len(valid_positions)
