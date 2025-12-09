@@ -503,7 +503,7 @@ async def _process_symbol_inner(
         )
 
     inserted = len(to_insert)
-    log.info(
+    log.debug(
         "BT_SIG_LR_COMPLEX: %s → вставлено событий=%s (long=%s, short=%s) для сигнала id=%s ('%s')",
         symbol,
         inserted,
