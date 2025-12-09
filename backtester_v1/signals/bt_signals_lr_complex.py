@@ -1,11 +1,13 @@
-# bt_signals_lr_complex.py — упрощённый воркер backfill для LR-сигналов (bounce по каналу с zone_k)
+# bt_signals_lr_complex.py — упрощённый воркер backfill для LR-сигналов (bounce по каналу с zone_k + фильтр по бинам)
 
 import asyncio
 import logging
 import uuid
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Кеши backtester_v1
 from backtester_config import get_all_ticker_symbols, get_ticker_info
@@ -95,6 +97,10 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
     # паттерн фиксируем как "bounce"
     pattern = "bounce"
 
+    # запрещённые бины по направлению (для текущего TF)
+    forbidden_bins_long = _parse_forbidden_bins(params, timeframe, "long")
+    forbidden_bins_short = _parse_forbidden_bins(params, timeframe, "short")
+
     # рабочее окно по времени
     now = datetime.utcnow()
     from_time = now - timedelta(days=backfill_days)
@@ -112,7 +118,8 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.debug(
         "BT_SIG_LR_COMPLEX: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, "
-        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, zone_k=%.3f",
+        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, zone_k=%.3f, "
+        "forbidden_bins_long=%s, forbidden_bins_short=%s",
         signal_id,
         name,
         signal_key,
@@ -123,6 +130,8 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
         lr_m5_instance_id,
         pattern,
         zone_k,
+        sorted(forbidden_bins_long),
+        sorted(forbidden_bins_short),
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -147,6 +156,8 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 allowed_directions=allowed_directions,
                 pattern=pattern,
                 zone_k=zone_k,
+                forbidden_bins_long=forbidden_bins_long,
+                forbidden_bins_short=forbidden_bins_short,
             )
         )
 
@@ -263,6 +274,8 @@ async def _process_symbol(
     allowed_directions: Set[str],
     pattern: str,
     zone_k: float,
+    forbidden_bins_long: Set[str],
+    forbidden_bins_short: Set[str],
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
@@ -280,6 +293,8 @@ async def _process_symbol(
                 allowed_directions=allowed_directions,
                 pattern=pattern,
                 zone_k=zone_k,
+                forbidden_bins_long=forbidden_bins_long,
+                forbidden_bins_short=forbidden_bins_short,
             )
         except Exception as e:
             log.error(
@@ -308,6 +323,8 @@ async def _process_symbol_inner(
     allowed_directions: Set[str],
     pattern: str,
     zone_k: float,
+    forbidden_bins_long: Set[str],
+    forbidden_bins_short: Set[str],
 ) -> Tuple[int, int, int]:
     # загружаем LR-канал на m5
     lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
@@ -382,7 +399,13 @@ async def _process_symbol_inner(
         upper_prev = lr_prev.get("upper")
         lower_prev = lr_prev.get("lower")
 
-        if angle_m5 is None or upper_curr is None or lower_curr is None or upper_prev is None or lower_prev is None:
+        if (
+            angle_m5 is None
+            or upper_curr is None
+            or lower_curr is None
+            or upper_prev is None
+            or lower_prev is None
+        ):
             continue
 
         try:
@@ -396,9 +419,9 @@ async def _process_symbol_inner(
         except Exception:
             continue
 
-        # высота канала
+        # высота канала на предыдущем баре
         H = upper_prev_f - lower_prev_f
-        if H <= 0:
+        if H <= 0.0:
             continue
 
         direction: Optional[str] = None
@@ -430,6 +453,23 @@ async def _process_symbol_inner(
                 direction = "short"
 
         if direction is None:
+            continue
+
+        # бин по цене входа (close текущего бара) относительно LR-канала на этом же баре (ts)
+        if direction == "long":
+            forbidden_bins = forbidden_bins_long
+        else:
+            forbidden_bins = forbidden_bins_short
+
+        bin_name = _compute_lr_bin(
+            price_f=close_curr_f,
+            upper_f=upper_curr_f,
+            lower_f=lower_curr_f,
+        )
+        if bin_name is None:
+            continue
+
+        if bin_name in forbidden_bins:
             continue
 
         key_event = (symbol, ts, direction)
@@ -617,3 +657,83 @@ def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float
         return float(str(raw))
     except Exception:
         return default
+
+
+# 🔸 Вспомогательная функция: парсинг списка запрещённых бинов из параметров
+def _parse_forbidden_bins(
+    params: Dict[str, Any],
+    timeframe: str,
+    direction: str,
+) -> Set[str]:
+    param_name = f"forbidden_bins_{timeframe}_{direction}"
+    cfg = params.get(param_name)
+    if cfg is None:
+        return set()
+
+    raw = cfg.get("value")
+    if raw is None:
+        return set()
+
+    text = str(raw).strip()
+    if not text:
+        return set()
+
+    # разделители: запятая, точка с запятой, пробелы
+    tokens = re.split(r"[,\s;]+", text)
+    bins: Set[str] = set()
+
+    for tok in tokens:
+        t = tok.strip().lower()
+        if not t:
+            continue
+        # допускаем форматы "bin_0", "0"
+        if t.startswith("bin_"):
+            suffix = t.split("_", 1)[1]
+            bin_name = f"bin_{suffix}"
+        else:
+            bin_name = f"bin_{t}"
+        bins.add(bin_name)
+
+    return bins
+
+
+# 🔸 Вспомогательная функция: расчёт bin_X для цены относительно LR-канала
+def _compute_lr_bin(
+    price_f: float,
+    upper_f: float,
+    lower_f: float,
+) -> Optional[str]:
+    try:
+        price = Decimal(str(price_f))
+        upper = Decimal(str(upper_f))
+        lower = Decimal(str(lower_f))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    H = upper - lower
+    if H <= Decimal("0"):
+        return None
+
+    # выше верхней границы
+    if price > upper:
+        return "bin_0"
+
+    # ниже нижней границы
+    if price < lower:
+        return "bin_9"
+
+    # внутри канала [lower, upper]
+    rel = (upper - price) / H  # 0 → верх, 1 → низ
+
+    if rel < Decimal("0"):
+        rel = Decimal("0")
+    if rel > Decimal("1"):
+        rel = Decimal("1")
+
+    # 8 полос внутри: rel ∈ [0,1] → idx ∈ [0,7]
+    idx = int((rel * Decimal("8")).quantize(Decimal("0"), rounding=ROUND_DOWN))
+    if idx >= 8:
+        idx = 7
+
+    bin_idx = 1 + idx  # bin_1..bin_8
+    return f"bin_{bin_idx}"
