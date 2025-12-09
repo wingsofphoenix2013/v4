@@ -649,8 +649,12 @@ async def _store_positions_postproc(
         to_insert: List[Tuple[Any, ...]] = []
         for uid, info in positions_map.items():
             bad_reasons = info.get("bad_reasons") or []
+
+            # формируем JSON для postproc_meta
             if bad_reasons:
-                postproc_meta = {"bad_reasons": bad_reasons}
+                meta_obj = {"bad_reasons": bad_reasons}
+                # сериализуем в строку, чтобы PG спокойно принял в jsonb
+                postproc_meta = json.dumps(meta_obj, ensure_ascii=False)
             else:
                 postproc_meta = None
 
@@ -772,7 +776,6 @@ async def _load_scenario_deposit(
 
     return dep
 
-
 # 🔸 Пересчёт агрегатов до/после и запись в bt_analysis_scenario_stat
 async def _update_analysis_scenario_stats(
     pg,
@@ -828,6 +831,12 @@ async def _update_analysis_scenario_stats(
                 threshold=MIN_WINRATE_THRESHOLD,
             )
 
+            # сериализуем raw_stat в JSON-строку для jsonb; если отбраковок нет — NULL
+            if raw_stat_obj is not None:
+                raw_stat_json = json.dumps(raw_stat_obj, ensure_ascii=False)
+            else:
+                raw_stat_json = None
+
             # upsert в bt_analysis_scenario_stat
             await conn.execute(
                 """
@@ -875,7 +884,7 @@ async def _update_analysis_scenario_stats(
                 filt_pnl_abs,
                 filt_winrate,
                 filt_roi,
-                raw_stat_obj,
+                raw_stat_json,
             )
 
             log.info(
@@ -890,7 +899,6 @@ async def _update_analysis_scenario_stats(
                 orig["pnl_abs"],
                 filt_pnl_abs,
             )
-
 
 # 🔸 Формирование raw_stat JSON для одного направления
 def _build_raw_stat_json_for_direction(
