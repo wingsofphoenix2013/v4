@@ -18,10 +18,11 @@ from signals.bt_signals_rsimfi import run_rsimfi_backfill
 from signals.bt_signals_rsiatr import run_rsiatr_backfill
 from signals.bt_signals_supertrendadx import run_supertrendadx_backfill
 from signals.bt_signals_lratr import run_lratr_backfill
+from signals.bt_signals_lr_complex import run_lr_complex_backfill
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60      # старт через минуту после запуска backtester_v1
-BT_TIMER_BACKFILL_INTERVAL_SEC = 28800      # повторный запуск полного цикла раз в Х секунд
+BT_TIMER_BACKFILL_INTERVAL_SEC = 57600      # повторный запуск полного цикла раз в Х секунд
 
 # 🔸 Настройки стримовых backfill-сигналов (по умолчанию)
 BT_STREAM_BACKFILL_BATCH_SIZE = 10
@@ -55,6 +56,7 @@ TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
     "rsi_atr_momentum": run_rsiatr_backfill,
     "supertrend_adx": run_supertrendadx_backfill,
     "lr_atr_momentum": run_lratr_backfill,
+    "lr_complex": run_lr_complex_backfill,
 }
 
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
