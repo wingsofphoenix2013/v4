@@ -1,4 +1,4 @@
-# bt_signals_lr_complex.py — упрощённый воркер backfill для LR-сигналов (bounce по каналу с zone_k + фильтр по бинам)
+# bt_signals_lr_complex.py — воркер backfill для LR-сигналов (bounce по каналу с zone_k + фильтр по бинам lr50/lr100)
 
 import asyncio
 import logging
@@ -59,10 +59,10 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         return
 
-    # читаем инстанс LR на m5 (обязательный)
+    # читаем основной инстанс LR на m5 (по нему ищем bounce — условно lr50)
     try:
         lr_cfg = params["lr_instance_id"]
-        lr_m5_instance_id = int(lr_cfg["value"])
+        lr_main_instance_id = int(lr_cfg["value"])
     except Exception as e:
         log.error(
             "BT_SIG_LR_COMPLEX: сигнал id=%s ('%s') — некорректные параметры lr_instance_id (m5): %s",
@@ -71,6 +71,21 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
             e,
         )
         return
+
+    # читаем дополнительный инстанс LR (lr100) — используется только как доп. фильтр по бинам
+    lr100_instance_id: Optional[int] = None
+    lr100_cfg = params.get("lr100_instance_id")
+    if lr100_cfg is not None:
+        try:
+            lr100_instance_id = int(lr100_cfg.get("value"))
+        except Exception as e:
+            log.error(
+                "BT_SIG_LR_COMPLEX: сигнал id=%s ('%s') — некорректные параметры lr100_instance_id: %s",
+                signal_id,
+                name,
+                e,
+            )
+            lr100_instance_id = None
 
     # маска направлений: 'long' / 'short' / 'both' (по умолчанию both)
     dir_mask_cfg = params.get("direction_mask")
@@ -97,9 +112,13 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
     # паттерн фиксируем как "bounce"
     pattern = "bounce"
 
-    # запрещённые бины по направлению (для текущего TF)
-    forbidden_bins_long = _parse_forbidden_bins(params, timeframe, "long")
-    forbidden_bins_short = _parse_forbidden_bins(params, timeframe, "short")
+    # запрещённые бины по основному LR (lr_instance_id) для данного TF
+    forbidden_bins_main_long = _parse_forbidden_bins(params, timeframe, "long")
+    forbidden_bins_main_short = _parse_forbidden_bins(params, timeframe, "short")
+
+    # запрещённые бины по lr100 (если настроены)
+    forbidden_bins_lr100_long = _parse_forbidden_bins(params, timeframe, "long", variant="lr100")
+    forbidden_bins_lr100_short = _parse_forbidden_bins(params, timeframe, "short", variant="lr100")
 
     # рабочее окно по времени
     now = datetime.utcnow()
@@ -118,8 +137,8 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.debug(
         "BT_SIG_LR_COMPLEX: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, "
-        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, zone_k=%.3f, "
-        "forbidden_bins_long=%s, forbidden_bins_short=%s",
+        "тикеров=%s, direction_mask=%s, lr_main_instance_id=%s, lr100_instance_id=%s, pattern=%s, zone_k=%.3f, "
+        "forbidden_main_long=%s, forbidden_main_short=%s, forbidden_lr100_long=%s, forbidden_lr100_short=%s",
         signal_id,
         name,
         signal_key,
@@ -127,11 +146,14 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
         backfill_days,
         len(symbols),
         mask_val,
-        lr_m5_instance_id,
+        lr_main_instance_id,
+        lr100_instance_id,
         pattern,
         zone_k,
-        sorted(forbidden_bins_long),
-        sorted(forbidden_bins_short),
+        sorted(forbidden_bins_main_long),
+        sorted(forbidden_bins_main_short),
+        sorted(forbidden_bins_lr100_long),
+        sorted(forbidden_bins_lr100_short),
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -147,7 +169,8 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 name=name,
                 timeframe=timeframe,
                 symbol=symbol,
-                lr_m5_instance_id=lr_m5_instance_id,
+                lr_main_instance_id=lr_main_instance_id,
+                lr100_instance_id=lr100_instance_id,
                 from_time=from_time,
                 to_time=to_time,
                 existing_events=existing_events,
@@ -156,8 +179,10 @@ async def run_lr_complex_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 allowed_directions=allowed_directions,
                 pattern=pattern,
                 zone_k=zone_k,
-                forbidden_bins_long=forbidden_bins_long,
-                forbidden_bins_short=forbidden_bins_short,
+                forbidden_bins_main_long=forbidden_bins_main_long,
+                forbidden_bins_main_short=forbidden_bins_main_short,
+                forbidden_bins_lr100_long=forbidden_bins_lr100_long,
+                forbidden_bins_lr100_short=forbidden_bins_lr100_short,
             )
         )
 
@@ -265,7 +290,8 @@ async def _process_symbol(
     name: str,
     timeframe: str,
     symbol: str,
-    lr_m5_instance_id: int,
+    lr_main_instance_id: int,
+    lr100_instance_id: Optional[int],
     from_time: datetime,
     to_time: datetime,
     existing_events: set[Tuple[str, datetime, str]],
@@ -274,8 +300,10 @@ async def _process_symbol(
     allowed_directions: Set[str],
     pattern: str,
     zone_k: float,
-    forbidden_bins_long: Set[str],
-    forbidden_bins_short: Set[str],
+    forbidden_bins_main_long: Set[str],
+    forbidden_bins_main_short: Set[str],
+    forbidden_bins_lr100_long: Set[str],
+    forbidden_bins_lr100_short: Set[str],
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
@@ -285,7 +313,8 @@ async def _process_symbol(
                 name=name,
                 timeframe=timeframe,
                 symbol=symbol,
-                lr_m5_instance_id=lr_m5_instance_id,
+                lr_main_instance_id=lr_main_instance_id,
+                lr100_instance_id=lr100_instance_id,
                 from_time=from_time,
                 to_time=to_time,
                 existing_events=existing_events,
@@ -293,8 +322,10 @@ async def _process_symbol(
                 allowed_directions=allowed_directions,
                 pattern=pattern,
                 zone_k=zone_k,
-                forbidden_bins_long=forbidden_bins_long,
-                forbidden_bins_short=forbidden_bins_short,
+                forbidden_bins_main_long=forbidden_bins_main_long,
+                forbidden_bins_main_short=forbidden_bins_main_short,
+                forbidden_bins_lr100_long=forbidden_bins_lr100_long,
+                forbidden_bins_lr100_short=forbidden_bins_lr100_short,
             )
         except Exception as e:
             log.error(
@@ -315,7 +346,8 @@ async def _process_symbol_inner(
     name: str,
     timeframe: str,
     symbol: str,
-    lr_m5_instance_id: int,
+    lr_main_instance_id: int,
+    lr100_instance_id: Optional[int],
     from_time: datetime,
     to_time: datetime,
     existing_events: set[Tuple[str, datetime, str]],
@@ -323,19 +355,37 @@ async def _process_symbol_inner(
     allowed_directions: Set[str],
     pattern: str,
     zone_k: float,
-    forbidden_bins_long: Set[str],
-    forbidden_bins_short: Set[str],
+    forbidden_bins_main_long: Set[str],
+    forbidden_bins_main_short: Set[str],
+    forbidden_bins_lr100_long: Set[str],
+    forbidden_bins_lr100_short: Set[str],
 ) -> Tuple[int, int, int]:
-    # загружаем LR-канал на m5
-    lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
-    if not lr_m5_series or len(lr_m5_series) < 2:
+    # загружаем основной LR-канал (lr_instance_id) на m5 — по нему ищем bounce и биним основной фильтр
+    lr_main_series = await _load_lr_series(pg, lr_main_instance_id, symbol, from_time, to_time)
+    if not lr_main_series or len(lr_main_series) < 2:
         log.debug(
-            "BT_SIG_LR_COMPLEX: недостаточно данных LR m5 для %s, сигнал id=%s ('%s')",
+            "BT_SIG_LR_COMPLEX: недостаточно данных основного LR m5 для %s, сигнал id=%s ('%s')",
             symbol,
             signal_id,
             name,
         )
         return 0, 0, 0
+
+    # загружаем LR-канал lr100 (если указан) — только для доп. бин-фильтра
+    lr100_series: Optional[Dict[datetime, Dict[str, float]]] = None
+    if lr100_instance_id is not None:
+        lr100_series = await _load_lr_series(pg, lr100_instance_id, symbol, from_time, to_time)
+        if not lr100_series:
+            log.debug(
+                "BT_SIG_LR_COMPLEX: нет данных lr100 для %s (instance_id=%s) в окне [%s..%s], "
+                "сигнал id=%s ('%s') — фильтр lr100 применяться не будет",
+                symbol,
+                lr100_instance_id,
+                from_time,
+                to_time,
+                signal_id,
+                name,
+            )
 
     # загружаем OHLCV для m5 (для цен)
     ohlcv_series = await _load_ohlcv_series(pg, symbol, timeframe, from_time, to_time)
@@ -350,11 +400,11 @@ async def _process_symbol_inner(
         )
         return 0, 0, 0
 
-    # работаем по общим временным точкам LR m5 + OHLCV
-    times = sorted(set(lr_m5_series.keys()) & set(ohlcv_series.keys()))
+    # работаем по общим временным точкам основного LR m5 + OHLCV
+    times = sorted(set(lr_main_series.keys()) & set(ohlcv_series.keys()))
     if len(times) < 2:
         log.debug(
-            "BT_SIG_LR_COMPLEX: нет достаточного пересечения LR/OHLCV для %s, сигнал id=%s ('%s')",
+            "BT_SIG_LR_COMPLEX: нет достаточного пересечения основного LR/OHLCV для %s, сигнал id=%s ('%s')",
             symbol,
             signal_id,
             name,
@@ -377,8 +427,8 @@ async def _process_symbol_inner(
         prev_ts = times[i - 1]
         ts = times[i]
 
-        lr_prev = lr_m5_series.get(prev_ts)
-        lr_curr = lr_m5_series.get(ts)
+        lr_prev = lr_main_series.get(prev_ts)
+        lr_curr = lr_main_series.get(ts)
         if lr_prev is None or lr_curr is None:
             continue
 
@@ -426,7 +476,7 @@ async def _process_symbol_inner(
 
         direction: Optional[str] = None
 
-        # LONG bounce: отскок от нижней границы
+        # LONG bounce: отскок от нижней границы по основному LR
         if "long" in allowed_directions and angle_m5_f > 0.0:
             # зона у нижней границы
             if zone_k == 0.0:
@@ -439,7 +489,7 @@ async def _process_symbol_inner(
             if in_zone_prev and close_curr_f > lower_prev_f:
                 direction = "long"
 
-        # SHORT bounce: отскок от верхней границы
+        # SHORT bounce: отскок от верхней границы по основному LR
         if direction is None and "short" in allowed_directions and angle_m5_f < 0.0:
             # зона у верхней границы
             if zone_k == 0.0:
@@ -455,22 +505,56 @@ async def _process_symbol_inner(
         if direction is None:
             continue
 
-        # бин по цене входа (close текущего бара) относительно LR-канала на этом же баре (ts)
+        # выбираем нужные наборы запрещённых бинов по направлению
         if direction == "long":
-            forbidden_bins = forbidden_bins_long
+            forbidden_main = forbidden_bins_main_long
+            forbidden_lr100 = forbidden_bins_lr100_long
         else:
-            forbidden_bins = forbidden_bins_short
+            forbidden_main = forbidden_bins_main_short
+            forbidden_lr100 = forbidden_bins_lr100_short
 
-        bin_name = _compute_lr_bin(
+        # бин по цене входа (close текущего бара) относительно основного LR на этом же баре (ts)
+        bin_main = _compute_lr_bin(
             price_f=close_curr_f,
             upper_f=upper_curr_f,
             lower_f=lower_curr_f,
         )
-        if bin_name is None:
+        if bin_main is None:
             continue
 
-        if bin_name in forbidden_bins:
+        # фильтр по основному LR: если бин запрещён — пропускаем
+        if bin_main in forbidden_main:
             continue
+
+        # фильтр по lr100: если настроены запрещённые бины и есть данные для lr100 на этом баре —
+        # рассчитываем бин и проверяем, что он не запрещён
+        if lr100_series is not None and forbidden_lr100:
+            lr100_curr = lr100_series.get(ts)
+            if lr100_curr is None:
+                # нет данных lr100 на этом баре — считаем, что фильтр не пройден
+                continue
+
+            upper100 = lr100_curr.get("upper")
+            lower100 = lr100_curr.get("lower")
+            if upper100 is None or lower100 is None:
+                continue
+
+            try:
+                upper100_f = float(upper100)
+                lower100_f = float(lower100)
+            except Exception:
+                continue
+
+            bin_lr100 = _compute_lr_bin(
+                price_f=close_curr_f,
+                upper_f=upper100_f,
+                lower_f=lower100_f,
+            )
+            if bin_lr100 is None:
+                continue
+
+            if bin_lr100 in forbidden_lr100:
+                continue
 
         key_event = (symbol, ts, direction)
         if key_event in existing_events:
@@ -500,8 +584,11 @@ async def _process_symbol_inner(
             "lower_prev": lower_prev_f,
             "upper_curr": upper_curr_f,
             "lower_curr": lower_curr_f,
-            "lr_m5_instance_id": lr_m5_instance_id,
+            "lr_main_instance_id": lr_main_instance_id,
         }
+
+        if lr100_instance_id is not None:
+            raw_message["lr100_instance_id"] = lr100_instance_id
 
         to_insert.append(
             (
@@ -664,8 +751,14 @@ def _parse_forbidden_bins(
     params: Dict[str, Any],
     timeframe: str,
     direction: str,
+    variant: Optional[str] = None,
 ) -> Set[str]:
-    param_name = f"forbidden_bins_{timeframe}_{direction}"
+    # формируем имя параметра: forbidden_bins_{tf}_{direction} или forbidden_bins_{tf}_{variant}_{direction}
+    if variant:
+        param_name = f"forbidden_bins_{timeframe}_{variant}_{direction}"
+    else:
+        param_name = f"forbidden_bins_{timeframe}_{direction}"
+
     cfg = params.get(param_name)
     if cfg is None:
         return set()
@@ -678,7 +771,6 @@ def _parse_forbidden_bins(
     if not text:
         return set()
 
-    # разделители: запятая, точка с запятой, пробелы
     tokens = re.split(r"[,\s;]+", text)
     bins: Set[str] = set()
 
