@@ -20,7 +20,7 @@ POSTPROC_STREAM_BLOCK_MS = 5000
 POSTPROC_MAX_CONCURRENCY = 8
 
 # минимальный winrate для биннов; всё, что ниже — считается "плохим бинном"
-MIN_WINRATE_THRESHOLD = Decimal("0.25")
+MIN_WINRATE_THRESHOLD = Decimal("0.3334")
 
 # кеш последних finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_analysis_finished_at: Dict[Tuple[int, int], datetime] = {}
@@ -808,14 +808,14 @@ async def _update_analysis_scenario_stats(
             good_positions = per_dir_good.get(direction, [])
             filt_trades = len(good_positions)
             filt_pnl_abs = sum((p["pnl_abs"] for p in good_positions), Decimal("0"))
-            # комментарий: winrate после фильтрации
+            # winrate после фильтрации
             if filt_trades > 0:
                 wins = sum(1 for p in good_positions if p["pnl_abs"] > 0)
                 filt_winrate = Decimal(wins) / Decimal(filt_trades)
             else:
                 filt_winrate = Decimal("0")
 
-            # комментарий: ROI после фильтрации, если есть депозит
+            # ROI после фильтрации, если есть депозит
             if deposit and deposit > 0:
                 try:
                     filt_roi = filt_pnl_abs / deposit
@@ -823,6 +823,23 @@ async def _update_analysis_scenario_stats(
                     filt_roi = Decimal("0")
             else:
                 filt_roi = Decimal("0")
+
+            # комментарий: считаем "аккуратность" среди удалённых сделок
+            removed_positions = [
+                p for p in per_dir_all.get(direction, [])
+                if not p["good_state"]
+            ]
+            removed_trades = len(removed_positions)
+            if removed_trades > 0:
+                removed_losers = sum(
+                    1 for p in removed_positions
+                    if p["pnl_abs"] <= 0
+                )
+                removed_accuracy = (
+                    Decimal(removed_losers) / Decimal(removed_trades)
+                )
+            else:
+                removed_accuracy = Decimal("0")
 
             # формируем raw_stat по отбраковкам для данного направления
             dir_removed = removed_stats.get(direction) or {}
@@ -852,26 +869,28 @@ async def _update_analysis_scenario_stats(
                     filt_pnl_abs,
                     filt_winrate,
                     filt_roi,
+                    removed_accuracy,
                     raw_stat
                 )
                 VALUES (
                     $1, $2, $3,
                     $4, $5, $6, $7,
                     $8, $9, $10, $11,
-                    $12
+                    $12, $13
                 )
                 ON CONFLICT (scenario_id, signal_id, direction)
                 DO UPDATE SET
-                    orig_trades  = EXCLUDED.orig_trades,
-                    orig_pnl_abs = EXCLUDED.orig_pnl_abs,
-                    orig_winrate = EXCLUDED.orig_winrate,
-                    orig_roi     = EXCLUDED.orig_roi,
-                    filt_trades  = EXCLUDED.filt_trades,
-                    filt_pnl_abs = EXCLUDED.filt_pnl_abs,
-                    filt_winrate = EXCLUDED.filt_winrate,
-                    filt_roi     = EXCLUDED.filt_roi,
-                    raw_stat     = EXCLUDED.raw_stat,
-                    updated_at   = now()
+                    orig_trades      = EXCLUDED.orig_trades,
+                    orig_pnl_abs     = EXCLUDED.orig_pnl_abs,
+                    orig_winrate     = EXCLUDED.orig_winrate,
+                    orig_roi         = EXCLUDED.orig_roi,
+                    filt_trades      = EXCLUDED.filt_trades,
+                    filt_pnl_abs     = EXCLUDED.filt_pnl_abs,
+                    filt_winrate     = EXCLUDED.filt_winrate,
+                    filt_roi         = EXCLUDED.filt_roi,
+                    removed_accuracy = EXCLUDED.removed_accuracy,
+                    raw_stat         = EXCLUDED.raw_stat,
+                    updated_at       = now()
                 """,
                 scenario_id,
                 signal_id,
@@ -884,13 +903,14 @@ async def _update_analysis_scenario_stats(
                 filt_pnl_abs,
                 filt_winrate,
                 filt_roi,
+                removed_accuracy,
                 raw_stat_json,
             )
 
             log.info(
                 "BT_ANALYSIS_POSTPROC: обновлена bt_analysis_scenario_stat для scenario_id=%s, "
                 "signal_id=%s, direction=%s — orig_trades=%s, filt_trades=%s, "
-                "orig_pnl=%s, filt_pnl=%s",
+                "orig_pnl=%s, filt_pnl=%s, removed_trades=%s, removed_accuracy=%.4f",
                 scenario_id,
                 signal_id,
                 direction,
@@ -898,8 +918,9 @@ async def _update_analysis_scenario_stats(
                 filt_trades,
                 orig["pnl_abs"],
                 filt_pnl_abs,
+                removed_trades,
+                float(removed_accuracy),
             )
-
 # 🔸 Формирование raw_stat JSON для одного направления
 def _build_raw_stat_json_for_direction(
     dir_removed: Dict[str, Dict[str, Any]],
