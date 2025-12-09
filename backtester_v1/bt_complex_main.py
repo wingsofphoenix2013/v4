@@ -512,7 +512,6 @@ async def _load_complex_instances_for_pair(
     )
     return complexes_list
 
-
 # 🔸 Запуск одного комплекса: очистка результатов, запуск воркера, запись raw и пересчёт bin-статистики
 async def _run_complex(
     complex_cfg: Dict[str, Any],
@@ -543,10 +542,17 @@ async def _run_complex(
             "bins_rows": 0,
         }
 
-    # indicator_param — по аналогии: param_name, если используется
-    indicator_param_cfg = params.get("param_name")
-    if indicator_param_cfg is not None:
-        indicator_param = str(indicator_param_cfg.get("value") or "").strip() or None
+    # формируем indicator_param из параметров комплекса (tf + ema_length + window_bars)
+    tf_cfg = params.get("tf") or {}
+    ema_len_cfg = params.get("ema_length") or {}
+    window_cfg = params.get("window_bars") or {}
+
+    tf_val = str(tf_cfg.get("value")).strip() if tf_cfg.get("value") is not None else None
+    ema_len_val = str(ema_len_cfg.get("value")).strip() if ema_len_cfg.get("value") is not None else None
+    window_val = str(window_cfg.get("value")).strip() if window_cfg.get("value") is not None else None
+
+    if tf_val and ema_len_val and window_val:
+        indicator_param = f"ema{ema_len_val}_{tf_val}_w{window_val}"
     else:
         indicator_param = None
 
@@ -742,7 +748,6 @@ async def _run_complex(
             "rows_inserted": 0,
             "bins_rows": 0,
         }
-
 
 # 🔸 Пересчёт статистики по биннам для комплексов в bt_complex_bins_stat
 async def _recalc_complex_bins_stat(
