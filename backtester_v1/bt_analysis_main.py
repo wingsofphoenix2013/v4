@@ -32,6 +32,7 @@ from analysis.bt_analysis_adxdmi_clarity import run_adxdmi_clarity_analysis
 from analysis.bt_analysis_atr_sl import run_atr_sl_analysis
 from analysis.bt_analysis_atr_sl_quantile import run_atr_sl_quantile_analysis
 from analysis.bt_analysis_ema_dist import run_ema_dist_analysis
+from analysis.bt_analysis_ema_stack import run_ema_stack_analysis
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
@@ -47,6 +48,7 @@ ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("atr", "atr_sl_bin"): run_atr_sl_analysis,
     ("atr", "atr_sl_qbin"): run_atr_sl_quantile_analysis,
     ("ema", "ema_dist_bin"): run_ema_dist_analysis,
+    ("ema", "ema_stack_bin"): run_ema_stack_analysis,
 }
 
 # 🔸 Константы стрима анализа
