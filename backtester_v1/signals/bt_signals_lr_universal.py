@@ -101,6 +101,14 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         trend_type = "agnostic"
 
+    # флаг: нужно ли следить, чтобы после отскока цена оставалась в своей половине канала
+    keep_half_cfg = params.get("keep_half")
+    if keep_half_cfg:
+        keep_half_raw = keep_half_cfg.get("value") or ""
+        keep_half = str(keep_half_raw).strip().lower() == "true"
+    else:
+        keep_half = False
+
     # параметр зоны у границы канала: доля высоты канала (0.0 .. 0.5)
     zone_k = _get_float_param(params, "zone_k", 0.0)
     if zone_k < 0.0:
@@ -128,7 +136,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.debug(
         "BT_SIG_LR_UNI: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, "
-        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, trend_type=%s, zone_k=%.3f",
+        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, trend_type=%s, zone_k=%.3f, keep_half=%s",
         signal_id,
         name,
         signal_key,
@@ -140,6 +148,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         pattern,
         trend_type,
         zone_k,
+        keep_half,
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -166,6 +175,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 pattern=pattern,
                 trend_type=trend_type,
                 zone_k=zone_k,
+                keep_half=keep_half,
             )
         )
 
@@ -185,7 +195,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     log.info(
         "BT_SIG_LR_UNI: backfill завершён для сигнала id=%s ('%s', key=%s): "
-        "вставлено событий=%s, long=%s, short=%s, окно=[%s .. %s], trend_type=%s, zone_k=%.3f",
+        "вставлено событий=%s, long=%s, short=%s, окно=[%s .. %s], trend_type=%s, zone_k=%.3f, keep_half=%s",
         signal_id,
         name,
         signal_key,
@@ -196,6 +206,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         to_time,
         trend_type,
         zone_k,
+        keep_half,
     )
 
     # отправляем уведомление в Redis Stream о готовности сигналов
@@ -285,6 +296,7 @@ async def _process_symbol(
     pattern: str,
     trend_type: str,
     zone_k: float,
+    keep_half: bool,
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
@@ -303,6 +315,7 @@ async def _process_symbol(
                 pattern=pattern,
                 trend_type=trend_type,
                 zone_k=zone_k,
+                keep_half=keep_half,
             )
         except Exception as e:
             log.error(
@@ -332,6 +345,7 @@ async def _process_symbol_inner(
     pattern: str,
     trend_type: str,
     zone_k: float,
+    keep_half: bool,
 ) -> Tuple[int, int, int]:
     # загружаем LR-канал на m5
     lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
@@ -405,8 +419,19 @@ async def _process_symbol_inner(
         lower_curr = lr_curr.get("lower")
         upper_prev = lr_prev.get("upper")
         lower_prev = lr_prev.get("lower")
+        center_curr = lr_curr.get("center")
 
-        if angle_m5 is None or upper_curr is None or lower_curr is None or upper_prev is None or lower_prev is None:
+        if (
+            angle_m5 is None
+            or upper_curr is None
+            or lower_curr is None
+            or upper_prev is None
+            or lower_prev is None
+        ):
+            continue
+
+        # если keep_half включён, но нет center_curr — не можем применить правило половины
+        if keep_half and center_curr is None:
             continue
 
         try:
@@ -417,6 +442,7 @@ async def _process_symbol_inner(
             lower_prev_f = float(lower_prev)
             close_prev_f = float(close_prev)
             close_curr_f = float(close_curr)
+            center_curr_f = float(center_curr) if center_curr is not None else 0.0
         except Exception:
             continue
 
@@ -442,28 +468,34 @@ async def _process_symbol_inner(
         if "long" in allowed_directions and long_trend_ok:
             if zone_k == 0.0:
                 # поведение: любой close_prev ниже/на границе
-                in_zone_prev = (close_prev_f <= lower_prev_f)
+                in_zone_prev = close_prev_f <= lower_prev_f
             else:
                 zone_up = zone_k * H
                 threshold = lower_prev_f + zone_up
                 # позволяем глубокие выносы ниже lower_prev, но не слишком далеко выше
-                in_zone_prev = (close_prev_f <= threshold)
+                in_zone_prev = close_prev_f <= threshold
 
             if in_zone_prev and close_curr_f > lower_prev_f:
+                # если keep_half включён — цена после отскока должна быть в нижней половине канала
+                if keep_half and not (close_curr_f <= center_curr_f):
+                    continue
                 direction = "long"
 
         # SHORT bounce: отскок от верхней границы
         if direction is None and "short" in allowed_directions and short_trend_ok:
             if zone_k == 0.0:
                 # поведение: любой close_prev выше/на границе
-                in_zone_prev = (close_prev_f >= upper_prev_f)
+                in_zone_prev = close_prev_f >= upper_prev_f
             else:
                 zone_down = zone_k * H
                 threshold = upper_prev_f - zone_down
                 # позволяем глубокие выносы выше upper_prev, но не слишком далеко ниже
-                in_zone_prev = (close_prev_f >= threshold)
+                in_zone_prev = close_prev_f >= threshold
 
             if in_zone_prev and close_curr_f < upper_prev_f:
+                # если keep_half включён — цена после отскока должна быть в верхней половине канала
+                if keep_half and not (close_curr_f >= center_curr_f):
+                    continue
                 direction = "short"
 
         if direction is None:
@@ -499,8 +531,10 @@ async def _process_symbol_inner(
             "lower_prev": lower_prev_f,
             "upper_curr": upper_curr_f,
             "lower_curr": lower_curr_f,
+            "center_curr": center_curr_f,
             "zone_k": float(zone_k),
             "trend_type": trend_type,
+            "keep_half": keep_half,
             "lr_m5_instance_id": lr_m5_instance_id,
         }
 
@@ -524,7 +558,7 @@ async def _process_symbol_inner(
 
     if not to_insert:
         log.debug(
-            "BT_SIG_LR_UNI: сигналов не найдено для %s в окне [%s..%s], сигнал id=%s ('%s'), trend_type=%s, zone_k=%.3f",
+            "BT_SIG_LR_UNI: сигналов не найдено для %s в окне [%s..%s], сигнал id=%s ('%s'), trend_type=%s, zone_k=%.3f, keep_half=%s",
             symbol,
             from_time,
             to_time,
@@ -532,6 +566,7 @@ async def _process_symbol_inner(
             name,
             trend_type,
             zone_k,
+            keep_half,
         )
         return 0, 0, 0
 
@@ -548,7 +583,7 @@ async def _process_symbol_inner(
     inserted = len(to_insert)
     log.debug(
         "BT_SIG_LR_UNI: %s → вставлено событий=%s (long=%s, short=%s) "
-        "для сигнала id=%s ('%s'), trend_type=%s, zone_k=%.3f",
+        "для сигнала id=%s ('%s'), trend_type=%s, zone_k=%.3f, keep_half=%s",
         symbol,
         inserted,
         long_count,
@@ -557,6 +592,7 @@ async def _process_symbol_inner(
         name,
         trend_type,
         zone_k,
+        keep_half,
     )
     return inserted, long_count, short_count
 
