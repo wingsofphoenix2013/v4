@@ -11,14 +11,6 @@ from typing import Dict, Any, List, Optional, Callable, Awaitable
 from backtester_config import get_enabled_signals
 
 # 🔸 Воркеры таймерных backfill-сигналов
-from signals.bt_signals_emacross import run_emacross_backfill
-from signals.bt_signals_bbrsi import run_bbrsi_backfill
-from signals.bt_signals_bbadx import run_bbadx_backfill
-from signals.bt_signals_rsimfi import run_rsimfi_backfill
-from signals.bt_signals_rsiatr import run_rsiatr_backfill
-from signals.bt_signals_supertrendadx import run_supertrendadx_backfill
-from signals.bt_signals_lratr import run_lratr_backfill
-from signals.bt_signals_lr_complex import run_lr_complex_backfill
 from signals.bt_signals_lr_universal import run_lr_universal_backfill
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
@@ -50,15 +42,7 @@ class LiveSignalHandler:
 
 # 🔸 Реестр таймерных backfill-сигналов: key → handler(signal, pg, redis)
 TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
-    "ema_cross_plain": run_emacross_backfill,
-    "bb_rsi_reversion": run_bbrsi_backfill,
-    "bb_adx_breakout": run_bbadx_backfill,
-    "rsi_mfi_range": run_rsimfi_backfill,
-    "rsi_atr_momentum": run_rsiatr_backfill,
-    "supertrend_adx": run_supertrendadx_backfill,
-    "lr_atr_momentum": run_lratr_backfill,
-    "lr_complex": run_lr_complex_backfill,
-    "lr_atr_momentum": run_lr_universal_backfill,
+    "lr_universal": run_lr_universal_backfill,
 }
 
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
