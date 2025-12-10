@@ -282,65 +282,82 @@ def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, Decimal]]:
     # если после парсинга бины пустые — вернём пустой список, выше подставится дефолт
     return bins
 
-
-# 🔸 Дефолтные бины EMA-distance в диапазоне [-5%, +5%]
+# 🔸 Дефолтные бины EMA-distance: более плотные около 0, с хвостами
 def _default_ema_dist_bins() -> List[Dict[str, Decimal]]:
     bins: List[Dict[str, Decimal]] = []
 
-    # границы: -5%, -3%, -1%, +1%, +3%, +5%
-    boundaries = [
-        Decimal("-0.05"),
-        Decimal("-0.03"),
-        Decimal("-0.01"),
-        Decimal("0.01"),
-        Decimal("0.03"),
-        Decimal("0.05"),
-    ]
+    # границы в долях (0.01 = 1%)
+    b1 = Decimal("-0.02")   # -2%
+    b2 = Decimal("-0.01")   # -1%
+    b3 = Decimal("-0.005")  # -0.5%
+    b4 = Decimal("0.005")   # +0.5%
+    b5 = Decimal("0.01")    # +1%
+    b6 = Decimal("0.02")    # +2%
 
-    # бины:
-    # [-0.05, -0.03)
+    # бин 0: dist < -2%
     bins.append(
         {
-            "name": "-0.05--0.03",
-            "min": boundaries[0],
-            "max": boundaries[1],
+            "name": "<-0.02",
+            "min": MIN_DIST,  # например -0.05
+            "max": b1,
         }
     )
-    # [-0.03, -0.01)
+
+    # бин 1: [-2%, -1%)
     bins.append(
         {
-            "name": "-0.03--0.01",
-            "min": boundaries[1],
-            "max": boundaries[2],
+            "name": "-0.02--0.01",
+            "min": b1,
+            "max": b2,
         }
     )
-    # [-0.01, 0.01)
+
+    # бин 2: [-1%, -0.5%)
     bins.append(
         {
-            "name": "-0.01-0.01",
-            "min": boundaries[2],
-            "max": boundaries[3],
+            "name": "-0.01--0.005",
+            "min": b2,
+            "max": b3,
         }
     )
-    # [0.01, 0.03)
+
+    # бин 3: [-0.5%, +0.5%]
     bins.append(
         {
-            "name": "0.01-0.03",
-            "min": boundaries[3],
-            "max": boundaries[4],
+            "name": "-0.005-0.005",
+            "min": b3,
+            "max": b4,
         }
     )
-    # [0.03, 0.05] (последний бин включает верхнюю границу)
+
+    # бин 4: (0.5%, 1%]
     bins.append(
         {
-            "name": "0.03-0.05",
-            "min": boundaries[4],
-            "max": boundaries[5],
+            "name": "0.005-0.01",
+            "min": b4,
+            "max": b5,
+        }
+    )
+
+    # бин 5: (1%, 2%]
+    bins.append(
+        {
+            "name": "0.01-0.02",
+            "min": b5,
+            "max": b6,
+        }
+    )
+
+    # бин 6: dist > 2%
+    bins.append(
+        {
+            "name": ">0.02",
+            "min": b6,
+            "max": MAX_DIST,  # например 0.05
         }
     )
 
     return bins
-
 
 # 🔸 Определение имени бина для значения dist
 def _assign_bin(
