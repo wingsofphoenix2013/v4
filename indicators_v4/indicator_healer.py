@@ -20,7 +20,7 @@ BB_TS_PREFIX = "bb:ts"  # bb:ts:{symbol}:{interval}:{field}
 
 
 # 🔸 Выборка «дыр» со статусом found и группировка по (instance_id, symbol, timeframe)
-async def fetch_found_gaps_grouped(pg, limit_pairs: int = 1000):
+async def fetch_found_gaps_grouped(pg, limit_pairs: int = 5_000):
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -199,7 +199,7 @@ async def write_healed(pg, instance_id: int, symbol: str, open_time: datetime, v
 
 
 # 🔸 Основной воркер healer: пересчёт и дозапись в БД
-async def run_indicator_healer(pg, redis, pause_sec: int = 2):
+async def run_indicator_healer(pg, redis, pause_sec: int = 0.5):
     log.debug("IND_HEALER: лечение индикаторных пропусков запущено")
     sema = asyncio.Semaphore(4)
 

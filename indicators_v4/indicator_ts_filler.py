@@ -6,7 +6,7 @@ import logging
 log = logging.getLogger("IND_TS_FILLER")
 
 # 🔸 Выборка «дыр» со статусом healed_db и группировка по (instance_id, symbol, timeframe)
-async def fetch_healed_db_gaps(pg, limit_rows: int = 1000):
+async def fetch_healed_db_gaps(pg, limit_rows: int = 5_000):
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -87,11 +87,11 @@ async def write_ts_and_mark(pg, redis, instance_id: int, symbol: str, timeframe:
     return len(written)
 
 # 🔸 Основной воркер TS-филлера
-async def run_indicator_ts_filler(pg, redis, pause_sec: int = 2):
+async def run_indicator_ts_filler(pg, redis, pause_sec: int = 0.5):
     log.debug("TS_FILLER индикаторов запущен")
     while True:
         try:
-            groups = await fetch_healed_db_gaps(pg)
+            groups = await fetch_healed_db_gaps(pg, limit_rows=5_000)
             if not groups:
                 await asyncio.sleep(pause_sec)
                 continue
