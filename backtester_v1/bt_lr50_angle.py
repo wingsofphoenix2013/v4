@@ -15,43 +15,42 @@ LR_TFS = ["m5", "m15", "h1"]
 
 # 🔸 Настройки периодичности
 INITIAL_DELAY_SEC = 60
-SLEEP_BETWEEN_RUNS_SEC = 3600
+SLEEP_BETWEEN_RUNS_SEC = 3600  # 1 час
 
-# 🔸 Биннинг для углов LR50: от 0 в обе стороны с шагом 0.5 до -5/5, остальное в крайние кучи
-# порядок важен для аккуратного логирования
+
+# 🔸 Биннинг углов LR50: шаг 0.1 от -0.5 до 0.5 + крайние кучи
 def _build_angle_bins() -> List[Tuple[Optional[float], Optional[float], str]]:
     bins: List[Tuple[Optional[float], Optional[float], str]] = []
 
-    # левая "куча": angle < -5.0
-    bins.append((None, -5.0, "< -5.0"))
+    # левая куча: angle < -0.5
+    bins.append((None, -0.5, "< -0.5"))
 
-    # промежутки от -5.0 до 0.0, шаг 0.5: [-5.0,-4.5), [-4.5,-4.0), ..., [-0.5,0.0)
-    step = 0.5
-    v = -5.0
+    # промежутки от -0.5 до 0.0
+    step = 0.1
+    v = -0.5
     while v < 0.0:
         lo = v
-        hi = v + step
-        # последний отрезок до 0.0 не включительно
+        hi = round(v + step, 10)
         label = f"[{lo:.1f}; {hi:.1f})"
         bins.append((lo, hi, label))
         v = hi
 
-    # от 0.0 до 5.0: [0.0,0.5), [0.5,1.0), ..., [4.5,5.0)
+    # промежутки от 0.0 до 0.5
     v = 0.0
-    while v < 5.0:
+    while v < 0.5:
         lo = v
-        hi = v + step
+        hi = round(v + step, 10)
         label = f"[{lo:.1f}; {hi:.1f})"
         bins.append((lo, hi, label))
         v = hi
 
-    # правая "куча": angle >= 5.0
-    bins.append((5.0, None, ">= 5.0"))
+    # правая куча: angle >= 0.5
+    bins.append((0.5, None, ">= 0.5"))
 
     return bins
 
 
-ANGLE_BINS = _build_angle_bins()
+ANGLE_BINS: List[Tuple[Optional[float], Optional[float], str]] = _build_angle_bins()
 
 
 # 🔸 Публичная точка входа: периодический запуск хистограмм по всем сигналам
@@ -88,6 +87,11 @@ async def run_bt_lr50_angle_worker(pg) -> None:
 async def _run_single_pass(pg) -> None:
     log.debug("BT_LR50_ANGLE: старт одиночного прохода по bt_scenario_positions")
 
+    # сначала очищаем таблицу bt_analysis_angle целиком
+    async with pg.acquire() as conn:
+        await conn.execute("DELETE FROM bt_analysis_angle")
+    log.debug("BT_LR50_ANGLE: таблица bt_analysis_angle очищена перед новым проходом")
+
     signal_ids = await _load_distinct_signal_ids(pg)
     if not signal_ids:
         log.info("BT_LR50_ANGLE: в bt_scenario_positions нет сигналов, проход завершён")
@@ -98,8 +102,10 @@ async def _run_single_pass(pg) -> None:
         len(signal_ids),
     )
 
+    run_at = datetime.utcnow()
+
     for signal_id in signal_ids:
-        await _process_signal(pg, signal_id)
+        await _process_signal(pg, signal_id, run_at)
 
 
 # 🔸 Загрузка списка уникальных signal_id из bt_scenario_positions
@@ -115,8 +121,8 @@ async def _load_distinct_signal_ids(pg) -> List[int]:
     return [int(r["signal_id"]) for r in rows]
 
 
-# 🔸 Обработка одного signal_id: подсчёт гистограмм по tf ∈ {m5, m15, h1}
-async def _process_signal(pg, signal_id: int) -> None:
+# 🔸 Обработка одного signal_id: подсчёт гистограмм по tf ∈ {m5, m15, h1} и запись в bt_analysis_angle
+async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -137,9 +143,10 @@ async def _process_signal(pg, signal_id: int) -> None:
         )
         return
 
-    # готовим счётчики по TF и бинам
     # структура: tf -> label -> count
-    hist: Dict[str, Dict[str, int]] = {tf: {label: 0 for _, _, label in ANGLE_BINS} for tf in LR_TFS}
+    hist: Dict[str, Dict[str, int]] = {
+        tf: {label: 0 for _, _, label in ANGLE_BINS} for tf in LR_TFS
+    }
     missing_by_tf: Dict[str, int] = {tf: 0 for tf in LR_TFS}
     total_by_tf: Dict[str, int] = {tf: 0 for tf in LR_TFS}
 
@@ -162,19 +169,38 @@ async def _process_signal(pg, signal_id: int) -> None:
 
             label = _assign_angle_bin(angle)
             if label is None:
-                # на всякий случай считаем это как missing
                 missing_by_tf[tf] += 1
                 continue
 
             hist[tf][label] += 1
 
-    # логируем итоговую статистику по каждому TF
+    # формируем строки для вставки в bt_analysis_angle
+    rows_to_insert: List[Tuple[Any, ...]] = []
+
     for tf in LR_TFS:
         total = total_by_tf[tf]
         missing = missing_by_tf[tf]
         used = total - missing
 
-        # формируем компактное представление гистограммы
+        for lo, hi, label in ANGLE_BINS:
+            count = hist[tf].get(label, 0)
+            # сохраняем все бины, даже с нулевым count — можно убрать условие, если нужен только ненулевой
+            rows_to_insert.append(
+                (
+                    run_at,
+                    signal_id,
+                    tf,
+                    lo,
+                    hi,
+                    label,
+                    total,
+                    used,
+                    missing,
+                    count,
+                )
+            )
+
+        # компактное summary в лог
         bins_repr = ", ".join(
             f"{label}: {count}"
             for label, count in hist[tf].items()
@@ -190,6 +216,37 @@ async def _process_signal(pg, signal_id: int) -> None:
             missing,
             bins_repr,
         )
+
+    # записываем в bt_analysis_angle
+    async with pg.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO bt_analysis_angle (
+                run_at,
+                signal_id,
+                timeframe,
+                bin_lo,
+                bin_hi,
+                bin_label,
+                positions_total,
+                positions_with_angle,
+                positions_missing,
+                count_in_bin
+            )
+            VALUES (
+                $1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10
+            )
+            """,
+            rows_to_insert,
+        )
+
+    log.debug(
+        "BT_LR50_ANGLE: в bt_analysis_angle записано строк=%s для signal_id=%s",
+        len(rows_to_insert),
+        signal_id,
+    )
 
 
 # 🔸 Извлечение lr50_angle из raw_stat для заданного TF
@@ -234,11 +291,11 @@ def _assign_angle_bin(angle: Decimal) -> Optional[str]:
         return None
 
     for lo, hi, label in ANGLE_BINS:
-        # левая "куча": angle < hi
+        # левая куча: angle < hi
         if lo is None and hi is not None:
             if val < hi:
                 return label
-        # правая "куча": angle >= lo
+        # правая куча: angle >= lo
         elif lo is not None and hi is None:
             if val >= lo:
                 return label
