@@ -18,39 +18,51 @@ INITIAL_DELAY_SEC = 60
 SLEEP_BETWEEN_RUNS_SEC = 3600  # 1 час
 
 
-# 🔸 Биннинг углов LR50: шаг 0.1 от -0.5 до 0.5 + крайние кучи
-def _build_angle_bins() -> List[Tuple[Optional[float], Optional[float], str]]:
-    bins: List[Tuple[Optional[float], Optional[float], str]] = []
+# 🔸 Вспомогательная функция форматирования Decimal с 2 знаками
+def _fmt2(d: Decimal) -> str:
+    return str(d.quantize(Decimal("0.00")))
 
-    # левая куча: angle < -0.5
-    bins.append((None, -0.5, "< -0.5"))
 
-    # промежутки от -0.5 до 0.0
-    step = 0.1
-    v = -0.5
-    while v < 0.0:
+# 🔸 Биннинг углов LR50:
+#     - левая куча: angle < -0.20
+#     - [-0.20; -0.10)
+#     - диапазон [-0.10; 0.10) с шагом 0.02
+#     - [0.10; 0.20)
+#     - правая куча: angle >= 0.20
+def _build_angle_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
+    bins: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = []
+
+    D = Decimal
+
+    # левая куча: angle < -0.20
+    bins.append((None, D("-0.20"), "< -0.20"))
+
+    # [-0.20; -0.10)
+    lo = D("-0.20")
+    hi = D("-0.10")
+    bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
+
+    # [-0.10; 0.10) с шагом 0.02
+    step = D("0.02")
+    v = D("-0.10")
+    while v < D("0.10"):
         lo = v
-        hi = round(v + step, 10)
-        label = f"[{lo:.1f}; {hi:.1f})"
-        bins.append((lo, hi, label))
+        hi = v + step
+        bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
         v = hi
 
-    # промежутки от 0.0 до 0.5
-    v = 0.0
-    while v < 0.5:
-        lo = v
-        hi = round(v + step, 10)
-        label = f"[{lo:.1f}; {hi:.1f})"
-        bins.append((lo, hi, label))
-        v = hi
+    # [0.10; 0.20)
+    lo = D("0.10")
+    hi = D("0.20")
+    bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
 
-    # правая куча: angle >= 0.5
-    bins.append((0.5, None, ">= 0.5"))
+    # правая куча: angle >= 0.20
+    bins.append((D("0.20"), None, ">= 0.20"))
 
     return bins
 
 
-ANGLE_BINS: List[Tuple[Optional[float], Optional[float], str]] = _build_angle_bins()
+ANGLE_BINS: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = _build_angle_bins()
 
 
 # 🔸 Публичная точка входа: периодический запуск хистограмм по всем сигналам
@@ -184,7 +196,6 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
 
         for lo, hi, label in ANGLE_BINS:
             count = hist[tf].get(label, 0)
-            # сохраняем все бины, даже с нулевым count — можно убрать условие, если нужен только ненулевой
             rows_to_insert.append(
                 (
                     run_at,
@@ -200,7 +211,6 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
                 )
             )
 
-        # компактное summary в лог
         bins_repr = ", ".join(
             f"{label}: {count}"
             for label, count in hist[tf].items()
@@ -285,10 +295,8 @@ def _extract_lr50_angle(raw_stat: Any, tf: str) -> Optional[Decimal]:
 
 # 🔸 Определение бина для угла LR50
 def _assign_angle_bin(angle: Decimal) -> Optional[str]:
-    try:
-        val = float(angle)
-    except (TypeError, InvalidOperation, ValueError):
-        return None
+    # работаем в Decimal, без перевода в float, чтобы не ловить артефакты
+    val = angle
 
     for lo, hi, label in ANGLE_BINS:
         # левая куча: angle < hi
