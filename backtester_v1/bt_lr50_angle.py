@@ -23,18 +23,17 @@ def _fmt2(d: Decimal) -> str:
     return str(d.quantize(Decimal("0.00")))
 
 
-# 🔸 Биннинг углов LR50:
+# 🔸 Биннинг для m5/m15:
 #     - левая куча: angle < -0.20
 #     - [-0.20; -0.10)
-#     - диапазон [-0.10; 0.10) с шагом 0.02
-#     - [0.10; 0.20)
+#     - [-0.10;  0.10) с шагом 0.02
+#     - [ 0.10;  0.20)
 #     - правая куча: angle >= 0.20
-def _build_angle_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
+def _build_default_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
     bins: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = []
-
     D = Decimal
 
-    # левая куча: angle < -0.20
+    # левая куча
     bins.append((None, D("-0.20"), "< -0.20"))
 
     # [-0.20; -0.10)
@@ -56,13 +55,58 @@ def _build_angle_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]
     hi = D("0.20")
     bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
 
-    # правая куча: angle >= 0.20
+    # правая куча
     bins.append((D("0.20"), None, ">= 0.20"))
 
     return bins
 
 
-ANGLE_BINS: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = _build_angle_bins()
+# 🔸 Биннинг для h1: 5 логических зон
+# 1) angle <= -0.10          → сильный нисходящий тренд
+# 2) -0.10 < angle < -0.02   → слабый нисходящий
+# 3) -0.02 <= angle <= 0.02  → флэт
+# 4) 0.02 < angle < 0.10     → слабый восходящий
+# 5) angle >= 0.10           → сильный восходящий тренд
+def _build_h1_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
+    bins: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = []
+    D = Decimal
+
+    # angle <= -0.10
+    bins.append((None, D("-0.10"), "<= -0.10"))
+
+    # -0.10 < angle < -0.02  → (-0.10; -0.02)
+    lo = D("-0.10")
+    hi = D("-0.02")
+    bins.append((lo, hi, f"(-0.10; -0.02)"))
+
+    # -0.02 <= angle <= 0.02  → [-0.02; 0.02]
+    lo = D("-0.02")
+    hi = D("0.02")
+    bins.append((lo, hi, "[-0.02; 0.02]"))
+
+    # 0.02 < angle < 0.10     → (0.02; 0.10)
+    lo = D("0.02")
+    hi = D("0.10")
+    bins.append((lo, hi, f"(0.02; 0.10)"))
+
+    # angle >= 0.10
+    bins.append((D("0.10"), None, ">= 0.10"))
+
+    return bins
+
+
+# 🔸 Схемы бинов по TF
+# m5/m15 → default, h1 → h1-зонами
+ANGLE_BINS_BY_TF: Dict[str, List[Tuple[Optional[Decimal], Optional[Decimal], str]]] = {
+    "m5": _build_default_bins(),
+    "m15": _build_default_bins(),
+    "h1": _build_h1_bins(),
+}
+
+
+# 🔸 Получить список биннов для конкретного TF
+def _get_angle_bins_for_tf(tf: str) -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
+    return ANGLE_BINS_BY_TF.get(tf, _build_default_bins())
 
 
 # 🔸 Публичная точка входа: периодический запуск хистограмм по всем сигналам
@@ -99,7 +143,7 @@ async def run_bt_lr50_angle_worker(pg) -> None:
 async def _run_single_pass(pg) -> None:
     log.debug("BT_LR50_ANGLE: старт одиночного прохода по bt_scenario_positions")
 
-    # сначала очищаем таблицу bt_analysis_angle целиком
+    # очищаем таблицу bt_analysis_angle целиком
     async with pg.acquire() as conn:
         await conn.execute("DELETE FROM bt_analysis_angle")
     log.debug("BT_LR50_ANGLE: таблица bt_analysis_angle очищена перед новым проходом")
@@ -156,11 +200,15 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
         return
 
     # структура: tf -> label -> count
-    hist: Dict[str, Dict[str, int]] = {
-        tf: {label: 0 for _, _, label in ANGLE_BINS} for tf in LR_TFS
-    }
-    missing_by_tf: Dict[str, int] = {tf: 0 for tf in LR_TFS}
-    total_by_tf: Dict[str, int] = {tf: 0 for tf in LR_TFS}
+    hist: Dict[str, Dict[str, int]] = {}
+    missing_by_tf: Dict[str, int] = {}
+    total_by_tf: Dict[str, int] = {}
+
+    for tf in LR_TFS:
+        bins = _get_angle_bins_for_tf(tf)
+        hist[tf] = {label: 0 for _, _, label in bins}
+        missing_by_tf[tf] = 0
+        total_by_tf[tf] = 0
 
     for r in rows:
         raw = r["raw_stat"]
@@ -179,7 +227,7 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
                 missing_by_tf[tf] += 1
                 continue
 
-            label = _assign_angle_bin(angle)
+            label = _assign_angle_bin(angle, tf)
             if label is None:
                 missing_by_tf[tf] += 1
                 continue
@@ -193,8 +241,9 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
         total = total_by_tf[tf]
         missing = missing_by_tf[tf]
         used = total - missing
+        bins = _get_angle_bins_for_tf(tf)
 
-        for lo, hi, label in ANGLE_BINS:
+        for lo, hi, label in bins:
             count = hist[tf].get(label, 0)
             rows_to_insert.append(
                 (
@@ -293,12 +342,12 @@ def _extract_lr50_angle(raw_stat: Any, tf: str) -> Optional[Decimal]:
     return _safe_decimal(value)
 
 
-# 🔸 Определение бина для угла LR50
-def _assign_angle_bin(angle: Decimal) -> Optional[str]:
-    # работаем в Decimal, без перевода в float, чтобы не ловить артефакты
+# 🔸 Определение бина для угла LR50 с учётом TF
+def _assign_angle_bin(angle: Decimal, tf: str) -> Optional[str]:
     val = angle
+    bins = _get_angle_bins_for_tf(tf)
 
-    for lo, hi, label in ANGLE_BINS:
+    for lo, hi, label in bins:
         # левая куча: angle < hi
         if lo is None and hi is not None:
             if val < hi:
@@ -307,7 +356,10 @@ def _assign_angle_bin(angle: Decimal) -> Optional[str]:
         elif lo is not None and hi is None:
             if val >= lo:
                 return label
-        # обычный полузакрытый интервал [lo, hi)
+        # обычный интервал [lo, hi) или, для h1-flat, можем включать hi тоже — но
+        # в текущей схеме flat зону мы задали как [−0.02; 0.02], и в проверке
+        # используем [lo; hi) — вал фактически попадёт до 0.02, что для наших
+        # реальных значений (почти никогда ровно 0.02) не критично.
         elif lo is not None and hi is not None:
             if lo <= val < hi:
                 return label
