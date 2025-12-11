@@ -19,6 +19,8 @@ from backtester_config import (
 
 # # 🔸 Оркестратор хистограмм LR50-углов по позициям
 # from bt_lr50_angle import run_bt_lr50_angle_worker
+# 🔸 Воркер квантильного анализа угла LR50 m5
+from bt_angle_quant_worker import run_bt_angle_quant_worker
 
 # 🔸 Оркестратор псевдо-сигналов
 from bt_signals_main import run_bt_signals_orchestrator
@@ -87,6 +89,7 @@ async def main():
         run_safe_loop(lambda: run_bt_complex_analysis_orchestrator(pg, redis), "BT_COMPLEX"),
         run_safe_loop(lambda: run_bt_complex_score_orchestrator(pg, redis), "BT_COMPLEX_SCORE"),
 #         run_safe_loop(lambda: run_bt_lr50_angle_worker(pg), "BT_LR50_ANGLE"),
+        run_safe_loop(lambda: run_bt_angle_quant_worker(pg, redis), "BT_ANGLE_QUANT"),
     )
 
 
