@@ -4,6 +4,7 @@ import logging
 import json
 from typing import Dict, Any, List, Optional
 from decimal import Decimal, InvalidOperation
+from datetime import datetime  # 🔸 для finished_at в Redis stream
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_LR_ANGLE_MTF")
@@ -14,7 +15,7 @@ async def run_lr_angle_mtf_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
     pg,
-    redis,  # оставляем для совместимости сигнатур, здесь не используется
+    redis,  # теперь используем для стрима bt:analysis:angle
 ) -> Dict[str, Any]:
     analysis_id = analysis.get("id")
     family_key = str(analysis.get("family_key") or "").strip()
@@ -46,13 +47,22 @@ async def run_lr_angle_mtf_analysis(
             scenario_id,
             signal_id,
         )
+        summary = {
+            "positions_total": 0,
+            "positions_used": 0,
+            "positions_skipped": 0,
+        }
+        # пробуем отправить пустое событие в bt:analysis:angle
+        await _publish_angle_ready(
+            redis=redis,
+            analysis_id=analysis_id,
+            scenario_id=scenario_id,
+            signal_id=signal_id,
+            summary=summary,
+        )
         return {
             "rows": [],
-            "summary": {
-                "positions_total": 0,
-                "positions_used": 0,
-                "positions_skipped": 0,
-            },
+            "summary": summary,
         }
 
     rows: List[Dict[str, Any]] = []
@@ -110,13 +120,24 @@ async def run_lr_angle_mtf_analysis(
         len(rows),
     )
 
+    summary = {
+        "positions_total": positions_total,
+        "positions_used": positions_used,
+        "positions_skipped": positions_skipped,
+    }
+
+    # 🔸 Публикуем событие в Redis stream bt:analysis:angle (временное решение для следующего воркера)
+    await _publish_angle_ready(
+        redis=redis,
+        analysis_id=analysis_id,
+        scenario_id=scenario_id,
+        signal_id=signal_id,
+        summary=summary,
+    )
+
     return {
         "rows": rows,
-        "summary": {
-            "positions_total": positions_total,
-            "positions_used": positions_used,
-            "positions_skipped": positions_skipped,
-        },
+        "summary": summary,
     }
 
 
@@ -238,6 +259,56 @@ def _angle_to_zone(angle: Decimal) -> Optional[str]:
 
     # теоретически сюда не попадём, но пусть будет
     return None
+
+
+# 🔸 Публикация события готовности MTF-углового анализа в bt:analysis:angle
+async def _publish_angle_ready(
+    redis,
+    analysis_id: int,
+    scenario_id: int,
+    signal_id: int,
+    summary: Dict[str, Any],
+) -> None:
+    if redis is None:
+        return
+
+    finished_at = datetime.utcnow()
+
+    try:
+        await redis.xadd(
+            "bt:analysis:angle",
+            {
+                "analysis_id": str(analysis_id),
+                "scenario_id": str(scenario_id),
+                "signal_id": str(signal_id),
+                "positions_total": str(summary.get("positions_total", 0)),
+                "positions_used": str(summary.get("positions_used", 0)),
+                "positions_skipped": str(summary.get("positions_skipped", 0)),
+                "finished_at": finished_at.isoformat(),
+            },
+        )
+        log.debug(
+            "BT_ANALYSIS_LR_ANGLE_MTF: опубликовано событие в стрим 'bt:analysis:angle' "
+            "для analysis_id=%s, scenario_id=%s, signal_id=%s, positions_total=%s, "
+            "positions_used=%s, positions_skipped=%s, finished_at=%s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            summary.get("positions_total", 0),
+            summary.get("positions_used", 0),
+            summary.get("positions_skipped", 0),
+            finished_at,
+        )
+    except Exception as e:
+        log.error(
+            "BT_ANALYSIS_LR_ANGLE_MTF: не удалось опубликовать событие в стрим 'bt:analysis:angle' "
+            "для analysis_id=%s, scenario_id=%s, signal_id=%s: %s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            e,
+            exc_info=True,
+        )
 
 
 # 🔸 Вспомогательная функция: безопасное приведение к Decimal
