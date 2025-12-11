@@ -1,4 +1,4 @@
-# bt_lr50_angle.py — периодический хистограмм-анализ углов LR50 по всем сигналам
+# bt_lr50_angle.py — периодический хистограмм-анализ углов LR50 по m15/h1 для всех сигналов
 
 import asyncio
 import json
@@ -10,8 +10,8 @@ from typing import Any, Dict, List, Tuple, Optional
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_LR50_ANGLE")
 
-# 🔸 Таймфреймы, по которым смотрим lr50_angle в raw_stat
-LR_TFS = ["m5", "m15", "h1"]
+# 🔸 Таймфреймы, по которым смотрим lr50_angle в raw_stat (m5 пока исключаем)
+LR_TFS = ["m15", "h1"]
 
 # 🔸 Настройки периодичности
 INITIAL_DELAY_SEC = 60
@@ -23,51 +23,13 @@ def _fmt2(d: Decimal) -> str:
     return str(d.quantize(Decimal("0.00")))
 
 
-# 🔸 Биннинг для m5/m15:
-#     - левая куча: angle < -0.20
-#     - [-0.20; -0.10)
-#     - [-0.10;  0.10) с шагом 0.02
-#     - [ 0.10;  0.20)
-#     - правая куча: angle >= 0.20
-def _build_default_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
-    bins: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = []
-    D = Decimal
-
-    # левая куча
-    bins.append((None, D("-0.20"), "< -0.20"))
-
-    # [-0.20; -0.10)
-    lo = D("-0.20")
-    hi = D("-0.10")
-    bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
-
-    # [-0.10; 0.10) с шагом 0.02
-    step = D("0.02")
-    v = D("-0.10")
-    while v < D("0.10"):
-        lo = v
-        hi = v + step
-        bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
-        v = hi
-
-    # [0.10; 0.20)
-    lo = D("0.10")
-    hi = D("0.20")
-    bins.append((lo, hi, f"[{_fmt2(lo)}; {_fmt2(hi)})"))
-
-    # правая куча
-    bins.append((D("0.20"), None, ">= 0.20"))
-
-    return bins
-
-
-# 🔸 Биннинг для h1: 5 логических зон
+# 🔸 Биннинг для m15 и h1: 5 логических зон по углу LR50
 # 1) angle <= -0.10          → сильный нисходящий тренд
 # 2) -0.10 < angle < -0.02   → слабый нисходящий
-# 3) -0.02 <= angle <= 0.02  → флэт
+# 3) -0.02 <= angle <= 0.02  → флэт / почти горизонт
 # 4) 0.02 < angle < 0.10     → слабый восходящий
 # 5) angle >= 0.10           → сильный восходящий тренд
-def _build_h1_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
+def _build_5zone_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
     bins: List[Tuple[Optional[Decimal], Optional[Decimal], str]] = []
     D = Decimal
 
@@ -77,7 +39,7 @@ def _build_h1_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
     # -0.10 < angle < -0.02  → (-0.10; -0.02)
     lo = D("-0.10")
     hi = D("-0.02")
-    bins.append((lo, hi, f"(-0.10; -0.02)"))
+    bins.append((lo, hi, "(-0.10; -0.02)"))
 
     # -0.02 <= angle <= 0.02  → [-0.02; 0.02]
     lo = D("-0.02")
@@ -87,7 +49,7 @@ def _build_h1_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
     # 0.02 < angle < 0.10     → (0.02; 0.10)
     lo = D("0.02")
     hi = D("0.10")
-    bins.append((lo, hi, f"(0.02; 0.10)"))
+    bins.append((lo, hi, "(0.02; 0.10)"))
 
     # angle >= 0.10
     bins.append((D("0.10"), None, ">= 0.10"))
@@ -95,18 +57,17 @@ def _build_h1_bins() -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
     return bins
 
 
-# 🔸 Схемы бинов по TF
-# m5/m15 → default, h1 → h1-зонами
+# 🔸 Схемы бинов по TF (для m15 и h1 одинаковые 5 зон)
 ANGLE_BINS_BY_TF: Dict[str, List[Tuple[Optional[Decimal], Optional[Decimal], str]]] = {
-    "m5": _build_default_bins(),
-    "m15": _build_default_bins(),
-    "h1": _build_h1_bins(),
+    "m15": _build_5zone_bins(),
+    "h1": _build_5zone_bins(),
 }
 
 
 # 🔸 Получить список биннов для конкретного TF
 def _get_angle_bins_for_tf(tf: str) -> List[Tuple[Optional[Decimal], Optional[Decimal], str]]:
-    return ANGLE_BINS_BY_TF.get(tf, _build_default_bins())
+    # по умолчанию тоже 5-зонная схема, если вдруг tf незнаком
+    return ANGLE_BINS_BY_TF.get(tf, _build_5zone_bins())
 
 
 # 🔸 Публичная точка входа: периодический запуск хистограмм по всем сигналам
@@ -177,7 +138,9 @@ async def _load_distinct_signal_ids(pg) -> List[int]:
     return [int(r["signal_id"]) for r in rows]
 
 
-# 🔸 Обработка одного signal_id: подсчёт гистограмм по tf ∈ {m5, m15, h1} и запись в bt_analysis_angle
+# 🔸 Обработка одного signal_id:
+#     - считаем гистограммы по m15/h1
+#     - для h1-бинов ещё считаем распределение m15-зон и кладём в raw_stat
 async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -210,6 +173,10 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
         missing_by_tf[tf] = 0
         total_by_tf[tf] = 0
 
+    # для h1: раскладка по m15-зонам внутри каждого h1-бина
+    # h1_label -> (m15_label -> count)
+    h1_m15_cross: Dict[str, Dict[str, int]] = {}
+
     for r in rows:
         raw = r["raw_stat"]
 
@@ -220,19 +187,38 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
             except Exception:
                 raw = None
 
-        for tf in LR_TFS:
-            total_by_tf[tf] += 1
-            angle = _extract_lr50_angle(raw, tf)
-            if angle is None:
-                missing_by_tf[tf] += 1
-                continue
+        # извлекаем углы сразу для обоих TF, чтобы использовать их в cross-статистике
+        angle_m15 = _extract_lr50_angle(raw, "m15")
+        angle_h1 = _extract_lr50_angle(raw, "h1")
 
-            label = _assign_angle_bin(angle, tf)
-            if label is None:
-                missing_by_tf[tf] += 1
-                continue
+        # m15
+        total_by_tf["m15"] += 1
+        m15_label: Optional[str] = None
+        if angle_m15 is None:
+            missing_by_tf["m15"] += 1
+        else:
+            m15_label = _assign_angle_bin(angle_m15, "m15")
+            if m15_label is None:
+                missing_by_tf["m15"] += 1
+            else:
+                hist["m15"][m15_label] += 1
 
-            hist[tf][label] += 1
+        # h1
+        total_by_tf["h1"] += 1
+        h1_label: Optional[str] = None
+        if angle_h1 is None:
+            missing_by_tf["h1"] += 1
+        else:
+            h1_label = _assign_angle_bin(angle_h1, "h1")
+            if h1_label is None:
+                missing_by_tf["h1"] += 1
+            else:
+                hist["h1"][h1_label] += 1
+
+        # cross: считаем m15-зоны внутри каждого h1-бина, если оба есть
+        if h1_label is not None and m15_label is not None:
+            m15_map = h1_m15_cross.setdefault(h1_label, {})
+            m15_map[m15_label] = m15_map.get(m15_label, 0) + 1
 
     # формируем строки для вставки в bt_analysis_angle
     rows_to_insert: List[Tuple[Any, ...]] = []
@@ -245,6 +231,20 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
 
         for lo, hi, label in bins:
             count = hist[tf].get(label, 0)
+
+            # raw_stat:
+            #  - для m15 оставляем NULL
+            #  - для h1 кладём JSON-раскладку по m15-зонам, если есть
+            if tf == "h1":
+                m15_dist = h1_m15_cross.get(label) or {}
+                if m15_dist:
+                    raw_obj = {"m15": m15_dist}
+                    raw_stat_json = json.dumps(raw_obj, ensure_ascii=False)
+                else:
+                    raw_stat_json = None
+            else:
+                raw_stat_json = None
+
             rows_to_insert.append(
                 (
                     run_at,
@@ -257,6 +257,7 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
                     used,
                     missing,
                     count,
+                    raw_stat_json,
                 )
             )
 
@@ -290,12 +291,14 @@ async def _process_signal(pg, signal_id: int, run_at: datetime) -> None:
                 positions_total,
                 positions_with_angle,
                 positions_missing,
-                count_in_bin
+                count_in_bin,
+                raw_stat
             )
             VALUES (
                 $1, $2, $3,
                 $4, $5, $6,
-                $7, $8, $9, $10
+                $7, $8, $9,
+                $10, $11
             )
             """,
             rows_to_insert,
@@ -356,10 +359,7 @@ def _assign_angle_bin(angle: Decimal, tf: str) -> Optional[str]:
         elif lo is not None and hi is None:
             if val >= lo:
                 return label
-        # обычный интервал [lo, hi) или, для h1-flat, можем включать hi тоже — но
-        # в текущей схеме flat зону мы задали как [−0.02; 0.02], и в проверке
-        # используем [lo; hi) — вал фактически попадёт до 0.02, что для наших
-        # реальных значений (почти никогда ровно 0.02) не критично.
+        # обычный интервал [lo, hi) или [lo, hi] в центральной зоне — нам хватит [lo; hi)
         elif lo is not None and hi is not None:
             if lo <= val < hi:
                 return label
