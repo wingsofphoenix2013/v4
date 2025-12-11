@@ -17,20 +17,23 @@ from backtester_config import (
     load_initial_analysis_connections,
 )
 
-# 🔸 Оркестратор псевдо-сигналов
-from bt_signals_main import run_bt_signals_orchestrator
-# 🔸 Оркестратор сценариев
-from bt_scenarios_main import run_bt_scenarios_orchestrator
-# 🔸 Постпроцессор сценариев
-from bt_scenarios_postproc import run_bt_scenarios_postproc
-# 🔸 Оркестратор анализаторов
-from bt_analysis_main import run_bt_analysis_orchestrator
-# 🔸 Оркестратор финального пост-процессинга анализов
-from bt_analysis_postproc import run_bt_analysis_postproc_orchestrator
-# 🔸 Оркестратор комплексных анализаторов
-from bt_complex_main import run_bt_complex_analysis_orchestrator
-# 🔸 Оркестратор скоринга комплексных анализаторов
-from bt_complex_score import run_bt_complex_score_orchestrator
+# 🔸 Оркестратор хистограмм LR50-углов по позициям
+from bt_lr50_angle import run_bt_lr50_angle_worker
+
+# # 🔸 Оркестратор псевдо-сигналов
+# from bt_signals_main import run_bt_signals_orchestrator
+# # 🔸 Оркестратор сценариев
+# from bt_scenarios_main import run_bt_scenarios_orchestrator
+# # 🔸 Постпроцессор сценариев
+# from bt_scenarios_postproc import run_bt_scenarios_postproc
+# # 🔸 Оркестратор анализаторов
+# from bt_analysis_main import run_bt_analysis_orchestrator
+# # 🔸 Оркестратор финального пост-процессинга анализов
+# from bt_analysis_postproc import run_bt_analysis_postproc_orchestrator
+# # 🔸 Оркестратор комплексных анализаторов
+# from bt_complex_main import run_bt_complex_analysis_orchestrator
+# # 🔸 Оркестратор скоринга комплексных анализаторов
+# from bt_complex_score import run_bt_complex_score_orchestrator
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -64,7 +67,7 @@ async def main():
     analysis_instances_count = await load_initial_analysis_instances(pg, only_enabled=True)
     analysis_links_count = await load_initial_analysis_connections(pg, only_enabled=True)
 
-    log.info(
+    log.debug(
         f"BT_MAIN: инициализация конфигурации завершена — "
         f"тикеров={tickers_count}, инстансов индикаторов={indicators_count}, "
         f"инстансов псевдо-сигналов={signals_count}, сценариев={scenarios_count}, "
@@ -76,13 +79,14 @@ async def main():
 
     # запуск воркеров в безопасных циклах
     await asyncio.gather(
-        run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
-        run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
-        run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
-        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
-        run_safe_loop(lambda: run_bt_analysis_postproc_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC"),
-        run_safe_loop(lambda: run_bt_complex_analysis_orchestrator(pg, redis), "BT_COMPLEX"),
-        run_safe_loop(lambda: run_bt_complex_score_orchestrator(pg, redis), "BT_COMPLEX_SCORE"),
+#         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
+#         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
+#         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
+#         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
+#         run_safe_loop(lambda: run_bt_analysis_postproc_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC"),
+#         run_safe_loop(lambda: run_bt_complex_analysis_orchestrator(pg, redis), "BT_COMPLEX"),
+#         run_safe_loop(lambda: run_bt_complex_score_orchestrator(pg, redis), "BT_COMPLEX_SCORE"),
+        run_safe_loop(lambda: run_bt_lr50_angle_worker(pg), "BT_LR50_ANGLE"),
     )
 
 
