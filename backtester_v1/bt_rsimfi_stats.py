@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("BT_RSIMFI_STATS")
@@ -16,16 +16,19 @@ RSIMFI_TFS = ["m5", "m15", "h1"]
 INITIAL_DELAY_SEC = 60
 SLEEP_BETWEEN_RUNS_SEC = 3600  # 1 час
 
-# 🔸 Пороги RSI/MFI (можно будет потом вынести в параметры)
-RSI_LOW = 30.0
-RSI_HIGH = 70.0
-MFI_LOW = 30.0
-MFI_HIGH = 70.0
+# 🔸 Пороги RSI/MFI (сузили нейтральную зону до 40–60)
+RSI_LOW = 40.0
+RSI_HIGH = 60.0
+MFI_LOW = 40.0
+MFI_HIGH = 60.0
 
 
 # 🔸 Публичная точка входа: периодический запуск анализа RSI/MFI по всем сигналам
 async def run_bt_rsimfi_stats_worker(pg) -> None:
-    log.debug("BT_RSIMFI_STATS: воркер запущен, первый проход будет выполнен через %s секунд", INITIAL_DELAY_SEC)
+    log.debug(
+        "BT_RSIMFI_STATS: воркер запущен, первый проход будет выполнен через %s секунд",
+        INITIAL_DELAY_SEC,
+    )
     await asyncio.sleep(INITIAL_DELAY_SEC)
 
     while True:
@@ -121,7 +124,6 @@ async def _process_pair(pg, scenario_id: int, signal_id: int, run_at: datetime) 
     for r in rows:
         raw = r["raw_stat"]
 
-        # raw_stat может быть либо jsonb, либо строка
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -153,7 +155,6 @@ async def _process_pair(pg, scenario_id: int, signal_id: int, run_at: datetime) 
         missing = missing_by_tf[tf]
         with_data = total - missing
 
-        # чтобы было видно, что TF вообще есть, даже если ни одна зона не набралась
         if not hist[tf]:
             rows_to_insert.append(
                 (
@@ -273,9 +274,8 @@ def _extract_indicator_value(
         return None
 
 
-# 🔸 Классификация RSI/MFI в одну из 5 корзинок
+# 🔸 Классификация RSI/MFI в одну из 5 корзинок (взаимоисключающие зоны)
 def _classify_rsi_mfi(rsi: float, mfi: float) -> Optional[str]:
-    # сначала классифицируем RSI/MFI по трём уровням
     r_zone = _level_3(rsi, RSI_LOW, RSI_HIGH)
     m_zone = _level_3(mfi, MFI_LOW, MFI_HIGH)
 
@@ -286,23 +286,23 @@ def _classify_rsi_mfi(rsi: float, mfi: float) -> Optional[str]:
     if (r_zone == "LOW" and m_zone == "LOW") or (r_zone == "HIGH" and m_zone == "HIGH"):
         return "Z1_CONFIRMED"
 
-    # Z2: цена в экстремуме, деньги не до конца подтверждают
-    if (r_zone == "HIGH" and m_zone in ("MID", "LOW")) or (r_zone == "LOW" and m_zone in ("MID", "HIGH")):
-        return "Z2_PRICE_EXTREME"
-
-    # Z3: деньги сильные, цена ещё средняя
-    if r_zone == "MID" and m_zone in ("HIGH", "LOW"):
-        return "Z3_FLOW_LEADS"
-
     # Z4: жёсткая дивергенция (цена и деньги на противоположных полюсах)
     if (r_zone == "HIGH" and m_zone == "LOW") or (r_zone == "LOW" and m_zone == "HIGH"):
         return "Z4_DIVERGENCE"
+
+    # Z2: цена в экстремуме, деньги в середине (EXTREME PRICE, NEUTRAL FLOW)
+    if r_zone in ("LOW", "HIGH") and m_zone == "MID":
+        return "Z2_PRICE_EXTREME"
+
+    # Z3: деньги сильные, цена в середине (FLOW LEADS)
+    if m_zone in ("LOW", "HIGH") and r_zone == "MID":
+        return "Z3_FLOW_LEADS"
 
     # Z5: оба в середине (нейтрально)
     if r_zone == "MID" and m_zone == "MID":
         return "Z5_NEUTRAL"
 
-    # теоретически сюда не попадём, но пусть будет
+    # fallback, теоретически сюда не должны попасть
     return "Z5_NEUTRAL"
 
 
