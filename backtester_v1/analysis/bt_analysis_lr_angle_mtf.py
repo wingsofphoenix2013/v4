@@ -1,27 +1,25 @@
-# bt_analysis_lr_angle_mtf.py — анализатор распределения позиций по комбинациям углов LR50 на h1/m15 + квантиль m5
+# bt_analysis_lr_angle_mtf.py — анализатор распределения позиций по комбинациям углов LR (h1/m15 + квантиль m5)
 
 import logging
 import json
 from typing import Dict, Any, List, Optional, Tuple
 from decimal import Decimal, InvalidOperation
-from datetime import datetime  # для стрима bt:analysis:angle
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_LR_ANGLE_MTF")
 
-# 🔸 Количество квантилей по углу m5 внутри каждой MTF-группы (H|M)
+# 🔸 Константы квантилей и дефолтов
 ANGLE_QUANTILES = 5
+DEFAULT_MIN_SHARE = Decimal("0.01")
+DEFAULT_LR_PREFIX = "lr50"
 
-# 🔸 Порог для “малых” групп: если доля позиций в группе < 1%, даём Q0 вместо квантилей
-MIN_SHARE = Decimal("0.01")
 
-
-# 🔸 Публичная точка входа анализатора LR50/angle MTF (h1 + m15 + квантиль m5)
+# 🔸 Публичная точка входа анализатора LR/angle MTF (h1 + m15 + квантиль m5)
 async def run_lr_angle_mtf_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
     pg,
-    redis,
+    redis,  # оставляем для совместимости сигнатур, здесь не используется
 ) -> Dict[str, Any]:
     analysis_id = analysis.get("id")
     family_key = str(analysis.get("family_key") or "").strip()
@@ -32,15 +30,21 @@ async def run_lr_angle_mtf_analysis(
     scenario_id = analysis_ctx.get("scenario_id")
     signal_id = analysis_ctx.get("signal_id")
 
+    # параметры анализатора
+    lr_prefix = _get_str_param(params, "lr_prefix", DEFAULT_LR_PREFIX)
+    min_share = _get_decimal_param(params, "min_share", DEFAULT_MIN_SHARE)
+
     log.debug(
         "BT_ANALYSIS_LR_ANGLE_MTF: старт анализа id=%s (family=%s, key=%s, name=%s) "
-        "для scenario_id=%s, signal_id=%s, params=%s",
+        "для scenario_id=%s, signal_id=%s, lr_prefix=%s, min_share=%s, params=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
         scenario_id,
         signal_id,
+        lr_prefix,
+        min_share,
         params,
     )
 
@@ -58,7 +62,6 @@ async def run_lr_angle_mtf_analysis(
             "positions_used": 0,
             "positions_skipped": 0,
         }
-        await _publish_angle_ready(redis, analysis_id, scenario_id, signal_id, summary)
         return {
             "rows": [],
             "summary": summary,
@@ -80,11 +83,11 @@ async def run_lr_angle_mtf_analysis(
         pnl_abs = p["pnl_abs"]
         raw_stat = p["raw_stat"]
 
-        # зоны LR50 для h1 и m15
-        zone_m15 = _extract_lr50_zone(raw_stat, "m15")
-        zone_h1 = _extract_lr50_zone(raw_stat, "h1")
-        # угол LR50 для m5
-        angle_m5 = _extract_lr50_angle(raw_stat, "m5")
+        # зоны LR для h1 и m15
+        zone_m15 = _extract_lr_zone(raw_stat, "m15", lr_prefix)
+        zone_h1 = _extract_lr_zone(raw_stat, "h1", lr_prefix)
+        # угол LR для m5
+        angle_m5 = _extract_lr_angle(raw_stat, "m5", lr_prefix)
 
         # если чего-то нет — позицию пропускаем
         if zone_m15 is None or zone_h1 is None or angle_m5 is None:
@@ -103,7 +106,7 @@ async def run_lr_angle_mtf_analysis(
             }
         )
 
-    # 🔸 Второй проход: внутри каждой группы (H|M) делаем квантильную разбивку по m5 угол
+    # 🔸 Второй проход: внутри каждой группы (H|M) делаем квантильную разбивку по углу m5
     if positions_total > 0:
         total_for_share = Decimal(positions_total - positions_skipped)
     else:
@@ -120,8 +123,8 @@ async def run_lr_angle_mtf_analysis(
 
         share = Decimal(group_n) / total_for_share
 
-        # если группа меньше 1% — не делим на квантиль, присваиваем Q0
-        if share < MIN_SHARE or group_n <= ANGLE_QUANTILES:
+        # если группа меньше min_share или слишком маленькая по количеству — не делим на квантиль, присваиваем Q0
+        if share < min_share or group_n <= ANGLE_QUANTILES:
             for rec in plist:
                 bin_name = f"H_{zone_h1}|M_{zone_m15}|Q0"
                 rows.append(
@@ -148,6 +151,7 @@ async def run_lr_angle_mtf_analysis(
                 continue
 
             direction = str(rec["direction"] or "").lower()
+            # для шорта инвертируем знак, чтобы "хорошие/плохие" углы были сопоставимыми
             if direction == "short":
                 sort_key = -angle_f
             else:
@@ -184,16 +188,20 @@ async def run_lr_angle_mtf_analysis(
 
     log.info(
         "BT_ANALYSIS_LR_ANGLE_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
+        "scenario_id=%s, signal_id=%s, lr_prefix=%s, min_share=%s — позиций всего=%s, "
+        "использовано=%s, пропущено=%s, групп=%s, строк_в_результате=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
         scenario_id,
         signal_id,
+        lr_prefix,
+        min_share,
         positions_total,
         positions_used,
         positions_skipped,
+        len(grouped),
         len(rows),
     )
 
@@ -202,15 +210,6 @@ async def run_lr_angle_mtf_analysis(
         "positions_used": positions_used,
         "positions_skipped": positions_skipped,
     }
-
-    # 🔸 Публикуем событие в Redis stream bt:analysis:angle (возможно, ещё пригодится)
-    await _publish_angle_ready(
-        redis=redis,
-        analysis_id=analysis_id,
-        scenario_id=scenario_id,
-        signal_id=signal_id,
-        summary=summary,
-    )
 
     return {
         "rows": rows,
@@ -246,6 +245,7 @@ async def _load_positions_for_analysis(
     for r in rows:
         raw = r["raw_stat"]
 
+        # приводим jsonb к dict, если он пришёл строкой
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -270,10 +270,11 @@ async def _load_positions_for_analysis(
     return positions
 
 
-# 🔸 Извлечение зоны LR50-угла для заданного TF (m15 или h1)
-def _extract_lr50_zone(
+# 🔸 Извлечение зоны LR-угла для заданного TF (m15 или h1)
+def _extract_lr_zone(
     raw_stat: Any,
     tf: str,
+    lr_prefix: str,
 ) -> Optional[str]:
     if raw_stat is None:
         return None
@@ -299,7 +300,8 @@ def _extract_lr50_zone(
     if not isinstance(lr_family, dict):
         return None
 
-    value = lr_family.get("lr50_angle")
+    key = f"{lr_prefix}_angle"
+    value = lr_family.get(key)
     if value is None:
         return None
 
@@ -307,10 +309,11 @@ def _extract_lr50_zone(
     return _angle_to_zone(angle)
 
 
-# 🔸 Извлечение угла LR50 для заданного TF (m5)
-def _extract_lr50_angle(
+# 🔸 Извлечение угла LR для заданного TF (m5)
+def _extract_lr_angle(
     raw_stat: Any,
     tf: str,
+    lr_prefix: str,
 ) -> Optional[Decimal]:
     if raw_stat is None:
         return None
@@ -336,7 +339,8 @@ def _extract_lr50_angle(
     if not isinstance(lr_family, dict):
         return None
 
-    value = lr_family.get("lr50_angle")
+    key = f"{lr_prefix}_angle"
+    value = lr_family.get(key)
     if value is None:
         return None
 
@@ -363,56 +367,6 @@ def _angle_to_zone(angle: Decimal) -> Optional[str]:
     return None
 
 
-# 🔸 Публикация события готовности MTF-углового анализа в bt:analysis:angle (временный стрим)
-async def _publish_angle_ready(
-    redis,
-    analysis_id: int,
-    scenario_id: int,
-    signal_id: int,
-    summary: Dict[str, Any],
-) -> None:
-    if redis is None:
-        return
-
-    finished_at = datetime.utcnow()
-
-    try:
-        await redis.xadd(
-            "bt:analysis:angle",
-            {
-                "analysis_id": str(analysis_id),
-                "scenario_id": str(scenario_id),
-                "signal_id": str(signal_id),
-                "positions_total": str(summary.get("positions_total", 0)),
-                "positions_used": str(summary.get("positions_used", 0)),
-                "positions_skipped": str(summary.get("positions_skipped", 0)),
-                "finished_at": finished_at.isoformat(),
-            },
-        )
-        log.debug(
-            "BT_ANALYSIS_LR_ANGLE_MTF: опубликовано событие в стрим 'bt:analysis:angle' "
-            "для analysis_id=%s, scenario_id=%s, signal_id=%s, positions_total=%s, "
-            "positions_used=%s, positions_skipped=%s, finished_at=%s",
-            analysis_id,
-            scenario_id,
-            signal_id,
-            summary.get("positions_total", 0),
-            summary.get("positions_used", 0),
-            summary.get("positions_skipped", 0),
-            finished_at,
-        )
-    except Exception as e:
-        log.error(
-            "BT_ANALYSIS_LR_ANGLE_MTF: не удалось опубликовать событие в стрим 'bt:analysis:angle' "
-            "для analysis_id=%s, scenario_id=%s, signal_id=%s: %s",
-            analysis_id,
-            scenario_id,
-            signal_id,
-            e,
-            exc_info=True,
-        )
-
-
 # 🔸 Вспомогательная функция: безопасное приведение к Decimal
 def _safe_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
@@ -421,3 +375,32 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
+
+
+# 🔸 Вспомогательная функция: безопасное чтение str-параметра
+def _get_str_param(params: Dict[str, Any], name: str, default: str) -> str:
+    cfg = params.get(name)
+    if cfg is None:
+        return default
+
+    raw = cfg.get("value")
+    if raw is None:
+        return default
+
+    return str(raw).strip()
+
+
+# 🔸 Вспомогательная функция: безопасное чтение Decimal-параметра
+def _get_decimal_param(params: Dict[str, Any], name: str, default: Decimal) -> Decimal:
+    cfg = params.get(name)
+    if cfg is None:
+        return default
+
+    raw = cfg.get("value")
+    if raw is None:
+        return default
+
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
