@@ -195,8 +195,10 @@ def _parse_angle_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
 # 🔸 Очистка временных таблиц перед проходом
 async def _truncate_tmp_tables(pg) -> None:
     async with pg.acquire() as conn:
-        await conn.execute("TRUNCATE TABLE bt_tmp_angle_quant_detail")
-        await conn.execute("TRUNCATE TABLE bt_tmp_angle_quant_header")
+        # TRUNCATE двух таблиц в одном выражении, чтобы не ругался FK
+        await conn.execute(
+            "TRUNCATE TABLE bt_tmp_angle_quant_detail, bt_tmp_angle_quant_header"
+        )
     log.debug("BT_ANGLE_QUANT: bt_tmp_angle_quant_* очищены перед новым проходом")
 
 
