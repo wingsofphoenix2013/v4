@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("BT_ANGLE_QUANT")
 
-# 🔸 Настройки Redis stream
-ANGLE_STREAM_KEY = "bt:analysis:angle"
+# 🔸 Настройки Redis stream: слушаем bt:analysis:ready (после пересчёта bins_stat)
+ANGLE_STREAM_KEY = "bt:analysis:ready"
 ANGLE_CONSUMER_GROUP = "bt_angle_quant"
 ANGLE_CONSUMER_NAME = "bt_angle_quant_main"
 
@@ -17,13 +17,32 @@ ANGLE_STREAM_BATCH_SIZE = 10
 ANGLE_STREAM_BLOCK_MS = 5000
 
 # 🔸 Настройки квантильного анализа
-ANGLE_QUANTILES = 5              # по сколько квантилей бить
+ANGLE_QUANTILES = 5              # на сколько квантилей делим
 MIN_SHARE = Decimal("0.01")      # 1% от общего числа сделок в бине — порог отбора биннов
+
+# 🔸 ID анализатора lr_angle_mtf, подтягиваем при старте
+ANGLE_ANALYSIS_ID: Optional[int] = None
 
 
 # 🔸 Публичная точка входа: оркестратор квантилей по углу m5 внутри MTF-бинов
 async def run_bt_angle_quant_worker(pg, redis) -> None:
+    global ANGLE_ANALYSIS_ID
+
     log.debug("BT_ANGLE_QUANT: воркер квантильного анализа запущен")
+
+    # находим analysis_id для lr_angle_mtf
+    ANGLE_ANALYSIS_ID = await _load_lr_angle_mtf_analysis_id(pg)
+    if ANGLE_ANALYSIS_ID is None:
+        log.error(
+            "BT_ANGLE_QUANT: не найден анализатор lr_angle_mtf в bt_analysis_instances "
+            "(family_key='lr', key='lr_angle_mtf'), воркер не будет работать"
+        )
+        return
+
+    log.info(
+        "BT_ANGLE_QUANT: используем analysis_id=%s для lr_angle_mtf",
+        ANGLE_ANALYSIS_ID,
+    )
 
     # подготавливаем consumer group
     await _ensure_consumer_group(redis)
@@ -31,7 +50,7 @@ async def run_bt_angle_quant_worker(pg, redis) -> None:
     # очищаем временные таблицы перед первым проходом
     await _truncate_tmp_tables(pg)
 
-    # основной цикл чтения стрима bt:analysis:angle
+    # основной цикл чтения стрима bt:analysis:ready
     while True:
         try:
             entries = await _read_from_stream(redis)
@@ -50,19 +69,17 @@ async def run_bt_angle_quant_worker(pg, redis) -> None:
                 for entry_id, fields in messages:
                     total_msgs += 1
 
-                    ctx = _parse_angle_message(fields)
+                    ctx = _parse_ready_message(fields)
                     if not ctx:
                         await redis.xack(ANGLE_STREAM_KEY, ANGLE_CONSUMER_GROUP, entry_id)
                         continue
 
-                    analysis_id = ctx["analysis_id"]
                     scenario_id = ctx["scenario_id"]
                     signal_id = ctx["signal_id"]
 
                     log.debug(
-                        "BT_ANGLE_QUANT: получено событие angle-analysis "
-                        "analysis_id=%s, scenario_id=%s, signal_id=%s, finished_at=%s, stream_id=%s",
-                        analysis_id,
+                        "BT_ANGLE_QUANT: получено событие bt:analysis:ready "
+                        "scenario_id=%s, signal_id=%s, finished_at=%s, stream_id=%s",
                         scenario_id,
                         signal_id,
                         ctx["finished_at"],
@@ -71,7 +88,7 @@ async def run_bt_angle_quant_worker(pg, redis) -> None:
 
                     bins_processed = await _process_angle_for_pair(
                         pg=pg,
-                        analysis_id=analysis_id,
+                        analysis_id=ANGLE_ANALYSIS_ID,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
                     )
@@ -97,7 +114,26 @@ async def run_bt_angle_quant_worker(pg, redis) -> None:
             await asyncio.sleep(2)
 
 
-# 🔸 Проверка/создание consumer group для стрима bt:analysis:angle
+# 🔸 Загрузка analysis_id для lr_angle_mtf
+async def _load_lr_angle_mtf_analysis_id(pg) -> Optional[int]:
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id
+            FROM bt_analysis_instances
+            WHERE family_key = 'lr'
+              AND "key" = 'lr_angle_mtf'
+              AND enabled = true
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+    if not row:
+        return None
+    return int(row["id"])
+
+
+# 🔸 Проверка/создание consumer group для стрима bt:analysis:ready
 async def _ensure_consumer_group(redis) -> None:
     try:
         await redis.xgroup_create(
@@ -129,7 +165,7 @@ async def _ensure_consumer_group(redis) -> None:
             raise
 
 
-# 🔸 Чтение сообщений из стрима bt:analysis:angle
+# 🔸 Чтение сообщений из стрима bt:analysis:ready
 async def _read_from_stream(redis) -> List[Any]:
     entries = await redis.xreadgroup(
         groupname=ANGLE_CONSUMER_GROUP,
@@ -165,26 +201,25 @@ async def _read_from_stream(redis) -> List[Any]:
     return parsed
 
 
-# 🔸 Парсинг сообщения из bt:analysis:angle
-def _parse_angle_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
+# 🔸 Парсинг сообщения из bt:analysis:ready
+def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
-        analysis_id_str = fields.get("analysis_id")
         scenario_id_str = fields.get("scenario_id")
         signal_id_str = fields.get("signal_id")
         finished_at_str = fields.get("finished_at")
 
-        if not (analysis_id_str and scenario_id_str and signal_id_str and finished_at_str):
+        if not (scenario_id_str and signal_id_str and finished_at_str):
             return None
 
-        return {
-            "analysis_id": int(analysis_id_str),
-            "scenario_id": int(scenario_id_str),
-            "signal_id": int(signal_id_str),
-            "finished_at": datetime.fromisoformat(finished_at_str),
-        }
+        return:
+            {
+                "scenario_id": int(scenario_id_str),
+                "signal_id": int(signal_id_str),
+                "finished_at": datetime.fromisoformat(finished_at_str),
+            }
     except Exception as e:
         log.error(
-            "BT_ANGLE_QUANT: ошибка разбора сообщения стрима bt:analysis:angle: %s, fields=%s",
+            "BT_ANGLE_QUANT: ошибка разбора сообщения стрима bt:analysis:ready: %s, fields=%s",
             e,
             fields,
             exc_info=True,
@@ -195,7 +230,7 @@ def _parse_angle_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
 # 🔸 Очистка временных таблиц перед проходом
 async def _truncate_tmp_tables(pg) -> None:
     async with pg.acquire() as conn:
-        # TRUNCATE двух таблиц в одном выражении, чтобы не ругался FK
+        # TRUNCATE двух таблиц в одном выражении (из-за FK detail -> header)
         await conn.execute(
             "TRUNCATE TABLE bt_tmp_angle_quant_detail, bt_tmp_angle_quant_header"
         )
@@ -243,7 +278,7 @@ async def _process_angle_for_pair(
         return 0
 
     threshold = (Decimal(total_trades) * MIN_SHARE)
-    # чисто > 1%, как ты и просил
+    # > 1% от общего числа сделок
     selected_bins = [r for r in rows if Decimal(int(r["trades"])) > threshold]
 
     if not selected_bins:
@@ -364,7 +399,7 @@ async def _process_single_bin(
     else:
         direction_val = "mixed"
 
-    # складываем в временную таблицу заголовок
+    # заголовок
     async with pg.acquire() as conn:
         row_hdr = await conn.fetchrow(
             """
@@ -395,7 +430,7 @@ async def _process_single_bin(
         )
         header_id = int(row_hdr["id"])
 
-    # считаем квантили по angle_m5 через NTILE в SQL, чтобы не городить свои квантильщики
+    # считаем квантили по angle_m5 через NTILE в SQL
     async with pg.acquire() as conn:
         quant_rows = await conn.fetch(
             """
@@ -517,7 +552,7 @@ async def _process_single_bin(
     return header_id
 
 
-# 🔸 Вспомогательная: безопасное приведение к Decimal (если понадобится)
+# 🔸 Вспомогательная: безопасное приведение к Decimal (на будущее)
 def _safe_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
         return value
