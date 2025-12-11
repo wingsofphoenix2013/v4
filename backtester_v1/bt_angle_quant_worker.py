@@ -211,12 +211,11 @@ def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         if not (scenario_id_str and signal_id_str and finished_at_str):
             return None
 
-        return:
-            {
-                "scenario_id": int(scenario_id_str),
-                "signal_id": int(signal_id_str),
-                "finished_at": datetime.fromisoformat(finished_at_str),
-            }
+        return {
+            "scenario_id": int(scenario_id_str),
+            "signal_id": int(signal_id_str),
+            "finished_at": datetime.fromisoformat(finished_at_str),
+        }
     except Exception as e:
         log.error(
             "BT_ANGLE_QUANT: ошибка разбора сообщения стрима bt:analysis:ready: %s, fields=%s",
