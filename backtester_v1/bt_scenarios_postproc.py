@@ -447,7 +447,6 @@ async def _process_single_position(
 
             tf_open_time = open_times.get(tf)
             if tf_open_time is None:
-                # если не удалось найти свечу для TF — пропускаем позицию
                 log.debug(
                     "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s — нет open_time для TF=%s, позиция пропущена",
                     pos_id,
@@ -471,7 +470,7 @@ async def _process_single_position(
                 instance_ids,
             )
 
-            # группируем по instance_id
+            # группируем по instance_id на основе реально имеющихся значений
             by_instance: Dict[int, List[Dict[str, Any]]] = {}
             for r in rows:
                 iid = r["instance_id"]
@@ -482,20 +481,18 @@ async def _process_single_position(
                     }
                 )
 
-            # проверяем полноту: у каждого ожидаемого инстанса должны быть данные
+            # если каких-то инстансов нет — просто логируем и продолжаем, пишем то, что есть
             missing_instances = [iid for iid in instance_ids if iid not in by_instance]
             if missing_instances:
                 log.debug(
                     "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s, TF=%s — отсутствуют значения индикаторов "
-                    "для instance_id=%s, позиция пропущена",
+                    "для instance_id=%s, будут записаны только доступные",
                     pos_id,
                     symbol,
                     tf,
                     missing_instances,
                 )
-                return "skipped"
 
-            # наполняем данные по "семьям" внутри TF
             tf_families: Dict[str, Dict[str, float]] = {}
 
             for iid, records in by_instance.items():
@@ -511,12 +508,22 @@ async def _process_single_position(
                     value = rec["value"]
                     family_dict[param_name] = value
 
+            # если для TF нет ни одного индикатора — пропускаем TF, но не всю позицию
+            if not tf_families:
+                log.debug(
+                    "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s, TF=%s — нет доступных индикаторов для записи, TF пропускается",
+                    pos_id,
+                    symbol,
+                    tf,
+                )
+                continue
+
             tf_payload[tf] = {
                 "open_time": tf_open_time.isoformat(),
                 "indicators": tf_families,
             }
 
-    # если по какой-то причине нечего записывать — пропускаем
+    # если по какой-то причине нечего записывать вообще — пропускаем позицию
     if not tf_payload:
         log.debug(
             "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s — нет данных индикаторов для записи, позиция пропущена",
@@ -531,7 +538,6 @@ async def _process_single_position(
         "tf": tf_payload,
     }
 
-    # сериализуем в JSON-строку для jsonb
     raw_stat_json = json.dumps(raw_stat)
 
     # записываем raw_stat и помечаем позицию как обработанную
@@ -614,7 +620,6 @@ async def _resolve_open_times_for_position(
 
             open_times[tf] = tf_row["open_time"]
 
-    # убеждаемся, что у нас есть все три TF
     required_tfs = {"m5", "m15", "h1"}
     if not required_tfs.issubset(open_times.keys()):
         log.debug(
