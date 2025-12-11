@@ -29,7 +29,7 @@ from analysis.bt_analysis_lr_angle_bin import run_lr_angle_bin_analysis
 from analysis.bt_analysis_atr_bin import run_atr_bin_analysis
 from analysis.bt_analysis_dmigap_bin import run_dmigap_bin_analysis
 from analysis.bt_analysis_supertrend_bin import run_supertrend_bin_analysis
-
+from analysis.bt_analysis_lr_angle_mtf import run_lr_angle_mtf_analysis
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
@@ -42,6 +42,7 @@ ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("atr", "atr_bin"): run_atr_bin_analysis,
     ("adx_dmi", "dmigap_bin"): run_dmigap_bin_analysis,
     ("supertrend", "supertrend_bin"): run_supertrend_bin_analysis,
+    ("lr", "lr_angle_mtf"): run_lr_angle_mtf_analysis,
 }
 
 # 🔸 Константы стрима анализа
