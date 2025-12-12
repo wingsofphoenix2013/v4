@@ -1,11 +1,10 @@
-# bt_rsimfi_stats.py — периодический снимок распределения позиций по корзинкам RSI/MFI
+# bt_rsimfi_stats.py — периодический снимок распределения позиций по биннам RSI/MFI
 
 import asyncio
 import json
 import logging
 from datetime import datetime
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("BT_RSIMFI_STATS")
 
@@ -16,11 +15,13 @@ RSIMFI_TFS = ["m5", "m15", "h1"]
 INITIAL_DELAY_SEC = 60
 SLEEP_BETWEEN_RUNS_SEC = 3600  # 1 час
 
-# 🔸 Пороги RSI/MFI (сузили нейтральную зону до 40–60)
-RSI_LOW = 40.0
-RSI_HIGH = 60.0
-MFI_LOW = 40.0
-MFI_HIGH = 60.0
+# 🔸 Индикаторы и их param_name в raw_stat + имя для indicator_param
+INDICATORS: List[Tuple[str, str, str]] = [
+    ("rsi", "rsi14", "rsi14"),
+    ("rsi", "rsi21", "rsi21"),
+    ("mfi", "mfi14", "mfi14"),
+    ("mfi", "mfi21", "mfi21"),
+]
 
 
 # 🔸 Публичная точка входа: периодический запуск анализа RSI/MFI по всем сигналам
@@ -91,7 +92,7 @@ async def _load_distinct_scenario_signal_pairs(pg) -> List[tuple]:
     return [(int(r["scenario_id"]), int(r["signal_id"])) for r in rows]
 
 
-# 🔸 Обработка одной пары (scenario_id, signal_id): считаем гистограммы по TF и записываем в bt_analysys_rsimfi
+# 🔸 Обработка одной пары (scenario_id, signal_id): считаем гистограммы по TF и индикаторам и записываем в bt_analysys_rsimfi
 async def _process_pair(pg, scenario_id: int, signal_id: int, run_at: datetime) -> None:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -116,9 +117,17 @@ async def _process_pair(pg, scenario_id: int, signal_id: int, run_at: datetime) 
         )
         return
 
-    # структура: tf -> зона -> count
-    hist: Dict[str, Dict[str, int]] = {tf: {} for tf in RSIMFI_TFS}
-    missing_by_tf: Dict[str, int] = {tf: 0 for tf in RSIMFI_TFS}
+    # структура:
+    #   hist[tf][indicator_param][bin_name] = count
+    #   missing_by_tf[tf][indicator_param] = count_missing
+    hist: Dict[str, Dict[str, Dict[str, int]]] = {
+        tf: {ind_param: {} for _, _, ind_param in INDICATORS}
+        for tf in RSIMFI_TFS
+    }
+    missing_by_tf: Dict[str, Dict[str, int]] = {
+        tf: {ind_param: 0 for _, _, ind_param in INDICATORS}
+        for tf in RSIMFI_TFS
+    }
     total_by_tf: Dict[str, int] = {tf: 0 for tf in RSIMFI_TFS}
 
     for r in rows:
@@ -133,74 +142,82 @@ async def _process_pair(pg, scenario_id: int, signal_id: int, run_at: datetime) 
         for tf in RSIMFI_TFS:
             total_by_tf[tf] += 1
 
-            rsi_val = _extract_indicator_value(raw, tf, "rsi", "rsi14")
-            mfi_val = _extract_indicator_value(raw, tf, "mfi", "mfi14")
+            for family, param_name, ind_param in INDICATORS:
+                value = _extract_indicator_value(raw, tf, family, param_name)
+                if value is None:
+                    missing_by_tf[tf][ind_param] += 1
+                    continue
 
-            if rsi_val is None or mfi_val is None:
-                missing_by_tf[tf] += 1
-                continue
+                bin_name = _value_to_bin(value)
+                if bin_name is None:
+                    missing_by_tf[tf][ind_param] += 1
+                    continue
 
-            zone = _classify_rsi_mfi(rsi_val, mfi_val)
-            if zone is None:
-                missing_by_tf[tf] += 1
-                continue
-
-            hist[tf][zone] = hist[tf].get(zone, 0) + 1
+                tf_hist = hist[tf][ind_param]
+                tf_hist[bin_name] = tf_hist.get(bin_name, 0) + 1
 
     # формируем строки для вставки
     rows_to_insert: List[tuple] = []
 
     for tf in RSIMFI_TFS:
         total = total_by_tf[tf]
-        missing = missing_by_tf[tf]
-        with_data = total - missing
 
-        if not hist[tf]:
-            rows_to_insert.append(
-                (
-                    run_at,
-                    scenario_id,
-                    signal_id,
-                    tf,
-                    "NONE",
-                    total,
-                    with_data,
-                    missing,
-                    0,
-                )
-            )
-        else:
-            for zone_label, count in hist[tf].items():
+        for _, _, ind_param in INDICATORS:
+            missing = missing_by_tf[tf][ind_param]
+            with_data = total - missing
+            bins = hist[tf][ind_param]
+
+            if not bins:
+                # нет ни одной валидной точки данных для этого индикатора на данном TF
                 rows_to_insert.append(
                     (
                         run_at,
                         scenario_id,
                         signal_id,
                         tf,
-                        zone_label,
+                        "NONE",
                         total,
                         with_data,
                         missing,
-                        count,
+                        0,
+                        ind_param,
                     )
                 )
+                bins_repr = ""
+            else:
+                for bin_name, count in sorted(bins.items()):
+                    rows_to_insert.append(
+                        (
+                            run_at,
+                            scenario_id,
+                            signal_id,
+                            tf,
+                            bin_name,
+                            total,
+                            with_data,
+                            missing,
+                            count,
+                            ind_param,
+                        )
+                    )
 
-        bins_repr = ", ".join(
-            f"{zone}: {count}"
-            for zone, count in hist[tf].items()
-        )
+                bins_repr = ", ".join(
+                    f"{bin_name}: {count}"
+                    for bin_name, count in sorted(bins.items())
+                )
 
-        log.info(
-            "BT_RSIMFI_STATS: scenario_id=%s, signal_id=%s, tf=%s — позиций_всего=%s, с_данными=%s, без_данных=%s, "
-            "распределение={%s}",
-            scenario_id,
-            signal_id,
-            tf,
-            total,
-            with_data,
-            missing,
-            bins_repr,
-        )
+            log.info(
+                "BT_RSIMFI_STATS: scenario_id=%s, signal_id=%s, tf=%s, indicator=%s — "
+                "позиций_всего=%s, с_данными=%s, без_данных=%s, распределение={%s}",
+                scenario_id,
+                signal_id,
+                tf,
+                ind_param,
+                total,
+                with_data,
+                missing,
+                bins_repr,
+            )
 
     if rows_to_insert:
         async with pg.acquire() as conn:
@@ -215,11 +232,12 @@ async def _process_pair(pg, scenario_id: int, signal_id: int, run_at: datetime) 
                     positions_total,
                     positions_with_data,
                     positions_missing,
-                    count_in_zone
+                    count_in_zone,
+                    indicator_param
                 )
                 VALUES (
                     $1, $2, $3,
-                    $4, $5, $6, $7, $8, $9
+                    $4, $5, $6, $7, $8, $9, $10
                 )
                 """,
                 rows_to_insert,
@@ -274,47 +292,18 @@ def _extract_indicator_value(
         return None
 
 
-# 🔸 Классификация RSI/MFI в одну из 5 корзинок (взаимоисключающие зоны)
-def _classify_rsi_mfi(rsi: float, mfi: float) -> Optional[str]:
-    r_zone = _level_3(rsi, RSI_LOW, RSI_HIGH)
-    m_zone = _level_3(mfi, MFI_LOW, MFI_HIGH)
-
-    if r_zone is None or m_zone is None:
-        return None
-
-    # Z1: подтверждённый сильный тренд (оба в LOW или оба в HIGH)
-    if (r_zone == "LOW" and m_zone == "LOW") or (r_zone == "HIGH" and m_zone == "HIGH"):
-        return "Z1_CONFIRMED"
-
-    # Z4: жёсткая дивергенция (цена и деньги на противоположных полюсах)
-    if (r_zone == "HIGH" and m_zone == "LOW") or (r_zone == "LOW" and m_zone == "HIGH"):
-        return "Z4_DIVERGENCE"
-
-    # Z2: цена в экстремуме, деньги в середине (EXTREME PRICE, NEUTRAL FLOW)
-    if r_zone in ("LOW", "HIGH") and m_zone == "MID":
-        return "Z2_PRICE_EXTREME"
-
-    # Z3: деньги сильные, цена в середине (FLOW LEADS)
-    if m_zone in ("LOW", "HIGH") and r_zone == "MID":
-        return "Z3_FLOW_LEADS"
-
-    # Z5: оба в середине (нейтрально)
-    if r_zone == "MID" and m_zone == "MID":
-        return "Z5_NEUTRAL"
-
-    # fallback, теоретически сюда не должны попасть
-    return "Z5_NEUTRAL"
-
-
-# 🔸 Классификация значения в LOW/MID/HIGH по двум порогам
-def _level_3(value: float, low: float, high: float) -> Optional[str]:
+# 🔸 Разбиение значения 0–100 по биннам bin_0..bin_4 (шаг 20)
+def _value_to_bin(value: float) -> Optional[str]:
     try:
         v = float(value)
     except (TypeError, ValueError):
         return None
 
-    if v <= low:
-        return "LOW"
-    if v >= high:
-        return "HIGH"
-    return "MID"
+    # допускаем небольшие выходы за пределы, но квантуем в 0..4
+    idx = int(v // 20)
+    if idx < 0:
+        idx = 0
+    if idx > 4:
+        idx = 4
+
+    return f"bin_{idx}"
