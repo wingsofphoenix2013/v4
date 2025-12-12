@@ -19,19 +19,19 @@ from backtester_config import (
 
 # 🔸 Воркер снимков RSI/MFI статистики
 # from bt_rsimfi_stats import run_bt_rsimfi_stats_worker
-# 🔸 Воркер снимков LR статистики
-from bt_lr_stats import run_bt_lr_stats_worker
+# # 🔸 Воркер снимков LR статистики
+# from bt_lr_stats import run_bt_lr_stats_worker
 
-# # 🔸 Оркестратор псевдо-сигналов
-# from bt_signals_main import run_bt_signals_orchestrator
-# # 🔸 Оркестратор сценариев
-# from bt_scenarios_main import run_bt_scenarios_orchestrator
-# # 🔸 Постпроцессор сценариев
-# from bt_scenarios_postproc import run_bt_scenarios_postproc
-# # 🔸 Оркестратор анализаторов
-# from bt_analysis_main import run_bt_analysis_orchestrator
-# # 🔸 Оркестратор финального пост-процессинга анализов
-# from bt_analysis_postproc import run_bt_analysis_postproc_orchestrator
+# 🔸 Оркестратор псевдо-сигналов
+from bt_signals_main import run_bt_signals_orchestrator
+# 🔸 Оркестратор сценариев
+from bt_scenarios_main import run_bt_scenarios_orchestrator
+# 🔸 Постпроцессор сценариев
+from bt_scenarios_postproc import run_bt_scenarios_postproc
+# 🔸 Оркестратор анализаторов
+from bt_analysis_main import run_bt_analysis_orchestrator
+# 🔸 Оркестратор финального пост-процессинга анализов
+from bt_analysis_postproc import run_bt_analysis_postproc_orchestrator
 # # 🔸 Оркестратор комплексных анализаторов
 # from bt_complex_main import run_bt_complex_analysis_orchestrator
 # # 🔸 Оркестратор скоринга комплексных анализаторов
@@ -81,15 +81,15 @@ async def main():
 
     # запуск воркеров в безопасных циклах
     await asyncio.gather(
-#         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
-#         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
-#         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
-#         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
-#         run_safe_loop(lambda: run_bt_analysis_postproc_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC"),
+        run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
+        run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
+        run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
+        run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
+        run_safe_loop(lambda: run_bt_analysis_postproc_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC"),
 #         run_safe_loop(lambda: run_bt_complex_analysis_orchestrator(pg, redis), "BT_COMPLEX"),
 #         run_safe_loop(lambda: run_bt_complex_score_orchestrator(pg, redis), "BT_COMPLEX_SCORE"),
 #         run_safe_loop(lambda: run_bt_rsimfi_stats_worker(pg), "BT_RSIMFI_STATS"),
-        run_safe_loop(lambda: run_bt_lr_stats_worker(pg), "BT_LR_STATS"),
+#         run_safe_loop(lambda: run_bt_lr_stats_worker(pg), "BT_LR_STATS"),
     )
 
 
