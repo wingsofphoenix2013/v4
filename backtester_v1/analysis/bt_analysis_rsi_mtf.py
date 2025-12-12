@@ -1,4 +1,4 @@
-# bt_analysis_rsi_mtf.py — анализатор распределения позиций по MTF-корзинкам RSI (h1 + m15)
+# bt_analysis_rsi_mtf.py — анализатор распределения позиций по MTF-корзинкам RSI (h1 + m15 + m5)
 
 import logging
 import json
@@ -13,7 +13,7 @@ DEFAULT_MIN_SHARE = Decimal("0.01")
 DEFAULT_LENGTH = 14
 
 
-# 🔸 Публичная точка входа анализатора RSI MTF (h1 + m15)
+# 🔸 Публичная точка входа анализатора RSI MTF (h1 + m15 + m5, без фильтрации по m5)
 async def run_rsi_mtf_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
@@ -69,8 +69,8 @@ async def run_rsi_mtf_analysis(
     positions_total = 0
     positions_skipped = 0
 
-    # сначала собираем все бин-коды по h1/m15 для каждой позиции
-    # H: bin_0..bin_4, M: bin_0..bin_4
+    # сначала собираем все бин-коды по h1/m15/m5 для каждой позиции
+    # H1: bin_0..bin_4, M15: bin_0..bin_4, M5: bin_0..bin_4
     base_list: List[Dict[str, Any]] = []
 
     for p in positions:
@@ -83,15 +83,17 @@ async def run_rsi_mtf_analysis(
 
         rsi_h1 = _extract_rsi_value(raw_stat, "h1", length)
         rsi_m15 = _extract_rsi_value(raw_stat, "m15", length)
+        rsi_m5 = _extract_rsi_value(raw_stat, "m5", length)
 
-        # если не удалось прочитать оба значения — пропускаем позицию
-        if rsi_h1 is None or rsi_m15 is None:
+        # если не удалось прочитать все три значения — пропускаем позицию
+        if rsi_h1 is None or rsi_m15 is None or rsi_m5 is None:
             positions_skipped += 1
             continue
 
         h_bin = _value_to_bin(rsi_h1)
-        m_bin = _value_to_bin(rsi_m15)
-        if h_bin is None or m_bin is None:
+        m15_bin = _value_to_bin(rsi_m15)
+        m5_bin = _value_to_bin(rsi_m5)
+        if h_bin is None or m15_bin is None or m5_bin is None:
             positions_skipped += 1
             continue
 
@@ -100,8 +102,9 @@ async def run_rsi_mtf_analysis(
                 "position_uid": position_uid,
                 "direction": direction,
                 "pnl_abs": pnl_abs,
-                "h_bin": h_bin,  # например "bin_2"
-                "m_bin": m_bin,  # например "bin_3"
+                "h_bin": h_bin,      # например "bin_2"
+                "m15_bin": m15_bin,  # например "bin_3"
+                "m5_bin": m5_bin,    # например "bin_1"
             }
         )
 
@@ -125,7 +128,7 @@ async def run_rsi_mtf_analysis(
 
     total_for_share = Decimal(positions_used)
 
-    # группируем по H-бинам (h1)
+    # группируем по H1-бинам
     by_h1: Dict[str, List[Dict[str, Any]]] = {}
     for rec in base_list:
         h_bin = rec["h_bin"]
@@ -133,15 +136,16 @@ async def run_rsi_mtf_analysis(
 
     rows: List[Dict[str, Any]] = []
 
-    # проходим по H-бинам и применяем min_share
+    # проходим по H1-бинам и последовательно применяем min_share (H1 → M15 → M5)
     for h_bin, group_h in by_h1.items():
         group_n_h = len(group_h)
         share_h = Decimal(group_n_h) / total_for_share
 
-        # если доля по h1 < min_share — все позиции этого бина идут в агрегированный M_0
+        # если доля по H1 < min_share — все позиции этого бина идут в агрегированный хвост:
+        # H1_bin_X|M15_0|M5_0
         if share_h < min_share:
             for rec in group_h:
-                bin_name = f"H_{h_bin}|M_0"  # пример: H_bin_2|M_0
+                bin_name = f"H1_{h_bin}|M15_0|M5_0"
                 rows.append(
                     {
                         "position_uid": rec["position_uid"],
@@ -154,25 +158,52 @@ async def run_rsi_mtf_analysis(
                 )
             continue
 
-        # иначе внутри H-бина учитываем разбиение по M-бинам
+        # внутри этого H1-бина — фильтр по M15
+        by_m15: Dict[str, List[Dict[str, Any]]] = {}
         for rec in group_h:
-            m_bin = rec["m_bin"]
-            bin_name = f"H_{h_bin}|M_{m_bin}"  # пример: H_bin_2|M_bin_3
-            rows.append(
-                {
-                    "position_uid": rec["position_uid"],
-                    "timeframe": "mtf",
-                    "direction": rec["direction"],
-                    "bin_name": bin_name,
-                    "value": 0,
-                    "pnl_abs": rec["pnl_abs"],
-                }
-            )
+            m15_bin = rec["m15_bin"]
+            by_m15.setdefault(m15_bin, []).append(rec)
+
+        for m15_bin, group_m15 in by_m15.items():
+            group_n_m15 = len(group_m15)
+            share_m15 = Decimal(group_n_m15) / total_for_share
+
+            # если доля по (H1, M15) < min_share — кладём в:
+            # H1_bin_X|M15_bin_Y|M5_0
+            if share_m15 < min_share:
+                for rec in group_m15:
+                    bin_name = f"H1_{h_bin}|M15_{m15_bin}|M5_0"
+                    rows.append(
+                        {
+                            "position_uid": rec["position_uid"],
+                            "timeframe": "mtf",
+                            "direction": rec["direction"],
+                            "bin_name": bin_name,
+                            "value": 0,
+                            "pnl_abs": rec["pnl_abs"],
+                        }
+                    )
+                continue
+
+            # иначе — полноценная MTF-матрица: H1_bin_X|M15_bin_Y|M5_bin_Z
+            for rec in group_m15:
+                m5_bin = rec["m5_bin"]
+                bin_name = f"H1_{h_bin}|M15_{m15_bin}|M5_{m5_bin}"
+                rows.append(
+                    {
+                        "position_uid": rec["position_uid"],
+                        "timeframe": "mtf",
+                        "direction": rec["direction"],
+                        "bin_name": bin_name,
+                        "value": 0,
+                        "pnl_abs": rec["pnl_abs"],
+                    }
+                )
 
     log.info(
         "BT_ANALYSIS_RSI_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s, length=%s, min_share=%s — "
-        "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s, H-бинов=%s",
+        "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s, H1-бинов=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -253,7 +284,7 @@ async def _load_positions_for_analysis(
     return positions
 
 
-# 🔸 Извлечение значения RSI для заданного TF и длины
+# извлечение значения RSI для заданного TF и длины
 def _extract_rsi_value(
     raw_stat: Any,
     tf: str,
@@ -294,7 +325,7 @@ def _extract_rsi_value(
         return None
 
 
-# 🔸 Разбиение значения 0–100 по биннам bin_0..bin_4 (шаг 20)
+# разбиение значения 0–100 по биннам bin_0..bin_4 (шаг 20)
 def _value_to_bin(value: float) -> Optional[str]:
     try:
         v = float(value)
@@ -310,7 +341,7 @@ def _value_to_bin(value: float) -> Optional[str]:
     return f"bin_{idx}"
 
 
-# 🔸 Вспомогательная функция: безопасное приведение к Decimal
+# вспомогательная функция: безопасное приведение к Decimal
 def _safe_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
         return value
@@ -320,7 +351,7 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
-# 🔸 Вспомогательная функция: безопасное чтение Decimal-параметра
+# вспомогательная функция: безопасное чтение Decimal-параетра
 def _get_decimal_param(params: Dict[str, Any], name: str, default: Decimal) -> Decimal:
     cfg = params.get(name)
     if cfg is None:
@@ -336,7 +367,7 @@ def _get_decimal_param(params: Dict[str, Any], name: str, default: Decimal) -> D
         return default
 
 
-# 🔸 Вспомогательная функция: безопасное чтение int-параметра
+# вспомогательная функция: безопасное чтение int-параметра
 def _get_int_param(params: Dict[str, Any], name: str, default: int) -> int:
     cfg = params.get(name)
     if cfg is None:
