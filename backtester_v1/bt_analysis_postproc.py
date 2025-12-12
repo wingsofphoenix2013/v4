@@ -20,7 +20,7 @@ POSTPROC_STREAM_BLOCK_MS = 5000
 POSTPROC_MAX_CONCURRENCY = 8
 
 # минимальный winrate для биннов; всё, что ниже — считается "плохим бинном"
-MIN_WINRATE_THRESHOLD = Decimal("0.3334")
+MIN_WINRATE_THRESHOLD = Decimal("0.25")
 
 # кеш последних finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_analysis_finished_at: Dict[Tuple[int, int], datetime] = {}
