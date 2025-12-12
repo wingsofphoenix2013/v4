@@ -4,19 +4,15 @@ import logging
 import json
 from typing import Dict, Any, List, Optional, Tuple
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_RSIMFI_MTF")
 
-# 🔸 Пороги RSI/MFI (должны совпадать с bt_rsimfi_stats)
-RSI_LOW = 40.0
-RSI_HIGH = 60.0
-MFI_LOW = 40.0
-MFI_HIGH = 60.0
-
-# 🔸 Порог доли группы (1%) для фильтров по h1 и m15
-MIN_SHARE = Decimal("0.01")
+# 🔸 Дефолтные пороги и параметры (должны совпадать с bt_rsimfi_stats по умолчанию)
+DEFAULT_RSIMFI_LOW = Decimal("40.0")
+DEFAULT_RSIMFI_HIGH = Decimal("60.0")
+DEFAULT_MIN_SHARE = Decimal("0.01")
+DEFAULT_LENGTH = 14
 
 
 # 🔸 Публичная точка входа анализатора RSI/MFI MTF (h1 + m15 + m5)
@@ -24,7 +20,7 @@ async def run_rsimfi_mtf_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
     pg,
-    redis,  # оставляем, на будущее (bt:analysis:angle), сейчас можно не использовать
+    redis,  # оставляем для совместимости сигнатур, здесь не используется
 ) -> Dict[str, Any]:
     analysis_id = analysis.get("id")
     family_key = str(analysis.get("family_key") or "").strip()
@@ -35,15 +31,26 @@ async def run_rsimfi_mtf_analysis(
     scenario_id = analysis_ctx.get("scenario_id")
     signal_id = analysis_ctx.get("signal_id")
 
+    # параметры анализатора
+    rsimfi_low = _get_decimal_param(params, "rsimfi_low", DEFAULT_RSIMFI_LOW)
+    rsimfi_high = _get_decimal_param(params, "rsimfi_high", DEFAULT_RSIMFI_HIGH)
+    min_share = _get_decimal_param(params, "min_share", DEFAULT_MIN_SHARE)
+    length = _get_int_param(params, "length", DEFAULT_LENGTH)
+
     log.debug(
         "BT_ANALYSIS_RSIMFI_MTF: старт анализа id=%s (family=%s, key=%s, name=%s) "
-        "для scenario_id=%s, signal_id=%s, params=%s",
+        "для scenario_id=%s, signal_id=%s, rsimfi_low=%s, rsimfi_high=%s, "
+        "min_share=%s, length=%s, params=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
         scenario_id,
         signal_id,
+        rsimfi_low,
+        rsimfi_high,
+        min_share,
+        length,
         params,
     )
 
@@ -80,9 +87,9 @@ async def run_rsimfi_mtf_analysis(
         pnl_abs = p["pnl_abs"]
         raw_stat = p["raw_stat"]
 
-        zone_h1 = _extract_rsimfi_zone(raw_stat, "h1")
-        zone_m15 = _extract_rsimfi_zone(raw_stat, "m15")
-        zone_m5 = _extract_rsimfi_zone(raw_stat, "m5")
+        zone_h1 = _extract_rsimfi_zone(raw_stat, "h1", length, rsimfi_low, rsimfi_high)
+        zone_m15 = _extract_rsimfi_zone(raw_stat, "m15", length, rsimfi_low, rsimfi_high)
+        zone_m5 = _extract_rsimfi_zone(raw_stat, "m5", length, rsimfi_low, rsimfi_high)
 
         # если не удалось определить полную тройку зон — пропускаем позицию
         if zone_h1 is None or zone_m15 is None or zone_m5 is None:
@@ -124,7 +131,7 @@ async def run_rsimfi_mtf_analysis(
 
     total_for_share = Decimal(positions_used)
 
-    # 🔸 Фильтр 1% после h1: группируем по zone_h1
+    # 🔸 Фильтр min_share после h1: группируем по zone_h1
     by_h1: Dict[str, List[Dict[str, Any]]] = {}
     for rec in base_list:
         z_h1 = rec["zone_h1"]
@@ -136,8 +143,8 @@ async def run_rsimfi_mtf_analysis(
         group_n_h1 = len(h1_group)
         share_h1 = Decimal(group_n_h1) / total_for_share
 
-        # если доля по h1 < 1% — весь этот хвост складываем в H_Zh|M15_Z0|M5_Z0
-        if share_h1 < MIN_SHARE:
+        # если доля по h1 < min_share — весь этот хвост складываем в H_Zh|M15_Z0|M5_Z0
+        if share_h1 < min_share:
             bin_name = f"H_{z_h1}|M15_Z0|M5_Z0"
             for rec in h1_group:
                 rows.append(
@@ -162,8 +169,8 @@ async def run_rsimfi_mtf_analysis(
             group_n_m15 = len(m15_group)
             share_m15 = Decimal(group_n_m15) / total_for_share
 
-            # если доля по этой (h1,m15)-зоне < 1% — кладём в H_Zh|M15_Zm|M5_Z0
-            if share_m15 < MIN_SHARE:
+            # если доля по этой (h1,m15)-зоне < min_share — кладём в H_Zh|M15_Zm|M5_Z0
+            if share_m15 < min_share:
                 bin_name = f"H_{z_h1}|M15_{z_m15}|M5_Z0"
                 for rec in m15_group:
                     rows.append(
@@ -195,13 +202,18 @@ async def run_rsimfi_mtf_analysis(
 
     log.info(
         "BT_ANALYSIS_RSIMFI_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
+        "scenario_id=%s, signal_id=%s, rsimfi_low=%s, rsimfi_high=%s, min_share=%s, length=%s — "
+        "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
         scenario_id,
         signal_id,
+        rsimfi_low,
+        rsimfi_high,
+        min_share,
+        length,
         positions_total,
         positions_used,
         positions_skipped,
@@ -246,6 +258,7 @@ async def _load_positions_for_analysis(
     for r in rows:
         raw = r["raw_stat"]
 
+        # приводим jsonb к dict, если он пришёл строкой
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -274,6 +287,9 @@ async def _load_positions_for_analysis(
 def _extract_rsimfi_zone(
     raw_stat: Any,
     tf: str,
+    length: int,
+    rsimfi_low: Decimal,
+    rsimfi_high: Decimal,
 ) -> Optional[str]:
     if raw_stat is None:
         return None
@@ -300,8 +316,11 @@ def _extract_rsimfi_zone(
     if not isinstance(rsi_family, dict) or not isinstance(mfi_family, dict):
         return None
 
-    rsi_val = rsi_family.get("rsi14")
-    mfi_val = mfi_family.get("mfi14")
+    rsi_key = f"rsi{length}"
+    mfi_key = f"mfi{length}"
+
+    rsi_val = rsi_family.get(rsi_key)
+    mfi_val = mfi_family.get(mfi_key)
     if rsi_val is None or mfi_val is None:
         return None
 
@@ -312,14 +331,19 @@ def _extract_rsimfi_zone(
         return None
 
     # используем ту же логику зон, что в bt_rsimfi_stats, но возвращаем имена типа "Z1_CONFIRMED"
-    zone = _classify_rsi_mfi(rsi_f, mfi_f)
+    zone = _classify_rsi_mfi(rsi_f, mfi_f, float(rsimfi_low), float(rsimfi_high))
     return zone
 
 
 # 🔸 Классификация RSI/MFI в одну из 5 корзинок (взаимоисключающие зоны)
-def _classify_rsi_mfi(rsi: float, mfi: float) -> Optional[str]:
-    r_zone = _level_3(rsi, RSI_LOW, RSI_HIGH)
-    m_zone = _level_3(mfi, MFI_LOW, MFI_HIGH)
+def _classify_rsi_mfi(
+    rsi: float,
+    mfi: float,
+    low: float,
+    high: float,
+) -> Optional[str]:
+    r_zone = _level_3(rsi, low, high)
+    m_zone = _level_3(mfi, low, high)
 
     if r_zone is None or m_zone is None:
         return None
@@ -370,3 +394,35 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
+
+
+# 🔸 Вспомогательная функция: безопасное чтение Decimal-параметра
+def _get_decimal_param(params: Dict[str, Any], name: str, default: Decimal) -> Decimal:
+    cfg = params.get(name)
+    if cfg is None:
+        return default
+
+    raw = cfg.get("value")
+    if raw is None:
+        return default
+
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+# 🔸 Вспомогательная функция: безопасное чтение int-параметра
+def _get_int_param(params: Dict[str, Any], name: str, default: int) -> int:
+    cfg = params.get(name)
+    if cfg is None:
+        return default
+
+    raw = cfg.get("value")
+    if raw is None:
+        return default
+
+    try:
+        return int(str(raw))
+    except (TypeError, ValueError):
+        return default
