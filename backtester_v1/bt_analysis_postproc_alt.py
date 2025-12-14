@@ -1,4 +1,4 @@
-# bt_analysis_postproc_alt.py — альтернативный постпроцессинг анализов (поиск оптимального MIN_WINRATE_THRESHOLD)
+# bt_analysis_postproc_alt.py — альтернативный постпроцессинг анализов (поиск оптимального порога winrate только по направлениям сигнала)
 
 import asyncio
 import json
@@ -22,7 +22,7 @@ ALT_MAX_CONCURRENCY = 6
 # eps нужен, потому что правило фильтрации строгое: winrate < threshold
 EPS_THRESHOLD = Decimal("0.00000001")
 
-# кеш последних finished_at по (scenario_id, signal_id) для отсечки дублей
+# 🔸 Кеш последних finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_analysis_finished_at: Dict[Tuple[int, int], datetime] = {}
 
 log = logging.getLogger("BT_ANALYSIS_POSTPROC_ALT")
@@ -222,16 +222,20 @@ async def _process_message(
         started_at = datetime.utcnow()
 
         try:
+            # определяем направления для работы по параметрам сигнала
+            direction_mask = await _load_signal_direction_mask(pg, signal_id)
+            directions = _directions_from_mask(direction_mask)
+
             # собираем “подпись” набора анализаторов (для объяснимости результатов)
             analysis_ids = await _load_analysis_ids_for_pair(pg, scenario_id, signal_id)
 
             # депозит сценария (для ROI)
             deposit = await _load_scenario_deposit(pg, scenario_id)
 
-            # считаем оптимум отдельно для long/short
+            # считаем оптимум только по направлениям сигнала
             results: Dict[str, Dict[str, Any]] = {}
-            for direction in ("long", "short"):
-                # расчёт оптимального порога и метрик
+
+            for direction in directions:
                 res = await _compute_best_threshold_for_direction(
                     pg=pg,
                     scenario_id=scenario_id,
@@ -241,7 +245,6 @@ async def _process_message(
                 )
                 results[direction] = res
 
-                # запись результата в отдельную таблицу (upsert)
                 await _upsert_threshold_opt_result(
                     pg=pg,
                     scenario_id=scenario_id,
@@ -251,20 +254,38 @@ async def _process_message(
                     analysis_ids=analysis_ids,
                     deposit=deposit,
                     source_finished_at=finished_at,
+                    direction_mask=direction_mask,
                 )
+
+            # удаляем “лишние” направления из таблицы (чтобы не оставались старые нулевые строки)
+            other_dirs = [d for d in ("long", "short") if d not in directions]
+            for d in other_dirs:
+                await _delete_threshold_opt_row(pg, scenario_id, signal_id, d)
 
             elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
+            # суммарный лог
+            long_res = results.get("long") or {}
+            short_res = results.get("short") or {}
+
+            # комментарий: в лог выводим только то, что реально считали
+            parts: List[str] = []
+            if "long" in results:
+                parts.append(
+                    f"long=thr:{long_res.get('best_threshold')} roi:{long_res.get('filt_roi')} trades:{long_res.get('filt_trades')}"
+                )
+            if "short" in results:
+                parts.append(
+                    f"short=thr:{short_res.get('best_threshold')} roi:{short_res.get('filt_roi')} trades:{short_res.get('filt_trades')}"
+                )
+
             log.info(
-                "BT_ANALYSIS_POSTPROC_ALT: scenario_id=%s, signal_id=%s — best_threshold: long=%s (filt_roi=%s, trades=%s), short=%s (filt_roi=%s, trades=%s), elapsed_ms=%s",
+                "BT_ANALYSIS_POSTPROC_ALT: scenario_id=%s, signal_id=%s — direction_mask=%s, directions=%s, %s, elapsed_ms=%s",
                 scenario_id,
                 signal_id,
-                results.get("long", {}).get("best_threshold"),
-                results.get("long", {}).get("filt_roi"),
-                results.get("long", {}).get("filt_trades"),
-                results.get("short", {}).get("best_threshold"),
-                results.get("short", {}).get("filt_roi"),
-                results.get("short", {}).get("filt_trades"),
+                direction_mask,
+                directions,
+                " | ".join(parts) if parts else "no_directions",
                 elapsed_ms,
             )
 
@@ -277,8 +298,53 @@ async def _process_message(
                 exc_info=True,
             )
         finally:
-            # помечаем сообщение как обработанное в любом случае
             await redis.xack(ANALYSIS_READY_STREAM_KEY, ALT_CONSUMER_GROUP, entry_id)
+
+
+# 🔸 Загрузка direction_mask сигнала из bt_signals_parameters (param_name='direction_mask')
+async def _load_signal_direction_mask(pg, signal_id: int) -> Optional[str]:
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT param_value
+            FROM bt_signals_parameters
+            WHERE signal_id  = $1
+              AND param_name = 'direction_mask'
+            LIMIT 1
+            """,
+            signal_id,
+        )
+
+    if not row:
+        return None
+
+    value = row["param_value"]
+    if value is None:
+        return None
+
+    return str(value).strip().lower() or None
+
+
+# 🔸 Преобразование direction_mask -> список направлений
+def _directions_from_mask(mask: Optional[str]) -> List[str]:
+    # если mask не задан — считаем сигнал двунаправленным
+    if not mask:
+        return ["long", "short"]
+
+    # нормализуем часто встречающиеся варианты
+    m = mask.strip().lower()
+
+    if m == "long":
+        return ["long"]
+    if m == "short":
+        return ["short"]
+
+    # варианты “оба направления”
+    if m in ("both", "all", "any", "long_short", "short_long", "long+short", "short+long", "long|short", "short|long"):
+        return ["long", "short"]
+
+    # дефолт: безопасный fallback — считаем оба направления
+    return ["long", "short"]
 
 
 # 🔸 Загрузка analysis_id, присутствующих в bins_stat по паре (scenario_id, signal_id)
@@ -341,7 +407,6 @@ async def _compute_best_threshold_for_direction(
     positions = await _load_positions_with_worst_winrate(pg, scenario_id, signal_id, direction)
 
     if not positions:
-        # если позиций нет — пишем нули
         return {
             "best_threshold": Decimal("0"),
             "orig_trades": 0,
@@ -355,12 +420,14 @@ async def _compute_best_threshold_for_direction(
             "removed_trades": 0,
             "removed_accuracy": Decimal("0"),
             "candidates": 0,
+            "removable_positions": 0,
         }
 
     # исходные агрегаты (до фильтрации)
     orig_trades = len(positions)
     orig_pnl_abs = sum((p["pnl_abs"] for p in positions), Decimal("0"))
     orig_wins = sum(1 for p in positions if p["pnl_abs"] > 0)
+
     if orig_trades > 0:
         orig_winrate = Decimal(orig_wins) / Decimal(orig_trades)
     else:
@@ -377,10 +444,12 @@ async def _compute_best_threshold_for_direction(
     # группируем позиции по worst_winrate (только те, которые потенциально удаляемы)
     groups: Dict[Decimal, Dict[str, Any]] = {}
     removable_count = 0
+
     for p in positions:
         w = p["worst_winrate"]
         if w is None:
             continue
+
         removable_count += 1
         g = groups.setdefault(
             w,
@@ -394,7 +463,7 @@ async def _compute_best_threshold_for_direction(
             g["losers"] += 1
 
     unique_worst = sorted(groups.keys())
-    candidates = 1 + len(unique_worst)  # baseline + по каждому worst_winrate
+    candidates = 1 + len(unique_worst)
 
     # стартовое состояние: ничего не удалено (threshold=0)
     best_threshold = Decimal("0")
@@ -418,8 +487,8 @@ async def _compute_best_threshold_for_direction(
     removed_wins = 0
     removed_losers = 0
 
-    # sweep: постепенно повышаем threshold и удаляем группы worst_winrate <= v
     for v in unique_worst:
+        # комментарий: повышаем threshold, удаляя все позиции с worst_winrate <= v
         g = groups[v]
 
         removed_trades += int(g["trades"])
@@ -451,15 +520,13 @@ async def _compute_best_threshold_for_direction(
 
         threshold = v + EPS_THRESHOLD
 
-        # выбираем objective
         if objective_mode == "roi":
             objective = filt_roi
         else:
             objective = filt_pnl
 
-        # правило выбора лучшего:
         # 1) максимальный objective
-        # 2) при равенстве — больше filt_trades (меньше агрессия)
+        # 2) при равенстве — больше filt_trades
         # 3) при равенстве — меньший threshold
         if objective > best_objective:
             best_objective = objective
@@ -488,7 +555,6 @@ async def _compute_best_threshold_for_direction(
                 best_removed_trades = removed_trades
                 best_removed_accuracy = removed_accuracy
 
-    # лёгкая квантизация метрик для предсказуемости (как в остальных модулях)
     return {
         "best_threshold": _q_decimal(best_threshold),
         "orig_trades": int(orig_trades),
@@ -577,13 +643,15 @@ async def _upsert_threshold_opt_result(
     analysis_ids: List[int],
     deposit: Optional[Decimal],
     source_finished_at: datetime,
+    direction_mask: Optional[str],
 ) -> None:
-    # собираем meta для explainability
+    # формируем meta для explainability
     meta_obj = {
         "version": 1,
         "method": "worst_winrate_sweep",
         "eps": str(EPS_THRESHOLD),
         "direction": direction,
+        "direction_mask": direction_mask,
         "deposit": str(deposit) if deposit is not None else None,
         "analysis_ids": analysis_ids,
         "candidates": result.get("candidates", 0),
@@ -668,6 +736,27 @@ async def _upsert_threshold_opt_result(
     )
 
 
+# 🔸 Удаление строки результата для направления, которое не относится к сигналу
+async def _delete_threshold_opt_row(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+) -> None:
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            DELETE FROM bt_analysis_threshold_opt
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND direction   = $3
+            """,
+            scenario_id,
+            signal_id,
+            direction,
+        )
+
+
 # 🔸 Вспомогательная функция: безопасное приведение к Decimal
 def _safe_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
@@ -692,5 +781,4 @@ def _safe_decimal_or_none(value: Any) -> Optional[Decimal]:
 
 # 🔸 Вспомогательная функция: квантизация Decimal до 4 знаков
 def _q_decimal(value: Decimal) -> Decimal:
-    # 4 знака после запятой для предсказуемости (как в других частях системы)
     return value.quantize(Decimal("0.0001"))
