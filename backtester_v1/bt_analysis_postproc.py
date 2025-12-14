@@ -1,4 +1,4 @@
-# bt_analysis_postproc.py — финальная пост-обработка результатов анализаторов по сценариям/сигналам (с динамическим порогом из bt_analysis_threshold_opt)
+# bt_analysis_postproc.py — финальная пост-обработка результатов анализаторов по сценариям/сигналам (применение разметки биннов из bt_analysis_bins_labels)
 
 import asyncio
 import json
@@ -19,7 +19,7 @@ POSTPROC_STREAM_BLOCK_MS = 5000
 
 POSTPROC_MAX_CONCURRENCY = 8
 
-# 🔸 Fallback порога (если по какой-то причине best_threshold не найден в bt_analysis_threshold_opt)
+# 🔸 Fallback порога (если по какой-то причине модель не найдена)
 DEFAULT_MIN_WINRATE_THRESHOLD = Decimal("0.3334")
 
 # 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
@@ -72,8 +72,7 @@ async def run_bt_analysis_postproc_orchestrator(pg, redis):
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
                 log.info(
-                    "BT_ANALYSIS_POSTPROC: обработан пакет сообщений из bt:analysis:preproc_ready — "
-                    "сообщений=%s, ошибок=%s",
+                    "BT_ANALYSIS_POSTPROC: обработан пакет сообщений из bt:analysis:preproc_ready — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
                 )
@@ -169,10 +168,8 @@ def _parse_preproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, A
 
         scenario_id = int(scenario_id_str)
         signal_id = int(signal_id_str)
-
         finished_at = datetime.fromisoformat(finished_at_str)
 
-        # source_finished_at — привязка к прогону bt:analysis:ready (желательно, но может быть пустым)
         source_finished_at = None
         if source_finished_at_str:
             try:
@@ -256,31 +253,26 @@ async def _process_message(
             direction_mask = direction_mask_from_msg or await _load_signal_direction_mask(pg, signal_id)
             directions = _directions_from_mask(direction_mask)
 
-            # загружаем best_threshold по направлениям
-            thresholds = await _load_thresholds_for_pair(pg, scenario_id, signal_id, directions)
+            # загружаем модели по направлениям
+            model_map = await _load_model_opt_map(pg, scenario_id, signal_id, directions)
 
-            # если threshold не найден — fallback на DEFAULT
-            threshold_map: Dict[str, Decimal] = {}
-            for d in directions:
-                thr = thresholds.get(d)
-                if thr is None or thr <= 0:
-                    log.warning(
-                        "BT_ANALYSIS_POSTPROC: best_threshold не найден или некорректен — "
-                        "используется DEFAULT=%s для scenario_id=%s, signal_id=%s, direction=%s",
-                        DEFAULT_MIN_WINRATE_THRESHOLD,
-                        scenario_id,
-                        signal_id,
-                        d,
-                    )
-                    thr = DEFAULT_MIN_WINRATE_THRESHOLD
-                threshold_map[d] = thr
+            # если модели нет — всё равно попробуем отработать с fallback порогом (но без bad bins это бессмысленно)
+            if not model_map:
+                log.warning(
+                    "BT_ANALYSIS_POSTPROC: bt_analysis_model_opt не найден для scenario_id=%s, signal_id=%s — постпроцессинг пропущен",
+                    scenario_id,
+                    signal_id,
+                )
+                await redis.xack(PREPROC_READY_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
+                return
 
+            # применяем разметку биннов из bt_analysis_bins_labels
             result = await _process_pair_postproc(
                 pg=pg,
                 scenario_id=scenario_id,
                 signal_id=signal_id,
                 directions=directions,
-                threshold_map=threshold_map,
+                model_map=model_map,
             )
 
             # публикуем событие готовности финального постпроцессинга
@@ -289,19 +281,18 @@ async def _process_message(
                 scenario_id=scenario_id,
                 signal_id=signal_id,
                 result=result,
-                threshold_map=threshold_map,
+                model_map=model_map,
                 source_finished_at=dedup_ts,
             )
 
             log.info(
-                "BT_ANALYSIS_POSTPROC: постпроцессинг завершён для scenario_id=%s, signal_id=%s — "
-                "позиции_всего=%s, хорошие=%s, плохие=%s, thresholds=%s",
+                "BT_ANALYSIS_POSTPROC: постпроцессинг завершён для scenario_id=%s, signal_id=%s — позиции_всего=%s, хорошие=%s, плохие=%s, models=%s",
                 scenario_id,
                 signal_id,
                 result.get("positions_total", 0),
                 result.get("positions_good", 0),
                 result.get("positions_bad", 0),
-                {k: str(v) for k, v in threshold_map.items()},
+                {d: {"model_id": model_map[d]["model_id"], "thr": str(model_map[d]["best_threshold"])} for d in model_map},
             )
 
         except Exception as e:
@@ -317,13 +308,13 @@ async def _process_message(
             await redis.xack(PREPROC_READY_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
 
-# 🔸 Основной постпроцессинг для одной пары (scenario_id, signal_id)
+# 🔸 Основной постпроцессинг для одной пары (scenario_id, signal_id) по разметке биннов
 async def _process_pair_postproc(
     pg,
     scenario_id: int,
     signal_id: int,
     directions: List[str],
-    threshold_map: Dict[str, Decimal],
+    model_map: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     log.debug(
         "BT_ANALYSIS_POSTPROC: старт постпроцессинга для scenario_id=%s, signal_id=%s, directions=%s",
@@ -373,45 +364,63 @@ async def _process_pair_postproc(
 
     positions_total = len(positions_map)
 
-    # загружаем индекс raw для быстрых поисков (только нужные направления)
-    raw_index = await _load_positions_raw_index(pg, scenario_id, signal_id, directions)
-
     # агрегат по отбраковкам: direction -> indicator_param -> {total_trades, total_pnl, by_tf{tf->{trades,pnl}}}
     removed_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    # чтобы не удваивать вклад одной и той же позиции в рамках (dir, indicator_param, tf)
     removed_seen: set = set()
 
-    # применяем отбраковку по направлениям с разными threshold
-    total_bad_bins = 0
-    for direction in directions:
-        threshold = threshold_map.get(direction) or DEFAULT_MIN_WINRATE_THRESHOLD
+    # threshold_map для записи в bt_analysis_scenario_stat.raw_stat
+    threshold_map: Dict[str, Decimal] = {}
 
-        bad_bins = await _load_bad_bins_for_pair(
+    total_bad_bins = 0
+    total_bad_hits = 0
+
+    for direction in directions:
+        model = model_map.get(direction)
+        if not model:
+            continue
+
+        model_id = int(model.get("model_id"))
+        best_threshold = _safe_decimal(model.get("best_threshold") or DEFAULT_MIN_WINRATE_THRESHOLD)
+        threshold_map[direction] = best_threshold
+
+        # загружаем bad bins напрямую из labels (state='bad')
+        bad_bins = await _load_bad_bins_from_labels(
             pg=pg,
+            model_id=model_id,
             scenario_id=scenario_id,
             signal_id=signal_id,
             direction=direction,
-            threshold=threshold,
         )
         total_bad_bins += len(bad_bins)
 
         if not bad_bins:
             continue
 
+        # набор analysis_id для ускорения индекса
+        bad_analysis_ids = sorted({b["analysis_id"] for b in bad_bins})
+
+        # строим индекс raw только по нужным analysis_id для этого направления
+        raw_index = await _load_positions_raw_index_for_analysis_ids(
+            pg=pg,
+            scenario_id=scenario_id,
+            signal_id=signal_id,
+            direction=direction,
+            analysis_ids=bad_analysis_ids,
+        )
+
+        # применяем bad bins к позициям
         for b in bad_bins:
             analysis_id = b["analysis_id"]
-            indicator_param = b["indicator_param"]  # может быть None
+            indicator_param = b["indicator_param"]
             timeframe = b["timeframe"]
-            bin_direction = b["direction"]
             bin_name = b["bin_name"]
 
-            key = (analysis_id, timeframe, bin_direction, bin_name)
+            key = (analysis_id, timeframe, bin_name)
             pos_uids = raw_index.get(key, [])
 
             if not pos_uids:
                 continue
 
-            # комментарий: обновляем good_state и накапливаем причины/статистику отбраковки
             indicator_key = indicator_param if indicator_param is not None else "_none_"
 
             for uid in pos_uids:
@@ -426,21 +435,24 @@ async def _process_pair_postproc(
                         "key": b["analysis_key"],
                         "indicator_param": indicator_param,
                         "timeframe": timeframe,
-                        "direction": bin_direction,
+                        "direction": direction,
                         "bin_name": bin_name,
-                        "threshold": float(threshold),
+                        "threshold": float(b["threshold_used"]),
+                        "winrate": float(b["winrate"]),
+                        "trades": int(b["trades"]),
+                        "pnl_abs": float(b["pnl_abs"]),
                     }
                 )
                 pos["good_state"] = False
+                total_bad_hits += 1
 
-                # ключ для отсечения дублей в статистике по отбраковкам
-                seen_key = (bin_direction, indicator_key, timeframe, uid)
+                # ключ для отсечения дублей в removed_stats
+                seen_key = (direction, indicator_key, timeframe, uid)
                 if seen_key in removed_seen:
                     continue
                 removed_seen.add(seen_key)
 
-                # накапливаем статистику по отбраковкам
-                d_stats = removed_stats.setdefault(bin_direction, {})
+                d_stats = removed_stats.setdefault(direction, {})
                 i_stats = d_stats.setdefault(
                     indicator_key,
                     {
@@ -467,14 +479,14 @@ async def _process_pair_postproc(
     positions_bad = positions_total - positions_good
 
     log.debug(
-        "BT_ANALYSIS_POSTPROC: итоги фильтрации по позициям для scenario_id=%s, signal_id=%s — "
-        "всего=%s, хорошие=%s, плохие=%s, bad_bins_total=%s",
+        "BT_ANALYSIS_POSTPROC: итоги фильтрации для scenario_id=%s, signal_id=%s — всего=%s, хорошие=%s, плохие=%s, bad_bins=%s, bad_hits=%s",
         scenario_id,
         signal_id,
         positions_total,
         positions_good,
         positions_bad,
         total_bad_bins,
+        total_bad_hits,
     )
 
     # записываем контейнер в bt_analysis_positions_postproc (сначала чистим старые строки по паре)
@@ -547,21 +559,25 @@ def _directions_from_mask(mask: Optional[str]) -> List[str]:
     return ["long", "short"]
 
 
-# 🔸 Загрузка best_threshold по направлениям из bt_analysis_threshold_opt
-async def _load_thresholds_for_pair(
+# 🔸 Загрузка моделей bt_analysis_model_opt по направлениям
+async def _load_model_opt_map(
     pg,
     scenario_id: int,
     signal_id: int,
     directions: List[str],
-) -> Dict[str, Decimal]:
+) -> Dict[str, Dict[str, Any]]:
     if not directions:
         return {}
 
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT direction, best_threshold
-            FROM bt_analysis_threshold_opt
+            SELECT
+                id,
+                direction,
+                best_threshold,
+                selected_analysis_ids
+            FROM bt_analysis_model_opt
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND direction   = ANY($3::text[])
@@ -571,12 +587,116 @@ async def _load_thresholds_for_pair(
             directions,
         )
 
-    out: Dict[str, Decimal] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         d = str(r["direction"]).strip().lower()
-        out[d] = _safe_decimal(r["best_threshold"])
+        selected = r["selected_analysis_ids"]
+        if isinstance(selected, str):
+            try:
+                selected = json.loads(selected)
+            except Exception:
+                selected = []
+        out[d] = {
+            "model_id": int(r["id"]),
+            "best_threshold": _safe_decimal(r["best_threshold"]),
+            "selected_analysis_ids": selected if isinstance(selected, list) else [],
+        }
+    return out
+
+
+# 🔸 Загрузка bad bins из bt_analysis_bins_labels (state='bad') + подтягивание family_key/key
+async def _load_bad_bins_from_labels(
+    pg,
+    model_id: int,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+) -> List[Dict[str, Any]]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                l.analysis_id,
+                l.indicator_param,
+                l.timeframe,
+                l.bin_name,
+                l.threshold_used,
+                l.trades,
+                l.pnl_abs,
+                l.winrate,
+                ai.family_key,
+                ai."key" AS analysis_key
+            FROM bt_analysis_bins_labels l
+            JOIN bt_analysis_instances ai
+              ON ai.id = l.analysis_id
+            WHERE l.model_id    = $1
+              AND l.scenario_id = $2
+              AND l.signal_id   = $3
+              AND l.direction   = $4
+              AND l.state       = 'bad'
+            """,
+            model_id,
+            scenario_id,
+            signal_id,
+            direction,
+        )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "analysis_id": int(r["analysis_id"]),
+                "indicator_param": r["indicator_param"],
+                "timeframe": str(r["timeframe"]),
+                "bin_name": str(r["bin_name"]),
+                "threshold_used": _safe_decimal(r["threshold_used"]),
+                "trades": int(r["trades"]),
+                "pnl_abs": _safe_decimal(r["pnl_abs"]),
+                "winrate": _safe_decimal(r["winrate"]),
+                "family_key": r["family_key"],
+                "analysis_key": r["analysis_key"],
+            }
+        )
 
     return out
+
+
+# 🔸 Индекс raw позиций по ключу (analysis_id, timeframe, bin_name) для конкретного направления и списка анализаторов
+async def _load_positions_raw_index_for_analysis_ids(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    analysis_ids: List[int],
+) -> Dict[Tuple[int, str, str], List[Any]]:
+    if not analysis_ids:
+        return {}
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                analysis_id,
+                timeframe,
+                bin_name,
+                position_uid
+            FROM bt_analysis_positions_raw
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND direction   = $3
+              AND analysis_id = ANY($4::int[])
+            """,
+            scenario_id,
+            signal_id,
+            direction,
+            analysis_ids,
+        )
+
+    index: Dict[Tuple[int, str, str], List[Any]] = {}
+    for r in rows:
+        key = (int(r["analysis_id"]), str(r["timeframe"]), str(r["bin_name"]))
+        index.setdefault(key, []).append(r["position_uid"])
+    return index
 
 
 # 🔸 Загрузка позиций сценария/сигнала (postproc=true) по направлениям
@@ -623,146 +743,6 @@ async def _load_positions_for_pair(
         len(positions),
     )
     return positions
-
-# 🔸 Загрузка "плохих биннов" из bt_analysis_bins_stat по направлению и порогу
-async def _load_bad_bins_for_pair(
-    pg,
-    scenario_id: int,
-    signal_id: int,
-    direction: str,
-    threshold: Decimal,
-) -> List[Dict[str, Any]]:
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                analysis_id,
-                indicator_param,
-                timeframe,
-                direction,
-                bin_name,
-                pnl_abs,
-                winrate
-            FROM bt_analysis_bins_stat
-            WHERE scenario_id = $1
-              AND signal_id   = $2
-              AND direction   = $3
-              AND winrate     <= $4
-            """,
-            scenario_id,
-            signal_id,
-            direction,
-            threshold,
-        )
-
-    bad_bins: List[Dict[str, Any]] = []
-    if not rows:
-        log.debug(
-            "BT_ANALYSIS_POSTPROC: для scenario_id=%s, signal_id=%s, direction=%s нет биннов с winrate <= %s",
-            scenario_id,
-            signal_id,
-            direction,
-            threshold,
-        )
-        return bad_bins
-
-    # подтягиваем family_key/key для всех analysis_id из списка
-    analysis_ids = sorted({r["analysis_id"] for r in rows})
-    family_map = await _load_analysis_family_keys(pg, analysis_ids)
-
-    for r in rows:
-        aid = r["analysis_id"]
-        fm = family_map.get(aid) or {}
-
-        bad_bins.append(
-            {
-                "analysis_id": aid,
-                "indicator_param": r["indicator_param"],
-                "timeframe": r["timeframe"],
-                "direction": r["direction"],
-                "bin_name": r["bin_name"],
-                "pnl_abs": _safe_decimal(r["pnl_abs"]),
-                "winrate": _safe_decimal(r["winrate"]),
-                "family_key": fm.get("family_key"),
-                "analysis_key": fm.get("key"),
-            }
-        )
-
-    log.debug(
-        "BT_ANALYSIS_POSTPROC: для scenario_id=%s, signal_id=%s, direction=%s найдено плохих биннов: %s (threshold=%s)",
-        scenario_id,
-        signal_id,
-        direction,
-        len(bad_bins),
-        threshold,
-    )
-    return bad_bins
-
-# 🔸 Загрузка family_key / key для множества analysis_id
-async def _load_analysis_family_keys(
-    pg,
-    analysis_ids: List[int],
-) -> Dict[int, Dict[str, Any]]:
-    if not analysis_ids:
-        return {}
-
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, family_key, "key"
-            FROM bt_analysis_instances
-            WHERE id = ANY($1::int[])
-            """,
-            analysis_ids,
-        )
-
-    result: Dict[int, Dict[str, Any]] = {}
-    for r in rows:
-        result[r["id"]] = {
-            "family_key": r["family_key"],
-            "key": r["key"],
-        }
-    return result
-
-
-# 🔸 Построение индекса bt_analysis_positions_raw по (analysis_id, timeframe, direction, bin_name)
-async def _load_positions_raw_index(
-    pg,
-    scenario_id: int,
-    signal_id: int,
-    directions: List[str],
-) -> Dict[Tuple[int, str, str, str], List[Any]]:
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                analysis_id,
-                timeframe,
-                direction,
-                bin_name,
-                position_uid
-            FROM bt_analysis_positions_raw
-            WHERE scenario_id = $1
-              AND signal_id   = $2
-              AND direction   = ANY($3::text[])
-            """,
-            scenario_id,
-            signal_id,
-            directions,
-        )
-
-    index: Dict[Tuple[int, str, str, str], List[Any]] = {}
-    for r in rows:
-        key = (r["analysis_id"], r["timeframe"], r["direction"], r["bin_name"])
-        index.setdefault(key, []).append(r["position_uid"])
-
-    log.debug(
-        "BT_ANALYSIS_POSTPROC: построен индекс raw позиций для scenario_id=%s, signal_id=%s — ключей=%s",
-        scenario_id,
-        signal_id,
-        len(index),
-    )
-    return index
 
 
 # 🔸 Запись контейнера позиций в bt_analysis_positions_postproc
@@ -834,8 +814,7 @@ async def _store_positions_postproc(
         )
 
     log.info(
-        "BT_ANALYSIS_POSTPROC: записано строк в bt_analysis_positions_postproc "
-        "для scenario_id=%s, signal_id=%s: %s",
+        "BT_ANALYSIS_POSTPROC: записано строк в bt_analysis_positions_postproc для scenario_id=%s, signal_id=%s: %s",
         scenario_id,
         signal_id,
         len(to_insert),
@@ -968,7 +947,7 @@ async def _update_analysis_scenario_stats(
             else:
                 removed_accuracy = Decimal("0")
 
-            # raw_stat по отбраковкам для данного направления
+            # raw_stat по отбраковкам
             dir_removed = removed_stats.get(direction) or {}
             threshold = threshold_map.get(direction) or DEFAULT_MIN_WINRATE_THRESHOLD
 
@@ -977,10 +956,8 @@ async def _update_analysis_scenario_stats(
                 threshold=threshold,
             )
 
-            # сериализуем raw_stat в JSON-строку для jsonb; если отбраковок нет — NULL
             raw_stat_json = json.dumps(raw_stat_obj, ensure_ascii=False) if raw_stat_obj is not None else None
 
-            # upsert в bt_analysis_scenario_stat
             await conn.execute(
                 """
                 INSERT INTO bt_analysis_scenario_stat (
@@ -1034,8 +1011,7 @@ async def _update_analysis_scenario_stats(
             )
 
             log.info(
-                "BT_ANALYSIS_POSTPROC: обновлена bt_analysis_scenario_stat для scenario_id=%s, signal_id=%s, direction=%s — "
-                "orig_trades=%s, filt_trades=%s, orig_pnl=%s, filt_pnl=%s, removed_trades=%s, removed_accuracy=%.4f, threshold=%s",
+                "BT_ANALYSIS_POSTPROC: обновлена bt_analysis_scenario_stat для scenario_id=%s, signal_id=%s, direction=%s — orig_trades=%s, filt_trades=%s, orig_pnl=%s, filt_pnl=%s, removed_trades=%s, removed_accuracy=%.4f, threshold=%s",
                 scenario_id,
                 signal_id,
                 direction,
@@ -1068,7 +1044,6 @@ def _build_raw_stat_json_for_direction(
         total_trades += it_total_trades
         total_pnl += it_total_pnl
 
-        # разрез по TF
         by_tf_obj: Dict[str, Any] = {}
         by_tf = istats.get("by_tf") or {}
         for tf, tf_stats in by_tf.items():
@@ -1107,7 +1082,7 @@ async def _publish_postproc_ready(
     scenario_id: int,
     signal_id: int,
     result: Dict[str, Any],
-    threshold_map: Dict[str, Decimal],
+    model_map: Dict[str, Dict[str, Any]],
     source_finished_at: datetime,
 ) -> None:
     finished_at = datetime.utcnow()
@@ -1116,7 +1091,16 @@ async def _publish_postproc_ready(
     positions_good = result.get("positions_good", 0)
     positions_bad = result.get("positions_bad", 0)
 
-    thresholds_json = json.dumps({k: str(v) for k, v in threshold_map.items()}, ensure_ascii=False)
+    models_json = json.dumps(
+        {
+            d: {
+                "model_id": int(m.get("model_id")),
+                "threshold": str(m.get("best_threshold")),
+            }
+            for d, m in model_map.items()
+        },
+        ensure_ascii=False,
+    )
 
     try:
         await redis.xadd(
@@ -1127,7 +1111,7 @@ async def _publish_postproc_ready(
                 "positions_total": str(positions_total),
                 "positions_good": str(positions_good),
                 "positions_bad": str(positions_bad),
-                "thresholds": thresholds_json,
+                "models": models_json,
                 "source_finished_at": source_finished_at.isoformat(),
                 "finished_at": finished_at.isoformat(),
             },
