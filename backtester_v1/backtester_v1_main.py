@@ -25,10 +25,10 @@ from bt_scenarios_main import run_bt_scenarios_orchestrator
 from bt_scenarios_postproc import run_bt_scenarios_postproc
 # 🔸 Оркестратор анализаторов
 from bt_analysis_main import run_bt_analysis_orchestrator
+# 🔸 Оркестратор препроцессинга анализов (поиск оптимального порога)
+from bt_analysis_preproc import run_bt_analysis_preproc_orchestrator
 # 🔸 Оркестратор финального пост-процессинга анализов
 from bt_analysis_postproc import run_bt_analysis_postproc_orchestrator
-# 🔸 Оркестратор альтернативного пост-процессинга анализов (поиск оптимального порога)
-from bt_analysis_postproc_alt import run_bt_analysis_postproc_alt_orchestrator
 # # 🔸 Оркестратор комплексных анализаторов
 # from bt_complex_main import run_bt_complex_analysis_orchestrator
 # # 🔸 Оркестратор скоринга комплексных анализаторов
@@ -82,8 +82,8 @@ async def main():
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
+        run_safe_loop(lambda: run_bt_analysis_preproc_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC"),
         run_safe_loop(lambda: run_bt_analysis_postproc_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC"),
-        run_safe_loop(lambda: run_bt_analysis_postproc_alt_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC_ALT"),
 #         run_safe_loop(lambda: run_bt_complex_analysis_orchestrator(pg, redis), "BT_COMPLEX"),
 #         run_safe_loop(lambda: run_bt_complex_score_orchestrator(pg, redis), "BT_COMPLEX_SCORE"),
     )
