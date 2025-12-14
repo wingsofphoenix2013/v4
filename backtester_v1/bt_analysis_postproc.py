@@ -624,7 +624,6 @@ async def _load_positions_for_pair(
     )
     return positions
 
-
 # 🔸 Загрузка "плохих биннов" из bt_analysis_bins_stat по направлению и порогу
 async def _load_bad_bins_for_pair(
     pg,
@@ -648,7 +647,7 @@ async def _load_bad_bins_for_pair(
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND direction   = $3
-              AND winrate     < $4
+              AND winrate     <= $4
             """,
             scenario_id,
             signal_id,
@@ -659,7 +658,7 @@ async def _load_bad_bins_for_pair(
     bad_bins: List[Dict[str, Any]] = []
     if not rows:
         log.debug(
-            "BT_ANALYSIS_POSTPROC: для scenario_id=%s, signal_id=%s, direction=%s нет биннов с winrate < %s",
+            "BT_ANALYSIS_POSTPROC: для scenario_id=%s, signal_id=%s, direction=%s нет биннов с winrate <= %s",
             scenario_id,
             signal_id,
             direction,
@@ -674,6 +673,7 @@ async def _load_bad_bins_for_pair(
     for r in rows:
         aid = r["analysis_id"]
         fm = family_map.get(aid) or {}
+
         bad_bins.append(
             {
                 "analysis_id": aid,
@@ -697,7 +697,6 @@ async def _load_bad_bins_for_pair(
         threshold,
     )
     return bad_bins
-
 
 # 🔸 Загрузка family_key / key для множества analysis_id
 async def _load_analysis_family_keys(
