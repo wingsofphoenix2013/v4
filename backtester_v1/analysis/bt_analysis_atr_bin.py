@@ -1,4 +1,4 @@
-# bt_analysis_atr_bin.py — анализатор распределения позиций по биннам ATR в процентах от цены входа (адаптивные границы + запись в bt_analysis_bin_dict_adaptive)
+# bt_analysis_atr_bin.py — анализатор распределения позиций по биннам ATR в процентах от цены входа (адаптивные границы q6 + запись в bt_analysis_bin_dict_adaptive)
 
 import logging
 import json
@@ -8,6 +8,9 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_ATR_BIN")
+
+# 🔸 Единая точность для адаптивных биннов (источник истины)
+Q6 = Decimal("0.000001")
 
 
 # 🔸 Публичная точка входа анализатора ATR/bin (ATR% от цены входа, линейные бины по диапазону + запись границ в bt_analysis_bin_dict_adaptive)
@@ -31,7 +34,7 @@ async def run_atr_bin_analysis(
     atr_param_name = _get_str_param(params, "param_name", "atr14")  # например atr14
 
     if analysis_id is None or scenario_id is None or signal_id is None:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_ATR_BIN: нет обязательных идентификаторов (analysis_id=%s, scenario_id=%s, signal_id=%s) — анализ пропущен",
             analysis_id,
             scenario_id,
@@ -63,7 +66,7 @@ async def run_atr_bin_analysis(
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat и entry_price)
     positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_ATR_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
             analysis_id,
             family_key,
@@ -85,12 +88,12 @@ async def run_atr_bin_analysis(
     valid_values: List[Decimal] = []
     valid_positions: List[Dict[str, Any]] = []
 
-    # первый проход: считаем atr_pct для каждой позиции
+    # первый проход: считаем atr_pct (q6) для каждой позиции
     for p in positions:
         raw_stat = p["raw_stat"]
         entry_price: Decimal = p["entry_price"]
 
-        if entry_price <= Decimal("0"):
+        if entry_price is None or entry_price <= Decimal("0"):
             p["atr_pct"] = None
             continue
 
@@ -99,18 +102,20 @@ async def run_atr_bin_analysis(
             p["atr_pct"] = None
             continue
 
+        # считаем ATR% и приводим к q6 (источник истины)
         try:
             atr_pct = (atr_val / entry_price) * Decimal("100")
         except Exception:
             p["atr_pct"] = None
             continue
 
-        p["atr_pct"] = atr_pct
-        valid_values.append(atr_pct)
+        atr_pct_q = _q6(atr_pct)
+        p["atr_pct"] = atr_pct_q
+        valid_values.append(atr_pct_q)
         valid_positions.append(p)
 
     if not valid_positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_ATR_BIN: нет валидных значений ATR%% для анализа id=%s (family=%s, key=%s, name=%s), "
             "scenario_id=%s, signal_id=%s — positions_total=%s",
             analysis_id,
@@ -133,7 +138,7 @@ async def run_atr_bin_analysis(
     min_atr_pct = min(valid_values)
     max_atr_pct = max(valid_values)
 
-    # строим линейные бины по диапазону [min_atr_pct .. max_atr_pct]
+    # строим линейные бины по диапазону [min_atr_pct .. max_atr_pct] (в q6)
     bins_count = 10
     bins = _build_atr_bins(
         min_val=min_atr_pct,
@@ -154,7 +159,7 @@ async def run_atr_bin_analysis(
             bins=bins,
             source_finished_at=source_finished_at,
         )
-        log.info(
+        log.debug(
             "BT_ANALYSIS_ATR_BIN: записан bt_analysis_bin_dict_adaptive — analysis_id=%s, scenario_id=%s, signal_id=%s, tf=%s, rows=%s, min_atr_pct=%s, max_atr_pct=%s",
             analysis_id,
             scenario_id,
@@ -178,7 +183,7 @@ async def run_atr_bin_analysis(
     positions_used = 0
     positions_skipped = positions_total - len(valid_positions)
 
-    # второй проход: раскладываем позиции по бинам
+    # второй проход: раскладываем позиции по бинам (с q6-значением)
     for p in valid_positions:
         position_uid = p["position_uid"]
         direction = p["direction"]
@@ -189,13 +194,15 @@ async def run_atr_bin_analysis(
             positions_skipped += 1
             continue
 
-        # клипуем значение в [min_atr_pct, max_atr_pct] на всякий случай
-        if atr_pct < min_atr_pct:
-            atr_pct = min_atr_pct
-        if atr_pct > max_atr_pct:
-            atr_pct = max_atr_pct
+        v = _q6(atr_pct)
 
-        bin_name = _assign_bin(bins, atr_pct)
+        # клипуем значение в [min_atr_pct, max_atr_pct] (в q6)
+        if v < min_atr_pct:
+            v = min_atr_pct
+        if v > max_atr_pct:
+            v = max_atr_pct
+
+        bin_name = _assign_bin(bins, v)
         if bin_name is None:
             positions_skipped += 1
             continue
@@ -206,13 +213,13 @@ async def run_atr_bin_analysis(
                 "timeframe": tf,
                 "direction": direction,
                 "bin_name": bin_name,
-                "value": atr_pct,   # ATR в процентах от цены входа
+                "value": v,        # ATR% (q6)
                 "pnl_abs": pnl_abs,
             }
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_ATR_BIN: summary id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
         "positions_total=%s, valid=%s, used=%s, skipped=%s, rows=%s, min_atr_pct=%s, max_atr_pct=%s",
         analysis_id,
@@ -332,7 +339,7 @@ def _extract_atr_from_raw_stat(
     return _safe_decimal(value)
 
 
-# 🔸 Построение линейных бинов по диапазону ATR% (bin_name в формате TF_BIN_N)
+# 🔸 Построение линейных биннов по диапазону ATR% (bin_name в формате TF_BIN_N, границы q6)
 def _build_atr_bins(
     min_val: Decimal,
     max_val: Decimal,
@@ -342,27 +349,44 @@ def _build_atr_bins(
     bins: List[Dict[str, Any]] = []
     tf_up = str(tf or "").strip().upper()
 
+    min_q = _q6(min_val)
+    max_q = _q6(max_val)
+
     # вырожденный диапазон — все бины одинаковые
-    if max_val <= min_val:
+    if max_q <= min_q:
         for i in range(bins_count):
             bins.append(
                 {
                     "bin_order": i,
                     "bin_name": f"{tf_up}_bin_{i}",
-                    "min": min_val,
-                    "max": max_val,
+                    "min": min_q,
+                    "max": max_q,
                     "to_inclusive": (i == bins_count - 1),
                 }
             )
         return bins
 
-    total_range = max_val - min_val
-    step = total_range / Decimal(bins_count)
+    total_range = max_q - min_q
+    step = _q6(total_range / Decimal(bins_count))
+
+    # если шаг “схлопнулся” до 0 из-за q6 — считаем диапазон вырожденным
+    if step <= Decimal("0"):
+        for i in range(bins_count):
+            bins.append(
+                {
+                    "bin_order": i,
+                    "bin_name": f"{tf_up}_bin_{i}",
+                    "min": min_q,
+                    "max": max_q,
+                    "to_inclusive": (i == bins_count - 1),
+                }
+            )
+        return bins
 
     # первые bins_count-1 бинов [min, max)
     for i in range(bins_count - 1):
-        lo = min_val + step * Decimal(i)
-        hi = min_val + step * Decimal(i + 1)
+        lo = _q6(min_q + step * Decimal(i))
+        hi = _q6(min_q + step * Decimal(i + 1))
         bins.append(
             {
                 "bin_order": i,
@@ -373,14 +397,14 @@ def _build_atr_bins(
             }
         )
 
-    # последний бин [min_last, max_val] включительно
-    lo_last = min_val + step * Decimal(bins_count - 1)
+    # последний бин [min_last, max_q] включительно
+    lo_last = _q6(min_q + step * Decimal(bins_count - 1))
     bins.append(
         {
             "bin_order": bins_count - 1,
             "bin_name": f"{tf_up}_bin_{bins_count - 1}",
             "min": lo_last,
-            "max": max_val,
+            "max": max_q,
             "to_inclusive": True,
         }
     )
@@ -388,7 +412,7 @@ def _build_atr_bins(
     return bins
 
 
-# 🔸 Определение имени бина для значения ATR%
+# 🔸 Определение имени бина для значения ATR% (q6-границы)
 def _assign_bin(
     bins: List[Dict[str, Any]],
     value: Decimal,
@@ -397,6 +421,7 @@ def _assign_bin(
         return None
 
     last_index = len(bins) - 1
+    v = _q6(value)
 
     for idx, b in enumerate(bins):
         name = b.get("bin_name")
@@ -407,19 +432,22 @@ def _assign_bin(
         if lo is None or hi is None or name is None:
             continue
 
+        lo_q = _q6(lo)
+        hi_q = _q6(hi)
+
         # обычный бин: [min, max)
         # inclusive бин: [min, max]
         if to_inclusive or idx == last_index:
-            if lo <= value <= hi:
+            if lo_q <= v <= hi_q:
                 return str(name)
         else:
-            if lo <= value < hi:
+            if lo_q <= v < hi_q:
                 return str(name)
 
     return None
 
 
-# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short)
+# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short, границы q6)
 async def _store_adaptive_bins(
     pg,
     analysis_id: int,
@@ -439,8 +467,8 @@ async def _store_adaptive_bins(
         for b in bins:
             bin_order = int(b.get("bin_order") or 0)
             bin_name = str(b.get("bin_name") or "")
-            val_from = b.get("min")
-            val_to = b.get("max")
+            val_from = _q6(b.get("min"))
+            val_to = _q6(b.get("max"))
             to_inclusive = bool(b.get("to_inclusive"))
 
             to_insert.append(
@@ -498,6 +526,18 @@ async def _store_adaptive_bins(
         )
 
     return len(to_insert)
+
+
+# 🔸 q6 квантизация (ROUND_DOWN) — источник истины
+def _q6(value: Any) -> Decimal:
+    try:
+        if isinstance(value, Decimal):
+            d = value
+        else:
+            d = Decimal(str(value))
+        return d.quantize(Q6, rounding=ROUND_DOWN)
+    except Exception:
+        return Decimal("0").quantize(Q6, rounding=ROUND_DOWN)
 
 
 # 🔸 Вспомогательная функция: безопасное чтение str-параметра

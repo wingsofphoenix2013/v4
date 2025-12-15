@@ -1,4 +1,4 @@
-# bt_analysis_lr_angle_bin.py — анализатор распределения позиций по биннам угла LR (адаптивные границы + запись в bt_analysis_bin_dict_adaptive)
+# bt_analysis_lr_angle_bin.py — анализатор распределения позиций по биннам угла LR (адаптивные границы q6 + запись в bt_analysis_bin_dict_adaptive)
 
 import logging
 import json
@@ -8,6 +8,9 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_LR_ANGLE_BIN")
+
+# 🔸 Единая точность для адаптивных биннов (источник истины)
+Q6 = Decimal("0.000001")
 
 
 # 🔸 Публичная точка входа анализатора LR/angle_bin (адаптивные бины по углу + запись границ в bt_analysis_bin_dict_adaptive)
@@ -31,7 +34,7 @@ async def run_lr_angle_bin_analysis(
     angle_param_name = _get_str_param(params, "param_name", "lr50_angle")  # например lr50_angle
 
     if analysis_id is None or scenario_id is None or signal_id is None:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_BIN: нет обязательных идентификаторов (analysis_id=%s, scenario_id=%s, signal_id=%s) — анализ пропущен",
             analysis_id,
             scenario_id,
@@ -63,7 +66,7 @@ async def run_lr_angle_bin_analysis(
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
     positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
             analysis_id,
             family_key,
@@ -81,7 +84,7 @@ async def run_lr_angle_bin_analysis(
             },
         }
 
-    # первый проход: собираем углы по всем позициям, находим min/max
+    # первый проход: собираем углы по всем позициям, находим min/max (в q6)
     positions_total = len(positions)
     valid_angles: List[Decimal] = []
 
@@ -92,11 +95,12 @@ async def run_lr_angle_bin_analysis(
             p["angle"] = None
             continue
 
-        p["angle"] = angle
-        valid_angles.append(angle)
+        angle_q = _q6(angle)
+        p["angle"] = angle_q
+        valid_angles.append(angle_q)
 
     if not valid_angles:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_BIN: нет валидных углов LR для анализа id=%s (family=%s, key=%s, name=%s), "
             "scenario_id=%s, signal_id=%s — positions_total=%s",
             analysis_id,
@@ -119,7 +123,7 @@ async def run_lr_angle_bin_analysis(
     min_angle = min(valid_angles)
     max_angle = max(valid_angles)
 
-    # строим адаптивные бины по углу в диапазоне [min_angle .. max_angle]
+    # строим адаптивные бины по углу в диапазоне [min_angle .. max_angle] (в q6)
     bins = _build_angle_bins(
         min_angle=min_angle,
         max_angle=max_angle,
@@ -139,7 +143,7 @@ async def run_lr_angle_bin_analysis(
             bins=bins,
             source_finished_at=source_finished_at,
         )
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_BIN: записан bt_analysis_bin_dict_adaptive — analysis_id=%s, scenario_id=%s, signal_id=%s, tf=%s, rows=%s, min_angle=%s, max_angle=%s",
             analysis_id,
             scenario_id,
@@ -163,7 +167,7 @@ async def run_lr_angle_bin_analysis(
     positions_used = 0
     positions_skipped = 0
 
-    # второй проход: раскладываем позиции по биннам
+    # второй проход: раскладываем позиции по биннам (с q6-значением)
     for p in positions:
         position_uid = p["position_uid"]
         direction = p["direction"]
@@ -174,13 +178,15 @@ async def run_lr_angle_bin_analysis(
             positions_skipped += 1
             continue
 
-        # на всякий случай клипуем угол в диапазон [min_angle, max_angle]
-        if angle < min_angle:
-            angle = min_angle
-        if angle > max_angle:
-            angle = max_angle
+        angle_q = _q6(angle)
 
-        bin_name = _assign_bin(bins, angle)
+        # клипуем угол в диапазон [min_angle, max_angle] (в q6)
+        if angle_q < min_angle:
+            angle_q = min_angle
+        if angle_q > max_angle:
+            angle_q = max_angle
+
+        bin_name = _assign_bin(bins, angle_q)
         if bin_name is None:
             positions_skipped += 1
             continue
@@ -191,13 +197,13 @@ async def run_lr_angle_bin_analysis(
                 "timeframe": tf,
                 "direction": direction,
                 "bin_name": bin_name,
-                "value": angle,   # значение угла LR на входе
+                "value": angle_q,   # значение угла LR (q6)
                 "pnl_abs": pnl_abs,
             }
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_LR_ANGLE_BIN: summary id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
         "positions_total=%s, used=%s, skipped=%s, rows=%s, min_angle=%s, max_angle=%s",
         analysis_id,
@@ -314,7 +320,7 @@ def _extract_angle_from_raw_stat(
     return _safe_decimal(value)
 
 
-# 🔸 Построение адаптивных бинов по углу LR (bin_name в формате TF_BIN_N)
+# 🔸 Построение адаптивных бинов по углу LR (bin_name в формате TF_BIN_N, границы q6)
 def _build_angle_bins(
     min_angle: Decimal,
     max_angle: Decimal,
@@ -324,47 +330,48 @@ def _build_angle_bins(
     bins: List[Dict[str, Any]] = []
     tf_up = str(tf or "").strip().upper()
 
+    min_q = _q6(min_angle)
+    max_q = _q6(max_angle)
+
     # если диапазон вырожденный — делаем bins_count одинаковых бинов
-    if max_angle <= min_angle:
+    if max_q <= min_q:
         for i in range(bins_count):
-            name = f"{tf_up}_bin_{i}"
             bins.append(
                 {
                     "bin_order": i,
-                    "bin_name": name,
-                    "min": min_angle,
-                    "max": max_angle,
+                    "bin_name": f"{tf_up}_bin_{i}",
+                    "min": min_q,
+                    "max": max_q,
                     "to_inclusive": (i == bins_count - 1),
                 }
             )
         return bins
 
-    total_range = max_angle - min_angle
-    step = total_range / Decimal(bins_count)
+    total_range = max_q - min_q
+    step = _q6(total_range / Decimal(bins_count))
 
     # первые bins_count-1 бинов [min, max)
     for i in range(bins_count - 1):
-        lo = min_angle + step * Decimal(i)
-        hi = min_angle + step * Decimal(i + 1)
-        name = f"{tf_up}_bin_{i}"
+        lo = _q6(min_q + step * Decimal(i))
+        hi = _q6(min_q + step * Decimal(i + 1))
         bins.append(
             {
                 "bin_order": i,
-                "bin_name": name,
+                "bin_name": f"{tf_up}_bin_{i}",
                 "min": lo,
                 "max": hi,
                 "to_inclusive": False,
             }
         )
 
-    # последний бин [min_last, max_angle] включительно
-    lo_last = min_angle + step * Decimal(bins_count - 1)
+    # последний бин [min_last, max_q] включительно
+    lo_last = _q6(min_q + step * Decimal(bins_count - 1))
     bins.append(
         {
             "bin_order": bins_count - 1,
             "bin_name": f"{tf_up}_bin_{bins_count - 1}",
             "min": lo_last,
-            "max": max_angle,
+            "max": max_q,
             "to_inclusive": True,
         }
     )
@@ -372,7 +379,7 @@ def _build_angle_bins(
     return bins
 
 
-# 🔸 Определение имени бина для значения угла (по адаптивным границам)
+# 🔸 Определение имени бина для значения угла (по q6-границам)
 def _assign_bin(
     bins: List[Dict[str, Any]],
     value: Decimal,
@@ -381,6 +388,7 @@ def _assign_bin(
         return None
 
     last_index = len(bins) - 1
+    v = _q6(value)
 
     for idx, b in enumerate(bins):
         name = b.get("bin_name")
@@ -391,19 +399,22 @@ def _assign_bin(
         if lo is None or hi is None or name is None:
             continue
 
+        lo_q = _q6(lo)
+        hi_q = _q6(hi)
+
         # обычный бин: [min, max)
         # inclusive бин: [min, max]
         if to_inclusive or idx == last_index:
-            if lo <= value <= hi:
+            if lo_q <= v <= hi_q:
                 return str(name)
         else:
-            if lo <= value < hi:
+            if lo_q <= v < hi_q:
                 return str(name)
 
     return None
 
 
-# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short)
+# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short, границы q6)
 async def _store_adaptive_bins(
     pg,
     analysis_id: int,
@@ -423,8 +434,8 @@ async def _store_adaptive_bins(
         for b in bins:
             bin_order = int(b.get("bin_order") or 0)
             bin_name = str(b.get("bin_name") or "")
-            val_from = b.get("min")
-            val_to = b.get("max")
+            val_from = _q6(b.get("min"))
+            val_to = _q6(b.get("max"))
             to_inclusive = bool(b.get("to_inclusive"))
 
             to_insert.append(
@@ -471,17 +482,29 @@ async def _store_adaptive_bins(
             )
             ON CONFLICT ON CONSTRAINT bt_analysis_bin_dict_adaptive_uniq_order
             DO UPDATE SET
-                bin_name          = EXCLUDED.bin_name,
-                val_from          = EXCLUDED.val_from,
-                val_to            = EXCLUDED.val_to,
-                to_inclusive      = EXCLUDED.to_inclusive,
-                source_finished_at= EXCLUDED.source_finished_at,
-                updated_at        = now()
+                bin_name           = EXCLUDED.bin_name,
+                val_from           = EXCLUDED.val_from,
+                val_to             = EXCLUDED.val_to,
+                to_inclusive       = EXCLUDED.to_inclusive,
+                source_finished_at = EXCLUDED.source_finished_at,
+                updated_at         = now()
             """,
             to_insert,
         )
 
     return len(to_insert)
+
+
+# 🔸 q6 квантизация (ROUND_DOWN) — источник истины
+def _q6(value: Any) -> Decimal:
+    try:
+        if isinstance(value, Decimal):
+            d = value
+        else:
+            d = Decimal(str(value))
+        return d.quantize(Q6, rounding=ROUND_DOWN)
+    except Exception:
+        return Decimal("0").quantize(Q6, rounding=ROUND_DOWN)
 
 
 # 🔸 Вспомогательная функция: безопасное чтение str-параметра
@@ -505,8 +528,3 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
-
-
-# 🔸 Вспомогательная функция: квантизация Decimal до 4 знаков (если понадобится)
-def _q_decimal(value: Decimal) -> Decimal:
-    return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
