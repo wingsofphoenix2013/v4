@@ -47,7 +47,7 @@ ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("lr", "lr_angle_bin"): run_lr_angle_bin_analysis,
     ("atr", "atr_bin"): run_atr_bin_analysis,
     ("adx_dmi", "dmigap_bin"): run_dmigap_bin_analysis,
-    ("supertrend", "supertrend_mtf"): run_supertrend_mtf_analysis
+    ("supertrend", "supertrend_mtf"): run_supertrend_mtf_analysis,
     ("lr", "lr_angle_mtf"): run_lr_angle_mtf_analysis,
     ("rsimfi", "rsimfi_mtf"): run_rsimfi_mtf_analysis,
     ("rsi", "rsi_mtf"): run_rsi_mtf_analysis,
