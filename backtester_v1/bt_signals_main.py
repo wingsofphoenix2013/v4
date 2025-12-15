@@ -5,7 +5,7 @@ import logging
 import uuid
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Callable, Awaitable
+from typing import Dict, Any, List, Callable, Awaitable
 
 # 🔸 Конфиг и кеши backtester_v1
 from backtester_config import get_enabled_signals
@@ -90,7 +90,6 @@ async def run_bt_signals_orchestrator(pg, redis):
         mode = str(mode_raw or "").strip().lower()
         params = signal.get("params") or {}
 
-        # логируем обнаруженный сигнал
         log.debug(
             "BT_SIGNALS_MAIN: найден сигнал id=%s, key=%s, name=%s, mode=%s",
             sid,
@@ -273,7 +272,6 @@ async def run_bt_signals_orchestrator(pg, redis):
         len(live_signals_by_stream_key),
     )
 
-    # ждём завершения всех планировщиков и воркеров (они, по идее, живут бесконечно)
     await asyncio.gather(*tasks)
 
 
@@ -302,6 +300,7 @@ async def _run_timer_backfill_scheduler(
         cycle_started_at = datetime.utcnow()
         total_signals = len(timer_signals)
         processed_signals = 0
+        total_deleted_rows = 0
 
         for signal in timer_signals:
             sid = signal.get("id")
@@ -309,6 +308,25 @@ async def _run_timer_backfill_scheduler(
             name = signal.get("name")
             timeframe = signal.get("timeframe")
             mode = signal.get("mode")
+
+            # очистка истории по конкретному сигналу перед backfill
+            deleted_rows = 0
+            if sid is not None:
+                try:
+                    deleted_rows = await _delete_signal_values(pg, int(sid))
+                    total_deleted_rows += deleted_rows
+                    log.info(
+                        "BT_SIGNALS_TIMER: очистка bt_signals_values перед backfill: signal_id=%s, deleted_rows=%s",
+                        sid,
+                        deleted_rows,
+                    )
+                except Exception as e:
+                    log.error(
+                        "BT_SIGNALS_TIMER: ошибка очистки bt_signals_values перед backfill для signal_id=%s: %s",
+                        sid,
+                        e,
+                        exc_info=True,
+                    )
 
             log.debug(
                 "BT_SIGNALS_TIMER: старт backfill для timer-сигнала id=%s, key=%s, name=%s, timeframe=%s, mode=%s",
@@ -347,10 +365,11 @@ async def _run_timer_backfill_scheduler(
 
         log.info(
             "BT_SIGNALS_TIMER: цикл timer-backfill завершён: сигналов=%s, обработано=%s, длительность=%.2f сек, "
-            "следующий запуск через %s сек",
+            "deleted_rows_total=%s, следующий запуск через %s сек",
             total_signals,
             processed_signals,
             duration_sec,
+            total_deleted_rows,
             BT_TIMER_BACKFILL_INTERVAL_SEC,
         )
 
@@ -776,3 +795,29 @@ async def _publish_live_signal(
             live_signal,
             exc_info=True,
         )
+
+
+# 🔸 Удаление всех значений конкретного сигнала из bt_signals_values
+async def _delete_signal_values(pg, signal_id: int) -> int:
+    log = logging.getLogger("BT_SIGNALS_TIMER")
+    if not signal_id:
+        return 0
+
+    async with pg.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM bt_signals_values WHERE signal_id = $1",
+            signal_id,
+        )
+
+    # res обычно вида "DELETE 123"
+    try:
+        deleted_rows = int(str(res).split()[-1])
+    except Exception:
+        deleted_rows = 0
+        log.debug(
+            "BT_SIGNALS_TIMER: не удалось распарсить результат DELETE для signal_id=%s, res=%s",
+            signal_id,
+            res,
+        )
+
+    return deleted_rows
