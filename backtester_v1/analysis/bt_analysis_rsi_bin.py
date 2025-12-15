@@ -31,7 +31,7 @@ async def run_rsi_bin_analysis(
 
     # загружаем конфигурацию биннов из словаря
     if analysis_id is None:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI_BIN: analysis_id отсутствует (family=%s, key=%s, name=%s), "
             "scenario_id=%s, signal_id=%s — анализ пропущен",
             family_key,
@@ -52,7 +52,7 @@ async def run_rsi_bin_analysis(
 
     bins_by_dir = await _load_bins_dict_for_analysis(pg, int(analysis_id), tf)
     if not bins_by_dir:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI_BIN: нет биннов в bt_analysis_bins_dict для analysis_id=%s, tf=%s "
             "(family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — анализ пропущен",
             analysis_id,
@@ -90,7 +90,7 @@ async def run_rsi_bin_analysis(
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
     positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_RSI_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), "
             "scenario_id=%s, signal_id=%s",
             analysis_id,
@@ -160,7 +160,7 @@ async def run_rsi_bin_analysis(
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI_BIN: анализатор id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
         "tf=%s, rsi_param_name=%s, позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
         analysis_id,
