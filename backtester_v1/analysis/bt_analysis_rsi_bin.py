@@ -1,4 +1,4 @@
-# bt_analysis_rsi_bin.py — анализатор распределения позиций по биннам RSI
+# bt_analysis_rsi_bin.py — анализатор распределения позиций по биннам RSI (биннинг берётся из bt_analysis_bins_dict)
 
 import logging
 import json
@@ -29,15 +29,53 @@ async def run_rsi_bin_analysis(
     tf = _get_str_param(params, "tf", default="m5")                  # TF из raw_stat["tf"][tf]
     rsi_param_name = _get_str_param(params, "param_name", "rsi14")   # например rsi14 / rsi21
 
-    # загружаем конфигурацию биннов
-    bins = _load_bins_from_params(params)
-    if not bins:
-        # если по какой-то причине не удалось собрать бины — используем дефолт 0-10, 10-20, ... 90-100
-        bins = _default_rsi_bins()
+    # загружаем конфигурацию биннов из словаря
+    if analysis_id is None:
+        log.info(
+            "BT_ANALYSIS_RSI_BIN: analysis_id отсутствует (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s — анализ пропущен",
+            family_key,
+            analysis_key,
+            name,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "no_analysis_id",
+            },
+        }
+
+    bins_by_dir = await _load_bins_dict_for_analysis(pg, int(analysis_id), tf)
+    if not bins_by_dir:
+        log.info(
+            "BT_ANALYSIS_RSI_BIN: нет биннов в bt_analysis_bins_dict для analysis_id=%s, tf=%s "
+            "(family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — анализ пропущен",
+            analysis_id,
+            tf,
+            family_key,
+            analysis_key,
+            name,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "no_bins_dict",
+            },
+        }
 
     log.debug(
         "BT_ANALYSIS_RSI_BIN: старт анализа id=%s (family=%s, key=%s, name=%s) "
-        "для scenario_id=%s, signal_id=%s, tf=%s, rsi_param_name=%s, bins=%s",
+        "для scenario_id=%s, signal_id=%s, tf=%s, rsi_param_name=%s, bins_loaded=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -46,15 +84,19 @@ async def run_rsi_bin_analysis(
         signal_id,
         tf,
         rsi_param_name,
-        bins,
+        {d: len(b) for d, b in bins_by_dir.items()},
     )
 
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
     positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
     if not positions:
-        log.debug(
-            "BT_ANALYSIS_RSI_BIN: нет позиций для анализа id=%s, scenario_id=%s, signal_id=%s",
+        log.info(
+            "BT_ANALYSIS_RSI_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s",
             analysis_id,
+            family_key,
+            analysis_key,
+            name,
             scenario_id,
             signal_id,
         )
@@ -76,9 +118,15 @@ async def run_rsi_bin_analysis(
         positions_total += 1
 
         position_uid = p["position_uid"]
-        direction = p["direction"]
+        direction = str(p["direction"] or "").strip().lower()
         pnl_abs = p["pnl_abs"]
         raw_stat = p["raw_stat"]
+
+        # бины зависят от направления
+        bins = bins_by_dir.get(direction)
+        if not bins:
+            positions_skipped += 1
+            continue
 
         # извлекаем значение RSI из raw_stat по TF и param_name
         rsi_dec = _extract_rsi_from_raw_stat(raw_stat, tf, rsi_param_name)
@@ -97,7 +145,6 @@ async def run_rsi_bin_analysis(
 
         bin_name = _assign_bin(bins, rsi_dec)
         if bin_name is None:
-            # если по какой-то причине не нашли бин — считаем позицию пропущенной
             positions_skipped += 1
             continue
 
@@ -113,15 +160,17 @@ async def run_rsi_bin_analysis(
         )
         positions_used += 1
 
-    log.debug(
-        "BT_ANALYSIS_RSI_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
+    log.info(
+        "BT_ANALYSIS_RSI_BIN: анализатор id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
+        "tf=%s, rsi_param_name=%s, позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
         scenario_id,
         signal_id,
+        tf,
+        rsi_param_name,
         positions_total,
         positions_used,
         positions_skipped,
@@ -136,6 +185,53 @@ async def run_rsi_bin_analysis(
             "positions_skipped": positions_skipped,
         },
     }
+
+
+# 🔸 Загрузка биннов из bt_analysis_bins_dict для analysis_id + tf (группировка по direction)
+async def _load_bins_dict_for_analysis(
+    pg,
+    analysis_id: int,
+    timeframe: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                direction,
+                bin_order,
+                bin_name,
+                val_from,
+                val_to,
+                to_inclusive
+            FROM bt_analysis_bins_dict
+            WHERE analysis_id = $1
+              AND timeframe   = $2
+              AND bin_type    = 'bins'
+            ORDER BY direction, bin_order
+            """,
+            analysis_id,
+            timeframe,
+        )
+
+    if not rows:
+        return {}
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        direction = str(r["direction"] or "").strip().lower()
+        if not direction:
+            continue
+
+        out.setdefault(direction, []).append(
+            {
+                "name": str(r["bin_name"]),
+                "min": _safe_decimal(r["val_from"]),
+                "max": _safe_decimal(r["val_to"]),
+                "to_inclusive": bool(r["to_inclusive"]),
+            }
+        )
+
+    return out
 
 
 # 🔸 Загрузка позиций сценария/сигнала с postproc=true
@@ -225,106 +321,30 @@ def _extract_rsi_from_raw_stat(
     return _safe_decimal(value)
 
 
-# 🔸 Загрузка конфигурации биннов из параметров анализатора
-def _load_bins_from_params(params: Dict[str, Any]) -> List[Dict[str, Decimal]]:
-    bins_cfg = params.get("bins")
-    if not bins_cfg:
-        return []
-
-    raw = bins_cfg.get("value")
-    if not raw:
-        return []
-
-    try:
-        data = json.loads(raw)
-    except Exception:
-        log.warning("BT_ANALYSIS_RSI_BIN: не удалось распарсить JSON в параметре 'bins', используется дефолтная схема")
-        return []
-
-    bins: List[Dict[str, Decimal]] = []
-    for item in data:
-        # ожидаемый формат элемента: {"name": "0-10", "min": 0, "max": 10}
-        if not isinstance(item, dict):
-            continue
-
-        name = item.get("name")
-        min_v = item.get("min")
-        max_v = item.get("max")
-
-        if name is None or min_v is None or max_v is None:
-            continue
-
-        min_d = _safe_decimal(min_v)
-        max_d = _safe_decimal(max_v)
-
-        bins.append(
-            {
-                "name": str(name),
-                "min": min_d,
-                "max": max_d,
-            }
-        )
-
-    # если после парсинга бины пустые — вернём пустой список, выше подставится дефолт
-    return bins
-
-
-# 🔸 Дефолтные бины RSI: 0-10, 10-20, ..., 90-100
-def _default_rsi_bins() -> List[Dict[str, Decimal]]:
-    bins: List[Dict[str, Decimal]] = []
-    step = Decimal("10")
-
-    # первые 9 бинов [0,10), [10,20), ..., [80,90)
-    for i in range(9):
-        lo = step * Decimal(i)
-        hi = step * Decimal(i + 1)
-        name = f"{int(lo)}-{int(hi)}"
-        bins.append(
-            {
-                "name": name,
-                "min": lo,
-                "max": hi,
-            }
-        )
-
-    # последний бин [90,100]
-    bins.append(
-        {
-            "name": "90-100",
-            "min": Decimal("90"),
-            "max": Decimal("100"),
-        }
-    )
-
-    return bins
-
-
-# 🔸 Определение имени бина для значения RSI
+# 🔸 Определение имени бина для значения RSI (границы из bt_analysis_bins_dict)
 def _assign_bin(
-    bins: List[Dict[str, Decimal]],
+    bins: List[Dict[str, Any]],
     value: Decimal,
 ) -> Optional[str]:
-    # все бины кроме последнего: [min, max)
-    # последний бин: [min, max] (включая верхнюю границу)
     if not bins:
         return None
 
-    last_index = len(bins) - 1
-
-    for idx, b in enumerate(bins):
+    for b in bins:
         name = b.get("name")
         lo = b.get("min")
         hi = b.get("max")
+        to_inclusive = bool(b.get("to_inclusive"))
 
         if lo is None or hi is None or name is None:
             continue
 
-        if idx < last_index:
-            if lo <= value < hi:
+        # обычный бин: [min, max)
+        # inclusive бин: [min, max]
+        if to_inclusive:
+            if lo <= value <= hi:
                 return str(name)
         else:
-            # последний бин включительно по верхней границе
-            if lo <= value <= hi:
+            if lo <= value < hi:
                 return str(name)
 
     return None
