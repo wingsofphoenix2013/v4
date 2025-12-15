@@ -1,15 +1,19 @@
-# bt_analysis_dmigap_bin.py — анализатор распределения позиций по биннам DMI-gap (+DI − −DI)
+# bt_analysis_dmigap_bin.py — анализатор распределения позиций по биннам DMI-gap (+DI − −DI) (адаптивные границы q6 + запись в bt_analysis_bin_dict_adaptive)
 
 import logging
 import json
-from typing import Dict, Any, List, Optional
-from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_DMIGAP_BIN")
 
+# 🔸 Единая точность для адаптивных биннов (источник истины)
+Q6 = Decimal("0.000001")
 
-# 🔸 Публичная точка входа анализатора DMI-gap/bin (линейные бины по диапазону)
+
+# 🔸 Публичная точка входа анализатора DMI-gap/bin (линейные адаптивные бины по диапазону + запись границ в bt_analysis_bin_dict_adaptive)
 async def run_dmigap_bin_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
@@ -26,8 +30,25 @@ async def run_dmigap_bin_analysis(
     signal_id = analysis_ctx.get("signal_id")
 
     # базовые параметры анализатора
-    tf = _get_str_param(params, "tf", default="m5")                 # TF из raw_stat["tf"][tf]
+    tf = _get_str_param(params, "tf", default="m5")                      # TF из raw_stat["tf"][tf]
     base_param_name = _get_str_param(params, "param_name", "adx_dmi14")  # например adx_dmi14
+
+    if analysis_id is None or scenario_id is None or signal_id is None:
+        log.debug(
+            "BT_ANALYSIS_DMIGAP_BIN: нет обязательных идентификаторов (analysis_id=%s, scenario_id=%s, signal_id=%s) — анализ пропущен",
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "missing_ids",
+            },
+        }
 
     log.debug(
         "BT_ANALYSIS_DMIGAP_BIN: старт анализа id=%s (family=%s, key=%s, name=%s) "
@@ -43,11 +64,14 @@ async def run_dmigap_bin_analysis(
     )
 
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
-    positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
+    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
     if not positions:
         log.debug(
-            "BT_ANALYSIS_DMIGAP_BIN: нет позиций для анализа id=%s, scenario_id=%s, signal_id=%s",
+            "BT_ANALYSIS_DMIGAP_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
             analysis_id,
+            family_key,
+            analysis_key,
+            name,
             scenario_id,
             signal_id,
         )
@@ -64,7 +88,7 @@ async def run_dmigap_bin_analysis(
     valid_values: List[Decimal] = []
     valid_positions: List[Dict[str, Any]] = []
 
-    # первый проход: считаем dmi_gap для каждой позиции
+    # первый проход: считаем dmi_gap (q6) для каждой позиции
     for p in positions:
         raw_stat = p["raw_stat"]
         dmi_gap = _extract_dmigap_from_raw_stat(raw_stat, tf, base_param_name)
@@ -72,15 +96,15 @@ async def run_dmigap_bin_analysis(
             p["dmi_gap"] = None
             continue
 
-        p["dmi_gap"] = dmi_gap
-        valid_values.append(dmi_gap)
+        dmi_gap_q = _q6(dmi_gap)
+        p["dmi_gap"] = dmi_gap_q
+        valid_values.append(dmi_gap_q)
         valid_positions.append(p)
 
     if not valid_positions:
         log.debug(
-            "BT_ANALYSIS_DMIGAP_BIN: анализатор id=%s (family=%s, key=%s, name=%s) "
-            "для scenario_id=%s, signal_id=%s — нет валидных значений DMI-gap для анализа "
-            "(positions_total=%s)",
+            "BT_ANALYSIS_DMIGAP_BIN: нет валидных значений DMI-gap для анализа id=%s (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s — positions_total=%s",
             analysis_id,
             family_key,
             analysis_key,
@@ -101,15 +125,52 @@ async def run_dmigap_bin_analysis(
     min_gap = min(valid_values)
     max_gap = max(valid_values)
 
-    # строим линейные бины по диапазону [min_gap .. max_gap]
+    # строим линейные бины по диапазону [min_gap .. max_gap] (в q6)
     bins_count = 10
-    bins = _build_dmigap_bins(min_gap, max_gap, bins_count=bins_count)
+    bins = _build_dmigap_bins(
+        min_val=min_gap,
+        max_val=max_gap,
+        bins_count=bins_count,
+        tf=tf,
+    )
+
+    # записываем адаптивный словарь биннов в БД (на каждый проход)
+    source_finished_at = datetime.utcnow()
+    try:
+        inserted_rows = await _store_adaptive_bins(
+            pg=pg,
+            analysis_id=int(analysis_id),
+            scenario_id=int(scenario_id),
+            signal_id=int(signal_id),
+            tf=tf,
+            bins=bins,
+            source_finished_at=source_finished_at,
+        )
+        log.debug(
+            "BT_ANALYSIS_DMIGAP_BIN: записан bt_analysis_bin_dict_adaptive — analysis_id=%s, scenario_id=%s, signal_id=%s, tf=%s, rows=%s, min_gap=%s, max_gap=%s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            tf,
+            inserted_rows,
+            str(min_gap),
+            str(max_gap),
+        )
+    except Exception as e:
+        log.error(
+            "BT_ANALYSIS_DMIGAP_BIN: ошибка записи bt_analysis_bin_dict_adaptive для analysis_id=%s, scenario_id=%s, signal_id=%s: %s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            e,
+            exc_info=True,
+        )
 
     rows: List[Dict[str, Any]] = []
     positions_used = 0
     positions_skipped = positions_total - len(valid_positions)
 
-    # второй проход: раскладываем позиции по бинам
+    # второй проход: раскладываем позиции по бинам (с q6-значением)
     for p in valid_positions:
         position_uid = p["position_uid"]
         direction = p["direction"]
@@ -120,13 +181,15 @@ async def run_dmigap_bin_analysis(
             positions_skipped += 1
             continue
 
-        # клипуем значение в [min_gap, max_gap] на всякий случай
-        if dmi_gap < min_gap:
-            dmi_gap = min_gap
-        if dmi_gap > max_gap:
-            dmi_gap = max_gap
+        v = _q6(dmi_gap)
 
-        bin_name = _assign_bin(bins, dmi_gap)
+        # клипуем значение в [min_gap, max_gap] на всякий случай
+        if v < min_gap:
+            v = min_gap
+        if v > max_gap:
+            v = max_gap
+
+        bin_name = _assign_bin(bins, v)
         if bin_name is None:
             positions_skipped += 1
             continue
@@ -137,16 +200,15 @@ async def run_dmigap_bin_analysis(
                 "timeframe": tf,
                 "direction": direction,
                 "bin_name": bin_name,
-                "value": dmi_gap,   # DMI-gap (+DI - -DI)
+                "value": v,        # DMI-gap (+DI - -DI) (q6)
                 "pnl_abs": pnl_abs,
             }
         )
         positions_used += 1
 
     log.debug(
-        "BT_ANALYSIS_DMIGAP_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, валидных=%s, использовано=%s, "
-        "пропущено=%s, строк_в_результате=%s, min_gap=%s, max_gap=%s",
+        "BT_ANALYSIS_DMIGAP_BIN: summary id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
+        "positions_total=%s, valid=%s, used=%s, skipped=%s, rows=%s, min_gap=%s, max_gap=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -168,6 +230,9 @@ async def run_dmigap_bin_analysis(
             "positions_total": positions_total,
             "positions_used": positions_used,
             "positions_skipped": positions_skipped,
+            "min_gap": str(min_gap),
+            "max_gap": str(max_gap),
+            "source_finished_at": source_finished_at.isoformat(),
         },
     }
 
@@ -267,85 +332,203 @@ def _extract_dmigap_from_raw_stat(
     return plus_dec - minus_dec
 
 
-# 🔸 Построение линейных бинов по диапазону DMI-gap
+# 🔸 Построение линейных биннов по диапазону DMI-gap (bin_name в формате TF_BIN_N, границы q6)
 def _build_dmigap_bins(
     min_val: Decimal,
     max_val: Decimal,
     bins_count: int = 10,
-) -> List[Dict[str, Decimal]]:
-    bins: List[Dict[str, Decimal]] = []
+    tf: str = "m5",
+) -> List[Dict[str, Any]]:
+    bins: List[Dict[str, Any]] = []
+    tf_up = str(tf or "").strip().upper()
+
+    min_q = _q6(min_val)
+    max_q = _q6(max_val)
 
     # вырожденный диапазон — все бины одинаковые
-    if max_val <= min_val:
+    if max_q <= min_q:
         for i in range(bins_count):
-            name = f"bin_{i}"
             bins.append(
                 {
-                    "name": name,
-                    "min": min_val,
-                    "max": max_val,
+                    "bin_order": i,
+                    "bin_name": f"{tf_up}_bin_{i}",
+                    "min": min_q,
+                    "max": max_q,
+                    "to_inclusive": (i == bins_count - 1),
                 }
             )
         return bins
 
-    total_range = max_val - min_val
-    step = total_range / Decimal(bins_count)
+    total_range = max_q - min_q
+    step = _q6(total_range / Decimal(bins_count))
+
+    # если шаг “схлопнулся” до 0 из-за q6 — считаем диапазон вырожденным
+    if step <= Decimal("0"):
+        for i in range(bins_count):
+            bins.append(
+                {
+                    "bin_order": i,
+                    "bin_name": f"{tf_up}_bin_{i}",
+                    "min": min_q,
+                    "max": max_q,
+                    "to_inclusive": (i == bins_count - 1),
+                }
+            )
+        return bins
 
     # первые bins_count-1 бинов [min, max)
     for i in range(bins_count - 1):
-        lo = min_val + step * Decimal(i)
-        hi = min_val + step * Decimal(i + 1)
-        name = f"bin_{i}"
+        lo = _q6(min_q + step * Decimal(i))
+        hi = _q6(min_q + step * Decimal(i + 1))
         bins.append(
             {
-                "name": name,
+                "bin_order": i,
+                "bin_name": f"{tf_up}_bin_{i}",
                 "min": lo,
                 "max": hi,
+                "to_inclusive": False,
             }
         )
 
-    # последний бин [min_last, max_val] включительно
-    lo_last = min_val + step * Decimal(bins_count - 1)
+    # последний бин [min_last, max_q] включительно
+    lo_last = _q6(min_q + step * Decimal(bins_count - 1))
     bins.append(
         {
-            "name": f"bin_{bins_count - 1}",
+            "bin_order": bins_count - 1,
+            "bin_name": f"{tf_up}_bin_{bins_count - 1}",
             "min": lo_last,
-            "max": max_val,
+            "max": max_q,
+            "to_inclusive": True,
         }
     )
 
     return bins
 
 
-# 🔸 Определение имени бина для значения DMI-gap
+# 🔸 Определение имени бина для значения DMI-gap (q6-границы)
 def _assign_bin(
-    bins: List[Dict[str, Decimal]],
+    bins: List[Dict[str, Any]],
     value: Decimal,
 ) -> Optional[str]:
-    # все бины кроме последнего: [min, max)
-    # последний бин: [min, max] (включая верхнюю границу)
     if not bins:
         return None
 
     last_index = len(bins) - 1
+    v = _q6(value)
 
     for idx, b in enumerate(bins):
-        name = b.get("name")
+        name = b.get("bin_name")
         lo = b.get("min")
         hi = b.get("max")
+        to_inclusive = bool(b.get("to_inclusive"))
 
         if lo is None or hi is None or name is None:
             continue
 
-        if idx < last_index:
-            if lo <= value < hi:
+        lo_q = _q6(lo)
+        hi_q = _q6(hi)
+
+        if to_inclusive or idx == last_index:
+            if lo_q <= v <= hi_q:
                 return str(name)
         else:
-            # последний бин включительно по верхней границе
-            if lo <= value <= hi:
+            if lo_q <= v < hi_q:
                 return str(name)
 
     return None
+
+
+# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short, границы q6)
+async def _store_adaptive_bins(
+    pg,
+    analysis_id: int,
+    scenario_id: int,
+    signal_id: int,
+    tf: str,
+    bins: List[Dict[str, Any]],
+    source_finished_at: datetime,
+) -> int:
+    if not bins:
+        return 0
+
+    to_insert: List[Tuple[Any, ...]] = []
+    tf_l = str(tf or "").strip().lower()
+
+    for direction in ("long", "short"):
+        for b in bins:
+            bin_order = int(b.get("bin_order") or 0)
+            bin_name = str(b.get("bin_name") or "")
+            val_from = _q6(b.get("min"))
+            val_to = _q6(b.get("max"))
+            to_inclusive = bool(b.get("to_inclusive"))
+
+            to_insert.append(
+                (
+                    analysis_id,
+                    scenario_id,
+                    signal_id,
+                    direction,
+                    tf_l,
+                    "bins",
+                    bin_order,
+                    bin_name,
+                    val_from,
+                    val_to,
+                    to_inclusive,
+                    source_finished_at,
+                )
+            )
+
+    async with pg.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO bt_analysis_bin_dict_adaptive (
+                analysis_id,
+                scenario_id,
+                signal_id,
+                direction,
+                timeframe,
+                bin_type,
+                bin_order,
+                bin_name,
+                val_from,
+                val_to,
+                to_inclusive,
+                source_finished_at,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12,
+                now()
+            )
+            ON CONFLICT ON CONSTRAINT bt_analysis_bin_dict_adaptive_uniq_order
+            DO UPDATE SET
+                bin_name           = EXCLUDED.bin_name,
+                val_from           = EXCLUDED.val_from,
+                val_to             = EXCLUDED.val_to,
+                to_inclusive       = EXCLUDED.to_inclusive,
+                source_finished_at = EXCLUDED.source_finished_at,
+                updated_at         = now()
+            """,
+            to_insert,
+        )
+
+    return len(to_insert)
+
+
+# 🔸 q6 квантизация (ROUND_DOWN) — источник истины
+def _q6(value: Any) -> Decimal:
+    try:
+        if isinstance(value, Decimal):
+            d = value
+        else:
+            d = Decimal(str(value))
+        return d.quantize(Q6, rounding=ROUND_DOWN)
+    except Exception:
+        return Decimal("0").quantize(Q6, rounding=ROUND_DOWN)
 
 
 # 🔸 Вспомогательная функция: безопасное чтение str-параметра
