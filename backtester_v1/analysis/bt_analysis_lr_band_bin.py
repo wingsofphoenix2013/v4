@@ -1,4 +1,4 @@
-# bt_analysis_lr_band_bin.py — анализатор положения цены в LR-канале по полосам
+# bt_analysis_lr_band_bin.py — анализатор положения цены в LR-канале по полосам (названия бинов берутся из bt_analysis_bins_dict)
 
 import logging
 import json
@@ -26,12 +26,56 @@ async def run_lr_band_bin_analysis(
     signal_id = analysis_ctx.get("signal_id")
 
     # базовые параметры анализатора
-    tf = _get_str_param(params, "tf", default="m5")          # TF из raw_stat["tf"][tf]
+    tf = _get_str_param(params, "tf", default="m5")           # TF из raw_stat["tf"][tf]
     lr_prefix = _get_str_param(params, "param_name", "lr50")  # префикс LR: lr50 / lr100
+
+    # загружаем словарь биннов (имена) из bt_analysis_bins_dict
+    if analysis_id is None:
+        log.debug(
+            "BT_ANALYSIS_LR_BAND_BIN: analysis_id отсутствует (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s — анализ пропущен",
+            family_key,
+            analysis_key,
+            name,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "no_analysis_id",
+            },
+        }
+
+    bin_names_by_dir = await _load_bin_names_dict_for_analysis(pg, int(analysis_id), tf)
+    if not bin_names_by_dir:
+        log.debug(
+            "BT_ANALYSIS_LR_BAND_BIN: нет биннов в bt_analysis_bins_dict для analysis_id=%s, tf=%s "
+            "(family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — анализ пропущен",
+            analysis_id,
+            tf,
+            family_key,
+            analysis_key,
+            name,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "no_bins_dict",
+            },
+        }
 
     log.debug(
         "BT_ANALYSIS_LR_BAND_BIN: старт анализа id=%s (family=%s, key=%s, name=%s) "
-        "для scenario_id=%s, signal_id=%s, tf=%s, lr_prefix=%s",
+        "для scenario_id=%s, signal_id=%s, tf=%s, lr_prefix=%s, bins_loaded=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -40,14 +84,19 @@ async def run_lr_band_bin_analysis(
         signal_id,
         tf,
         lr_prefix,
+        {d: len(m) for d, m in bin_names_by_dir.items()},
     )
 
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
     positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
     if not positions:
         log.debug(
-            "BT_ANALYSIS_LR_BAND_BIN: нет позиций для анализа id=%s, scenario_id=%s, signal_id=%s",
+            "BT_ANALYSIS_LR_BAND_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s",
             analysis_id,
+            family_key,
+            analysis_key,
+            name,
             scenario_id,
             signal_id,
         )
@@ -69,10 +118,16 @@ async def run_lr_band_bin_analysis(
         positions_total += 1
 
         position_uid = p["position_uid"]
-        direction = p["direction"]
+        direction = str(p["direction"] or "").strip().lower()
         pnl_abs = p["pnl_abs"]
         raw_stat = p["raw_stat"]
         entry_price = p["entry_price"]
+
+        # имена биннов зависят от направления
+        names_map = bin_names_by_dir.get(direction) or {}
+        if not names_map:
+            positions_skipped += 1
+            continue
 
         upper, lower = _extract_lr_from_raw_stat(raw_stat, tf, lr_prefix)
         if upper is None or lower is None:
@@ -92,12 +147,15 @@ async def run_lr_band_bin_analysis(
 
         price = entry_price
 
-        # бин 0: выше верхней границы
+        # сохраняем прежнюю логику биннинга 1-в-1 (только имя берём из словаря)
+        # bin_order:
+        #   0 -> выше upper
+        #   9 -> ниже lower
+        #   1..8 -> 8 полос внутри канала
         if price > upper:
-            bin_name = "bin_0"
-        # бин 9: ниже нижней границы
+            bin_order = 0
         elif price < lower:
-            bin_name = "bin_9"
+            bin_order = 9
         else:
             # внутри канала [lower, upper]
             rel = (upper - price) / H  # 0 → верх, 1 → низ
@@ -107,13 +165,16 @@ async def run_lr_band_bin_analysis(
             if rel > Decimal("1"):
                 rel = Decimal("1")
 
-            # 8 полос внутри: rel ∈ [0,1] → idx ∈ [0,7]
             idx = int((rel * Decimal("8")).quantize(Decimal("0"), rounding=ROUND_DOWN))
             if idx >= 8:
                 idx = 7
 
-            bin_idx = 1 + idx  # bin_1..bin_8
-            bin_name = f"bin_{bin_idx}"
+            bin_order = 1 + idx  # 1..8
+
+        bin_name = names_map.get(bin_order)
+        if not bin_name:
+            positions_skipped += 1
+            continue
 
         rows.append(
             {
@@ -121,22 +182,23 @@ async def run_lr_band_bin_analysis(
                 "timeframe": tf,
                 "direction": direction,
                 "bin_name": bin_name,
-                # можно хранить цену входа как value (удобно для отладки/аналитики)
-                "value": price,
+                "value": price,   # сохраняем прежний смысл: цена входа
                 "pnl_abs": pnl_abs,
             }
         )
         positions_used += 1
 
     log.debug(
-        "BT_ANALYSIS_LR_BAND_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
+        "BT_ANALYSIS_LR_BAND_BIN: анализатор id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
+        "tf=%s, lr_prefix=%s, позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
         analysis_id,
         family_key,
         analysis_key,
         name,
         scenario_id,
         signal_id,
+        tf,
+        lr_prefix,
         positions_total,
         positions_used,
         positions_skipped,
@@ -151,6 +213,52 @@ async def run_lr_band_bin_analysis(
             "positions_skipped": positions_skipped,
         },
     }
+
+
+# 🔸 Загрузка имен биннов из bt_analysis_bins_dict для analysis_id + tf (map direction -> bin_order -> bin_name)
+async def _load_bin_names_dict_for_analysis(
+    pg,
+    analysis_id: int,
+    timeframe: str,
+) -> Dict[str, Dict[int, str]]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                direction,
+                bin_order,
+                bin_name
+            FROM bt_analysis_bins_dict
+            WHERE analysis_id = $1
+              AND timeframe   = $2
+              AND bin_type    = 'bins'
+            ORDER BY direction, bin_order
+            """,
+            analysis_id,
+            timeframe,
+        )
+
+    if not rows:
+        return {}
+
+    out: Dict[str, Dict[int, str]] = {}
+    for r in rows:
+        direction = str(r["direction"] or "").strip().lower()
+        if not direction:
+            continue
+
+        try:
+            order = int(r["bin_order"])
+        except Exception:
+            continue
+
+        name = r["bin_name"]
+        if name is None:
+            continue
+
+        out.setdefault(direction, {})[order] = str(name)
+
+    return out
 
 
 # 🔸 Загрузка позиций сценария/сигнала с postproc=true
