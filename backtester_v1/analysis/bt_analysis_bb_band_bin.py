@@ -127,7 +127,7 @@ async def run_bb_band_bin_analysis(
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_BB_BAND_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
         analysis_id,

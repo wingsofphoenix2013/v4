@@ -113,7 +113,7 @@ async def run_mfi_bin_analysis(
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_MFI_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",
         analysis_id,

@@ -101,6 +101,15 @@ async def run_bt_analysis_orchestrator(pg, redis):
             total_rows_inserted = 0
             total_bins_rows = 0
 
+            # сводка по очисткам
+            total_cleanup_raw = 0
+            total_cleanup_bins = 0
+            total_cleanup_model = 0
+            total_cleanup_labels = 0
+            total_cleanup_postproc = 0
+            total_cleanup_scenario_stat = 0
+            total_cleanup_total = 0
+
             for stream_key, entries in messages:
                 if stream_key != ANALYSIS_STREAM_KEY:
                     # на всякий случай игнорируем чужие стримы
@@ -146,6 +155,40 @@ async def run_bt_analysis_orchestrator(pg, redis):
                         finished_at,
                         entry_id,
                     )
+
+                    # очистка всего контура анализаторов по паре (scenario_id, signal_id) перед прогоном "с чистого листа"
+                    try:
+                        cleanup = await _cleanup_analysis_tables_for_pair(pg, scenario_id, signal_id)
+                        total_cleanup_raw += cleanup["raw"]
+                        total_cleanup_bins += cleanup["bins"]
+                        total_cleanup_model += cleanup["model_opt"]
+                        total_cleanup_labels += cleanup["bins_labels"]
+                        total_cleanup_postproc += cleanup["positions_postproc"]
+                        total_cleanup_scenario_stat += cleanup["scenario_stat"]
+                        total_cleanup_total += cleanup["total"]
+
+                        log.info(
+                            "BT_ANALYSIS_MAIN: cleanup перед анализом scenario_id=%s, signal_id=%s — "
+                            "deleted_raw=%s, deleted_bins=%s, deleted_model_opt=%s, deleted_bins_labels=%s, "
+                            "deleted_positions_postproc=%s, deleted_scenario_stat=%s, deleted_total=%s",
+                            scenario_id,
+                            signal_id,
+                            cleanup["raw"],
+                            cleanup["bins"],
+                            cleanup["model_opt"],
+                            cleanup["bins_labels"],
+                            cleanup["positions_postproc"],
+                            cleanup["scenario_stat"],
+                            cleanup["total"],
+                        )
+                    except Exception as e:
+                        log.error(
+                            "BT_ANALYSIS_MAIN: ошибка cleanup перед анализом scenario_id=%s, signal_id=%s: %s",
+                            scenario_id,
+                            signal_id,
+                            e,
+                            exc_info=True,
+                        )
 
                     # получаем все связки сценарий ↔ сигнал ↔ анализатор
                     links = get_analysis_connections_for_scenario_signal(scenario_id, signal_id)
@@ -300,9 +343,10 @@ async def run_bt_analysis_orchestrator(pg, redis):
 
             log.debug(
                 "BT_ANALYSIS_MAIN: пакет сообщений обработан — сообщений=%s, пар=%s, "
-                "анализаторов_планировалось=%s, успехов=%s, ошибок=%s, строк_raw=%s, строк_bins=%s",
+                "cleanup_total=%s, анализаторов_планировалось=%s, успехов=%s, ошибок=%s, строк_raw=%s, строк_bins=%s",
                 total_msgs,
                 total_pairs,
+                total_cleanup_total,
                 total_analyses_planned,
                 total_analyses_ok,
                 total_analyses_failed,
@@ -311,9 +355,17 @@ async def run_bt_analysis_orchestrator(pg, redis):
             )
             log.info(
                 "BT_ANALYSIS_MAIN: итог по пакету — сообщений=%s, пар=%s, "
+                "cleanup_raw=%s, cleanup_bins=%s, cleanup_model_opt=%s, cleanup_bins_labels=%s, cleanup_positions_postproc=%s, cleanup_scenario_stat=%s, cleanup_total=%s, "
                 "анализаторов всего=%s, успешно=%s, с ошибками=%s, строк в raw=%s, строк в bins_stat=%s",
                 total_msgs,
                 total_pairs,
+                total_cleanup_raw,
+                total_cleanup_bins,
+                total_cleanup_model,
+                total_cleanup_labels,
+                total_cleanup_postproc,
+                total_cleanup_scenario_stat,
+                total_cleanup_total,
                 total_analyses_planned,
                 total_analyses_ok,
                 total_analyses_failed,
@@ -859,3 +911,105 @@ async def _publish_analysis_ready(
             e,
             exc_info=True,
         )
+
+
+# 🔸 Очистка всех результатов контура анализаторов по паре (scenario_id, signal_id)
+async def _cleanup_analysis_tables_for_pair(pg, scenario_id: int, signal_id: int) -> Dict[str, int]:
+    deleted_raw = 0
+    deleted_bins = 0
+    deleted_model = 0
+    deleted_labels = 0
+    deleted_postproc = 0
+    deleted_scenario_stat = 0
+
+    async with pg.acquire() as conn:
+        # транзакция очистки
+        async with conn.transaction():
+            # сначала labels (на случай отсутствия ON DELETE CASCADE по model_id)
+            res_labels = await conn.execute(
+                """
+                DELETE FROM bt_analysis_bins_labels
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_labels = _parse_pg_execute_count(res_labels)
+
+            # затем модели (и всё, что может быть связано каскадом)
+            res_model = await conn.execute(
+                """
+                DELETE FROM bt_analysis_model_opt
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_model = _parse_pg_execute_count(res_model)
+
+            # финальный контейнер позиций
+            res_postproc = await conn.execute(
+                """
+                DELETE FROM bt_analysis_positions_postproc
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_postproc = _parse_pg_execute_count(res_postproc)
+
+            # финальная статистика по сценарию
+            res_sc_stat = await conn.execute(
+                """
+                DELETE FROM bt_analysis_scenario_stat
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_scenario_stat = _parse_pg_execute_count(res_sc_stat)
+
+            # сырые результаты и агрегаты по биннам
+            res_bins = await conn.execute(
+                """
+                DELETE FROM bt_analysis_bins_stat
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_bins = _parse_pg_execute_count(res_bins)
+
+            res_raw = await conn.execute(
+                """
+                DELETE FROM bt_analysis_positions_raw
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_raw = _parse_pg_execute_count(res_raw)
+
+    return {
+        "raw": deleted_raw,
+        "bins": deleted_bins,
+        "model_opt": deleted_model,
+        "bins_labels": deleted_labels,
+        "positions_postproc": deleted_postproc,
+        "scenario_stat": deleted_scenario_stat,
+        "total": deleted_raw + deleted_bins + deleted_model + deleted_labels + deleted_postproc + deleted_scenario_stat,
+    }
+
+
+# 🔸 Парсинг результата asyncpg conn.execute вида "DELETE 123"
+def _parse_pg_execute_count(res: Any) -> int:
+    try:
+        return int(str(res).split()[-1])
+    except Exception:
+        return 0

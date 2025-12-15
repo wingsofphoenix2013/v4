@@ -252,7 +252,7 @@ async def run_bb_mtf_analysis(
                     }
                 )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_BB_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s, min_share=%s, bb_key=%s — "
         "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s, H1-бинов=%s",

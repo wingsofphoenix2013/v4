@@ -29,14 +29,9 @@ from bt_analysis_main import run_bt_analysis_orchestrator
 from bt_analysis_preproc import run_bt_analysis_preproc_orchestrator
 # 🔸 Оркестратор финального пост-процессинга анализов
 from bt_analysis_postproc import run_bt_analysis_postproc_orchestrator
-# # 🔸 Оркестратор комплексных анализаторов
-# from bt_complex_main import run_bt_complex_analysis_orchestrator
-# # 🔸 Оркестратор скоринга комплексных анализаторов
-# from bt_complex_score import run_bt_complex_score_orchestrator
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
-
 
 # 🔸 Точка входа
 async def main():
@@ -84,8 +79,6 @@ async def main():
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
         run_safe_loop(lambda: run_bt_analysis_preproc_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC"),
         run_safe_loop(lambda: run_bt_analysis_postproc_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC"),
-#         run_safe_loop(lambda: run_bt_complex_analysis_orchestrator(pg, redis), "BT_COMPLEX"),
-#         run_safe_loop(lambda: run_bt_complex_score_orchestrator(pg, redis), "BT_COMPLEX_SCORE"),
     )
 
 

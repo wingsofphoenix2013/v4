@@ -200,7 +200,7 @@ async def run_rsimfi_mtf_analysis(
                     }
                 )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSIMFI_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s, rsimfi_low=%s, rsimfi_high=%s, min_share=%s, length=%s — "
         "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s",

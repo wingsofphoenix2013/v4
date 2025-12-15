@@ -77,7 +77,7 @@ async def run_dmigap_bin_analysis(
         valid_positions.append(p)
 
     if not valid_positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_DMIGAP_BIN: анализатор id=%s (family=%s, key=%s, name=%s) "
             "для scenario_id=%s, signal_id=%s — нет валидных значений DMI-gap для анализа "
             "(positions_total=%s)",
@@ -143,7 +143,7 @@ async def run_dmigap_bin_analysis(
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_DMIGAP_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s — позиций всего=%s, валидных=%s, использовано=%s, "
         "пропущено=%s, строк_в_результате=%s, min_gap=%s, max_gap=%s",

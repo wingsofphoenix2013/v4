@@ -71,7 +71,7 @@ async def run_bt_analysis_postproc_orchestrator(pg, redis):
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_POSTPROC: обработан пакет сообщений из bt:analysis:preproc_ready — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
@@ -813,7 +813,7 @@ async def _store_positions_postproc(
             to_insert,
         )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_POSTPROC: записано строк в bt_analysis_positions_postproc для scenario_id=%s, signal_id=%s: %s",
         scenario_id,
         signal_id,

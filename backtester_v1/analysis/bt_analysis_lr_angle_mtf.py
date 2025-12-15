@@ -186,7 +186,7 @@ async def run_lr_angle_mtf_analysis(
             )
             positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_LR_ANGLE_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s, lr_prefix=%s, min_share=%s — позиций всего=%s, "
         "использовано=%s, пропущено=%s, групп=%s, строк_в_результате=%s",

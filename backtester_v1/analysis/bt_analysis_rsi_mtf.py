@@ -200,7 +200,7 @@ async def run_rsi_mtf_analysis(
                     }
                 )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_RSI_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
         "scenario_id=%s, signal_id=%s, length=%s, min_share=%s — "
         "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s, H1-бинов=%s",
