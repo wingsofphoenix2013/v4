@@ -912,7 +912,6 @@ async def _publish_analysis_ready(
             exc_info=True,
         )
 
-
 # 🔸 Очистка всех результатов контура анализаторов по паре (scenario_id, signal_id)
 async def _cleanup_analysis_tables_for_pair(pg, scenario_id: int, signal_id: int) -> Dict[str, int]:
     deleted_raw = 0
@@ -921,6 +920,7 @@ async def _cleanup_analysis_tables_for_pair(pg, scenario_id: int, signal_id: int
     deleted_labels = 0
     deleted_postproc = 0
     deleted_scenario_stat = 0
+    deleted_adaptive_bins = 0
 
     async with pg.acquire() as conn:
         # транзакция очистки
@@ -948,6 +948,18 @@ async def _cleanup_analysis_tables_for_pair(pg, scenario_id: int, signal_id: int
                 signal_id,
             )
             deleted_model = _parse_pg_execute_count(res_model)
+
+            # адаптивный словарь биннов (пересчитывается на каждый проход)
+            res_adapt = await conn.execute(
+                """
+                DELETE FROM bt_analysis_bin_dict_adaptive
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_adaptive_bins = _parse_pg_execute_count(res_adapt)
 
             # финальный контейнер позиций
             res_postproc = await conn.execute(
@@ -1003,9 +1015,17 @@ async def _cleanup_analysis_tables_for_pair(pg, scenario_id: int, signal_id: int
         "bins_labels": deleted_labels,
         "positions_postproc": deleted_postproc,
         "scenario_stat": deleted_scenario_stat,
-        "total": deleted_raw + deleted_bins + deleted_model + deleted_labels + deleted_postproc + deleted_scenario_stat,
+        "adaptive_bins": deleted_adaptive_bins,
+        "total": (
+            deleted_raw
+            + deleted_bins
+            + deleted_model
+            + deleted_labels
+            + deleted_postproc
+            + deleted_scenario_stat
+            + deleted_adaptive_bins
+        ),
     }
-
 
 # 🔸 Парсинг результата asyncpg conn.execute вида "DELETE 123"
 def _parse_pg_execute_count(res: Any) -> int:

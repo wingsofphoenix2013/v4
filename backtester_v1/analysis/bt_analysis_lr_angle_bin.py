@@ -1,15 +1,16 @@
-# bt_analysis_lr_angle_bin.py — анализатор распределения позиций по биннам угла LR
+# bt_analysis_lr_angle_bin.py — анализатор распределения позиций по биннам угла LR (адаптивные границы + запись в bt_analysis_bin_dict_adaptive)
 
 import logging
 import json
-from typing import Dict, Any, List, Optional
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_LR_ANGLE_BIN")
 
 
-# 🔸 Публичная точка входа анализатора LR/angle_bin (адаптивные бины по углу)
+# 🔸 Публичная точка входа анализатора LR/angle_bin (адаптивные бины по углу + запись границ в bt_analysis_bin_dict_adaptive)
 async def run_lr_angle_bin_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
@@ -29,6 +30,23 @@ async def run_lr_angle_bin_analysis(
     tf = _get_str_param(params, "tf", default="m5")  # TF из raw_stat["tf"][tf]
     angle_param_name = _get_str_param(params, "param_name", "lr50_angle")  # например lr50_angle
 
+    if analysis_id is None or scenario_id is None or signal_id is None:
+        log.info(
+            "BT_ANALYSIS_LR_ANGLE_BIN: нет обязательных идентификаторов (analysis_id=%s, scenario_id=%s, signal_id=%s) — анализ пропущен",
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "missing_ids",
+            },
+        }
+
     log.debug(
         "BT_ANALYSIS_LR_ANGLE_BIN: старт анализа id=%s (family=%s, key=%s, name=%s) "
         "для scenario_id=%s, signal_id=%s, tf=%s, angle_param_name=%s",
@@ -43,11 +61,14 @@ async def run_lr_angle_bin_analysis(
     )
 
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
-    positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
+    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
     if not positions:
-        log.debug(
-            "BT_ANALYSIS_LR_ANGLE_BIN: нет позиций для анализа id=%s, scenario_id=%s, signal_id=%s",
+        log.info(
+            "BT_ANALYSIS_LR_ANGLE_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
             analysis_id,
+            family_key,
+            analysis_key,
+            name,
             scenario_id,
             signal_id,
         )
@@ -75,10 +96,9 @@ async def run_lr_angle_bin_analysis(
         valid_angles.append(angle)
 
     if not valid_angles:
-        log.debug(
-            "BT_ANALYSIS_LR_ANGLE_BIN: анализатор id=%s (family=%s, key=%s, name=%s) "
-            "для scenario_id=%s, signal_id=%s — нет валидных углов LR для анализа "
-            "(positions_total=%s)",
+        log.info(
+            "BT_ANALYSIS_LR_ANGLE_BIN: нет валидных углов LR для анализа id=%s (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s — positions_total=%s",
             analysis_id,
             family_key,
             analysis_key,
@@ -100,7 +120,44 @@ async def run_lr_angle_bin_analysis(
     max_angle = max(valid_angles)
 
     # строим адаптивные бины по углу в диапазоне [min_angle .. max_angle]
-    bins = _build_angle_bins(min_angle, max_angle, bins_count=10)
+    bins = _build_angle_bins(
+        min_angle=min_angle,
+        max_angle=max_angle,
+        bins_count=10,
+        tf=tf,
+    )
+
+    # записываем адаптивный словарь биннов в БД (на каждый проход)
+    source_finished_at = datetime.utcnow()
+    try:
+        inserted_rows = await _store_adaptive_bins(
+            pg=pg,
+            analysis_id=int(analysis_id),
+            scenario_id=int(scenario_id),
+            signal_id=int(signal_id),
+            tf=tf,
+            bins=bins,
+            source_finished_at=source_finished_at,
+        )
+        log.info(
+            "BT_ANALYSIS_LR_ANGLE_BIN: записан bt_analysis_bin_dict_adaptive — analysis_id=%s, scenario_id=%s, signal_id=%s, tf=%s, rows=%s, min_angle=%s, max_angle=%s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            tf,
+            inserted_rows,
+            str(min_angle),
+            str(max_angle),
+        )
+    except Exception as e:
+        log.error(
+            "BT_ANALYSIS_LR_ANGLE_BIN: ошибка записи bt_analysis_bin_dict_adaptive для analysis_id=%s, scenario_id=%s, signal_id=%s: %s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            e,
+            exc_info=True,
+        )
 
     rows: List[Dict[str, Any]] = []
     positions_used = 0
@@ -140,10 +197,9 @@ async def run_lr_angle_bin_analysis(
         )
         positions_used += 1
 
-    log.debug(
-        "BT_ANALYSIS_LR_ANGLE_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, использовано=%s, пропущено=%s, "
-        "строк_в_результате=%s, min_angle=%s, max_angle=%s",
+    log.info(
+        "BT_ANALYSIS_LR_ANGLE_BIN: summary id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
+        "positions_total=%s, used=%s, skipped=%s, rows=%s, min_angle=%s, max_angle=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -164,6 +220,9 @@ async def run_lr_angle_bin_analysis(
             "positions_total": positions_total,
             "positions_used": positions_used,
             "positions_skipped": positions_skipped,
+            "min_angle": str(min_angle),
+            "max_angle": str(max_angle),
+            "source_finished_at": source_finished_at.isoformat(),
         },
     }
 
@@ -255,23 +314,27 @@ def _extract_angle_from_raw_stat(
     return _safe_decimal(value)
 
 
-# 🔸 Построение адаптивных бинов по углу LR
+# 🔸 Построение адаптивных бинов по углу LR (bin_name в формате TF_BIN_N)
 def _build_angle_bins(
     min_angle: Decimal,
     max_angle: Decimal,
     bins_count: int = 10,
-) -> List[Dict[str, Decimal]]:
-    bins: List[Dict[str, Decimal]] = []
+    tf: str = "m5",
+) -> List[Dict[str, Any]]:
+    bins: List[Dict[str, Any]] = []
+    tf_up = str(tf or "").strip().upper()
 
-    # если диапазон вырожденный — делаем 10 одинаковых бинов
+    # если диапазон вырожденный — делаем bins_count одинаковых бинов
     if max_angle <= min_angle:
         for i in range(bins_count):
-            name = f"bin_{i}"
+            name = f"{tf_up}_bin_{i}"
             bins.append(
                 {
-                    "name": name,
+                    "bin_order": i,
+                    "bin_name": name,
                     "min": min_angle,
                     "max": max_angle,
+                    "to_inclusive": (i == bins_count - 1),
                 }
             )
         return bins
@@ -283,12 +346,14 @@ def _build_angle_bins(
     for i in range(bins_count - 1):
         lo = min_angle + step * Decimal(i)
         hi = min_angle + step * Decimal(i + 1)
-        name = f"bin_{i}"
+        name = f"{tf_up}_bin_{i}"
         bins.append(
             {
-                "name": name,
+                "bin_order": i,
+                "bin_name": name,
                 "min": lo,
                 "max": hi,
+                "to_inclusive": False,
             }
         )
 
@@ -296,44 +361,127 @@ def _build_angle_bins(
     lo_last = min_angle + step * Decimal(bins_count - 1)
     bins.append(
         {
-            "name": f"bin_{bins_count - 1}",
+            "bin_order": bins_count - 1,
+            "bin_name": f"{tf_up}_bin_{bins_count - 1}",
             "min": lo_last,
             "max": max_angle,
+            "to_inclusive": True,
         }
     )
 
     return bins
 
 
-# 🔸 Определение имени бина для значения угла
+# 🔸 Определение имени бина для значения угла (по адаптивным границам)
 def _assign_bin(
-    bins: List[Dict[str, Decimal]],
+    bins: List[Dict[str, Any]],
     value: Decimal,
 ) -> Optional[str]:
-    # все бины кроме последнего: [min, max)
-    # последний бин: [min, max] (включая верхнюю границу)
     if not bins:
         return None
 
     last_index = len(bins) - 1
 
     for idx, b in enumerate(bins):
-        name = b.get("name")
+        name = b.get("bin_name")
         lo = b.get("min")
         hi = b.get("max")
+        to_inclusive = bool(b.get("to_inclusive"))
 
         if lo is None or hi is None or name is None:
             continue
 
-        if idx < last_index:
-            if lo <= value < hi:
+        # обычный бин: [min, max)
+        # inclusive бин: [min, max]
+        if to_inclusive or idx == last_index:
+            if lo <= value <= hi:
                 return str(name)
         else:
-            # последний бин включительно по верхней границе
-            if lo <= value <= hi:
+            if lo <= value < hi:
                 return str(name)
 
     return None
+
+
+# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short)
+async def _store_adaptive_bins(
+    pg,
+    analysis_id: int,
+    scenario_id: int,
+    signal_id: int,
+    tf: str,
+    bins: List[Dict[str, Any]],
+    source_finished_at: datetime,
+) -> int:
+    if not bins:
+        return 0
+
+    to_insert: List[Tuple[Any, ...]] = []
+    tf_l = str(tf or "").strip().lower()
+
+    for direction in ("long", "short"):
+        for b in bins:
+            bin_order = int(b.get("bin_order") or 0)
+            bin_name = str(b.get("bin_name") or "")
+            val_from = b.get("min")
+            val_to = b.get("max")
+            to_inclusive = bool(b.get("to_inclusive"))
+
+            to_insert.append(
+                (
+                    analysis_id,
+                    scenario_id,
+                    signal_id,
+                    direction,
+                    tf_l,
+                    "bins",
+                    bin_order,
+                    bin_name,
+                    val_from,
+                    val_to,
+                    to_inclusive,
+                    source_finished_at,
+                )
+            )
+
+    async with pg.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO bt_analysis_bin_dict_adaptive (
+                analysis_id,
+                scenario_id,
+                signal_id,
+                direction,
+                timeframe,
+                bin_type,
+                bin_order,
+                bin_name,
+                val_from,
+                val_to,
+                to_inclusive,
+                source_finished_at,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12,
+                now()
+            )
+            ON CONFLICT ON CONSTRAINT bt_analysis_bin_dict_adaptive_uniq_order
+            DO UPDATE SET
+                bin_name          = EXCLUDED.bin_name,
+                val_from          = EXCLUDED.val_from,
+                val_to            = EXCLUDED.val_to,
+                to_inclusive      = EXCLUDED.to_inclusive,
+                source_finished_at= EXCLUDED.source_finished_at,
+                updated_at        = now()
+            """,
+            to_insert,
+        )
+
+    return len(to_insert)
 
 
 # 🔸 Вспомогательная функция: безопасное чтение str-параметра
