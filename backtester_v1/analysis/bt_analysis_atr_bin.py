@@ -1,15 +1,16 @@
-# bt_analysis_atr_bin.py — анализатор распределения позиций по биннам ATR в процентах от цены входа
+# bt_analysis_atr_bin.py — анализатор распределения позиций по биннам ATR в процентах от цены входа (адаптивные границы + запись в bt_analysis_bin_dict_adaptive)
 
 import logging
 import json
-from typing import Dict, Any, List, Optional
-from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_ANALYSIS_ATR_BIN")
 
 
-# 🔸 Публичная точка входа анализатора ATR/bin (ATR% от цены входа, линейные бины по диапазону)
+# 🔸 Публичная точка входа анализатора ATR/bin (ATR% от цены входа, линейные бины по диапазону + запись границ в bt_analysis_bin_dict_adaptive)
 async def run_atr_bin_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
@@ -26,8 +27,25 @@ async def run_atr_bin_analysis(
     signal_id = analysis_ctx.get("signal_id")
 
     # базовые параметры анализатора
-    tf = _get_str_param(params, "tf", default="m5")              # TF из raw_stat["tf"][tf]
+    tf = _get_str_param(params, "tf", default="m5")                 # TF из raw_stat["tf"][tf]
     atr_param_name = _get_str_param(params, "param_name", "atr14")  # например atr14
+
+    if analysis_id is None or scenario_id is None or signal_id is None:
+        log.info(
+            "BT_ANALYSIS_ATR_BIN: нет обязательных идентификаторов (analysis_id=%s, scenario_id=%s, signal_id=%s) — анализ пропущен",
+            analysis_id,
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "missing_ids",
+            },
+        }
 
     log.debug(
         "BT_ANALYSIS_ATR_BIN: старт анализа id=%s (family=%s, key=%s, name=%s) "
@@ -43,11 +61,14 @@ async def run_atr_bin_analysis(
     )
 
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat и entry_price)
-    positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
+    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
     if not positions:
-        log.debug(
-            "BT_ANALYSIS_ATR_BIN: нет позиций для анализа id=%s, scenario_id=%s, signal_id=%s",
+        log.info(
+            "BT_ANALYSIS_ATR_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
             analysis_id,
+            family_key,
+            analysis_key,
+            name,
             scenario_id,
             signal_id,
         )
@@ -89,10 +110,9 @@ async def run_atr_bin_analysis(
         valid_positions.append(p)
 
     if not valid_positions:
-        log.debug(
-            "BT_ANALYSIS_ATR_BIN: анализатор id=%s (family=%s, key=%s, name=%s) "
-            "для scenario_id=%s, signal_id=%s — нет валидных значений ATR%% для анализа "
-            "(positions_total=%s)",
+        log.info(
+            "BT_ANALYSIS_ATR_BIN: нет валидных значений ATR%% для анализа id=%s (family=%s, key=%s, name=%s), "
+            "scenario_id=%s, signal_id=%s — positions_total=%s",
             analysis_id,
             family_key,
             analysis_key,
@@ -115,7 +135,44 @@ async def run_atr_bin_analysis(
 
     # строим линейные бины по диапазону [min_atr_pct .. max_atr_pct]
     bins_count = 10
-    bins = _build_atr_bins(min_atr_pct, max_atr_pct, bins_count=bins_count)
+    bins = _build_atr_bins(
+        min_val=min_atr_pct,
+        max_val=max_atr_pct,
+        bins_count=bins_count,
+        tf=tf,
+    )
+
+    # записываем адаптивный словарь биннов в БД (на каждый проход)
+    source_finished_at = datetime.utcnow()
+    try:
+        inserted_rows = await _store_adaptive_bins(
+            pg=pg,
+            analysis_id=int(analysis_id),
+            scenario_id=int(scenario_id),
+            signal_id=int(signal_id),
+            tf=tf,
+            bins=bins,
+            source_finished_at=source_finished_at,
+        )
+        log.info(
+            "BT_ANALYSIS_ATR_BIN: записан bt_analysis_bin_dict_adaptive — analysis_id=%s, scenario_id=%s, signal_id=%s, tf=%s, rows=%s, min_atr_pct=%s, max_atr_pct=%s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            tf,
+            inserted_rows,
+            str(min_atr_pct),
+            str(max_atr_pct),
+        )
+    except Exception as e:
+        log.error(
+            "BT_ANALYSIS_ATR_BIN: ошибка записи bt_analysis_bin_dict_adaptive для analysis_id=%s, scenario_id=%s, signal_id=%s: %s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            e,
+            exc_info=True,
+        )
 
     rows: List[Dict[str, Any]] = []
     positions_used = 0
@@ -155,10 +212,9 @@ async def run_atr_bin_analysis(
         )
         positions_used += 1
 
-    log.debug(
-        "BT_ANALYSIS_ATR_BIN: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s — позиций всего=%s, валидных=%s, использовано=%s, "
-        "пропущено=%s, строк_в_результате=%s, min_atr_pct=%s, max_atr_pct=%s",
+    log.info(
+        "BT_ANALYSIS_ATR_BIN: summary id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
+        "positions_total=%s, valid=%s, used=%s, skipped=%s, rows=%s, min_atr_pct=%s, max_atr_pct=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -180,6 +236,9 @@ async def run_atr_bin_analysis(
             "positions_total": positions_total,
             "positions_used": positions_used,
             "positions_skipped": positions_skipped,
+            "min_atr_pct": str(min_atr_pct),
+            "max_atr_pct": str(max_atr_pct),
+            "source_finished_at": source_finished_at.isoformat(),
         },
     }
 
@@ -273,23 +332,26 @@ def _extract_atr_from_raw_stat(
     return _safe_decimal(value)
 
 
-# 🔸 Построение линейных бинов по диапазону ATR%
+# 🔸 Построение линейных бинов по диапазону ATR% (bin_name в формате TF_BIN_N)
 def _build_atr_bins(
     min_val: Decimal,
     max_val: Decimal,
     bins_count: int = 10,
-) -> List[Dict[str, Decimal]]:
-    bins: List[Dict[str, Decimal]] = []
+    tf: str = "m5",
+) -> List[Dict[str, Any]]:
+    bins: List[Dict[str, Any]] = []
+    tf_up = str(tf or "").strip().upper()
 
     # вырожденный диапазон — все бины одинаковые
     if max_val <= min_val:
         for i in range(bins_count):
-            name = f"bin_{i}"
             bins.append(
                 {
-                    "name": name,
+                    "bin_order": i,
+                    "bin_name": f"{tf_up}_bin_{i}",
                     "min": min_val,
                     "max": max_val,
+                    "to_inclusive": (i == bins_count - 1),
                 }
             )
         return bins
@@ -301,12 +363,13 @@ def _build_atr_bins(
     for i in range(bins_count - 1):
         lo = min_val + step * Decimal(i)
         hi = min_val + step * Decimal(i + 1)
-        name = f"bin_{i}"
         bins.append(
             {
-                "name": name,
+                "bin_order": i,
+                "bin_name": f"{tf_up}_bin_{i}",
                 "min": lo,
                 "max": hi,
+                "to_inclusive": False,
             }
         )
 
@@ -314,9 +377,11 @@ def _build_atr_bins(
     lo_last = min_val + step * Decimal(bins_count - 1)
     bins.append(
         {
-            "name": f"bin_{bins_count - 1}",
+            "bin_order": bins_count - 1,
+            "bin_name": f"{tf_up}_bin_{bins_count - 1}",
             "min": lo_last,
             "max": max_val,
+            "to_inclusive": True,
         }
     )
 
@@ -325,33 +390,114 @@ def _build_atr_bins(
 
 # 🔸 Определение имени бина для значения ATR%
 def _assign_bin(
-    bins: List[Dict[str, Decimal]],
+    bins: List[Dict[str, Any]],
     value: Decimal,
 ) -> Optional[str]:
-    # все бины кроме последнего: [min, max)
-    # последний бин: [min, max] (включая верхнюю границу)
     if not bins:
         return None
 
     last_index = len(bins) - 1
 
     for idx, b in enumerate(bins):
-        name = b.get("name")
+        name = b.get("bin_name")
         lo = b.get("min")
         hi = b.get("max")
+        to_inclusive = bool(b.get("to_inclusive"))
 
         if lo is None or hi is None or name is None:
             continue
 
-        if idx < last_index:
-            if lo <= value < hi:
+        # обычный бин: [min, max)
+        # inclusive бин: [min, max]
+        if to_inclusive or idx == last_index:
+            if lo <= value <= hi:
                 return str(name)
         else:
-            # последний бин включительно по верхней границе
-            if lo <= value <= hi:
+            if lo <= value < hi:
                 return str(name)
 
     return None
+
+
+# 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short)
+async def _store_adaptive_bins(
+    pg,
+    analysis_id: int,
+    scenario_id: int,
+    signal_id: int,
+    tf: str,
+    bins: List[Dict[str, Any]],
+    source_finished_at: datetime,
+) -> int:
+    if not bins:
+        return 0
+
+    to_insert: List[Tuple[Any, ...]] = []
+    tf_l = str(tf or "").strip().lower()
+
+    for direction in ("long", "short"):
+        for b in bins:
+            bin_order = int(b.get("bin_order") or 0)
+            bin_name = str(b.get("bin_name") or "")
+            val_from = b.get("min")
+            val_to = b.get("max")
+            to_inclusive = bool(b.get("to_inclusive"))
+
+            to_insert.append(
+                (
+                    analysis_id,
+                    scenario_id,
+                    signal_id,
+                    direction,
+                    tf_l,
+                    "bins",
+                    bin_order,
+                    bin_name,
+                    val_from,
+                    val_to,
+                    to_inclusive,
+                    source_finished_at,
+                )
+            )
+
+    async with pg.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO bt_analysis_bin_dict_adaptive (
+                analysis_id,
+                scenario_id,
+                signal_id,
+                direction,
+                timeframe,
+                bin_type,
+                bin_order,
+                bin_name,
+                val_from,
+                val_to,
+                to_inclusive,
+                source_finished_at,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12,
+                now()
+            )
+            ON CONFLICT ON CONSTRAINT bt_analysis_bin_dict_adaptive_uniq_order
+            DO UPDATE SET
+                bin_name           = EXCLUDED.bin_name,
+                val_from           = EXCLUDED.val_from,
+                val_to             = EXCLUDED.val_to,
+                to_inclusive       = EXCLUDED.to_inclusive,
+                source_finished_at = EXCLUDED.source_finished_at,
+                updated_at         = now()
+            """,
+            to_insert,
+        )
+
+    return len(to_insert)
 
 
 # 🔸 Вспомогательная функция: безопасное чтение str-параметра
