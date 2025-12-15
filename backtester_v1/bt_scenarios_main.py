@@ -299,6 +299,29 @@ async def _run_scenario_worker(
         )
         return
 
+    # очистка результатов сценария перед прогоном "с чистого листа"
+    try:
+        cleanup = await _cleanup_scenario_tables(pg, int(scenario_id), int(signal_id))
+        log.info(
+            "BT_SCENARIOS_MAIN: cleanup перед сценарием scenario_id=%s, signal_id=%s — "
+            "deleted_positions=%s, deleted_logs=%s, deleted_daily=%s, deleted_stat=%s, deleted_total=%s",
+            scenario_id,
+            signal_id,
+            cleanup["positions"],
+            cleanup["logs"],
+            cleanup["daily"],
+            cleanup["stat"],
+            cleanup["total"],
+        )
+    except Exception as e:
+        log.error(
+            "BT_SCENARIOS_MAIN: ошибка cleanup перед сценарием scenario_id=%s, signal_id=%s: %s",
+            scenario_id,
+            signal_id,
+            e,
+            exc_info=True,
+        )
+
     try:
         await handler(scenario, signal_ctx, pg, redis)
         log.debug(
@@ -321,3 +344,76 @@ async def _run_scenario_worker(
             e,
             exc_info=True,
         )
+
+
+# 🔸 Очистка таблиц сценария перед прогоном (scenario_id + signal_id)
+async def _cleanup_scenario_tables(pg, scenario_id: int, signal_id: int) -> Dict[str, int]:
+    deleted_positions = 0
+    deleted_logs = 0
+    deleted_daily = 0
+    deleted_stat = 0
+
+    async with pg.acquire() as conn:
+        # транзакция очистки
+        async with conn.transaction():
+            res_logs = await conn.execute(
+                """
+                DELETE FROM bt_signals_log l
+                USING bt_signals_values v
+                WHERE l.signal_uuid = v.signal_uuid
+                  AND l.scenario_id = $1
+                  AND v.signal_id = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_logs = _parse_pg_execute_count(res_logs)
+
+            res_pos = await conn.execute(
+                """
+                DELETE FROM bt_scenario_positions
+                WHERE scenario_id = $1
+                  AND signal_id = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_positions = _parse_pg_execute_count(res_pos)
+
+            res_daily = await conn.execute(
+                """
+                DELETE FROM bt_scenario_daily
+                WHERE scenario_id = $1
+                  AND signal_id = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_daily = _parse_pg_execute_count(res_daily)
+
+            res_stat = await conn.execute(
+                """
+                DELETE FROM bt_scenario_stat
+                WHERE scenario_id = $1
+                  AND signal_id = $2
+                """,
+                scenario_id,
+                signal_id,
+            )
+            deleted_stat = _parse_pg_execute_count(res_stat)
+
+    return {
+        "positions": deleted_positions,
+        "logs": deleted_logs,
+        "daily": deleted_daily,
+        "stat": deleted_stat,
+        "total": deleted_positions + deleted_logs + deleted_daily + deleted_stat,
+    }
+
+
+# 🔸 Парсинг результата asyncpg conn.execute вида "DELETE 123"
+def _parse_pg_execute_count(res: Any) -> int:
+    try:
+        return int(str(res).split()[-1])
+    except Exception:
+        return 0
