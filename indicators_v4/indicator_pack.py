@@ -394,7 +394,7 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
 
             # итоговый лог: что присвоили "сейчас"
             for direction, bin_name in published_items:
-                log.info(
+                log.debug(
                     f"analysis_id={rt.analysis_id} symbol={symbol} tf={rt.timeframe} "
                     f"direction={direction} bin_name={bin_name} open_time={open_time} ttl={rt.ttl_sec}"
                 )
