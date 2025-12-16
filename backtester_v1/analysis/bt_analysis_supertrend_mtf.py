@@ -32,7 +32,7 @@ async def run_supertrend_mtf_analysis(
     tf_order = ["h1", "m15", "m5"]
 
     if analysis_id is None:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_SUPERTREND_MTF: analysis_id отсутствует (family=%s, key=%s, name=%s), "
             "scenario_id=%s, signal_id=%s — анализ пропущен",
             family_key,
@@ -54,7 +54,7 @@ async def run_supertrend_mtf_analysis(
     # загружаем словарь биннов (bin_order -> bin_name) для timeframe='mtf'
     bins_map = await _load_bins_dict_for_mtf(pg, int(analysis_id))
     if not bins_map:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_SUPERTREND_MTF: нет биннов в bt_analysis_bins_dict для analysis_id=%s, timeframe='mtf' "
             "(family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — анализ пропущен",
             analysis_id,
@@ -91,7 +91,7 @@ async def run_supertrend_mtf_analysis(
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
     positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_SUPERTREND_MTF: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
             analysis_id,
             family_key,
@@ -160,7 +160,7 @@ async def run_supertrend_mtf_analysis(
         )
         positions_used += 1
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_SUPERTREND_MTF: анализатор id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
         "positions_total=%s, used=%s, skipped=%s, rows=%s",
         analysis_id,

@@ -39,7 +39,7 @@ async def run_lr_mtf_analysis(
     length = _get_int_param(params, "length", DEFAULT_LENGTH)
 
     if analysis_id is None or scenario_id is None or signal_id is None:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_MTF: анализ пропущен (нет обязательных id) analysis_id=%s, scenario_id=%s, signal_id=%s",
             analysis_id,
             scenario_id,
@@ -74,7 +74,7 @@ async def run_lr_mtf_analysis(
 
     # условия достаточности словаря
     if not bins_h1_by_dir or not bins_m15_by_dir:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_MTF: анализ пропущен (нет биннов H1/M15 в bt_analysis_bins_dict) "
             "analysis_id=%s, scenario_id=%s, signal_id=%s, bins_h1=%s, bins_m15=%s",
             analysis_id,
@@ -96,7 +96,7 @@ async def run_lr_mtf_analysis(
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (postproc=true)
     positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_MTF: нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s",
             analysis_id,
             scenario_id,
@@ -190,7 +190,7 @@ async def run_lr_mtf_analysis(
     positions_used = len(base_list)
 
     if positions_used == 0:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_MTF: после фильтрации нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s "
             "(total=%s, skipped=%s)",
             analysis_id,
@@ -381,7 +381,7 @@ async def run_lr_mtf_analysis(
             exc_info=True,
         )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_LR_MTF: завершено analysis_id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
         "length=%s, min_share=%s, pos_total=%s, pos_used=%s, pos_skipped=%s, rows=%s, H1_groups=%s, adaptive_quantiles=%s",
         analysis_id,

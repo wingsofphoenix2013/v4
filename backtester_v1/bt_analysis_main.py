@@ -703,7 +703,7 @@ async def _run_single_analysis(
             indicator_param=indicator_param,
         )
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_MAIN: анализатор id=%s (family=%s, key=%s, name=%s) "
             "для scenario_id=%s, signal_id=%s записал raw строк=%s и bins строк=%s (trades_total=%s)",
             analysis_id,
