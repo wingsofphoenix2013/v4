@@ -1,4 +1,4 @@
-# bt_analysis_rsi_mtf.py — анализатор распределения позиций по MTF-корзинкам RSI (h1 + m15 + m5)
+# bt_analysis_rsi_mtf.py — анализатор распределения позиций по MTF-корзинкам RSI (h1 + m15 + m5) через bt_analysis_bins_dict
 
 import logging
 import json
@@ -13,7 +13,7 @@ DEFAULT_MIN_SHARE = Decimal("0.01")
 DEFAULT_LENGTH = 14
 
 
-# 🔸 Публичная точка входа анализатора RSI MTF (h1 + m15 + m5, без фильтрации по m5)
+# 🔸 Публичная точка входа анализатора RSI MTF (h1 + m15 + m5) через словарь биннов
 async def run_rsi_mtf_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
@@ -33,9 +33,25 @@ async def run_rsi_mtf_analysis(
     min_share = _get_decimal_param(params, "min_share", DEFAULT_MIN_SHARE)
     length = _get_int_param(params, "length", DEFAULT_LENGTH)
 
+    if analysis_id is None:
+        log.info(
+            "BT_ANALYSIS_RSI_MTF: анализ пропущен (нет analysis_id) scenario_id=%s, signal_id=%s",
+            scenario_id,
+            signal_id,
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "no_analysis_id",
+            },
+        }
+
     log.debug(
         "BT_ANALYSIS_RSI_MTF: старт анализа id=%s (family=%s, key=%s, name=%s) "
-        "для scenario_id=%s, signal_id=%s, min_share=%s, length=%s, params=%s",
+        "для scenario_id=%s, signal_id=%s, min_share=%s, length=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -44,14 +60,40 @@ async def run_rsi_mtf_analysis(
         signal_id,
         min_share,
         length,
-        params,
     )
+
+    # загружаем компонентные бины из словаря (по каждому TF отдельно)
+    bins_h1_by_dir = await _load_bins_dict_for_analysis(pg, int(analysis_id), "h1")
+    bins_m15_by_dir = await _load_bins_dict_for_analysis(pg, int(analysis_id), "m15")
+    bins_m5_by_dir = await _load_bins_dict_for_analysis(pg, int(analysis_id), "m5")
+
+    # условия достаточности словаря
+    if not bins_h1_by_dir or not bins_m15_by_dir or not bins_m5_by_dir:
+        log.info(
+            "BT_ANALYSIS_RSI_MTF: анализ пропущен (нет биннов в bt_analysis_bins_dict) "
+            "analysis_id=%s, scenario_id=%s, signal_id=%s, bins_h1=%s, bins_m15=%s, bins_m5=%s",
+            analysis_id,
+            scenario_id,
+            signal_id,
+            bool(bins_h1_by_dir),
+            bool(bins_m15_by_dir),
+            bool(bins_m5_by_dir),
+        )
+        return {
+            "rows": [],
+            "summary": {
+                "positions_total": 0,
+                "positions_used": 0,
+                "positions_skipped": 0,
+                "skipped_reason": "no_bins_dict",
+            },
+        }
 
     # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (postproc=true)
     positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
     if not positions:
-        log.debug(
-            "BT_ANALYSIS_RSI_MTF: нет позиций для анализа id=%s, scenario_id=%s, signal_id=%s",
+        log.info(
+            "BT_ANALYSIS_RSI_MTF: нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s",
             analysis_id,
             scenario_id,
             signal_id,
@@ -61,26 +103,31 @@ async def run_rsi_mtf_analysis(
             "positions_used": 0,
             "positions_skipped": 0,
         }
-        return {
-            "rows": [],
-            "summary": summary,
-        }
+        return {"rows": [], "summary": summary}
 
     positions_total = 0
     positions_skipped = 0
 
-    # сначала собираем все бин-коды по h1/m15/m5 для каждой позиции
-    # H1: bin_0..bin_4, M15: bin_0..bin_4, M5: bin_0..bin_4
+    # сначала собираем компонентные бин-коды по h1/m15/m5 для каждой позиции
     base_list: List[Dict[str, Any]] = []
 
     for p in positions:
         positions_total += 1
 
         position_uid = p["position_uid"]
-        direction = p["direction"]
+        direction = str(p["direction"] or "").strip().lower()
         pnl_abs = p["pnl_abs"]
         raw_stat = p["raw_stat"]
 
+        # бины зависят от направления
+        bins_h1 = bins_h1_by_dir.get(direction)
+        bins_m15 = bins_m15_by_dir.get(direction)
+        bins_m5 = bins_m5_by_dir.get(direction)
+        if not bins_h1 or not bins_m15 or not bins_m5:
+            positions_skipped += 1
+            continue
+
+        # извлекаем RSI на трёх TF
         rsi_h1 = _extract_rsi_value(raw_stat, "h1", length)
         rsi_m15 = _extract_rsi_value(raw_stat, "m15", length)
         rsi_m5 = _extract_rsi_value(raw_stat, "m5", length)
@@ -90,9 +137,16 @@ async def run_rsi_mtf_analysis(
             positions_skipped += 1
             continue
 
-        h_bin = _value_to_bin(rsi_h1)
-        m15_bin = _value_to_bin(rsi_m15)
-        m5_bin = _value_to_bin(rsi_m5)
+        # клипуем RSI в диапазон [0, 100]
+        rsi_h1 = _clip_0_100(rsi_h1)
+        rsi_m15 = _clip_0_100(rsi_m15)
+        rsi_m5 = _clip_0_100(rsi_m5)
+
+        # назначаем бины через bt_analysis_bins_dict (по bin_order)
+        h_bin = _assign_bin(bins_h1, rsi_h1)
+        m15_bin = _assign_bin(bins_m15, rsi_m15)
+        m5_bin = _assign_bin(bins_m5, rsi_m5)
+
         if h_bin is None or m15_bin is None or m5_bin is None:
             positions_skipped += 1
             continue
@@ -102,29 +156,30 @@ async def run_rsi_mtf_analysis(
                 "position_uid": position_uid,
                 "direction": direction,
                 "pnl_abs": pnl_abs,
-                "h_bin": h_bin,      # например "bin_2"
-                "m15_bin": m15_bin,  # например "bin_3"
-                "m5_bin": m5_bin,    # например "bin_1"
+                "h_bin": h_bin,        # например "H1_bin_2"
+                "m15_bin": m15_bin,    # например "M15_bin_3"
+                "m5_bin": m5_bin,      # например "M5_bin_1"
             }
         )
 
     positions_used = len(base_list)
 
     if positions_used == 0:
-        log.debug(
-            "BT_ANALYSIS_RSI_MTF: после фильтрации нет позиций для анализа scenario_id=%s, signal_id=%s",
+        log.info(
+            "BT_ANALYSIS_RSI_MTF: после фильтрации нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s "
+            "(total=%s, skipped=%s)",
+            analysis_id,
             scenario_id,
             signal_id,
+            positions_total,
+            positions_skipped,
         )
         summary = {
             "positions_total": positions_total,
             "positions_used": 0,
             "positions_skipped": positions_skipped,
         }
-        return {
-            "rows": [],
-            "summary": summary,
-        }
+        return {"rows": [], "summary": summary}
 
     total_for_share = Decimal(positions_used)
 
@@ -145,7 +200,7 @@ async def run_rsi_mtf_analysis(
         # H1_bin_X|M15_0|M5_0
         if share_h < min_share:
             for rec in group_h:
-                bin_name = f"H1_{h_bin}|M15_0|M5_0"
+                bin_name = f"{h_bin}|M15_0|M5_0"
                 rows.append(
                     {
                         "position_uid": rec["position_uid"],
@@ -172,7 +227,7 @@ async def run_rsi_mtf_analysis(
             # H1_bin_X|M15_bin_Y|M5_0
             if share_m15 < min_share:
                 for rec in group_m15:
-                    bin_name = f"H1_{h_bin}|M15_{m15_bin}|M5_0"
+                    bin_name = f"{h_bin}|{m15_bin}|M5_0"
                     rows.append(
                         {
                             "position_uid": rec["position_uid"],
@@ -187,8 +242,7 @@ async def run_rsi_mtf_analysis(
 
             # иначе — полноценная MTF-матрица: H1_bin_X|M15_bin_Y|M5_bin_Z
             for rec in group_m15:
-                m5_bin = rec["m5_bin"]
-                bin_name = f"H1_{h_bin}|M15_{m15_bin}|M5_{m5_bin}"
+                bin_name = f"{h_bin}|{m15_bin}|{rec['m5_bin']}"
                 rows.append(
                     {
                         "position_uid": rec["position_uid"],
@@ -200,10 +254,10 @@ async def run_rsi_mtf_analysis(
                     }
                 )
 
-    log.debug(
-        "BT_ANALYSIS_RSI_MTF: анализатор id=%s (family=%s, key=%s, name=%s), "
-        "scenario_id=%s, signal_id=%s, length=%s, min_share=%s — "
-        "позиций всего=%s, использовано=%s, пропущено=%s, строк_в_результате=%s, H1-бинов=%s",
+    # итоговый лог по результатам
+    log.info(
+        "BT_ANALYSIS_RSI_MTF: завершено analysis_id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
+        "length=%s, min_share=%s, pos_total=%s, pos_used=%s, pos_skipped=%s, rows=%s, H1_groups=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -225,10 +279,54 @@ async def run_rsi_mtf_analysis(
         "positions_skipped": positions_skipped,
     }
 
-    return {
-        "rows": rows,
-        "summary": summary,
-    }
+    return {"rows": rows, "summary": summary}
+
+
+# 🔸 Загрузка биннов из bt_analysis_bins_dict для analysis_id + tf (группировка по direction)
+async def _load_bins_dict_for_analysis(
+    pg,
+    analysis_id: int,
+    timeframe: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                direction,
+                bin_order,
+                bin_name,
+                val_from,
+                val_to,
+                to_inclusive
+            FROM bt_analysis_bins_dict
+            WHERE analysis_id = $1
+              AND timeframe   = $2
+              AND bin_type    = 'bins'
+            ORDER BY direction, bin_order
+            """,
+            analysis_id,
+            timeframe,
+        )
+
+    if not rows:
+        return {}
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        direction = str(r["direction"] or "").strip().lower()
+        if not direction:
+            continue
+
+        out.setdefault(direction, []).append(
+            {
+                "name": str(r["bin_name"]),
+                "min": _safe_decimal(r["val_from"]),
+                "max": _safe_decimal(r["val_to"]),
+                "to_inclusive": bool(r["to_inclusive"]),
+            }
+        )
+
+    return out
 
 
 # 🔸 Загрузка позиций сценария/сигнала с postproc=true
@@ -284,12 +382,12 @@ async def _load_positions_for_analysis(
     return positions
 
 
-# извлечение значения RSI для заданного TF и длины
+# 🔸 Извлечение значения RSI для заданного TF и длины (rsi{length})
 def _extract_rsi_value(
     raw_stat: Any,
     tf: str,
     length: int,
-) -> Optional[float]:
+) -> Optional[Decimal]:
     if raw_stat is None:
         return None
 
@@ -319,29 +417,48 @@ def _extract_rsi_value(
     if value is None:
         return None
 
-    try:
-        return float(value)
-    except (TypeError, ValueError):
+    return _safe_decimal(value)
+
+
+# 🔸 Определение имени бина для значения RSI (границы из bt_analysis_bins_dict)
+def _assign_bin(
+    bins: List[Dict[str, Any]],
+    value: Decimal,
+) -> Optional[str]:
+    if not bins:
         return None
 
+    for b in bins:
+        name = b.get("name")
+        lo = b.get("min")
+        hi = b.get("max")
+        to_inclusive = bool(b.get("to_inclusive"))
 
-# разбиение значения 0–100 по биннам bin_0..bin_4 (шаг 20)
-def _value_to_bin(value: float) -> Optional[str]:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
+        if lo is None or hi is None or name is None:
+            continue
 
-    idx = int(v // 20)
-    if idx < 0:
-        idx = 0
-    if idx > 4:
-        idx = 4
+        # обычный бин: [min, max)
+        # inclusive бин: [min, max]
+        if to_inclusive:
+            if lo <= value <= hi:
+                return str(name)
+        else:
+            if lo <= value < hi:
+                return str(name)
 
-    return f"bin_{idx}"
+    return None
 
 
-# вспомогательная функция: безопасное приведение к Decimal
+# 🔸 Клипование RSI в диапазон [0, 100]
+def _clip_0_100(value: Decimal) -> Decimal:
+    if value < Decimal("0"):
+        return Decimal("0")
+    if value > Decimal("100"):
+        return Decimal("100")
+    return value
+
+
+# 🔸 Вспомогательная функция: безопасное приведение к Decimal
 def _safe_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
         return value
@@ -351,7 +468,7 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
-# вспомогательная функция: безопасное чтение Decimal-параетра
+# 🔸 Вспомогательная функция: безопасное чтение Decimal-параметра
 def _get_decimal_param(params: Dict[str, Any], name: str, default: Decimal) -> Decimal:
     cfg = params.get(name)
     if cfg is None:
@@ -367,7 +484,7 @@ def _get_decimal_param(params: Dict[str, Any], name: str, default: Decimal) -> D
         return default
 
 
-# вспомогательная функция: безопасное чтение int-параметра
+# 🔸 Вспомогательная функция: безопасное чтение int-параметра
 def _get_int_param(params: Dict[str, Any], name: str, default: int) -> int:
     cfg = params.get(name)
     if cfg is None:
