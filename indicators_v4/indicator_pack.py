@@ -23,9 +23,15 @@ ANALYSIS_INSTANCES_TABLE = "bt_analysis_instances"
 ANALYSIS_PARAMETERS_TABLE = "bt_analysis_parameters"
 BINS_DICT_TABLE = "bt_analysis_bins_dict"
 
+# 🔸 Параметры чтения и параллельной обработки stream
+STREAM_READ_COUNT = 500          # сколько сообщений читать за раз
+STREAM_BLOCK_MS = 2000           # блокировка XREADGROUP (мс)
+MAX_PARALLEL_MESSAGES = 200      # сколько сообщений обрабатывать параллельно
+LOG_EVERY_EVENTS = 5000          # редкий суммарный лог по прогрессу
+
 # 🔸 TTL по TF (как договорились)
 TTL_BY_TF_SEC = {
-    "m5": 60,        # 1 минута
+    "m5": 120,        # 1 минута
     "m15": 960,      # 16 минут
     "h1": 3660,      # 61 минута
 }
@@ -393,8 +399,7 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> tuple[int, int, 
 
     return (1, computed, published, misses)
 
-
-# 🔸 Подписка на indicator_stream и оркестрация pack-обработки
+# 🔸 Подписка на indicator_stream и оркестрация pack-обработки (параллельно)
 async def watch_indicator_stream(redis):
     log = logging.getLogger("PACK_STREAM")
 
@@ -405,14 +410,33 @@ async def watch_indicator_stream(redis):
         if "BUSYGROUP" not in str(e):
             log.warning(f"xgroup_create error: {e}")
 
-    # счётчики для суммарного логирования
+    # суммарные счётчики
     total_events = 0
     total_matched = 0
     total_computed = 0
     total_published = 0
     total_misses = 0
     total_errors = 0
-    last_report_at = datetime.utcnow()
+
+    sem = asyncio.Semaphore(MAX_PARALLEL_MESSAGES)
+
+    async def _process_one(data: dict) -> tuple[int, int, int, int, int]:
+        # ограничение параллелизма
+        async with sem:
+            try:
+                msg = {
+                    "symbol": data.get("symbol"),
+                    "timeframe": data.get("timeframe"),
+                    "indicator": data.get("indicator"),
+                    "open_time": data.get("open_time"),
+                    "status": data.get("status"),
+                }
+
+                matched, computed, published, misses = await handle_indicator_ready(redis, msg)
+                return (1, matched, computed, published, misses)
+            except Exception as e:
+                log.warning(f"PACK_STREAM: обработка сообщения упала: {e}", exc_info=True)
+                return (0, 0, 0, 0, 0)
 
     while True:
         try:
@@ -420,69 +444,72 @@ async def watch_indicator_stream(redis):
                 IND_PACK_GROUP,
                 IND_PACK_CONSUMER,
                 streams={INDICATOR_STREAM: ">"},
-                count=200,
-                block=2000,
+                count=STREAM_READ_COUNT,
+                block=STREAM_BLOCK_MS,
             )
 
             if not resp:
-                # периодический отчёт даже при простое
-                now = datetime.utcnow()
-                if (now - last_report_at).total_seconds() >= 60:
-                    log.info(
-                        f"PACK_STREAM: events={total_events}, matched={total_matched}, "
-                        f"computed={total_computed}, published={total_published}, "
-                        f"misses={total_misses}, errors={total_errors}"
-                    )
-                    last_report_at = now
+                # нет новых сообщений — молчим (как ты и хочешь)
                 continue
 
-            to_ack = []
-
+            # расплющим в единый список
+            flat: list[tuple[str, dict]] = []
             for _, messages in resp:
                 for msg_id, data in messages:
-                    to_ack.append(msg_id)
-                    try:
-                        # привести поля к ожидаемым именам
-                        msg = {
-                            "symbol": data.get("symbol"),
-                            "timeframe": data.get("timeframe"),
-                            "indicator": data.get("indicator"),
-                            "open_time": data.get("open_time"),
-                            "status": data.get("status"),
-                        }
+                    flat.append((msg_id, data))
 
-                        total_events += 1
-                        matched, computed, published, misses = await handle_indicator_ready(redis, msg)
+            if not flat:
+                continue
 
-                        if matched:
-                            total_matched += 1
-                        total_computed += computed
-                        total_published += published
-                        total_misses += misses
+            to_ack = [msg_id for msg_id, _ in flat]
 
-                    except Exception as e:
-                        total_errors += 1
-                        log.warning(f"PACK_STREAM: обработка сообщения упала: {e}", exc_info=True)
+            # параллельная обработка пачки
+            tasks = [asyncio.create_task(_process_one(data)) for _, data in flat]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            # агрегация результатов пачки
+            batch_events = len(flat)
+            batch_matched = 0
+            batch_computed = 0
+            batch_published = 0
+            batch_misses = 0
+            batch_errors = 0
+
+            for ok, matched, computed, published, misses in results:
+                if ok == 0:
+                    batch_errors += 1
+                    continue
+                batch_matched += matched
+                batch_computed += computed
+                batch_published += published
+                batch_misses += misses
 
             # ack пачкой
-            if to_ack:
-                await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
+            await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
 
-            # суммарный отчёт раз в минуту
-            now = datetime.utcnow()
-            if (now - last_report_at).total_seconds() >= 60:
+            # обновить totals
+            total_events += batch_events
+            total_matched += batch_matched
+            total_computed += batch_computed
+            total_published += batch_published
+            total_misses += batch_misses
+            total_errors += batch_errors
+
+            # логируем только по делу:
+            # - если реально что-то публиковали
+            # - или если были ошибки
+            # - или редкий прогресс-лог по объёму
+            if batch_published > 0 or batch_errors > 0 or (total_events % LOG_EVERY_EVENTS == 0):
                 log.info(
-                    f"PACK_STREAM: events={total_events}, matched={total_matched}, "
-                    f"computed={total_computed}, published={total_published}, "
-                    f"misses={total_misses}, errors={total_errors}"
+                    f"PACK_STREAM: batch_events={batch_events}, batch_published={batch_published}, "
+                    f"events={total_events}, matched={total_matched}, computed={total_computed}, "
+                    f"published={total_published}, misses={total_misses}, errors={total_errors}"
                 )
-                last_report_at = now
 
         except Exception as e:
             total_errors += 1
             log.error(f"PACK_STREAM loop error: {e}", exc_info=True)
             await asyncio.sleep(2)
-
 
 # 🔸 Инициализация кэша и реестра pack-воркеров
 async def init_pack_runtime(pg):
