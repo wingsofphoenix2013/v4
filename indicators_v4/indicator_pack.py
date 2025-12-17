@@ -4,16 +4,16 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 # 🔸 Импорт pack-воркеров (предусмотрено расширение)
 from packs.rsi_bin import RsiBinPack
 from packs.mfi_bin import MfiBinPack
+from packs.adx_bin import AdxBinPack
 
 # 🔸 Константы Redis
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
-IND_PACK_PREFIX = "ind_pack"                   # префикс ключей результата (как договорились)
+IND_PACK_PREFIX = "ind_pack"                   # префикс ключей результата
 IND_PACK_GROUP = "ind_pack_group_v4"           # consumer-group для indicator_stream
 IND_PACK_CONSUMER = "ind_pack_consumer_1"      # consumer name
 
@@ -32,9 +32,9 @@ MAX_PARALLEL_MESSAGES = 200      # сколько сообщений обраб�
 # 🔸 Параметры холодного старта (bootstrap)
 BOOTSTRAP_MAX_PARALLEL = 300     # сколько тикеров/паков обрабатывать параллельно при старте
 
-# 🔸 TTL по TF (как договорились)
+# 🔸 TTL по TF
 TTL_BY_TF_SEC = {
-    "m5": 120,      # 2 минуты (ты поставил)
+    "m5": 120,      # 2 минуты
     "m15": 960,     # 16 минут
     "h1": 3660,     # 61 минута
 }
@@ -43,6 +43,7 @@ TTL_BY_TF_SEC = {
 PACK_WORKERS = {
     "rsi_bin": RsiBinPack,
     "mfi_bin": MfiBinPack,
+    "adx_bin": AdxBinPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
@@ -91,6 +92,20 @@ def get_bins_source(bins_policy: dict[str, Any] | None, timeframe: str) -> str:
         return str(bins_policy.get(timeframe) or bins_policy.get("default") or "static")
     except Exception:
         return "static"
+
+
+# 🔸 Приведение param_name к indicator_stream.indicator (base)
+def get_stream_indicator_key(family_key: str, param_name: str) -> str:
+    # если нет '_' — совпадает как есть
+    if "_" not in param_name:
+        return param_name
+
+    # adx_dmi{len}_adx -> adx_dmi{len}
+    if family_key == "adx_dmi":
+        return param_name.rsplit("_", 1)[0]
+
+    # bb20_2_0_upper -> bb20, macd12_macd_hist -> macd12, lr50_angle -> lr50, supertrend10_3_0_trend -> supertrend10
+    return param_name.split("_", 1)[0]
 
 
 # 🔸 Загрузка включённых pack-инстансов
@@ -259,6 +274,7 @@ def build_pack_registry(
 
         analysis_key = str(meta["key"])
         analysis_name = str(meta["name"])
+        family_key = str(meta["family_key"])
 
         timeframe = params.get("tf")
         source_param_name = params.get("param_name")
@@ -318,8 +334,9 @@ def build_pack_registry(
             worker=worker_cls(),
         )
 
-        # матчимся по indicator_stream.indicator == source_param_name
-        registry.setdefault((timeframe, source_param_name), []).append(runtime)
+        # матчимся по indicator_stream.indicator (base)
+        stream_indicator = get_stream_indicator_key(family_key, source_param_name)
+        registry.setdefault((timeframe, stream_indicator), []).append(runtime)
         active += 1
 
     log.debug(
@@ -419,8 +436,6 @@ async def ensure_indicator_stream_group(redis):
 async def watch_indicator_stream(redis):
     log = logging.getLogger("PACK_STREAM")
 
-    await ensure_indicator_stream_group(redis)
-
     sem = asyncio.Semaphore(MAX_PARALLEL_MESSAGES)
 
     async def _process_one(data: dict) -> None:
@@ -486,7 +501,12 @@ async def load_active_symbols(pg) -> list[str]:
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
 
-    symbols = [str(r["symbol"]) for r in rows if r and r.get("symbol")]
+    symbols: list[str] = []
+    for r in rows:
+        sym = r["symbol"]
+        if sym:
+            symbols.append(str(sym))
+
     log.debug(f"PACK_BOOT: активных тикеров загружено: {len(symbols)}")
     return symbols
 
@@ -511,13 +531,7 @@ async def bootstrap_current_state(pg, redis):
 
     sem = asyncio.Semaphore(BOOTSTRAP_MAX_PARALLEL)
 
-    published = 0
-    misses = 0
-    errors = 0
-
     async def _process_one(symbol: str, rt: PackRuntime):
-        nonlocal published, misses, errors
-
         async with sem:
             # получить raw значение из Redis KV индикаторов
             raw_key = f"ind:{symbol}:{rt.timeframe}:{rt.source_param_name}"
@@ -525,13 +539,11 @@ async def bootstrap_current_state(pg, redis):
 
             # если нет значения — пропускаем
             if raw_value is None:
-                misses += 1
                 return
 
             try:
                 value = float(raw_value)
             except Exception:
-                misses += 1
                 return
 
             # считаем бины (long/short) и публикуем два ключа
@@ -562,11 +574,7 @@ async def bootstrap_current_state(pg, redis):
                 published_items.append((direction, bin_name))
 
             if publish_tasks:
-                res = await asyncio.gather(*publish_tasks, return_exceptions=True)
-                # если были исключения внутри publish — считаем как errors
-                for r in res:
-                    if isinstance(r, Exception):
-                        errors += 1
+                await asyncio.gather(*publish_tasks, return_exceptions=True)
 
                 # лог: что выставили на старте
                 for direction, bin_name in published_items:
@@ -575,8 +583,6 @@ async def bootstrap_current_state(pg, redis):
                         f"direction={direction} bin_name={bin_name} open_time=startup ttl={rt.ttl_sec}"
                     )
 
-                published += len(published_items)
-
     # запускаем bootstrap пачкой
     tasks = []
     for rt in runtimes:
@@ -584,11 +590,7 @@ async def bootstrap_current_state(pg, redis):
             tasks.append(asyncio.create_task(_process_one(symbol, rt)))
 
     await asyncio.gather(*tasks, return_exceptions=True)
-
-    log.debug(
-        f"PACK_BOOT: bootstrap завершён —CELY — packs={len(runtimes)}, symbols={len(symbols)}, "
-        f"published={published}, misses={misses}, errors={errors}"
-    )
+    log.debug(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
 
 
 # 🔸 Инициализация кэша и реестра pack-воркеров
