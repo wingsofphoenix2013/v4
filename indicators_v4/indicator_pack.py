@@ -2,6 +2,7 @@
 
 # 🔸 Базовые импорты
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,13 +16,13 @@ from packs.bb_band_bin import BbBandBinPack
 from packs.lr_band_bin import LrBandBinPack
 from packs.lr_angle_bin import LrAngleBinPack
 
-# 🔸 Константы Redis
+# 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
 IND_PACK_PREFIX = "ind_pack"                   # префикс ключей результата
 IND_PACK_GROUP = "ind_pack_group_v4"           # consumer-group для indicator_stream
 IND_PACK_CONSUMER = "ind_pack_consumer_1"      # consumer name
 
-# 🔸 Константы стрима обновления adaptive-словаря
+# 🔸 Константы Redis (постпроцессинг бектеста → сигнал обновления adaptive-словаря)
 POSTPROC_STREAM_KEY = "bt:analysis:postproc_ready"
 POSTPROC_GROUP = "ind_pack_postproc_group_v4"
 POSTPROC_CONSUMER = "ind_pack_postproc_1"
@@ -111,7 +112,7 @@ class PackRuntime:
 # 🔸 Определение источника бинов из bins_policy
 def get_bins_source(bins_policy: dict[str, Any] | None, timeframe: str) -> str:
     # дефолт — static
-    if not bins_policy:
+    if not isinstance(bins_policy, dict):
         return "static"
 
     try:
@@ -219,15 +220,28 @@ async def load_enabled_packs(pg) -> list[dict[str, Any]]:
         """)
 
     packs: list[dict[str, Any]] = []
+    parsed_json = 0
     for r in rows:
-        packs.append({
-            "id": int(r["id"]),
-            "analysis_id": int(r["analysis_id"]),
-            "bins_policy": r["bins_policy"],  # jsonb -> dict (asyncpg)
-            "enabled_at": r["enabled_at"],
-        })
+        policy = r["bins_policy"]
 
-    log.debug(f"PACK_INIT: включённых pack-инстансов загружено: {len(packs)}")
+        # если jsonb пришёл строкой — парсим
+        if isinstance(policy, str):
+            try:
+                policy = json.loads(policy)
+                parsed_json += 1
+            except Exception:
+                policy = None
+
+        packs.append(
+            {
+                "id": int(r["id"]),
+                "analysis_id": int(r["analysis_id"]),
+                "bins_policy": policy,
+                "enabled_at": r["enabled_at"],
+            }
+        )
+
+    log.info(f"PACK_INIT: включённых pack-инстансов загружено: {len(packs)} (bins_policy parsed_from_str={parsed_json})")
     return packs
 
 
@@ -253,7 +267,7 @@ async def load_analysis_instances(pg, analysis_ids: list[int]) -> dict[int, dict
             "enabled": bool(r["enabled"]),
         }
 
-    log.debug(f"PACK_INIT: analysis-инстансов загружено: {len(out)}")
+    log.info(f"PACK_INIT: bt_analysis_instances загружено: {len(out)}")
     return out
 
 
@@ -277,7 +291,16 @@ async def load_analysis_parameters(pg, analysis_ids: list[int]) -> dict[int, dic
         pval = str(r["param_value"])
         params.setdefault(aid, {})[pname] = pval
 
-    log.debug(f"PACK_INIT: параметров анализаторов загружено: {len(params)}")
+    ok = 0
+    missing = 0
+    for aid in analysis_ids:
+        p = params.get(aid, {})
+        if p.get("tf") and p.get("param_name"):
+            ok += 1
+        else:
+            missing += 1
+
+    log.info(f"PACK_INIT: bt_analysis_parameters (tf+param_name) OK={ok}, missing={missing}")
     return params
 
 
@@ -297,10 +320,13 @@ async def load_static_bins_dict(pg, analysis_ids: list[int]) -> dict[int, dict[s
         """, analysis_ids)
 
     out: dict[int, dict[str, dict[str, list[BinRule]]]] = {}
+    total_rules = 0
+
     for r in rows:
         aid = int(r["analysis_id"])
         direction = str(r["direction"])
         timeframe = str(r["timeframe"])
+
         rule = BinRule(
             direction=direction,
             timeframe=timeframe,
@@ -311,14 +337,16 @@ async def load_static_bins_dict(pg, analysis_ids: list[int]) -> dict[int, dict[s
             val_to=float(r["val_to"]) if r["val_to"] is not None else None,
             to_inclusive=bool(r["to_inclusive"]),
         )
+
         out.setdefault(aid, {}).setdefault(timeframe, {}).setdefault(direction, []).append(rule)
+        total_rules += 1
 
     for aid in out:
         for tf in out[aid]:
             for direction in out[aid][tf]:
                 out[aid][tf][direction].sort(key=lambda x: x.bin_order)
 
-    log.debug("PACK_INIT: static bins dict загружен")
+    log.info(f"PACK_INIT: static bins загружено: rules={total_rules}")
     return out
 
 
@@ -345,6 +373,7 @@ async def load_adaptive_bins_for_pair(pg, analysis_ids: list[int], scenario_id: 
         aid = int(r["analysis_id"])
         tf = str(r["timeframe"])
         direction = str(r["direction"])
+
         rule = BinRule(
             direction=direction,
             timeframe=tf,
@@ -373,13 +402,21 @@ def build_pack_registry(
     log = logging.getLogger("PACK_INIT")
 
     registry: dict[tuple[str, str], list[PackRuntime]] = {}
+    runtimes_total = 0
+    runtimes_static = 0
+    runtimes_adaptive = 0
 
     for pack in packs:
         analysis_id = int(pack["analysis_id"])
         meta = analysis_meta.get(analysis_id)
         params = analysis_params.get(analysis_id, {})
 
-        if not meta or not bool(meta.get("enabled", True)):
+        if not meta:
+            log.warning(f"PACK_INIT: analysis_id={analysis_id} пропущен: нет записи в bt_analysis_instances")
+            continue
+
+        if not bool(meta.get("enabled", True)):
+            log.warning(f"PACK_INIT: analysis_id={analysis_id} пропущен: bt_analysis_instances.enabled=false")
             continue
 
         analysis_key = str(meta["key"])
@@ -389,6 +426,7 @@ def build_pack_registry(
         timeframe = params.get("tf")
         source_param_name = params.get("param_name")
         if not timeframe or not source_param_name:
+            log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) пропущен: нет tf/param_name")
             continue
 
         bins_policy = pack.get("bins_policy")
@@ -409,13 +447,14 @@ def build_pack_registry(
             if not adaptive_pairs:
                 log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) bins_source=adaptive, но pairs пустой — пропущен")
                 continue
-
+            runtimes_adaptive += 1
         else:
             bins_tf = static_bins_dict.get(analysis_id, {}).get(timeframe, {})
             bins_by_direction = {
                 "long": bins_tf.get("long", []),
                 "short": bins_tf.get("short", []),
             }
+            runtimes_static += 1
 
         runtime = PackRuntime(
             analysis_id=analysis_id,
@@ -434,8 +473,9 @@ def build_pack_registry(
 
         stream_indicator = get_stream_indicator_key(family_key, source_param_name)
         registry.setdefault((timeframe, stream_indicator), []).append(runtime)
+        runtimes_total += 1
 
-    log.debug(f"PACK_INIT: registry построен — match_keys={len(registry)}")
+    log.info(f"PACK_INIT: registry построен — match_keys={len(registry)}, runtimes_total={runtimes_total}, static={runtimes_static}, adaptive={runtimes_adaptive}")
     return registry
 
 
@@ -493,9 +533,8 @@ async def build_lr_band_value(redis, symbol: str, timeframe: str, lr_prefix: str
 
 
 # 🔸 Получение adaptive-правил из кеша
-async def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
-    async with adaptive_lock:
-        return adaptive_bins_cache.get((analysis_id, scenario_id, signal_id, timeframe, direction), [])
+def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
+    return adaptive_bins_cache.get((analysis_id, scenario_id, signal_id, timeframe, direction), [])
 
 
 # 🔸 Обработка одного события indicator_stream (status=ready)
@@ -540,9 +579,11 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
 
         # static vs adaptive
         if rt.bins_source == "adaptive":
+            publish_tasks = []
+
             for (scenario_id, signal_id) in rt.adaptive_pairs:
                 for direction in ("long", "short"):
-                    rules = await get_adaptive_rules(rt.analysis_id, scenario_id, signal_id, rt.timeframe, direction)
+                    rules = get_adaptive_rules(rt.analysis_id, scenario_id, signal_id, rt.timeframe, direction)
                     if not rules:
                         continue
 
@@ -550,28 +591,25 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
                     if not bin_name:
                         continue
 
-                    await publish_pack_state_adaptive(
-                        redis=redis,
-                        analysis_id=rt.analysis_id,
-                        scenario_id=scenario_id,
-                        signal_id=signal_id,
-                        direction=direction,
-                        symbol=symbol,
-                        timeframe=rt.timeframe,
-                        bin_name=bin_name,
-                        ttl_sec=rt.ttl_sec,
+                    publish_tasks.append(
+                        publish_pack_state_adaptive(
+                            redis=redis,
+                            analysis_id=rt.analysis_id,
+                            scenario_id=scenario_id,
+                            signal_id=signal_id,
+                            direction=direction,
+                            symbol=symbol,
+                            timeframe=rt.timeframe,
+                            bin_name=bin_name,
+                            ttl_sec=rt.ttl_sec,
+                        )
                     )
 
-                    log.debug(
-                        f"analysis_id={rt.analysis_id} scenario_id={scenario_id} signal_id={signal_id} "
-                        f"symbol={symbol} tf={rt.timeframe} direction={direction} "
-                        f"bin_name={bin_name} open_time={open_time} ttl={rt.ttl_sec}"
-                    )
+            if publish_tasks:
+                await asyncio.gather(*publish_tasks, return_exceptions=True)
 
         else:
             publish_tasks = []
-            published_items: list[tuple[str, str]] = []
-
             for direction in ("long", "short"):
                 rules = rt.bins_by_direction.get(direction) or []
                 if not rules:
@@ -592,15 +630,9 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
                         ttl_sec=rt.ttl_sec,
                     )
                 )
-                published_items.append((direction, bin_name))
 
             if publish_tasks:
                 await asyncio.gather(*publish_tasks, return_exceptions=True)
-                for direction, bin_name in published_items:
-                    log.debug(
-                        f"analysis_id={rt.analysis_id} symbol={symbol} tf={rt.timeframe} "
-                        f"direction={direction} bin_name={bin_name} open_time={open_time} ttl={rt.ttl_sec}"
-                    )
 
 
 # 🔸 Создание consumer-group (общий хелпер)
@@ -620,6 +652,7 @@ async def watch_indicator_stream(redis):
     sem = asyncio.Semaphore(MAX_PARALLEL_MESSAGES)
 
     async def _process_one(data: dict) -> None:
+        # ограничение параллелизма
         async with sem:
             msg = {
                 "symbol": data.get("symbol"),
@@ -656,6 +689,7 @@ async def watch_indicator_stream(redis):
             tasks = [asyncio.create_task(_process_one(data)) for _, data in flat]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
+            # логируем только ошибки обработки (если были)
             for r in results:
                 if isinstance(r, Exception):
                     log.warning(f"PACK_STREAM: message processing error: {r}", exc_info=True)
@@ -683,19 +717,24 @@ async def watch_postproc_ready(pg, redis):
             loaded = await load_adaptive_bins_for_pair(pg, analysis_ids, scenario_id, signal_id)
 
             async with adaptive_lock:
-                # очистить старые значения для пары (только нужные analysis_id)
+                # удалить старые ключи пары (только нужные analysis_id)
                 keys_to_del = [
-                    k for k in adaptive_bins_cache.keys()
+                    k for k in list(adaptive_bins_cache.keys())
                     if k[1] == scenario_id and k[2] == signal_id and k[0] in analysis_ids
                 ]
                 for k in keys_to_del:
                     adaptive_bins_cache.pop(k, None)
 
                 # записать новые
+                loaded_rules = 0
                 for (aid, tf, direction), rules in loaded.items():
                     adaptive_bins_cache[(aid, scenario_id, signal_id, tf, direction)] = rules
+                    loaded_rules += len(rules)
 
-            log.info(f"PACK_ADAPTIVE: обновлён adaptive dict для scenario_id={scenario_id}, signal_id={signal_id}, analysis_ids={analysis_ids}")
+            log.info(
+                f"PACK_ADAPTIVE: обновлён adaptive dict для scenario_id={scenario_id}, signal_id={signal_id}, "
+                f"analysis_ids={analysis_ids}, rules_loaded={loaded_rules}"
+            )
 
     while True:
         try:
@@ -724,11 +763,11 @@ async def watch_postproc_ready(pg, redis):
 
                     pair = (scenario_id, signal_id)
 
-                    # если пара не используется в live — просто игнор
+                    # если пара не используется в live — игнор
                     if pair not in adaptive_pairs_set:
                         continue
 
-                    # перезагрузка только для интересной пары
+                    # точечный reload по паре
                     asyncio.create_task(_reload_pair(scenario_id, signal_id))
 
             if to_ack:
@@ -741,6 +780,8 @@ async def watch_postproc_ready(pg, redis):
 
 # 🔸 Загрузка активных тикеров (для bootstrap)
 async def load_active_symbols(pg) -> list[str]:
+    log = logging.getLogger("PACK_BOOT")
+
     async with pg.acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT symbol
@@ -753,6 +794,8 @@ async def load_active_symbols(pg) -> list[str]:
         sym = r["symbol"]
         if sym:
             symbols.append(str(sym))
+
+    log.info(f"PACK_BOOT: активных тикеров загружено: {len(symbols)}")
     return symbols
 
 
@@ -765,12 +808,12 @@ async def bootstrap_current_state(pg, redis):
         runtimes.extend(lst)
 
     if not runtimes:
-        log.debug("PACK_BOOT: нет активных pack-инстансов, bootstrap пропущен")
+        log.info("PACK_BOOT: нет активных pack-инстансов, bootstrap пропущен")
         return
 
     symbols = await load_active_symbols(pg)
     if not symbols:
-        log.debug("PACK_BOOT: нет активных тикеров, bootstrap пропущен")
+        log.info("PACK_BOOT: нет активных тикеров, bootstrap пропущен")
         return
 
     sem = asyncio.Semaphore(BOOTSTRAP_MAX_PARALLEL)
@@ -818,9 +861,11 @@ async def bootstrap_current_state(pg, redis):
 
             # публикация
             if rt.bins_source == "adaptive":
+                publish_tasks = []
+
                 for (scenario_id, signal_id) in rt.adaptive_pairs:
                     for direction in ("long", "short"):
-                        rules = await get_adaptive_rules(rt.analysis_id, scenario_id, signal_id, rt.timeframe, direction)
+                        rules = get_adaptive_rules(rt.analysis_id, scenario_id, signal_id, rt.timeframe, direction)
                         if not rules:
                             continue
 
@@ -828,27 +873,25 @@ async def bootstrap_current_state(pg, redis):
                         if not bin_name:
                             continue
 
-                        await publish_pack_state_adaptive(
-                            redis=redis,
-                            analysis_id=rt.analysis_id,
-                            scenario_id=scenario_id,
-                            signal_id=signal_id,
-                            direction=direction,
-                            symbol=symbol,
-                            timeframe=rt.timeframe,
-                            bin_name=bin_name,
-                            ttl_sec=rt.ttl_sec,
+                        publish_tasks.append(
+                            publish_pack_state_adaptive(
+                                redis=redis,
+                                analysis_id=rt.analysis_id,
+                                scenario_id=scenario_id,
+                                signal_id=signal_id,
+                                direction=direction,
+                                symbol=symbol,
+                                timeframe=rt.timeframe,
+                                bin_name=bin_name,
+                                ttl_sec=rt.ttl_sec,
+                            )
                         )
 
-                        log.debug(
-                            f"analysis_id={rt.analysis_id} scenario_id={scenario_id} signal_id={signal_id} "
-                            f"symbol={symbol} tf={rt.timeframe} direction={direction} "
-                            f"bin_name={bin_name} open_time=startup ttl={rt.ttl_sec}"
-                        )
+                if publish_tasks:
+                    await asyncio.gather(*publish_tasks, return_exceptions=True)
 
             else:
                 publish_tasks = []
-                published_items: list[tuple[str, str]] = []
 
                 for direction in ("long", "short"):
                     rules = rt.bins_by_direction.get(direction) or []
@@ -870,15 +913,9 @@ async def bootstrap_current_state(pg, redis):
                             ttl_sec=rt.ttl_sec,
                         )
                     )
-                    published_items.append((direction, bin_name))
 
                 if publish_tasks:
                     await asyncio.gather(*publish_tasks, return_exceptions=True)
-                    for direction, bin_name in published_items:
-                        log.debug(
-                            f"analysis_id={rt.analysis_id} symbol={symbol} tf={rt.timeframe} "
-                            f"direction={direction} bin_name={bin_name} open_time=startup ttl={rt.ttl_sec}"
-                        )
 
     tasks = []
     for rt in runtimes:
@@ -886,7 +923,7 @@ async def bootstrap_current_state(pg, redis):
             tasks.append(asyncio.create_task(_process_one(symbol, rt)))
 
     await asyncio.gather(*tasks, return_exceptions=True)
-    log.debug(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
+    log.info(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
 
 
 # 🔸 Инициализация кэша и реестра pack-воркеров
@@ -917,32 +954,49 @@ async def init_pack_runtime(pg):
     for lst in pack_registry.values():
         all_runtimes.extend(lst)
 
+    adaptive_runtimes = 0
     for rt in all_runtimes:
         if rt.bins_source != "adaptive":
             continue
+        adaptive_runtimes += 1
         for pair in rt.adaptive_pairs:
             adaptive_pairs_set.add(pair)
             adaptive_pairs_index.setdefault(pair, set()).add(rt.analysis_id)
 
-    log.info(f"PACK_INIT: adaptive pairs configured: {len(adaptive_pairs_set)}")
+    log.info(f"PACK_INIT: adaptive pairs configured: {len(adaptive_pairs_set)} (adaptive_runtimes={adaptive_runtimes})")
 
     # первичная загрузка adaptive-кеша для нужных пар
+    loaded_pairs = 0
+    loaded_rules_total = 0
+
     for (scenario_id, signal_id) in sorted(list(adaptive_pairs_set)):
         analysis_list = sorted(list(adaptive_pairs_index.get((scenario_id, signal_id), set())))
         if not analysis_list:
             continue
 
         loaded = await load_adaptive_bins_for_pair(pg, analysis_list, scenario_id, signal_id)
+
         async with adaptive_lock:
+            rules_loaded = 0
             for (aid, tf, direction), rules in loaded.items():
                 adaptive_bins_cache[(aid, scenario_id, signal_id, tf, direction)] = rules
+                rules_loaded += len(rules)
 
-        log.info(f"PACK_INIT: adaptive dict loaded for scenario_id={scenario_id}, signal_id={signal_id}, analysis_ids={analysis_list}")
+        loaded_pairs += 1
+        loaded_rules_total += rules_loaded
+
+        log.info(
+            f"PACK_INIT: adaptive dict loaded for scenario_id={scenario_id}, signal_id={signal_id}, "
+            f"analysis_ids={analysis_list}, rules_loaded={rules_loaded}"
+        )
+
+    if adaptive_pairs_set:
+        log.info(f"PACK_INIT: adaptive cache ready — pairs_loaded={loaded_pairs}, rules_total={loaded_rules_total}")
 
 
 # 🔸 Внешняя точка входа (запускается через indicators_v4_main.py и run_safe_loop)
 async def run_indicator_pack(pg, redis):
-    # загрузить конфиг и кеши
+    # первичная загрузка
     await init_pack_runtime(pg)
 
     # создать группы заранее
