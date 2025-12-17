@@ -9,7 +9,7 @@ from typing import Any
 
 # 🔸 Импорт pack-воркеров (предусмотрено расширение)
 from packs.rsi_bin import RsiBinPack
-
+from packs.mfi_bin import MfiBinPack
 
 # 🔸 Константы Redis
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -42,6 +42,7 @@ TTL_BY_TF_SEC = {
 # 🔸 Реестр доступных pack-воркеров (key берём из bt_analysis_instances.key)
 PACK_WORKERS = {
     "rsi_bin": RsiBinPack,
+    "mfi_bin": MfiBinPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
