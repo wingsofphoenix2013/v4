@@ -15,6 +15,7 @@ from packs.adx_bin import AdxBinPack
 from packs.bb_band_bin import BbBandBinPack
 from packs.lr_band_bin import LrBandBinPack
 from packs.lr_angle_bin import LrAngleBinPack
+from packs.atr_bin import AtrBinPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -62,6 +63,7 @@ PACK_WORKERS = {
     "bb_band_bin": BbBandBinPack,
     "lr_band_bin": LrBandBinPack,
     "lr_angle_bin": LrAngleBinPack,
+    "atr_bin": AtrBinPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
@@ -531,11 +533,28 @@ async def build_lr_band_value(redis, symbol: str, timeframe: str, lr_prefix: str
 
     return {"price": close_val, "upper": upper_val, "lower": lower_val}
 
+# 🔸 Сбор value для ATR% bins (atr из indicators KV, close из feed TS)
+async def build_atr_pct_value(redis, symbol: str, timeframe: str, atr_param_name: str, ts_ms: int | None) -> dict[str, str] | None:
+    # atr (KV индикаторов)
+    atr_key = f"ind:{symbol}:{timeframe}:{atr_param_name}"
+    atr_val = await redis.get(atr_key)
+    if atr_val is None:
+        return None
+
+    # close по нужному ts_ms (Redis TS фида)
+    if ts_ms is None:
+        return None
+
+    close_key = f"{BB_TS_PREFIX}:{symbol}:{timeframe}:c"
+    close_val = await ts_get_value_at(redis, close_key, ts_ms)
+    if close_val is None:
+        return None
+
+    return {"atr": atr_val, "price": close_val}
 
 # 🔸 Получение adaptive-правил из кеша
 def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
     return adaptive_bins_cache.get((analysis_id, scenario_id, signal_id, timeframe, direction), [])
-
 
 # 🔸 Обработка одного события indicator_stream (status=ready)
 async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
@@ -563,10 +582,17 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
             value = await build_bb_band_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
             if value is None:
                 continue
+
         elif rt.analysis_key == "lr_band_bin":
             value = await build_lr_band_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
             if value is None:
                 continue
+
+        elif rt.analysis_key == "atr_bin":
+            value = await build_atr_pct_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
+            if value is None:
+                continue
+
         else:
             raw_key = f"ind:{symbol}:{rt.timeframe}:{rt.source_param_name}"
             raw_value = await redis.get(raw_key)
@@ -633,7 +659,6 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
 
             if publish_tasks:
                 await asyncio.gather(*publish_tasks, return_exceptions=True)
-
 
 # 🔸 Создание consumer-group (общий хелпер)
 async def ensure_stream_group(redis, stream: str, group: str):
@@ -798,7 +823,6 @@ async def load_active_symbols(pg) -> list[str]:
     log.info(f"PACK_BOOT: активных тикеров загружено: {len(symbols)}")
     return symbols
 
-
 # 🔸 Холодный старт: пересчитать текущее состояние (без ожидания next ready)
 async def bootstrap_current_state(pg, redis):
     log = logging.getLogger("PACK_BOOT")
@@ -848,6 +872,22 @@ async def bootstrap_current_state(pg, redis):
                     return
 
                 value: Any = {"price": close_val, "upper": upper_val, "lower": lower_val}
+
+            elif rt.analysis_key == "atr_bin":
+                # ts_ms берём из Redis TS индикаторов по atr (последняя точка)
+                atr_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{rt.source_param_name}"
+                atr = await ts_get(redis, atr_ts_key)
+                if not atr:
+                    return
+                ts_ms, atr_val = atr
+
+                # close по ts_ms из фида
+                close_key = f"{BB_TS_PREFIX}:{symbol}:{rt.timeframe}:c"
+                close_val = await ts_get_value_at(redis, close_key, ts_ms)
+                if close_val is None:
+                    return
+
+                value = {"atr": atr_val, "price": close_val}
 
             else:
                 raw_key = f"ind:{symbol}:{rt.timeframe}:{rt.source_param_name}"
@@ -924,7 +964,6 @@ async def bootstrap_current_state(pg, redis):
 
     await asyncio.gather(*tasks, return_exceptions=True)
     log.info(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
-
 
 # 🔸 Инициализация кэша и реестра pack-воркеров
 async def init_pack_runtime(pg):
