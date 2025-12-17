@@ -16,6 +16,7 @@ from packs.bb_band_bin import BbBandBinPack
 from packs.lr_band_bin import LrBandBinPack
 from packs.lr_angle_bin import LrAngleBinPack
 from packs.atr_bin import AtrBinPack
+from packs.dmigap_bin import DmiGapBinPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -64,6 +65,7 @@ PACK_WORKERS = {
     "lr_band_bin": LrBandBinPack,
     "lr_angle_bin": LrAngleBinPack,
     "atr_bin": AtrBinPack,
+    "dmigap_bin": DmiGapBinPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
@@ -552,6 +554,19 @@ async def build_atr_pct_value(redis, symbol: str, timeframe: str, atr_param_name
 
     return {"atr": atr_val, "price": close_val}
 
+# 🔸 Сбор value для DMI-gap bins (plus/minus из indicators KV)
+async def build_dmigap_value(redis, symbol: str, timeframe: str, base_param_name: str) -> dict[str, str] | None:
+    plus_key = f"ind:{symbol}:{timeframe}:{base_param_name}_plus_di"
+    minus_key = f"ind:{symbol}:{timeframe}:{base_param_name}_minus_di"
+
+    plus_val = await redis.get(plus_key)
+    minus_val = await redis.get(minus_key)
+
+    if plus_val is None or minus_val is None:
+        return None
+
+    return {"plus": plus_val, "minus": minus_val}
+
 # 🔸 Получение adaptive-правил из кеша
 def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
     return adaptive_bins_cache.get((analysis_id, scenario_id, signal_id, timeframe, direction), [])
@@ -590,6 +605,11 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
 
         elif rt.analysis_key == "atr_bin":
             value = await build_atr_pct_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
+            if value is None:
+                continue
+
+        elif rt.analysis_key == "dmigap_bin":
+            value = await build_dmigap_value(redis, symbol, rt.timeframe, rt.source_param_name)
             if value is None:
                 continue
 
@@ -888,6 +908,29 @@ async def bootstrap_current_state(pg, redis):
                     return
 
                 value = {"atr": atr_val, "price": close_val}
+
+            elif rt.analysis_key == "dmigap_bin":
+                base = rt.source_param_name  # например adx_dmi14
+
+                plus_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{base}_plus_di"
+                plus = await ts_get(redis, plus_ts_key)
+                if not plus:
+                    return
+                ts_ms, plus_val = plus
+
+                minus_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{base}_minus_di"
+                minus = await ts_get(redis, minus_ts_key)
+                if not minus:
+                    return
+
+                minus_ts, minus_val = minus
+                if minus_ts != ts_ms:
+                    minus_at = await ts_get_value_at(redis, minus_ts_key, ts_ms)
+                    if minus_at is None:
+                        return
+                    minus_val = minus_at
+
+                value = {"plus": plus_val, "minus": minus_val}
 
             else:
                 raw_key = f"ind:{symbol}:{rt.timeframe}:{rt.source_param_name}"
