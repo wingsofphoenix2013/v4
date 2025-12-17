@@ -12,6 +12,7 @@ from packs.rsi_bin import RsiBinPack
 from packs.mfi_bin import MfiBinPack
 from packs.adx_bin import AdxBinPack
 from packs.bb_band_bin import BbBandBinPack
+from packs.lr_band_bin import LrBandBinPack
 
 # 🔸 Константы Redis
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -51,6 +52,7 @@ PACK_WORKERS = {
     "mfi_bin": MfiBinPack,
     "adx_bin": AdxBinPack,
     "bb_band_bin": BbBandBinPack,
+    "lr_band_bin": LrBandBinPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
@@ -419,6 +421,27 @@ async def build_bb_band_value(redis, symbol: str, timeframe: str, bb_prefix: str
 
     return {"price": close_val, "upper": upper_val, "lower": lower_val}
 
+# 🔸 Сбор value для LR bands (upper/lower из indicators KV, close из feed TS)
+async def build_lr_band_value(redis, symbol: str, timeframe: str, lr_prefix: str, ts_ms: int | None) -> dict[str, str] | None:
+    # upper/lower (KV индикаторов)
+    upper_key = f"ind:{symbol}:{timeframe}:{lr_prefix}_upper"
+    lower_key = f"ind:{symbol}:{timeframe}:{lr_prefix}_lower"
+
+    upper_val = await redis.get(upper_key)
+    lower_val = await redis.get(lower_key)
+    if upper_val is None or lower_val is None:
+        return None
+
+    # close по нужному ts_ms (Redis TS фида)
+    if ts_ms is None:
+        return None
+
+    close_key = f"{BB_TS_PREFIX}:{symbol}:{timeframe}:c"
+    close_val = await ts_get_value_at(redis, close_key, ts_ms)
+    if close_val is None:
+        return None
+
+    return {"price": close_val, "upper": upper_val, "lower": lower_val}
 
 # 🔸 Обработка одного события indicator_stream (status=ready)
 async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
@@ -447,6 +470,13 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
             value = await build_bb_band_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
             if value is None:
                 continue
+
+        elif rt.analysis_key == "lr_band_bin":
+            # lr_prefix = "lr50" / "lr100" (из bt_analysis_parameters.param_name)
+            value = await build_lr_band_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
+            if value is None:
+                continue
+
         else:
             raw_key = f"ind:{symbol}:{rt.timeframe}:{rt.source_param_name}"
             raw_value = await redis.get(raw_key)
@@ -493,7 +523,6 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
                     f"analysis_id={rt.analysis_id} symbol={symbol} tf={rt.timeframe} "
                     f"direction={direction} bin_name={bin_name} open_time={open_time} ttl={rt.ttl_sec}"
                 )
-
 
 # 🔸 Создание consumer-group (чтобы не пропустить события во время bootstrap)
 async def ensure_indicator_stream_group(redis):
@@ -583,7 +612,6 @@ async def load_active_symbols(pg) -> list[str]:
     log.debug(f"PACK_BOOT: активных тикеров загружено: {len(symbols)}")
     return symbols
 
-
 # 🔸 Холодный старт: пересчитать текущее состояние из Redis KV/TS (без ожидания next ready)
 async def bootstrap_current_state(pg, redis):
     log = logging.getLogger("PACK_BOOT")
@@ -606,17 +634,22 @@ async def bootstrap_current_state(pg, redis):
 
     async def _process_one(symbol: str, rt: PackRuntime):
         async with sem:
+            open_time = "startup"
+
             # получить value для воркера
-            if rt.analysis_key == "bb_band_bin":
+            if rt.analysis_key in ("bb_band_bin", "lr_band_bin"):
+                # префикс: bb20_2_0 или lr50/lr100
+                prefix = rt.source_param_name
+
                 # ts_ms берём из Redis TS индикаторов по upper (последняя точка)
-                upper_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{rt.source_param_name}_upper"
+                upper_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{prefix}_upper"
                 upper = await ts_get(redis, upper_ts_key)
                 if not upper:
                     return
                 ts_ms, upper_val = upper
 
                 # lower пытаемся взять тем же способом; если ts отличается — берём lower на ts_ms
-                lower_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{rt.source_param_name}_lower"
+                lower_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{prefix}_lower"
                 lower = await ts_get(redis, lower_ts_key)
                 if not lower:
                     return
@@ -635,7 +668,7 @@ async def bootstrap_current_state(pg, redis):
                     return
 
                 value: Any = {"price": close_val, "upper": upper_val, "lower": lower_val}
-                open_time = "startup"
+
             else:
                 raw_key = f"ind:{symbol}:{rt.timeframe}:{rt.source_param_name}"
                 raw_value = await redis.get(raw_key)
@@ -645,7 +678,6 @@ async def bootstrap_current_state(pg, redis):
                     value = float(raw_value)
                 except Exception:
                     return
-                open_time = "startup"
 
             # считаем бины (long/short) и публикуем два ключа
             publish_tasks = []
@@ -690,7 +722,6 @@ async def bootstrap_current_state(pg, redis):
 
     await asyncio.gather(*tasks, return_exceptions=True)
     log.debug(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
-
 
 # 🔸 Инициализация кэша и реестра pack-воркеров
 async def init_pack_runtime(pg):
