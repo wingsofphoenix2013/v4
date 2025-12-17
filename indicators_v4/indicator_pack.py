@@ -1,4 +1,4 @@
-# indicator_pack.py — оркестратор расчёта и публикации обогащённых состояний (ind_pack)
+# indicator_pack.py — оркестратор расчёта и публикации обогащённых состояний (ind_pack), включая MTF «свежесть» и labels-cache
 
 # 🔸 Базовые импорты
 import asyncio
@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 # 🔸 Импорт pack-воркеров (предусмотрено расширение)
@@ -17,6 +18,7 @@ from packs.lr_band_bin import LrBandBinPack
 from packs.lr_angle_bin import LrAngleBinPack
 from packs.atr_bin import AtrBinPack
 from packs.dmigap_bin import DmiGapBinPack
+from packs.rsi_mtf import RsiMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -24,7 +26,7 @@ IND_PACK_PREFIX = "ind_pack"                   # префикс ключей р�
 IND_PACK_GROUP = "ind_pack_group_v4"           # consumer-group для indicator_stream
 IND_PACK_CONSUMER = "ind_pack_consumer_1"      # consumer name
 
-# 🔸 Константы Redis (постпроцессинг бектеста → сигнал обновления adaptive-словаря)
+# 🔸 Константы Redis (постпроцессинг бектеста → сигнал обновления словарей)
 POSTPROC_STREAM_KEY = "bt:analysis:postproc_ready"
 POSTPROC_GROUP = "ind_pack_postproc_group_v4"
 POSTPROC_CONSUMER = "ind_pack_postproc_1"
@@ -39,6 +41,7 @@ ANALYSIS_INSTANCES_TABLE = "bt_analysis_instances"
 ANALYSIS_PARAMETERS_TABLE = "bt_analysis_parameters"
 BINS_DICT_TABLE = "bt_analysis_bins_dict"
 ADAPTIVE_BINS_TABLE = "bt_analysis_bin_dict_adaptive"
+BINS_LABELS_TABLE = "bt_analysis_bins_labels"
 BB_TICKERS_TABLE = "tickers_bb"
 
 # 🔸 Параметры чтения и параллельной обработки stream
@@ -49,11 +52,23 @@ MAX_PARALLEL_MESSAGES = 200      # сколько сообщений обраб�
 # 🔸 Параметры холодного старта (bootstrap)
 BOOTSTRAP_MAX_PARALLEL = 300     # сколько тикеров/паков обрабатывать параллельно при старте
 
+# 🔸 Retry для «свежих» значений MTF (по TS на стыках TF)
+MTF_RETRY_TOTAL_SEC = 60         # максимум ожидания «свежего» TF
+MTF_RETRY_STEP_SEC = 5           # период опроса TS
+
+# 🔸 Таймшаги TF (ms) — в системе везде open_time (начало бара)
+TF_STEP_MS = {
+    "m5": 300_000,
+    "m15": 900_000,
+    "h1": 3_600_000,
+}
+
 # 🔸 TTL по TF
 TTL_BY_TF_SEC = {
     "m5": 120,      # 2 минуты
     "m15": 960,     # 16 минут
     "h1": 3660,     # 61 минута
+    "mtf": 120,     # MTF-результат живёт как m5-состояние
 }
 
 # 🔸 Реестр доступных pack-воркеров (key берём из bt_analysis_instances.key)
@@ -66,11 +81,12 @@ PACK_WORKERS = {
     "lr_angle_bin": LrAngleBinPack,
     "atr_bin": AtrBinPack,
     "dmigap_bin": DmiGapBinPack,
+    "rsi_mtf": RsiMtfPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
 pack_registry: dict[tuple[str, str], list["PackRuntime"]] = {}
-# key: (timeframe, indicator_from_stream) -> list[PackRuntime]
+# key: (timeframe_from_stream, indicator_from_stream) -> list[PackRuntime]
 
 # 🔸 Кеш adaptive-словаря: (analysis_id, scenario_id, signal_id, tf, direction) -> [BinRule...]
 adaptive_bins_cache: dict[tuple[int, int, int, str, str], list["BinRule"]] = {}
@@ -78,13 +94,26 @@ adaptive_bins_cache: dict[tuple[int, int, int, str, str], list["BinRule"]] = {}
 # 🔸 Индекс используемых пар (scenario_id, signal_id) -> set(analysis_id)
 adaptive_pairs_index: dict[tuple[int, int], set[int]] = {}
 
-# 🔸 Быстрый set для проверки "интересна ли пара" в стриме postproc_ready
+# 🔸 Быстрый set для проверки "интересна ли пара" в стриме postproc_ready (adaptive)
 adaptive_pairs_set: set[tuple[int, int]] = set()
 
 # 🔸 Лок для обновления adaptive-кеша
 adaptive_lock = asyncio.Lock()
 
+# 🔸 Labels cache: (scenario_id, signal_id, direction, analysis_id, indicator_param, timeframe) -> set(bin_name)
+labels_bins_cache: dict[tuple[int, int, str, int, str, str], set[str]] = {}
 
+# 🔸 Индекс: (scenario_id, signal_id) -> set(LabelsContext)
+labels_pairs_index: dict[tuple[int, int], set["LabelsContext"]] = {}
+
+# 🔸 Быстрый set для проверки "интересна ли пара" (labels)
+labels_pairs_set: set[tuple[int, int]] = set()
+
+# 🔸 Лок для обновления labels-кеша
+labels_lock = asyncio.Lock()
+
+
+# 🔸 Models
 @dataclass(frozen=True)
 class BinRule:
     direction: str
@@ -97,12 +126,20 @@ class BinRule:
     to_inclusive: bool
 
 
+@dataclass(frozen=True)
+class LabelsContext:
+    analysis_id: int
+    indicator_param: str
+    timeframe: str  # например "mtf"
+
+
 @dataclass
 class PackRuntime:
     analysis_id: int
     analysis_key: str
     analysis_name: str
     family_key: str
+
     timeframe: str
     source_param_name: str
     bins_policy: dict[str, Any] | None
@@ -111,6 +148,14 @@ class PackRuntime:
     bins_by_direction: dict[str, list[BinRule]]  # используется для static
     ttl_sec: int
     worker: Any
+
+    # 🔸 MTF-конфиг (для mtf-паков)
+    is_mtf: bool = False
+    mtf_pairs: list[tuple[int, int]] | None = None
+    mtf_trigger_tf: str | None = None
+    mtf_component_tfs: list[str] | None = None
+    mtf_component_params: dict[str, str] | None = None          # tf -> param_name (в Redis)
+    mtf_bins_static: dict[str, dict[str, list[BinRule]]] | None = None  # tf -> direction -> rules
 
 
 # 🔸 Определение источника бинов из bins_policy
@@ -131,8 +176,8 @@ def get_bins_source(bins_policy: dict[str, Any] | None, timeframe: str) -> str:
         return "static"
 
 
-# 🔸 Разбор списка пар для adaptive из bins_policy
-def get_adaptive_pairs(bins_policy: dict[str, Any] | None) -> list[tuple[int, int]]:
+# 🔸 Разбор списка пар из bins_policy
+def get_pairs(bins_policy: dict[str, Any] | None) -> list[tuple[int, int]]:
     if not isinstance(bins_policy, dict):
         return []
 
@@ -212,6 +257,127 @@ async def ts_get_value_at(redis, key: str, ts_ms: int) -> str | None:
         return None
 
 
+# 🔸 Decimal helpers
+def safe_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def clip_0_100(value: Decimal) -> Decimal:
+    if value < Decimal("0"):
+        return Decimal("0")
+    if value > Decimal("100"):
+        return Decimal("100")
+    return value
+
+
+# 🔸 Labels cache helpers (без model_id)
+def labels_cache_key(
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    analysis_id: int,
+    indicator_param: str,
+    timeframe: str,
+) -> tuple[int, int, str, int, str, str]:
+    return (
+        int(scenario_id),
+        int(signal_id),
+        str(direction),
+        int(analysis_id),
+        str(indicator_param),
+        str(timeframe),
+    )
+
+
+def labels_has_bin(
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    analysis_id: int,
+    indicator_param: str,
+    timeframe: str,
+    bin_name: str,
+) -> bool:
+    key = labels_cache_key(scenario_id, signal_id, direction, analysis_id, indicator_param, timeframe)
+    s = labels_bins_cache.get(key)
+    if not s:
+        return False
+    return str(bin_name) in s
+
+
+# 🔸 MTF helpers: styk TF (open_time + step) и ожидание «свежих» значений из TS
+def is_tf_boundary(ts_ms: int, tf: str) -> bool:
+    step = TF_STEP_MS.get(tf)
+    if not step:
+        return False
+    return (int(ts_ms) % int(step)) == 0
+
+
+def calc_close_boundary_ts_ms(open_ts_ms: int, tf: str) -> int:
+    # в терминах open_time: граница закрытия бара — следующий open_time
+    step = TF_STEP_MS.get(tf)
+    if not step:
+        return int(open_ts_ms)
+    return int(open_ts_ms) + int(step)
+
+
+def just_closed_open_time(boundary_ts_ms: int, tf: str) -> int:
+    # boundary — open_time следующего бара, значит закрывшийся бар начинается в boundary - step
+    return int(boundary_ts_ms) - int(TF_STEP_MS[tf])
+
+
+async def get_kv_decimal(redis, symbol: str, tf: str, param_name: str) -> Decimal | None:
+    # читаем последнее значение (KV)
+    key = f"ind:{symbol}:{tf}:{param_name}"
+    raw = await redis.get(key)
+    return safe_decimal(raw)
+
+
+async def get_ts_decimal_with_retry(redis, symbol: str, tf: str, param_name: str, ts_ms: int) -> Decimal | None:
+    # читаем точку TS с ретраями до MTF_RETRY_TOTAL_SEC
+    key = f"{IND_TS_PREFIX}:{symbol}:{tf}:{param_name}"
+
+    waited = 0
+    while waited <= MTF_RETRY_TOTAL_SEC:
+        raw = await ts_get_value_at(redis, key, ts_ms)
+        d = safe_decimal(raw)
+        if d is not None:
+            return d
+
+        # таймаут достигнут
+        if waited >= MTF_RETRY_TOTAL_SEC:
+            break
+
+        await asyncio.sleep(MTF_RETRY_STEP_SEC)
+        waited += MTF_RETRY_STEP_SEC
+
+    return None
+
+
+async def get_mtf_value_decimal(redis, symbol: str, trigger_open_ts_ms: int, target_tf: str, param_name: str) -> Decimal | None:
+    # m5 — событие ready уже гарантирует актуальность значения для этого open_time
+    if target_tf == "m5":
+        return await get_kv_decimal(redis, symbol, "m5", param_name)
+
+    # граница закрытия m5-бара
+    boundary = calc_close_boundary_ts_ms(trigger_open_ts_ms, "m5")
+
+    # если boundary не является границей target_tf — target_tf не пересчитывается сейчас, KV безопасен
+    if not is_tf_boundary(boundary, target_tf):
+        return await get_kv_decimal(redis, symbol, target_tf, param_name)
+
+    # styk TF: нужен «свежий» бар target_tf, который только что закрылся на boundary
+    target_open = just_closed_open_time(boundary, target_tf)
+    return await get_ts_decimal_with_retry(redis, symbol, target_tf, param_name, target_open)
+
+
 # 🔸 Загрузка включённых pack-инстансов
 async def load_enabled_packs(pg) -> list[dict[str, Any]]:
     log = logging.getLogger("PACK_INIT")
@@ -275,7 +441,7 @@ async def load_analysis_instances(pg, analysis_ids: list[int]) -> dict[int, dict
     return out
 
 
-# 🔸 Загрузка параметров анализаторов (нужны tf и param_name)
+# 🔸 Загрузка параметров анализаторов (нужны tf и param_name; tf может быть выведен из *_mtf)
 async def load_analysis_parameters(pg, analysis_ids: list[int]) -> dict[int, dict[str, str]]:
     log = logging.getLogger("PACK_INIT")
     if not analysis_ids:
@@ -299,12 +465,13 @@ async def load_analysis_parameters(pg, analysis_ids: list[int]) -> dict[int, dic
     missing = 0
     for aid in analysis_ids:
         p = params.get(aid, {})
-        if p.get("tf") and p.get("param_name"):
+        # условия достаточности (tf допускаем пустым для *_mtf)
+        if p.get("param_name"):
             ok += 1
         else:
             missing += 1
 
-    log.info(f"PACK_INIT: bt_analysis_parameters (tf+param_name) OK={ok}, missing={missing}")
+    log.info(f"PACK_INIT: bt_analysis_parameters (param_name) OK={ok}, missing={missing}")
     return params
 
 
@@ -396,6 +563,70 @@ async def load_adaptive_bins_for_pair(pg, analysis_ids: list[int], scenario_id: 
     return out
 
 
+# 🔸 Загрузка labels (bin_name set) для одной пары (scenario_id, signal_id) и набора контекстов (model_id игнорируется)
+async def load_labels_bins_for_pair(pg, scenario_id: int, signal_id: int, contexts: list[LabelsContext]) -> dict[tuple[int, int, str, int, str, str], set[str]]:
+    # возвращает: labels_cache_key -> set(bin_name)
+    if not contexts:
+        return {}
+
+    analysis_ids = sorted({c.analysis_id for c in contexts})
+    indicator_params = sorted({c.indicator_param for c in contexts})
+    timeframes = sorted({c.timeframe for c in contexts})
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT
+                scenario_id,
+                signal_id,
+                direction,
+                analysis_id,
+                indicator_param,
+                timeframe,
+                bin_name
+            FROM {BINS_LABELS_TABLE}
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND analysis_id = ANY($3::int[])
+              AND indicator_param = ANY($4::text[])
+              AND timeframe   = ANY($5::text[])
+            """,
+            int(scenario_id),
+            int(signal_id),
+            analysis_ids,
+            indicator_params,
+            timeframes,
+        )
+
+    out: dict[tuple[int, int, str, int, str, str], set[str]] = {}
+
+    # условия достаточности
+    if not rows:
+        return out
+
+    ctx_set = {(c.analysis_id, c.indicator_param, c.timeframe) for c in contexts}
+
+    for r in rows:
+        try:
+            aid = int(r["analysis_id"])
+            ip = str(r["indicator_param"])
+            tf = str(r["timeframe"])
+            if (aid, ip, tf) not in ctx_set:
+                continue
+
+            direction = str(r["direction"] or "")
+            bin_name = str(r["bin_name"] or "")
+            if not direction or not bin_name:
+                continue
+
+            k = labels_cache_key(int(scenario_id), int(signal_id), direction, aid, ip, tf)
+            out.setdefault(k, set()).add(bin_name)
+        except Exception:
+            continue
+
+    return out
+
+
 # 🔸 Построение реестра pack-воркеров
 def build_pack_registry(
     packs: list[dict[str, Any]],
@@ -409,6 +640,7 @@ def build_pack_registry(
     runtimes_total = 0
     runtimes_static = 0
     runtimes_adaptive = 0
+    runtimes_mtf = 0
 
     for pack in packs:
         analysis_id = int(pack["analysis_id"])
@@ -427,8 +659,14 @@ def build_pack_registry(
         analysis_name = str(meta["name"])
         family_key = str(meta["family_key"])
 
-        timeframe = params.get("tf")
-        source_param_name = params.get("param_name")
+        source_param_name = str(params.get("param_name") or "").strip()
+        timeframe = str(params.get("tf") or "").strip()
+
+        # MTF: если tf отсутствует, но param_name заканчивается на "_mtf" — считаем tf="mtf"
+        if not timeframe and source_param_name.lower().endswith("_mtf"):
+            timeframe = "mtf"
+
+        # условия достаточности
         if not timeframe or not source_param_name:
             log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) пропущен: нет tf/param_name")
             continue
@@ -441,13 +679,85 @@ def build_pack_registry(
             log.warning(f"PACK_INIT: analysis_id={analysis_id} пропущен: воркер для key='{analysis_key}' не найден")
             continue
 
+        # 🔸 MTF (через отдельный воркер)
+        is_mtf = (timeframe.lower() == "mtf") or source_param_name.lower().endswith("_mtf")
+        if is_mtf:
+            runtimes_mtf += 1
+
+            pairs = get_pairs(bins_policy)
+            if not pairs:
+                log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) mtf: bins_policy.pairs пустой — пропущен")
+                continue
+
+            worker = worker_cls()
+            cfg = worker.mtf_config(source_param_name) if hasattr(worker, "mtf_config") else {}
+
+            trigger_tf = str(cfg.get("trigger_tf") or "m5")
+            component_tfs = list(cfg.get("component_tfs") or [])
+            component_param = str(cfg.get("component_param") or "")
+
+            # условия достаточности
+            if not component_tfs or not component_param:
+                log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) mtf: некорректный mtf_config()")
+                continue
+
+            # component_params может быть dict tf->param_name, иначе одинаковый param_name для всех TF
+            component_params: dict[str, str] = {}
+            comp_params_cfg = cfg.get("component_params")
+            if isinstance(comp_params_cfg, dict):
+                for tf in component_tfs:
+                    v = comp_params_cfg.get(tf)
+                    if v:
+                        component_params[str(tf)] = str(v)
+            for tf in component_tfs:
+                component_params.setdefault(str(tf), component_param)
+
+            # bins берём из bt_analysis_bins_dict по компонентным TF (static)
+            mtf_bins_static: dict[str, dict[str, list[BinRule]]] = {}
+            for tf in component_tfs:
+                bins_tf = static_bins_dict.get(analysis_id, {}).get(str(tf), {})
+                mtf_bins_static[str(tf)] = {
+                    "long": bins_tf.get("long", []),
+                    "short": bins_tf.get("short", []),
+                }
+
+            ttl_sec = int(TTL_BY_TF_SEC.get("mtf", TTL_BY_TF_SEC.get("m5", 120)))
+
+            runtime = PackRuntime(
+                analysis_id=analysis_id,
+                analysis_key=analysis_key,
+                analysis_name=analysis_name,
+                family_key=family_key,
+                timeframe="mtf",
+                source_param_name=source_param_name,
+                bins_policy=bins_policy,
+                bins_source="static",
+                adaptive_pairs=[],
+                bins_by_direction={"long": [], "short": []},
+                ttl_sec=ttl_sec,
+                worker=worker,
+                is_mtf=True,
+                mtf_pairs=pairs,
+                mtf_trigger_tf=trigger_tf,
+                mtf_component_tfs=component_tfs,
+                mtf_component_params=component_params,
+                mtf_bins_static=mtf_bins_static,
+            )
+
+            # триггеримся по base индикатора на trigger_tf
+            stream_indicator = get_stream_indicator_key(family_key, component_param)
+            registry.setdefault((trigger_tf, stream_indicator), []).append(runtime)
+            runtimes_total += 1
+            continue
+
+        # 🔸 Single-TF (как было)
         ttl_sec = int(TTL_BY_TF_SEC.get(timeframe, 60))
 
         adaptive_pairs: list[tuple[int, int]] = []
         bins_by_direction: dict[str, list[BinRule]] = {"long": [], "short": []}
 
         if bins_source == "adaptive":
-            adaptive_pairs = get_adaptive_pairs(bins_policy)
+            adaptive_pairs = get_pairs(bins_policy)
             if not adaptive_pairs:
                 log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) bins_source=adaptive, но pairs пустой — пропущен")
                 continue
@@ -479,7 +789,14 @@ def build_pack_registry(
         registry.setdefault((timeframe, stream_indicator), []).append(runtime)
         runtimes_total += 1
 
-    log.info(f"PACK_INIT: registry построен — match_keys={len(registry)}, runtimes_total={runtimes_total}, static={runtimes_static}, adaptive={runtimes_adaptive}")
+    log.info(
+        "PACK_INIT: registry построен — match_keys=%s, runtimes_total=%s, static=%s, adaptive=%s, mtf=%s",
+        len(registry),
+        runtimes_total,
+        runtimes_static,
+        runtimes_adaptive,
+        runtimes_mtf,
+    )
     return registry
 
 
@@ -535,6 +852,7 @@ async def build_lr_band_value(redis, symbol: str, timeframe: str, lr_prefix: str
 
     return {"price": close_val, "upper": upper_val, "lower": lower_val}
 
+
 # 🔸 Сбор value для ATR% bins (atr из indicators KV, close из feed TS)
 async def build_atr_pct_value(redis, symbol: str, timeframe: str, atr_param_name: str, ts_ms: int | None) -> dict[str, str] | None:
     # atr (KV индикаторов)
@@ -554,6 +872,7 @@ async def build_atr_pct_value(redis, symbol: str, timeframe: str, atr_param_name
 
     return {"atr": atr_val, "price": close_val}
 
+
 # 🔸 Сбор value для DMI-gap bins (plus/minus из indicators KV)
 async def build_dmigap_value(redis, symbol: str, timeframe: str, base_param_name: str) -> dict[str, str] | None:
     plus_key = f"ind:{symbol}:{timeframe}:{base_param_name}_plus_di"
@@ -567,9 +886,134 @@ async def build_dmigap_value(redis, symbol: str, timeframe: str, base_param_name
 
     return {"plus": plus_val, "minus": minus_val}
 
+
 # 🔸 Получение adaptive-правил из кеша
 def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
     return adaptive_bins_cache.get((analysis_id, scenario_id, signal_id, timeframe, direction), [])
+
+
+# 🔸 Обработка MTF-пака: получить values_by_tf + подобрать канонический bin через labels
+async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_ms: int, trigger_tf: str, trigger_indicator: str) -> None:
+    log = logging.getLogger("PACK_MTF")
+
+    # условия достаточности
+    if not rt.mtf_pairs or not rt.mtf_component_tfs or not rt.mtf_component_params or not rt.mtf_bins_static:
+        return
+
+    # собираем значения по TF (m5 KV, m15/h1 KV или TS+retry на стыках)
+    tasks = []
+    for tf in rt.mtf_component_tfs:
+        param = rt.mtf_component_params.get(tf) or ""
+        if not param:
+            tasks.append(asyncio.create_task(asyncio.sleep(0, result=None)))
+        else:
+            tasks.append(asyncio.create_task(get_mtf_value_decimal(redis, symbol, trigger_open_ts_ms, tf, param)))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    values_by_tf: dict[str, Decimal] = {}
+    errors = 0
+
+    for tf, r in zip(rt.mtf_component_tfs, results):
+        if isinstance(r, Exception):
+            errors += 1
+            continue
+        if r is None:
+            continue
+        # для RSI соответствуем анализатору: клип 0..100
+        values_by_tf[str(tf)] = clip_0_100(r)
+
+    # если не собрали все TF — skip
+    if errors or any(tf not in values_by_tf for tf in rt.mtf_component_tfs):
+        boundary = calc_close_boundary_ts_ms(trigger_open_ts_ms, "m5")
+        styk_m15 = is_tf_boundary(boundary, "m15")
+        styk_h1 = is_tf_boundary(boundary, "h1")
+        if styk_m15 or styk_h1:
+            log.warning(
+                "PACK_MTF: missing values after retry — skip (symbol=%s, trigger=%s/%s, analysis_id=%s, open_time=%s, boundary=%s, styk_m15=%s, styk_h1=%s)",
+                symbol,
+                trigger_tf,
+                trigger_indicator,
+                rt.analysis_id,
+                trigger_open_ts_ms,
+                boundary,
+                styk_m15,
+                styk_h1,
+            )
+        return
+
+    published = 0
+    skipped = 0
+
+    # считаем для каждой пары и каждого направления
+    for (scenario_id, signal_id) in rt.mtf_pairs:
+        for direction in ("long", "short"):
+            # правила бинов по TF для данного направления
+            rules_by_tf: dict[str, list[Any]] = {}
+            for tf in rt.mtf_component_tfs:
+                rules_by_tf[str(tf)] = (rt.mtf_bins_static.get(str(tf), {}) or {}).get(direction, []) or []
+
+            # условия достаточности правил
+            if any(not rules_by_tf.get(str(tf)) for tf in rt.mtf_component_tfs):
+                skipped += 1
+                continue
+
+            # кандидаты bin_name (full → схлопывания)
+            try:
+                candidates = rt.worker.bin_candidates(values_by_tf=values_by_tf, rules_by_tf=rules_by_tf)
+            except Exception:
+                skipped += 1
+                continue
+
+            if not candidates:
+                skipped += 1
+                continue
+
+            # выбрать первый кандидат, который существует в labels-cache
+            chosen = None
+            for cand in candidates:
+                if labels_has_bin(
+                    scenario_id=int(scenario_id),
+                    signal_id=int(signal_id),
+                    direction=str(direction),
+                    analysis_id=int(rt.analysis_id),
+                    indicator_param=str(rt.source_param_name),
+                    timeframe="mtf",
+                    bin_name=str(cand),
+                ):
+                    chosen = str(cand)
+                    break
+
+            if not chosen:
+                skipped += 1
+                continue
+
+            # публикуем как pair-key (как adaptive), но timeframe="mtf"
+            await publish_pack_state_adaptive(
+                redis=redis,
+                analysis_id=int(rt.analysis_id),
+                scenario_id=int(scenario_id),
+                signal_id=int(signal_id),
+                direction=str(direction),
+                symbol=symbol,
+                timeframe="mtf",
+                bin_name=chosen,
+                ttl_sec=int(rt.ttl_sec),
+            )
+            published += 1
+
+    # суммирующий лог на одно ready-событие
+    if published or skipped:
+        log.info(
+            "PACK_MTF: done (symbol=%s, trigger=%s/%s, analysis_id=%s, published=%s, skipped=%s)",
+            symbol,
+            trigger_tf,
+            trigger_indicator,
+            rt.analysis_id,
+            published,
+            skipped,
+        )
+
 
 # 🔸 Обработка одного события indicator_stream (status=ready)
 async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
@@ -592,7 +1036,23 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
     ts_ms = parse_open_time_to_ts_ms(open_time)
 
     for rt in runtimes:
-        # value для воркера
+        # MTF паки
+        if rt.is_mtf:
+            # условия достаточности
+            if ts_ms is None:
+                continue
+
+            await handle_mtf_pack(
+                redis=redis,
+                rt=rt,
+                symbol=symbol,
+                trigger_open_ts_ms=int(ts_ms),
+                trigger_tf=str(timeframe),
+                trigger_indicator=str(indicator_key),
+            )
+            continue
+
+        # value для воркера (single-TF)
         if rt.analysis_key == "bb_band_bin":
             value = await build_bb_band_value(redis, symbol, rt.timeframe, rt.source_param_name, ts_ms)
             if value is None:
@@ -680,6 +1140,7 @@ async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
             if publish_tasks:
                 await asyncio.gather(*publish_tasks, return_exceptions=True)
 
+
 # 🔸 Создание consumer-group (общий хелпер)
 async def ensure_stream_group(redis, stream: str, group: str):
     log = logging.getLogger("PACK_STREAM")
@@ -735,51 +1196,92 @@ async def watch_indicator_stream(redis):
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # логируем только ошибки обработки (если были)
+            errors = 0
             for r in results:
                 if isinstance(r, Exception):
+                    errors += 1
                     log.warning(f"PACK_STREAM: message processing error: {r}", exc_info=True)
 
             await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
+
+            # суммирующий лог по батчу
+            if errors:
+                log.info("PACK_STREAM: batch processed=%s, errors=%s", len(flat), errors)
 
         except Exception as e:
             log.error(f"PACK_STREAM loop error: {e}", exc_info=True)
             await asyncio.sleep(2)
 
 
-# 🔸 Подписка на bt:analysis:postproc_ready и точечный reload adaptive-cache
+# 🔸 Подписка на bt:analysis:postproc_ready и точечный reload adaptive-cache + labels-cache
 async def watch_postproc_ready(pg, redis):
-    log = logging.getLogger("PACK_ADAPTIVE")
+    log = logging.getLogger("PACK_POSTPROC")
 
     sem = asyncio.Semaphore(50)
 
     async def _reload_pair(scenario_id: int, signal_id: int):
         async with sem:
             pair = (scenario_id, signal_id)
+
+            # adaptive reload
             analysis_ids = sorted(list(adaptive_pairs_index.get(pair, set())))
-            if not analysis_ids:
-                return
+            if analysis_ids:
+                loaded = await load_adaptive_bins_for_pair(pg, analysis_ids, scenario_id, signal_id)
 
-            loaded = await load_adaptive_bins_for_pair(pg, analysis_ids, scenario_id, signal_id)
+                async with adaptive_lock:
+                    # удалить старые ключи пары (только нужные analysis_id)
+                    keys_to_del = [
+                        k for k in list(adaptive_bins_cache.keys())
+                        if k[1] == scenario_id and k[2] == signal_id and k[0] in analysis_ids
+                    ]
+                    for k in keys_to_del:
+                        adaptive_bins_cache.pop(k, None)
 
-            async with adaptive_lock:
-                # удалить старые ключи пары (только нужные analysis_id)
-                keys_to_del = [
-                    k for k in list(adaptive_bins_cache.keys())
-                    if k[1] == scenario_id and k[2] == signal_id and k[0] in analysis_ids
-                ]
-                for k in keys_to_del:
-                    adaptive_bins_cache.pop(k, None)
+                    # записать новые
+                    loaded_rules = 0
+                    for (aid, tf, direction), rules in loaded.items():
+                        adaptive_bins_cache[(aid, scenario_id, signal_id, tf, direction)] = rules
+                        loaded_rules += len(rules)
 
-                # записать новые
-                loaded_rules = 0
-                for (aid, tf, direction), rules in loaded.items():
-                    adaptive_bins_cache[(aid, scenario_id, signal_id, tf, direction)] = rules
-                    loaded_rules += len(rules)
+                log.info(
+                    "PACK_ADAPTIVE: updated (scenario_id=%s, signal_id=%s, analysis_ids=%s, rules_loaded=%s)",
+                    scenario_id,
+                    signal_id,
+                    analysis_ids,
+                    loaded_rules,
+                )
 
-            log.info(
-                f"PACK_ADAPTIVE: обновлён adaptive dict для scenario_id={scenario_id}, signal_id={signal_id}, "
-                f"analysis_ids={analysis_ids}, rules_loaded={loaded_rules}"
+            # labels reload (без model_id)
+            contexts = sorted(
+                list(labels_pairs_index.get(pair, set())),
+                key=lambda x: (x.analysis_id, x.indicator_param, x.timeframe),
             )
+            if contexts:
+                loaded_bins = await load_labels_bins_for_pair(pg, scenario_id, signal_id, contexts)
+
+                async with labels_lock:
+                    # удалить старые ключи пары и контекстов
+                    ctx_set = {(c.analysis_id, c.indicator_param, c.timeframe) for c in contexts}
+                    keys_to_del = [
+                        k for k in list(labels_bins_cache.keys())
+                        if k[0] == scenario_id and k[1] == signal_id and (k[3], k[4], k[5]) in ctx_set
+                    ]
+                    for k in keys_to_del:
+                        labels_bins_cache.pop(k, None)
+
+                    # записать новые
+                    bins_loaded = 0
+                    for k, s in loaded_bins.items():
+                        labels_bins_cache[k] = s
+                        bins_loaded += len(s)
+
+                log.info(
+                    "PACK_LABELS: updated (scenario_id=%s, signal_id=%s, ctx=%s, bins_loaded=%s)",
+                    scenario_id,
+                    signal_id,
+                    len(contexts),
+                    bins_loaded,
+                )
 
     while True:
         try:
@@ -808,8 +1310,8 @@ async def watch_postproc_ready(pg, redis):
 
                     pair = (scenario_id, signal_id)
 
-                    # если пара не используется в live — игнор
-                    if pair not in adaptive_pairs_set:
+                    # если пара не используется ни в adaptive, ни в labels — игнор
+                    if pair not in adaptive_pairs_set and pair not in labels_pairs_set:
                         continue
 
                     # точечный reload по паре
@@ -819,7 +1321,7 @@ async def watch_postproc_ready(pg, redis):
                 await redis.xack(POSTPROC_STREAM_KEY, POSTPROC_GROUP, *to_ack)
 
         except Exception as e:
-            log.error(f"PACK_ADAPTIVE loop error: {e}", exc_info=True)
+            log.error(f"PACK_POSTPROC loop error: {e}", exc_info=True)
             await asyncio.sleep(2)
 
 
@@ -843,6 +1345,7 @@ async def load_active_symbols(pg) -> list[str]:
     log.info(f"PACK_BOOT: активных тикеров загружено: {len(symbols)}")
     return symbols
 
+
 # 🔸 Холодный старт: пересчитать текущее состояние (без ожидания next ready)
 async def bootstrap_current_state(pg, redis):
     log = logging.getLogger("PACK_BOOT")
@@ -864,6 +1367,10 @@ async def bootstrap_current_state(pg, redis):
 
     async def _process_one(symbol: str, rt: PackRuntime):
         async with sem:
+            # MTF bootstrap осознанно пропускаем (требует trigger m5 + styk-логика + labels)
+            if rt.is_mtf:
+                return
+
             # value для воркера
             if rt.analysis_key in ("bb_band_bin", "lr_band_bin"):
                 prefix = rt.source_param_name
@@ -894,14 +1401,12 @@ async def bootstrap_current_state(pg, redis):
                 value: Any = {"price": close_val, "upper": upper_val, "lower": lower_val}
 
             elif rt.analysis_key == "atr_bin":
-                # ts_ms берём из Redis TS индикаторов по atr (последняя точка)
                 atr_ts_key = f"{IND_TS_PREFIX}:{symbol}:{rt.timeframe}:{rt.source_param_name}"
                 atr = await ts_get(redis, atr_ts_key)
                 if not atr:
                     return
                 ts_ms, atr_val = atr
 
-                # close по ts_ms из фида
                 close_key = f"{BB_TS_PREFIX}:{symbol}:{rt.timeframe}:c"
                 close_val = await ts_get_value_at(redis, close_key, ts_ms)
                 if close_val is None:
@@ -1008,9 +1513,10 @@ async def bootstrap_current_state(pg, redis):
     await asyncio.gather(*tasks, return_exceptions=True)
     log.info(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
 
+
 # 🔸 Инициализация кэша и реестра pack-воркеров
 async def init_pack_runtime(pg):
-    global pack_registry, adaptive_pairs_index, adaptive_pairs_set
+    global pack_registry, adaptive_pairs_index, adaptive_pairs_set, labels_pairs_index, labels_pairs_set
 
     log = logging.getLogger("PACK_INIT")
 
@@ -1028,26 +1534,45 @@ async def init_pack_runtime(pg):
         static_bins_dict=static_bins_dict,
     )
 
-    # построить индекс используемых пар для adaptive
+    # adaptive index
     adaptive_pairs_index = {}
     adaptive_pairs_set = set()
+
+    # labels index
+    labels_pairs_index = {}
+    labels_pairs_set = set()
 
     all_runtimes: list[PackRuntime] = []
     for lst in pack_registry.values():
         all_runtimes.extend(lst)
 
     adaptive_runtimes = 0
+    labels_runtimes = 0
+
     for rt in all_runtimes:
-        if rt.bins_source != "adaptive":
-            continue
-        adaptive_runtimes += 1
-        for pair in rt.adaptive_pairs:
-            adaptive_pairs_set.add(pair)
-            adaptive_pairs_index.setdefault(pair, set()).add(rt.analysis_id)
+        # adaptive
+        if rt.bins_source == "adaptive":
+            adaptive_runtimes += 1
+            for pair in rt.adaptive_pairs:
+                adaptive_pairs_set.add(pair)
+                adaptive_pairs_index.setdefault(pair, set()).add(rt.analysis_id)
+
+        # labels (для mtf паков)
+        if rt.is_mtf and rt.mtf_pairs:
+            labels_runtimes += 1
+            for pair in rt.mtf_pairs:
+                labels_pairs_set.add(pair)
+                ctx = LabelsContext(
+                    analysis_id=int(rt.analysis_id),
+                    indicator_param=str(rt.source_param_name),
+                    timeframe="mtf",
+                )
+                labels_pairs_index.setdefault(pair, set()).add(ctx)
 
     log.info(f"PACK_INIT: adaptive pairs configured: {len(adaptive_pairs_set)} (adaptive_runtimes={adaptive_runtimes})")
+    log.info(f"PACK_INIT: labels pairs configured: {len(labels_pairs_set)} (labels_runtimes={labels_runtimes})")
 
-    # первичная загрузка adaptive-кеша для нужных пар
+    # первичная загрузка adaptive-кеша
     loaded_pairs = 0
     loaded_rules_total = 0
 
@@ -1068,12 +1593,46 @@ async def init_pack_runtime(pg):
         loaded_rules_total += rules_loaded
 
         log.info(
-            f"PACK_INIT: adaptive dict loaded for scenario_id={scenario_id}, signal_id={signal_id}, "
-            f"analysis_ids={analysis_list}, rules_loaded={rules_loaded}"
+            "PACK_INIT: adaptive dict loaded for scenario_id=%s, signal_id=%s, analysis_ids=%s, rules_loaded=%s",
+            scenario_id,
+            signal_id,
+            analysis_list,
+            rules_loaded,
         )
 
     if adaptive_pairs_set:
         log.info(f"PACK_INIT: adaptive cache ready — pairs_loaded={loaded_pairs}, rules_total={loaded_rules_total}")
+
+    # первичная загрузка labels-кеша
+    loaded_pairs_lbl = 0
+    loaded_bins_total = 0
+
+    for (scenario_id, signal_id) in sorted(list(labels_pairs_set)):
+        contexts = sorted(
+            list(labels_pairs_index.get((scenario_id, signal_id), set())),
+            key=lambda x: (x.analysis_id, x.indicator_param, x.timeframe),
+        )
+        if not contexts:
+            continue
+
+        loaded = await load_labels_bins_for_pair(pg, scenario_id, signal_id, contexts)
+
+        async with labels_lock:
+            for k, s in loaded.items():
+                labels_bins_cache[k] = s
+                loaded_bins_total += len(s)
+
+        loaded_pairs_lbl += 1
+        log.info(
+            "PACK_INIT: labels cache loaded for scenario_id=%s, signal_id=%s, ctx=%s, keys=%s",
+            scenario_id,
+            signal_id,
+            len(contexts),
+            len(loaded),
+        )
+
+    if labels_pairs_set:
+        log.info(f"PACK_INIT: labels cache ready — pairs_loaded={loaded_pairs_lbl}, bins_total={loaded_bins_total}")
 
 
 # 🔸 Внешняя точка входа (запускается через indicators_v4_main.py и run_safe_loop)
