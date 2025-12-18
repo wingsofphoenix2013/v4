@@ -22,6 +22,7 @@ from packs.rsi_mtf import RsiMtfPack
 from packs.mfi_mtf import MfiMtfPack
 from packs.rsimfi_mtf import RsiMfiMtfPack
 from packs.supertrend_mtf import SupertrendMtfPack
+from packs.lr_mtf import LrMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -88,20 +89,30 @@ PACK_WORKERS = {
     "mfi_mtf": MfiMtfPack,
     "rsimfi_mtf": RsiMfiMtfPack,
     "supertrend_mtf": SupertrendMtfPack,
+    "lr_mtf": LrMtfPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
 pack_registry: dict[tuple[str, str], list["PackRuntime"]] = {}
 # key: (timeframe_from_stream, indicator_from_stream) -> list[PackRuntime]
 
-# 🔸 Кеш adaptive-словаря: (analysis_id, scenario_id, signal_id, tf, direction) -> [BinRule...]
+# 🔸 Кеш adaptive-словаря (bins): (analysis_id, scenario_id, signal_id, tf, direction) -> [BinRule...]
 adaptive_bins_cache: dict[tuple[int, int, int, str, str], list["BinRule"]] = {}
 
-# 🔸 Индекс используемых пар (scenario_id, signal_id) -> set(analysis_id)
+# 🔸 Кеш adaptive-словаря (quantiles): (analysis_id, scenario_id, signal_id, tf, direction) -> [BinRule...]
+adaptive_quantiles_cache: dict[tuple[int, int, int, str, str], list["BinRule"]] = {}
+
+# 🔸 Индекс используемых пар (scenario_id, signal_id) -> set(analysis_id) для bins
 adaptive_pairs_index: dict[tuple[int, int], set[int]] = {}
 
-# 🔸 Быстрый set для проверки "интересна ли пара" в стриме postproc_ready (adaptive)
+# 🔸 Индекс используемых пар (scenario_id, signal_id) -> set(analysis_id) для quantiles
+adaptive_quantiles_pairs_index: dict[tuple[int, int], set[int]] = {}
+
+# 🔸 Быстрый set для проверки "интересна ли пара" в стриме postproc_ready (bins)
 adaptive_pairs_set: set[tuple[int, int]] = set()
+
+# 🔸 Быстрый set для проверки "интересна ли пара" в стриме postproc_ready (quantiles)
+adaptive_quantiles_pairs_set: set[tuple[int, int]] = set()
 
 # 🔸 Лок для обновления adaptive-кеша
 adaptive_lock = asyncio.Lock()
@@ -127,8 +138,8 @@ class BinRule:
     bin_type: str
     bin_order: int
     bin_name: str
-    val_from: float | None
-    val_to: float | None
+    val_from: str | None
+    val_to: str | None
     to_inclusive: bool
 
 
@@ -164,6 +175,12 @@ class PackRuntime:
     mtf_bins_static: dict[str, dict[str, list[BinRule]]] | None = None  # tf/bins_tf -> direction -> rules
     mtf_bins_tf: str = "components"                             # "components" | "mtf"
     mtf_clip_0_100: bool = True                                 # для supertrend должен быть False
+
+    mtf_required_bins_tfs: list[str] | None = None              # какие TF требуют static bins (для lr_mtf: ["h1","m15"])
+    mtf_quantiles_key: str | None = None                        # ключ rules_by_tf для quantiles (для lr_mtf: "quantiles")
+    mtf_needs_price: bool = False                               # нужен ли price (для lr_mtf: True)
+    mtf_price_tf: str = "m5"                                    # откуда брать price (tf)
+    mtf_price_field: str = "c"                                  # поле цены (обычно 'c')
 
 # 🔸 Определение источника бинов из bins_policy
 def get_bins_source(bins_policy: dict[str, Any] | None, timeframe: str) -> str:
@@ -511,8 +528,8 @@ async def load_static_bins_dict(pg, analysis_ids: list[int]) -> dict[int, dict[s
             bin_type=str(r["bin_type"]),
             bin_order=int(r["bin_order"]),
             bin_name=str(r["bin_name"]),
-            val_from=float(r["val_from"]) if r["val_from"] is not None else None,
-            val_to=float(r["val_to"]) if r["val_to"] is not None else None,
+            val_from=str(r["val_from"]) if r["val_from"] is not None else None,
+            val_to=str(r["val_to"]) if r["val_to"] is not None else None,
             to_inclusive=bool(r["to_inclusive"]),
         )
 
@@ -558,8 +575,8 @@ async def load_adaptive_bins_for_pair(pg, analysis_ids: list[int], scenario_id: 
             bin_type=str(r["bin_type"]),
             bin_order=int(r["bin_order"]),
             bin_name=str(r["bin_name"]),
-            val_from=float(r["val_from"]) if r["val_from"] is not None else None,
-            val_to=float(r["val_to"]) if r["val_to"] is not None else None,
+            val_from=str(r["val_from"]) if r["val_from"] is not None else None,
+            val_to=str(r["val_to"]) if r["val_to"] is not None else None,
             to_inclusive=bool(r["to_inclusive"]),
         )
         out.setdefault((aid, tf, direction), []).append(rule)
@@ -569,6 +586,46 @@ async def load_adaptive_bins_for_pair(pg, analysis_ids: list[int], scenario_id: 
 
     return out
 
+# 🔸 Загрузка adaptive-словаря (quantiles) для одной пары (scenario_id, signal_id)
+async def load_adaptive_quantiles_for_pair(pg, analysis_ids: list[int], scenario_id: int, signal_id: int) -> dict[tuple[int, str, str], list[BinRule]]:
+    # возвращает: (analysis_id, timeframe, direction) -> rules[]
+    if not analysis_ids:
+        return {}
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT analysis_id, direction, timeframe, bin_type, bin_order, bin_name,
+                   val_from, val_to, to_inclusive
+            FROM {ADAPTIVE_BINS_TABLE}
+            WHERE analysis_id = ANY($1::int[])
+              AND scenario_id = $2
+              AND signal_id   = $3
+              AND bin_type    = 'quantiles'
+            ORDER BY analysis_id, timeframe, direction, bin_order
+        """, analysis_ids, scenario_id, signal_id)
+
+    out: dict[tuple[int, str, str], list[BinRule]] = {}
+    for r in rows:
+        aid = int(r["analysis_id"])
+        tf = str(r["timeframe"])
+        direction = str(r["direction"])
+
+        rule = BinRule(
+            direction=direction,
+            timeframe=tf,
+            bin_type=str(r["bin_type"]),
+            bin_order=int(r["bin_order"]),
+            bin_name=str(r["bin_name"]),
+            val_from=str(r["val_from"]) if r["val_from"] is not None else None,
+            val_to=str(r["val_to"]) if r["val_to"] is not None else None,
+            to_inclusive=bool(r["to_inclusive"]),
+        )
+        out.setdefault((aid, tf, direction), []).append(rule)
+
+    for k in out:
+        out[k].sort(key=lambda x: x.bin_order)
+
+    return out
 
 # 🔸 Загрузка labels (bin_name set) для одной пары (scenario_id, signal_id) и набора контекстов (model_id игнорируется)
 async def load_labels_bins_for_pair(pg, scenario_id: int, signal_id: int, contexts: list[LabelsContext]) -> dict[tuple[int, int, str, int, str, str], set[str]]:
@@ -765,6 +822,18 @@ def build_pack_registry(
 
             ttl_sec = int(TTL_BY_TF_SEC.get("mtf", TTL_BY_TF_SEC.get("m5", 120)))
 
+            required_bins_tfs = cfg.get("required_bins_tfs")
+            if not isinstance(required_bins_tfs, list) or not required_bins_tfs:
+                required_bins_tfs = component_tfs
+
+            quantiles_key = cfg.get("quantiles_key")
+            if quantiles_key is not None:
+                quantiles_key = str(quantiles_key).strip() or None
+
+            needs_price = bool(cfg.get("needs_price", False))
+            price_tf = str(cfg.get("price_tf") or "m5").strip()
+            price_field = str(cfg.get("price_field") or "c").strip()
+
             runtime = PackRuntime(
                 analysis_id=analysis_id,
                 analysis_key=analysis_key,
@@ -786,6 +855,11 @@ def build_pack_registry(
                 mtf_bins_static=mtf_bins_static,
                 mtf_bins_tf=bins_tf_key,
                 mtf_clip_0_100=mtf_clip_0_100,
+                mtf_required_bins_tfs=[str(x) for x in required_bins_tfs],
+                mtf_quantiles_key=quantiles_key,
+                mtf_needs_price=needs_price,
+                mtf_price_tf=price_tf,
+                mtf_price_field=price_field,
             )
 
             # триггеримся по base индикатора на trigger_tf
@@ -944,8 +1018,8 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
         return
 
     # собираем значения по TF:
-    # - если spec строка: одно значение на TF (как rsi_mtf / mfi_mtf)
-    # - если spec dict: несколько значений на TF (как rsimfi_mtf: rsi+mfi)
+    # - если spec строка: одно значение на TF (как rsi_mtf / mfi_mtf / supertrend_mtf)
+    # - если spec dict: несколько значений на TF (как rsimfi_mtf: rsi+mfi, lr_mtf: upper/lower)
     tasks = []
     meta: list[tuple[str, str | None]] = []  # (tf, sub_name|None)
 
@@ -971,7 +1045,7 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
                     meta.append((str(tf), str(name)))
                     continue
 
-                # для m5 в multi-param режиме читаем TS по open_time m5 (ждём второй индикатор, если он чуть позже)
+                # для m5 в multi-param режиме читаем TS по open_time m5 (ждём второй индикатор/параметр, если он чуть позже)
                 if str(tf) == "m5":
                     tasks.append(asyncio.create_task(get_ts_decimal_with_retry(redis, symbol, "m5", pname, int(trigger_open_ts_ms))))
                 else:
@@ -995,7 +1069,7 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
         if r is None:
             continue
 
-        # клип 0..100 — безопасно для RSI и MFI (и соответствует анализаторам)
+        # клип 0..100 — безопасно для RSI/MFI; для supertrend/lr клип отключён
         v = clip_0_100(r) if rt.mtf_clip_0_100 else r
 
         if name is None:
@@ -1050,33 +1124,51 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
             )
         return
 
+    # price (close) для воркеров, которые требуют price (lr_mtf)
+    if rt.mtf_needs_price:
+        price_key = f"{BB_TS_PREFIX}:{symbol}:{rt.mtf_price_tf}:{rt.mtf_price_field}"
+        raw_price = await ts_get_value_at(redis, price_key, int(trigger_open_ts_ms))
+        price_d = safe_decimal(raw_price)
+        if price_d is None:
+            return
+        values_by_tf["price"] = price_d
+
     published = 0
     skipped = 0
 
     # считаем для каждой пары и каждого направления
     for (scenario_id, signal_id) in rt.mtf_pairs:
         for direction in ("long", "short"):
-            # правила бинов по TF для данного направления
             rules_by_tf: dict[str, list[Any]] = {}
 
             # supertrend_mtf: правила лежат в timeframe='mtf'
             if str(rt.mtf_bins_tf) == "mtf":
                 rules_by_tf["mtf"] = (rt.mtf_bins_static.get("mtf", {}) or {}).get(direction, []) or []
-
-                # условия достаточности правил
                 if not rules_by_tf["mtf"]:
                     skipped += 1
                     continue
 
             # обычные MTF (rsi/mfi/rsimfi): правила по компонентным TF
             else:
-                for tf in rt.mtf_component_tfs:
+                required_tfs = rt.mtf_required_bins_tfs or rt.mtf_component_tfs or []
+                for tf in required_tfs:
                     rules_by_tf[str(tf)] = (rt.mtf_bins_static.get(str(tf), {}) or {}).get(direction, []) or []
 
-                # условия достаточности правил
-                if any(not rules_by_tf.get(str(tf)) for tf in rt.mtf_component_tfs):
+                # условия достаточности static правил
+                if any(not rules_by_tf.get(str(tf)) for tf in required_tfs):
                     skipped += 1
                     continue
+
+            # quantiles rules (lr_mtf): берём из adaptive_quantiles_cache по (analysis_id, pair, "mtf", direction)
+            if rt.mtf_quantiles_key:
+                q_rules = adaptive_quantiles_cache.get(
+                    (int(rt.analysis_id), int(scenario_id), int(signal_id), "mtf", str(direction)),
+                    [],
+                )
+                if not q_rules:
+                    skipped += 1
+                    continue
+                rules_by_tf[str(rt.mtf_quantiles_key)] = q_rules
 
             # кандидаты bin_name (full → схлопывания)
             try:
@@ -1373,6 +1465,32 @@ async def watch_postproc_ready(pg, redis):
                     loaded_rules,
                 )
 
+            # adaptive quantiles reload
+            q_analysis_ids = sorted(list(adaptive_quantiles_pairs_index.get(pair, set())))
+            if q_analysis_ids:
+                loaded_q = await load_adaptive_quantiles_for_pair(pg, q_analysis_ids, scenario_id, signal_id)
+
+                async with adaptive_lock:
+                    keys_to_del = [
+                        k for k in list(adaptive_quantiles_cache.keys())
+                        if k[1] == scenario_id and k[2] == signal_id and k[0] in q_analysis_ids
+                    ]
+                    for k in keys_to_del:
+                        adaptive_quantiles_cache.pop(k, None)
+
+                    loaded_rules = 0
+                    for (aid, tf, direction), rules in loaded_q.items():
+                        adaptive_quantiles_cache[(aid, scenario_id, signal_id, tf, direction)] = rules
+                        loaded_rules += len(rules)
+
+                log.info(
+                    "PACK_ADAPTIVE_QUANTILES: updated (scenario_id=%s, signal_id=%s, analysis_ids=%s, rules_loaded=%s)",
+                    scenario_id,
+                    signal_id,
+                    q_analysis_ids,
+                    loaded_rules,
+                )
+
             # labels reload (без model_id)
             contexts = sorted(
                 list(labels_pairs_index.get(pair, set())),
@@ -1433,7 +1551,7 @@ async def watch_postproc_ready(pg, redis):
                     pair = (scenario_id, signal_id)
 
                     # если пара не используется ни в adaptive, ни в labels — игнор
-                    if pair not in adaptive_pairs_set and pair not in labels_pairs_set:
+                    if pair not in adaptive_pairs_set and pair not in labels_pairs_set and pair not in adaptive_quantiles_pairs_set:
                         continue
 
                     # точечный reload по паре
@@ -1635,10 +1753,9 @@ async def bootstrap_current_state(pg, redis):
     await asyncio.gather(*tasks, return_exceptions=True)
     log.info(f"PACK_BOOT: bootstrap завершён — packs={len(runtimes)}, symbols={len(symbols)}")
 
-
 # 🔸 Инициализация кэша и реестра pack-воркеров
 async def init_pack_runtime(pg):
-    global pack_registry, adaptive_pairs_index, adaptive_pairs_set, labels_pairs_index, labels_pairs_set
+    global pack_registry, adaptive_pairs_index, adaptive_pairs_set, adaptive_quantiles_pairs_index, adaptive_quantiles_pairs_set, labels_pairs_index, labels_pairs_set
 
     log = logging.getLogger("PACK_INIT")
 
@@ -1660,6 +1777,9 @@ async def init_pack_runtime(pg):
     adaptive_pairs_index = {}
     adaptive_pairs_set = set()
 
+    adaptive_quantiles_pairs_index = {}
+    adaptive_quantiles_pairs_set = set()
+
     # labels index
     labels_pairs_index = {}
     labels_pairs_set = set()
@@ -1672,14 +1792,20 @@ async def init_pack_runtime(pg):
     labels_runtimes = 0
 
     for rt in all_runtimes:
-        # adaptive
+        # adaptive (bins)
         if rt.bins_source == "adaptive":
             adaptive_runtimes += 1
             for pair in rt.adaptive_pairs:
                 adaptive_pairs_set.add(pair)
-                adaptive_pairs_index.setdefault(pair, set()).add(rt.analysis_id)
+                adaptive_pairs_index.setdefault(pair, set()).add(int(rt.analysis_id))
 
-        # labels (для mtf паков)
+        # quantiles (для lr_mtf и любых mtf, кто просит quantiles_key)
+        if rt.is_mtf and rt.mtf_pairs and rt.mtf_quantiles_key:
+            for pair in rt.mtf_pairs:
+                adaptive_quantiles_pairs_set.add(pair)
+                adaptive_quantiles_pairs_index.setdefault(pair, set()).add(int(rt.analysis_id))
+
+        # labels (для всех mtf паков)
         if rt.is_mtf and rt.mtf_pairs:
             labels_runtimes += 1
             for pair in rt.mtf_pairs:
@@ -1694,7 +1820,7 @@ async def init_pack_runtime(pg):
     log.info(f"PACK_INIT: adaptive pairs configured: {len(adaptive_pairs_set)} (adaptive_runtimes={adaptive_runtimes})")
     log.info(f"PACK_INIT: labels pairs configured: {len(labels_pairs_set)} (labels_runtimes={labels_runtimes})")
 
-    # первичная загрузка adaptive-кеша
+    # первичная загрузка adaptive-кеша (bins)
     loaded_pairs = 0
     loaded_rules_total = 0
 
@@ -1724,6 +1850,36 @@ async def init_pack_runtime(pg):
 
     if adaptive_pairs_set:
         log.info(f"PACK_INIT: adaptive cache ready — pairs_loaded={loaded_pairs}, rules_total={loaded_rules_total}")
+
+    # первичная загрузка adaptive-quantiles кеша (bin_type='quantiles')
+    loaded_q_pairs = 0
+    loaded_q_rules_total = 0
+
+    for (scenario_id, signal_id) in sorted(list(adaptive_quantiles_pairs_set)):
+        analysis_list = sorted(list(adaptive_quantiles_pairs_index.get((scenario_id, signal_id), set())))
+        if not analysis_list:
+            continue
+
+        loaded = await load_adaptive_quantiles_for_pair(pg, analysis_list, scenario_id, signal_id)
+
+        async with adaptive_lock:
+            rules_loaded = 0
+            for (aid, tf, direction), rules in loaded.items():
+                adaptive_quantiles_cache[(aid, scenario_id, signal_id, tf, direction)] = rules
+                rules_loaded += len(rules)
+            loaded_q_rules_total += rules_loaded
+
+        loaded_q_pairs += 1
+        log.info(
+            "PACK_INIT: adaptive quantiles loaded for scenario_id=%s, signal_id=%s, analysis_ids=%s, rules_loaded=%s",
+            scenario_id,
+            signal_id,
+            analysis_list,
+            rules_loaded,
+        )
+
+    if adaptive_quantiles_pairs_set:
+        log.info("PACK_INIT: adaptive quantiles cache ready — pairs_loaded=%s, rules_total=%s", loaded_q_pairs, loaded_q_rules_total)
 
     # первичная загрузка labels-кеша
     loaded_pairs_lbl = 0
@@ -1755,7 +1911,6 @@ async def init_pack_runtime(pg):
 
     if labels_pairs_set:
         log.info(f"PACK_INIT: labels cache ready — pairs_loaded={loaded_pairs_lbl}, bins_total={loaded_bins_total}")
-
 
 # 🔸 Внешняя точка входа (запускается через indicators_v4_main.py и run_safe_loop)
 async def run_indicator_pack(pg, redis):
