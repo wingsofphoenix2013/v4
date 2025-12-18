@@ -12,6 +12,7 @@ from backtester_config import get_enabled_signals
 
 # 🔸 Воркеры таймерных backfill-сигналов
 from signals.bt_signals_lr_universal import run_lr_universal_backfill
+from signals.bt_signals_emacross import run_emacross_backfill
 
 # 🔸 Live-воркер LR universal (indicator_stream → live signals)
 from signals.bt_signals_lr_universal_live import (
@@ -52,6 +53,7 @@ class LiveSignalHandler:
 # 🔸 Реестр таймерных backfill-сигналов: key → handler(signal, pg, redis)
 TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
     "lr_universal": run_lr_universal_backfill,
+    "ema_cross": run_emacross_backfill,
 }
 
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
