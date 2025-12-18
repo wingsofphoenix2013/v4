@@ -21,6 +21,7 @@ from packs.dmigap_bin import DmiGapBinPack
 from packs.rsi_mtf import RsiMtfPack
 from packs.mfi_mtf import MfiMtfPack
 from packs.rsimfi_mtf import RsiMfiMtfPack
+from packs.supertrend_mtf import SupertrendMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -86,6 +87,7 @@ PACK_WORKERS = {
     "rsi_mtf": RsiMtfPack,
     "mfi_mtf": MfiMtfPack,
     "rsimfi_mtf": RsiMfiMtfPack,
+    "supertrend_mtf": SupertrendMtfPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
@@ -159,8 +161,9 @@ class PackRuntime:
     mtf_trigger_tf: str | None = None
     mtf_component_tfs: list[str] | None = None
     mtf_component_params: dict[str, Any] | None = None          # tf -> param_name OR tf -> {name:param_name}
-    mtf_bins_static: dict[str, dict[str, list[BinRule]]] | None = None  # tf -> direction -> rules
-
+    mtf_bins_static: dict[str, dict[str, list[BinRule]]] | None = None  # tf/bins_tf -> direction -> rules
+    mtf_bins_tf: str = "components"                             # "components" | "mtf"
+    mtf_clip_0_100: bool = True                                 # для supertrend должен быть False
 
 # 🔸 Определение источника бинов из bins_policy
 def get_bins_source(bins_policy: dict[str, Any] | None, timeframe: str) -> str:
@@ -735,14 +738,30 @@ def build_pack_registry(
             for tf in component_tfs:
                 component_params.setdefault(str(tf), component_param)
 
-            # bins берём из bt_analysis_bins_dict по компонентным TF (static)
+            # bins_tf и клипование значений (для supertrend клиповать нельзя)
+            bins_tf_key = str(cfg.get("bins_tf") or "").strip().lower()
+            if not bins_tf_key:
+                bins_tf_key = "components"
+
+            clip_cfg = cfg.get("clip_0_100")
+            mtf_clip_0_100 = True if clip_cfg is None else bool(clip_cfg)
+
+            # bins берём либо по компонентным TF, либо из timeframe='mtf'
             mtf_bins_static: dict[str, dict[str, list[BinRule]]] = {}
-            for tf in component_tfs:
-                bins_tf = static_bins_dict.get(analysis_id, {}).get(str(tf), {})
-                mtf_bins_static[str(tf)] = {
-                    "long": bins_tf.get("long", []),
-                    "short": bins_tf.get("short", []),
+
+            if bins_tf_key == "mtf":
+                bins_mtf = static_bins_dict.get(analysis_id, {}).get("mtf", {})
+                mtf_bins_static["mtf"] = {
+                    "long": bins_mtf.get("long", []),
+                    "short": bins_mtf.get("short", []),
                 }
+            else:
+                for tf in component_tfs:
+                    bins_tf = static_bins_dict.get(analysis_id, {}).get(str(tf), {})
+                    mtf_bins_static[str(tf)] = {
+                        "long": bins_tf.get("long", []),
+                        "short": bins_tf.get("short", []),
+                    }
 
             ttl_sec = int(TTL_BY_TF_SEC.get("mtf", TTL_BY_TF_SEC.get("m5", 120)))
 
@@ -765,6 +784,8 @@ def build_pack_registry(
                 mtf_component_tfs=component_tfs,
                 mtf_component_params=component_params,
                 mtf_bins_static=mtf_bins_static,
+                mtf_bins_tf=bins_tf_key,
+                mtf_clip_0_100=mtf_clip_0_100,
             )
 
             # триггеримся по base индикатора на trigger_tf
@@ -975,7 +996,7 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
             continue
 
         # клип 0..100 — безопасно для RSI и MFI (и соответствует анализаторам)
-        v = clip_0_100(r)
+        v = clip_0_100(r) if rt.mtf_clip_0_100 else r
 
         if name is None:
             values_by_tf[str(tf)] = v
@@ -1037,17 +1058,32 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
         for direction in ("long", "short"):
             # правила бинов по TF для данного направления
             rules_by_tf: dict[str, list[Any]] = {}
-            for tf in rt.mtf_component_tfs:
-                rules_by_tf[str(tf)] = (rt.mtf_bins_static.get(str(tf), {}) or {}).get(direction, []) or []
 
-            # условия достаточности правил
-            if any(not rules_by_tf.get(str(tf)) for tf in rt.mtf_component_tfs):
-                skipped += 1
-                continue
+            # supertrend_mtf: правила лежат в timeframe='mtf'
+            if str(rt.mtf_bins_tf) == "mtf":
+                rules_by_tf["mtf"] = (rt.mtf_bins_static.get("mtf", {}) or {}).get(direction, []) or []
+
+                # условия достаточности правил
+                if not rules_by_tf["mtf"]:
+                    skipped += 1
+                    continue
+
+            # обычные MTF (rsi/mfi/rsimfi): правила по компонентным TF
+            else:
+                for tf in rt.mtf_component_tfs:
+                    rules_by_tf[str(tf)] = (rt.mtf_bins_static.get(str(tf), {}) or {}).get(direction, []) or []
+
+                # условия достаточности правил
+                if any(not rules_by_tf.get(str(tf)) for tf in rt.mtf_component_tfs):
+                    skipped += 1
+                    continue
 
             # кандидаты bin_name (full → схлопывания)
             try:
-                candidates = rt.worker.bin_candidates(values_by_tf=values_by_tf, rules_by_tf=rules_by_tf)
+                try:
+                    candidates = rt.worker.bin_candidates(values_by_tf=values_by_tf, rules_by_tf=rules_by_tf, direction=direction)
+                except TypeError:
+                    candidates = rt.worker.bin_candidates(values_by_tf=values_by_tf, rules_by_tf=rules_by_tf)
             except Exception:
                 skipped += 1
                 continue
