@@ -19,6 +19,7 @@ from packs.lr_angle_bin import LrAngleBinPack
 from packs.atr_bin import AtrBinPack
 from packs.dmigap_bin import DmiGapBinPack
 from packs.rsi_mtf import RsiMtfPack
+from packs.mfi_mtf import MfiMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -82,6 +83,7 @@ PACK_WORKERS = {
     "atr_bin": AtrBinPack,
     "dmigap_bin": DmiGapBinPack,
     "rsi_mtf": RsiMtfPack,
+    "mfi_mtf": MfiMtfPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
