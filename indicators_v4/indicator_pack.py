@@ -20,6 +20,7 @@ from packs.atr_bin import AtrBinPack
 from packs.dmigap_bin import DmiGapBinPack
 from packs.rsi_mtf import RsiMtfPack
 from packs.mfi_mtf import MfiMtfPack
+from packs.rsimfi_mtf import RsiMfiMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -84,6 +85,7 @@ PACK_WORKERS = {
     "dmigap_bin": DmiGapBinPack,
     "rsi_mtf": RsiMtfPack,
     "mfi_mtf": MfiMtfPack,
+    "rsimfi_mtf": RsiMfiMtfPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
@@ -156,7 +158,7 @@ class PackRuntime:
     mtf_pairs: list[tuple[int, int]] | None = None
     mtf_trigger_tf: str | None = None
     mtf_component_tfs: list[str] | None = None
-    mtf_component_params: dict[str, str] | None = None          # tf -> param_name (в Redis)
+    mtf_component_params: dict[str, Any] | None = None          # tf -> param_name OR tf -> {name:param_name}
     mtf_bins_static: dict[str, dict[str, list[BinRule]]] | None = None  # tf -> direction -> rules
 
 
@@ -668,6 +670,10 @@ def build_pack_registry(
         if not timeframe and source_param_name.lower().endswith("_mtf"):
             timeframe = "mtf"
 
+        # MTF: если tf отсутствует, но key анализатора заканчивается на "_mtf" — считаем tf="mtf"
+        if not timeframe and analysis_key.lower().endswith("_mtf"):
+            timeframe = "mtf"
+
         # условия достаточности
         if not timeframe or not source_param_name:
             log.warning(f"PACK_INIT: analysis_id={analysis_id} ({analysis_key}) пропущен: нет tf/param_name")
@@ -692,6 +698,14 @@ def build_pack_registry(
                 continue
 
             worker = worker_cls()
+
+            # перед mtf_config: применить параметры анализатора (если воркер поддерживает)
+            if hasattr(worker, "configure"):
+                try:
+                    worker.configure(params)
+                except Exception:
+                    pass
+
             cfg = worker.mtf_config(source_param_name) if hasattr(worker, "mtf_config") else {}
 
             trigger_tf = str(cfg.get("trigger_tf") or "m5")
@@ -704,13 +718,20 @@ def build_pack_registry(
                 continue
 
             # component_params может быть dict tf->param_name, иначе одинаковый param_name для всех TF
-            component_params: dict[str, str] = {}
+            component_params: dict[str, Any] = {}
             comp_params_cfg = cfg.get("component_params")
+
             if isinstance(comp_params_cfg, dict):
                 for tf in component_tfs:
                     v = comp_params_cfg.get(tf)
-                    if v:
+
+                    # допускаем либо строку (один param_name), либо dict (несколько param_name)
+                    if isinstance(v, dict):
+                        component_params[str(tf)] = {str(k): str(val) for k, val in v.items() if k and val}
+                    elif v:
                         component_params[str(tf)] = str(v)
+
+            # дефолт: один и тот же param_name для всех TF
             for tf in component_tfs:
                 component_params.setdefault(str(tf), component_param)
 
@@ -893,7 +914,6 @@ async def build_dmigap_value(redis, symbol: str, timeframe: str, base_param_name
 def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
     return adaptive_bins_cache.get((analysis_id, scenario_id, signal_id, timeframe, direction), [])
 
-
 # 🔸 Обработка MTF-пака: получить values_by_tf + подобрать канонический bin через labels
 async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_ms: int, trigger_tf: str, trigger_indicator: str) -> None:
     log = logging.getLogger("PACK_MTF")
@@ -902,31 +922,96 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
     if not rt.mtf_pairs or not rt.mtf_component_tfs or not rt.mtf_component_params or not rt.mtf_bins_static:
         return
 
-    # собираем значения по TF (m5 KV, m15/h1 KV или TS+retry на стыках)
+    # собираем значения по TF:
+    # - если spec строка: одно значение на TF (как rsi_mtf / mfi_mtf)
+    # - если spec dict: несколько значений на TF (как rsimfi_mtf: rsi+mfi)
     tasks = []
+    meta: list[tuple[str, str | None]] = []  # (tf, sub_name|None)
+
     for tf in rt.mtf_component_tfs:
-        param = rt.mtf_component_params.get(tf) or ""
-        if not param:
-            tasks.append(asyncio.create_task(asyncio.sleep(0, result=None)))
+        spec = rt.mtf_component_params.get(tf)
+
+        # один параметр на TF
+        if isinstance(spec, str):
+            param = str(spec or "").strip()
+            if not param:
+                tasks.append(asyncio.create_task(asyncio.sleep(0, result=None)))
+                meta.append((str(tf), None))
+            else:
+                tasks.append(asyncio.create_task(get_mtf_value_decimal(redis, symbol, trigger_open_ts_ms, str(tf), param)))
+                meta.append((str(tf), None))
+
+        # несколько параметров на TF (dict)
+        elif isinstance(spec, dict):
+            for name, param_name in spec.items():
+                pname = str(param_name or "").strip()
+                if not pname:
+                    tasks.append(asyncio.create_task(asyncio.sleep(0, result=None)))
+                    meta.append((str(tf), str(name)))
+                    continue
+
+                # для m5 в multi-param режиме читаем TS по open_time m5 (ждём второй индикатор, если он чуть позже)
+                if str(tf) == "m5":
+                    tasks.append(asyncio.create_task(get_ts_decimal_with_retry(redis, symbol, "m5", pname, int(trigger_open_ts_ms))))
+                else:
+                    tasks.append(asyncio.create_task(get_mtf_value_decimal(redis, symbol, trigger_open_ts_ms, str(tf), pname)))
+
+                meta.append((str(tf), str(name)))
+
         else:
-            tasks.append(asyncio.create_task(get_mtf_value_decimal(redis, symbol, trigger_open_ts_ms, tf, param)))
+            tasks.append(asyncio.create_task(asyncio.sleep(0, result=None)))
+            meta.append((str(tf), None))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    values_by_tf: dict[str, Decimal] = {}
+    values_by_tf: dict[str, Any] = {}
     errors = 0
 
-    for tf, r in zip(rt.mtf_component_tfs, results):
+    for (tf, name), r in zip(meta, results):
         if isinstance(r, Exception):
             errors += 1
             continue
         if r is None:
             continue
-        # для RSI соответствуем анализатору: клип 0..100
-        values_by_tf[str(tf)] = clip_0_100(r)
+
+        # клип 0..100 — безопасно для RSI и MFI (и соответствует анализаторам)
+        v = clip_0_100(r)
+
+        if name is None:
+            values_by_tf[str(tf)] = v
+        else:
+            block = values_by_tf.get(str(tf))
+            if not isinstance(block, dict):
+                block = {}
+                values_by_tf[str(tf)] = block
+            block[str(name)] = v
+
+    # проверка полноты: для каждого TF должны быть все требуемые значения
+    missing = False
+    for tf in rt.mtf_component_tfs:
+        spec = rt.mtf_component_params.get(tf)
+
+        if isinstance(spec, str):
+            if str(tf) not in values_by_tf:
+                missing = True
+                break
+        elif isinstance(spec, dict):
+            block = values_by_tf.get(str(tf))
+            if not isinstance(block, dict):
+                missing = True
+                break
+            for name in spec.keys():
+                if str(name) not in block:
+                    missing = True
+                    break
+            if missing:
+                break
+        else:
+            missing = True
+            break
 
     # если не собрали все TF — skip
-    if errors or any(tf not in values_by_tf for tf in rt.mtf_component_tfs):
+    if errors or missing:
         boundary = calc_close_boundary_ts_ms(trigger_open_ts_ms, "m5")
         styk_m15 = is_tf_boundary(boundary, "m15")
         styk_h1 = is_tf_boundary(boundary, "h1")
@@ -1015,7 +1100,6 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
             published,
             skipped,
         )
-
 
 # 🔸 Обработка одного события indicator_stream (status=ready)
 async def handle_indicator_ready(redis, msg: dict[str, str]) -> None:
