@@ -24,11 +24,12 @@ TF_STEP_MINUTES = {
 
 
 # 🔸 Простейший контейнер контекста live-воркера
-def init_lr_universal_live(
+async def init_lr_universal_live(
     signals: List[Dict[str, Any]],
     pg,
     redis,
 ) -> Dict[str, Any]:
+
     # подготовка контекста для live-обработчика lr_universal
     if not signals:
         raise RuntimeError("init_lr_universal_live: empty signals list")
