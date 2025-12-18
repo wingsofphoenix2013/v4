@@ -23,35 +23,27 @@ TF_STEP_MINUTES = {
 }
 
 
-# 🔸 Простейший контейнер контекста live-воркера
+# 🔸 Инициализация live-контекста (один ctx на key=lr_universal)
 async def init_lr_universal_live(
     signals: List[Dict[str, Any]],
     pg,
     redis,
 ) -> Dict[str, Any]:
-
     # подготовка контекста для live-обработчика lr_universal
     if not signals:
         raise RuntimeError("init_lr_universal_live: empty signals list")
 
-    # собираем настройки по каждому инстансу сигнала
     cfgs: List[Dict[str, Any]] = []
 
-    # определяем базовые общие параметры (ожидаем одинаковые для long/short)
     timeframe = None
     lr_instance_id = None
-    indicator_base = None
-    param_angle = None
-    param_upper = None
-    param_lower = None
-    param_center = None
 
     for s in signals:
         sid = int(s.get("id") or 0)
         tf = str(s.get("timeframe") or "").strip().lower()
         params = s.get("params") or {}
 
-        # извлекаем обязательные параметры
+        # читаем обязательные параметры
         try:
             lr_cfg = params["indicator"]
             lr_id = int(lr_cfg.get("value"))
@@ -75,7 +67,7 @@ async def init_lr_universal_live(
         except Exception:
             raise RuntimeError(f"init_lr_universal_live: signal_id={sid} missing/invalid param 'message'")
 
-        # параметры стратегии (повторяем логику backfill)
+        # параметры bounce (как в backfill)
         trend_cfg = params.get("trend_type")
         trend_type = str((trend_cfg or {}).get("value") or "agnostic").strip().lower()
         if trend_type not in ("trend", "counter", "agnostic"):
@@ -108,7 +100,6 @@ async def init_lr_universal_live(
             }
         )
 
-        # общие параметры фиксируем по первому сигналу
         if timeframe is None:
             timeframe = tf
         if lr_instance_id is None:
@@ -128,7 +119,7 @@ async def init_lr_universal_live(
                 f"init_lr_universal_live: mixed lr_instance_id in signals (got {c['lr_instance_id']} vs {lr_instance_id})"
             )
 
-    # вычисляем indicator_base по правилам indicators_v4 (base = f"{indicator}{length}" если есть length)
+    # правила naming: indicators_v4 compute_and_store -> base = f"{indicator}{length}" если length в params
     ind_inst = get_indicator_instance(int(lr_instance_id))
     if not ind_inst:
         raise RuntimeError(f"init_lr_universal_live: indicator instance_id={lr_instance_id} not found in cache")
@@ -137,7 +128,6 @@ async def init_lr_universal_live(
     ind_params = ind_inst.get("params") or {}
 
     if indicator == "macd":
-        # не наш кейс, но сохраняем логику naming из indicators_v4
         fast = str(ind_params.get("fast") or "").strip()
         indicator_base = f"{indicator}{fast}" if fast else indicator
     elif "length" in ind_params:
@@ -149,7 +139,7 @@ async def init_lr_universal_live(
     else:
         indicator_base = indicator
 
-    # имена параметров LR (как в indicators_v4)
+    # имена параметров LR
     param_angle = f"{indicator_base}_angle"
     param_upper = f"{indicator_base}_upper"
     param_lower = f"{indicator_base}_lower"
@@ -187,6 +177,9 @@ async def init_lr_universal_live(
             "messages_total": 0,
             "sent_total": 0,
             "ignored_total": 0,
+            "ignored_wrong_indicator": 0,
+            "ignored_wrong_tf": 0,
+            "ignored_not_ready": 0,
             "errors_total": 0,
         },
     }
@@ -199,7 +192,7 @@ async def handle_lr_universal_indicator_ready(
     pg,
     redis,
 ) -> List[Dict[str, Any]]:
-    # входной контракт indicator_stream (compute_and_store): symbol, indicator(base), timeframe, open_time, status
+    # входной контракт indicator_stream: symbol, indicator(base), timeframe, open_time, status
     live_signals: List[Dict[str, Any]] = []
 
     tf_expected = str(ctx.get("timeframe") or "m5")
@@ -211,10 +204,9 @@ async def handle_lr_universal_indicator_ready(
     open_time_iso = (fields.get("open_time") or "").strip()
     status = (fields.get("status") or "").strip().lower()
 
-    # увеличиваем счётчик сообщений (не критично, даже если есть гонки)
     ctx["counters"]["messages_total"] = int(ctx["counters"].get("messages_total", 0)) + 1
 
-    # минимальная валидация ключевых полей (иначе нечего писать в bt_signals_live)
+    # минимальная валидация ключевых полей
     if not symbol or not open_time_iso or not timeframe:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         log.error(
@@ -233,7 +225,7 @@ async def handle_lr_universal_indicator_ready(
         )
         return []
 
-    # правила фильтрации: всё, что не подходит — игнорируем и пишем в журнал
+    # 🔸 Жёсткая фильтрация: "чужие" события не пишем в БД (чтобы не раздувать журнал)
     ignore_reason: Optional[str] = None
     if status != "ready":
         ignore_reason = "ignored_not_ready"
@@ -243,45 +235,25 @@ async def handle_lr_universal_indicator_ready(
         ignore_reason = "ignored_wrong_indicator"
 
     if ignore_reason:
-        details = {
-            "reason": ignore_reason,
-            "event": {
-                "symbol": symbol,
-                "indicator": indicator_base,
-                "timeframe": timeframe,
-                "open_time": open_time_iso,
-                "status": status,
-            },
-            "expected": {
-                "indicator": base_expected,
-                "timeframe": tf_expected,
-                "status": "ready",
-            },
-        }
-
-        # пишем в журнал для каждого инстанса (long/short)
-        for scfg in ctx.get("signals") or []:
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=int(scfg["signal_id"]),
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status=ignore_reason,
-                details=details,
-            )
-
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
+
+        if ignore_reason == "ignored_wrong_indicator":
+            ctx["counters"]["ignored_wrong_indicator"] = int(ctx["counters"].get("ignored_wrong_indicator", 0)) + 1
+        elif ignore_reason == "ignored_wrong_tf":
+            ctx["counters"]["ignored_wrong_tf"] = int(ctx["counters"].get("ignored_wrong_tf", 0)) + 1
+        elif ignore_reason == "ignored_not_ready":
+            ctx["counters"]["ignored_not_ready"] = int(ctx["counters"].get("ignored_not_ready", 0)) + 1
+
         return []
 
-    # получаем prev_time и таймштампы в ms
+    # prev_time и ts_ms
     step_delta: timedelta = ctx["step_delta"]
     prev_time = open_time - step_delta
 
     ts_ms = _to_ms_utc(open_time)
     prev_ms = _to_ms_utc(prev_time)
 
-    # читаем OHLCV (close) и LR-канал из Redis TS (строго по двум точкам prev/curr)
+    # 🔸 Читаем OHLCV (close) и LR-канал из Redis TS по prev/curr
     close_key = BB_TS_CLOSE_KEY.format(symbol=symbol, tf=tf_expected)
 
     angle_name = str(ctx["param_angle"])
@@ -294,7 +266,6 @@ async def handle_lr_universal_indicator_ready(
     lower_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=lower_name)
     center_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=center_name)
 
-    # используем pipeline для скорости
     pipe = redis.pipeline()
     # close prev/curr
     pipe.execute_command("TS.RANGE", close_key, prev_ms, prev_ms)
@@ -305,7 +276,7 @@ async def handle_lr_universal_indicator_ready(
     # LR: angle/center curr
     pipe.execute_command("TS.RANGE", angle_key, ts_ms, ts_ms)
     pipe.execute_command("TS.RANGE", center_key, ts_ms, ts_ms)
-    # LR: upper/lower curr (для details, не обязательно для условий, но полезно)
+    # LR: upper/lower curr (для details)
     pipe.execute_command("TS.RANGE", upper_key, ts_ms, ts_ms)
     pipe.execute_command("TS.RANGE", lower_key, ts_ms, ts_ms)
 
@@ -346,7 +317,7 @@ async def handle_lr_universal_indicator_ready(
 
         return []
 
-    # распаковываем результаты pipeline
+    # распаковка
     close_prev = _extract_ts_value(res[0])
     close_curr = _extract_ts_value(res[1])
     upper_prev = _extract_ts_value(res[2])
@@ -369,6 +340,7 @@ async def handle_lr_universal_indicator_ready(
         missing.append("angle_curr")
     if center_curr is None:
         missing.append("center_curr")
+
     if missing:
         details = {
             "reason": "data_missing",
@@ -402,14 +374,13 @@ async def handle_lr_universal_indicator_ready(
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return []
 
-    # precision цены для raw_message/details
+    # precision цены
     ticker_info = get_ticker_info(symbol) or {}
     try:
         precision_price = int(ticker_info.get("precision_price") or 8)
     except Exception:
         precision_price = 8
 
-    # общие вычисления для оценки bounce
     H = float(upper_prev) - float(lower_prev)
 
     base_details = {
@@ -441,7 +412,7 @@ async def handle_lr_universal_indicator_ready(
         },
     }
 
-    # оцениваем по каждому инстансу (long и short) и формируем live-сигналы
+    # 🔸 Один read → два решения (long и short)
     for scfg in ctx.get("signals") or []:
         signal_id = int(scfg["signal_id"])
         direction = str(scfg["direction"])
@@ -452,9 +423,9 @@ async def handle_lr_universal_indicator_ready(
 
         # условия достаточности
         if H <= 0:
+            passed = False
             eval_status = "data_missing"
             eval_extra = {"reason": "invalid_channel_height", "H": float(H)}
-            passed = False
         else:
             passed, eval_status, eval_extra = _evaluate_lr_bounce(
                 direction=direction,
@@ -487,7 +458,6 @@ async def handle_lr_universal_indicator_ready(
             },
         }
 
-        # пишем в журнал (idempotent) и решаем — публиковать ли сигнал
         should_send = await _upsert_live_log(
             pg=pg,
             signal_id=signal_id,
@@ -547,14 +517,17 @@ async def handle_lr_universal_indicator_ready(
                 message,
             )
 
-    # суммарный лог раз в ~100 сообщений (примерно), чтобы не спамить
+    # 🔸 Суммарный лог (без записи в БД по ignored_wrong_indicator)
     total = int(ctx["counters"].get("messages_total", 0))
-    if total % 100 == 0:
+    if total % 200 == 0:
         log.info(
-            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, sent=%s, ignored=%s, errors=%s",
+            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, sent=%s, ignored=%s (wrong_ind=%s, wrong_tf=%s, not_ready=%s), errors=%s",
             total,
             int(ctx["counters"].get("sent_total", 0)),
             int(ctx["counters"].get("ignored_total", 0)),
+            int(ctx["counters"].get("ignored_wrong_indicator", 0)),
+            int(ctx["counters"].get("ignored_wrong_tf", 0)),
+            int(ctx["counters"].get("ignored_not_ready", 0)),
             int(ctx["counters"].get("errors_total", 0)),
         )
 
@@ -586,7 +559,7 @@ def _evaluate_lr_bounce(
         long_trend_ok = True
         short_trend_ok = True
 
-    # правила bounce long
+    # LONG bounce
     if direction == "long":
         if not long_trend_ok:
             return False, "rejected_trend", {"angle_curr": angle_curr, "trend_type": trend_type}
@@ -609,7 +582,7 @@ def _evaluate_lr_bounce(
 
         return True, "signal_sent", {"threshold": threshold}
 
-    # правила bounce short
+    # SHORT bounce
     if direction == "short":
         if not short_trend_ok:
             return False, "rejected_trend", {"angle_curr": angle_curr, "trend_type": trend_type}
@@ -632,7 +605,6 @@ def _evaluate_lr_bounce(
 
         return True, "signal_sent", {"threshold": threshold}
 
-    # неизвестное направление
     return False, "error", {"reason": "unknown_direction", "direction": direction}
 
 
@@ -646,7 +618,6 @@ async def _upsert_live_log(
     status: str,
     details: Dict[str, Any],
 ) -> bool:
-    # если запись вставлена/обновлена и status='signal_sent' — можно отправлять сигнал
     payload = json.dumps(details, ensure_ascii=False)
 
     async with pg.acquire() as conn:
@@ -670,10 +641,8 @@ async def _upsert_live_log(
         )
 
     if not rows:
-        # конфликт с уже отправленным сигналом (status='signal_sent'), ничего не делаем
         return False
 
-    # если мы реально вставили/обновили и итоговый статус 'signal_sent' — можно публиковать
     try:
         st = str(rows[0]["status"] or "")
     except Exception:
@@ -698,7 +667,7 @@ def _to_ms_utc(dt_naive_utc: datetime) -> int:
 # 🔸 Извлечение одного значения из TS.RANGE ответа
 def _extract_ts_value(ts_range_result: Any) -> Optional[float]:
     try:
-        # ожидаем формат: [[timestamp, "value"]] или []
+        # формат: [[timestamp, "value"]] или []
         if not ts_range_result:
             return None
         point = ts_range_result[0]
@@ -710,7 +679,7 @@ def _extract_ts_value(ts_range_result: Any) -> Optional[float]:
         return None
 
 
-# 🔸 Округление цены для удобства логов/details
+# 🔸 Округление цены для логов/details
 def _round_price(value: float, precision_price: int) -> float:
     try:
         return float(f"{value:.{int(precision_price)}f}")
