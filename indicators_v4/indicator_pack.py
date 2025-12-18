@@ -1223,7 +1223,7 @@ async def handle_mtf_pack(redis, rt: PackRuntime, symbol: str, trigger_open_ts_m
 
     # суммирующий лог на одно ready-событие
     if published or skipped:
-        log.info(
+        log.debug(
             "PACK_MTF: done (symbol=%s, trigger=%s/%s, analysis_id=%s, published=%s, skipped=%s)",
             symbol,
             trigger_tf,
