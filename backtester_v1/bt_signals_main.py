@@ -1,4 +1,4 @@
-# bt_signals_main.py — оркестратор псевдо-сигналов backtester_v1
+# bt_signals_main.py — оркестратор псевдо-сигналов backtester_v1 (backfill + live)
 
 import asyncio
 import logging
@@ -13,9 +13,15 @@ from backtester_config import get_enabled_signals
 # 🔸 Воркеры таймерных backfill-сигналов
 from signals.bt_signals_lr_universal import run_lr_universal_backfill
 
+# 🔸 Live-воркер LR universal (indicator_stream → live signals)
+from signals.bt_signals_lr_universal_live import (
+    init_lr_universal_live,
+    handle_lr_universal_indicator_ready,
+)
+
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60      # старт через минуту после запуска backtester_v1
-BT_TIMER_BACKFILL_INTERVAL_SEC = 7200      # повторный запуск полного цикла раз в Х секунд
+BT_TIMER_BACKFILL_INTERVAL_SEC = 7200       # повторный запуск полного цикла раз в Х секунд
 
 # 🔸 Настройки стримовых backfill-сигналов (по умолчанию)
 BT_STREAM_BACKFILL_BATCH_SIZE = 10
@@ -24,6 +30,9 @@ BT_STREAM_BACKFILL_BLOCK_MS = 5000
 # 🔸 Настройки live-сигналов (по умолчанию)
 BT_LIVE_STREAM_BATCH_SIZE = 100
 BT_LIVE_STREAM_BLOCK_MS = 5000
+
+# 🔸 Ограничение параллельной обработки live-сообщений (важно для скорости)
+BT_LIVE_MAX_CONCURRENCY = 50
 
 
 # 🔸 Типы обработчиков сигналов
@@ -46,17 +55,17 @@ TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
 }
 
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
-# сейчас заглушка — реестр пустой, но код оркестрации уже готов
 STREAM_BACKFILL_HANDLERS: Dict[str, StreamBackfillHandler] = {
     # пример для будущего:
     # "ema_cross_rsislope": run_emacross_rsislope_backfill,
 }
 
 # 🔸 Реестр live-сигналов: key → LiveSignalHandler(init, handle)
-# сейчас заглушка — реестр пустой, но код оркестрации уже готов
 LIVE_SIGNAL_HANDLERS: Dict[str, LiveSignalHandler] = {
-    # пример для будущего:
-    # "ema_cross_rsislope": LiveSignalHandler(init_emacross_rsislope_live, handle_emacross_rsislope_indicator_event),
+    "lr_universal": LiveSignalHandler(
+        init=init_lr_universal_live,
+        handle=handle_lr_universal_indicator_ready,
+    ),
 }
 
 
@@ -140,6 +149,7 @@ async def run_bt_signals_orchestrator(pg, redis):
 
         # 🔸 2) Стримовые backfill-сигналы — стартуют от сообщений в стриме
         if is_backfill and schedule_type == "stream":
+            # stream_key: backfill_stream_key или stream_key
             stream_key_cfg = (
                 params.get("backfill_stream_key")
                 or params.get("stream_key")
@@ -511,7 +521,7 @@ async def _run_stream_backfill_dispatcher(
             await asyncio.sleep(2)
 
 
-# 🔸 Универсальный live-диспетчер по stream_key
+# 🔸 Универсальный live-диспетчер по stream_key (параллельная обработка сообщений)
 async def _run_live_stream_dispatcher(
     stream_key: str,
     signals_for_stream: List[Dict[str, Any]],
@@ -541,6 +551,7 @@ async def _run_live_stream_dispatcher(
         if key in ctx_by_key:
             continue
 
+        # один ctx на ключ, init получает список сигналов с этим key (например long+short)
         try:
             ctx = await handler_cfg.init(
                 [s for s in signals_for_stream if str(s.get("key") or "").strip().lower() == key],
@@ -569,7 +580,72 @@ async def _run_live_stream_dispatcher(
         while True:
             await asyncio.sleep(60)
 
-    # основной цикл чтения стрима и маршрутизации в бизнес-логику
+    # ограничение параллелизма по сообщениям (важно для скорости и стабильности)
+    sema = asyncio.Semaphore(BT_LIVE_MAX_CONCURRENCY)
+
+    async def _process_one_live_message(msg_id: str, fields: Dict[str, Any]) -> int:
+        # обработка одного сообщения + ack (старые/повторные события не догоняем, поэтому ack всегда)
+        async with sema:
+            # нормализуем поля в str-словарь
+            str_fields: Dict[str, str] = {}
+            for k, v in fields.items():
+                key_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                val_str = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                str_fields[key_str] = val_str
+
+            produced = 0
+
+            try:
+                # вызываем бизнес-логику live по всем ключам, для которых есть контекст
+                for signal in signals_for_stream:
+                    key = str(signal.get("key") or "").strip().lower()
+                    handler_cfg = LIVE_SIGNAL_HANDLERS.get(key)
+                    if handler_cfg is None:
+                        continue
+
+                    ctx = ctx_by_key.get(key)
+                    if ctx is None:
+                        continue
+
+                    try:
+                        live_signals = await handler_cfg.handle(
+                            ctx,
+                            str_fields,
+                            pg,
+                            redis,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "BT_SIGNALS_LIVE: ошибка обработки live-сообщения stream_id=%s для key=%s: %s, fields=%s",
+                            msg_id,
+                            key,
+                            e,
+                            str_fields,
+                            exc_info=True,
+                        )
+                        live_signals = []
+
+                    for live_sig in live_signals:
+                        await _publish_live_signal(live_sig, pg, redis)
+                        produced += 1
+
+            finally:
+                # помечаем сообщение как обработанное (включая ошибки)
+                try:
+                    await redis.xack(stream_key, group_name, msg_id)
+                except Exception as e:
+                    log.error(
+                        "BT_SIGNALS_LIVE: не удалось xack stream_id=%s (stream=%s, group=%s): %s",
+                        msg_id,
+                        stream_key,
+                        group_name,
+                        e,
+                        exc_info=True,
+                    )
+
+            return produced
+
+    # основной цикл чтения стрима и параллельной маршрутизации
     while True:
         try:
             entries = await redis.xreadgroup(
@@ -583,8 +659,11 @@ async def _run_live_stream_dispatcher(
             if not entries:
                 continue
 
+            batch_started_at = datetime.utcnow()
             total_msgs = 0
             total_signals = 0
+
+            msg_tasks: List[asyncio.Task] = []
 
             for raw_stream_key, messages in entries:
                 if isinstance(raw_stream_key, bytes):
@@ -598,61 +677,36 @@ async def _run_live_stream_dispatcher(
                         msg_id = msg_id.decode("utf-8")
 
                     total_msgs += 1
+                    msg_tasks.append(
+                        asyncio.create_task(
+                            _process_one_live_message(msg_id, fields),
+                            name=f"BT_SIG_LIVE_MSG_{stream_key}_{msg_id}",
+                        )
+                    )
 
-                    # нормализуем поля в str-словарь
-                    str_fields: Dict[str, str] = {}
-                    for k, v in fields.items():
-                        key_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
-                        val_str = v.decode("utf-8") if isinstance(v, bytes) else str(v)
-                        str_fields[key_str] = val_str
+            if msg_tasks:
+                results = await asyncio.gather(*msg_tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        continue
+                    total_signals += int(r)
 
-                    # вызываем бизнес-логику live по всем ключам, для которых есть контекст
-                    for signal in signals_for_stream:
-                        key = str(signal.get("key") or "").strip().lower()
-                        handler_cfg = LIVE_SIGNAL_HANDLERS.get(key)
-                        if handler_cfg is None:
-                            continue
-
-                        ctx = ctx_by_key.get(key)
-                        if ctx is None:
-                            continue
-
-                        try:
-                            live_signals = await handler_cfg.handle(
-                                ctx,
-                                str_fields,
-                                pg,
-                                redis,
-                            )
-                        except Exception as e:
-                            log.error(
-                                "BT_SIGNALS_LIVE: ошибка обработки live-сообщения stream_id=%s для key=%s: %s, fields=%s",
-                                msg_id,
-                                key,
-                                e,
-                                str_fields,
-                                exc_info=True,
-                            )
-                            live_signals = []
-
-                        for live_sig in live_signals:
-                            await _publish_live_signal(live_sig, pg, redis)
-                            total_signals += 1
-
-                    # помечаем сообщение как обработанное
-                    await redis.xack(stream_key, group_name, msg_id)
+            duration_ms = int((datetime.utcnow() - batch_started_at).total_seconds() * 1000)
 
             log.debug(
-                "BT_SIGNALS_LIVE: пакет сообщений обработан — сообщений=%s, сгенерировано_live_сигналов=%s",
+                "BT_SIGNALS_LIVE: пакет сообщений обработан — сообщений=%s, сгенерировано_live_сигналов=%s, duration_ms=%s",
                 total_msgs,
                 total_signals,
+                duration_ms,
             )
 
-            if total_signals > 0:
+            if total_msgs > 0:
                 log.info(
-                    "BT_SIGNALS_LIVE: обработан пакет live-сообщений: сообщений=%s, live-сигналов=%s",
+                    "BT_SIGNALS_LIVE: обработан live-пакет (stream=%s): сообщений=%s, live-сигналов=%s, duration_ms=%s",
+                    stream_key,
                     total_msgs,
                     total_signals,
+                    duration_ms,
                 )
 
         except Exception as e:
@@ -726,7 +780,7 @@ async def _publish_live_signal(
         bar_time_iso = open_time.isoformat()
         now_iso = datetime.utcnow().isoformat()
 
-        # публикация в signals_stream
+        # публикация в signals_stream (signals_v4 consumer)
         await redis.xadd(
             "signals_stream",
             {
