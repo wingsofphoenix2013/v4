@@ -24,6 +24,7 @@ from packs.rsimfi_mtf import RsiMfiMtfPack
 from packs.supertrend_mtf import SupertrendMtfPack
 from packs.lr_mtf import LrMtfPack
 from packs.bb_mtf import BbMtfPack
+from packs.lr_angle_mtf import LrAngleMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
@@ -92,6 +93,7 @@ PACK_WORKERS = {
     "supertrend_mtf": SupertrendMtfPack,
     "lr_mtf": LrMtfPack,
     "bb_mtf": BbMtfPack,
+    "lr_angle_mtf": LrAngleMtfPack,
 }
 
 # 🔸 Глобальный реестр pack-инстансов, готовых к работе
