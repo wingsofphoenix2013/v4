@@ -24,7 +24,7 @@ IND_PACK_STATIC_KEY = "ind_pack:{analysis_id}:{direction}:{symbol}:{timeframe}"
 IND_PACK_PAIR_KEY = "ind_pack:{analysis_id}:{scenario_id}:{signal_id}:{direction}:{symbol}:{timeframe}"
 
 # 🔸 Настройки ожидания ключей для filtered (общий дедлайн на комплект)
-FILTER_WAIT_TOTAL_SEC = 60
+FILTER_WAIT_TOTAL_SEC = 90
 FILTER_WAIT_STEP_SEC = 5
 
 # 🔸 Защита от “догоняющих” сигналов (не обрабатываем фильтрацию, если событие уже слишком старое)
