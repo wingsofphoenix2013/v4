@@ -234,20 +234,28 @@ def get_pairs(bins_policy: dict[str, Any] | None) -> list[tuple[int, int]]:
         uniq.append(p)
     return uniq
 
-
 # 🔸 Приведение param_name к indicator_stream.indicator (base)
 def get_stream_indicator_key(family_key: str, param_name: str) -> str:
-    # если нет '_' — совпадает как есть
-    if "_" not in param_name:
-        return param_name
+    pname = str(param_name or "").strip()
+    if not pname:
+        return ""
 
-    # adx_dmi{len}_adx -> adx_dmi{len}
+    # если нет '_' — совпадает как есть
+    if "_" not in pname:
+        return pname
+
+    # adx_dmi: base = adx_dmi{len}; параметры могут быть:
+    # - adx_dmi14            -> adx_dmi14
+    # - adx_dmi14_adx        -> adx_dmi14
+    # - adx_dmi14_plus_di    -> adx_dmi14
+    # - adx_dmi14_minus_di   -> adx_dmi14
     if family_key == "adx_dmi":
-        return param_name.rsplit("_", 1)[0]
+        if pname.endswith("_plus_di") or pname.endswith("_minus_di") or pname.endswith("_adx"):
+            return pname.rsplit("_", 1)[0]
+        return pname
 
     # bb20_2_0_upper -> bb20, macd12_macd_hist -> macd12, lr50_angle -> lr50, supertrend10_3_0_trend -> supertrend10
-    return param_name.split("_", 1)[0]
-
+    return pname.split("_", 1)[0]
 
 # 🔸 Парсинг open_time ISO (UTC-naive) -> ts_ms
 def parse_open_time_to_ts_ms(open_time: str | None) -> int | None:
