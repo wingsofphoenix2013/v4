@@ -1,20 +1,21 @@
-# bt_signals_lr_universal_live.py — live-воркер LR universal bounce + (опционально) mirror-фильтрация по bad bins (ind_pack + bt_analysis_bins_labels)
+# bt_signals_lr_universal_live.py — live-воркер LR universal bounce (raw) + mirror-фильтрация (filtered) без блокировки потока indicator_stream
 
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# 🔸 Кеши backtester_v1 (инстансы индикаторов + тикеры/precision)
+# 🔸 Кеши backtester_v1
 from backtester_config import get_indicator_instance, get_ticker_info
 
-# 🔸 Кеш bad bins для mirror-фильтрации
+# 🔸 Кеш bad-bins для mirror-фильтрации
 from bt_signals_cache_config import get_mirror_bad_cache, load_initial_mirror_caches
 
 log = logging.getLogger("BT_SIG_LR_UNI_LIVE")
 
-# 🔸 RedisTimeSeries ключи (источники)
+# 🔸 RedisTimeSeries ключи
 BB_TS_CLOSE_KEY = "bb:ts:{symbol}:{tf}:c"
 IND_TS_KEY = "ts_ind:{symbol}:{tf}:{param_name}"
 
@@ -22,16 +23,20 @@ IND_TS_KEY = "ts_ind:{symbol}:{tf}:{param_name}"
 IND_PACK_STATIC_KEY = "ind_pack:{analysis_id}:{direction}:{symbol}:{timeframe}"
 IND_PACK_PAIR_KEY = "ind_pack:{analysis_id}:{scenario_id}:{signal_id}:{direction}:{symbol}:{timeframe}"
 
-# 🔸 Тайминги ожидания ind_pack
+# 🔸 Настройки ожидания ключей для filtered (общий дедлайн на комплект)
 FILTER_WAIT_TOTAL_SEC = 60
 FILTER_WAIT_STEP_SEC = 5
 
-# 🔸 Шаг таймфрейма (в минутах)
-TF_STEP_MINUTES = {
-    "m5": 5,
-    "m15": 15,
-    "h1": 60,
-}
+# 🔸 Защита от “догоняющих” сигналов (не обрабатываем фильтрацию, если событие уже слишком старое)
+FILTER_STALE_MAX_SEC = 90
+
+# 🔸 Ограничение ресурсов фильтрации
+FILTER_MAX_CONCURRENCY = 50
+FILTER_QUEUE_MAXSIZE = 500
+FILTER_WORKERS = 20
+
+# 🔸 Таймшаги TF (в минутах)
+TF_STEP_MINUTES = {"m5": 5}
 
 
 # 🔸 Инициализация live-контекста (один ctx на key=lr_universal)
@@ -47,7 +52,6 @@ async def init_lr_universal_live(
 
     timeframe = None
     lr_instance_id = None
-
     raw_cnt = 0
     filt_cnt = 0
 
@@ -71,9 +75,7 @@ async def init_lr_universal_live(
             raise RuntimeError(f"init_lr_universal_live: signal_id={sid} missing/invalid param 'direction_mask'")
 
         if direction not in ("long", "short"):
-            raise RuntimeError(
-                f"init_lr_universal_live: signal_id={sid} invalid direction_mask={direction} (expected long/short)"
-            )
+            raise RuntimeError(f"init_lr_universal_live: signal_id={sid} invalid direction_mask={direction}")
 
         # message
         try:
@@ -108,7 +110,6 @@ async def init_lr_universal_live(
 
         ms_cfg = params.get("mirror_scenario_id")
         mi_cfg = params.get("mirror_signal_id")
-
         if ms_cfg and mi_cfg:
             try:
                 mirror_scenario_id = int(ms_cfg.get("value"))
@@ -144,7 +145,7 @@ async def init_lr_universal_live(
         if lr_instance_id is None:
             lr_instance_id = lr_id
 
-    # валидация
+    # условия достаточности
     if timeframe is None or timeframe != "m5":
         raise RuntimeError(f"init_lr_universal_live: unsupported timeframe={timeframe} (expected m5)")
 
@@ -154,7 +155,7 @@ async def init_lr_universal_live(
         if c["lr_instance_id"] != lr_instance_id:
             raise RuntimeError("init_lr_universal_live: mixed lr_instance_id in signals")
 
-    # rules naming: indicators_v4 base = f"{indicator}{length}" if length exists
+    # indicator naming: base = f"{indicator}{length}" (как в indicators_v4)
     ind_inst = get_indicator_instance(int(lr_instance_id))
     if not ind_inst:
         raise RuntimeError(f"init_lr_universal_live: indicator instance_id={lr_instance_id} not found in cache")
@@ -182,21 +183,36 @@ async def init_lr_universal_live(
     step_min = TF_STEP_MINUTES.get(timeframe, 0)
     if step_min <= 0:
         raise RuntimeError(f"init_lr_universal_live: unknown timeframe step for tf={timeframe}")
-    step_delta = timedelta(minutes=step_min)
+
+    # фильтрация: очередь + воркеры
+    filter_queue: asyncio.Queue = asyncio.Queue(maxsize=FILTER_QUEUE_MAXSIZE)
+    filter_sema = asyncio.Semaphore(FILTER_MAX_CONCURRENCY)
+
+    filter_workers: List[asyncio.Task] = []
+    for i in range(FILTER_WORKERS):
+        task = asyncio.create_task(
+            _filter_worker_loop(pg, redis, filter_queue, filter_sema),
+            name=f"BT_LR_UNI_FILTER_WORKER_{i}",
+        )
+        filter_workers.append(task)
 
     log.info(
-        "BT_SIG_LR_UNI_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, lr_instance_id=%s, indicator_base=%s",
+        "BT_SIG_LR_UNI_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, lr_instance_id=%s, indicator_base=%s, "
+        "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
         len(cfgs),
         raw_cnt,
         filt_cnt,
         timeframe,
         lr_instance_id,
         indicator_base,
+        FILTER_WORKERS,
+        FILTER_QUEUE_MAXSIZE,
+        FILTER_MAX_CONCURRENCY,
     )
 
     return {
         "timeframe": timeframe,
-        "step_delta": step_delta,
+        "step_delta": timedelta(minutes=step_min),
         "lr_instance_id": int(lr_instance_id),
         "indicator_base": indicator_base,
         "param_angle": param_angle,
@@ -204,21 +220,23 @@ async def init_lr_universal_live(
         "param_lower": param_lower,
         "param_center": param_center,
         "signals": cfgs,
+        "filter_queue": filter_queue,
+        "filter_workers": filter_workers,
         "counters": {
             "messages_total": 0,
-            "sent_total": 0,
+            "raw_sent_total": 0,
+            "filtered_sent_total": 0,
             "blocked_bad": 0,
-            "blocked_missing": 0,
+            "blocked_timeout": 0,
+            "dropped_stale": 0,
+            "dropped_overload": 0,
             "ignored_total": 0,
-            "ignored_wrong_indicator": 0,
-            "ignored_wrong_tf": 0,
-            "ignored_not_ready": 0,
             "errors_total": 0,
         },
     }
 
 
-# 🔸 Обработка одного ready-сообщения из indicator_stream
+# 🔸 Обработка одного ready-сообщения из indicator_stream (быстро, без ожиданий)
 async def handle_lr_universal_indicator_ready(
     ctx: Dict[str, Any],
     fields: Dict[str, str],
@@ -238,38 +256,21 @@ async def handle_lr_universal_indicator_ready(
 
     ctx["counters"]["messages_total"] = int(ctx["counters"].get("messages_total", 0)) + 1
 
-    # базовая валидация
+    # условия достаточности
     if not symbol or not open_time_iso or not timeframe:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        log.error("BT_SIG_LR_UNI_LIVE: ignored_missing_fields — fields=%s", fields)
         return []
 
     open_time = _parse_open_time_iso(open_time_iso)
     if open_time is None:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        log.error("BT_SIG_LR_UNI_LIVE: ignored_invalid_open_time — symbol=%s, open_time=%s", symbol, open_time_iso)
         return []
 
-    # 🔸 Жёсткая фильтрация входного события (в БД не пишем, чтобы не раздувать)
-    ignore_reason: Optional[str] = None
-    if status != "ready":
-        ignore_reason = "ignored_not_ready"
-    elif timeframe != tf_expected:
-        ignore_reason = "ignored_wrong_tf"
-    elif indicator_base != base_expected:
-        ignore_reason = "ignored_wrong_indicator"
-
-    if ignore_reason:
+    # жёсткая фильтрация входного события (в журнал не пишем, чтобы не раздувать)
+    if status != "ready" or timeframe != tf_expected or indicator_base != base_expected:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        if ignore_reason == "ignored_wrong_indicator":
-            ctx["counters"]["ignored_wrong_indicator"] = int(ctx["counters"].get("ignored_wrong_indicator", 0)) + 1
-        elif ignore_reason == "ignored_wrong_tf":
-            ctx["counters"]["ignored_wrong_tf"] = int(ctx["counters"].get("ignored_wrong_tf", 0)) + 1
-        elif ignore_reason == "ignored_not_ready":
-            ctx["counters"]["ignored_not_ready"] = int(ctx["counters"].get("ignored_not_ready", 0)) + 1
         return []
 
-    # prev_time и ts_ms
     step_delta: timedelta = ctx["step_delta"]
     prev_time = open_time - step_delta
 
@@ -290,31 +291,26 @@ async def handle_lr_universal_indicator_ready(
     center_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=center_name)
 
     pipe = redis.pipeline()
-    # close prev/curr
-    pipe.execute_command("TS.RANGE", close_key, prev_ms, prev_ms)
-    pipe.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)
-    # upper/lower prev
-    pipe.execute_command("TS.RANGE", upper_key, prev_ms, prev_ms)
-    pipe.execute_command("TS.RANGE", lower_key, prev_ms, prev_ms)
-    # angle/center curr
-    pipe.execute_command("TS.RANGE", angle_key, ts_ms, ts_ms)
-    pipe.execute_command("TS.RANGE", center_key, ts_ms, ts_ms)
-    # upper/lower curr (для details)
-    pipe.execute_command("TS.RANGE", upper_key, ts_ms, ts_ms)
-    pipe.execute_command("TS.RANGE", lower_key, ts_ms, ts_ms)
+    pipe.execute_command("TS.RANGE", close_key, prev_ms, prev_ms)   # close_prev
+    pipe.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)       # close_curr
+    pipe.execute_command("TS.RANGE", upper_key, prev_ms, prev_ms)   # upper_prev
+    pipe.execute_command("TS.RANGE", lower_key, prev_ms, prev_ms)   # lower_prev
+    pipe.execute_command("TS.RANGE", angle_key, ts_ms, ts_ms)       # angle_curr
+    pipe.execute_command("TS.RANGE", center_key, ts_ms, ts_ms)      # center_curr
+    pipe.execute_command("TS.RANGE", upper_key, ts_ms, ts_ms)       # upper_curr (details)
+    pipe.execute_command("TS.RANGE", lower_key, ts_ms, ts_ms)       # lower_curr (details)
 
     try:
         res = await pipe.execute()
     except Exception as e:
         ctx["counters"]["errors_total"] = int(ctx["counters"].get("errors_total", 0)) + 1
         log.error(
-            "BT_SIG_LR_UNI_LIVE: error_redis_pipeline — symbol=%s, open_time=%s, err=%s",
+            "BT_SIG_LR_UNI_LIVE: redis pipeline error — symbol=%s, open_time=%s, err=%s",
             symbol,
             open_time_iso,
             e,
             exc_info=True,
         )
-        await _log_error_for_all(pg, ctx, symbol, timeframe, open_time, fields, str(e))
         return []
 
     close_prev = _extract_ts_value(res[0])
@@ -341,24 +337,12 @@ async def handle_lr_universal_indicator_ready(
         missing.append("center_curr")
 
     if missing:
+        # пишем в журнал по всем инстансам только 1 раз (на случай диагностики TS дыр)
         details = {
+            "event": {"status": status, "symbol": symbol, "indicator": indicator_base, "open_time": open_time_iso, "timeframe": timeframe},
             "reason": "data_missing",
             "missing": missing,
-            "event": {
-                "symbol": symbol,
-                "indicator": indicator_base,
-                "timeframe": timeframe,
-                "open_time": open_time_iso,
-                "status": status,
-            },
-            "ts": {
-                "prev_time": prev_time.isoformat(),
-                "open_time": open_time.isoformat(),
-                "prev_ms": prev_ms,
-                "ts_ms": ts_ms,
-            },
         }
-
         for scfg in ctx.get("signals") or []:
             await _upsert_live_log(
                 pg=pg,
@@ -369,11 +353,9 @@ async def handle_lr_universal_indicator_ready(
                 status="data_missing",
                 details=details,
             )
-
-        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return []
 
-    # precision цены
+    # precision цены для деталей
     ticker_info = get_ticker_info(symbol) or {}
     try:
         precision_price = int(ticker_info.get("precision_price") or 8)
@@ -383,31 +365,20 @@ async def handle_lr_universal_indicator_ready(
     H = float(upper_prev) - float(lower_prev)
 
     base_details = {
-        "event": {
-            "symbol": symbol,
-            "indicator": indicator_base,
-            "timeframe": timeframe,
-            "open_time": open_time_iso,
-            "status": status,
-        },
-        "ts": {
-            "prev_time": prev_time.isoformat(),
-            "open_time": open_time.isoformat(),
-            "prev_ms": prev_ms,
-            "ts_ms": ts_ms,
-        },
+        "event": {"status": status, "symbol": symbol, "indicator": indicator_base, "open_time": open_time_iso, "timeframe": timeframe},
+        "ts": {"ts_ms": ts_ms, "prev_ms": prev_ms, "open_time": open_time.isoformat(), "prev_time": prev_time.isoformat()},
         "ohlcv": {
             "close_prev": _round_price(float(close_prev), precision_price),
             "close_curr": _round_price(float(close_curr), precision_price),
         },
         "lr": {
+            "H": float(H),
             "angle_curr": float(angle_curr),
             "upper_prev": float(upper_prev),
             "lower_prev": float(lower_prev),
             "center_curr": float(center_curr),
             "upper_curr": float(upper_curr) if upper_curr is not None else None,
             "lower_curr": float(lower_curr) if lower_curr is not None else None,
-            "H": float(H),
         },
     }
 
@@ -424,7 +395,7 @@ async def handle_lr_universal_indicator_ready(
         mirror_scenario_id = scfg.get("mirror_scenario_id")
         mirror_signal_id = scfg.get("mirror_signal_id")
 
-        # условия достаточности
+        # bounce
         if H <= 0:
             passed = False
             eval_status = "data_missing"
@@ -444,7 +415,7 @@ async def handle_lr_universal_indicator_ready(
                 H=float(H),
             )
 
-        # если bounce не прошёл — просто пишем журнал и идём дальше
+        # bounce не прошёл — просто журнал и дальше
         if not passed:
             details = {
                 **base_details,
@@ -456,18 +427,10 @@ async def handle_lr_universal_indicator_ready(
                     "zone_k": zone_k,
                     "keep_half": keep_half,
                     "filtered": is_filtered,
-                    "mirror": {
-                        "scenario_id": mirror_scenario_id,
-                        "signal_id": mirror_signal_id,
-                    } if is_filtered else None,
+                    "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id} if is_filtered else None,
                 },
-                "result": {
-                    "passed": False,
-                    "status": eval_status,
-                    "extra": eval_extra,
-                },
+                "result": {"passed": False, "status": eval_status, "extra": eval_extra},
             }
-
             await _upsert_live_log(
                 pg=pg,
                 signal_id=signal_id,
@@ -479,26 +442,14 @@ async def handle_lr_universal_indicator_ready(
             )
             continue
 
-        # ✅ bounce прошёл — теперь либо raw, либо filtered
+        # bounce прошёл
         if not is_filtered:
+            # raw — публикуем через bt_signals_main (возвращаем payload), журнал как раньше
             details = {
                 **base_details,
-                "signal": {
-                    "signal_id": signal_id,
-                    "direction": direction,
-                    "message": message,
-                    "trend_type": trend_type,
-                    "zone_k": zone_k,
-                    "keep_half": keep_half,
-                    "filtered": False,
-                },
-                "result": {
-                    "passed": True,
-                    "status": "signal_sent",
-                    "extra": eval_extra,
-                },
+                "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filtered": False},
+                "result": {"passed": True, "status": "signal_sent"},
             }
-
             should_send = await _upsert_live_log(
                 pg=pg,
                 signal_id=signal_id,
@@ -508,17 +459,16 @@ async def handle_lr_universal_indicator_ready(
                 status="signal_sent",
                 details=details,
             )
-
             if should_send:
                 live_signals.append(
-                    _build_live_signal_payload(
-                        signal_id=signal_id,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        direction=direction,
-                        open_time=open_time,
-                        message=message,
-                        raw_message={
+                    {
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "direction": direction,
+                        "open_time": open_time,
+                        "message": message,
+                        "raw_message": {
                             "signal_id": signal_id,
                             "symbol": symbol,
                             "timeframe": timeframe,
@@ -528,22 +478,34 @@ async def handle_lr_universal_indicator_ready(
                             "source": "backtester_v1",
                             "mode": "live_raw",
                         },
-                    )
+                    }
                 )
-                ctx["counters"]["sent_total"] = int(ctx["counters"].get("sent_total", 0)) + 1
-                log.info(
-                    "BT_SIG_LR_UNI_LIVE: signal_sent (raw) — signal_id=%s, symbol=%s, dir=%s, time=%s, msg=%s",
-                    signal_id,
-                    symbol,
-                    direction,
-                    open_time_iso,
-                    message,
-                )
+                ctx["counters"]["raw_sent_total"] = int(ctx["counters"].get("raw_sent_total", 0)) + 1
             continue
 
-        # filtered path
+        # filtered — создаём кандидат и отдаём в очередь (не блокируем поток)
         if mirror_scenario_id is None or mirror_signal_id is None:
-            # конфиг сломан — консервативно блокируем
+            details = {
+                **base_details,
+                "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filtered": True},
+                "filter": {"reason": "missing_mirror_params"},
+            }
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="blocked_missing_keys_timeout",
+                details=details,
+            )
+            ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
+            continue
+
+        # “не догоняем”: если событие уже старое — сразу дропаем (не ждём ключи)
+        now_utc = datetime.utcnow().replace(tzinfo=None)
+        age_sec = (now_utc - open_time).total_seconds()
+        if age_sec > FILTER_STALE_MAX_SEC:
             details = {
                 **base_details,
                 "signal": {
@@ -551,9 +513,12 @@ async def handle_lr_universal_indicator_ready(
                     "direction": direction,
                     "message": message,
                     "filtered": True,
+                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
                 },
                 "filter": {
-                    "reason": "missing_mirror_params",
+                    "rule": "dropped_stale_backlog",
+                    "age_sec": float(age_sec),
+                    "stale_max_sec": FILTER_STALE_MAX_SEC,
                 },
             }
             await _upsert_live_log(
@@ -562,21 +527,88 @@ async def handle_lr_universal_indicator_ready(
                 symbol=symbol,
                 timeframe=timeframe,
                 open_time=open_time,
-                status="blocked_missing_keys",
+                status="dropped_stale_backlog",
                 details=details,
             )
-            ctx["counters"]["blocked_missing"] = int(ctx["counters"].get("blocked_missing", 0)) + 1
+            ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
             continue
 
-        # подгружаем кеш mirror (если еще не загружен)
+        # кеш зеркала
         required_pairs, bad_bins_map = get_mirror_bad_cache(int(mirror_scenario_id), int(mirror_signal_id), direction)
         if required_pairs is None or bad_bins_map is None:
-            # попытка “самовосстановления”: загрузить initial caches (дешево, т.к. зеркало ограничено)
             await load_initial_mirror_caches(pg)
             required_pairs, bad_bins_map = get_mirror_bad_cache(int(mirror_scenario_id), int(mirror_signal_id), direction)
 
         if not required_pairs or not bad_bins_map:
-            # нечего проверять => не можем доказать безопасность => блокируем
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                },
+                "filter": {"reason": "mirror_cache_empty"},
+            }
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="blocked_missing_keys_timeout",
+                details=details,
+            )
+            ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
+            continue
+
+        candidate = {
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "open_time": open_time,
+            "direction": direction,
+            "message": message,
+            "mirror_scenario_id": int(mirror_scenario_id),
+            "mirror_signal_id": int(mirror_signal_id),
+            "required_pairs": set(required_pairs),
+            "bad_bins_map": {k: set(v) for k, v in bad_bins_map.items()},
+            "detected_at": now_utc,
+            "base_details": base_details,
+        }
+
+        # записываем, что начали ждать (это НЕ множит строки, т.к. unique key)
+        await _upsert_live_log(
+            pg=pg,
+            signal_id=signal_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            open_time=open_time,
+            status="filter_waiting",
+            details={
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                },
+                "filter": {
+                    "rule": "waiting_keys",
+                    "required_total": len(required_pairs),
+                    "deadline_sec": FILTER_WAIT_TOTAL_SEC,
+                    "step_sec": FILTER_WAIT_STEP_SEC,
+                },
+            },
+        )
+
+        # кладём в очередь (bounded)
+        q: asyncio.Queue = ctx["filter_queue"]
+        try:
+            q.put_nowait(candidate)
+        except asyncio.QueueFull:
             details = {
                 **base_details,
                 "signal": {
@@ -587,7 +619,8 @@ async def handle_lr_universal_indicator_ready(
                     "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
                 },
                 "filter": {
-                    "reason": "mirror_cache_empty",
+                    "rule": "dropped_overload",
+                    "queue_maxsize": FILTER_QUEUE_MAXSIZE,
                 },
             }
             await _upsert_live_log(
@@ -596,72 +629,65 @@ async def handle_lr_universal_indicator_ready(
                 symbol=symbol,
                 timeframe=timeframe,
                 open_time=open_time,
-                status="blocked_missing_keys",
+                status="dropped_overload",
                 details=details,
             )
-            ctx["counters"]["blocked_missing"] = int(ctx["counters"].get("blocked_missing", 0)) + 1
-            continue
+            ctx["counters"]["dropped_overload"] = int(ctx["counters"].get("dropped_overload", 0)) + 1
 
-        # ждём ind_pack до 60 секунд, каждые 5 секунд
-        verdict, verdict_details = await _run_mirror_filter(
-            redis=redis,
-            symbol=symbol,
-            direction=direction,
-            mirror_scenario_id=int(mirror_scenario_id),
-            mirror_signal_id=int(mirror_signal_id),
-            required_pairs=required_pairs,
-            bad_bins_map=bad_bins_map,
+    # суммирующий лог раз в 200 событий
+    total = int(ctx["counters"].get("messages_total", 0))
+    if total % 200 == 0:
+        log.info(
+            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, raw_sent=%s, filt_sent=%s, blocked_bad=%s, blocked_timeout=%s, dropped_stale=%s, dropped_overload=%s, errors=%s",
+            total,
+            int(ctx["counters"].get("raw_sent_total", 0)),
+            int(ctx["counters"].get("filtered_sent_total", 0)),
+            int(ctx["counters"].get("blocked_bad", 0)),
+            int(ctx["counters"].get("blocked_timeout", 0)),
+            int(ctx["counters"].get("dropped_stale", 0)),
+            int(ctx["counters"].get("dropped_overload", 0)),
+            int(ctx["counters"].get("errors_total", 0)),
         )
 
-        if verdict == "blocked_bad_bin":
-            details = {
-                **base_details,
-                "signal": {
-                    "signal_id": signal_id,
-                    "direction": direction,
-                    "message": message,
-                    "filtered": True,
-                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
-                },
-                "filter": verdict_details,
-            }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="blocked_bad_bin",
-                details=details,
-            )
-            ctx["counters"]["blocked_bad"] = int(ctx["counters"].get("blocked_bad", 0)) + 1
-            continue
+    return live_signals
 
-        if verdict == "blocked_missing_keys":
-            details = {
-                **base_details,
-                "signal": {
-                    "signal_id": signal_id,
-                    "direction": direction,
-                    "message": message,
-                    "filtered": True,
-                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
-                },
-                "filter": verdict_details,
-            }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="blocked_missing_keys",
-                details=details,
-            )
-            ctx["counters"]["blocked_missing"] = int(ctx["counters"].get("blocked_missing", 0)) + 1
-            continue
 
-        # verdict == allow
+# 🔸 Воркер фильтрации: отдельные задачи, дедлайн 60с (общий на комплект), без блокировки indicator_stream
+async def _filter_worker_loop(pg, redis, queue: asyncio.Queue, sema: asyncio.Semaphore) -> None:
+    while True:
+        candidate = await queue.get()
+        try:
+            async with sema:
+                await _process_filter_candidate(pg, redis, candidate)
+        except Exception as e:
+            log.error("BT_SIG_LR_UNI_LIVE: filter worker error: %s", e, exc_info=True)
+        finally:
+            queue.task_done()
+
+
+# 🔸 Обработка одного кандидата фильтра (1 сигнал) с дедлайном
+async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
+    signal_id = int(c["signal_id"])
+    symbol = str(c["symbol"])
+    timeframe = str(c["timeframe"])
+    open_time: datetime = c["open_time"]
+    direction = str(c["direction"])
+    message = str(c["message"])
+
+    mirror_scenario_id = int(c["mirror_scenario_id"])
+    mirror_signal_id = int(c["mirror_signal_id"])
+
+    required_pairs: Set[Tuple[int, str]] = set(c.get("required_pairs") or set())
+    bad_bins_map: Dict[Tuple[int, str], Set[str]] = c.get("bad_bins_map") or {}
+    detected_at: datetime = c.get("detected_at") or datetime.utcnow().replace(tzinfo=None)
+
+    base_details = c.get("base_details") or {}
+
+    started_at = datetime.utcnow().replace(tzinfo=None)
+    queue_delay_sec = (started_at - detected_at).total_seconds()
+
+    # если кандидат слишком “залежался” в очереди — не обрабатываем
+    if queue_delay_sec > FILTER_STALE_MAX_SEC:
         details = {
             **base_details,
             "signal": {
@@ -669,96 +695,33 @@ async def handle_lr_universal_indicator_ready(
                 "direction": direction,
                 "message": message,
                 "filtered": True,
-                "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
             },
-            "filter": verdict_details,
-            "result": {
-                "passed": True,
-                "status": "signal_sent",
+            "filter": {
+                "rule": "dropped_stale_backlog",
+                "queue_delay_sec": float(queue_delay_sec),
+                "stale_max_sec": FILTER_STALE_MAX_SEC,
             },
         }
+        await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_stale_backlog", details)
+        return
 
-        should_send = await _upsert_live_log(
-            pg=pg,
-            signal_id=signal_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            open_time=open_time,
-            status="signal_sent",
-            details=details,
-        )
-
-        if should_send:
-            live_signals.append(
-                _build_live_signal_payload(
-                    signal_id=signal_id,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    direction=direction,
-                    open_time=open_time,
-                    message=message,
-                    raw_message={
-                        "signal_id": signal_id,
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "open_time": open_time.isoformat(),
-                        "direction": direction,
-                        "message": message,
-                        "source": "backtester_v1",
-                        "mode": "live_filtered",
-                        "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
-                        "filter": verdict_details,
-                    },
-                )
-            )
-            ctx["counters"]["sent_total"] = int(ctx["counters"].get("sent_total", 0)) + 1
-            log.info(
-                "BT_SIG_LR_UNI_LIVE: signal_sent (filtered) — signal_id=%s, symbol=%s, dir=%s, time=%s, msg=%s mirror=%s:%s",
-                signal_id,
-                symbol,
-                direction,
-                open_time_iso,
-                message,
-                int(mirror_scenario_id),
-                int(mirror_signal_id),
-            )
-
-    # суммарный лог раз в 200 событий
-    total = int(ctx["counters"].get("messages_total", 0))
-    if total % 200 == 0:
-        log.info(
-            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, sent=%s, blocked_bad=%s, blocked_missing=%s, ignored=%s, errors=%s",
-            total,
-            int(ctx["counters"].get("sent_total", 0)),
-            int(ctx["counters"].get("blocked_bad", 0)),
-            int(ctx["counters"].get("blocked_missing", 0)),
-            int(ctx["counters"].get("ignored_total", 0)),
-            int(ctx["counters"].get("errors_total", 0)),
-        )
-
-    return live_signals
-
-
-# 🔸 Mirror-фильтр: ждём ind_pack, ищем bad, иначе разрешаем
-async def _run_mirror_filter(
-    redis,
-    symbol: str,
-    direction: str,
-    mirror_scenario_id: int,
-    mirror_signal_id: int,
-    required_pairs: Set[Tuple[int, str]],
-    bad_bins_map: Dict[Tuple[int, str], Set[str]],
-) -> Tuple[str, Dict[str, Any]]:
-    required_list = sorted(list(required_pairs), key=lambda x: (x[1], x[0]))
-    required_total = len(required_list)
+    deadline = detected_at + timedelta(seconds=FILTER_WAIT_TOTAL_SEC)
 
     found_bins: Dict[Tuple[int, str], str] = {}
     missing_pairs: Set[Tuple[int, str]] = set(required_pairs)
 
-    # пробуем до 60 секунд, каждые 5 секунд
-    attempts = FILTER_WAIT_TOTAL_SEC // FILTER_WAIT_STEP_SEC + 1
-    for attempt in range(attempts):
-        # читаем ind_pack для всех ещё missing
+    required_list = sorted(list(required_pairs), key=lambda x: (x[1], x[0]))
+    required_total = len(required_list)
+
+    attempt = 0
+
+    while True:
+        now = datetime.utcnow().replace(tzinfo=None)
+        if now > deadline:
+            break
+
+        # читаем missing пачкой
         if missing_pairs:
             newly_found = await _read_ind_pack_bins(
                 redis=redis,
@@ -769,51 +732,120 @@ async def _run_mirror_filter(
                 pairs=list(missing_pairs),
             )
 
-            for pair, bin_name in newly_found.items():
-                if bin_name is None:
+            for pair, bn in newly_found.items():
+                if bn is None:
                     continue
-                found_bins[pair] = bin_name
+                found_bins[pair] = bn
                 if pair in missing_pairs:
                     missing_pairs.remove(pair)
 
-        # проверяем bad по всем найденным
+        # bad-hit — сразу стоп
         for (aid, tf), bn in found_bins.items():
             bad_set = bad_bins_map.get((aid, tf)) or set()
             if bn in bad_set:
-                return "blocked_bad_bin", {
-                    "rule": "bad_hit",
+                details = {
+                    **base_details,
+                    "signal": {
+                        "signal_id": signal_id,
+                        "direction": direction,
+                        "message": message,
+                        "filtered": True,
+                        "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
+                    },
+                    "filter": {
+                        "rule": "bad_hit",
+                        "attempt": attempt,
+                        "required_total": required_total,
+                        "found_total": len(found_bins),
+                        "missing_total": len(missing_pairs),
+                        "hit": {"analysis_id": int(aid), "timeframe": tf, "bin_name": bn},
+                    },
+                }
+                await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_bad_bin", details)
+                return
+
+        # полный комплект и bad нет — пропускаем
+        if not missing_pairs:
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                    "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
+                },
+                "filter": {
+                    "rule": "no_bad_and_full_set",
                     "attempt": attempt,
                     "required_total": required_total,
                     "found_total": len(found_bins),
-                    "missing_total": len(missing_pairs),
-                    "hit": {"analysis_id": aid, "timeframe": tf, "bin_name": bn},
-                }
-
-        # если комплект собран и bad нет — разрешаем
-        if not missing_pairs:
-            return "allow", {
-                "rule": "no_bad_and_full_set",
-                "attempt": attempt,
-                "required_total": required_total,
-                "found_total": len(found_bins),
+                    "missing_total": 0,
+                },
+                "result": {"passed": True, "status": "signal_sent"},
             }
 
-        # ещё не собрались — ждём
-        if attempt < attempts - 1:
-            await asyncio.sleep(FILTER_WAIT_STEP_SEC)
+            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "signal_sent", details)
+            if should_send:
+                await _publish_to_signals_stream(redis, symbol, open_time, message)
+            return
 
-    # таймаут — блокируем
+        # ждём до следующего шага (если ещё есть время)
+        attempt += 1
+        await asyncio.sleep(FILTER_WAIT_STEP_SEC)
+
+    # timeout — блок
     missing_sorted = sorted(list(missing_pairs), key=lambda x: (x[1], x[0]))
-    return "blocked_missing_keys", {
-        "rule": "timeout_missing_keys",
-        "required_total": required_total,
-        "found_total": len(found_bins),
-        "missing_total": len(missing_pairs),
-        "missing_pairs": [{"analysis_id": a, "timeframe": tf} for a, tf in missing_sorted],
+    details = {
+        **base_details,
+        "signal": {
+            "signal_id": signal_id,
+            "direction": direction,
+            "message": message,
+            "filtered": True,
+            "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
+        },
+        "filter": {
+            "rule": "timeout_missing_keys",
+            "attempt": attempt,
+            "required_total": required_total,
+            "found_total": len(found_bins),
+            "missing_total": len(missing_pairs),
+            "missing_pairs": [{"analysis_id": int(a), "timeframe": tf} for a, tf in missing_sorted],
+        },
     }
+    await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
 
 
-# 🔸 Чтение ind_pack ключей (сначала pair-key, потом static-key), батчами через MGET
+# 🔸 Публикация filtered-live сигнала в signals_stream (без записи в bt_signals_values)
+async def _publish_to_signals_stream(redis, symbol: str, open_time: datetime, message: str) -> None:
+    now_iso = datetime.utcnow().isoformat()
+    bar_time_iso = open_time.isoformat()
+
+    try:
+        await redis.xadd(
+            "signals_stream",
+            {
+                "message": message,
+                "symbol": symbol,
+                "bar_time": bar_time_iso,
+                "sent_at": now_iso,
+                "received_at": now_iso,
+                "source": "backtester_v1",
+            },
+        )
+    except Exception as e:
+        log.error(
+            "BT_SIG_LR_UNI_LIVE: failed to publish to signals_stream: %s (symbol=%s, time=%s, msg=%s)",
+            e,
+            symbol,
+            bar_time_iso,
+            message,
+            exc_info=True,
+        )
+
+
+# 🔸 Чтение ind_pack ключей: сначала pair-key, потом static-key (батч MGET)
 async def _read_ind_pack_bins(
     redis,
     symbol: str,
@@ -978,54 +1010,6 @@ async def _upsert_live_log(
 
     st = str(rows[0]["status"] or "")
     return st == "signal_sent"
-
-
-# 🔸 Логирование ошибки для всех инстансов (редко, но удобно)
-async def _log_error_for_all(
-    pg,
-    ctx: Dict[str, Any],
-    symbol: str,
-    timeframe: str,
-    open_time: datetime,
-    fields: Dict[str, str],
-    err: str,
-) -> None:
-    details = {
-        "reason": "error",
-        "event": fields,
-        "error": err,
-    }
-    for scfg in ctx.get("signals") or []:
-        await _upsert_live_log(
-            pg=pg,
-            signal_id=int(scfg["signal_id"]),
-            symbol=symbol,
-            timeframe=timeframe,
-            open_time=open_time,
-            status="error",
-            details=details,
-        )
-
-
-# 🔸 Пакет для публикации наружу (его подхватит bt_signals_main -> _publish_live_signal)
-def _build_live_signal_payload(
-    signal_id: int,
-    symbol: str,
-    timeframe: str,
-    direction: str,
-    open_time: datetime,
-    message: str,
-    raw_message: Dict[str, Any],
-) -> Dict[str, Any]:
-    return {
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "direction": direction,
-        "open_time": open_time,
-        "message": message,
-        "raw_message": raw_message,
-    }
 
 
 # 🔸 Парсинг open_time ISO (UTC-naive)
