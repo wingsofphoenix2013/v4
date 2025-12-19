@@ -19,6 +19,8 @@ from backtester_config import (
 
 # 🔸 Оркестратор псевдо-сигналов
 from bt_signals_main import run_bt_signals_orchestrator
+# 🔸 Управление загрузки в кеш таблицы labels
+from bt_signals_cache_config import run_bt_signals_cache_watcher
 # 🔸 Оркестратор сценариев
 from bt_scenarios_main import run_bt_scenarios_orchestrator
 # 🔸 Постпроцессор сценариев
@@ -74,6 +76,7 @@ async def main():
     # запуск воркеров в безопасных циклах
     await asyncio.gather(
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
+        run_safe_loop(lambda: run_bt_signals_cache_watcher(pg, redis), "BT_SIGNALS_CACHE"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),

@@ -1,19 +1,30 @@
-# bt_signals_lr_universal_live.py — live-воркер LR universal bounce (trend/counter/agnostic) по indicator_stream на m5
+# bt_signals_lr_universal_live.py — live-воркер LR universal bounce + (опционально) mirror-фильтрация по bad bins (ind_pack + bt_analysis_bins_labels)
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 🔸 Кеши backtester_v1 (инстансы индикаторов + тикеры/precision)
 from backtester_config import get_indicator_instance, get_ticker_info
 
-# 🔸 Логгер модуля
+# 🔸 Кеш bad bins для mirror-фильтрации
+from bt_signals_cache_config import get_mirror_bad_cache, load_initial_mirror_caches
+
 log = logging.getLogger("BT_SIG_LR_UNI_LIVE")
 
 # 🔸 RedisTimeSeries ключи (источники)
 BB_TS_CLOSE_KEY = "bb:ts:{symbol}:{tf}:c"
 IND_TS_KEY = "ts_ind:{symbol}:{tf}:{param_name}"
+
+# 🔸 Redis ключи ind_pack
+IND_PACK_STATIC_KEY = "ind_pack:{analysis_id}:{direction}:{symbol}:{timeframe}"
+IND_PACK_PAIR_KEY = "ind_pack:{analysis_id}:{scenario_id}:{signal_id}:{direction}:{symbol}:{timeframe}"
+
+# 🔸 Тайминги ожидания ind_pack
+FILTER_WAIT_TOTAL_SEC = 60
+FILTER_WAIT_STEP_SEC = 5
 
 # 🔸 Шаг таймфрейма (в минутах)
 TF_STEP_MINUTES = {
@@ -29,7 +40,6 @@ async def init_lr_universal_live(
     pg,
     redis,
 ) -> Dict[str, Any]:
-    # подготовка контекста для live-обработчика lr_universal
     if not signals:
         raise RuntimeError("init_lr_universal_live: empty signals list")
 
@@ -38,36 +48,41 @@ async def init_lr_universal_live(
     timeframe = None
     lr_instance_id = None
 
+    raw_cnt = 0
+    filt_cnt = 0
+
     for s in signals:
         sid = int(s.get("id") or 0)
         tf = str(s.get("timeframe") or "").strip().lower()
         params = s.get("params") or {}
 
-        # читаем обязательные параметры
+        # indicator (LR instance_id)
         try:
             lr_cfg = params["indicator"]
             lr_id = int(lr_cfg.get("value"))
         except Exception:
             raise RuntimeError(f"init_lr_universal_live: signal_id={sid} missing/invalid param 'indicator'")
 
+        # direction
         try:
             dm_cfg = params["direction_mask"]
-            direction_mask = str(dm_cfg.get("value") or "").strip().lower()
+            direction = str(dm_cfg.get("value") or "").strip().lower()
         except Exception:
             raise RuntimeError(f"init_lr_universal_live: signal_id={sid} missing/invalid param 'direction_mask'")
 
-        if direction_mask not in ("long", "short"):
+        if direction not in ("long", "short"):
             raise RuntimeError(
-                f"init_lr_universal_live: signal_id={sid} invalid direction_mask={direction_mask} (expected long/short)"
+                f"init_lr_universal_live: signal_id={sid} invalid direction_mask={direction} (expected long/short)"
             )
 
+        # message
         try:
             msg_cfg = params["message"]
             message = str(msg_cfg.get("value") or "").strip()
         except Exception:
             raise RuntimeError(f"init_lr_universal_live: signal_id={sid} missing/invalid param 'message'")
 
-        # параметры bounce (как в backfill)
+        # bounce params
         trend_cfg = params.get("trend_type")
         trend_type = str((trend_cfg or {}).get("value") or "agnostic").strip().lower()
         if trend_type not in ("trend", "counter", "agnostic"):
@@ -87,16 +102,40 @@ async def init_lr_universal_live(
         keep_half_raw = str((keep_cfg or {}).get("value") or "").strip().lower()
         keep_half = keep_half_raw == "true"
 
+        # mirror params (optional)
+        mirror_scenario_id = None
+        mirror_signal_id = None
+
+        ms_cfg = params.get("mirror_scenario_id")
+        mi_cfg = params.get("mirror_signal_id")
+
+        if ms_cfg and mi_cfg:
+            try:
+                mirror_scenario_id = int(ms_cfg.get("value"))
+                mirror_signal_id = int(mi_cfg.get("value"))
+            except Exception:
+                mirror_scenario_id = None
+                mirror_signal_id = None
+
+        is_filtered = mirror_scenario_id is not None and mirror_signal_id is not None
+        if is_filtered:
+            filt_cnt += 1
+        else:
+            raw_cnt += 1
+
         cfgs.append(
             {
                 "signal_id": sid,
                 "timeframe": tf,
-                "direction": direction_mask,
+                "direction": direction,
                 "message": message,
                 "trend_type": trend_type,
                 "zone_k": zone_k,
                 "keep_half": keep_half,
                 "lr_instance_id": lr_id,
+                "mirror_scenario_id": mirror_scenario_id,
+                "mirror_signal_id": mirror_signal_id,
+                "is_filtered": is_filtered,
             }
         )
 
@@ -105,21 +144,17 @@ async def init_lr_universal_live(
         if lr_instance_id is None:
             lr_instance_id = lr_id
 
-    # базовая валидация консистентности пары long/short
+    # валидация
     if timeframe is None or timeframe != "m5":
         raise RuntimeError(f"init_lr_universal_live: unsupported timeframe={timeframe} (expected m5)")
 
     for c in cfgs:
         if c["timeframe"] != timeframe:
-            raise RuntimeError(
-                f"init_lr_universal_live: mixed timeframes in signals (got {c['timeframe']} vs {timeframe})"
-            )
+            raise RuntimeError("init_lr_universal_live: mixed timeframes in signals")
         if c["lr_instance_id"] != lr_instance_id:
-            raise RuntimeError(
-                f"init_lr_universal_live: mixed lr_instance_id in signals (got {c['lr_instance_id']} vs {lr_instance_id})"
-            )
+            raise RuntimeError("init_lr_universal_live: mixed lr_instance_id in signals")
 
-    # правила naming: indicators_v4 compute_and_store -> base = f"{indicator}{length}" если length в params
+    # rules naming: indicators_v4 base = f"{indicator}{length}" if length exists
     ind_inst = get_indicator_instance(int(lr_instance_id))
     if not ind_inst:
         raise RuntimeError(f"init_lr_universal_live: indicator instance_id={lr_instance_id} not found in cache")
@@ -139,28 +174,24 @@ async def init_lr_universal_live(
     else:
         indicator_base = indicator
 
-    # имена параметров LR
     param_angle = f"{indicator_base}_angle"
     param_upper = f"{indicator_base}_upper"
     param_lower = f"{indicator_base}_lower"
     param_center = f"{indicator_base}_center"
 
-    # шаг таймфрейма
     step_min = TF_STEP_MINUTES.get(timeframe, 0)
     if step_min <= 0:
         raise RuntimeError(f"init_lr_universal_live: unknown timeframe step for tf={timeframe}")
     step_delta = timedelta(minutes=step_min)
 
     log.info(
-        "BT_SIG_LR_UNI_LIVE: init ok — signals=%s, tf=%s, lr_instance_id=%s, indicator_base=%s, params=[%s,%s,%s,%s]",
+        "BT_SIG_LR_UNI_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, lr_instance_id=%s, indicator_base=%s",
         len(cfgs),
+        raw_cnt,
+        filt_cnt,
         timeframe,
         lr_instance_id,
         indicator_base,
-        param_angle,
-        param_upper,
-        param_lower,
-        param_center,
     )
 
     return {
@@ -176,6 +207,8 @@ async def init_lr_universal_live(
         "counters": {
             "messages_total": 0,
             "sent_total": 0,
+            "blocked_bad": 0,
+            "blocked_missing": 0,
             "ignored_total": 0,
             "ignored_wrong_indicator": 0,
             "ignored_wrong_tf": 0,
@@ -192,7 +225,6 @@ async def handle_lr_universal_indicator_ready(
     pg,
     redis,
 ) -> List[Dict[str, Any]]:
-    # входной контракт indicator_stream: symbol, indicator(base), timeframe, open_time, status
     live_signals: List[Dict[str, Any]] = []
 
     tf_expected = str(ctx.get("timeframe") or "m5")
@@ -206,26 +238,19 @@ async def handle_lr_universal_indicator_ready(
 
     ctx["counters"]["messages_total"] = int(ctx["counters"].get("messages_total", 0)) + 1
 
-    # минимальная валидация ключевых полей
+    # базовая валидация
     if not symbol or not open_time_iso or not timeframe:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        log.error(
-            "BT_SIG_LR_UNI_LIVE: ignored_missing_fields — fields=%s",
-            fields,
-        )
+        log.error("BT_SIG_LR_UNI_LIVE: ignored_missing_fields — fields=%s", fields)
         return []
 
     open_time = _parse_open_time_iso(open_time_iso)
     if open_time is None:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        log.error(
-            "BT_SIG_LR_UNI_LIVE: ignored_invalid_open_time — symbol=%s, open_time=%s",
-            symbol,
-            open_time_iso,
-        )
+        log.error("BT_SIG_LR_UNI_LIVE: ignored_invalid_open_time — symbol=%s, open_time=%s", symbol, open_time_iso)
         return []
 
-    # 🔸 Жёсткая фильтрация: "чужие" события не пишем в БД (чтобы не раздувать журнал)
+    # 🔸 Жёсткая фильтрация входного события (в БД не пишем, чтобы не раздувать)
     ignore_reason: Optional[str] = None
     if status != "ready":
         ignore_reason = "ignored_not_ready"
@@ -236,14 +261,12 @@ async def handle_lr_universal_indicator_ready(
 
     if ignore_reason:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-
         if ignore_reason == "ignored_wrong_indicator":
             ctx["counters"]["ignored_wrong_indicator"] = int(ctx["counters"].get("ignored_wrong_indicator", 0)) + 1
         elif ignore_reason == "ignored_wrong_tf":
             ctx["counters"]["ignored_wrong_tf"] = int(ctx["counters"].get("ignored_wrong_tf", 0)) + 1
         elif ignore_reason == "ignored_not_ready":
             ctx["counters"]["ignored_not_ready"] = int(ctx["counters"].get("ignored_not_ready", 0)) + 1
-
         return []
 
     # prev_time и ts_ms
@@ -253,7 +276,7 @@ async def handle_lr_universal_indicator_ready(
     ts_ms = _to_ms_utc(open_time)
     prev_ms = _to_ms_utc(prev_time)
 
-    # 🔸 Читаем OHLCV (close) и LR-канал из Redis TS по prev/curr
+    # 🔸 Читаем OHLCV close и LR-канал из Redis TS по prev/curr
     close_key = BB_TS_CLOSE_KEY.format(symbol=symbol, tf=tf_expected)
 
     angle_name = str(ctx["param_angle"])
@@ -270,13 +293,13 @@ async def handle_lr_universal_indicator_ready(
     # close prev/curr
     pipe.execute_command("TS.RANGE", close_key, prev_ms, prev_ms)
     pipe.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)
-    # LR: upper/lower prev
+    # upper/lower prev
     pipe.execute_command("TS.RANGE", upper_key, prev_ms, prev_ms)
     pipe.execute_command("TS.RANGE", lower_key, prev_ms, prev_ms)
-    # LR: angle/center curr
+    # angle/center curr
     pipe.execute_command("TS.RANGE", angle_key, ts_ms, ts_ms)
     pipe.execute_command("TS.RANGE", center_key, ts_ms, ts_ms)
-    # LR: upper/lower curr (для details)
+    # upper/lower curr (для details)
     pipe.execute_command("TS.RANGE", upper_key, ts_ms, ts_ms)
     pipe.execute_command("TS.RANGE", lower_key, ts_ms, ts_ms)
 
@@ -291,33 +314,9 @@ async def handle_lr_universal_indicator_ready(
             e,
             exc_info=True,
         )
-
-        details = {
-            "reason": "error",
-            "event": {
-                "symbol": symbol,
-                "indicator": indicator_base,
-                "timeframe": timeframe,
-                "open_time": open_time_iso,
-                "status": status,
-            },
-            "error": str(e),
-        }
-
-        for scfg in ctx.get("signals") or []:
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=int(scfg["signal_id"]),
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="error",
-                details=details,
-            )
-
+        await _log_error_for_all(pg, ctx, symbol, timeframe, open_time, fields, str(e))
         return []
 
-    # распаковка
     close_prev = _extract_ts_value(res[0])
     close_curr = _extract_ts_value(res[1])
     upper_prev = _extract_ts_value(res[2])
@@ -412,7 +411,7 @@ async def handle_lr_universal_indicator_ready(
         },
     }
 
-    # 🔸 Один read → два решения (long и short)
+    # 🔸 Один read → обработка всех инстансов (raw + filtered)
     for scfg in ctx.get("signals") or []:
         signal_id = int(scfg["signal_id"])
         direction = str(scfg["direction"])
@@ -420,6 +419,10 @@ async def handle_lr_universal_indicator_ready(
         trend_type = str(scfg["trend_type"])
         zone_k = float(scfg["zone_k"])
         keep_half = bool(scfg["keep_half"])
+
+        is_filtered = bool(scfg.get("is_filtered"))
+        mirror_scenario_id = scfg.get("mirror_scenario_id")
+        mirror_signal_id = scfg.get("mirror_signal_id")
 
         # условия достаточности
         if H <= 0:
@@ -441,20 +444,237 @@ async def handle_lr_universal_indicator_ready(
                 H=float(H),
             )
 
+        # если bounce не прошёл — просто пишем журнал и идём дальше
+        if not passed:
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "trend_type": trend_type,
+                    "zone_k": zone_k,
+                    "keep_half": keep_half,
+                    "filtered": is_filtered,
+                    "mirror": {
+                        "scenario_id": mirror_scenario_id,
+                        "signal_id": mirror_signal_id,
+                    } if is_filtered else None,
+                },
+                "result": {
+                    "passed": False,
+                    "status": eval_status,
+                    "extra": eval_extra,
+                },
+            }
+
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status=eval_status,
+                details=details,
+            )
+            continue
+
+        # ✅ bounce прошёл — теперь либо raw, либо filtered
+        if not is_filtered:
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "trend_type": trend_type,
+                    "zone_k": zone_k,
+                    "keep_half": keep_half,
+                    "filtered": False,
+                },
+                "result": {
+                    "passed": True,
+                    "status": "signal_sent",
+                    "extra": eval_extra,
+                },
+            }
+
+            should_send = await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="signal_sent",
+                details=details,
+            )
+
+            if should_send:
+                live_signals.append(
+                    _build_live_signal_payload(
+                        signal_id=signal_id,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        direction=direction,
+                        open_time=open_time,
+                        message=message,
+                        raw_message={
+                            "signal_id": signal_id,
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "open_time": open_time.isoformat(),
+                            "direction": direction,
+                            "message": message,
+                            "source": "backtester_v1",
+                            "mode": "live_raw",
+                        },
+                    )
+                )
+                ctx["counters"]["sent_total"] = int(ctx["counters"].get("sent_total", 0)) + 1
+                log.info(
+                    "BT_SIG_LR_UNI_LIVE: signal_sent (raw) — signal_id=%s, symbol=%s, dir=%s, time=%s, msg=%s",
+                    signal_id,
+                    symbol,
+                    direction,
+                    open_time_iso,
+                    message,
+                )
+            continue
+
+        # filtered path
+        if mirror_scenario_id is None or mirror_signal_id is None:
+            # конфиг сломан — консервативно блокируем
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                },
+                "filter": {
+                    "reason": "missing_mirror_params",
+                },
+            }
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="blocked_missing_keys",
+                details=details,
+            )
+            ctx["counters"]["blocked_missing"] = int(ctx["counters"].get("blocked_missing", 0)) + 1
+            continue
+
+        # подгружаем кеш mirror (если еще не загружен)
+        required_pairs, bad_bins_map = get_mirror_bad_cache(int(mirror_scenario_id), int(mirror_signal_id), direction)
+        if required_pairs is None or bad_bins_map is None:
+            # попытка “самовосстановления”: загрузить initial caches (дешево, т.к. зеркало ограничено)
+            await load_initial_mirror_caches(pg)
+            required_pairs, bad_bins_map = get_mirror_bad_cache(int(mirror_scenario_id), int(mirror_signal_id), direction)
+
+        if not required_pairs or not bad_bins_map:
+            # нечего проверять => не можем доказать безопасность => блокируем
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                },
+                "filter": {
+                    "reason": "mirror_cache_empty",
+                },
+            }
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="blocked_missing_keys",
+                details=details,
+            )
+            ctx["counters"]["blocked_missing"] = int(ctx["counters"].get("blocked_missing", 0)) + 1
+            continue
+
+        # ждём ind_pack до 60 секунд, каждые 5 секунд
+        verdict, verdict_details = await _run_mirror_filter(
+            redis=redis,
+            symbol=symbol,
+            direction=direction,
+            mirror_scenario_id=int(mirror_scenario_id),
+            mirror_signal_id=int(mirror_signal_id),
+            required_pairs=required_pairs,
+            bad_bins_map=bad_bins_map,
+        )
+
+        if verdict == "blocked_bad_bin":
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                },
+                "filter": verdict_details,
+            }
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="blocked_bad_bin",
+                details=details,
+            )
+            ctx["counters"]["blocked_bad"] = int(ctx["counters"].get("blocked_bad", 0)) + 1
+            continue
+
+        if verdict == "blocked_missing_keys":
+            details = {
+                **base_details,
+                "signal": {
+                    "signal_id": signal_id,
+                    "direction": direction,
+                    "message": message,
+                    "filtered": True,
+                    "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                },
+                "filter": verdict_details,
+            }
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                status="blocked_missing_keys",
+                details=details,
+            )
+            ctx["counters"]["blocked_missing"] = int(ctx["counters"].get("blocked_missing", 0)) + 1
+            continue
+
+        # verdict == allow
         details = {
             **base_details,
             "signal": {
                 "signal_id": signal_id,
                 "direction": direction,
                 "message": message,
-                "trend_type": trend_type,
-                "zone_k": zone_k,
-                "keep_half": keep_half,
+                "filtered": True,
+                "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
             },
+            "filter": verdict_details,
             "result": {
-                "passed": bool(passed),
-                "status": eval_status,
-                "extra": eval_extra,
+                "passed": True,
+                "status": "signal_sent",
             },
         }
 
@@ -464,77 +684,193 @@ async def handle_lr_universal_indicator_ready(
             symbol=symbol,
             timeframe=timeframe,
             open_time=open_time,
-            status=("signal_sent" if passed else eval_status),
+            status="signal_sent",
             details=details,
         )
 
-        if passed and should_send:
-            raw_message = {
-                "signal_id": signal_id,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "open_time": open_time.isoformat(),
-                "direction": direction,
-                "message": message,
-                "source": "backtester_v1",
-                "indicator_base": indicator_base,
-                "lr_instance_id": int(ctx.get("lr_instance_id") or 0),
-                "trend_type": trend_type,
-                "zone_k": float(zone_k),
-                "keep_half": bool(keep_half),
-                "lr": {
-                    "angle_curr": float(angle_curr),
-                    "upper_prev": float(upper_prev),
-                    "lower_prev": float(lower_prev),
-                    "center_curr": float(center_curr),
-                    "H": float(H),
-                },
-                "ohlcv": {
-                    "close_prev": _round_price(float(close_prev), precision_price),
-                    "close_curr": _round_price(float(close_curr), precision_price),
-                },
-            }
-
+        if should_send:
             live_signals.append(
-                {
-                    "signal_id": signal_id,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "direction": direction,
-                    "open_time": open_time,
-                    "message": message,
-                    "raw_message": raw_message,
-                }
+                _build_live_signal_payload(
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    direction=direction,
+                    open_time=open_time,
+                    message=message,
+                    raw_message={
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "open_time": open_time.isoformat(),
+                        "direction": direction,
+                        "message": message,
+                        "source": "backtester_v1",
+                        "mode": "live_filtered",
+                        "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                        "filter": verdict_details,
+                    },
+                )
             )
-
             ctx["counters"]["sent_total"] = int(ctx["counters"].get("sent_total", 0)) + 1
             log.info(
-                "BT_SIG_LR_UNI_LIVE: signal_sent — signal_id=%s, symbol=%s, dir=%s, time=%s, msg=%s",
+                "BT_SIG_LR_UNI_LIVE: signal_sent (filtered) — signal_id=%s, symbol=%s, dir=%s, time=%s, msg=%s mirror=%s:%s",
                 signal_id,
                 symbol,
                 direction,
                 open_time_iso,
                 message,
+                int(mirror_scenario_id),
+                int(mirror_signal_id),
             )
 
-    # 🔸 Суммарный лог (без записи в БД по ignored_wrong_indicator)
+    # суммарный лог раз в 200 событий
     total = int(ctx["counters"].get("messages_total", 0))
     if total % 200 == 0:
         log.info(
-            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, sent=%s, ignored=%s (wrong_ind=%s, wrong_tf=%s, not_ready=%s), errors=%s",
+            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, sent=%s, blocked_bad=%s, blocked_missing=%s, ignored=%s, errors=%s",
             total,
             int(ctx["counters"].get("sent_total", 0)),
+            int(ctx["counters"].get("blocked_bad", 0)),
+            int(ctx["counters"].get("blocked_missing", 0)),
             int(ctx["counters"].get("ignored_total", 0)),
-            int(ctx["counters"].get("ignored_wrong_indicator", 0)),
-            int(ctx["counters"].get("ignored_wrong_tf", 0)),
-            int(ctx["counters"].get("ignored_not_ready", 0)),
             int(ctx["counters"].get("errors_total", 0)),
         )
 
     return live_signals
 
 
-# 🔸 Оценка bounce по правилам backfill (1-в-1)
+# 🔸 Mirror-фильтр: ждём ind_pack, ищем bad, иначе разрешаем
+async def _run_mirror_filter(
+    redis,
+    symbol: str,
+    direction: str,
+    mirror_scenario_id: int,
+    mirror_signal_id: int,
+    required_pairs: Set[Tuple[int, str]],
+    bad_bins_map: Dict[Tuple[int, str], Set[str]],
+) -> Tuple[str, Dict[str, Any]]:
+    required_list = sorted(list(required_pairs), key=lambda x: (x[1], x[0]))
+    required_total = len(required_list)
+
+    found_bins: Dict[Tuple[int, str], str] = {}
+    missing_pairs: Set[Tuple[int, str]] = set(required_pairs)
+
+    # пробуем до 60 секунд, каждые 5 секунд
+    attempts = FILTER_WAIT_TOTAL_SEC // FILTER_WAIT_STEP_SEC + 1
+    for attempt in range(attempts):
+        # читаем ind_pack для всех ещё missing
+        if missing_pairs:
+            newly_found = await _read_ind_pack_bins(
+                redis=redis,
+                symbol=symbol,
+                direction=direction,
+                mirror_scenario_id=mirror_scenario_id,
+                mirror_signal_id=mirror_signal_id,
+                pairs=list(missing_pairs),
+            )
+
+            for pair, bin_name in newly_found.items():
+                if bin_name is None:
+                    continue
+                found_bins[pair] = bin_name
+                if pair in missing_pairs:
+                    missing_pairs.remove(pair)
+
+        # проверяем bad по всем найденным
+        for (aid, tf), bn in found_bins.items():
+            bad_set = bad_bins_map.get((aid, tf)) or set()
+            if bn in bad_set:
+                return "blocked_bad_bin", {
+                    "rule": "bad_hit",
+                    "attempt": attempt,
+                    "required_total": required_total,
+                    "found_total": len(found_bins),
+                    "missing_total": len(missing_pairs),
+                    "hit": {"analysis_id": aid, "timeframe": tf, "bin_name": bn},
+                }
+
+        # если комплект собран и bad нет — разрешаем
+        if not missing_pairs:
+            return "allow", {
+                "rule": "no_bad_and_full_set",
+                "attempt": attempt,
+                "required_total": required_total,
+                "found_total": len(found_bins),
+            }
+
+        # ещё не собрались — ждём
+        if attempt < attempts - 1:
+            await asyncio.sleep(FILTER_WAIT_STEP_SEC)
+
+    # таймаут — блокируем
+    missing_sorted = sorted(list(missing_pairs), key=lambda x: (x[1], x[0]))
+    return "blocked_missing_keys", {
+        "rule": "timeout_missing_keys",
+        "required_total": required_total,
+        "found_total": len(found_bins),
+        "missing_total": len(missing_pairs),
+        "missing_pairs": [{"analysis_id": a, "timeframe": tf} for a, tf in missing_sorted],
+    }
+
+
+# 🔸 Чтение ind_pack ключей (сначала pair-key, потом static-key), батчами через MGET
+async def _read_ind_pack_bins(
+    redis,
+    symbol: str,
+    direction: str,
+    mirror_scenario_id: int,
+    mirror_signal_id: int,
+    pairs: List[Tuple[int, str]],
+) -> Dict[Tuple[int, str], Optional[str]]:
+    # сначала pair-specific keys
+    pair_keys: List[str] = []
+    for aid, tf in pairs:
+        pair_keys.append(
+            IND_PACK_PAIR_KEY.format(
+                analysis_id=int(aid),
+                scenario_id=int(mirror_scenario_id),
+                signal_id=int(mirror_signal_id),
+                direction=str(direction),
+                symbol=symbol,
+                timeframe=str(tf),
+            )
+        )
+
+    res_pair = await redis.mget(pair_keys)
+
+    out: Dict[Tuple[int, str], Optional[str]] = {}
+    missing_static: List[Tuple[int, str]] = []
+
+    for (aid, tf), val in zip(pairs, res_pair):
+        if val is not None:
+            out[(aid, tf)] = str(val)
+        else:
+            out[(aid, tf)] = None
+            missing_static.append((aid, tf))
+
+    # затем static keys только для missing
+    if missing_static:
+        static_keys: List[str] = []
+        for aid, tf in missing_static:
+            static_keys.append(
+                IND_PACK_STATIC_KEY.format(
+                    analysis_id=int(aid),
+                    direction=str(direction),
+                    symbol=symbol,
+                    timeframe=str(tf),
+                )
+            )
+
+        res_static = await redis.mget(static_keys)
+
+        for (aid, tf), val in zip(missing_static, res_static):
+            if val is not None:
+                out[(aid, tf)] = str(val)
+
+    return out
+
+
+# 🔸 Оценка bounce (1-в-1 с backfill)
 def _evaluate_lr_bounce(
     direction: str,
     close_prev: float,
@@ -548,7 +884,6 @@ def _evaluate_lr_bounce(
     keep_half: bool,
     H: float,
 ) -> Tuple[bool, str, Dict[str, Any]]:
-    # условия по тренду
     if trend_type == "trend":
         long_trend_ok = angle_curr > 0.0
         short_trend_ok = angle_curr < 0.0
@@ -559,7 +894,6 @@ def _evaluate_lr_bounce(
         long_trend_ok = True
         short_trend_ok = True
 
-    # LONG bounce
     if direction == "long":
         if not long_trend_ok:
             return False, "rejected_trend", {"angle_curr": angle_curr, "trend_type": trend_type}
@@ -572,7 +906,7 @@ def _evaluate_lr_bounce(
             in_zone_prev = close_prev <= threshold
 
         if not in_zone_prev:
-            return False, "rejected_zone", {"close_prev": close_prev, "lower_prev": lower_prev, "threshold": threshold}
+            return False, "rejected_zone", {"threshold": threshold, "close_prev": close_prev, "lower_prev": lower_prev}
 
         if not (close_curr > lower_prev):
             return False, "no_bounce", {"close_curr": close_curr, "lower_prev": lower_prev}
@@ -582,7 +916,6 @@ def _evaluate_lr_bounce(
 
         return True, "signal_sent", {"threshold": threshold}
 
-    # SHORT bounce
     if direction == "short":
         if not short_trend_ok:
             return False, "rejected_trend", {"angle_curr": angle_curr, "trend_type": trend_type}
@@ -595,7 +928,7 @@ def _evaluate_lr_bounce(
             in_zone_prev = close_prev >= threshold
 
         if not in_zone_prev:
-            return False, "rejected_zone", {"close_prev": close_prev, "upper_prev": upper_prev, "threshold": threshold}
+            return False, "rejected_zone", {"threshold": threshold, "close_prev": close_prev, "upper_prev": upper_prev}
 
         if not (close_curr < upper_prev):
             return False, "no_bounce", {"close_curr": close_curr, "upper_prev": upper_prev}
@@ -643,11 +976,56 @@ async def _upsert_live_log(
     if not rows:
         return False
 
-    try:
-        st = str(rows[0]["status"] or "")
-    except Exception:
-        st = ""
+    st = str(rows[0]["status"] or "")
     return st == "signal_sent"
+
+
+# 🔸 Логирование ошибки для всех инстансов (редко, но удобно)
+async def _log_error_for_all(
+    pg,
+    ctx: Dict[str, Any],
+    symbol: str,
+    timeframe: str,
+    open_time: datetime,
+    fields: Dict[str, str],
+    err: str,
+) -> None:
+    details = {
+        "reason": "error",
+        "event": fields,
+        "error": err,
+    }
+    for scfg in ctx.get("signals") or []:
+        await _upsert_live_log(
+            pg=pg,
+            signal_id=int(scfg["signal_id"]),
+            symbol=symbol,
+            timeframe=timeframe,
+            open_time=open_time,
+            status="error",
+            details=details,
+        )
+
+
+# 🔸 Пакет для публикации наружу (его подхватит bt_signals_main -> _publish_live_signal)
+def _build_live_signal_payload(
+    signal_id: int,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    open_time: datetime,
+    message: str,
+    raw_message: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "open_time": open_time,
+        "message": message,
+        "raw_message": raw_message,
+    }
 
 
 # 🔸 Парсинг open_time ISO (UTC-naive)
@@ -667,14 +1045,12 @@ def _to_ms_utc(dt_naive_utc: datetime) -> int:
 # 🔸 Извлечение одного значения из TS.RANGE ответа
 def _extract_ts_value(ts_range_result: Any) -> Optional[float]:
     try:
-        # формат: [[timestamp, "value"]] или []
         if not ts_range_result:
             return None
         point = ts_range_result[0]
         if not point or len(point) < 2:
             return None
-        v = point[1]
-        return float(v)
+        return float(point[1])
     except Exception:
         return None
 
