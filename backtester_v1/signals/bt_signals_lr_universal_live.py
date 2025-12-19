@@ -502,9 +502,11 @@ async def handle_lr_universal_indicator_ready(
             ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
             continue
 
-        # “не догоняем”: если событие уже старое — сразу дропаем (не ждём ключи)
+        # “не догоняем”: stale считаем от close_time бара (open_time + step), а не от open_time
         now_utc = datetime.utcnow().replace(tzinfo=None)
-        age_sec = (now_utc - open_time).total_seconds()
+        decision_time = open_time + step_delta
+        age_sec = (now_utc - decision_time).total_seconds()
+
         if age_sec > FILTER_STALE_MAX_SEC:
             details = {
                 **base_details,
@@ -519,6 +521,7 @@ async def handle_lr_universal_indicator_ready(
                     "rule": "dropped_stale_backlog",
                     "age_sec": float(age_sec),
                     "stale_max_sec": FILTER_STALE_MAX_SEC,
+                    "decision_time": decision_time.isoformat(),
                 },
             }
             await _upsert_live_log(

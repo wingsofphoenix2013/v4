@@ -14,11 +14,9 @@ from backtester_config import get_enabled_signals
 from signals.bt_signals_lr_universal import run_lr_universal_backfill
 from signals.bt_signals_emacross import run_emacross_backfill
 
-# 🔸 Live-воркер LR universal (indicator_stream → live signals)
-from signals.bt_signals_lr_universal_live import (
-    init_lr_universal_live,
-    handle_lr_universal_indicator_ready,
-)
+# 🔸 Live-воркеры сигналов
+from signals.bt_signals_lr_universal_live import init_lr_universal_live, handle_lr_universal_indicator_ready
+from signals.bt_signals_emacross_live import init_emacross_live, handle_emacross_indicator_ready
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60      # старт через минуту после запуска backtester_v1
@@ -64,12 +62,9 @@ STREAM_BACKFILL_HANDLERS: Dict[str, StreamBackfillHandler] = {
 
 # 🔸 Реестр live-сигналов: key → LiveSignalHandler(init, handle)
 LIVE_SIGNAL_HANDLERS: Dict[str, LiveSignalHandler] = {
-    "lr_universal": LiveSignalHandler(
-        init=init_lr_universal_live,
-        handle=handle_lr_universal_indicator_ready,
-    ),
+    "lr_universal": LiveSignalHandler(init_lr_universal_live, handle_lr_universal_indicator_ready),
+    "emacross": LiveSignalHandler(init_emacross_live, handle_emacross_indicator_ready),
 }
-
 
 # 🔸 Оркестратор псевдо-сигналов: поднимает backfill и live-воркеры для всех включённых инстансов
 async def run_bt_signals_orchestrator(pg, redis):
@@ -703,7 +698,7 @@ async def _run_live_stream_dispatcher(
             )
 
             if total_msgs > 0:
-                log.info(
+                log.debug(
                     "BT_SIGNALS_LIVE: обработан live-пакет (stream=%s): сообщений=%s, live-сигналов=%s, duration_ms=%s",
                     stream_key,
                     total_msgs,
