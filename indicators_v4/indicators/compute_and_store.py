@@ -106,6 +106,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
             tasks.append(ts_add)
 
         # Redis Stream (core)
+        stream_precision = 5 if "angle" in param_name else precision
         tasks.append(redis.xadd("indicator_stream_core", {
             "symbol": symbol,
             "interval": timeframe,
@@ -113,7 +114,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
             "open_time": open_time_iso,
             "param_name": param_name,
             "value": str_value,
-            "precision": str(precision)
+            "precision": str(stream_precision)
         }))
 
     # Redis Stream (готовность)
