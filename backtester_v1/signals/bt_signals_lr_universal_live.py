@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -37,6 +36,58 @@ FILTER_WORKERS = 20
 
 # 🔸 Таймшаги TF (в минутах)
 TF_STEP_MINUTES = {"m5": 5}
+
+
+# 🔸 ind_pack JSON parser (Contract v1 + backward compatible)
+def _parse_ind_pack_value(raw: Optional[str]) -> Dict[str, Any]:
+    # returns: {"state": "absent|ok|fail", "bin_name": str|None, "reason": str|None, "details": dict|None}
+    if raw is None:
+        return {"state": "absent", "bin_name": None, "reason": None, "details": None}
+
+    s = str(raw)
+
+    # backward-compat: plain bin_name string
+    if not s.startswith("{"):
+        return {"state": "ok", "bin_name": s, "reason": None, "details": None}
+
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return {
+            "state": "fail",
+            "bin_name": None,
+            "reason": "invalid_input_value",
+            "details": {"kind": "invalid_json", "raw": s[:500]},
+        }
+
+    ok = obj.get("ok")
+    if ok is True:
+        bn = obj.get("bin_name")
+        if bn is None:
+            return {
+                "state": "fail",
+                "bin_name": None,
+                "reason": "internal_error",
+                "details": {"kind": "missing_bin_name"},
+            }
+        return {"state": "ok", "bin_name": str(bn), "reason": None, "details": None}
+
+    if ok is False:
+        reason = obj.get("reason")
+        details = obj.get("details")
+        return {
+            "state": "fail",
+            "bin_name": None,
+            "reason": str(reason) if reason is not None else "internal_error",
+            "details": details if isinstance(details, dict) else {},
+        }
+
+    return {
+        "state": "fail",
+        "bin_name": None,
+        "reason": "internal_error",
+        "details": {"kind": "invalid_payload_shape"},
+    }
 
 
 # 🔸 Инициализация live-контекста (один ctx на key=lr_universal)
@@ -337,7 +388,6 @@ async def handle_lr_universal_indicator_ready(
         missing.append("center_curr")
 
     if missing:
-        # пишем в журнал по всем инстансам только 1 раз (на случай диагностики TS дыр)
         details = {
             "event": {"status": status, "symbol": symbol, "indicator": indicator_base, "open_time": open_time_iso, "timeframe": timeframe},
             "reason": "data_missing",
@@ -355,7 +405,7 @@ async def handle_lr_universal_indicator_ready(
             )
         return []
 
-    # precision цены для деталей
+    # precision цены для details
     ticker_info = get_ticker_info(symbol) or {}
     try:
         precision_price = int(ticker_info.get("precision_price") or 8)
@@ -415,7 +465,7 @@ async def handle_lr_universal_indicator_ready(
                 H=float(H),
             )
 
-        # bounce не прошёл — просто журнал и дальше
+        # bounce не прошёл
         if not passed:
             details = {
                 **base_details,
@@ -431,34 +481,17 @@ async def handle_lr_universal_indicator_ready(
                 },
                 "result": {"passed": False, "status": eval_status, "extra": eval_extra},
             }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status=eval_status,
-                details=details,
-            )
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, eval_status, details)
             continue
 
         # bounce прошёл
         if not is_filtered:
-            # raw — публикуем через bt_signals_main (возвращаем payload), журнал как раньше
             details = {
                 **base_details,
                 "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filtered": False},
                 "result": {"passed": True, "status": "signal_sent"},
             }
-            should_send = await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="signal_sent",
-                details=details,
-            )
+            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "signal_sent", details)
             if should_send:
                 live_signals.append(
                     {
@@ -483,26 +516,18 @@ async def handle_lr_universal_indicator_ready(
                 ctx["counters"]["raw_sent_total"] = int(ctx["counters"].get("raw_sent_total", 0)) + 1
             continue
 
-        # filtered — создаём кандидат и отдаём в очередь (не блокируем поток)
+        # filtered — enqueue на фильтрацию
         if mirror_scenario_id is None or mirror_signal_id is None:
             details = {
                 **base_details,
                 "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filtered": True},
                 "filter": {"reason": "missing_mirror_params"},
             }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="blocked_missing_keys_timeout",
-                details=details,
-            )
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
             ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
             continue
 
-        # “не догоняем”: stale считаем от close_time бара (open_time + step), а не от open_time
+        # “не догоняем”: stale считаем от close_time бара (open_time + step)
         now_utc = datetime.utcnow().replace(tzinfo=None)
         decision_time = open_time + step_delta
         age_sec = (now_utc - decision_time).total_seconds()
@@ -524,15 +549,7 @@ async def handle_lr_universal_indicator_ready(
                     "decision_time": decision_time.isoformat(),
                 },
             }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="dropped_stale_backlog",
-                details=details,
-            )
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_stale_backlog", details)
             ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
             continue
 
@@ -554,15 +571,7 @@ async def handle_lr_universal_indicator_ready(
                 },
                 "filter": {"reason": "mirror_cache_empty"},
             }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="blocked_missing_keys_timeout",
-                details=details,
-            )
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
             ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
             continue
 
@@ -581,7 +590,6 @@ async def handle_lr_universal_indicator_ready(
             "base_details": base_details,
         }
 
-        # записываем, что начали ждать (это НЕ множит строки, т.к. unique key)
         await _upsert_live_log(
             pg=pg,
             signal_id=signal_id,
@@ -607,7 +615,6 @@ async def handle_lr_universal_indicator_ready(
             },
         )
 
-        # кладём в очередь (bounded)
         q: asyncio.Queue = ctx["filter_queue"]
         try:
             q.put_nowait(candidate)
@@ -621,41 +628,15 @@ async def handle_lr_universal_indicator_ready(
                     "filtered": True,
                     "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
                 },
-                "filter": {
-                    "rule": "dropped_overload",
-                    "queue_maxsize": FILTER_QUEUE_MAXSIZE,
-                },
+                "filter": {"rule": "dropped_overload", "queue_maxsize": FILTER_QUEUE_MAXSIZE},
             }
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                status="dropped_overload",
-                details=details,
-            )
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_overload", details)
             ctx["counters"]["dropped_overload"] = int(ctx["counters"].get("dropped_overload", 0)) + 1
-
-    # суммирующий лог раз в 200 событий
-    total = int(ctx["counters"].get("messages_total", 0))
-    if total % 200 == 0:
-        log.info(
-            "BT_SIG_LR_UNI_LIVE: summary — messages=%s, raw_sent=%s, filt_sent=%s, blocked_bad=%s, blocked_timeout=%s, dropped_stale=%s, dropped_overload=%s, errors=%s",
-            total,
-            int(ctx["counters"].get("raw_sent_total", 0)),
-            int(ctx["counters"].get("filtered_sent_total", 0)),
-            int(ctx["counters"].get("blocked_bad", 0)),
-            int(ctx["counters"].get("blocked_timeout", 0)),
-            int(ctx["counters"].get("dropped_stale", 0)),
-            int(ctx["counters"].get("dropped_overload", 0)),
-            int(ctx["counters"].get("errors_total", 0)),
-        )
 
     return live_signals
 
 
-# 🔸 Воркер фильтрации: отдельные задачи, дедлайн 60с (общий на комплект), без блокировки indicator_stream
+# 🔸 Воркер фильтрации: отдельные задачи, дедлайн (общий на комплект), без блокировки indicator_stream
 async def _filter_worker_loop(pg, redis, queue: asyncio.Queue, sema: asyncio.Semaphore) -> None:
     while True:
         candidate = await queue.get()
@@ -689,7 +670,6 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
     started_at = datetime.utcnow().replace(tzinfo=None)
     queue_delay_sec = (started_at - detected_at).total_seconds()
 
-    # если кандидат слишком “залежался” в очереди — не обрабатываем
     if queue_delay_sec > FILTER_STALE_MAX_SEC:
         details = {
             **base_details,
@@ -700,23 +680,21 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 "filtered": True,
                 "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
             },
-            "filter": {
-                "rule": "dropped_stale_backlog",
-                "queue_delay_sec": float(queue_delay_sec),
-                "stale_max_sec": FILTER_STALE_MAX_SEC,
-            },
+            "filter": {"rule": "dropped_stale_backlog", "queue_delay_sec": float(queue_delay_sec), "stale_max_sec": FILTER_STALE_MAX_SEC},
         }
         await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_stale_backlog", details)
         return
 
     deadline = detected_at + timedelta(seconds=FILTER_WAIT_TOTAL_SEC)
 
+    # only ok=true bins are used for bad-hit
     found_bins: Dict[Tuple[int, str], str] = {}
     missing_pairs: Set[Tuple[int, str]] = set(required_pairs)
 
-    required_list = sorted(list(required_pairs), key=lambda x: (x[1], x[0]))
-    required_total = len(required_list)
+    # explained failures: pair -> {source, reason, details}
+    explained: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
+    required_total = len(required_pairs)
     attempt = 0
 
     while True:
@@ -724,9 +702,8 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
         if now > deadline:
             break
 
-        # читаем missing пачкой
         if missing_pairs:
-            newly_found = await _read_ind_pack_bins(
+            states = await _read_ind_pack_states(
                 redis=redis,
                 symbol=symbol,
                 direction=direction,
@@ -735,14 +712,28 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 pairs=list(missing_pairs),
             )
 
-            for pair, bn in newly_found.items():
-                if bn is None:
-                    continue
-                found_bins[pair] = bn
-                if pair in missing_pairs:
-                    missing_pairs.remove(pair)
+            for pair, st in states.items():
+                state = str(st.get("state") or "absent")
 
-        # bad-hit — сразу стоп
+                if state == "ok":
+                    bn = st.get("bin_name")
+                    if bn is not None:
+                        found_bins[pair] = str(bn)
+                        missing_pairs.discard(pair)
+                        explained.pop(pair, None)
+                    continue
+
+                if state == "fail":
+                    explained[pair] = {
+                        "source": st.get("source"),
+                        "reason": st.get("reason"),
+                        "details": st.get("details"),
+                    }
+                    continue
+
+                continue
+
+        # bad-hit by any ok bin
         for (aid, tf), bn in found_bins.items():
             bad_set = bad_bins_map.get((aid, tf)) or set()
             if bn in bad_set:
@@ -760,14 +751,13 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                         "attempt": attempt,
                         "required_total": required_total,
                         "found_total": len(found_bins),
-                        "missing_total": len(missing_pairs),
+                        "missing_total": required_total - len(found_bins),
                         "hit": {"analysis_id": int(aid), "timeframe": tf, "bin_name": bn},
                     },
                 }
                 await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_bad_bin", details)
                 return
 
-        # полный комплект и bad нет — пропускаем
         if not missing_pairs:
             details = {
                 **base_details,
@@ -778,27 +768,36 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     "filtered": True,
                     "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
                 },
-                "filter": {
-                    "rule": "no_bad_and_full_set",
-                    "attempt": attempt,
-                    "required_total": required_total,
-                    "found_total": len(found_bins),
-                    "missing_total": 0,
-                },
+                "filter": {"rule": "no_bad_and_full_set", "attempt": attempt, "required_total": required_total},
                 "result": {"passed": True, "status": "signal_sent"},
             }
-
             should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "signal_sent", details)
             if should_send:
                 await _publish_to_signals_stream(redis, symbol, open_time, message)
             return
 
-        # ждём до следующего шага (если ещё есть время)
         attempt += 1
         await asyncio.sleep(FILTER_WAIT_STEP_SEC)
 
-    # timeout — блок
-    missing_sorted = sorted(list(missing_pairs), key=lambda x: (x[1], x[0]))
+    # timeout → blocked_missing_keys_timeout with absent vs explained
+    missing_absent: List[Tuple[int, str]] = []
+    missing_explained: List[Dict[str, Any]] = []
+
+    for pair in sorted(list(missing_pairs), key=lambda x: (x[1], x[0])):
+        if pair in explained:
+            info = explained.get(pair) or {}
+            missing_explained.append(
+                {
+                    "analysis_id": int(pair[0]),
+                    "timeframe": str(pair[1]),
+                    "source": info.get("source"),
+                    "reason": info.get("reason"),
+                    "details": info.get("details"),
+                }
+            )
+        else:
+            missing_absent.append(pair)
+
     details = {
         **base_details,
         "signal": {
@@ -813,8 +812,9 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             "attempt": attempt,
             "required_total": required_total,
             "found_total": len(found_bins),
-            "missing_total": len(missing_pairs),
-            "missing_pairs": [{"analysis_id": int(a), "timeframe": tf} for a, tf in missing_sorted],
+            "missing_total": required_total - len(found_bins),
+            "missing_absent": [{"analysis_id": int(a), "timeframe": tf} for a, tf in missing_absent],
+            "missing_explained": missing_explained,
         },
     }
     await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
@@ -848,16 +848,15 @@ async def _publish_to_signals_stream(redis, symbol: str, open_time: datetime, me
         )
 
 
-# 🔸 Чтение ind_pack ключей: сначала pair-key, потом static-key (батч MGET)
-async def _read_ind_pack_bins(
+# 🔸 Чтение ind_pack ключей: сначала pair-key, потом static-key (батч MGET) + JSON parse
+async def _read_ind_pack_states(
     redis,
     symbol: str,
     direction: str,
     mirror_scenario_id: int,
     mirror_signal_id: int,
     pairs: List[Tuple[int, str]],
-) -> Dict[Tuple[int, str], Optional[str]]:
-    # сначала pair-specific keys
+) -> Dict[Tuple[int, str], Dict[str, Any]]:
     pair_keys: List[str] = []
     for aid, tf in pairs:
         pair_keys.append(
@@ -873,17 +872,17 @@ async def _read_ind_pack_bins(
 
     res_pair = await redis.mget(pair_keys)
 
-    out: Dict[Tuple[int, str], Optional[str]] = {}
+    out: Dict[Tuple[int, str], Dict[str, Any]] = {}
     missing_static: List[Tuple[int, str]] = []
 
     for (aid, tf), val in zip(pairs, res_pair):
         if val is not None:
-            out[(aid, tf)] = str(val)
+            parsed = _parse_ind_pack_value(str(val))
+            out[(aid, tf)] = {"source": "pair", **parsed}
         else:
-            out[(aid, tf)] = None
+            out[(aid, tf)] = {"source": "pair", "state": "absent", "bin_name": None, "reason": None, "details": None}
             missing_static.append((aid, tf))
 
-    # затем static keys только для missing
     if missing_static:
         static_keys: List[str] = []
         for aid, tf in missing_static:
@@ -899,8 +898,10 @@ async def _read_ind_pack_bins(
         res_static = await redis.mget(static_keys)
 
         for (aid, tf), val in zip(missing_static, res_static):
-            if val is not None:
-                out[(aid, tf)] = str(val)
+            if val is None:
+                continue
+            parsed = _parse_ind_pack_value(str(val))
+            out[(aid, tf)] = {"source": "static", **parsed}
 
     return out
 
