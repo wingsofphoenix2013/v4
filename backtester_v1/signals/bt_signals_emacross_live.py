@@ -41,6 +41,22 @@ EMA_STATE_ABOVE = "above"
 EMA_STATE_BELOW = "below"
 EMA_STATE_NEUTRAL = "neutral"
 
+# 🔸 ind_pack JSON Contract v1: перманентные причины (при них ждём 0 секунд — сразу блок)
+PACK_PERMANENT_REASONS = {
+    "invalid_trigger_event",
+    "pair_not_configured",
+    "no_rules_static",
+    "no_rules_adaptive",
+    "no_quantiles_rules",
+    "no_candidates",
+    "no_labels_match",
+    "invalid_direction",
+    "internal_error",
+}
+
+def _is_pack_permanent_reason(reason: Optional[str]) -> bool:
+    r = str(reason or "").strip()
+    return r in PACK_PERMANENT_REASONS
 
 # 🔸 ind_pack JSON parser (Contract v1 + backward compatible)
 def _parse_ind_pack_value(raw: Optional[str]) -> Dict[str, Any]:
@@ -710,12 +726,54 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                         explained.pop(pair, None)
                     continue
 
-                # ok=false (explained missing)
+                # ok=false
                 if state == "fail":
+                    fail_reason = st.get("reason")
+                    fail_details = st.get("details")
+
+                    # 🔸 Перманентный fail → сразу блокируем (без ожидания дедлайна)
+                    if _is_pack_permanent_reason(fail_reason):
+                        aid, tf = pair
+
+                        await _upsert_live_log(
+                            pg,
+                            signal_id,
+                            symbol,
+                            timeframe,
+                            open_time,
+                            "blocked_missing_keys_timeout",
+                            {
+                                **details_base,
+                                "signal": {
+                                    "signal_id": signal_id,
+                                    "direction": direction,
+                                    "message": message,
+                                    "filtered": True,
+                                    "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
+                                },
+                                "filter": {
+                                    "rule": "permanent_pack_fail",
+                                    "attempt": attempt,
+                                    "required_total": required_total,
+                                    "found_total": len(found_bins),
+                                    "missing_total": required_total - len(found_bins),
+                                    "permanent_fail": {
+                                        "analysis_id": int(aid),
+                                        "timeframe": str(tf),
+                                        "source": st.get("source"),
+                                        "reason": str(fail_reason) if fail_reason is not None else None,
+                                        "details": fail_details if isinstance(fail_details, dict) else {},
+                                    },
+                                },
+                            },
+                        )
+                        return
+
+                    # 🔸 Транзиентный fail → запоминаем и продолжаем ждать
                     explained[pair] = {
                         "source": st.get("source"),
-                        "reason": st.get("reason"),
-                        "details": st.get("details"),
+                        "reason": fail_reason,
+                        "details": fail_details if isinstance(fail_details, dict) else {},
                     }
                     continue
 
