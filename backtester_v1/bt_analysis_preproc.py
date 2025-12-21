@@ -69,7 +69,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis):
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_PREPROC: обработан пакет сообщений из bt:analysis:ready — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
@@ -276,7 +276,7 @@ async def _process_message(
                     f"analyses={r.get('selected_cnt')}/{r.get('initial_cnt')} removed_harmful={r.get('harmful_removed_cnt')}"
                 )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_PREPROC: scenario_id=%s, signal_id=%s — direction_mask=%s, directions=%s, %s, source_finished_at=%s, elapsed_ms=%s",
                 scenario_id,
                 signal_id,
@@ -509,7 +509,7 @@ async def _finalize_and_store_model(
         bins_rows=bins_rows,
     )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_PREPROC: модель сохранена — scenario_id=%s, signal_id=%s, direction=%s, model_id=%s, thr=%s, analyses=%s/%s, harmful_removed=%s, bins_labels=%s, filt_roi=%s, filt_trades=%s",
         scenario_id,
         signal_id,

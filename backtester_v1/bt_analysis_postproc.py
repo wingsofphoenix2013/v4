@@ -285,7 +285,7 @@ async def _process_message(
                 source_finished_at=dedup_ts,
             )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_POSTPROC: постпроцессинг завершён для scenario_id=%s, signal_id=%s — позиции_всего=%s, хорошие=%s, плохие=%s, models=%s",
                 scenario_id,
                 signal_id,
@@ -326,7 +326,7 @@ async def _process_pair_postproc(
     # загружаем позиции сценария/сигнала (postproc=true) только по нужным направлениям
     positions = await _load_positions_for_pair(pg, scenario_id, signal_id, directions)
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_POSTPROC: нет позиций для постпроцессинга scenario_id=%s, signal_id=%s, directions=%s",
             scenario_id,
             signal_id,
@@ -1010,7 +1010,7 @@ async def _update_analysis_scenario_stats(
                 raw_stat_json,
             )
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_POSTPROC: обновлена bt_analysis_scenario_stat для scenario_id=%s, signal_id=%s, direction=%s — orig_trades=%s, filt_trades=%s, orig_pnl=%s, filt_pnl=%s, removed_trades=%s, removed_accuracy=%.4f, threshold=%s",
                 scenario_id,
                 signal_id,

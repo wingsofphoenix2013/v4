@@ -264,7 +264,7 @@ async def init_lr_universal_live(
         )
         filter_workers.append(task)
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_UNI_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, lr_instance_id=%s, indicator_base=%s, "
         "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
         len(cfgs),
@@ -758,7 +758,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                             open_time,
                             "blocked_missing_keys_timeout",
                             {
-                                **details_base,
+                                **base_details,
                                 "signal": {
                                     "signal_id": signal_id,
                                     "direction": direction,

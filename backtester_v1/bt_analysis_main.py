@@ -168,7 +168,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                         total_cleanup_scenario_stat += cleanup["scenario_stat"]
                         total_cleanup_total += cleanup["total"]
 
-                        log.info(
+                        log.debug(
                             "BT_ANALYSIS_MAIN: cleanup перед анализом scenario_id=%s, signal_id=%s — "
                             "deleted_raw=%s, deleted_bins=%s, deleted_model_opt=%s, deleted_bins_labels=%s, "
                             "deleted_positions_postproc=%s, deleted_scenario_stat=%s, deleted_total=%s",
@@ -315,7 +315,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     total_rows_inserted += rows_inserted
                     total_bins_rows += bins_rows_for_pair
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_MAIN: scenario_id=%s, signal_id=%s — анализаторов всего=%s, "
                         "успешно=%s, с ошибками=%s, строк в raw=%s, строк в bins_stat=%s",
                         scenario_id,
@@ -354,7 +354,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                 total_rows_inserted,
                 total_bins_rows,
             )
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_MAIN: итог по пакету — сообщений=%s, пар=%s, "
                 "cleanup_raw=%s, cleanup_bins=%s, cleanup_model_opt=%s, cleanup_bins_labels=%s, cleanup_positions_postproc=%s, cleanup_scenario_stat=%s, cleanup_total=%s, "
                 "анализаторов всего=%s, успешно=%s, с ошибками=%s, строк в raw=%s, строк в bins_stat=%s",

@@ -193,7 +193,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         total_long += longs
         total_short += shorts
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_UNI: backfill завершён для сигнала id=%s ('%s', key=%s): "
         "вставлено событий=%s, long=%s, short=%s, окно=[%s .. %s], trend_type=%s, zone_k=%.3f, keep_half=%s",
         signal_id,

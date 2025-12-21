@@ -238,7 +238,7 @@ async def init_emacross_live(
         )
         filter_workers.append(task)
 
-    log.info(
+    log.debug(
         "BT_SIG_EMA_CROSS_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, fast=%s(id=%s), slow=%s(id=%s), trigger=%s, "
         "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
         len(cfgs),
