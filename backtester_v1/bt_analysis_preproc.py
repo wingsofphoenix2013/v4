@@ -5,7 +5,7 @@ import json
 import logging
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 # 🔸 Константы стримов и настроек препроцессинга
 ANALYSIS_READY_STREAM_KEY = "bt:analysis:ready"
@@ -21,8 +21,11 @@ PREPROC_MAX_CONCURRENCY = 6
 
 # 🔸 Настройки оптимизации
 EPS_THRESHOLD = Decimal("0.00000001")          # технический eps для строгих сравнений (по факту winrate уже квантован)
-MAX_MODEL_ITERS = 20                           # максимум итераций удаления "вредных" анализаторов
+MAX_MODEL_ITERS = 30                           # максимум итераций удаления "вредных" анализаторов
 MIN_ANALYZERS_LEFT = 1                         # не даём удалиться до 0 (можно менять позже)
+
+# 🔸 Настройки бин-прунинга (inactive на уровне биннов)
+BIN_PRUNE_MAX_ITERS = 30                       # максимум итераций pruning по биннам
 
 # 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_analysis_finished_at: Dict[Tuple[int, int], datetime] = {}
@@ -69,7 +72,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis):
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
-                log.debug(
+                log.info(
                     "BT_ANALYSIS_PREPROC: обработан пакет сообщений из bt:analysis:ready — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
@@ -238,7 +241,7 @@ async def _process_message(
                     direction=direction,
                 )
 
-                # оптимизация состава + порога
+                # оптимизация состава + порога + бин-прунинг
                 model_result = await _optimize_model_for_direction(
                     pg=pg,
                     scenario_id=scenario_id,
@@ -273,10 +276,11 @@ async def _process_message(
                 r = results.get(d) or {}
                 parts.append(
                     f"{d} thr={r.get('best_threshold')} roi={r.get('filt_roi')} trades={r.get('filt_trades')} "
-                    f"analyses={r.get('selected_cnt')}/{r.get('initial_cnt')} removed_harmful={r.get('harmful_removed_cnt')}"
+                    f"analyses={r.get('selected_cnt')}/{r.get('initial_cnt')} removed_harmful={r.get('harmful_removed_cnt')} "
+                    f"bad_bins={r.get('bad_bins_final')}/{r.get('bad_bins_initial')} bins_inactive={r.get('bins_inactivated_total')}"
                 )
 
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_PREPROC: scenario_id=%s, signal_id=%s — direction_mask=%s, directions=%s, %s, source_finished_at=%s, elapsed_ms=%s",
                 scenario_id,
                 signal_id,
@@ -299,7 +303,7 @@ async def _process_message(
             await redis.xack(ANALYSIS_READY_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
 
 
-# 🔸 Оптимизация модели для одного направления: состав анализаторов + порог + запись model_opt + bins_labels
+# 🔸 Оптимизация модели для одного направления: состав анализаторов + порог + бин-прунинг + запись model_opt + bins_labels
 async def _optimize_model_for_direction(
     pg,
     scenario_id: int,
@@ -313,12 +317,11 @@ async def _optimize_model_for_direction(
     selected_ids: List[int] = list(initial_analysis_ids)
     harmful_removed: List[Dict[str, Any]] = []
 
-    # основной итеративный цикл
+    # основной итеративный цикл удаления "вредных" анализаторов
     last_threshold = None
     last_filt_roi = None
 
     for it in range(MAX_MODEL_ITERS):
-        # если совсем нечего выбирать — всё равно считаем порог/метрики (будут 0/исходные)
         threshold_result = await _compute_best_threshold_for_direction(
             pg=pg,
             scenario_id=scenario_id,
@@ -334,7 +337,6 @@ async def _optimize_model_for_direction(
         # условия стабильности (порог и ROI не меняются)
         if last_threshold is not None and last_filt_roi is not None:
             if best_threshold == last_threshold and filt_roi == last_filt_roi:
-                # стабилизировались
                 break
         last_threshold = best_threshold
         last_filt_roi = filt_roi
@@ -358,7 +360,6 @@ async def _optimize_model_for_direction(
         worst_pnl = Decimal("0")
         worst_trades = 0
 
-        # комментарий: marginal_map содержит только тех, у кого есть unique_removed_trades
         for aid, m in marginal_map.items():
             pnl = m.get("unique_removed_pnl_abs", Decimal("0"))
             trades = int(m.get("unique_removed_trades", 0) or 0)
@@ -371,7 +372,6 @@ async def _optimize_model_for_direction(
 
         # если нет вредных — завершаем оптимизацию состава
         if worst_id is None or worst_pnl <= 0:
-            # дополнительно: финальная метрика уже есть в threshold_result
             return await _finalize_and_store_model(
                 pg=pg,
                 scenario_id=scenario_id,
@@ -445,7 +445,7 @@ async def _optimize_model_for_direction(
     )
 
 
-# 🔸 Финализация: запись bt_analysis_model_opt + bt_analysis_bins_labels + (опционально) bt_analysis_threshold_opt
+# 🔸 Финализация: запись bt_analysis_model_opt + bt_analysis_bins_labels (с бин-прунингом bad-bins)
 async def _finalize_and_store_model(
     pg,
     scenario_id: int,
@@ -460,11 +460,25 @@ async def _finalize_and_store_model(
     source_finished_at: datetime,
 ) -> Dict[str, Any]:
     best_threshold = threshold_result["best_threshold"]
+    selected_set: Set[int] = set(int(x) for x in (selected_analysis_ids or []))
 
+    # считаем бин-прунинг bad bins (inactive на уровне бинов)
+    prune_result = await _prune_bad_bins_iterative(
+        pg=pg,
+        scenario_id=scenario_id,
+        signal_id=signal_id,
+        direction=direction,
+        analysis_ids=selected_set,
+        threshold=best_threshold,
+        max_iters=BIN_PRUNE_MAX_ITERS,
+    )
+
+    # meta
     meta_obj = {
-        "version": 1,
+        "version": 2,
         "method": "greedy_remove_harmful_unique",
         "threshold_method": "worst_winrate_sweep",
+        "bin_prune_method": "iterative_unique_redundant_and_unique_profit",
         "eps": str(EPS_THRESHOLD),
         "direction": direction,
         "direction_mask": direction_mask,
@@ -476,6 +490,16 @@ async def _finalize_and_store_model(
         "harmful_removed_cnt": len(harmful_removed),
         "candidates": threshold_result.get("candidates", 0),
         "removable_positions": threshold_result.get("removable_positions", 0),
+        "bin_prune": {
+            "max_iters": BIN_PRUNE_MAX_ITERS,
+            "iters_used": prune_result.get("iters_used", 0),
+            "bad_bins_initial": prune_result.get("bad_bins_initial", 0),
+            "bad_bins_final": prune_result.get("bad_bins_final", 0),
+            "bins_inactivated_total": prune_result.get("bins_inactivated_total", 0),
+            "bins_inactivated_harmful": prune_result.get("bins_inactivated_harmful", 0),
+            "bins_inactivated_redundant": prune_result.get("bins_inactivated_redundant", 0),
+            "bins_inactivated_zero_hit": prune_result.get("bins_inactivated_zero_hit", 0),
+        },
     }
 
     # upsert model_opt и получаем model_id
@@ -498,6 +522,9 @@ async def _finalize_and_store_model(
         signal_id=signal_id,
         direction=direction,
     )
+
+    active_bad_bins: Set[Tuple[int, str, str]] = prune_result.get("active_bad_bins") or set()
+
     labels_inserted = await _rebuild_bins_labels(
         pg=pg,
         model_id=model_id,
@@ -505,12 +532,14 @@ async def _finalize_and_store_model(
         signal_id=signal_id,
         direction=direction,
         threshold_used=best_threshold,
-        selected_analysis_ids=set(selected_analysis_ids),
+        selected_analysis_ids=selected_set,
+        active_bad_bins=active_bad_bins,
         bins_rows=bins_rows,
     )
 
-    log.debug(
-        "BT_ANALYSIS_PREPROC: модель сохранена — scenario_id=%s, signal_id=%s, direction=%s, model_id=%s, thr=%s, analyses=%s/%s, harmful_removed=%s, bins_labels=%s, filt_roi=%s, filt_trades=%s",
+    log.info(
+        "BT_ANALYSIS_PREPROC: модель сохранена — scenario_id=%s, signal_id=%s, direction=%s, model_id=%s, thr=%s, "
+        "analyses=%s/%s, harmful_removed=%s, bad_bins=%s/%s, bins_inactive=%s, bins_labels=%s, filt_roi=%s, filt_trades=%s",
         scenario_id,
         signal_id,
         direction,
@@ -519,12 +548,14 @@ async def _finalize_and_store_model(
         len(selected_analysis_ids),
         len(initial_analysis_ids),
         len(harmful_removed),
+        prune_result.get("bad_bins_final", 0),
+        prune_result.get("bad_bins_initial", 0),
+        prune_result.get("bins_inactivated_total", 0),
         labels_inserted,
         threshold_result.get("filt_roi"),
         threshold_result.get("filt_trades"),
     )
 
-    # возвращаем данные для итогового суммарного лога
     return {
         "model_id": model_id,
         "best_threshold": best_threshold,
@@ -542,6 +573,9 @@ async def _finalize_and_store_model(
         "selected_cnt": len(selected_analysis_ids),
         "harmful_removed_cnt": len(harmful_removed),
         "bins_labels": labels_inserted,
+        "bad_bins_initial": prune_result.get("bad_bins_initial", 0),
+        "bad_bins_final": prune_result.get("bad_bins_final", 0),
+        "bins_inactivated_total": prune_result.get("bins_inactivated_total", 0),
     }
 
 
@@ -641,7 +675,7 @@ async def _compute_best_threshold_for_direction(
     removed_losers = 0
 
     for v in unique_worst:
-        # удаляем все позиции с worst_winrate <= v (эквивалент winrate <= threshold)
+        # удаляем все позиции с worst_winrate <= v
         g = groups[v]
 
         removed_trades += int(g["trades"])
@@ -673,10 +707,7 @@ async def _compute_best_threshold_for_direction(
 
         threshold = v + EPS_THRESHOLD
 
-        if objective_mode == "roi":
-            objective = filt_roi
-        else:
-            objective = filt_pnl
+        objective = filt_roi if objective_mode == "roi" else filt_pnl
 
         # 1) максимальный objective
         # 2) при равенстве — больше filt_trades
@@ -708,7 +739,6 @@ async def _compute_best_threshold_for_direction(
                 best_removed_trades = removed_trades
                 best_removed_accuracy = removed_accuracy
 
-    # комментарий: порог и метрики квантим до 4 знаков для предсказуемости (winrate в bins_stat уже квантован)
     return {
         "best_threshold": _q_decimal(best_threshold),
         "orig_trades": int(orig_trades),
@@ -734,7 +764,6 @@ async def _load_positions_with_worst_winrate(
     direction: str,
     analysis_ids: List[int],
 ) -> List[Dict[str, Any]]:
-    # если анализаторов нет — worst_winrate никогда не определится
     analysis_ids = analysis_ids or []
 
     async with pg.acquire() as conn:
@@ -882,6 +911,314 @@ async def _load_marginal_unique_removed_map(
     return out
 
 
+# 🔸 Итеративный бин-прунинг: inactive для редундантных и вредных bad-bins
+async def _prune_bad_bins_iterative(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    analysis_ids: Set[int],
+    threshold: Decimal,
+    max_iters: int,
+) -> Dict[str, Any]:
+    if not analysis_ids:
+        return {
+            "active_bad_bins": set(),
+            "bad_bins_initial": 0,
+            "bad_bins_final": 0,
+            "bins_inactivated_total": 0,
+            "bins_inactivated_harmful": 0,
+            "bins_inactivated_redundant": 0,
+            "bins_inactivated_zero_hit": 0,
+            "iters_used": 0,
+        }
+
+    # стартовый набор bad bins из bins_stat по threshold
+    active_bad_bins = await _load_bad_bins_set(
+        pg=pg,
+        scenario_id=scenario_id,
+        signal_id=signal_id,
+        direction=direction,
+        analysis_ids=analysis_ids,
+        threshold=threshold,
+    )
+
+    bad_initial = len(active_bad_bins)
+
+    bins_inactivated_total = 0
+    bins_inactivated_harmful = 0
+    bins_inactivated_redundant = 0
+    bins_inactivated_zero_hit = 0
+
+    iters_used = 0
+
+    for it in range(int(max_iters or 0)):
+        iters_used = it + 1
+
+        # если уже нечего чистить
+        if not active_bad_bins:
+            break
+
+        stats = await _load_bad_bins_unique_stats(
+            pg=pg,
+            scenario_id=scenario_id,
+            signal_id=signal_id,
+            direction=direction,
+            bad_bins=active_bad_bins,
+        )
+
+        if not stats:
+            break
+
+        # 1) вредные бины (unique pnl > 0) — отключаем пачкой
+        harmful_bins: Set[Tuple[int, str, str]] = set()
+        for b in stats:
+            uniq_tr = int(b.get("unique_removed_trades", 0) or 0)
+            uniq_pnl = _safe_decimal(b.get("unique_removed_pnl_abs", 0))
+            if uniq_tr > 0 and uniq_pnl > 0:
+                harmful_bins.add((int(b["analysis_id"]), str(b["timeframe"]), str(b["bin_name"])))
+
+        # 2) редундантные бины (unique_trades == 0) — отключаем по одному (чтобы не снять покрытие сразу у группы дубликатов)
+        redundant_bins: List[Dict[str, Any]] = []
+        for b in stats:
+            uniq_tr = int(b.get("unique_removed_trades", 0) or 0)
+            if uniq_tr == 0:
+                redundant_bins.append(b)
+
+        removed_this_iter: Set[Tuple[int, str, str]] = set()
+
+        if harmful_bins:
+            removed_this_iter |= harmful_bins
+
+        # сначала выкидываем редундантные с нулевыми hits (их можно пачкой)
+        zero_hit_bins: Set[Tuple[int, str, str]] = set()
+        for b in redundant_bins:
+            hits_total = int(b.get("hits_total", 0) or 0)
+            if hits_total == 0:
+                zero_hit_bins.add((int(b["analysis_id"]), str(b["timeframe"]), str(b["bin_name"])))
+
+        if zero_hit_bins:
+            removed_this_iter |= zero_hit_bins
+
+        # затем выбираем один редундантный бин с минимальным hits_total (если остались)
+        if redundant_bins:
+            # исключаем те, что уже в removed_this_iter
+            candidates = []
+            for b in redundant_bins:
+                key = (int(b["analysis_id"]), str(b["timeframe"]), str(b["bin_name"]))
+                if key in removed_this_iter:
+                    continue
+                candidates.append(b)
+
+            if candidates:
+                # выбираем минимальный hits_total, при равенстве — минимальный analysis_id/timeframe/bin_name
+                candidates_sorted = sorted(
+                    candidates,
+                    key=lambda x: (
+                        int(x.get("hits_total", 0) or 0),
+                        int(x.get("analysis_id", 0) or 0),
+                        str(x.get("timeframe") or ""),
+                        str(x.get("bin_name") or ""),
+                    ),
+                )
+                chosen = candidates_sorted[0]
+                removed_this_iter.add((int(chosen["analysis_id"]), str(chosen["timeframe"]), str(chosen["bin_name"])))
+
+        if not removed_this_iter:
+            break
+
+        # статистика категорий
+        harmful_only = {k for k in removed_this_iter if k in harmful_bins}
+        zero_hit_only = {k for k in removed_this_iter if k in zero_hit_bins}
+        redundant_only = removed_this_iter - harmful_bins - zero_hit_bins
+
+        # применяем удаление
+        before_cnt = len(active_bad_bins)
+        active_bad_bins = set(x for x in active_bad_bins if x not in removed_this_iter)
+        after_cnt = len(active_bad_bins)
+
+        removed_cnt = before_cnt - after_cnt
+        if removed_cnt <= 0:
+            break
+
+        bins_inactivated_total += removed_cnt
+        bins_inactivated_harmful += len(harmful_only)
+        bins_inactivated_zero_hit += len(zero_hit_only)
+        bins_inactivated_redundant += len(redundant_only)
+
+    return {
+        "active_bad_bins": active_bad_bins,
+        "bad_bins_initial": bad_initial,
+        "bad_bins_final": len(active_bad_bins),
+        "bins_inactivated_total": bins_inactivated_total,
+        "bins_inactivated_harmful": bins_inactivated_harmful,
+        "bins_inactivated_redundant": bins_inactivated_redundant,
+        "bins_inactivated_zero_hit": bins_inactivated_zero_hit,
+        "iters_used": iters_used,
+    }
+
+
+# 🔸 Загрузка множества bad-bins из bt_analysis_bins_stat по threshold
+async def _load_bad_bins_set(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    analysis_ids: Set[int],
+    threshold: Decimal,
+) -> Set[Tuple[int, str, str]]:
+    if not analysis_ids:
+        return set()
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT
+                analysis_id,
+                timeframe,
+                bin_name
+            FROM bt_analysis_bins_stat
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND direction   = $3
+              AND analysis_id = ANY($4::int[])
+              AND winrate     <= $5
+            """,
+            scenario_id,
+            signal_id,
+            direction,
+            sorted(list(analysis_ids)),
+            threshold,
+        )
+
+    out: Set[Tuple[int, str, str]] = set()
+    for r in rows:
+        out.add((int(r["analysis_id"]), str(r["timeframe"]), str(r["bin_name"])))
+    return out
+
+
+# 🔸 Загрузка статистики уникального вклада по текущему набору active bad-bins
+async def _load_bad_bins_unique_stats(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    bad_bins: Set[Tuple[int, str, str]],
+) -> List[Dict[str, Any]]:
+    if not bad_bins:
+        return []
+
+    # готовим массивы для UNNEST (длины должны совпадать)
+    a_ids: List[int] = []
+    tfs: List[str] = []
+    bnames: List[str] = []
+
+    for aid, tf, bn in sorted(list(bad_bins), key=lambda x: (x[1], x[0], x[2])):
+        a_ids.append(int(aid))
+        tfs.append(str(tf))
+        bnames.append(str(bn))
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH active_bins AS (
+                SELECT *
+                FROM unnest($4::int[], $5::text[], $6::text[]) AS t(analysis_id, timeframe, bin_name)
+            ),
+            flags AS (
+                SELECT DISTINCT
+                    r.position_uid,
+                    r.analysis_id,
+                    r.timeframe,
+                    r.bin_name
+                FROM bt_analysis_positions_raw r
+                JOIN active_bins b
+                  ON b.analysis_id = r.analysis_id
+                 AND b.timeframe   = r.timeframe
+                 AND b.bin_name    = r.bin_name
+                WHERE r.scenario_id = $1
+                  AND r.signal_id   = $2
+                  AND r.direction   = $3
+            ),
+            pos_cnt AS (
+                SELECT position_uid, COUNT(*) AS hits_cnt
+                FROM flags
+                GROUP BY position_uid
+            ),
+            tot AS (
+                SELECT analysis_id, timeframe, bin_name, COUNT(*) AS hits_total
+                FROM flags
+                GROUP BY analysis_id, timeframe, bin_name
+            ),
+            uniq_hits AS (
+                SELECT f.analysis_id, f.timeframe, f.bin_name, f.position_uid
+                FROM flags f
+                JOIN pos_cnt pc
+                  ON pc.position_uid = f.position_uid
+                WHERE pc.hits_cnt = 1
+            ),
+            uniq_agg AS (
+                SELECT
+                    u.analysis_id,
+                    u.timeframe,
+                    u.bin_name,
+                    COUNT(*)                                         AS unique_removed_trades,
+                    COALESCE(SUM(p.pnl_abs), 0)                      AS unique_removed_pnl_abs,
+                    COUNT(*) FILTER (WHERE p.pnl_abs > 0)            AS unique_removed_wins,
+                    COUNT(*) FILTER (WHERE p.pnl_abs <= 0)           AS unique_removed_losers
+                FROM uniq_hits u
+                JOIN bt_scenario_positions p
+                  ON p.position_uid = u.position_uid
+                WHERE p.scenario_id = $1
+                  AND p.signal_id   = $2
+                  AND p.direction   = $3
+                  AND p.postproc    = true
+                GROUP BY u.analysis_id, u.timeframe, u.bin_name
+            )
+            SELECT
+                a.analysis_id,
+                a.timeframe,
+                a.bin_name,
+                COALESCE(t.hits_total, 0)                AS hits_total,
+                COALESCE(u.unique_removed_trades, 0)     AS unique_removed_trades,
+                COALESCE(u.unique_removed_pnl_abs, 0)    AS unique_removed_pnl_abs,
+                COALESCE(u.unique_removed_wins, 0)       AS unique_removed_wins,
+                COALESCE(u.unique_removed_losers, 0)     AS unique_removed_losers
+            FROM active_bins a
+            LEFT JOIN tot t
+              ON t.analysis_id = a.analysis_id
+             AND t.timeframe   = a.timeframe
+             AND t.bin_name    = a.bin_name
+            LEFT JOIN uniq_agg u
+              ON u.analysis_id = a.analysis_id
+             AND u.timeframe   = a.timeframe
+             AND u.bin_name    = a.bin_name
+            """,
+            scenario_id,
+            signal_id,
+            direction,
+            a_ids,
+            tfs,
+            bnames,
+        )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "analysis_id": int(r["analysis_id"]),
+                "timeframe": str(r["timeframe"]),
+                "bin_name": str(r["bin_name"]),
+                "hits_total": int(r["hits_total"]),
+                "unique_removed_trades": int(r["unique_removed_trades"]),
+                "unique_removed_pnl_abs": _safe_decimal(r["unique_removed_pnl_abs"]),
+                "unique_removed_wins": int(r["unique_removed_wins"]),
+                "unique_removed_losers": int(r["unique_removed_losers"]),
+            }
+        )
+    return out
+
+
 # 🔸 Upsert model_opt и возврат model_id
 async def _upsert_model_opt_return_id(
     pg,
@@ -1014,7 +1351,7 @@ async def _load_bins_stat_rows(
     return out
 
 
-# 🔸 Пересборка разметки биннов bt_analysis_bins_labels для model_id (good/bad/inactive)
+# 🔸 Пересборка разметки биннов bt_analysis_bins_labels для model_id (good/bad/inactive) с учётом бин-прунинга
 async def _rebuild_bins_labels(
     pg,
     model_id: int,
@@ -1022,7 +1359,8 @@ async def _rebuild_bins_labels(
     signal_id: int,
     direction: str,
     threshold_used: Decimal,
-    selected_analysis_ids: set,
+    selected_analysis_ids: Set[int],
+    active_bad_bins: Set[Tuple[int, str, str]],
     bins_rows: List[Dict[str, Any]],
 ) -> int:
     async with pg.acquire() as conn:
@@ -1041,14 +1379,21 @@ async def _rebuild_bins_labels(
         to_insert: List[Tuple[Any, ...]] = []
         for b in bins_rows:
             aid = int(b["analysis_id"])
+            tf = str(b["timeframe"])
+            bn = str(b["bin_name"])
             winrate = b["winrate"]
 
-            # комментарий: inactive для отключенных анализаторов
+            # inactive для отключенных анализаторов
             if aid not in selected_analysis_ids:
                 state = "inactive"
             else:
-                # bad если winrate <= threshold
-                state = "bad" if winrate <= threshold_used else "good"
+                # бин-прунинг: bad только если бин в активном bad-наборе
+                key = (aid, tf, bn)
+                if key in active_bad_bins:
+                    state = "bad"
+                else:
+                    # если winrate <= threshold, но бин не в active_bad_bins — значит он "приглушён" (inactive)
+                    state = "inactive" if winrate <= threshold_used else "good"
 
             to_insert.append(
                 (
@@ -1058,8 +1403,8 @@ async def _rebuild_bins_labels(
                     direction,
                     aid,
                     b["indicator_param"],
-                    b["timeframe"],
-                    b["bin_name"],
+                    tf,
+                    bn,
                     state,
                     threshold_used,
                     int(b["trades"]),
