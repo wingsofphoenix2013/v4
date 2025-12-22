@@ -26,7 +26,7 @@ HOLDOUT_DAYS = 7
 EPS_THRESHOLD = Decimal("0.00000001")
 EPS_SCORE = Decimal("0.00000001")
 
-V2_LAMBDA = Decimal("1.0")          # штраф за просадку holdout относительно train
+V2_LAMBDA = Decimal("0.5")          # штраф за просадку holdout относительно train
 NEAR_THRESHOLD_MARGIN = Decimal("0.0500")  # зона "рядом с порогом" для кандидатов на включение
 MAX_TOGGLE_ITERS = 200              # максимум итераций улучшения набора bad-биннов
 MAX_BAD_BINS_LIMIT = 300            # safety-лимит на число bad-биннов (не min_trades, а ограничение сложности)
