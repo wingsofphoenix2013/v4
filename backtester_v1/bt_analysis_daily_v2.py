@@ -1,4 +1,4 @@
-# bt_analysis_daily_v2.py — суточная агрегация v2 original/filtered по результатам финального постпроцессинга v2
+# bt_analysis_daily_v2.py — суточная агрегация статистики original/filtered по результатам финального постпроцессинга анализов v2
 
 import asyncio
 import logging
@@ -6,18 +6,16 @@ from datetime import datetime, date
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Tuple
 
-
 # 🔸 Константы стримов и настроек воркера v2
-POSTPROC_READY_STREAM_KEY = "bt:analysis:postproc_ready_v2"
+POSTPROC_READY_STREAM_KEY_V2 = "bt:analysis:postproc_ready_v2"
 
-DAILY_CONSUMER_GROUP = "bt_analysis_daily_v2"
-DAILY_CONSUMER_NAME = "bt_analysis_daily_v2_main"
+DAILY_CONSUMER_GROUP_V2 = "bt_analysis_daily_v2"
+DAILY_CONSUMER_NAME_V2 = "bt_analysis_daily_v2_main"
 
 DAILY_STREAM_BATCH_SIZE = 10
 DAILY_STREAM_BLOCK_MS = 5000
 
-DAILY_MAX_CONCURRENCY = 6
-
+DAILY_MAX_CONCURRENCY = 16
 
 # 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_daily_source_finished_at: Dict[Tuple[int, int], datetime] = {}
@@ -44,7 +42,7 @@ async def run_bt_analysis_daily_v2_orchestrator(pg, redis):
             total_msgs = 0
 
             for stream_key, messages in entries:
-                if stream_key != POSTPROC_READY_STREAM_KEY:
+                if stream_key != POSTPROC_READY_STREAM_KEY_V2:
                     continue
 
                 for entry_id, fields in messages:
@@ -83,28 +81,28 @@ async def run_bt_analysis_daily_v2_orchestrator(pg, redis):
 async def _ensure_consumer_group(redis) -> None:
     try:
         await redis.xgroup_create(
-            name=POSTPROC_READY_STREAM_KEY,
-            groupname=DAILY_CONSUMER_GROUP,
+            name=POSTPROC_READY_STREAM_KEY_V2,
+            groupname=DAILY_CONSUMER_GROUP_V2,
             id="$",
             mkstream=True,
         )
         log.debug(
             "BT_ANALYSIS_DAILY_V2: создана consumer group '%s' для стрима '%s'",
-            DAILY_CONSUMER_GROUP,
-            POSTPROC_READY_STREAM_KEY,
+            DAILY_CONSUMER_GROUP_V2,
+            POSTPROC_READY_STREAM_KEY_V2,
         )
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.debug(
                 "BT_ANALYSIS_DAILY_V2: consumer group '%s' для стрима '%s' уже существует",
-                DAILY_CONSUMER_GROUP,
-                POSTPROC_READY_STREAM_KEY,
+                DAILY_CONSUMER_GROUP_V2,
+                POSTPROC_READY_STREAM_KEY_V2,
             )
         else:
             log.error(
                 "BT_ANALYSIS_DAILY_V2: ошибка при создании consumer group '%s': %s",
-                DAILY_CONSUMER_GROUP,
+                DAILY_CONSUMER_GROUP_V2,
                 e,
                 exc_info=True,
             )
@@ -114,9 +112,9 @@ async def _ensure_consumer_group(redis) -> None:
 # 🔸 Чтение сообщений из стрима bt:analysis:postproc_ready_v2
 async def _read_from_stream(redis) -> List[Any]:
     entries = await redis.xreadgroup(
-        groupname=DAILY_CONSUMER_GROUP,
-        consumername=DAILY_CONSUMER_NAME,
-        streams={POSTPROC_READY_STREAM_KEY: ">"},
+        groupname=DAILY_CONSUMER_GROUP_V2,
+        consumername=DAILY_CONSUMER_NAME_V2,
+        streams={POSTPROC_READY_STREAM_KEY_V2: ">"},
         count=DAILY_STREAM_BATCH_SIZE,
         block=DAILY_STREAM_BLOCK_MS,
     )
@@ -203,7 +201,7 @@ async def _process_message(
     async with sema:
         ctx = _parse_postproc_ready_message(fields)
         if not ctx:
-            await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
+            await redis.xack(POSTPROC_READY_STREAM_KEY_V2, DAILY_CONSUMER_GROUP_V2, entry_id)
             return
 
         scenario_id = ctx["scenario_id"]
@@ -226,7 +224,7 @@ async def _process_message(
                 dedup_ts,
                 entry_id,
             )
-            await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
+            await redis.xack(POSTPROC_READY_STREAM_KEY_V2, DAILY_CONSUMER_GROUP_V2, entry_id)
             return
 
         _last_daily_source_finished_at[pair_key] = dedup_ts
@@ -234,7 +232,7 @@ async def _process_message(
         started_at = datetime.utcnow()
 
         try:
-            # читаем депозит сценария (для ROI), всё в UTC
+            # читаем депозит сценария (для ROI)
             deposit = await _load_scenario_deposit(pg, scenario_id)
 
             # пересборка суточной статистики: delete + insert
@@ -271,7 +269,7 @@ async def _process_message(
                 exc_info=True,
             )
         finally:
-            await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
+            await redis.xack(POSTPROC_READY_STREAM_KEY_V2, DAILY_CONSUMER_GROUP_V2, entry_id)
 
 
 # 🔸 Пересборка суточной статистики v2 для пары (scenario_id, signal_id) по exit_time::date (UTC)
@@ -284,7 +282,7 @@ async def _rebuild_daily_for_pair(
     # загружаем исходные агрегации (orig) по дням/направлениям
     orig_rows = await _load_orig_daily_rows(pg, scenario_id, signal_id)
 
-    # загружаем отфильтрованные агрегации (filt) + removed_accuracy входные данные (через postproc_v2)
+    # загружаем отфильтрованные агрегации (filt) + removed_accuracy входные данные (v2 контейнер)
     filt_rows = await _load_filt_daily_rows_v2(pg, scenario_id, signal_id)
 
     # строим индекс filt по (day, direction)
@@ -356,7 +354,7 @@ async def _rebuild_daily_for_pair(
         else:
             removed_accuracy = Decimal("0")
 
-        # квантизация для предсказуемости
+        # квантизация
         orig_pnl_q = _q_decimal(orig_pnl_abs)
         filt_pnl_q = _q_decimal(filt_pnl_abs)
         orig_winrate_q = _q_decimal(orig_winrate)
@@ -385,7 +383,6 @@ async def _rebuild_daily_for_pair(
 
     async with pg.acquire() as conn:
         async with conn.transaction():
-            # очищаем таблицу по паре
             await conn.execute(
                 """
                 DELETE FROM bt_analysis_scenario_daily_v2
