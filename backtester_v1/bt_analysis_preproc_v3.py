@@ -19,12 +19,15 @@ PREPROC_STREAM_BLOCK_MS = 5000
 
 PREPROC_MAX_CONCURRENCY = 6
 
-# 🔸 Настройки v3 (bad — как v2, good — winrate > X)
+# 🔸 Настройки v3
 HOLDOUT_DAYS = 7
 V3_LAMBDA = Decimal("0.5")
 NEAR_THRESHOLD_MARGIN = Decimal("0.0500")
 
-GOOD_WINRATE_THRESHOLD = Decimal("0.60")   # <— меняй тут
+GOOD_WINRATE_MIN = Decimal("0.50")
+GOOD_WINRATE_MAX = Decimal("1.00")
+GOOD_WINRATE_STEP = Decimal("0.01")
+
 MAX_TOGGLE_ITERS = 220
 MAX_BAD_BINS_LIMIT = 350
 
@@ -266,11 +269,13 @@ async def _process_message(
                 )
 
             log.info(
-                "BT_ANALYSIS_PREPROC_V3: scenario_id=%s, signal_id=%s — directions=%s, good_thr=%s, deposit=%s, %s, elapsed_ms=%s",
+                "BT_ANALYSIS_PREPROC_V3: scenario_id=%s, signal_id=%s — directions=%s, good_thr_sweep=%s..%s step=%s, deposit=%s, %s, elapsed_ms=%s",
                 scenario_id,
                 signal_id,
                 directions,
-                str(GOOD_WINRATE_THRESHOLD),
+                str(GOOD_WINRATE_MIN),
+                str(GOOD_WINRATE_MAX),
+                str(GOOD_WINRATE_STEP),
                 str(deposit) if deposit is not None else None,
                 " | ".join(parts) if parts else "no_results",
                 elapsed_ms,
@@ -290,7 +295,7 @@ async def _process_message(
 
 # 🔸 Построение модели v3 для одного направления:
 #   - bad: по логике v2 (threshold+toggle)
-#   - good: winrate > GOOD_WINRATE_THRESHOLD
+#   - good: winrate > good_threshold_selected (подбирается sweep 0.50..1.00)
 #   - neutral: всё остальное
 #   - labels_v3 содержит все строки из bins_stat
 async def _build_model_for_direction_v3(
@@ -384,7 +389,12 @@ async def _build_model_for_direction_v3(
                 "lambda": str(V3_LAMBDA),
                 "holdout": {"days": HOLDOUT_DAYS, "used": bool(val_used), "window": val_window},
                 "threshold": str(best_threshold),
-                "good_winrate_threshold": str(GOOD_WINRATE_THRESHOLD),
+                "good_threshold_sweep": {
+                    "from": str(GOOD_WINRATE_MIN),
+                    "to": str(GOOD_WINRATE_MAX),
+                    "step": str(GOOD_WINRATE_STEP),
+                },
+                "good_threshold_selected": str(GOOD_WINRATE_MIN),
                 "note": "no_bins_stat_rows",
             },
             source_finished_at=source_finished_at,
@@ -396,6 +406,7 @@ async def _build_model_for_direction_v3(
             signal_id=signal_id,
             direction=direction,
             threshold_used=best_threshold,
+            good_threshold_selected=GOOD_WINRATE_MIN,
             bins_rows=[],
             bad_bins_set=set(),
         )
@@ -473,22 +484,37 @@ async def _build_model_for_direction_v3(
         max_bad_bins=MAX_BAD_BINS_LIMIT,
     )
 
-    # финальные kept/rem
+    # финальные kept/rem по bad
     removed_all: Set[Any] = set()
     for k in bad_bins_set:
         removed_all |= hits_index.get(k, set())
 
     kept_all = set(uid for uid in all_uids if uid not in removed_all)
 
-    filt_trades = len(kept_all)
-    filt_pnl_abs = sum((pos_pnl[uid] for uid in kept_all), Decimal("0"))
-    filt_wins = sum(1 for uid in kept_all if pos_win.get(uid))
-    filt_winrate = (Decimal(filt_wins) / Decimal(filt_trades)) if filt_trades > 0 else Decimal("0")
-    filt_roi = (filt_pnl_abs / deposit) if (deposit and deposit > 0) else Decimal("0")
+    # подбор good_threshold по max filt_roi (на всём окне) для whitelist:
+    # good_hit = (best_good_winrate > threshold) среди биннов НЕ bad
+    good_sel = _select_best_good_threshold(
+        all_uids=all_uids,
+        kept_after_bad=kept_all,
+        bins_rows=bins_rows,
+        hits_index=hits_index,
+        bad_bins_set=bad_bins_set,
+        pos_pnl=pos_pnl,
+        pos_win=pos_win,
+        deposit=deposit,
+    )
+    good_threshold_selected = good_sel["good_threshold_selected"]
+    filt_trades = good_sel["filt_trades"]
+    filt_pnl_abs = good_sel["filt_pnl_abs"]
+    filt_winrate = good_sel["filt_winrate"]
+    filt_roi = good_sel["filt_roi"]
+
+    kept_final = good_sel["kept_uids"]
+    removed_final = set(uid for uid in all_uids if uid not in kept_final)
 
     removed_trades = orig_trades - filt_trades
     if removed_trades > 0:
-        removed_losers = sum(1 for uid in removed_all if (uid in all_uids and not pos_win.get(uid, False)))
+        removed_losers = sum(1 for uid in removed_final if not pos_win.get(uid, False))
         removed_accuracy = Decimal(removed_losers) / Decimal(removed_trades)
     else:
         removed_accuracy = Decimal("0")
@@ -504,7 +530,12 @@ async def _build_model_for_direction_v3(
         "holdout": {"days": HOLDOUT_DAYS, "used": bool(val_used), "window": val_window},
         "threshold": str(best_threshold),
         "near_threshold_margin": str(NEAR_THRESHOLD_MARGIN),
-        "good_winrate_threshold": str(GOOD_WINRATE_THRESHOLD),
+        "good_threshold_sweep": {
+            "from": str(GOOD_WINRATE_MIN),
+            "to": str(GOOD_WINRATE_MAX),
+            "step": str(GOOD_WINRATE_STEP),
+        },
+        "good_threshold_selected": str(good_threshold_selected),
         "bad_bins": {
             "initial": int(len(active_bad_bins)),
             "final": int(len(bad_bins_set)),
@@ -549,6 +580,7 @@ async def _build_model_for_direction_v3(
         signal_id=signal_id,
         direction=direction,
         threshold_used=best_threshold,
+        good_threshold_selected=good_threshold_selected,
         bins_rows=bins_rows,
         bad_bins_set=bad_bins_set,
     )
@@ -1370,6 +1402,7 @@ async def _rebuild_labels_v3_all_bins(
     signal_id: int,
     direction: str,
     threshold_used: Decimal,
+    good_threshold_selected: Decimal,
     bins_rows: List[Dict[str, Any]],
     bad_bins_set: Set[Tuple[int, str, str]],
 ) -> Tuple[int, int, int, int]:
@@ -1404,7 +1437,7 @@ async def _rebuild_labels_v3_all_bins(
                 state = "bad"
                 bad_cnt += 1
             else:
-                if winrate > GOOD_WINRATE_THRESHOLD:
+                if winrate > good_threshold_selected:
                     state = "good"
                     good_cnt += 1
                 else:
@@ -1517,6 +1550,101 @@ async def _publish_preproc_ready_v3(
             exc_info=True,
         )
 
+# 🔸 Подбор best GOOD_WINRATE_THRESHOLD по max filt_roi (на всём окне), при фиксированном bad_set
+def _select_best_good_threshold(
+    all_uids: Set[Any],
+    kept_after_bad: Set[Any],
+    bins_rows: List[Dict[str, Any]],
+    hits_index: Dict[Tuple[int, str, str], Set[Any]],
+    bad_bins_set: Set[Tuple[int, str, str]],
+    pos_pnl: Dict[Any, Decimal],
+    pos_win: Dict[Any, bool],
+    deposit: Optional[Decimal],
+) -> Dict[str, Any]:
+    # best_good_winrate для каждой позиции (только среди биннов НЕ bad)
+    best_win: Dict[Any, Optional[Decimal]] = {uid: None for uid in kept_after_bad}
+
+    # строим map winrate по key
+    winrate_by_key: Dict[Tuple[int, str, str], Decimal] = {}
+    for b in bins_rows:
+        k = (int(b["analysis_id"]), str(b["timeframe"]), str(b["bin_name"]))
+        winrate_by_key[k] = _safe_decimal(b.get("winrate", 0))
+
+    for k, hits in hits_index.items():
+        if k in bad_bins_set:
+            continue
+        w = winrate_by_key.get(k)
+        if w is None:
+            continue
+        for uid in hits:
+            if uid not in best_win:
+                continue
+            cur = best_win.get(uid)
+            if cur is None or w > cur:
+                best_win[uid] = w
+
+    # перебор порогов 0.50..1.00 step 0.01
+    best_thr = GOOD_WINRATE_MIN
+    best_roi = Decimal("-999999")
+    best_trades = 0
+    best_pnl = Decimal("0")
+    best_winrate = Decimal("0")
+    best_kept_uids: Set[Any] = set()
+
+    thr = GOOD_WINRATE_MIN
+    while thr <= GOOD_WINRATE_MAX + Decimal("0.000000001"):
+        kept = []
+        for uid in kept_after_bad:
+            w = best_win.get(uid)
+            if w is not None and w > thr:
+                kept.append(uid)
+
+        trades = len(kept)
+        pnl = sum((pos_pnl.get(uid, Decimal("0")) for uid in kept), Decimal("0"))
+        wins = sum(1 for uid in kept if pos_win.get(uid))
+
+        if trades > 0:
+            wr = Decimal(wins) / Decimal(trades)
+        else:
+            wr = Decimal("0")
+
+        if deposit and deposit > 0:
+            try:
+                roi = pnl / deposit
+            except (InvalidOperation, ZeroDivisionError):
+                roi = Decimal("0")
+        else:
+            roi = Decimal("0")
+
+        # выбираем max filt_roi; при равенстве — больше trades; потом меньший thr
+        if roi > best_roi:
+            best_roi = roi
+            best_thr = thr
+            best_trades = trades
+            best_pnl = pnl
+            best_winrate = wr
+            best_kept_uids = set(kept)
+        elif roi == best_roi:
+            if trades > best_trades:
+                best_thr = thr
+                best_trades = trades
+                best_pnl = pnl
+                best_winrate = wr
+                best_kept_uids = set(kept)
+            elif trades == best_trades and thr < best_thr:
+                best_thr = thr
+                best_kept_uids = set(kept)
+
+        thr += GOOD_WINRATE_STEP
+
+    return {
+        "good_threshold_selected": best_thr,
+        "filt_trades": int(best_trades),
+        "filt_pnl_abs": best_pnl,
+        "filt_winrate": best_winrate,
+        "filt_roi": best_roi,
+        "kept_uids": best_kept_uids,
+    }
 
 # 🔸 Вспомогательная функция: безопасное Decimal
 def _safe_decimal(value: Any) -> Decimal:

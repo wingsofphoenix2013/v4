@@ -453,6 +453,11 @@ async def _process_pair_postproc_v3(
     deposit = await _load_scenario_deposit(pg, scenario_id)
 
     # обновляем bt_analysis_scenario_stat_v3
+    good_thr_map: Dict[str, Any] = {}
+    for d in directions:
+        m = model_map.get(d) or {}
+        good_thr_map[d] = m.get("good_threshold_selected")
+
     await _update_analysis_scenario_stats_v3(
         pg=pg,
         scenario_id=scenario_id,
@@ -462,6 +467,7 @@ async def _process_pair_postproc_v3(
         removed_stats_no_good=removed_stats_good_missing,
         orig_stats=orig_stats,
         deposit=deposit,
+        good_threshold_map=good_thr_map,
     )
 
     return {
@@ -529,7 +535,8 @@ async def _load_model_opt_map_v3(
                 id,
                 direction,
                 best_threshold,
-                selected_analysis_ids
+                selected_analysis_ids,
+                meta
             FROM bt_analysis_model_opt_v3
             WHERE scenario_id = $1
               AND signal_id   = $2
@@ -549,10 +556,27 @@ async def _load_model_opt_map_v3(
                 selected = json.loads(selected)
             except Exception:
                 selected = []
+        meta = r["meta"]
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = None
+
+        good_thr = None
+        if isinstance(meta, dict):
+            raw_thr = meta.get("good_threshold_selected")
+            if raw_thr is not None:
+                try:
+                    good_thr = float(raw_thr)
+                except Exception:
+                    good_thr = None
+
         out[d] = {
             "model_id": int(r["id"]),
             "best_threshold": _safe_decimal(r["best_threshold"]),
             "selected_analysis_ids": selected if isinstance(selected, list) else [],
+            "good_threshold_selected": good_thr,
         }
     return out
 
@@ -818,6 +842,7 @@ async def _update_analysis_scenario_stats_v3(
     removed_stats_no_good: Dict[str, Dict[str, Any]],
     orig_stats: Dict[str, Dict[str, Any]],
     deposit: Optional[Decimal],
+    good_threshold_map: Dict[str, Any],
 ) -> None:
     per_dir_all: Dict[str, List[Dict[str, Any]]] = {}
     per_dir_good: Dict[str, List[Dict[str, Any]]] = {}
@@ -867,6 +892,7 @@ async def _update_analysis_scenario_stats_v3(
             raw_obj: Dict[str, Any] = {
                 "version": 3,
                 "note": "removed stats are diagnostic and may include overlaps across indicators",
+                "good_threshold_selected": good_threshold_map.get(direction),
                 "removed": {},
             }
 
@@ -883,7 +909,7 @@ async def _update_analysis_scenario_stats_v3(
                     "pnl_abs": _decimal_to_json_number(_safe_decimal(ng.get("pnl_abs", 0))),
                 }
 
-            raw_json = json.dumps(raw_obj, ensure_ascii=False) if raw_obj.get("removed") else None
+            raw_json = json.dumps(raw_obj, ensure_ascii=False)
 
             await conn.execute(
                 """
