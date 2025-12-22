@@ -15,7 +15,7 @@ DAILY_CONSUMER_NAME = "bt_analysis_daily_main"
 DAILY_STREAM_BATCH_SIZE = 10
 DAILY_STREAM_BLOCK_MS = 5000
 
-DAILY_MAX_CONCURRENCY = 6
+DAILY_MAX_CONCURRENCY = 16
 
 # 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_daily_source_finished_at: Dict[Tuple[int, int], datetime] = {}

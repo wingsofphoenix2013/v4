@@ -17,7 +17,7 @@ POSTPROC_CONSUMER_NAME = "bt_analysis_postproc_main"
 POSTPROC_STREAM_BATCH_SIZE = 10
 POSTPROC_STREAM_BLOCK_MS = 5000
 
-POSTPROC_MAX_CONCURRENCY = 8
+POSTPROC_MAX_CONCURRENCY = 16
 
 # 🔸 Fallback порога (если по какой-то причине модель не найдена)
 DEFAULT_MIN_WINRATE_THRESHOLD = Decimal("0.3334")
