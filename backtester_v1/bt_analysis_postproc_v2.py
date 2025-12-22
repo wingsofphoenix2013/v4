@@ -1,4 +1,4 @@
-# bt_analysis_postproc_v2.py — финальная пост-обработка v2 (позиция GOOD если есть хотя бы одно попадание в good-бин; публикация bt:analysis:postproc_ready_v2)
+# bt_analysis_postproc_v2.py — финальная пост-обработка v2 (позиция GOOD если есть >=1 good-hit и нет ни одного bad-hit; публикация bt:analysis:postproc_ready_v2)
 
 import asyncio
 import json
@@ -256,7 +256,7 @@ async def _process_message(
                 await redis.xack(PREPROC_READY_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
                 return
 
-            # применяем разметку good-биннов из bt_analysis_bins_labels_v2
+            # применяем разметку (good + bad) из bt_analysis_bins_labels_v2
             result = await _process_pair_postproc_v2(
                 pg=pg,
                 scenario_id=scenario_id,
@@ -278,15 +278,19 @@ async def _process_message(
             elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
             log.info(
-                "BT_ANALYSIS_POSTPROC_V2: scenario_id=%s, signal_id=%s — directions=%s, positions_total=%s, good=%s, bad=%s, good_hits=%s, good_bins=%s, models=%s, elapsed_ms=%s, dedup_ts=%s",
+                "BT_ANALYSIS_POSTPROC_V2: scenario_id=%s, signal_id=%s — directions=%s, positions_total=%s, good=%s, bad=%s, "
+                "good_bins=%s bad_bins=%s good_hits=%s bad_hits=%s no_good_hit=%s, models=%s, elapsed_ms=%s, dedup_ts=%s",
                 scenario_id,
                 signal_id,
                 directions,
                 result.get("positions_total", 0),
                 result.get("positions_good", 0),
                 result.get("positions_bad", 0),
-                result.get("good_hits", 0),
                 result.get("good_bins", 0),
+                result.get("bad_bins", 0),
+                result.get("good_hits", 0),
+                result.get("bad_hits", 0),
+                result.get("no_good_hit_positions", 0),
                 {d: {"model_id": model_map[d]["model_id"], "thr": str(model_map[d]["best_threshold"])} for d in model_map},
                 elapsed_ms,
                 dedup_ts,
@@ -304,7 +308,7 @@ async def _process_message(
             await redis.xack(PREPROC_READY_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
 
-# 🔸 Основной постпроцессинг v2 для одной пары (scenario_id, signal_id) по попаданиям в good-бинны
+# 🔸 Основной постпроцессинг v2 для одной пары (scenario_id, signal_id)
 async def _process_pair_postproc_v2(
     pg,
     scenario_id: int,
@@ -340,33 +344,37 @@ async def _process_pair_postproc_v2(
                 scenario_id,
                 signal_id,
             )
+
         return {
             "positions_total": 0,
             "positions_good": 0,
             "positions_bad": 0,
             "good_hits": 0,
+            "bad_hits": 0,
             "good_bins": 0,
+            "bad_bins": 0,
+            "no_good_hit_positions": 0,
         }
 
-    # структура: position_uid -> {pnl_abs, direction, good_state, good_reasons: [...]}
-    # по правилу v2: позиция GOOD, если есть хотя бы один good hit; иначе BAD
+    # структура: position_uid -> {pnl_abs, direction, has_good, has_bad, good_state, good_reasons, bad_reasons}
     positions_map: Dict[Any, Dict[str, Any]] = {}
     for p in positions:
         positions_map[p["position_uid"]] = {
             "pnl_abs": p["pnl_abs"],
             "direction": p["direction"],
-            "good_state": False,     # по умолчанию BAD
+            "has_good": False,
+            "has_bad": False,
+            "good_state": False,  # выставим после подсчёта has_good/has_bad
             "good_reasons": [],
+            "bad_reasons": [],
         }
 
     positions_total = len(positions_map)
 
-    # агрегат по "включениям": direction -> indicator_param -> {total_trades, total_pnl, by_tf{tf->{trades,pnl}}}
-    included_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    included_seen: set = set()
-
     total_good_bins = 0
+    total_bad_bins = 0
     total_good_hits = 0
+    total_bad_hits = 0
 
     for direction in directions:
         model = model_map.get(direction)
@@ -375,115 +383,127 @@ async def _process_pair_postproc_v2(
 
         model_id = int(model.get("model_id"))
 
-        # загружаем good bins напрямую из labels_v2 (state='good')
-        good_bins = await _load_good_bins_from_labels_v2(
+        # загружаем good/bad bins напрямую из labels_v2
+        good_bins = await _load_bins_from_labels_v2(
             pg=pg,
             model_id=model_id,
             scenario_id=scenario_id,
             signal_id=signal_id,
             direction=direction,
+            state="good",
         )
-        total_good_bins += len(good_bins)
+        bad_bins = await _load_bins_from_labels_v2(
+            pg=pg,
+            model_id=model_id,
+            scenario_id=scenario_id,
+            signal_id=signal_id,
+            direction=direction,
+            state="bad",
+        )
 
-        if not good_bins:
+        total_good_bins += len(good_bins)
+        total_bad_bins += len(bad_bins)
+
+        if not good_bins and not bad_bins:
             continue
 
-        # набор analysis_id для ускорения индекса
-        good_analysis_ids = sorted({b["analysis_id"] for b in good_bins})
-
-        # строим индекс raw только по нужным analysis_id для этого направления
+        # объединяем analysis_id для единого индекса raw
+        analysis_ids = sorted({b["analysis_id"] for b in (good_bins + bad_bins)})
         raw_index = await _load_positions_raw_index_for_analysis_ids(
             pg=pg,
             scenario_id=scenario_id,
             signal_id=signal_id,
             direction=direction,
-            analysis_ids=good_analysis_ids,
+            analysis_ids=analysis_ids,
         )
 
-        # применяем good bins к позициям
+        # применяем good bins
         for b in good_bins:
             analysis_id = b["analysis_id"]
-            indicator_param = b["indicator_param"]
             timeframe = b["timeframe"]
             bin_name = b["bin_name"]
 
             key = (analysis_id, timeframe, bin_name)
             pos_uids = raw_index.get(key, [])
-
             if not pos_uids:
                 continue
-
-            indicator_key = indicator_param if indicator_param is not None else "_none_"
 
             for uid in pos_uids:
                 pos = positions_map.get(uid)
                 if pos is None:
                     continue
 
-                # фиксируем good_state по наличию хотя бы одного good hit
-                if not pos["good_state"]:
-                    pos["good_state"] = True
-
+                pos["has_good"] = True
                 pos["good_reasons"].append(
                     {
                         "analysis_id": analysis_id,
                         "family_key": b["family_key"],
                         "key": b["analysis_key"],
-                        "indicator_param": indicator_param,
+                        "indicator_param": b["indicator_param"],
                         "timeframe": timeframe,
                         "direction": direction,
                         "bin_name": bin_name,
                         "pnl_abs_bin": float(b["pnl_abs"]),
                         "trades_bin": int(b["trades"]),
                         "winrate_bin": float(b["winrate"]),
+                        "state": "good",
                     }
                 )
                 total_good_hits += 1
 
-                # ключ для отсечения дублей в included_stats
-                seen_key = (direction, indicator_key, timeframe, uid)
-                if seen_key in included_seen:
+        # применяем bad bins
+        for b in bad_bins:
+            analysis_id = b["analysis_id"]
+            timeframe = b["timeframe"]
+            bin_name = b["bin_name"]
+
+            key = (analysis_id, timeframe, bin_name)
+            pos_uids = raw_index.get(key, [])
+            if not pos_uids:
+                continue
+
+            for uid in pos_uids:
+                pos = positions_map.get(uid)
+                if pos is None:
                     continue
-                included_seen.add(seen_key)
 
-                d_stats = included_stats.setdefault(direction, {})
-                i_stats = d_stats.setdefault(
-                    indicator_key,
+                pos["has_bad"] = True
+                pos["bad_reasons"].append(
                     {
-                        "total_trades": 0,
-                        "total_pnl": Decimal("0"),
-                        "by_tf": {},
-                    },
+                        "analysis_id": analysis_id,
+                        "family_key": b["family_key"],
+                        "key": b["analysis_key"],
+                        "indicator_param": b["indicator_param"],
+                        "timeframe": timeframe,
+                        "direction": direction,
+                        "bin_name": bin_name,
+                        "pnl_abs_bin": float(b["pnl_abs"]),
+                        "trades_bin": int(b["trades"]),
+                        "winrate_bin": float(b["winrate"]),
+                        "state": "bad",
+                    }
                 )
-                i_stats["total_trades"] += 1
-                i_stats["total_pnl"] += pos["pnl_abs"]
+                total_bad_hits += 1
 
-                tf_stats = i_stats["by_tf"].setdefault(
-                    timeframe,
-                    {
-                        "trades": 0,
-                        "pnl_abs": Decimal("0"),
-                    },
-                )
-                tf_stats["trades"] += 1
-                tf_stats["pnl_abs"] += pos["pnl_abs"]
+    # финальное правило v2:
+    # GOOD если есть >=1 good-hit И нет ни одного bad-hit
+    no_good_hit_positions = 0
+    for info in positions_map.values():
+        has_good = bool(info.get("has_good"))
+        has_bad = bool(info.get("has_bad"))
 
-    # считаем good/bad позиции
-    positions_good = sum(1 for p in positions_map.values() if p["good_state"])
+        if not has_good:
+            no_good_hit_positions += 1
+
+        info["good_state"] = bool(has_good and not has_bad)
+
+    positions_good = sum(1 for p in positions_map.values() if p.get("good_state"))
     positions_bad = positions_total - positions_good
 
-    log.debug(
-        "BT_ANALYSIS_POSTPROC_V2: итоги фильтрации для scenario_id=%s, signal_id=%s — всего=%s, good=%s, bad=%s, good_bins=%s, good_hits=%s",
-        scenario_id,
-        signal_id,
-        positions_total,
-        positions_good,
-        positions_bad,
-        total_good_bins,
-        total_good_hits,
-    )
+    # считаем статистику “accepted” и “rejected”
+    accepted_stats, rejected_stats, rejected_no_good = _build_accept_reject_stats(positions_map)
 
-    # записываем контейнер в bt_analysis_positions_postproc_v2 (сначала чистим старые строки по паре)
+    # записываем контейнер в bt_analysis_positions_postproc_v2
     await _store_positions_postproc_v2(pg, scenario_id, signal_id, positions_map)
 
     # загружаем исходную статистику сценария/сигнала по направлениям
@@ -498,7 +518,9 @@ async def _process_pair_postproc_v2(
         scenario_id=scenario_id,
         signal_id=signal_id,
         positions_map=positions_map,
-        included_stats=included_stats,
+        accepted_stats=accepted_stats,
+        rejected_stats=rejected_stats,
+        rejected_no_good=rejected_no_good,
         orig_stats=orig_stats,
         deposit=deposit,
     )
@@ -508,7 +530,10 @@ async def _process_pair_postproc_v2(
         "positions_good": positions_good,
         "positions_bad": positions_bad,
         "good_hits": total_good_hits,
+        "bad_hits": total_bad_hits,
         "good_bins": total_good_bins,
+        "bad_bins": total_bad_bins,
+        "no_good_hit_positions": no_good_hit_positions,
     }
 
 
@@ -599,13 +624,14 @@ async def _load_model_opt_map_v2(
     return out
 
 
-# 🔸 Загрузка good bins из bt_analysis_bins_labels_v2 (state='good') + подтягивание family_key/key
-async def _load_good_bins_from_labels_v2(
+# 🔸 Загрузка bins из bt_analysis_bins_labels_v2 по state (good/bad) + подтягивание family_key/key
+async def _load_bins_from_labels_v2(
     pg,
     model_id: int,
     scenario_id: int,
     signal_id: int,
     direction: str,
+    state: str,
 ) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -627,12 +653,13 @@ async def _load_good_bins_from_labels_v2(
               AND l.scenario_id = $2
               AND l.signal_id   = $3
               AND l.direction   = $4
-              AND l.state       = 'good'
+              AND l.state       = $5
             """,
             model_id,
             scenario_id,
             signal_id,
             direction,
+            state,
         )
 
     out: List[Dict[str, Any]] = []
@@ -737,6 +764,90 @@ async def _load_positions_for_pair(
     return positions
 
 
+# 🔸 Построение статистики по принятым/отклонённым позициям (по причинам good/bad)
+def _build_accept_reject_stats(
+    positions_map: Dict[Any, Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Dict[str, Any]]]:
+    accepted_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    rejected_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    rejected_no_good: Dict[str, Dict[str, Any]] = {}
+
+    accepted_seen = set()
+    rejected_seen = set()
+
+    for uid, info in positions_map.items():
+        direction = str(info.get("direction") or "").strip().lower()
+        pnl_abs = info.get("pnl_abs", Decimal("0"))
+
+        if info.get("good_state"):
+            reasons = info.get("good_reasons") or []
+            for r in reasons:
+                indicator_key = r.get("indicator_param") or "_none_"
+                tf = str(r.get("timeframe") or "")
+
+                seen_key = (direction, indicator_key, tf, uid)
+                if seen_key in accepted_seen:
+                    continue
+                accepted_seen.add(seen_key)
+
+                d_stats = accepted_stats.setdefault(direction, {})
+                i_stats = d_stats.setdefault(
+                    indicator_key,
+                    {
+                        "total_trades": 0,
+                        "total_pnl": Decimal("0"),
+                        "by_tf": {},
+                    },
+                )
+                i_stats["total_trades"] += 1
+                i_stats["total_pnl"] += pnl_abs
+
+                tf_stats = i_stats["by_tf"].setdefault(tf, {"trades": 0, "pnl_abs": Decimal("0")})
+                tf_stats["trades"] += 1
+                tf_stats["pnl_abs"] += pnl_abs
+
+        else:
+            bad_reasons = info.get("bad_reasons") or []
+            if bad_reasons:
+                for r in bad_reasons:
+                    indicator_key = r.get("indicator_param") or "_none_"
+                    tf = str(r.get("timeframe") or "")
+
+                    seen_key = (direction, indicator_key, tf, uid)
+                    if seen_key in rejected_seen:
+                        continue
+                    rejected_seen.add(seen_key)
+
+                    d_stats = rejected_stats.setdefault(direction, {})
+                    i_stats = d_stats.setdefault(
+                        indicator_key,
+                        {
+                            "total_trades": 0,
+                            "total_pnl": Decimal("0"),
+                            "by_tf": {},
+                        },
+                    )
+                    i_stats["total_trades"] += 1
+                    i_stats["total_pnl"] += pnl_abs
+
+                    tf_stats = i_stats["by_tf"].setdefault(tf, {"trades": 0, "pnl_abs": Decimal("0")})
+                    tf_stats["trades"] += 1
+                    tf_stats["pnl_abs"] += pnl_abs
+            else:
+                # отклонено по причине "нет ни одного good-hit"
+                d = rejected_no_good.setdefault(
+                    direction,
+                    {
+                        "trades": 0,
+                        "pnl_abs": Decimal("0"),
+                    },
+                )
+                d["trades"] += 1
+                d["pnl_abs"] += pnl_abs
+
+    return accepted_stats, rejected_stats, rejected_no_good
+
+
 # 🔸 Запись контейнера позиций в bt_analysis_positions_postproc_v2
 async def _store_positions_postproc_v2(
     pg,
@@ -759,13 +870,16 @@ async def _store_positions_postproc_v2(
         to_insert: List[Tuple[Any, ...]] = []
         for uid, info in positions_map.items():
             good_reasons = info.get("good_reasons") or []
+            bad_reasons = info.get("bad_reasons") or []
 
             # формируем JSON для postproc_meta
+            meta_obj = {}
             if good_reasons:
-                meta_obj = {"good_reasons": good_reasons}
-                postproc_meta = json.dumps(meta_obj, ensure_ascii=False)
-            else:
-                postproc_meta = None
+                meta_obj["good_reasons"] = good_reasons
+            if bad_reasons:
+                meta_obj["bad_reasons"] = bad_reasons
+
+            postproc_meta = json.dumps(meta_obj, ensure_ascii=False) if meta_obj else None
 
             to_insert.append(
                 (
@@ -774,7 +888,7 @@ async def _store_positions_postproc_v2(
                     signal_id,
                     info["pnl_abs"],
                     postproc_meta,
-                    info["good_state"],
+                    bool(info.get("good_state")),
                 )
             )
 
@@ -874,7 +988,9 @@ async def _update_analysis_scenario_stats_v2(
     scenario_id: int,
     signal_id: int,
     positions_map: Dict[Any, Dict[str, Any]],
-    included_stats: Dict[str, Dict[str, Dict[str, Any]]],
+    accepted_stats: Dict[str, Dict[str, Dict[str, Any]]],
+    rejected_stats: Dict[str, Dict[str, Dict[str, Any]]],
+    rejected_no_good: Dict[str, Dict[str, Any]],
     orig_stats: Dict[str, Dict[str, Any]],
     deposit: Optional[Decimal],
 ) -> None:
@@ -917,7 +1033,7 @@ async def _update_analysis_scenario_stats_v2(
             else:
                 filt_roi = Decimal("0")
 
-            # аккуратность среди удалённых сделок (те, кто НЕ попал ни в один good-бин)
+            # аккуратность среди удалённых сделок
             removed_positions = [p for p in per_dir_all.get(direction, []) if not p.get("good_state")]
             removed_trades = len(removed_positions)
             if removed_trades > 0:
@@ -926,10 +1042,11 @@ async def _update_analysis_scenario_stats_v2(
             else:
                 removed_accuracy = Decimal("0")
 
-            # raw_stat: что “включило” сделки в good (агрегация по indicator_param и TF)
-            dir_included = included_stats.get(direction) or {}
+            # raw_stat: accepted/rejected breakdown
             raw_stat_obj = _build_raw_stat_json_for_direction(
-                dir_included=dir_included,
+                accepted=accepted_stats.get(direction) or {},
+                rejected=rejected_stats.get(direction) or {},
+                rejected_no_good=rejected_no_good.get(direction) or None,
             )
             raw_stat_json = json.dumps(raw_stat_obj, ensure_ascii=False) if raw_stat_obj is not None else None
 
@@ -986,53 +1103,67 @@ async def _update_analysis_scenario_stats_v2(
             )
 
 
-# 🔸 Формирование raw_stat JSON для одного направления (агрегация “включений” в good)
+# 🔸 Формирование raw_stat JSON для одного направления (accepted/rejected + rejected_no_good_hit)
 def _build_raw_stat_json_for_direction(
-    dir_included: Dict[str, Dict[str, Any]],
+    accepted: Dict[str, Dict[str, Any]],
+    rejected: Dict[str, Dict[str, Any]],
+    rejected_no_good: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    if not dir_included:
+    if not accepted and not rejected and not rejected_no_good:
         return None
 
-    total_trades = 0
-    total_pnl = Decimal("0")
+    def _pack(stats_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        total_trades = 0
+        total_pnl = Decimal("0")
+        by_indicator: Dict[str, Any] = {}
 
-    by_indicator: Dict[str, Any] = {}
+        for indicator_key, istats in (stats_map or {}).items():
+            it_total_trades = int(istats.get("total_trades", 0) or 0)
+            it_total_pnl = istats.get("total_pnl", Decimal("0")) or Decimal("0")
 
-    for indicator_key, istats in dir_included.items():
-        it_total_trades = int(istats.get("total_trades", 0) or 0)
-        it_total_pnl = istats.get("total_pnl", Decimal("0")) or Decimal("0")
-        total_trades += it_total_trades
-        total_pnl += it_total_pnl
+            total_trades += it_total_trades
+            total_pnl += it_total_pnl
 
-        by_tf_obj: Dict[str, Any] = {}
-        by_tf = istats.get("by_tf") or {}
-        for tf, tf_stats in by_tf.items():
-            tf_trades = int(tf_stats.get("trades", 0) or 0)
-            tf_pnl = tf_stats.get("pnl_abs", Decimal("0")) or Decimal("0")
-            by_tf_obj[str(tf)] = {
-                "trades": tf_trades,
-                "pnl_abs": _decimal_to_json_number(tf_pnl),
+            by_tf_obj: Dict[str, Any] = {}
+            by_tf = istats.get("by_tf") or {}
+            for tf, tf_stats in by_tf.items():
+                tf_trades = int(tf_stats.get("trades", 0) or 0)
+                tf_pnl = tf_stats.get("pnl_abs", Decimal("0")) or Decimal("0")
+                by_tf_obj[str(tf)] = {
+                    "trades": tf_trades,
+                    "pnl_abs": _decimal_to_json_number(tf_pnl),
+                }
+
+            by_indicator[str(indicator_key)] = {
+                "total": {
+                    "trades": it_total_trades,
+                    "pnl_abs": _decimal_to_json_number(it_total_pnl),
+                },
+                "by_tf": by_tf_obj,
             }
 
-        by_indicator[str(indicator_key)] = {
-            "total": {
-                "trades": it_total_trades,
-                "pnl_abs": _decimal_to_json_number(it_total_pnl),
-            },
-            "by_tf": by_tf_obj,
-        }
-
-    return {
-        "version": 1,
-        "method": "good_bin_hit",
-        "included": {
+        return {
             "total": {
                 "trades": int(total_trades),
                 "pnl_abs": _decimal_to_json_number(total_pnl),
             },
             "by_indicator": by_indicator,
-        },
+        }
+
+    out: Dict[str, Any] = {
+        "version": 2,
+        "method": "good_and_not_bad",
+        "accepted": _pack(accepted) if accepted else {"total": {"trades": 0, "pnl_abs": 0.0}, "by_indicator": {}},
+        "rejected_by_bad": _pack(rejected) if rejected else {"total": {"trades": 0, "pnl_abs": 0.0}, "by_indicator": {}},
     }
+
+    if rejected_no_good:
+        out["rejected_no_good_hit"] = {
+            "trades": int(rejected_no_good.get("trades", 0) or 0),
+            "pnl_abs": _decimal_to_json_number(rejected_no_good.get("pnl_abs", Decimal("0")) or Decimal("0")),
+        }
+
+    return out
 
 
 # 🔸 Публикация события готовности финального постпроцессинга v2 в bt:analysis:postproc_ready_v2
@@ -1107,8 +1238,10 @@ def _safe_decimal(value: Any) -> Decimal:
 
 
 # 🔸 Вспомогательная функция: Decimal -> JSON-совместимое число
-def _decimal_to_json_number(value: Decimal) -> float:
+def _decimal_to_json_number(value: Any) -> float:
     try:
-        return float(value)
-    except (TypeError, InvalidOperation, ValueError):
+        if isinstance(value, Decimal):
+            return float(value)
+        return float(Decimal(str(value)))
+    except Exception:
         return 0.0
