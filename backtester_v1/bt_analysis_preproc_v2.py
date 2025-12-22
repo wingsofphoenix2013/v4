@@ -1,4 +1,4 @@
-# bt_analysis_preproc_v2.py — препроцессинг анализов v2.2 (v1-порог + оптимизация bad-биннов по score с multi-holdout)
+# bt_analysis_preproc_v2.py — препроцессинг анализов v2.1 (v1-порог + оптимизация набора bad-биннов через score с holdout)
 
 import asyncio
 import json
@@ -19,17 +19,17 @@ PREPROC_STREAM_BLOCK_MS = 5000
 
 PREPROC_MAX_CONCURRENCY = 6
 
-# 🔸 Настройки окна holdout (multi-holdout внутри 28-дневного окна истории)
-HOLDOUT_WINDOWS_DAYS = [7, 5, 3]  # используем worst(val_roi) среди окон
+# 🔸 Настройки окна holdout (при окне истории 28 дней)
+HOLDOUT_DAYS = 7
 
-# 🔸 Настройки оптимизации v2.2
+# 🔸 Настройки оптимизации v2.1
 EPS_THRESHOLD = Decimal("0.00000001")
 EPS_SCORE = Decimal("0.00000001")
 
-V2_LAMBDA = Decimal("0.5")                 # штраф за просадку holdout относительно train (мягче, чем v2.1 с 1.0)
+V2_LAMBDA = Decimal("1.0")          # штраф за просадку holdout относительно train
 NEAR_THRESHOLD_MARGIN = Decimal("0.0500")  # зона "рядом с порогом" для кандидатов на включение
-MAX_TOGGLE_ITERS = 220                     # максимум итераций улучшения набора bad-биннов
-MAX_BAD_BINS_LIMIT = 350                   # лимит сложности набора bad-биннов
+MAX_TOGGLE_ITERS = 200              # максимум итераций улучшения набора bad-биннов
+MAX_BAD_BINS_LIMIT = 300            # safety-лимит на число bad-биннов (не min_trades, а ограничение сложности)
 
 # 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
 _last_analysis_finished_at: Dict[Tuple[int, int], datetime] = {}
@@ -235,14 +235,14 @@ async def _process_message(
 
             results: Dict[str, Dict[str, Any]] = {}
             for direction in directions:
-                res = await _build_model_for_direction_v22(
+                res = await _build_model_for_direction_v21(
                     pg=pg,
                     scenario_id=scenario_id,
                     signal_id=signal_id,
                     direction=direction,
                     deposit=deposit,
                     source_finished_at=source_finished_at,
-                    holdout_windows_days=HOLDOUT_WINDOWS_DAYS,
+                    holdout_days=HOLDOUT_DAYS,
                 )
                 results[direction] = res
 
@@ -257,16 +257,15 @@ async def _process_message(
 
             elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
-            # суммарный лог
             parts: List[str] = []
             for d in directions:
                 r = results.get(d) or {}
                 parts.append(
                     f"{d} thr={r.get('best_threshold')} "
                     f"orig_roi={r.get('orig_roi')} filt_roi={r.get('filt_roi')} "
-                    f"train_roi={r.get('train_roi')} val_worst={r.get('val_roi_worst')} score={r.get('score')} "
-                    f"orig_tr={r.get('orig_trades')} filt_tr={r.get('filt_trades')} "
-                    f"bad_bins={r.get('bad_bins_final')}/{r.get('bad_bins_initial')} iters={r.get('iters_used')}"
+                    f"train_roi={r.get('train_roi')} val_roi={r.get('val_roi')} score={r.get('score')} "
+                    f"orig_trades={r.get('orig_trades')} filt_trades={r.get('filt_trades')} "
+                    f"bad_bins_init={r.get('bad_bins_initial')} bad_bins_final={r.get('bad_bins_final')} iters={r.get('iters_used')}"
                 )
 
             log.info(
@@ -292,15 +291,15 @@ async def _process_message(
             await redis.xack(ANALYSIS_READY_STREAM_KEY, PREPROC_CONSUMER_GROUP_V2, entry_id)
 
 
-# 🔸 v2.2: построение модели для одного направления (v1-порог + оптимизация bad-биннов по score с multi-holdout)
-async def _build_model_for_direction_v22(
+# 🔸 v2.1: построение модели для одного направления (v1-порог + оптимизация bad-биннов по score)
+async def _build_model_for_direction_v21(
     pg,
     scenario_id: int,
     signal_id: int,
     direction: str,
     deposit: Optional[Decimal],
     source_finished_at: datetime,
-    holdout_windows_days: List[int],
+    holdout_days: int,
 ) -> Dict[str, Any]:
     # загружаем позиции направления
     positions = await _load_positions_for_direction(pg, scenario_id, signal_id, direction)
@@ -314,7 +313,7 @@ async def _build_model_for_direction_v22(
             "filt_trades": 0,
             "filt_roi": "0",
             "train_roi": "0",
-            "val_roi_worst": "0",
+            "val_roi": "0",
             "score": "0",
             "bad_bins_initial": 0,
             "bad_bins_final": 0,
@@ -335,16 +334,12 @@ async def _build_model_for_direction_v22(
         pos_win[uid] = pnl > 0
         pos_exit_time[uid] = p["exit_time"]
 
-    # split train + список val-окон
-    split = _build_train_and_val_windows(
+    # split train/val по exit_time
+    train_uids, val_uids, val_used, val_window = _split_train_val_uids(
         uids=all_uids,
         pos_exit_time=pos_exit_time,
-        windows_days=holdout_windows_days,
+        holdout_days=holdout_days,
     )
-    train_uids = split["train_uids"]
-    val_windows = split["val_windows"]
-    val_used = bool(split["val_used"])
-    split_meta = split["meta"]
 
     # базовые метрики (orig) на полном окне
     orig_trades = len(all_uids)
@@ -353,7 +348,7 @@ async def _build_model_for_direction_v22(
     orig_winrate = (Decimal(orig_wins) / Decimal(orig_trades)) if orig_trades > 0 else Decimal("0")
     orig_roi = (orig_pnl_abs / deposit) if (deposit and deposit > 0) else Decimal("0")
 
-    # получаем порог как в v1, но оптимизируем по train (worst_winrate sweep)
+    # получаем порог как в v1, но оптимизируем по train (и только по direction)
     worst_rows = await _load_positions_with_worst_winrate(pg, scenario_id, signal_id, direction)
     best_threshold = _compute_best_threshold_train(
         rows=worst_rows,
@@ -364,6 +359,7 @@ async def _build_model_for_direction_v22(
     # грузим bins_stat по направлению
     bins_rows = await _load_bins_stat_rows(pg, scenario_id, signal_id, direction)
     if not bins_rows:
+        # модель без фильтрации
         model_id = await _upsert_model_opt_v2_return_id(
             pg=pg,
             scenario_id=scenario_id,
@@ -382,12 +378,12 @@ async def _build_model_for_direction_v22(
             removed_trades=0,
             removed_accuracy=Decimal("0"),
             meta_obj={
-                "version": 22,
-                "method": "v1_threshold + toggle_bad_bins_by_score + multi_holdout",
+                "version": 21,
+                "method": "v1_threshold + toggle_bad_bins_by_score",
                 "direction": direction,
                 "deposit": str(deposit) if deposit is not None else None,
                 "lambda": str(V2_LAMBDA),
-                "holdout": split_meta,
+                "holdout": {"days": holdout_days, "used": bool(val_used), "window": val_window},
                 "threshold": str(best_threshold),
                 "note": "no_bins_stat_rows",
             },
@@ -410,17 +406,17 @@ async def _build_model_for_direction_v22(
             "filt_trades": orig_trades,
             "filt_roi": str(_q_decimal(orig_roi)),
             "train_roi": str(_q_decimal(orig_roi)),
-            "val_roi_worst": str(_q_decimal(orig_roi)),
+            "val_roi": str(_q_decimal(orig_roi)),
             "score": str(_q_decimal(orig_roi)),
             "bad_bins_initial": 0,
             "bad_bins_final": 0,
             "iters_used": 0,
         }
 
-    # индекс попаданий raw
+    # строим индекс попаданий raw
     hits_index = await _load_hits_index_for_direction(pg, scenario_id, signal_id, direction)
 
-    # кандидаты: только те, что имеют попадания
+    # формируем кандидаты-бинны: только те, что реально имеют попадания в positions_raw
     bin_by_key: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
     for b in bins_rows:
         k = (int(b["analysis_id"]), str(b["timeframe"]), str(b["bin_name"]))
@@ -431,6 +427,7 @@ async def _build_model_for_direction_v22(
         bin_by_key[k] = b
 
     if not bin_by_key:
+        # нечего оптимизировать
         model_id = await _upsert_model_opt_v2_return_id(
             pg=pg,
             scenario_id=scenario_id,
@@ -449,12 +446,12 @@ async def _build_model_for_direction_v22(
             removed_trades=0,
             removed_accuracy=Decimal("0"),
             meta_obj={
-                "version": 22,
-                "method": "v1_threshold + toggle_bad_bins_by_score + multi_holdout",
+                "version": 21,
+                "method": "v1_threshold + toggle_bad_bins_by_score",
                 "direction": direction,
                 "deposit": str(deposit) if deposit is not None else None,
                 "lambda": str(V2_LAMBDA),
-                "holdout": split_meta,
+                "holdout": {"days": holdout_days, "used": bool(val_used), "window": val_window},
                 "threshold": str(best_threshold),
                 "note": "no_usable_bins_with_hits",
             },
@@ -477,68 +474,65 @@ async def _build_model_for_direction_v22(
             "filt_trades": orig_trades,
             "filt_roi": str(_q_decimal(orig_roi)),
             "train_roi": str(_q_decimal(orig_roi)),
-            "val_roi_worst": str(_q_decimal(orig_roi)),
+            "val_roi": str(_q_decimal(orig_roi)),
             "score": str(_q_decimal(orig_roi)),
             "bad_bins_initial": 0,
             "bad_bins_final": 0,
             "iters_used": 0,
         }
 
-    # стартовый bad-набор как в v1: winrate <= threshold
+    # стартовый активный набор bad-биннов как в v1: winrate <= threshold
     active_bad_bins: Set[Tuple[int, str, str]] = set()
     for k, b in bin_by_key.items():
         if _safe_decimal(b["winrate"]) <= best_threshold:
-            active_bad_bins.add(k)
+            # условия достаточности: бин должен реально задевать хоть одну позицию в окне
+            if hits_index.get(k):
+                active_bad_bins.add(k)
 
     bad_bins_initial = len(active_bad_bins)
 
-    # пул на включение: bины рядом с порогом
+    # кандидаты на включение: все бины "рядом с порогом" (<= threshold + margin)
     enable_pool: Set[Tuple[int, str, str]] = set()
     thr_hi = best_threshold + NEAR_THRESHOLD_MARGIN
     for k, b in bin_by_key.items():
         if _safe_decimal(b["winrate"]) <= thr_hi:
             enable_pool.add(k)
 
-    # hits на train
+    # подготавливаем hits для train/val
     hits_train: Dict[Tuple[int, str, str], Set[Any]] = {}
+    hits_val: Dict[Tuple[int, str, str], Set[Any]] = {}
+
     for k, hits in hits_index.items():
         if k not in bin_by_key:
             continue
+
+        # hits на train/val
         ht = hits.intersection(train_uids)
+        hv = hits.intersection(val_uids) if val_used else set()
+
         if ht:
             hits_train[k] = ht
+        if hv:
+            hits_val[k] = hv
 
-    # hits на val-окна (по индексу окна)
-    hits_val_windows: List[Dict[Tuple[int, str, str], Set[Any]]] = []
-    if val_used:
-        for vw in val_windows:
-            vset = vw["uids"]
-            hv_map: Dict[Tuple[int, str, str], Set[Any]] = {}
-            for k, hits in hits_index.items():
-                if k not in bin_by_key:
-                    continue
-                hv = hits.intersection(vset)
-                if hv:
-                    hv_map[k] = hv
-            hits_val_windows.append(hv_map)
-
-    # инициализация состояния
-    state = _init_state_counts_multi_holdout(
+    # инициализация состояния (counts + kept-агрегаты)
+    state = _init_state_counts(
         all_uids=all_uids,
         train_uids=train_uids,
-        val_windows=val_windows,
+        val_uids=val_uids,
         val_used=val_used,
         pos_pnl=pos_pnl,
         pos_win=pos_win,
         hits_train=hits_train,
-        hits_val_windows=hits_val_windows,
+        hits_val=hits_val,
         active_bad_bins=active_bad_bins,
-        deposit=deposit,
     )
 
-    # оптимизация набора bad-биннов
-    selected_bins_set, iters_used, steps = _optimize_bad_bins_by_score_multi_holdout(
+    # оптимизация набора bad-биннов (disable/enable) по score
+    selected_bins_set, iters_used, steps = _optimize_bad_bins_by_score(
         state=state,
+        deposit=deposit,
+        val_used=val_used,
         enable_pool=enable_pool,
         max_iters=MAX_TOGGLE_ITERS,
         max_bad_bins=MAX_BAD_BINS_LIMIT,
@@ -546,7 +540,8 @@ async def _build_model_for_direction_v22(
 
     bad_bins_final = len(selected_bins_set)
 
-    # финальные метрики на полном окне
+    # финальные метрики на полном окне (не только train)
+    # считаем removed как union hits по выбранным bad-бинам
     removed_all: Set[Any] = set()
     for k in selected_bins_set:
         removed_all |= hits_index.get(k, set())
@@ -577,17 +572,18 @@ async def _build_model_for_direction_v22(
 
     selected_analysis_ids_list = sorted(list(selected_analysis_ids))
 
+    # train/val/score из состояния
     train_roi = state.get("roi_train") or Decimal("0")
-    val_roi_worst = state.get("roi_val_worst") or Decimal("0")
+    val_roi = state.get("roi_val") or Decimal("0")
     score = state.get("score") or Decimal("0")
 
     meta_obj = {
-        "version": 22,
-        "method": "v1_threshold + toggle_bad_bins_by_score + multi_holdout",
+        "version": 21,
+        "method": "v1_threshold + toggle_bad_bins_by_score",
         "direction": direction,
         "deposit": str(deposit) if deposit is not None else None,
         "lambda": str(V2_LAMBDA),
-        "holdout": split_meta,
+        "holdout": {"days": holdout_days, "used": bool(val_used), "window": val_window},
         "threshold": str(best_threshold),
         "near_threshold_margin": str(NEAR_THRESHOLD_MARGIN),
         "bins": {
@@ -595,13 +591,12 @@ async def _build_model_for_direction_v22(
             "final_bad": int(bad_bins_final),
             "enable_pool": int(len(enable_pool)),
         },
+        "iters": int(iters_used),
         "score": {
             "train_roi": str(_q_decimal(train_roi)),
-            "val_roi_worst": str(_q_decimal(val_roi_worst)),
-            "val_rois": [str(_q_decimal(x)) for x in (state.get("roi_val_list") or [])],
+            "val_roi": str(_q_decimal(val_roi)),
             "score": str(_q_decimal(score)),
         },
-        "iters": int(iters_used),
         "steps": steps,
     }
 
@@ -627,7 +622,7 @@ async def _build_model_for_direction_v22(
         source_finished_at=source_finished_at,
     )
 
-    # labels_v2: только bad
+    # пересобираем labels_v2: state='bad' только для выбранных биннов
     await _rebuild_bins_labels_v2(
         pg=pg,
         model_id=model_id,
@@ -646,7 +641,7 @@ async def _build_model_for_direction_v22(
         "filt_trades": filt_trades,
         "filt_roi": str(_q_decimal(filt_roi)),
         "train_roi": str(_q_decimal(train_roi)),
-        "val_roi_worst": str(_q_decimal(val_roi_worst)),
+        "val_roi": str(_q_decimal(val_roi)),
         "score": str(_q_decimal(score)),
         "bad_bins_initial": bad_bins_initial,
         "bad_bins_final": bad_bins_final,
@@ -654,49 +649,33 @@ async def _build_model_for_direction_v22(
     }
 
 
-# 🔸 Инициализация состояния (counts + kept-агрегаты) для multi-holdout
-def _init_state_counts_multi_holdout(
+# 🔸 Инициализация состояния (counts + kept-метрики) для активного набора bad-биннов
+def _init_state_counts(
     all_uids: Set[Any],
     train_uids: Set[Any],
-    val_windows: List[Dict[str, Any]],
+    val_uids: Set[Any],
     val_used: bool,
     pos_pnl: Dict[Any, Decimal],
     pos_win: Dict[Any, bool],
     hits_train: Dict[Tuple[int, str, str], Set[Any]],
-    hits_val_windows: List[Dict[Tuple[int, str, str], Set[Any]]],
+    hits_val: Dict[Tuple[int, str, str], Set[Any]],
     active_bad_bins: Set[Tuple[int, str, str]],
-    deposit: Optional[Decimal],
 ) -> Dict[str, Any]:
-    # train kept = все train
+    # стартовые агрегаты kept = все
     train_kept_trades = len(train_uids)
     train_kept_pnl = sum((pos_pnl.get(uid, Decimal("0")) for uid in train_uids), Decimal("0"))
     train_kept_wins = sum(1 for uid in train_uids if pos_win.get(uid))
 
-    # val windows kept = все их uids
-    val_kept_trades: List[int] = []
-    val_kept_pnl: List[Decimal] = []
-    val_kept_wins: List[int] = []
-    bad_count_val: List[Dict[Any, int]] = []
+    val_kept_trades = len(val_uids) if val_used else 0
+    val_kept_pnl = sum((pos_pnl.get(uid, Decimal("0")) for uid in val_uids), Decimal("0")) if val_used else Decimal("0")
+    val_kept_wins = sum(1 for uid in val_uids if pos_win.get(uid)) if val_used else 0
 
-    if val_used:
-        for vw in val_windows:
-            uids = vw["uids"]
-            val_kept_trades.append(len(uids))
-            val_kept_pnl.append(sum((pos_pnl.get(uid, Decimal("0")) for uid in uids), Decimal("0")))
-            val_kept_wins.append(sum(1 for uid in uids if pos_win.get(uid)))
-            bad_count_val.append({})
-    else:
-        val_kept_trades = []
-        val_kept_pnl = []
-        val_kept_wins = []
-        bad_count_val = []
-
-    # counts train
+    # counts: uid -> сколько активных bad-биннов по нему сработало
     bad_count_train: Dict[Any, int] = {}
+    bad_count_val: Dict[Any, int] = {}
 
-    # применяем активные bad-бинны
+    # применяем все активные бины (переводим часть позиций в removed)
     for k in active_bad_bins:
-        # train
         ht = hits_train.get(k) or set()
         for uid in ht:
             c = bad_count_train.get(uid, 0)
@@ -707,32 +686,26 @@ def _init_state_counts_multi_holdout(
                     train_kept_wins -= 1
             bad_count_train[uid] = c + 1
 
-        # val windows
         if val_used:
-            for idx in range(len(val_windows)):
-                hv_map = hits_val_windows[idx] if idx < len(hits_val_windows) else {}
-                hv = hv_map.get(k) or set()
-                if not hv:
-                    continue
-                bc = bad_count_val[idx]
-                for uid in hv:
-                    c = bc.get(uid, 0)
-                    if c == 0:
-                        val_kept_trades[idx] -= 1
-                        val_kept_pnl[idx] -= pos_pnl.get(uid, Decimal("0"))
-                        if pos_win.get(uid):
-                            val_kept_wins[idx] -= 1
-                    bc[uid] = c + 1
+            hv = hits_val.get(k) or set()
+            for uid in hv:
+                c = bad_count_val.get(uid, 0)
+                if c == 0:
+                    val_kept_trades -= 1
+                    val_kept_pnl -= pos_pnl.get(uid, Decimal("0"))
+                    if pos_win.get(uid):
+                        val_kept_wins -= 1
+                bad_count_val[uid] = c + 1
 
     state: Dict[str, Any] = {
         "all_uids": all_uids,
         "train_uids": train_uids,
-        "val_windows": val_windows,
+        "val_uids": val_uids,
         "val_used": val_used,
         "pos_pnl": pos_pnl,
         "pos_win": pos_win,
         "hits_train": hits_train,
-        "hits_val_windows": hits_val_windows,
+        "hits_val": hits_val,
         "active": set(active_bad_bins),
         "bad_count_train": bad_count_train,
         "bad_count_val": bad_count_val,
@@ -742,91 +715,72 @@ def _init_state_counts_multi_holdout(
         "val_kept_trades": val_kept_trades,
         "val_kept_pnl": val_kept_pnl,
         "val_kept_wins": val_kept_wins,
-        "deposit": deposit,
     }
-
-    # первичный score
-    _recalc_score_multi_holdout(state)
     return state
 
 
-# 🔸 Пересчёт ROI/score для multi-holdout (worst val ROI)
-def _recalc_score_multi_holdout(state: Dict[str, Any]) -> None:
-    deposit = state.get("deposit")
-
-    # roi train
-    if deposit and deposit > 0:
-        try:
-            roi_train = state["train_kept_pnl"] / deposit
-        except (InvalidOperation, ZeroDivisionError):
-            roi_train = Decimal("0")
-    else:
-        roi_train = Decimal("0")
-
-    roi_val_list: List[Decimal] = []
-    if state.get("val_used"):
-        vals: List[Decimal] = state.get("val_kept_pnl") or []
-        for pnl in vals:
-            if deposit and deposit > 0:
-                try:
-                    roi_val_list.append(pnl / deposit)
-                except (InvalidOperation, ZeroDivisionError):
-                    roi_val_list.append(Decimal("0"))
-            else:
-                roi_val_list.append(Decimal("0"))
-
-    if roi_val_list:
-        roi_val_worst = min(roi_val_list)
-    else:
-        roi_val_worst = roi_train
-        roi_val_list = []
-
-    # score
-    drop = roi_train - roi_val_worst
-    if drop > 0:
-        score = roi_train - (V2_LAMBDA * drop)
-    else:
-        score = roi_train
-
-    state["roi_train"] = roi_train
-    state["roi_val_list"] = roi_val_list
-    state["roi_val_worst"] = roi_val_worst
-    state["score"] = score
-
-
-# 🔸 Оптимизация набора bad-биннов (disable/enable по одному) по score с multi-holdout
-def _optimize_bad_bins_by_score_multi_holdout(
+# 🔸 Оптимизация набора bad-биннов (disable/enable по одному) по score с holdout
+def _optimize_bad_bins_by_score(
     state: Dict[str, Any],
+    deposit: Optional[Decimal],
+    val_used: bool,
     enable_pool: Set[Tuple[int, str, str]],
     max_iters: int,
     max_bad_bins: int,
 ) -> Tuple[Set[Tuple[int, str, str]], int, List[Dict[str, Any]]]:
     steps: List[Dict[str, Any]] = []
 
+    # вспомогательные вычисления score
+    def calc_roi(pnl: Decimal) -> Decimal:
+        if deposit and deposit > 0:
+            try:
+                return pnl / deposit
+            except (InvalidOperation, ZeroDivisionError):
+                return Decimal("0")
+        return Decimal("0")
+
+    def calc_score(roi_train: Decimal, roi_val: Decimal) -> Decimal:
+        # если holdout хуже train — штрафуем разницу
+        drop = roi_train - roi_val
+        if drop > 0:
+            return roi_train - (V2_LAMBDA * drop)
+        return roi_train
+
+    # текущие значения
+    roi_train = calc_roi(state["train_kept_pnl"])
+    roi_val = calc_roi(state["val_kept_pnl"]) if val_used else roi_train
+    score = calc_score(roi_train, roi_val)
+
+    state["roi_train"] = roi_train
+    state["roi_val"] = roi_val
+    state["score"] = score
+
     active: Set[Tuple[int, str, str]] = state["active"]
     hits_train: Dict[Tuple[int, str, str], Set[Any]] = state["hits_train"]
-    hits_val_windows: List[Dict[Tuple[int, str, str], Set[Any]]] = state.get("hits_val_windows") or []
-
+    hits_val: Dict[Tuple[int, str, str], Set[Any]] = state["hits_val"]
     pos_pnl: Dict[Any, Decimal] = state["pos_pnl"]
     pos_win: Dict[Any, bool] = state["pos_win"]
-
     bad_count_train: Dict[Any, int] = state["bad_count_train"]
-    bad_count_val: List[Dict[Any, int]] = state.get("bad_count_val") or []
+    bad_count_val: Dict[Any, int] = state["bad_count_val"]
 
-    val_used = bool(state.get("val_used"))
     iters_used = 0
 
     for it in range(int(max_iters or 0)):
         iters_used = it + 1
 
         best_move = None
-        best_new_score = state["score"]
+        best_new_score = score
+        best_new_roi_train = roi_train
+        best_new_roi_val = roi_val
 
-        # 1) disable: пробуем выключать активные бины
+        # 1) пробуем выключать активные bad-бинны
         for k in list(active):
+            # условия достаточности: нужно иметь hits в train/val, иначе выключение бессмысленно
             ht = hits_train.get(k) or set()
+            hv = hits_val.get(k) or set()
 
-            # delta train при disable
+            # считаем дельты для disable:
+            # позиция вернётся в kept, если её текущий count == 1
             delta_train_trades = 0
             delta_train_pnl = Decimal("0")
             delta_train_wins = 0
@@ -838,54 +792,33 @@ def _optimize_bad_bins_by_score_multi_holdout(
                     if pos_win.get(uid):
                         delta_train_wins += 1
 
-            # delta val по каждому окну
-            delta_val_trades: List[int] = []
-            delta_val_pnl: List[Decimal] = []
-            delta_val_wins: List[int] = []
+            delta_val_trades = 0
+            delta_val_pnl = Decimal("0")
+            delta_val_wins = 0
 
-            if val_used and hits_val_windows:
-                for w_idx in range(len(hits_val_windows)):
-                    hv = hits_val_windows[w_idx].get(k) or set()
-                    bc = bad_count_val[w_idx]
-                    dt = 0
-                    dp = Decimal("0")
-                    dw = 0
-                    for uid in hv:
-                        if bc.get(uid, 0) == 1:
-                            dt += 1
-                            dp += pos_pnl.get(uid, Decimal("0"))
-                            if pos_win.get(uid):
-                                dw += 1
-                    delta_val_trades.append(dt)
-                    delta_val_pnl.append(dp)
-                    delta_val_wins.append(dw)
+            if val_used:
+                for uid in hv:
+                    if bad_count_val.get(uid, 0) == 1:
+                        delta_val_trades += 1
+                        delta_val_pnl += pos_pnl.get(uid, Decimal("0"))
+                        if pos_win.get(uid):
+                            delta_val_wins += 1
 
-            # применяем виртуально
-            new_state = _shallow_state_snapshot(state)
-            new_state["train_kept_trades"] = state["train_kept_trades"] + delta_train_trades
-            new_state["train_kept_pnl"] = state["train_kept_pnl"] + delta_train_pnl
-            new_state["train_kept_wins"] = state["train_kept_wins"] + delta_train_wins
+            new_train_pnl = state["train_kept_pnl"] + delta_train_pnl
+            new_val_pnl = (state["val_kept_pnl"] + delta_val_pnl) if val_used else new_train_pnl
 
-            if val_used and delta_val_pnl:
-                new_vals_trades = list(state["val_kept_trades"])
-                new_vals_pnl = list(state["val_kept_pnl"])
-                new_vals_wins = list(state["val_kept_wins"])
-                for w_idx in range(len(delta_val_pnl)):
-                    new_vals_trades[w_idx] = new_vals_trades[w_idx] + delta_val_trades[w_idx]
-                    new_vals_pnl[w_idx] = new_vals_pnl[w_idx] + delta_val_pnl[w_idx]
-                    new_vals_wins[w_idx] = new_vals_wins[w_idx] + delta_val_wins[w_idx]
-                new_state["val_kept_trades"] = new_vals_trades
-                new_state["val_kept_pnl"] = new_vals_pnl
-                new_state["val_kept_wins"] = new_vals_wins
+            new_roi_train = calc_roi(new_train_pnl)
+            new_roi_val = calc_roi(new_val_pnl) if val_used else new_roi_train
+            new_score = calc_score(new_roi_train, new_roi_val)
 
-            _recalc_score_multi_holdout(new_state)
-            new_score = new_state["score"]
-
+            # выбираем улучшение score; при равенстве предпочитаем больше train_kept_trades
             if new_score > best_new_score + EPS_SCORE:
                 best_new_score = new_score
-                best_move = ("disable", k, delta_train_trades, delta_train_pnl, delta_train_wins, delta_val_trades, delta_val_pnl, delta_val_wins)
+                best_new_roi_train = new_roi_train
+                best_new_roi_val = new_roi_val
+                best_move = ("disable", k, delta_train_trades, delta_train_pnl, delta_val_trades, delta_val_pnl)
 
-        # 2) enable: пробуем включать кандидаты
+        # 2) пробуем включать кандидаты из enable_pool (но не те, что уже активны)
         if len(active) < int(max_bad_bins or 0):
             for k in enable_pool:
                 if k in active:
@@ -895,7 +828,8 @@ def _optimize_bad_bins_by_score_multi_holdout(
                 if not ht:
                     continue
 
-                # delta train при enable (позиции уйдут из kept, если count==0)
+                # dельты для enable:
+                # позиция уйдёт из kept, если её текущий count == 0
                 delta_train_trades = 0
                 delta_train_pnl = Decimal("0")
                 delta_train_wins = 0
@@ -910,62 +844,42 @@ def _optimize_bad_bins_by_score_multi_holdout(
                 if delta_train_trades <= 0:
                     continue
 
-                # delta val
-                delta_val_trades = []
-                delta_val_pnl = []
-                delta_val_wins = []
+                hv = hits_val.get(k) or set()
 
-                if val_used and hits_val_windows:
-                    for w_idx in range(len(hits_val_windows)):
-                        hv = hits_val_windows[w_idx].get(k) or set()
-                        bc = bad_count_val[w_idx]
-                        dt = 0
-                        dp = Decimal("0")
-                        dw = 0
-                        for uid in hv:
-                            if bc.get(uid, 0) == 0:
-                                dt += 1
-                                dp += pos_pnl.get(uid, Decimal("0"))
-                                if pos_win.get(uid):
-                                    dw += 1
-                        delta_val_trades.append(dt)
-                        delta_val_pnl.append(dp)
-                        delta_val_wins.append(dw)
+                delta_val_trades = 0
+                delta_val_pnl = Decimal("0")
+                delta_val_wins = 0
 
-                # применяем виртуально
-                new_state = _shallow_state_snapshot(state)
-                new_state["train_kept_trades"] = state["train_kept_trades"] - delta_train_trades
-                new_state["train_kept_pnl"] = state["train_kept_pnl"] - delta_train_pnl
-                new_state["train_kept_wins"] = state["train_kept_wins"] - delta_train_wins
+                if val_used and hv:
+                    for uid in hv:
+                        if bad_count_val.get(uid, 0) == 0:
+                            delta_val_trades += 1
+                            delta_val_pnl += pos_pnl.get(uid, Decimal("0"))
+                            if pos_win.get(uid):
+                                delta_val_wins += 1
 
-                if val_used and delta_val_pnl:
-                    new_vals_trades = list(state["val_kept_trades"])
-                    new_vals_pnl = list(state["val_kept_pnl"])
-                    new_vals_wins = list(state["val_kept_wins"])
-                    for w_idx in range(len(delta_val_pnl)):
-                        new_vals_trades[w_idx] = new_vals_trades[w_idx] - delta_val_trades[w_idx]
-                        new_vals_pnl[w_idx] = new_vals_pnl[w_idx] - delta_val_pnl[w_idx]
-                        new_vals_wins[w_idx] = new_vals_wins[w_idx] - delta_val_wins[w_idx]
-                    new_state["val_kept_trades"] = new_vals_trades
-                    new_state["val_kept_pnl"] = new_vals_pnl
-                    new_state["val_kept_wins"] = new_vals_wins
+                new_train_pnl = state["train_kept_pnl"] - delta_train_pnl
+                new_val_pnl = (state["val_kept_pnl"] - delta_val_pnl) if val_used else new_train_pnl
 
-                _recalc_score_multi_holdout(new_state)
-                new_score = new_state["score"]
+                new_roi_train = calc_roi(new_train_pnl)
+                new_roi_val = calc_roi(new_val_pnl) if val_used else new_roi_train
+                new_score = calc_score(new_roi_train, new_roi_val)
 
                 if new_score > best_new_score + EPS_SCORE:
                     best_new_score = new_score
-                    best_move = ("enable", k, delta_train_trades, delta_train_pnl, delta_train_wins, delta_val_trades, delta_val_pnl, delta_val_wins)
+                    best_new_roi_train = new_roi_train
+                    best_new_roi_val = new_roi_val
+                    best_move = ("enable", k, delta_train_trades, delta_train_pnl, delta_val_trades, delta_val_pnl)
 
         # если шагов улучшения нет — стоп
         if best_move is None:
             break
 
-        # применяем лучший шаг на реальное состояние
-        action, k, dt_tr, dp_tr, dw_tr, dt_vals, dp_vals, dw_vals = best_move
+        # применяем лучший шаг
+        action, k, dt_tr, dt_pnl_tr, dv_tr, dv_pnl_tr = best_move
 
         if action == "disable":
-            # train counts
+            # обновляем counts и агрегаты (позиции могут вернуться в kept)
             ht = hits_train.get(k) or set()
             for uid in ht:
                 c = bad_count_train.get(uid, 0)
@@ -980,27 +894,24 @@ def _optimize_bad_bins_by_score_multi_holdout(
                     if bad_count_train[uid] == 0:
                         bad_count_train.pop(uid, None)
 
-            # val counts
-            if val_used and hits_val_windows:
-                for w_idx in range(len(hits_val_windows)):
-                    hv = hits_val_windows[w_idx].get(k) or set()
-                    bc = bad_count_val[w_idx]
-                    for uid in hv:
-                        c = bc.get(uid, 0)
-                        if c <= 0:
-                            continue
-                        bc[uid] = c - 1
-                        if c == 1:
-                            state["val_kept_trades"][w_idx] += 1
-                            state["val_kept_pnl"][w_idx] += pos_pnl.get(uid, Decimal("0"))
-                            if pos_win.get(uid):
-                                state["val_kept_wins"][w_idx] += 1
-                            if bc[uid] == 0:
-                                bc.pop(uid, None)
+            if val_used:
+                hv = hits_val.get(k) or set()
+                for uid in hv:
+                    c = bad_count_val.get(uid, 0)
+                    if c <= 0:
+                        continue
+                    bad_count_val[uid] = c - 1
+                    if c == 1:
+                        state["val_kept_trades"] += 1
+                        state["val_kept_pnl"] += pos_pnl.get(uid, Decimal("0"))
+                        if pos_win.get(uid):
+                            state["val_kept_wins"] += 1
+                        if bad_count_val[uid] == 0:
+                            bad_count_val.pop(uid, None)
 
             active.discard(k)
 
-        else:  # enable
+        elif action == "enable":
             ht = hits_train.get(k) or set()
             for uid in ht:
                 c = bad_count_train.get(uid, 0)
@@ -1011,115 +922,47 @@ def _optimize_bad_bins_by_score_multi_holdout(
                         state["train_kept_wins"] -= 1
                 bad_count_train[uid] = c + 1
 
-            if val_used and hits_val_windows:
-                for w_idx in range(len(hits_val_windows)):
-                    hv = hits_val_windows[w_idx].get(k) or set()
-                    bc = bad_count_val[w_idx]
-                    for uid in hv:
-                        c = bc.get(uid, 0)
-                        if c == 0:
-                            state["val_kept_trades"][w_idx] -= 1
-                            state["val_kept_pnl"][w_idx] -= pos_pnl.get(uid, Decimal("0"))
-                            if pos_win.get(uid):
-                                state["val_kept_wins"][w_idx] -= 1
-                        bc[uid] = c + 1
+            if val_used:
+                hv = hits_val.get(k) or set()
+                for uid in hv:
+                    c = bad_count_val.get(uid, 0)
+                    if c == 0:
+                        state["val_kept_trades"] -= 1
+                        state["val_kept_pnl"] -= pos_pnl.get(uid, Decimal("0"))
+                        if pos_win.get(uid):
+                            state["val_kept_wins"] -= 1
+                    bad_count_val[uid] = c + 1
 
             active.add(k)
 
-        _recalc_score_multi_holdout(state)
+        # обновляем score
+        roi_train = calc_roi(state["train_kept_pnl"])
+        roi_val = calc_roi(state["val_kept_pnl"]) if val_used else roi_train
+        score = calc_score(roi_train, roi_val)
 
-        # шаг meta (сжато)
+        state["roi_train"] = roi_train
+        state["roi_val"] = roi_val
+        state["score"] = score
+
+        # шаги meta (сжато)
         steps.append(
             {
                 "step": it + 1,
                 "action": action,
                 "bin": {"analysis_id": int(k[0]), "timeframe": str(k[1]), "bin_name": str(k[2])},
-                "roi_train": str(_q_decimal(state["roi_train"])),
-                "val_worst": str(_q_decimal(state["roi_val_worst"])),
-                "val_rois": [str(_q_decimal(x)) for x in (state.get("roi_val_list") or [])],
-                "score": str(_q_decimal(state["score"])),
+                "roi_train": str(_q_decimal(roi_train)),
+                "roi_val": str(_q_decimal(roi_val)),
+                "score": str(_q_decimal(score)),
                 "active_bad_bins": int(len(active)),
             }
         )
 
+        # ограничение размера meta
         if len(steps) >= 120:
             steps.append({"note": "steps_truncated"})
             break
 
     return set(active), iters_used, steps
-
-
-# 🔸 Снимок состояния для виртуальной оценки шага (лёгкий копипаст нужных полей)
-def _shallow_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
-    snap = {
-        "deposit": state.get("deposit"),
-        "val_used": state.get("val_used"),
-        "train_kept_trades": state.get("train_kept_trades"),
-        "train_kept_pnl": state.get("train_kept_pnl"),
-        "train_kept_wins": state.get("train_kept_wins"),
-        "val_kept_trades": state.get("val_kept_trades"),
-        "val_kept_pnl": state.get("val_kept_pnl"),
-        "val_kept_wins": state.get("val_kept_wins"),
-    }
-    return snap
-
-
-# 🔸 Построение train и списка val-окон (multi-holdout) по exit_time
-def _build_train_and_val_windows(
-    uids: Set[Any],
-    pos_exit_time: Dict[Any, datetime],
-    windows_days: List[int],
-) -> Dict[str, Any]:
-    # нормализуем дни
-    days_list = sorted({int(x) for x in (windows_days or []) if int(x) > 0}, reverse=True)
-    if not days_list:
-        return {"train_uids": set(uids), "val_windows": [], "val_used": False, "meta": {"used": False, "reason": "no_windows"}}
-
-    max_ts = None
-    for uid in uids:
-        ts = pos_exit_time.get(uid)
-        if ts is None:
-            continue
-        if max_ts is None or ts > max_ts:
-            max_ts = ts
-
-    if max_ts is None:
-        return {"train_uids": set(uids), "val_windows": [], "val_used": False, "meta": {"used": False, "reason": "no_exit_time"}}
-
-    # строим окна val
-    val_windows: List[Dict[str, Any]] = []
-    for d in days_list:
-        cut = max_ts - timedelta(days=d)
-        vset: Set[Any] = set()
-        for uid in uids:
-            ts = pos_exit_time.get(uid)
-            if ts is None:
-                continue
-            if ts >= cut:
-                vset.add(uid)
-        val_windows.append({"days": d, "cut": cut, "uids": vset})
-
-    # train = всё минус самое большое окно
-    max_win = val_windows[0]
-    train_uids = set(uid for uid in uids if uid not in max_win["uids"])
-
-    # условия достаточности
-    if not train_uids or any(len(w["uids"]) == 0 for w in val_windows):
-        meta = {
-            "used": False,
-            "reason": "empty_split",
-            "train": len(train_uids),
-            "windows": [{"days": w["days"], "val": len(w["uids"]), "cut": w["cut"].isoformat()} for w in val_windows],
-        }
-        return {"train_uids": set(uids), "val_windows": [], "val_used": False, "meta": meta}
-
-    meta = {
-        "used": True,
-        "mode": "exit_time_multi_days",
-        "train": len(train_uids),
-        "windows": [{"days": w["days"], "val": len(w["uids"]), "cut": w["cut"].isoformat()} for w in val_windows],
-    }
-    return {"train_uids": train_uids, "val_windows": val_windows, "val_used": True, "meta": meta}
 
 
 # 🔸 v1-подобный sweep: расчёт оптимального порога по train (через worst_winrate позиции)
@@ -1128,13 +971,19 @@ def _compute_best_threshold_train(
     train_uids: Set[Any],
     deposit: Optional[Decimal],
 ) -> Decimal:
-    # train + worst_winrate
+    # фильтруем только train и только позиции с worst_winrate
     train_rows = [r for r in rows if r["position_uid"] in train_uids and r.get("worst_winrate") is not None]
     if not train_rows:
         return Decimal("0")
 
     orig_trades = len(train_rows)
     orig_pnl = sum((r["pnl_abs"] for r in train_rows), Decimal("0"))
+    orig_wins = sum(1 for r in train_rows if r["pnl_abs"] > 0)
+
+    if orig_trades > 0:
+        orig_winrate = Decimal(orig_wins) / Decimal(orig_trades)
+    else:
+        orig_winrate = Decimal("0")
 
     if deposit and deposit > 0:
         try:
@@ -1144,14 +993,19 @@ def _compute_best_threshold_train(
     else:
         orig_roi = Decimal("0")
 
+    # группируем по worst_winrate
     groups: Dict[Decimal, Dict[str, Any]] = {}
     for r in train_rows:
         w = r["worst_winrate"]
         if w is None:
             continue
-        g = groups.setdefault(w, {"trades": 0, "pnl": Decimal("0")})
+        g = groups.setdefault(w, {"trades": 0, "pnl": Decimal("0"), "wins": 0, "losers": 0})
         g["trades"] += 1
         g["pnl"] += r["pnl_abs"]
+        if r["pnl_abs"] > 0:
+            g["wins"] += 1
+        else:
+            g["losers"] += 1
 
     unique_w = sorted(groups.keys())
     if not unique_w:
@@ -1161,6 +1015,7 @@ def _compute_best_threshold_train(
     best_filt_trades = orig_trades
     best_filt_pnl = orig_pnl
     best_filt_roi = orig_roi
+
     best_objective = best_filt_roi if (deposit and deposit > 0) else best_filt_pnl
 
     removed_trades = 0
@@ -1186,6 +1041,7 @@ def _compute_best_threshold_train(
 
         threshold = v + EPS_THRESHOLD
 
+        # 1) max objective, 2) при равенстве — больше trades, 3) при равенстве — меньший threshold
         if objective > best_objective:
             best_objective = objective
             best_threshold = threshold
@@ -1266,6 +1122,45 @@ async def _load_positions_with_worst_winrate(
             }
         )
     return out
+
+
+# 🔸 Split train/val по exit_time с holdout_days
+def _split_train_val_uids(
+    uids: Set[Any],
+    pos_exit_time: Dict[Any, datetime],
+    holdout_days: int,
+) -> Tuple[Set[Any], Set[Any], bool, Dict[str, Any]]:
+    # окно holdout
+    max_ts = None
+    for uid in uids:
+        ts = pos_exit_time.get(uid)
+        if ts is None:
+            continue
+        if max_ts is None or ts > max_ts:
+            max_ts = ts
+
+    if max_ts is None:
+        return set(uids), set(), False, {"mode": "none", "reason": "no_exit_time"}
+
+    cut = max_ts - timedelta(days=int(holdout_days or 0))
+
+    train: Set[Any] = set()
+    val: Set[Any] = set()
+
+    for uid in uids:
+        ts = pos_exit_time.get(uid)
+        if ts is None:
+            train.add(uid)
+            continue
+        if ts >= cut:
+            val.add(uid)
+        else:
+            train.add(uid)
+
+    if not train or not val:
+        return set(uids), set(), False, {"mode": "none", "reason": "empty_split", "train": len(train), "val": len(val)}
+
+    return train, val, True, {"mode": "exit_time_days", "days": int(holdout_days), "cut": cut.isoformat(), "train": len(train), "val": len(val)}
 
 
 # 🔸 Загрузка direction_mask сигнала из bt_signals_parameters (param_name='direction_mask')
