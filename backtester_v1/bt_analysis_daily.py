@@ -1,4 +1,4 @@
-# bt_analysis_daily.py — суточная агрегация статистики original/filtered по результатам финального постпроцессинга анализов
+# bt_analysis_daily.py — суточная агрегация статистики original/filtered по результатам финального postproc (контур v1)
 
 import asyncio
 import logging
@@ -6,7 +6,7 @@ from datetime import datetime, date
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Tuple
 
-# 🔸 Константы стримов и настроек воркера
+# 🔸 Константы стримов и настроек воркера v1
 POSTPROC_READY_STREAM_KEY = "bt:analysis:postproc_ready"
 
 DAILY_CONSUMER_GROUP = "bt_analysis_daily"
@@ -23,13 +23,13 @@ _last_daily_source_finished_at: Dict[Tuple[int, int], datetime] = {}
 log = logging.getLogger("BT_ANALYSIS_DAILY")
 
 
-# 🔸 Публичная точка входа: оркестратор суточной статистики
+# 🔸 Публичная точка входа: оркестратор суточной статистики v1
 async def run_bt_analysis_daily_orchestrator(pg, redis):
     log.debug("BT_ANALYSIS_DAILY: оркестратор запущен")
 
     await _ensure_consumer_group(redis)
 
-    # общий семафор для ограничения параллелизма по парам (scenario_id, signal_id)
+    # общий семафор для ограничения параллелизма по парам
     sema = asyncio.Semaphore(DAILY_MAX_CONCURRENCY)
 
     while True:
@@ -63,17 +63,13 @@ async def run_bt_analysis_daily_orchestrator(pg, redis):
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
                 log.info(
-                    "BT_ANALYSIS_DAILY: обработан пакет сообщений из bt:analysis:postproc_ready — сообщений=%s, ошибок=%s",
+                    "BT_ANALYSIS_DAILY: обработан пакет сообщений — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
                 )
 
         except Exception as e:
-            log.error(
-                "BT_ANALYSIS_DAILY: ошибка в основном цикле оркестратора: %s",
-                e,
-                exc_info=True,
-            )
+            log.error("BT_ANALYSIS_DAILY: ошибка в основном цикле: %s", e, exc_info=True)
             await asyncio.sleep(2)
 
 
@@ -157,7 +153,6 @@ def _parse_postproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, 
         scenario_id = int(scenario_id_str)
         signal_id = int(signal_id_str)
 
-        # используем source_finished_at как основной дедуп (если он есть), иначе finished_at
         source_finished_at = None
         source_finished_at_str = fields.get("source_finished_at") or ""
         if source_finished_at_str:
@@ -181,16 +176,11 @@ def _parse_postproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, 
             "finished_at": finished_at,
         }
     except Exception as e:
-        log.error(
-            "BT_ANALYSIS_DAILY: ошибка разбора сообщения стрима bt:analysis:postproc_ready: %s, fields=%s",
-            e,
-            fields,
-            exc_info=True,
-        )
+        log.error("BT_ANALYSIS_DAILY: ошибка разбора сообщения: %s, fields=%s", e, fields, exc_info=True)
         return None
 
 
-# 🔸 Обработка одного сообщения из bt:analysis:postproc_ready с ограничением семафором
+# 🔸 Обработка одного сообщения из bt:analysis:postproc_ready
 async def _process_message(
     entry_id: str,
     fields: Dict[str, str],
@@ -209,33 +199,26 @@ async def _process_message(
         source_finished_at = ctx.get("source_finished_at")
         finished_at = ctx.get("finished_at")
 
-        # если source_finished_at отсутствует — fallback на finished_at, иначе current utc
         dedup_ts = source_finished_at or finished_at or datetime.utcnow()
-
         pair_key = (scenario_id, signal_id)
-        last_finished = _last_daily_source_finished_at.get(pair_key)
 
-        # отсечка дублей по равному dedup_ts
+        last_finished = _last_daily_source_finished_at.get(pair_key)
         if last_finished is not None and last_finished == dedup_ts:
             log.debug(
-                "BT_ANALYSIS_DAILY: дубликат сообщения для scenario_id=%s, signal_id=%s, dedup_ts=%s, stream_id=%s — расчёт не выполняется",
+                "BT_ANALYSIS_DAILY: дубликат scenario_id=%s signal_id=%s dedup_ts=%s — пропуск",
                 scenario_id,
                 signal_id,
                 dedup_ts,
-                entry_id,
             )
             await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
             return
 
         _last_daily_source_finished_at[pair_key] = dedup_ts
-
         started_at = datetime.utcnow()
 
         try:
-            # читаем депозит сценария (для ROI), всё в UTC
             deposit = await _load_scenario_deposit(pg, scenario_id)
 
-            # пересборка суточной статистики: delete + insert
             result = await _rebuild_daily_for_pair(
                 pg=pg,
                 scenario_id=scenario_id,
@@ -246,8 +229,8 @@ async def _process_message(
             elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
             log.info(
-                "BT_ANALYSIS_DAILY: пересчёт завершён — scenario_id=%s, signal_id=%s, deposit=%s, days=%s, rows=%s, "
-                "orig_trades=%s, filt_trades=%s, removed_trades=%s, elapsed_ms=%s, dedup_ts=%s",
+                "BT_ANALYSIS_DAILY: пересчёт завершён — scenario_id=%s signal_id=%s deposit=%s days=%s rows=%s "
+                "orig_trades=%s filt_trades=%s removed_trades=%s elapsed_ms=%s",
                 scenario_id,
                 signal_id,
                 str(deposit) if deposit is not None else None,
@@ -257,12 +240,11 @@ async def _process_message(
                 result.get("filt_trades_total", 0),
                 result.get("removed_trades_total", 0),
                 elapsed_ms,
-                dedup_ts,
             )
 
         except Exception as e:
             log.error(
-                "BT_ANALYSIS_DAILY: ошибка расчёта для scenario_id=%s, signal_id=%s: %s",
+                "BT_ANALYSIS_DAILY: ошибка расчёта scenario_id=%s signal_id=%s: %s",
                 scenario_id,
                 signal_id,
                 e,
@@ -272,26 +254,23 @@ async def _process_message(
             await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
 
 
-# 🔸 Пересборка суточной статистики для пары (scenario_id, signal_id) по exit_time::date (UTC)
+# 🔸 Пересборка суточной статистики v1 для пары (scenario_id, signal_id) по exit_time::date (UTC)
 async def _rebuild_daily_for_pair(
     pg,
     scenario_id: int,
     signal_id: int,
     deposit: Optional[Decimal],
 ) -> Dict[str, Any]:
-    # загружаем исходные агрегации (orig) по дням/направлениям
+    # orig по дням
     orig_rows = await _load_orig_daily_rows(pg, scenario_id, signal_id)
 
-    # загружаем отфильтрованные агрегации (filt) + removed_accuracy входные данные
+    # filt по дням (по контейнеру v1)
     filt_rows = await _load_filt_daily_rows(pg, scenario_id, signal_id)
 
-    # строим индекс filt по (day, direction)
     filt_map: Dict[Tuple[date, str], Dict[str, Any]] = {}
     for r in filt_rows:
-        key = (r["day"], r["direction"])
-        filt_map[key] = r
+        filt_map[(r["day"], r["direction"])] = r
 
-    # удаляем предыдущие результаты по паре и вставляем новые
     rows_to_insert: List[Tuple[Any, ...]] = []
 
     orig_trades_total = 0
@@ -301,6 +280,7 @@ async def _rebuild_daily_for_pair(
     for o in orig_rows:
         day = o["day"]
         direction = o["direction"]
+
         orig_trades = int(o["orig_trades"])
         orig_pnl_abs = _safe_decimal(o["orig_pnl_abs"])
         orig_wins = int(o["orig_wins"])
@@ -355,15 +335,6 @@ async def _rebuild_daily_for_pair(
         else:
             removed_accuracy = Decimal("0")
 
-        # квантизация для предсказуемости
-        orig_pnl_q = _q_decimal(orig_pnl_abs)
-        filt_pnl_q = _q_decimal(filt_pnl_abs)
-        orig_winrate_q = _q_decimal(orig_winrate)
-        filt_winrate_q = _q_decimal(filt_winrate)
-        orig_roi_q = _q_decimal(orig_roi)
-        filt_roi_q = _q_decimal(filt_roi)
-        removed_acc_q = _q_decimal(removed_accuracy)
-
         rows_to_insert.append(
             (
                 scenario_id,
@@ -371,20 +342,20 @@ async def _rebuild_daily_for_pair(
                 day,
                 direction,
                 orig_trades,
-                orig_pnl_q,
-                orig_winrate_q,
-                orig_roi_q,
+                _q_decimal(orig_pnl_abs),
+                _q_decimal(orig_winrate),
+                _q_decimal(orig_roi),
                 filt_trades,
-                filt_pnl_q,
-                filt_winrate_q,
-                filt_roi_q,
-                removed_acc_q,
+                _q_decimal(filt_pnl_abs),
+                _q_decimal(filt_winrate),
+                _q_decimal(filt_roi),
+                _q_decimal(removed_accuracy),
             )
         )
 
     async with pg.acquire() as conn:
         async with conn.transaction():
-            # очищаем таблицу по паре
+            # проход с чистого листа
             await conn.execute(
                 """
                 DELETE FROM bt_analysis_scenario_daily
@@ -395,7 +366,6 @@ async def _rebuild_daily_for_pair(
                 signal_id,
             )
 
-            # вставляем только если есть строки
             if rows_to_insert:
                 await conn.executemany(
                     """
@@ -425,7 +395,6 @@ async def _rebuild_daily_for_pair(
                 )
 
     days_count = len({r[2] for r in rows_to_insert})
-
     return {
         "days": days_count,
         "rows_inserted": len(rows_to_insert),
@@ -435,12 +404,8 @@ async def _rebuild_daily_for_pair(
     }
 
 
-# 🔸 Загрузка orig-агрегаций по дням и направлениям из bt_scenario_positions (postproc=true)
-async def _load_orig_daily_rows(
-    pg,
-    scenario_id: int,
-    signal_id: int,
-) -> List[Dict[str, Any]]:
+# 🔸 Загрузка orig-агрегаций по дням из bt_scenario_positions
+async def _load_orig_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -475,12 +440,8 @@ async def _load_orig_daily_rows(
     return out
 
 
-# 🔸 Загрузка filt-агрегаций по дням и направлениям из bt_scenario_positions + bt_analysis_positions_postproc
-async def _load_filt_daily_rows(
-    pg,
-    scenario_id: int,
-    signal_id: int,
-) -> List[Dict[str, Any]]:
+# 🔸 Загрузка filt-агрегаций по дням из bt_scenario_positions + bt_analysis_positions_postproc
+async def _load_filt_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -523,11 +484,8 @@ async def _load_filt_daily_rows(
     return out
 
 
-# 🔸 Загрузка депозита сценария из bt_scenario_parameters (param_name='deposit')
-async def _load_scenario_deposit(
-    pg,
-    scenario_id: int,
-) -> Optional[Decimal]:
+# 🔸 Загрузка депозита сценария
+async def _load_scenario_deposit(pg, scenario_id: int) -> Optional[Decimal]:
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -546,11 +504,10 @@ async def _load_scenario_deposit(
     dep = _safe_decimal(row["param_value"])
     if dep <= 0:
         return None
-
     return dep
 
 
-# 🔸 Вспомогательная функция: безопасное приведение к Decimal
+# 🔸 Вспомогательная функция: безопасное Decimal
 def _safe_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
         return value
@@ -560,6 +517,6 @@ def _safe_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
-# 🔸 Вспомогательная функция: квантизация Decimal до 4 знаков (вниз для предсказуемости)
+# 🔸 Вспомогательная функция: квантизация Decimal до 4 знаков
 def _q_decimal(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
