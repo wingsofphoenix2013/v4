@@ -39,6 +39,12 @@ from bt_analysis_preproc_v2 import run_bt_analysis_preproc_v2_orchestrator
 from bt_analysis_postproc_v2 import run_bt_analysis_postproc_v2_orchestrator
 # 🔸 Оркестратор суточной статистики v2
 from bt_analysis_daily_v2 import run_bt_analysis_daily_v2_orchestrator
+# 🔸 Оркестратор препроцессинга анализов v3 (bad+good+neutral)
+from bt_analysis_preproc_v3 import run_bt_analysis_preproc_v3_orchestrator
+# 🔸 Оркестратор финального пост-процессинга анализов v3
+from bt_analysis_postproc_v3 import run_bt_analysis_postproc_v3_orchestrator
+# 🔸 Оркестратор суточной статистики v3
+from bt_analysis_daily_v3 import run_bt_analysis_daily_v3_orchestrator
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -94,6 +100,9 @@ async def main():
         run_safe_loop(lambda: run_bt_analysis_preproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_postproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_daily_v2_orchestrator(pg, redis), "BT_ANALYSIS_DAILY_V2"),
+        run_safe_loop(lambda: run_bt_analysis_preproc_v3_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC_V3"),
+        run_safe_loop(lambda: run_bt_analysis_postproc_v3_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC_V3"),
+        run_safe_loop(lambda: run_bt_analysis_daily_v3_orchestrator(pg, redis), "BT_ANALYSIS_DAILY_V3"),
     )
 
 
