@@ -24,7 +24,7 @@ HOLDOUT_DAYS = 7
 V3_LAMBDA = Decimal("0.5")
 NEAR_THRESHOLD_MARGIN = Decimal("0.0500")
 
-GOOD_WINRATE_THRESHOLD = Decimal("0.50")   # <— меняй тут
+GOOD_WINRATE_THRESHOLD = Decimal("0.60")   # <— меняй тут
 MAX_TOGGLE_ITERS = 220
 MAX_BAD_BINS_LIMIT = 350
 
