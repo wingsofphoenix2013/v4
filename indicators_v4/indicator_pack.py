@@ -20,6 +20,19 @@ from packs_config.contract import (
     parse_open_time_to_open_ts_ms,
 )
 
+# 🔸 Imports: packs_config (redis ts helpers)
+from packs_config.redis_ts import (
+    IND_TS_PREFIX,
+    MTF_RETRY_STEP_SEC,
+    clip_0_100,
+    get_kv_decimal,
+    get_mtf_value_decimal,
+    get_ts_decimal_with_retry,
+    safe_decimal,
+    ts_get,
+    ts_get_value_at,
+)
+
 # 🔸 Импорт pack-воркеров
 from packs.rsi_bin import RsiBinPack
 from packs.mfi_bin import MfiBinPack
@@ -50,7 +63,6 @@ POSTPROC_CONSUMER = "ind_pack_postproc_1"
 
 # 🔸 Константы Redis TS (feed_bb + indicators_v4)
 BB_TS_PREFIX = "bb:ts"                         # bb:ts:{symbol}:{tf}:{field}
-IND_TS_PREFIX = "ts_ind"                       # ts_ind:{symbol}:{tf}:{param_name}
 
 # 🔸 Константы БД
 PACK_INSTANCES_TABLE = "indicator_pack_instances_v4"
@@ -68,17 +80,6 @@ MAX_PARALLEL_MESSAGES = 200      # сколько сообщений обраб�
 
 # 🔸 Параметры холодного старта (bootstrap)
 BOOTSTRAP_MAX_PARALLEL = 300     # сколько тикеров/паков обрабатывать параллельно при старте
-
-# 🔸 Retry для «свежих» значений MTF (по TS на стыках TF)
-MTF_RETRY_TOTAL_SEC = 60         # максимум ожидания «свежего» TF
-MTF_RETRY_STEP_SEC = 5           # период опроса TS
-
-# 🔸 Таймшаги TF (ms) — в системе везде open_time (начало бара)
-TF_STEP_MS = {
-    "m5": 300_000,
-    "m15": 900_000,
-    "h1": 3_600_000,
-}
 
 # 🔸 TTL по TF
 TTL_BY_TF_SEC = {
@@ -145,126 +146,6 @@ caches_ready = {
 reloading_pairs_bins: set[tuple[int, int]] = set()
 reloading_pairs_quantiles: set[tuple[int, int]] = set()
 reloading_pairs_labels: set[tuple[int, int]] = set()
-
-# 🔸 Redis TS helpers
-async def ts_get(redis, key: str) -> tuple[int, str] | None:
-    try:
-        res = await redis.execute_command("TS.GET", key)
-        if not res:
-            return None
-        ts_ms, value = res
-        return int(ts_ms), str(value)
-    except Exception:
-        return None
-
-
-async def ts_get_value_at(redis, key: str, ts_ms: int) -> str | None:
-    try:
-        res = await redis.execute_command("TS.RANGE", key, int(ts_ms), int(ts_ms))
-        if not res:
-            return None
-        _, value = res[-1]
-        return str(value)
-    except Exception:
-        return None
-
-
-# 🔸 Decimal helpers
-def safe_decimal(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return value
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
-
-def clip_0_100(value: Decimal) -> Decimal:
-    if value < Decimal("0"):
-        return Decimal("0")
-    if value > Decimal("100"):
-        return Decimal("100")
-    return value
-
-
-# 🔸 MTF boundary helpers
-def is_tf_boundary(ts_ms: int, tf: str) -> bool:
-    step = TF_STEP_MS.get(tf)
-    if not step:
-        return False
-    return (int(ts_ms) % int(step)) == 0
-
-
-def calc_close_boundary_ts_ms(open_ts_ms: int, tf: str) -> int:
-    step = TF_STEP_MS.get(tf)
-    if not step:
-        return int(open_ts_ms)
-    return int(open_ts_ms) + int(step)
-
-
-def just_closed_open_time(boundary_ts_ms: int, tf: str) -> int:
-    return int(boundary_ts_ms) - int(TF_STEP_MS[tf])
-
-
-# 🔸 KV/TS indicator getters for MTF
-async def get_kv_decimal(redis, symbol: str, tf: str, param_name: str) -> tuple[Decimal | None, str | None]:
-    key = f"ind:{symbol}:{tf}:{param_name}"
-    raw = await redis.get(key)
-    if raw is None:
-        return None, None
-    return safe_decimal(raw), str(raw)
-
-
-async def get_ts_decimal_with_retry(redis, symbol: str, tf: str, param_name: str, open_ts_ms: int) -> tuple[Decimal | None, str | None, int]:
-    key = f"{IND_TS_PREFIX}:{symbol}:{tf}:{param_name}"
-    waited = 0
-    raw = None
-
-    while waited <= MTF_RETRY_TOTAL_SEC:
-        raw = await ts_get_value_at(redis, key, int(open_ts_ms))
-        d = safe_decimal(raw)
-        if d is not None:
-            return d, (str(raw) if raw is not None else None), waited
-
-        # таймаут достигнут
-        if waited >= MTF_RETRY_TOTAL_SEC:
-            break
-
-        await asyncio.sleep(MTF_RETRY_STEP_SEC)
-        waited += MTF_RETRY_STEP_SEC
-
-    return None, (str(raw) if raw is not None else None), waited
-
-
-async def get_mtf_value_decimal(redis, symbol: str, trigger_open_ts_ms: int, target_tf: str, param_name: str) -> tuple[Decimal | None, str | None, dict[str, Any]]:
-    meta: dict[str, Any] = {"styk": False, "waited_sec": 0, "target_tf": str(target_tf)}
-
-    # m5 — событие ready уже гарантирует актуальность значения для этого open_time
-    if target_tf == "m5":
-        d, raw = await get_kv_decimal(redis, symbol, "m5", param_name)
-        return d, raw, meta
-
-    # граница закрытия m5-бара
-    boundary = calc_close_boundary_ts_ms(trigger_open_ts_ms, "m5")
-
-    # если boundary не является границей target_tf — target_tf не пересчитывается сейчас, KV безопасен
-    if not is_tf_boundary(boundary, target_tf):
-        d, raw = await get_kv_decimal(redis, symbol, target_tf, param_name)
-        return d, raw, meta
-
-    # styk TF: нужен «свежий» бар target_tf, который только что закрылся на boundary
-    meta["styk"] = True
-    meta["boundary_open_ts_ms"] = int(boundary)
-
-    target_open = just_closed_open_time(boundary, target_tf)
-    d, raw, waited = await get_ts_decimal_with_retry(redis, symbol, target_tf, param_name, target_open)
-
-    meta["target_open_ts_ms"] = int(target_open)
-    meta["waited_sec"] = int(waited)
-    return d, raw, meta
-
 
 # 🔸 Helpers: labels cache key + contains
 def labels_cache_key(
