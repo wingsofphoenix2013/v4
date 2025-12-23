@@ -75,6 +75,9 @@ MAX_PARALLEL_MESSAGES = 200      # сколько сообщений обраб�
 # 🔸 Ограничения диагностики (не заливаем Redis)
 MAX_CANDIDATES_IN_DETAILS = 5
 
+# 🔸 Константы Redis TS (feed_bb)
+BB_TS_PREFIX = "bb:ts"  # bb:ts:{symbol}:{tf}:{field}
+
 # 🔸 Handle MTF runtime: always publish for all pairs + dirs
 async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigger: dict[str, Any], open_ts_ms: int | None) -> tuple[int, int]:
     log = logging.getLogger("PACK_MTF")
