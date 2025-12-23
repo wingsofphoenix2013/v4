@@ -33,6 +33,17 @@ from packs_config.redis_ts import (
     ts_get_value_at,
 )
 
+# 🔸 Imports: packs_config (publish helpers)
+from packs_config.publish import IND_PACK_PREFIX, publish_pair, publish_static
+
+# 🔸 Imports: packs_config (value builders)
+from packs_config.value_builders import (
+    build_atr_pct_value,
+    build_bb_band_value,
+    build_dmigap_value,
+    build_lr_band_value,
+)
+
 # 🔸 Импорт pack-воркеров
 from packs.rsi_bin import RsiBinPack
 from packs.mfi_bin import MfiBinPack
@@ -52,7 +63,6 @@ from packs.lr_angle_mtf import LrAngleMtfPack
 
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
-IND_PACK_PREFIX = "ind_pack"                   # префикс ключей результата
 IND_PACK_GROUP = "ind_pack_group_v4"           # consumer-group для indicator_stream
 IND_PACK_CONSUMER = "ind_pack_consumer_1"      # consumer name
 
@@ -234,120 +244,6 @@ def get_stream_indicator_key(family_key: str, param_name: str) -> str:
 
     # bb20_2_0_upper -> bb20, macd12_macd_hist -> macd12, lr50_angle -> lr50, supertrend10_3_0_trend -> supertrend10
     return pname.split("_", 1)[0]
-
-
-# 🔸 Publish helpers (JSON)
-async def publish_static(redis, analysis_id: int, direction: str, symbol: str, timeframe: str, payload_json: str, ttl_sec: int):
-    key = f"{IND_PACK_PREFIX}:{analysis_id}:{direction}:{symbol}:{timeframe}"
-    await redis.set(key, payload_json, ex=int(ttl_sec))
-
-
-async def publish_pair(redis, analysis_id: int, scenario_id: int, signal_id: int, direction: str, symbol: str, timeframe: str, payload_json: str, ttl_sec: int):
-    key = f"{IND_PACK_PREFIX}:{analysis_id}:{scenario_id}:{signal_id}:{direction}:{symbol}:{timeframe}"
-    await redis.set(key, payload_json, ex=int(ttl_sec))
-
-
-# 🔸 Value builders (single-TF)
-async def build_bb_band_value(redis, symbol: str, timeframe: str, bb_prefix: str, open_ts_ms: int | None) -> tuple[dict[str, str] | None, list[Any]]:
-    missing: list[Any] = []
-
-    upper_key = f"ind:{symbol}:{timeframe}:{bb_prefix}_upper"
-    lower_key = f"ind:{symbol}:{timeframe}:{bb_prefix}_lower"
-
-    upper_val = await redis.get(upper_key)
-    lower_val = await redis.get(lower_key)
-
-    if upper_val is None:
-        missing.append(f"{bb_prefix}_upper")
-    if lower_val is None:
-        missing.append(f"{bb_prefix}_lower")
-
-    if open_ts_ms is None:
-        missing.append({"tf": timeframe, "field": "c", "source": "bb:ts", "open_ts_ms": None})
-        return None, missing
-
-    close_key = f"{BB_TS_PREFIX}:{symbol}:{timeframe}:c"
-    close_val = await ts_get_value_at(redis, close_key, int(open_ts_ms))
-    if close_val is None:
-        missing.append({"tf": timeframe, "field": "c", "source": "bb:ts", "open_ts_ms": int(open_ts_ms)})
-
-    if missing:
-        return None, missing
-
-    return {"price": str(close_val), "upper": str(upper_val), "lower": str(lower_val)}, []
-
-
-async def build_lr_band_value(redis, symbol: str, timeframe: str, lr_prefix: str, open_ts_ms: int | None) -> tuple[dict[str, str] | None, list[Any]]:
-    missing: list[Any] = []
-
-    upper_key = f"ind:{symbol}:{timeframe}:{lr_prefix}_upper"
-    lower_key = f"ind:{symbol}:{timeframe}:{lr_prefix}_lower"
-
-    upper_val = await redis.get(upper_key)
-    lower_val = await redis.get(lower_key)
-
-    if upper_val is None:
-        missing.append(f"{lr_prefix}_upper")
-    if lower_val is None:
-        missing.append(f"{lr_prefix}_lower")
-
-    if open_ts_ms is None:
-        missing.append({"tf": timeframe, "field": "c", "source": "bb:ts", "open_ts_ms": None})
-        return None, missing
-
-    close_key = f"{BB_TS_PREFIX}:{symbol}:{timeframe}:c"
-    close_val = await ts_get_value_at(redis, close_key, int(open_ts_ms))
-    if close_val is None:
-        missing.append({"tf": timeframe, "field": "c", "source": "bb:ts", "open_ts_ms": int(open_ts_ms)})
-
-    if missing:
-        return None, missing
-
-    return {"price": str(close_val), "upper": str(upper_val), "lower": str(lower_val)}, []
-
-
-async def build_atr_pct_value(redis, symbol: str, timeframe: str, atr_param_name: str, open_ts_ms: int | None) -> tuple[dict[str, str] | None, list[Any]]:
-    missing: list[Any] = []
-
-    atr_key = f"ind:{symbol}:{timeframe}:{atr_param_name}"
-    atr_val = await redis.get(atr_key)
-    if atr_val is None:
-        missing.append(str(atr_param_name))
-
-    if open_ts_ms is None:
-        missing.append({"tf": timeframe, "field": "c", "source": "bb:ts", "open_ts_ms": None})
-        return None, missing
-
-    close_key = f"{BB_TS_PREFIX}:{symbol}:{timeframe}:c"
-    close_val = await ts_get_value_at(redis, close_key, int(open_ts_ms))
-    if close_val is None:
-        missing.append({"tf": timeframe, "field": "c", "source": "bb:ts", "open_ts_ms": int(open_ts_ms)})
-
-    if missing:
-        return None, missing
-
-    return {"atr": str(atr_val), "price": str(close_val)}, []
-
-
-async def build_dmigap_value(redis, symbol: str, timeframe: str, base_param_name: str) -> tuple[dict[str, str] | None, list[Any]]:
-    missing: list[Any] = []
-
-    plus_key = f"ind:{symbol}:{timeframe}:{base_param_name}_plus_di"
-    minus_key = f"ind:{symbol}:{timeframe}:{base_param_name}_minus_di"
-
-    plus_val = await redis.get(plus_key)
-    minus_val = await redis.get(minus_key)
-
-    if plus_val is None:
-        missing.append(f"{base_param_name}_plus_di")
-    if minus_val is None:
-        missing.append(f"{base_param_name}_minus_di")
-
-    if missing:
-        return None, missing
-
-    return {"plus": str(plus_val), "minus": str(minus_val)}, []
-
 
 # 🔸 DB loaders: packs / analyzers / params / rules / labels
 async def load_enabled_packs(pg) -> list[dict[str, Any]]:
