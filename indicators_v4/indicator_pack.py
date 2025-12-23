@@ -10,7 +10,17 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-# 🔸 Импорт pack-воркеров (предусмотрено расширение)
+# 🔸 Imports: packs_config (models + contract)
+from packs_config.models import BinRule, LabelsContext, PackRuntime
+from packs_config.contract import (
+    pack_ok,
+    pack_fail,
+    short_error_str,
+    build_fail_details_base,
+    parse_open_time_to_open_ts_ms,
+)
+
+# 🔸 Импорт pack-воркеров
 from packs.rsi_bin import RsiBinPack
 from packs.mfi_bin import MfiBinPack
 from packs.adx_bin import AdxBinPack
@@ -78,28 +88,6 @@ TTL_BY_TF_SEC = {
     "mtf": 120,     # MTF-результат живёт как m5-состояние
 }
 
-# 🔸 ind_pack JSON Contract (v1): reason catalog
-TRANSIENT_REASONS = {
-    "not_ready_retrying",
-    "missing_inputs",
-    "mtf_missing_component_values",
-    "mtf_boundary_wait",
-    "labels_not_loaded_yet",
-    "rules_not_loaded_yet",
-    "invalid_input_value",
-}
-PERMANENT_REASONS = {
-    "invalid_trigger_event",
-    "pair_not_configured",
-    "no_rules_static",
-    "no_rules_adaptive",
-    "no_quantiles_rules",
-    "no_candidates",
-    "no_labels_match",
-    "invalid_direction",
-    "internal_error",
-}
-
 # 🔸 Ограничения диагностики (не заливаем Redis)
 MAX_CANDIDATES_IN_DETAILS = 5
 MAX_ERROR_STR_LEN = 400
@@ -157,126 +145,6 @@ caches_ready = {
 reloading_pairs_bins: set[tuple[int, int]] = set()
 reloading_pairs_quantiles: set[tuple[int, int]] = set()
 reloading_pairs_labels: set[tuple[int, int]] = set()
-
-
-# 🔸 Models
-@dataclass(frozen=True)
-class BinRule:
-    direction: str
-    timeframe: str
-    bin_type: str
-    bin_order: int
-    bin_name: str
-    val_from: str | None
-    val_to: str | None
-    to_inclusive: bool
-
-
-@dataclass(frozen=True)
-class LabelsContext:
-    analysis_id: int
-    indicator_param: str
-    timeframe: str  # например "mtf"
-
-
-@dataclass
-class PackRuntime:
-    analysis_id: int
-    analysis_key: str
-    analysis_name: str
-    family_key: str
-
-    timeframe: str
-    source_param_name: str
-    bins_policy: dict[str, Any] | None
-    bins_source: str                       # "static" | "adaptive"
-    adaptive_pairs: list[tuple[int, int]]  # [(scenario_id, signal_id), ...] если adaptive
-    bins_by_direction: dict[str, list[BinRule]]
-    ttl_sec: int
-    worker: Any
-
-    # 🔸 MTF-конфиг
-    is_mtf: bool = False
-    mtf_pairs: list[tuple[int, int]] | None = None
-    mtf_trigger_tf: str | None = None
-    mtf_component_tfs: list[str] | None = None
-    mtf_component_params: dict[str, Any] | None = None
-    mtf_bins_static: dict[str, dict[str, list[BinRule]]] | None = None
-    mtf_bins_tf: str = "components"         # "components" | "mtf"
-    mtf_clip_0_100: bool = True
-
-    mtf_required_bins_tfs: list[str] | None = None
-    mtf_quantiles_key: str | None = None
-    mtf_needs_price: bool = False
-    mtf_price_tf: str = "m5"
-    mtf_price_field: str = "c"
-
-
-# 🔸 JSON helpers
-def _json_dumps(obj: dict[str, Any]) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
-def pack_ok(bin_name: str) -> str:
-    return _json_dumps({"ok": True, "bin_name": str(bin_name)})
-
-
-def pack_fail(reason: str, details: dict[str, Any]) -> str:
-    r = str(reason or "")
-    if r not in TRANSIENT_REASONS and r not in PERMANENT_REASONS:
-        r = "internal_error"
-    if not isinstance(details, dict):
-        details = {}
-    details.setdefault("analysis_id", None)
-    details.setdefault("symbol", None)
-    details.setdefault("direction", None)
-    details.setdefault("timeframe", None)
-    details.setdefault("pair", None)
-    details.setdefault("trigger", {})
-    details.setdefault("open_ts_ms", None)
-    return _json_dumps({"ok": False, "reason": r, "details": details})
-
-
-def short_error_str(e: BaseException) -> str:
-    s = f"{type(e).__name__}: {e}".strip()
-    if len(s) > MAX_ERROR_STR_LEN:
-        s = s[:MAX_ERROR_STR_LEN] + "…"
-    return s
-
-
-# 🔸 Details base builder
-def build_fail_details_base(
-    analysis_id: int | None,
-    symbol: str | None,
-    direction: str | None,
-    timeframe: str | None,
-    pair: dict[str, int] | None,
-    trigger: dict[str, Any],
-    open_ts_ms: int | None,
-) -> dict[str, Any]:
-    return {
-        "analysis_id": int(analysis_id) if analysis_id is not None else None,
-        "symbol": str(symbol) if symbol is not None else None,
-        "direction": str(direction) if direction is not None else None,
-        "timeframe": str(timeframe) if timeframe is not None else None,
-        "pair": pair,
-        "trigger": trigger,
-        "open_ts_ms": int(open_ts_ms) if open_ts_ms is not None else None,
-    }
-
-
-# 🔸 Parse open_time ISO -> open_ts_ms
-def parse_open_time_to_open_ts_ms(open_time: str | None) -> int | None:
-    if not open_time:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(open_time))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1000)
-    except Exception:
-        return None
-
 
 # 🔸 Redis TS helpers
 async def ts_get(redis, key: str) -> tuple[int, str] | None:
