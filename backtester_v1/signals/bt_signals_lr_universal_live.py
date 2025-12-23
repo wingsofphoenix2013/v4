@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # 🔸 Кеши backtester_v1
 from backtester_config import get_indicator_instance, get_ticker_info
 
-# 🔸 Кеш bad-bins для mirror-фильтрации
-from bt_signals_cache_config import get_mirror_bad_cache, load_initial_mirror_caches
+# 🔸 Кеш label-bins (good/bad) для mirror-фильтрации
+from bt_signals_cache_config import get_mirror_label_cache, load_initial_mirror_caches
 
 log = logging.getLogger("BT_SIG_LR_UNI_LIVE")
 
@@ -570,13 +570,22 @@ async def handle_lr_universal_indicator_ready(
             ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
             continue
 
-        # кеш зеркала
-        required_pairs, bad_bins_map = get_mirror_bad_cache(int(mirror_scenario_id), int(mirror_signal_id), direction)
-        if required_pairs is None or bad_bins_map is None:
+        # кеш зеркала (good/bad)
+        required_pairs, bad_bins_map, good_bins_map = get_mirror_label_cache(
+            int(mirror_scenario_id),
+            int(mirror_signal_id),
+            direction,
+        )
+        if required_pairs is None or bad_bins_map is None or good_bins_map is None:
             await load_initial_mirror_caches(pg)
-            required_pairs, bad_bins_map = get_mirror_bad_cache(int(mirror_scenario_id), int(mirror_signal_id), direction)
+            required_pairs, bad_bins_map, good_bins_map = get_mirror_label_cache(
+                int(mirror_scenario_id),
+                int(mirror_signal_id),
+                direction,
+            )
 
-        if not required_pairs or not bad_bins_map:
+        # для работы фильтра нужен хотя бы один good (bad может быть пустым)
+        if not required_pairs or not good_bins_map:
             details = {
                 **base_details,
                 "signal": {
@@ -602,7 +611,8 @@ async def handle_lr_universal_indicator_ready(
             "mirror_scenario_id": int(mirror_scenario_id),
             "mirror_signal_id": int(mirror_signal_id),
             "required_pairs": set(required_pairs),
-            "bad_bins_map": {k: set(v) for k, v in bad_bins_map.items()},
+            "bad_bins_map": {k: set(v) for k, v in (bad_bins_map or {}).items()},
+            "good_bins_map": {k: set(v) for k, v in (good_bins_map or {}).items()},
             "detected_at": now_utc,
             "base_details": base_details,
         }
@@ -628,6 +638,7 @@ async def handle_lr_universal_indicator_ready(
                     "required_total": len(required_pairs),
                     "deadline_sec": FILTER_WAIT_TOTAL_SEC,
                     "step_sec": FILTER_WAIT_STEP_SEC,
+                    "require_good": True,
                 },
             },
         )
@@ -680,6 +691,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
 
     required_pairs: Set[Tuple[int, str]] = set(c.get("required_pairs") or set())
     bad_bins_map: Dict[Tuple[int, str], Set[str]] = c.get("bad_bins_map") or {}
+    good_bins_map: Dict[Tuple[int, str], Set[str]] = c.get("good_bins_map") or {}
     detected_at: datetime = c.get("detected_at") or datetime.utcnow().replace(tzinfo=None)
 
     base_details = c.get("base_details") or {}
@@ -704,9 +716,10 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
 
     deadline = detected_at + timedelta(seconds=FILTER_WAIT_TOTAL_SEC)
 
-    # only ok=true bins are used for bad-hit
+    # only ok=true bins are used for hits (bad/good)
     found_bins: Dict[Tuple[int, str], str] = {}
     missing_pairs: Set[Tuple[int, str]] = set(required_pairs)
+    good_hit = False
 
     # explained failures: pair -> {source, reason, details}
     explained: Dict[Tuple[int, str], Dict[str, Any]] = {}
@@ -795,7 +808,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 # absent -> keep waiting
                 continue
 
-        # bad-hit by any ok bin
+        # bad-hit / good-hit by any ok bin
         for (aid, tf), bn in found_bins.items():
             bad_set = bad_bins_map.get((aid, tf)) or set()
             if bn in bad_set:
@@ -820,7 +833,35 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_bad_bin", details)
                 return
 
+            good_set = good_bins_map.get((aid, tf)) or set()
+            if bn in good_set:
+                good_hit = True
+
         if not missing_pairs:
+            # требуется минимум один good-hit (neutral/inactive игнорируем на стадии кеша)
+            if not good_hit:
+                details = {
+                    **base_details,
+                    "signal": {
+                        "signal_id": signal_id,
+                        "direction": direction,
+                        "message": message,
+                        "filtered": True,
+                        "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
+                    },
+                    "filter": {
+                        "rule": "no_good_required",
+                        "attempt": attempt,
+                        "required_total": required_total,
+                        "found_total": len(found_bins),
+                        "missing_total": 0,
+                        "good_hit": False,
+                    },
+                    "result": {"passed": False, "status": "blocked_no_good_bin"},
+                }
+                await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_no_good_bin", details)
+                return
+
             details = {
                 **base_details,
                 "signal": {
@@ -830,7 +871,12 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     "filtered": True,
                     "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
                 },
-                "filter": {"rule": "no_bad_and_full_set", "attempt": attempt, "required_total": required_total},
+                "filter": {
+                    "rule": "no_bad_and_has_good_full_set",
+                    "attempt": attempt,
+                    "required_total": required_total,
+                    "good_hit": True,
+                },
                 "result": {"passed": True, "status": "signal_sent"},
             }
             should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "signal_sent", details)

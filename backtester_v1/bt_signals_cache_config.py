@@ -1,4 +1,4 @@
-# bt_signals_cache_config.py — кеш фильтров live-сигналов (bad bins) по mirror (scenario_id/signal_id) для backtester_v1
+# bt_signals_cache_config.py — кеш фильтров live-сигналов (good/bad bins) по mirror (scenario_id/signal_id) для backtester_v1
 
 import asyncio
 import logging
@@ -18,24 +18,40 @@ CACHE_CONSUMER_NAME = "bt_signals_cache_main"
 CACHE_STREAM_BATCH_SIZE = 50
 CACHE_STREAM_BLOCK_MS = 5000
 
-# 🔸 Кеш: ключ (scenario_id, signal_id, direction) -> bad bins
-# required_pairs: set[(analysis_id, timeframe)]
-# bad_bins_map: (analysis_id, timeframe) -> set[bin_name]
+# 🔸 Кеш: ключ (scenario_id, signal_id, direction) -> label bins (good/bad)
 bt_mirror_required_pairs: Dict[Tuple[int, int, str], Set[Tuple[int, str]]] = {}
 bt_mirror_bad_bins_map: Dict[Tuple[int, int, str], Dict[Tuple[int, str], Set[str]]] = {}
+bt_mirror_good_bins_map: Dict[Tuple[int, int, str], Dict[Tuple[int, str], Set[str]]] = {}
 
 # 🔸 Индекс активных mirror-пар (чтобы не грузить лишнее)
 _active_mirrors: Set[Tuple[int, int, str]] = set()
 
 
-# 🔸 Публичный геттер: получить кеш bad bins для mirror (scenario_id, signal_id, direction)
+# 🔸 Публичный геттер: получить кеш label bins (good/bad) для mirror (scenario_id, signal_id, direction)
+def get_mirror_label_cache(
+    mirror_scenario_id: int,
+    mirror_signal_id: int,
+    direction: str,
+) -> Tuple[
+    Optional[Set[Tuple[int, str]]],
+    Optional[Dict[Tuple[int, str], Set[str]]],
+    Optional[Dict[Tuple[int, str], Set[str]]],
+]:
+    key = (int(mirror_scenario_id), int(mirror_signal_id), str(direction).strip().lower())
+    return (
+        bt_mirror_required_pairs.get(key),
+        bt_mirror_bad_bins_map.get(key),
+        bt_mirror_good_bins_map.get(key),
+    )
+
+# 🔸 Публичный геттер (backward-compatible): получить кеш bad bins для mirror (scenario_id, signal_id, direction)
 def get_mirror_bad_cache(
     mirror_scenario_id: int,
     mirror_signal_id: int,
     direction: str,
 ) -> Tuple[Optional[Set[Tuple[int, str]]], Optional[Dict[Tuple[int, str], Set[str]]]]:
-    key = (int(mirror_scenario_id), int(mirror_signal_id), str(direction).strip().lower())
-    return bt_mirror_required_pairs.get(key), bt_mirror_bad_bins_map.get(key)
+    req, bad_map, _good_map = get_mirror_label_cache(mirror_scenario_id, mirror_signal_id, direction)
+    return req, bad_map
 
 
 # 🔸 Публичный метод: пересобрать индекс активных mirrors по enabled live-инстансам
@@ -76,7 +92,6 @@ def rebuild_active_mirrors_index() -> Set[Tuple[int, int, str]]:
     _active_mirrors = mirrors
     return mirrors
 
-
 # 🔸 Публичный метод: начальная загрузка кеша только для активных mirrors
 async def load_initial_mirror_caches(pg) -> None:
     mirrors = rebuild_active_mirrors_index()
@@ -88,21 +103,23 @@ async def load_initial_mirror_caches(pg) -> None:
     loaded = 0
     total_required = 0
     total_bad_bins = 0
+    total_good_bins = 0
 
     for (sc_id, sig_id, direction) in sorted(mirrors):
-        req, bad_map = await _load_bad_bins_for_pair(pg, sc_id, sig_id, direction)
-        _store_cache(sc_id, sig_id, direction, req, bad_map)
+        req, bad_map, good_map = await _load_label_bins_for_pair(pg, sc_id, sig_id, direction)
+        _store_cache(sc_id, sig_id, direction, req, bad_map, good_map)
         loaded += 1
         total_required += len(req)
         total_bad_bins += sum(len(v) for v in bad_map.values())
+        total_good_bins += sum(len(v) for v in good_map.values())
 
     log.info(
-        "BT_SIG_CACHE: initial cache loaded — mirrors=%s, required_pairs=%s, bad_bins=%s",
+        "BT_SIG_CACHE: initial cache loaded — mirrors=%s, required_pairs=%s, bad_bins=%s, good_bins=%s",
         loaded,
         total_required,
         total_bad_bins,
+        total_good_bins,
     )
-
 
 # 🔸 Воркер обновления кеша по стриму bt:analysis:postproc_ready
 async def run_bt_signals_cache_watcher(pg, redis) -> None:
@@ -158,17 +175,18 @@ async def run_bt_signals_cache_watcher(pg, redis) -> None:
                         continue
 
                     for (sc_id, sig_id, direction) in targets:
-                        req, bad_map = await _load_bad_bins_for_pair(pg, sc_id, sig_id, direction)
-                        _store_cache(sc_id, sig_id, direction, req, bad_map)
+                        req, bad_map, good_map = await _load_label_bins_for_pair(pg, sc_id, sig_id, direction)
+                        _store_cache(sc_id, sig_id, direction, req, bad_map, good_map)
                         refreshed += 1
 
                         log.info(
-                            "BT_SIG_CACHE: cache refreshed — mirror=%s:%s:%s, required_pairs=%s, bad_bins=%s, source_finished_at=%s",
+                            "BT_SIG_CACHE: cache refreshed — mirror=%s:%s:%s, required_pairs=%s, bad_bins=%s, good_bins=%s, source_finished_at=%s",
                             sc_id,
                             sig_id,
                             direction,
                             len(req),
                             sum(len(v) for v in bad_map.values()),
+                            sum(len(v) for v in good_map.values()),
                             source_finished_at,
                         )
 
@@ -242,25 +260,28 @@ def _parse_postproc_ready(fields: Dict[Any, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
-# 🔸 Загрузка bad bins из bt_analysis_bins_labels для mirror-пары и direction
-async def _load_bad_bins_for_pair(
+# 🔸 Загрузка label bins (good/bad) из bt_analysis_bins_labels для mirror-пары и direction
+async def _load_label_bins_for_pair(
     pg,
     scenario_id: int,
     signal_id: int,
     direction: str,
-) -> Tuple[Set[Tuple[int, str]], Dict[Tuple[int, str], Set[str]]]:
+) -> Tuple[
+    Set[Tuple[int, str]],
+    Dict[Tuple[int, str], Set[str]],
+    Dict[Tuple[int, str], Set[str]],
+]:
     direction_l = str(direction).strip().lower()
 
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT analysis_id, timeframe, bin_name
+            SELECT analysis_id, timeframe, bin_name, state
             FROM bt_analysis_bins_labels
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND direction   = $3
-              AND state       = 'bad'
+              AND state      IN ('bad', 'good')
             """,
             int(scenario_id),
             int(signal_id),
@@ -269,18 +290,26 @@ async def _load_bad_bins_for_pair(
 
     required_pairs: Set[Tuple[int, str]] = set()
     bad_bins_map: Dict[Tuple[int, str], Set[str]] = {}
+    good_bins_map: Dict[Tuple[int, str], Set[str]] = {}
 
     for r in rows:
         aid = int(r["analysis_id"])
         tf = str(r["timeframe"]).strip().lower()
         bn = str(r["bin_name"])
+        st = str(r["state"] or "").strip().lower()
 
         pair = (aid, tf)
         required_pairs.add(pair)
-        bad_bins_map.setdefault(pair, set()).add(bn)
 
-    return required_pairs, bad_bins_map
+        if st == "bad":
+            bad_bins_map.setdefault(pair, set()).add(bn)
+            continue
 
+        if st == "good":
+            good_bins_map.setdefault(pair, set()).add(bn)
+            continue
+
+    return required_pairs, bad_bins_map, good_bins_map
 
 # 🔸 Сохранение кеша
 def _store_cache(
@@ -289,7 +318,9 @@ def _store_cache(
     direction: str,
     required_pairs: Set[Tuple[int, str]],
     bad_bins_map: Dict[Tuple[int, str], Set[str]],
+    good_bins_map: Dict[Tuple[int, str], Set[str]],
 ) -> None:
     key = (int(scenario_id), int(signal_id), str(direction).strip().lower())
     bt_mirror_required_pairs[key] = set(required_pairs)
     bt_mirror_bad_bins_map[key] = {k: set(v) for k, v in bad_bins_map.items()}
+    bt_mirror_good_bins_map[key] = {k: set(v) for k, v in good_bins_map.items()}
