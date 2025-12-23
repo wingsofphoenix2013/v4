@@ -315,7 +315,6 @@ async def _cleanup_v1_tables_for_pair(pg, scenario_id: int, signal_id: int) -> D
     deleted_postproc = 0
     deleted_scenario_stat = 0
     deleted_daily = 0
-    deleted_adaptive_bins = 0
 
     async with pg.acquire() as conn:
         async with conn.transaction():
@@ -342,18 +341,6 @@ async def _cleanup_v1_tables_for_pair(pg, scenario_id: int, signal_id: int) -> D
                 signal_id,
             )
             deleted_model = _parse_pg_execute_count(res_model)
-
-            # адаптивный словарь биннов (если используется где-то в анализ-контуре)
-            res_adapt = await conn.execute(
-                """
-                DELETE FROM bt_analysis_bin_dict_adaptive
-                WHERE scenario_id = $1
-                  AND signal_id   = $2
-                """,
-                scenario_id,
-                signal_id,
-            )
-            deleted_adaptive_bins = _parse_pg_execute_count(res_adapt)
 
             # контейнер позиций postproc (v1)
             res_postproc = await conn.execute(
@@ -394,14 +381,12 @@ async def _cleanup_v1_tables_for_pair(pg, scenario_id: int, signal_id: int) -> D
     return {
         "labels": deleted_labels,
         "model_opt": deleted_model,
-        "adaptive_bins": deleted_adaptive_bins,
         "positions_postproc": deleted_postproc,
         "scenario_stat": deleted_scenario_stat,
         "scenario_daily": deleted_daily,
         "total": (
             deleted_labels
             + deleted_model
-            + deleted_adaptive_bins
             + deleted_postproc
             + deleted_scenario_stat
             + deleted_daily
