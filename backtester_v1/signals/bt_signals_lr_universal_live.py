@@ -50,6 +50,7 @@ PACK_PERMANENT_REASONS = {
     "internal_error",
 }
 
+
 def _is_pack_permanent_reason(reason: Optional[str]) -> bool:
     r = str(reason or "").strip()
     return r in PACK_PERMANENT_REASONS
@@ -264,7 +265,7 @@ async def init_lr_universal_live(
         )
         filter_workers.append(task)
 
-    log.debug(
+    log.info(
         "BT_SIG_LR_UNI_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, lr_instance_id=%s, indicator_base=%s, "
         "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
         len(cfgs),
@@ -342,8 +343,12 @@ async def handle_lr_universal_indicator_ready(
     step_delta: timedelta = ctx["step_delta"]
     prev_time = open_time - step_delta
 
+    # decision_time = close_time бара (момент принятия решения/готовности сигнала)
+    decision_time = open_time + step_delta
+
     ts_ms = _to_ms_utc(open_time)
     prev_ms = _to_ms_utc(prev_time)
+    decision_ms = _to_ms_utc(decision_time)
 
     # 🔸 Читаем OHLCV close и LR-канал из Redis TS по prev/curr
     close_key = BB_TS_CLOSE_KEY.format(symbol=symbol, tf=tf_expected)
@@ -406,7 +411,19 @@ async def handle_lr_universal_indicator_ready(
 
     if missing:
         details = {
-            "event": {"status": status, "symbol": symbol, "indicator": indicator_base, "open_time": open_time_iso, "timeframe": timeframe},
+            "event": {
+                "status": status,
+                "symbol": symbol,
+                "indicator": indicator_base,
+                "open_time": open_time_iso,
+                "timeframe": timeframe,
+            },
+            "ts": {
+                "open_time": open_time.isoformat(),
+                "decision_time": decision_time.isoformat(),
+                "ts_ms": ts_ms,
+                "decision_ms": decision_ms,
+            },
             "reason": "data_missing",
             "missing": missing,
         }
@@ -417,6 +434,7 @@ async def handle_lr_universal_indicator_ready(
                 symbol=symbol,
                 timeframe=timeframe,
                 open_time=open_time,
+                decision_time=decision_time,
                 status="data_missing",
                 details=details,
             )
@@ -433,7 +451,14 @@ async def handle_lr_universal_indicator_ready(
 
     base_details = {
         "event": {"status": status, "symbol": symbol, "indicator": indicator_base, "open_time": open_time_iso, "timeframe": timeframe},
-        "ts": {"ts_ms": ts_ms, "prev_ms": prev_ms, "open_time": open_time.isoformat(), "prev_time": prev_time.isoformat()},
+        "ts": {
+            "ts_ms": ts_ms,
+            "prev_ms": prev_ms,
+            "decision_ms": decision_ms,
+            "open_time": open_time.isoformat(),
+            "prev_time": prev_time.isoformat(),
+            "decision_time": decision_time.isoformat(),
+        },
         "ohlcv": {
             "close_prev": _round_price(float(close_prev), precision_price),
             "close_curr": _round_price(float(close_curr), precision_price),
@@ -498,7 +523,7 @@ async def handle_lr_universal_indicator_ready(
                 },
                 "result": {"passed": False, "status": eval_status, "extra": eval_extra},
             }
-            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, eval_status, details)
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, eval_status, details)
             continue
 
         # bounce прошёл
@@ -508,7 +533,7 @@ async def handle_lr_universal_indicator_ready(
                 "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filtered": False},
                 "result": {"passed": True, "status": "signal_sent"},
             }
-            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "signal_sent", details)
+            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "signal_sent", details)
             if should_send:
                 live_signals.append(
                     {
@@ -523,6 +548,7 @@ async def handle_lr_universal_indicator_ready(
                             "symbol": symbol,
                             "timeframe": timeframe,
                             "open_time": open_time.isoformat(),
+                            "decision_time": decision_time.isoformat(),
                             "direction": direction,
                             "message": message,
                             "source": "backtester_v1",
@@ -540,13 +566,12 @@ async def handle_lr_universal_indicator_ready(
                 "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filtered": True},
                 "filter": {"reason": "missing_mirror_params"},
             }
-            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_missing_keys_timeout", details)
             ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
             continue
 
-        # “не догоняем”: stale считаем от close_time бара (open_time + step)
+        # “не догоняем”: stale считаем от close_time бара (decision_time)
         now_utc = datetime.utcnow().replace(tzinfo=None)
-        decision_time = open_time + step_delta
         age_sec = (now_utc - decision_time).total_seconds()
 
         if age_sec > FILTER_STALE_MAX_SEC:
@@ -566,7 +591,7 @@ async def handle_lr_universal_indicator_ready(
                     "decision_time": decision_time.isoformat(),
                 },
             }
-            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_stale_backlog", details)
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "dropped_stale_backlog", details)
             ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
             continue
 
@@ -597,7 +622,7 @@ async def handle_lr_universal_indicator_ready(
                 },
                 "filter": {"reason": "mirror_cache_empty"},
             }
-            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_missing_keys_timeout", details)
             ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
             continue
 
@@ -606,6 +631,7 @@ async def handle_lr_universal_indicator_ready(
             "symbol": symbol,
             "timeframe": timeframe,
             "open_time": open_time,
+            "decision_time": decision_time,
             "direction": direction,
             "message": message,
             "mirror_scenario_id": int(mirror_scenario_id),
@@ -623,6 +649,7 @@ async def handle_lr_universal_indicator_ready(
             symbol=symbol,
             timeframe=timeframe,
             open_time=open_time,
+            decision_time=decision_time,
             status="filter_waiting",
             details={
                 **base_details,
@@ -658,7 +685,7 @@ async def handle_lr_universal_indicator_ready(
                 },
                 "filter": {"rule": "dropped_overload", "queue_maxsize": FILTER_QUEUE_MAXSIZE},
             }
-            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_overload", details)
+            await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "dropped_overload", details)
             ctx["counters"]["dropped_overload"] = int(ctx["counters"].get("dropped_overload", 0)) + 1
 
     return live_signals
@@ -683,6 +710,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
     symbol = str(c["symbol"])
     timeframe = str(c["timeframe"])
     open_time: datetime = c["open_time"]
+    decision_time: datetime = c.get("decision_time") or open_time
     direction = str(c["direction"])
     message = str(c["message"])
 
@@ -711,7 +739,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             },
             "filter": {"rule": "dropped_stale_backlog", "queue_delay_sec": float(queue_delay_sec), "stale_max_sec": FILTER_STALE_MAX_SEC},
         }
-        await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "dropped_stale_backlog", details)
+        await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "dropped_stale_backlog", details)
         return
 
     deadline = detected_at + timedelta(seconds=FILTER_WAIT_TOTAL_SEC)
@@ -759,7 +787,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     fail_reason = st.get("reason")
                     fail_details = st.get("details")
 
-                    # 🔸 Перманентный fail → сразу блокируем (без ожидания дедлайна)
+                    # перманентный fail → сразу блокируем (без ожидания дедлайна)
                     if _is_pack_permanent_reason(fail_reason):
                         aid, tf = pair
 
@@ -769,6 +797,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                             symbol,
                             timeframe,
                             open_time,
+                            decision_time,
                             "blocked_missing_keys_timeout",
                             {
                                 **base_details,
@@ -797,7 +826,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                         )
                         return
 
-                    # 🔸 Транзиентный fail → запоминаем и продолжаем ждать
+                    # транзиентный fail → запоминаем и продолжаем ждать
                     explained[pair] = {
                         "source": st.get("source"),
                         "reason": fail_reason,
@@ -830,7 +859,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                         "hit": {"analysis_id": int(aid), "timeframe": tf, "bin_name": bn},
                     },
                 }
-                await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_bad_bin", details)
+                await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_bad_bin", details)
                 return
 
             good_set = good_bins_map.get((aid, tf)) or set()
@@ -859,7 +888,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     },
                     "result": {"passed": False, "status": "blocked_no_good_bin"},
                 }
-                await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_no_good_bin", details)
+                await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_no_good_bin", details)
                 return
 
             details = {
@@ -879,7 +908,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 },
                 "result": {"passed": True, "status": "signal_sent"},
             }
-            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "signal_sent", details)
+            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "signal_sent", details)
             if should_send:
                 await _publish_to_signals_stream(redis, symbol, open_time, message)
             return
@@ -925,7 +954,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             "missing_explained": missing_explained,
         },
     }
-    await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, "blocked_missing_keys_timeout", details)
+    await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_missing_keys_timeout", details)
 
 
 # 🔸 Публикация filtered-live сигнала в signals_stream (без записи в bt_signals_values)
@@ -1092,6 +1121,7 @@ async def _upsert_live_log(
     symbol: str,
     timeframe: str,
     open_time: datetime,
+    decision_time: datetime,
     status: str,
     details: Dict[str, Any],
 ) -> bool:
@@ -1100,11 +1130,12 @@ async def _upsert_live_log(
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, status, details)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, decision_time, status, details)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
             ON CONFLICT (signal_id, symbol, timeframe, open_time)
             DO UPDATE
-               SET status = EXCLUDED.status,
+               SET decision_time = EXCLUDED.decision_time,
+                   status = EXCLUDED.status,
                    details = EXCLUDED.details
             WHERE bt_signals_live.status <> 'signal_sent'
             RETURNING status
@@ -1113,6 +1144,7 @@ async def _upsert_live_log(
             symbol,
             timeframe,
             open_time,
+            decision_time,
             status,
             payload,
         )

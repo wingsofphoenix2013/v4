@@ -19,6 +19,22 @@ getcontext().prec = 28
 # 🔸 Константы стримов
 BT_SCENARIOS_READY_STREAM = "bt:scenarios:ready"
 
+# 🔸 Таймшаги TF (в минутах) для decision_time
+TF_STEP_MINUTES = {
+    "m5": 5,
+    "m15": 15,
+    "h1": 60,
+}
+
+
+# 🔸 Длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = str(timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if not step_min:
+        return timedelta(0)
+    return timedelta(minutes=step_min)
+
 
 # 🔸 Утилита: обрезка денег/метрик до 4 знаков после запятой
 def _q_money(value: Decimal) -> Decimal:
@@ -117,6 +133,17 @@ async def run_basic_straight_mono_backfill(
         )
         return
 
+    # условия достаточности: decision_time = entry_time + TF
+    tf_delta = _get_timeframe_timedelta(timeframe)
+    if tf_delta <= timedelta(0):
+        log.error(
+            "BT_SCENARIO_BASIC_MONO: неизвестный TF для decision_time (timeframe=%s), scenario_id=%s, signal_id=%s",
+            timeframe,
+            scenario_id,
+            signal_id,
+        )
+        return
+
     log.debug(
         f"BT_SCENARIO_BASIC_MONO: старт обработки сценария id={scenario_id} (key={scenario_key}, type={scenario_type}) "
         f"для signal_id={signal_id}, TF={timeframe}, окно=[{from_time} .. {to_time}], "
@@ -181,7 +208,7 @@ async def run_basic_straight_mono_backfill(
             f"для обработки сигналов={len(dir_signals)}"
         )
 
-        # сортировка по времени сигнала
+        # сортировка по времени сигнала (open_time)
         dir_signals.sort(key=lambda s: s["open_time"])
 
         for s_row in dir_signals:
@@ -191,6 +218,9 @@ async def run_basic_straight_mono_backfill(
             open_time = s_row["open_time"]
             signal_uuid = s_row["signal_uuid"]
             raw_message = s_row["raw_message"]
+
+            # decision_time берём из сигнала, если есть; иначе вычисляем
+            decision_time = s_row.get("decision_time") or (open_time + tf_delta)
 
             # активные позиции на момент сигнала (entry_time <= T < exit_time)
             active_positions = _get_active_positions(existing_positions, new_positions, open_time)
@@ -403,7 +433,6 @@ async def run_basic_straight_mono_backfill(
             )
 
             if sim_result is None:
-                # позиция открыта и на момент to_time остаётся живой
                 logs_to_insert.append(
                     (
                         signal_uuid,
@@ -447,6 +476,7 @@ async def run_basic_straight_mono_backfill(
                     timeframe,
                     direction,
                     open_time,
+                    decision_time,
                     entry_price,             # цена уже приведена к precision_price/ticksize
                     entry_qty,               # qty уже приведено к precision_qty
                     entry_notional,          # деньги обрезаны до 4 знаков
@@ -499,6 +529,7 @@ async def run_basic_straight_mono_backfill(
                     timeframe,
                     direction,
                     entry_time,
+                    decision_time,
                     entry_price,
                     entry_qty,
                     entry_notional,
@@ -517,8 +548,9 @@ async def run_basic_straight_mono_backfill(
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7,
-                    $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, now()
+                    $8, $9, $10, $11, $12, $13, $14, $15,
+                    $16, $17, $18, $19, $20, $21, $22,
+                    $23, now()
                 )
                 """,
                 positions_to_insert,
@@ -592,6 +624,7 @@ async def _load_signals_for_scenario(
                 v.symbol,
                 v.timeframe,
                 v.open_time,
+                v.decision_time,
                 v.direction,
                 v.raw_message
             FROM bt_signals_values v
@@ -619,6 +652,7 @@ async def _load_signals_for_scenario(
                 "symbol": r["symbol"],
                 "timeframe": r["timeframe"],
                 "open_time": r["open_time"],
+                "decision_time": r["decision_time"],
                 "direction": r["direction"],
                 "raw_message": r["raw_message"],
             }
@@ -759,7 +793,6 @@ async def _simulate_trade(
         low = Decimal(str(r["low"]))
         close = Decimal(str(r["close"]))
 
-        # вычисляем благоприятное и неблагоприятное движение в абсолютных ценовых шагах
         if direction == "long":
             fav_move = high - entry_price
             adv_move = low - entry_price
@@ -813,7 +846,6 @@ async def _simulate_trade(
                 exit_reason = "full_tp_hit"
                 break
 
-    # если ни TP, ни SL не были задеты в окне до to_time — считаем позицию "живой"
     if exit_time is None or exit_price is None or exit_reason is None:
         return None
 

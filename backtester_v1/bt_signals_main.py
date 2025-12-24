@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Callable, Awaitable
 
 # 🔸 Конфиг и кеши backtester_v1
@@ -32,6 +32,22 @@ BT_LIVE_STREAM_BLOCK_MS = 5000
 
 # 🔸 Ограничение параллельной обработки live-сообщений (важно для скорости)
 BT_LIVE_MAX_CONCURRENCY = 50
+
+# 🔸 Таймшаги TF (в минутах) для decision_time
+TF_STEP_MINUTES = {
+    "m5": 5,
+    "m15": 15,
+    "h1": 60,
+}
+
+
+# 🔸 Длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if not step_min:
+        return timedelta(0)
+    return timedelta(minutes=step_min)
 
 
 # 🔸 Типы обработчиков сигналов
@@ -65,6 +81,7 @@ LIVE_SIGNAL_HANDLERS: Dict[str, LiveSignalHandler] = {
     "lr_universal": LiveSignalHandler(init_lr_universal_live, handle_lr_universal_indicator_ready),
     "emacross": LiveSignalHandler(init_emacross_live, handle_emacross_indicator_ready),
 }
+
 
 # 🔸 Оркестратор псевдо-сигналов: поднимает backfill и live-воркеры для всех включённых инстансов
 async def run_bt_signals_orchestrator(pg, redis):
@@ -697,15 +714,6 @@ async def _run_live_stream_dispatcher(
                 duration_ms,
             )
 
-            if total_msgs > 0:
-                log.debug(
-                    "BT_SIGNALS_LIVE: обработан live-пакет (stream=%s): сообщений=%s, live-сигналов=%s, duration_ms=%s",
-                    stream_key,
-                    total_msgs,
-                    total_signals,
-                    duration_ms,
-                )
-
         except Exception as e:
             log.error(
                 "BT_SIGNALS_LIVE: ошибка в основном цикле live-диспетчера стрима '%s': %s",
@@ -773,6 +781,10 @@ async def _publish_live_signal(
         message = live_signal["message"]
         raw_message = live_signal.get("raw_message") or {}
 
+        # decision_time = close_time бара (open_time + TF)
+        tf_delta = _get_timeframe_timedelta(timeframe)
+        decision_time = open_time + tf_delta if tf_delta > timedelta(0) else None
+
         # формируем времена
         bar_time_iso = open_time.isoformat()
         now_iso = datetime.utcnow().isoformat()
@@ -815,18 +827,23 @@ async def _publish_live_signal(
             raw_message["mode"] = "live"
         raw_message.setdefault("source", "backtester_v1")
 
+        # decision_time добавляем в raw_message для трассировки
+        if decision_time is not None:
+            raw_message.setdefault("decision_time", decision_time.isoformat())
+
         async with pg.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO bt_signals_values
-                    (signal_uuid, signal_id, symbol, timeframe, open_time, direction, message, raw_message)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
                 signal_uuid,
                 signal_id,
                 symbol,
                 timeframe,
                 open_time,
+                decision_time,
                 direction,
                 message,
                 json.dumps(raw_message),

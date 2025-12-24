@@ -54,9 +54,11 @@ PACK_PERMANENT_REASONS = {
     "internal_error",
 }
 
+
 def _is_pack_permanent_reason(reason: Optional[str]) -> bool:
     r = str(reason or "").strip()
     return r in PACK_PERMANENT_REASONS
+
 
 # 🔸 ind_pack JSON parser (Contract v1 + backward compatible)
 def _parse_ind_pack_value(raw: Optional[str]) -> Dict[str, Any]:
@@ -238,7 +240,7 @@ async def init_emacross_live(
         )
         filter_workers.append(task)
 
-    log.debug(
+    log.info(
         "BT_SIG_EMA_CROSS_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, fast=%s(id=%s), slow=%s(id=%s), trigger=%s, "
         "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
         len(cfgs),
@@ -312,28 +314,33 @@ async def handle_emacross_indicator_ready(
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return []
 
-    # не принимаем решение по слишком старым событиям: stale считаем от close_time бара
+    step_delta: timedelta = ctx["step_delta"]
+
+    # decision_time = close_time бара (момент принятия решения/готовности сигнала)
+    decision_time = open_time + step_delta
+
     now_utc = datetime.utcnow().replace(tzinfo=None)
-    decision_time = open_time + ctx["step_delta"]
     age_sec = (now_utc - decision_time).total_seconds()
 
+    # не принимаем решение по слишком старым событиям: stale считаем от decision_time
     if age_sec > STALE_MAX_SEC:
         details = {
             "event": {"symbol": symbol, "indicator": indicator_base, "timeframe": timeframe, "open_time": open_time_iso},
+            "ts": {"open_time": open_time.isoformat(), "decision_time": decision_time.isoformat()},
             "rule": "dropped_stale_backlog",
             "age_sec": float(age_sec),
             "stale_max_sec": STALE_MAX_SEC,
-            "decision_time": decision_time.isoformat(),
         }
         for scfg in ctx.get("signals") or []:
             await _upsert_live_log(
-                pg,
-                int(scfg["signal_id"]),
-                symbol,
-                timeframe,
-                open_time,
-                "dropped_stale_backlog",
-                details,
+                pg=pg,
+                signal_id=int(scfg["signal_id"]),
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                decision_time=decision_time,
+                status="dropped_stale_backlog",
+                details=details,
             )
         ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
         return []
@@ -342,6 +349,7 @@ async def handle_emacross_indicator_ready(
     lock = ctx["symbol_locks"].setdefault(symbol, asyncio.Lock())
     async with lock:
         ts_ms = _to_ms_utc(open_time)
+        decision_ms = _to_ms_utc(decision_time)
 
         fast_key = IND_TS_KEY.format(symbol=symbol, tf=timeframe, param_name=str(ctx["fast_base"]))
         slow_key = IND_TS_KEY.format(symbol=symbol, tf=timeframe, param_name=str(ctx["slow_base"]))
@@ -361,6 +369,7 @@ async def handle_emacross_indicator_ready(
                     symbol=symbol,
                     timeframe=timeframe,
                     open_time=open_time,
+                    decision_time=decision_time,
                     status="error",
                     details={"reason": "redis_pipeline_error", "error": str(e), "event": fields},
                 )
@@ -372,13 +381,23 @@ async def handle_emacross_indicator_ready(
         if fast_val is None or slow_val is None:
             details = {
                 "event": {"symbol": symbol, "indicator": indicator_base, "timeframe": timeframe, "open_time": open_time_iso},
+                "ts": {"ts_ms": ts_ms, "decision_ms": decision_ms, "open_time": open_time.isoformat(), "decision_time": decision_time.isoformat()},
                 "reason": "data_missing",
                 "missing": {"fast": fast_val is None, "slow": slow_val is None},
                 "fast_key": fast_key,
                 "slow_key": slow_key,
             }
             for scfg in ctx.get("signals") or []:
-                await _upsert_live_log(pg, int(scfg["signal_id"]), symbol, timeframe, open_time, "data_missing", details)
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=int(scfg["signal_id"]),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="data_missing",
+                    details=details,
+                )
             return []
 
         # epsilon = ticksize (как в backfill)
@@ -397,6 +416,7 @@ async def handle_emacross_indicator_ready(
 
         details_base = {
             "event": {"symbol": symbol, "indicator": indicator_base, "timeframe": timeframe, "open_time": open_time_iso},
+            "ts": {"ts_ms": ts_ms, "decision_ms": decision_ms, "open_time": open_time.isoformat(), "decision_time": decision_time.isoformat()},
             "ema": {
                 "fast": float(fast_val),
                 "slow": float(slow_val),
@@ -413,9 +433,14 @@ async def handle_emacross_indicator_ready(
         if state == EMA_STATE_NEUTRAL:
             for scfg in ctx.get("signals") or []:
                 await _upsert_live_log(
-                    pg, int(scfg["signal_id"]), symbol, timeframe, open_time,
-                    "no_cross_neutral_zone",
-                    {**details_base, "result": {"passed": False, "status": "no_cross_neutral_zone"}},
+                    pg=pg,
+                    signal_id=int(scfg["signal_id"]),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="no_cross_neutral_zone",
+                    details={**details_base, "result": {"passed": False, "status": "no_cross_neutral_zone"}},
                 )
             return []
 
@@ -424,9 +449,14 @@ async def handle_emacross_indicator_ready(
             prev_state_by_symbol[symbol] = state
             for scfg in ctx.get("signals") or []:
                 await _upsert_live_log(
-                    pg, int(scfg["signal_id"]), symbol, timeframe, open_time,
-                    "no_cross_state_init",
-                    {**details_base, "result": {"passed": False, "status": "no_cross_state_init"}},
+                    pg=pg,
+                    signal_id=int(scfg["signal_id"]),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="no_cross_state_init",
+                    details={**details_base, "result": {"passed": False, "status": "no_cross_state_init"}},
                 )
             return []
 
@@ -434,9 +464,14 @@ async def handle_emacross_indicator_ready(
         if state == prev_state:
             for scfg in ctx.get("signals") or []:
                 await _upsert_live_log(
-                    pg, int(scfg["signal_id"]), symbol, timeframe, open_time,
-                    "no_cross_state_unchanged",
-                    {**details_base, "result": {"passed": False, "status": "no_cross_state_unchanged"}},
+                    pg=pg,
+                    signal_id=int(scfg["signal_id"]),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="no_cross_state_unchanged",
+                    details={**details_base, "result": {"passed": False, "status": "no_cross_state_unchanged"}},
                 )
             return []
 
@@ -453,9 +488,14 @@ async def handle_emacross_indicator_ready(
         if cross_dir is None:
             for scfg in ctx.get("signals") or []:
                 await _upsert_live_log(
-                    pg, int(scfg["signal_id"]), symbol, timeframe, open_time,
-                    "no_cross_state_changed",
-                    {**details_base, "result": {"passed": False, "status": "no_cross_state_changed"}},
+                    pg=pg,
+                    signal_id=int(scfg["signal_id"]),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="no_cross_state_changed",
+                    details={**details_base, "result": {"passed": False, "status": "no_cross_state_changed"}},
                 )
             return []
 
@@ -472,13 +512,14 @@ async def handle_emacross_indicator_ready(
             # кросс не в нужную сторону
             if inst_dir != cross_dir:
                 await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "cross_rejected_direction_mask",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="cross_rejected_direction_mask",
+                    details={
                         **details_base,
                         "signal": {"signal_id": signal_id, "direction": inst_dir, "message": message, "filtered": is_filtered},
                         "result": {"passed": False, "status": "cross_rejected_direction_mask", "cross_dir": cross_dir},
@@ -489,13 +530,14 @@ async def handle_emacross_indicator_ready(
             # raw — отдаём наружу
             if not is_filtered:
                 should_send = await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "signal_sent",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="signal_sent",
+                    details={
                         **details_base,
                         "signal": {"signal_id": signal_id, "direction": inst_dir, "message": message, "filtered": False},
                         "result": {"passed": True, "status": "signal_sent"},
@@ -515,6 +557,7 @@ async def handle_emacross_indicator_ready(
                                 "symbol": symbol,
                                 "timeframe": timeframe,
                                 "open_time": open_time.isoformat(),
+                                "decision_time": decision_time.isoformat(),
                                 "direction": inst_dir,
                                 "message": message,
                                 "source": "backtester_v1",
@@ -529,13 +572,14 @@ async def handle_emacross_indicator_ready(
             # filtered — enqueue на фильтрацию
             if mirror_scenario_id is None or mirror_signal_id is None:
                 await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "blocked_missing_keys_timeout",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_missing_keys_timeout",
+                    details={
                         **details_base,
                         "signal": {"signal_id": signal_id, "direction": inst_dir, "message": message, "filtered": True},
                         "filter": {"reason": "missing_mirror_params"},
@@ -560,13 +604,14 @@ async def handle_emacross_indicator_ready(
             # для работы фильтра нужен хотя бы один good (bad может быть пустым)
             if not required_pairs or not good_bins_map:
                 await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "blocked_missing_keys_timeout",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_missing_keys_timeout",
+                    details={
                         **details_base,
                         "signal": {"signal_id": signal_id, "direction": inst_dir, "message": message, "filtered": True},
                         "filter": {"reason": "mirror_cache_empty"},
@@ -577,13 +622,14 @@ async def handle_emacross_indicator_ready(
 
             # waiting
             await _upsert_live_log(
-                pg,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                "filter_waiting",
-                {
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                decision_time=decision_time,
+                status="filter_waiting",
+                details={
                     **details_base,
                     "signal": {
                         "signal_id": signal_id,
@@ -596,6 +642,7 @@ async def handle_emacross_indicator_ready(
                         "rule": "waiting_keys",
                         "required_total": len(required_pairs),
                         "deadline_sec": FILTER_WAIT_TOTAL_SEC,
+                        "step_sec": FILTER_WAIT_STEP_SEC,
                         "require_good": True,
                     },
                 },
@@ -606,6 +653,7 @@ async def handle_emacross_indicator_ready(
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "open_time": open_time,
+                "decision_time": decision_time,
                 "direction": inst_dir,
                 "message": message,
                 "mirror_scenario_id": int(mirror_scenario_id),
@@ -622,13 +670,14 @@ async def handle_emacross_indicator_ready(
                 q.put_nowait(candidate)
             except asyncio.QueueFull:
                 await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "dropped_overload",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="dropped_overload",
+                    details={
                         **details_base,
                         "signal": {
                             "signal_id": signal_id,
@@ -664,6 +713,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
     symbol = str(c["symbol"])
     timeframe = str(c["timeframe"])
     open_time: datetime = c["open_time"]
+    decision_time: datetime = c.get("decision_time") or open_time
     direction = str(c["direction"])
     message = str(c["message"])
 
@@ -682,13 +732,14 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
     # stale по задержке в очереди
     if queue_delay_sec > STALE_MAX_SEC:
         await _upsert_live_log(
-            pg,
-            signal_id,
-            symbol,
-            timeframe,
-            open_time,
-            "dropped_stale_backlog",
-            {
+            pg=pg,
+            signal_id=signal_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            open_time=open_time,
+            decision_time=decision_time,
+            status="dropped_stale_backlog",
+            details={
                 **details_base,
                 "signal": {
                     "signal_id": signal_id,
@@ -748,18 +799,19 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     fail_reason = st.get("reason")
                     fail_details = st.get("details")
 
-                    # 🔸 Перманентный fail → сразу блокируем (без ожидания дедлайна)
+                    # перманентный fail → сразу блокируем (без ожидания дедлайна)
                     if _is_pack_permanent_reason(fail_reason):
                         aid, tf = pair
 
                         await _upsert_live_log(
-                            pg,
-                            signal_id,
-                            symbol,
-                            timeframe,
-                            open_time,
-                            "blocked_missing_keys_timeout",
-                            {
+                            pg=pg,
+                            signal_id=signal_id,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            open_time=open_time,
+                            decision_time=decision_time,
+                            status="blocked_missing_keys_timeout",
+                            details={
                                 **details_base,
                                 "signal": {
                                     "signal_id": signal_id,
@@ -786,7 +838,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                         )
                         return
 
-                    # 🔸 Транзиентный fail → запоминаем и продолжаем ждать
+                    # транзиентный fail → запоминаем и продолжаем ждать
                     explained[pair] = {
                         "source": st.get("source"),
                         "reason": fail_reason,
@@ -802,13 +854,14 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             bad_set = bad_bins_map.get((aid, tf)) or set()
             if bn in bad_set:
                 await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "blocked_bad_bin",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_bad_bin",
+                    details={
                         **details_base,
                         "signal": {
                             "signal_id": signal_id,
@@ -837,13 +890,14 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
         if not missing_pairs:
             if not good_hit:
                 await _upsert_live_log(
-                    pg,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    "blocked_no_good_bin",
-                    {
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_no_good_bin",
+                    details={
                         **details_base,
                         "signal": {
                             "signal_id": signal_id,
@@ -866,13 +920,14 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 return
 
             should_send = await _upsert_live_log(
-                pg,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                "signal_sent",
-                {
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=open_time,
+                decision_time=decision_time,
+                status="signal_sent",
+                details={
                     **details_base,
                     "signal": {
                         "signal_id": signal_id,
@@ -917,13 +972,14 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             missing_absent.append(pair)
 
     await _upsert_live_log(
-        pg,
-        signal_id,
-        symbol,
-        timeframe,
-        open_time,
-        "blocked_missing_keys_timeout",
-        {
+        pg=pg,
+        signal_id=signal_id,
+        symbol=symbol,
+        timeframe=timeframe,
+        open_time=open_time,
+        decision_time=decision_time,
+        status="blocked_missing_keys_timeout",
+        details={
             **details_base,
             "signal": {
                 "signal_id": signal_id,
@@ -1004,10 +1060,7 @@ async def _read_ind_pack_states(
     for (aid, tf), val in zip(pairs, res_pair):
         if val is not None:
             parsed = _parse_ind_pack_value(str(val))
-            out[(aid, tf)] = {
-                "source": "pair",
-                **parsed,
-            }
+            out[(aid, tf)] = {"source": "pair", **parsed}
         else:
             out[(aid, tf)] = {"source": "pair", "state": "absent", "bin_name": None, "reason": None, "details": None}
             missing_static.append((aid, tf))
@@ -1031,10 +1084,7 @@ async def _read_ind_pack_states(
             if val is None:
                 continue
             parsed = _parse_ind_pack_value(str(val))
-            out[(aid, tf)] = {
-                "source": "static",
-                **parsed,
-            }
+            out[(aid, tf)] = {"source": "static", **parsed}
 
     return out
 
@@ -1085,6 +1135,7 @@ async def _upsert_live_log(
     symbol: str,
     timeframe: str,
     open_time: datetime,
+    decision_time: datetime,
     status: str,
     details: Dict[str, Any],
 ) -> bool:
@@ -1093,11 +1144,12 @@ async def _upsert_live_log(
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, status, details)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, decision_time, status, details)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
             ON CONFLICT (signal_id, symbol, timeframe, open_time)
             DO UPDATE
-               SET status = EXCLUDED.status,
+               SET decision_time = EXCLUDED.decision_time,
+                   status = EXCLUDED.status,
                    details = EXCLUDED.details
             WHERE bt_signals_live.status <> 'signal_sent'
             RETURNING status
@@ -1106,6 +1158,7 @@ async def _upsert_live_log(
             symbol,
             timeframe,
             open_time,
+            decision_time,
             status,
             payload,
         )

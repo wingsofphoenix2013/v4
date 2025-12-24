@@ -208,6 +208,16 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         zone_k,
         keep_half,
     )
+    log.info(
+        "BT_SIG_LR_UNI: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], inserted=%s (long=%s, short=%s)",
+        signal_id,
+        timeframe,
+        from_time,
+        to_time,
+        total_inserted,
+        total_long,
+        total_short,
+    )
 
     # отправляем уведомление в Redis Stream о готовности сигналов
     finished_at = datetime.utcnow()
@@ -389,6 +399,17 @@ async def _process_symbol_inner(
     except Exception:
         precision_price = 8
 
+    # decision_time = open_time + TF (момент закрытия бара)
+    tf_delta = _get_timeframe_timedelta(timeframe)
+    if tf_delta <= timedelta(0):
+        log.debug(
+            "BT_SIG_LR_UNI: неизвестный TF для decision_time (timeframe=%s), symbol=%s, signal_id=%s",
+            timeframe,
+            symbol,
+            signal_id,
+        )
+        return 0, 0, 0
+
     to_insert = []
     long_count = 0
     short_count = 0
@@ -517,12 +538,16 @@ async def _process_symbol_inner(
         else:
             message = "LR_UNI_BOUNCE_SHORT"
 
+        # decision_time = close_time бара, по которому сформирован сигнал
+        decision_time = ts + tf_delta
+
         raw_message = {
             "signal_key": signal_key,
             "signal_id": signal_id,
             "symbol": symbol,
             "timeframe": timeframe,
             "open_time": ts.isoformat(),
+            "decision_time": decision_time.isoformat(),
             "direction": direction,
             "price": price_rounded,
             "pattern": pattern,
@@ -545,6 +570,7 @@ async def _process_symbol_inner(
                 symbol,
                 timeframe,
                 ts,
+                decision_time,
                 direction,
                 message,
                 json.dumps(raw_message),
@@ -574,8 +600,8 @@ async def _process_symbol_inner(
         await conn.executemany(
             """
             INSERT INTO bt_signals_values
-                (signal_uuid, signal_id, symbol, timeframe, open_time, direction, message, raw_message)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             """,
             to_insert,
         )

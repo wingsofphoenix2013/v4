@@ -14,6 +14,20 @@ from backtester_config import get_all_ticker_symbols, get_ticker_info
 BT_SIGNALS_READY_STREAM = "bt:signals:ready"
 log = logging.getLogger("BT_SIG_EMA_CROSS")
 
+# 🔸 Таймшаги TF (в минутах) для decision_time
+TF_STEP_MINUTES = {
+    "m5": 5,
+}
+
+
+# 🔸 Длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = (timeframe or "").lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if not step_min:
+        return timedelta(0)
+    return timedelta(minutes=step_min)
+
 
 # 🔸 Публичная точка входа: backfill по окну backfill_days для одного инстанса сигнала
 async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
@@ -26,8 +40,21 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
 
     if timeframe != "m5":
         log.warning(
-            f"BT_SIG_EMA_CROSS: сигнал id={signal_id} ('{name}') имеет неподдерживаемый timeframe={timeframe}, "
-            f"ожидается 'm5'"
+            "BT_SIG_EMA_CROSS: сигнал id=%s ('%s') имеет неподдерживаемый timeframe=%s, ожидается 'm5'",
+            signal_id,
+            name,
+            timeframe,
+        )
+        return
+
+    # условия достаточности: decision_time = open_time + TF
+    tf_delta = _get_timeframe_timedelta(timeframe)
+    if tf_delta <= timedelta(0):
+        log.error(
+            "BT_SIG_EMA_CROSS: неизвестный TF для decision_time (timeframe=%s), signal_id=%s ('%s')",
+            timeframe,
+            signal_id,
+            name,
         )
         return
 
@@ -39,14 +66,19 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         slow_instance_id = int(slow_cfg["value"])
     except Exception as e:
         log.error(
-            f"BT_SIG_EMA_CROSS: сигнал id={signal_id} ('{name}') — некорректные параметры EMA-инстансов: {e}"
+            "BT_SIG_EMA_CROSS: сигнал id=%s ('%s') — некорректные параметры EMA-инстансов: %s",
+            signal_id,
+            name,
+            e,
         )
         return
 
     if backfill_days <= 0:
         log.warning(
-            f"BT_SIG_EMA_CROSS: сигнал id={signal_id} ('{name}') имеет backfill_days={backfill_days}, "
-            f"ожидается > 0"
+            "BT_SIG_EMA_CROSS: сигнал id=%s ('%s') имеет backfill_days=%s, ожидается > 0",
+            signal_id,
+            name,
+            backfill_days,
         )
         return
 
@@ -73,13 +105,25 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
     # список активных тикеров из кеша
     symbols = get_all_ticker_symbols()
     if not symbols:
-        log.debug(f"BT_SIG_EMA_CROSS: нет активных тикеров для обработки, сигнал id={signal_id} ('{name}')")
+        log.debug(
+            "BT_SIG_EMA_CROSS: нет активных тикеров для обработки, сигнал id=%s ('%s')",
+            signal_id,
+            name,
+        )
         return
 
     log.debug(
-        f"BT_SIG_EMA_CROSS: старт backfill для сигнала id={signal_id} ('{name}', key={signal_key}), "
-        f"TF={timeframe}, окно={backfill_days} дней, тикеров={len(symbols)}, "
-        f"direction_mask={mask_val}"
+        "BT_SIG_EMA_CROSS: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, тикеров=%s, "
+        "direction_mask=%s, ema_fast_instance_id=%s, ema_slow_instance_id=%s",
+        signal_id,
+        name,
+        signal_key,
+        timeframe,
+        backfill_days,
+        len(symbols),
+        mask_val,
+        fast_instance_id,
+        slow_instance_id,
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -103,6 +147,7 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 pg=pg,
                 sema=sema,
                 allowed_directions=allowed_directions,
+                tf_delta=tf_delta,
             )
         )
 
@@ -121,9 +166,24 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         total_short += shorts
 
     log.debug(
-        f"BT_SIG_EMA_CROSS: backfill завершён для сигнала id={signal_id} ('{name}'): "
-        f"вставлено событий={total_inserted}, long={total_long}, short={total_short}, "
-        f"direction_mask={mask_val}"
+        "BT_SIG_EMA_CROSS: backfill завершён для сигнала id=%s ('%s'): вставлено событий=%s, long=%s, short=%s, "
+        "direction_mask=%s",
+        signal_id,
+        name,
+        total_inserted,
+        total_long,
+        total_short,
+        mask_val,
+    )
+    log.info(
+        "BT_SIG_EMA_CROSS: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], inserted=%s (long=%s, short=%s)",
+        signal_id,
+        timeframe,
+        from_time,
+        to_time,
+        total_inserted,
+        total_long,
+        total_short,
     )
 
     # отправляем уведомление в Redis Stream о готовности сигналов
@@ -140,14 +200,20 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
             },
         )
         log.debug(
-            f"BT_SIG_EMA_CROSS: опубликовано событие готовности в стрим '{BT_SIGNALS_READY_STREAM}' "
-            f"для signal_id={signal_id}, окно=[{from_time} .. {to_time}], finished_at={finished_at}"
+            "BT_SIG_EMA_CROSS: опубликовано событие готовности в стрим '%s' для signal_id=%s, окно=[%s .. %s], finished_at=%s",
+            BT_SIGNALS_READY_STREAM,
+            signal_id,
+            from_time,
+            to_time,
+            finished_at,
         )
     except Exception as e:
         # ошибки стрима не должны ломать основной backfill
         log.error(
-            f"BT_SIG_EMA_CROSS: не удалось опубликовать событие в стрим '{BT_SIGNALS_READY_STREAM}' "
-            f"для signal_id={signal_id}: {e}",
+            "BT_SIG_EMA_CROSS: не удалось опубликовать событие в стрим '%s' для signal_id=%s: %s",
+            BT_SIGNALS_READY_STREAM,
+            signal_id,
+            e,
             exc_info=True,
         )
 
@@ -178,8 +244,12 @@ async def _load_existing_events(
     for r in rows:
         existing.add((r["symbol"], r["open_time"], r["direction"]))
     log.debug(
-        f"BT_SIG_EMA_CROSS: уже существующих событий в окне [{from_time} .. {to_time}] "
-        f"для signal_id={signal_id}, TF={timeframe}: {len(existing)}"
+        "BT_SIG_EMA_CROSS: уже существующих событий в окне [%s .. %s] для signal_id=%s, TF=%s: %s",
+        from_time,
+        to_time,
+        signal_id,
+        timeframe,
+        len(existing),
     )
     return existing
 
@@ -199,26 +269,32 @@ async def _process_symbol(
     pg,
     sema: asyncio.Semaphore,
     allowed_directions: Set[str],
+    tf_delta: timedelta,
 ) -> Tuple[int, int, int]:
     async with sema:
         try:
             return await _process_symbol_inner(
-                signal_id,
-                signal_key,
-                name,
-                timeframe,
-                symbol,
-                fast_instance_id,
-                slow_instance_id,
-                from_time,
-                to_time,
-                existing_events,
-                pg,
-                allowed_directions,
+                signal_id=signal_id,
+                signal_key=signal_key,
+                name=name,
+                timeframe=timeframe,
+                symbol=symbol,
+                fast_instance_id=fast_instance_id,
+                slow_instance_id=slow_instance_id,
+                from_time=from_time,
+                to_time=to_time,
+                existing_events=existing_events,
+                pg=pg,
+                allowed_directions=allowed_directions,
+                tf_delta=tf_delta,
             )
         except Exception as e:
             log.error(
-                f"BT_SIG_EMA_CROSS: ошибка обработки символа {symbol} для сигнала id={signal_id} ('{name}'): {e}",
+                "BT_SIG_EMA_CROSS: ошибка обработки символа %s для сигнала id=%s ('%s'): %s",
+                symbol,
+                signal_id,
+                name,
+                e,
                 exc_info=True,
             )
             return 0, 0, 0
@@ -238,23 +314,20 @@ async def _process_symbol_inner(
     existing_events: set[Tuple[str, datetime, str]],
     pg,
     allowed_directions: Set[str],
+    tf_delta: timedelta,
 ) -> Tuple[int, int, int]:
     # загружаем серии EMA для fast и slow
     fast_series = await _load_ema_series(pg, fast_instance_id, symbol, from_time, to_time)
     slow_series = await _load_ema_series(pg, slow_instance_id, symbol, from_time, to_time)
 
     if not fast_series or not slow_series:
-        log.debug(
-            f"BT_SIG_EMA_CROSS: недостаточно данных EMA для {symbol}, сигнал id={signal_id} ('{name}')"
-        )
+        log.debug("BT_SIG_EMA_CROSS: недостаточно данных EMA для %s, сигнал id=%s ('%s')", symbol, signal_id, name)
         return 0, 0, 0
 
     # работаем только по общим временным точкам
     times = sorted(set(fast_series.keys()) & set(slow_series.keys()))
     if len(times) < 2:
-        log.debug(
-            f"BT_SIG_EMA_CROSS: слишком мало общих баров EMA для {symbol}, сигнал id={signal_id} ('{name}')"
-        )
+        log.debug("BT_SIG_EMA_CROSS: слишком мало общих баров EMA для %s, сигнал id=%s ('%s')", symbol, signal_id, name)
         return 0, 0, 0
 
     # epsilon = 1 * ticksize
@@ -306,7 +379,11 @@ async def _process_symbol_inner(
 
     if not candidates:
         log.debug(
-            f"BT_SIG_EMA_CROSS: кроссов EMA9/21 не найдено для {symbol} в окне [{from_time}..{to_time}]"
+            "BT_SIG_EMA_CROSS: кроссов EMA не найдено для %s в окне [%s..%s], signal_id=%s",
+            symbol,
+            from_time,
+            to_time,
+            signal_id,
         )
         return 0, 0, 0
 
@@ -330,6 +407,9 @@ async def _process_symbol_inner(
         if key in existing_events:
             continue
 
+        # decision_time = close_time бара, по которому сформирован сигнал
+        decision_time = ts + tf_delta
+
         signal_uuid = uuid.uuid4()
         message = "EMA_CROSS_LONG" if direction == "long" else "EMA_CROSS_SHORT"
 
@@ -339,6 +419,7 @@ async def _process_symbol_inner(
             "symbol": symbol,
             "timeframe": timeframe,
             "open_time": ts.isoformat(),
+            "decision_time": decision_time.isoformat(),
             "direction": direction,
             "price": float(price),
             "epsilon": epsilon,
@@ -351,9 +432,10 @@ async def _process_symbol_inner(
                 symbol,
                 timeframe,
                 ts,
+                decision_time,
                 direction,
                 message,
-                json.dumps(raw_message),  # сериализуем dict в JSON-строку
+                json.dumps(raw_message),
             )
         )
 
@@ -369,30 +451,34 @@ async def _process_symbol_inner(
         await conn.executemany(
             """
             INSERT INTO bt_signals_values
-                (signal_uuid, signal_id, symbol, timeframe, open_time, direction, message, raw_message)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             """,
             to_insert,
         )
 
     inserted = len(to_insert)
     log.debug(
-        f"BT_SIG_EMA_CROSS: {symbol} → вставлено событий={inserted} (long={long_count}, short={short_count}) "
-        f"для сигнала id={signal_id} ('{name}')"
+        "BT_SIG_EMA_CROSS: %s → вставлено событий=%s (long=%s, short=%s) для сигнала id=%s ('%s')",
+        symbol,
+        inserted,
+        long_count,
+        short_count,
+        signal_id,
+        name,
     )
     return inserted, long_count, short_count
 
 
 # 🔸 Классификация состояния fast vs slow по diff и epsilon
 def _classify_state(diff: float, epsilon: float) -> str:
+    # без epsilon считаем только знак
     if epsilon <= 0:
-        # без epsilon считаем только знак
         if diff > 0:
             return "above"
-        elif diff < 0:
+        if diff < 0:
             return "below"
-        else:
-            return "neutral"
+        return "neutral"
 
     if diff > epsilon:
         return "above"

@@ -19,6 +19,22 @@ getcontext().prec = 28
 # 🔸 Константы стримов
 BT_SCENARIOS_READY_STREAM = "bt:scenarios:ready"
 
+# 🔸 Таймшаги TF (в минутах) для decision_time
+TF_STEP_MINUTES = {
+    "m5": 5,
+    "m15": 15,
+    "h1": 60,
+}
+
+
+# 🔸 Длительность таймфрейма в виде timedelta
+def _get_timeframe_timedelta(timeframe: str) -> timedelta:
+    tf = str(timeframe or "").strip().lower()
+    step_min = TF_STEP_MINUTES.get(tf)
+    if not step_min:
+        return timedelta(0)
+    return timedelta(minutes=step_min)
+
 
 # 🔸 Утилита: обрезка денег/метрик до 4 знаков после запятой
 def _q_money(value: Decimal) -> Decimal:
@@ -171,6 +187,17 @@ async def run_double_straight_mono_backfill(
         )
         return
 
+    # условия достаточности: decision_time = entry_time + TF
+    tf_delta = _get_timeframe_timedelta(timeframe)
+    if tf_delta <= timedelta(0):
+        log.error(
+            "BT_SCENARIO_DOUBLE_MONO: неизвестный TF для decision_time (timeframe=%s), scenario_id=%s, signal_id=%s",
+            timeframe,
+            scenario_id,
+            signal_id,
+        )
+        return
+
     log.debug(
         "BT_SCENARIO_DOUBLE_MONO: старт обработки сценария id=%s (key=%s, type=%s) "
         "для signal_id=%s, TF=%s, окно=[%s .. %s], deposit=%s, leverage=%s, position_limit=%s, "
@@ -269,6 +296,9 @@ async def run_double_straight_mono_backfill(
             open_time = s_row["open_time"]
             signal_uuid = s_row["signal_uuid"]
             raw_message = s_row["raw_message"]
+
+            # decision_time берём из сигнала, если есть; иначе вычисляем
+            decision_time = s_row.get("decision_time") or (open_time + tf_delta)
 
             # активные позиции на момент сигнала (entry_time <= T < exit_time)
             active_positions = _get_active_positions(existing_positions, new_positions, open_time)
@@ -502,8 +532,6 @@ async def run_double_straight_mono_backfill(
                 continue
 
             # моделируем жизнь сделки ДО to_time:
-            # первая часть может закрыться по TP1, вторая часть по TP2 или SL;
-            # если ни TP2, ни SL не сработали — позиция "жива"
             sim_result = await _simulate_trade_double(
                 pg=pg,
                 symbol=symbol,
@@ -522,7 +550,6 @@ async def run_double_straight_mono_backfill(
             )
 
             if sim_result is None:
-                # позиция открыта и на момент to_time остаётся живой
                 logs_to_insert.append(
                     (
                         signal_uuid,
@@ -531,7 +558,6 @@ async def run_double_straight_mono_backfill(
                         "position opened and still alive (double TP)",
                     )
                 )
-                # для учёта маржи внутри текущего прогона считаем, что она жива до to_time
                 new_positions.append(
                     {
                         "symbol": symbol,
@@ -556,18 +582,11 @@ async def run_double_straight_mono_backfill(
             # формируем позицию
             position_uid = uuid.uuid4()
 
-            # собираем raw_stat по двум тейкам
             raw_stat = {
                 "version": "double_v1",
                 "tp_legs": {
-                    "tp1": {
-                        "share_percent": float(tp1_share_percent),
-                        "price": float(tp1_price),
-                    },
-                    "tp2": {
-                        "share_percent": float(tp2_share_percent),
-                        "price": float(tp2_price),
-                    },
+                    "tp1": {"share_percent": float(tp1_share_percent), "price": float(tp1_price)},
+                    "tp2": {"share_percent": float(tp2_share_percent), "price": float(tp2_price)},
                 },
             }
 
@@ -581,21 +600,22 @@ async def run_double_straight_mono_backfill(
                     timeframe,
                     direction,
                     open_time,
-                    entry_price,             # цена уже приведена к precision_price/ticksize
-                    entry_qty,               # qty уже приведено к precision_qty
-                    entry_notional,          # деньги обрезаны до 4 знаков
-                    margin_used,             # деньги обрезаны до 4 знаков
+                    decision_time,
+                    entry_price,
+                    entry_qty,
+                    entry_notional,
+                    margin_used,
                     sl_price,
-                    tp2_price,               # считаем финальный TP как TP2
+                    tp2_price,               # финальный TP = TP2
                     exit_time,
                     exit_price,
                     exit_reason,
                     pnl_abs,
                     duration,
-                    max_fav_pct,             # MFE в процентах от цены входа
-                    max_adv_pct,             # MAE в процентах от цены входа
-                    json.dumps(raw_stat),    # raw_stat, постпроцессор позже перезапишет, но базу оставим
-                    False,                   # postproc: ещё не обработана постпроцессором
+                    max_fav_pct,
+                    max_adv_pct,
+                    json.dumps(raw_stat),
+                    False,                   # postproc=false
                 )
             )
 
@@ -634,6 +654,7 @@ async def run_double_straight_mono_backfill(
                     timeframe,
                     direction,
                     entry_time,
+                    decision_time,
                     entry_price,
                     entry_qty,
                     entry_notional,
@@ -653,9 +674,9 @@ async def run_double_straight_mono_backfill(
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7,
-                    $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21,
-                    $22, $23, now()
+                    $8, $9, $10, $11, $12, $13, $14, $15,
+                    $16, $17, $18, $19, $20, $21, $22,
+                    $23, $24, now()
                 )
                 """,
                 positions_to_insert,
@@ -677,19 +698,8 @@ async def run_double_straight_mono_backfill(
                 logs_to_insert,
             )
 
-    log.debug(
-        "BT_SCENARIO_DOUBLE_MONO: сценарий id=%s, signal_id=%s — "
-        "обработано сигналов=%s, позиций открыто=%s, пропущено=%s, живых позиций=%s",
-        scenario_id,
-        signal_id,
-        total_signals_processed,
-        total_positions_opened,
-        total_skipped,
-        total_alive,
-    )
     log.info(
-        "BT_SCENARIO_DOUBLE_MONO: summary scenario_id=%s, signal_id=%s — "
-        "signals=%s, opened=%s, skipped=%s, alive=%s",
+        "BT_SCENARIO_DOUBLE_MONO: summary scenario_id=%s, signal_id=%s — signals=%s, opened=%s, skipped=%s, alive=%s",
         scenario_id,
         signal_id,
         total_signals_processed,
@@ -751,6 +761,7 @@ async def _load_signals_for_scenario(
                 v.symbol,
                 v.timeframe,
                 v.open_time,
+                v.decision_time,
                 v.direction,
                 v.raw_message
             FROM bt_signals_values v
@@ -778,14 +789,14 @@ async def _load_signals_for_scenario(
                 "symbol": r["symbol"],
                 "timeframe": r["timeframe"],
                 "open_time": r["open_time"],
+                "decision_time": r["decision_time"],
                 "direction": r["direction"],
                 "raw_message": r["raw_message"],
             }
         )
 
     log.debug(
-        "BT_SCENARIO_DOUBLE_MONO: загружено сигналов для scenario_id=%s, signal_id=%s, TF=%s "
-        "в окне [%s .. %s]: %s",
+        "BT_SCENARIO_DOUBLE_MONO: загружено сигналов для scenario_id=%s, signal_id=%s, TF=%s в окне [%s .. %s]: %s",
         scenario_id,
         signal_id,
         timeframe,
@@ -833,8 +844,7 @@ async def _load_existing_positions(
         )
 
     log.debug(
-        "BT_SCENARIO_DOUBLE_MONO: загружены существующие позиции для scenario_id=%s, signal_id=%s, "
-        "TF=%s, direction=%s: позиций=%s",
+        "BT_SCENARIO_DOUBLE_MONO: загружены существующие позиции для scenario_id=%s, signal_id=%s, TF=%s, direction=%s: позиций=%s",
         scenario_id,
         signal_id,
         timeframe,
@@ -929,12 +939,9 @@ async def _simulate_trade_double(
     exit_price: Optional[Decimal] = None
     exit_reason: Optional[str] = None
 
-    # состояние ног
-    leg1_open = True   # часть под TP1
-    leg2_open = True   # часть под TP2
-    had_tp1 = False    # фиксируем, был ли когда-либо TP1
+    leg1_open = True
+    leg2_open = True
 
-    # ПnL по ногам (используется только при полном закрытии позиции)
     pnl_leg1 = Decimal("0")
     pnl_leg2 = Decimal("0")
 
@@ -942,9 +949,8 @@ async def _simulate_trade_double(
         otime = r["open_time"]
         high = Decimal(str(r["high"]))
         low = Decimal(str(r["low"]))
-        close = Decimal(str(r["close"]))
 
-        # вычисляем благоприятное и неблагоприятное движение в абсолютных ценовых шагах
+        # MFE/MAE
         if direction == "long":
             fav_move = high - entry_price
             adv_move = low - entry_price
@@ -966,60 +972,12 @@ async def _simulate_trade_double(
             touched_tp1 = low <= tp1_price
             touched_tp2 = low <= tp2_price
 
-        # оба плеча ещё открыты
+        # обе ноги открыты
         if leg1_open and leg2_open:
-            # случаи полного SL (худший исход)
-            if touched_sl and not touched_tp2 and not touched_tp1:
-                # полное закрытие по SL
-                exit_time = otime
-                exit_price = sl_price
-                exit_reason = "full_sl_hit"
-
-                if direction == "long":
-                    pnl_full = (sl_price - entry_price) * (qty1 + qty2)
-                else:
-                    pnl_full = (entry_price - sl_price) * (qty1 + qty2)
-
-                pnl_leg1 = pnl_full
-                pnl_leg2 = Decimal("0")
-                break
-
-            if touched_sl and touched_tp1 and not touched_tp2:
-                # TP1 + SL на одной свече — считаем, что TP1 не сработал, худший исход — полный SL
-                exit_time = otime
-                exit_price = sl_price
-                exit_reason = "full_sl_hit"
-
-                if direction == "long":
-                    pnl_full = (sl_price - entry_price) * (qty1 + qty2)
-                else:
-                    pnl_full = (entry_price - sl_price) * (qty1 + qty2)
-
-                pnl_leg1 = pnl_full
-                pnl_leg2 = Decimal("0")
-                break
-
-            # случай TP1 + TP2 без SL — полный TP
-            if not touched_sl and touched_tp2:
-                exit_time = otime
-                exit_price = tp2_price
-                exit_reason = "full_tp_hit"
-                had_tp1 = True
-
-                if direction == "long":
-                    pnl_leg1 = (tp1_price - entry_price) * qty1
-                    pnl_leg2 = (tp2_price - entry_price) * qty2
-                else:
-                    pnl_leg1 = (entry_price - tp1_price) * qty1
-                    pnl_leg2 = (entry_price - tp2_price) * qty2
-                break
-
-            # случай TP2 + SL на одной свече — SL после TP
             if touched_sl and touched_tp2:
                 exit_time = otime
                 exit_price = sl_price
                 exit_reason = "sl_after_tp"
-                had_tp1 = True
 
                 if direction == "long":
                     pnl_leg1 = (tp1_price - entry_price) * qty1
@@ -1029,58 +987,70 @@ async def _simulate_trade_double(
                     pnl_leg2 = (entry_price - sl_price) * qty2
                 break
 
-            # только TP1 — закрывается первая часть, вторая продолжает жить
-            if touched_tp1 and not touched_sl and not touched_tp2:
-                had_tp1 = True
-                leg1_open = False
-
-                if direction == "long":
-                    pnl_leg1 = (tp1_price - entry_price) * qty1
-                else:
-                    pnl_leg1 = (entry_price - tp1_price) * qty1
-
-                # leg2 остаётся открытой, продолжаем симуляцию
-                continue
-
-        # первая нога уже закрыта по TP1, жива только вторая
-        if not leg1_open and leg2_open:
-            # SL по остаточной позиции → SL after TP
-            if touched_sl:
+            if touched_sl and not touched_tp1 and not touched_tp2:
                 exit_time = otime
                 exit_price = sl_price
-                exit_reason = "sl_after_tp"
+                exit_reason = "full_sl_hit"
 
                 if direction == "long":
-                    pnl_leg2 = (sl_price - entry_price) * qty2
+                    pnl_leg1 = (sl_price - entry_price) * (qty1 + qty2)
                 else:
-                    pnl_leg2 = (entry_price - sl_price) * qty2
+                    pnl_leg1 = (entry_price - sl_price) * (qty1 + qty2)
+                pnl_leg2 = Decimal("0")
                 break
 
-            # TP2 по остаточной позиции → полный TP (обе части по TP)
-            if touched_tp2:
+            if not touched_sl and touched_tp2:
                 exit_time = otime
                 exit_price = tp2_price
                 exit_reason = "full_tp_hit"
 
+                if direction == "long":
+                    pnl_leg1 = (tp1_price - entry_price) * qty1
+                    pnl_leg2 = (tp2_price - entry_price) * qty2
+                else:
+                    pnl_leg1 = (entry_price - tp1_price) * qty1
+                    pnl_leg2 = (entry_price - tp2_price) * qty2
+                break
+
+            if touched_tp1 and not touched_sl and not touched_tp2:
+                leg1_open = False
+                if direction == "long":
+                    pnl_leg1 = (tp1_price - entry_price) * qty1
+                else:
+                    pnl_leg1 = (entry_price - tp1_price) * qty1
+                continue
+
+        # нога 1 закрыта, нога 2 открыта
+        if (not leg1_open) and leg2_open:
+            if touched_sl:
+                exit_time = otime
+                exit_price = sl_price
+                exit_reason = "sl_after_tp"
+                if direction == "long":
+                    pnl_leg2 = (sl_price - entry_price) * qty2
+                else:
+                    pnl_leg2 = (entry_price - sl_price) * qty2
+                break
+
+            if touched_tp2:
+                exit_time = otime
+                exit_price = tp2_price
+                exit_reason = "full_tp_hit"
                 if direction == "long":
                     pnl_leg2 = (tp2_price - entry_price) * qty2
                 else:
                     pnl_leg2 = (entry_price - tp2_price) * qty2
                 break
 
-    # если ни TP2, ни SL не были задеты в окне до to_time — считаем позицию "живой"
     if exit_time is None or exit_price is None or exit_reason is None:
         return None
 
-    # суммарный PnL по обеим частям
-    raw_pnl = pnl_leg1 + pnl_leg2
-    raw_pnl = _q_money(raw_pnl)
+    raw_pnl = _q_money(pnl_leg1 + pnl_leg2)
 
-    commission_rate = Decimal("0.0015")  # 0.15% вход+выход (упрощённо, без детализации по частям)
+    commission_rate = Decimal("0.0015")  # 0.15% вход+выход
     commission = _q_money(entry_notional * commission_rate)
 
-    pnl_abs = raw_pnl - commission
-    pnl_abs = _q_money(pnl_abs)
+    pnl_abs = _q_money(raw_pnl - commission)
 
     duration = exit_time - entry_time
 
@@ -1283,7 +1253,7 @@ async def _recalc_total_stats(
                     winrate                     = EXCLUDED.winrate,
                     roi                         = EXCLUDED.roi,
                     max_favorable_excursion_avg = EXCLUDED.max_favorable_excursion_avg,
-                    max_adverse_excursion_avg   = EXCLUDED.max_adverse_excursion_avg,
+                    max_adverse_excursion_avg   = EXCLUDED.max_favorable_excursion_avg,
                     updated_at                  = now()
                 """,
                 scenario_id,
