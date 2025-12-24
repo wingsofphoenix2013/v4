@@ -1,4 +1,4 @@
-# bt_signals_lr_universal.py — воркер backfill для LR-bounce сигналов (trend / counter / agnostic) на m5
+# bt_signals_lr_universal.py — воркер backfill для LR-bounce сигналов (trend / counter / agnostic) на m5 (с фиксацией run_id)
 
 import asyncio
 import logging
@@ -30,7 +30,14 @@ def _get_timeframe_timedelta(timeframe: str) -> timedelta:
 
 
 # 🔸 Публичная точка входа: backfill по окну backfill_days для одного инстанса LR-сигнала
-async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
+async def run_lr_universal_backfill(
+    signal: Dict[str, Any],
+    pg,
+    redis,
+    run_id: Optional[int] = None,
+    window_from_time: Optional[datetime] = None,
+    window_to_time: Optional[datetime] = None,
+) -> None:
     signal_id = signal.get("id")
     signal_key = signal.get("key")
     name = signal.get("name")
@@ -60,9 +67,9 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         return
 
-    if backfill_days <= 0:
+    if backfill_days <= 0 and (window_from_time is None or window_to_time is None):
         log.warning(
-            "BT_SIG_LR_UNI: сигнал id=%s ('%s') имеет backfill_days=%s, ожидается > 0",
+            "BT_SIG_LR_UNI: сигнал id=%s ('%s') имеет backfill_days=%s и окно не передано, backfill пропущен",
             signal_id,
             name,
             backfill_days,
@@ -120,9 +127,13 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
     pattern = "bounce"
 
     # рабочее окно по времени
-    now = datetime.utcnow()
-    from_time = now - timedelta(days=backfill_days)
-    to_time = now
+    if window_from_time is not None and window_to_time is not None:
+        from_time = window_from_time
+        to_time = window_to_time
+    else:
+        now = datetime.utcnow()
+        from_time = now - timedelta(days=int(backfill_days))
+        to_time = now
 
     # список активных тикеров из кеша
     symbols = get_all_ticker_symbols()
@@ -135,13 +146,14 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         return
 
     log.debug(
-        "BT_SIG_LR_UNI: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, "
-        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, trend_type=%s, zone_k=%.3f, keep_half=%s",
+        "BT_SIG_LR_UNI: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=[%s..%s], "
+        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, trend_type=%s, zone_k=%.3f, keep_half=%s, run_id=%s",
         signal_id,
         name,
         signal_key,
         timeframe,
-        backfill_days,
+        from_time,
+        to_time,
         len(symbols),
         mask_val,
         lr_m5_instance_id,
@@ -149,6 +161,7 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
         trend_type,
         zone_k,
         keep_half,
+        run_id,
     )
 
     # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
@@ -176,75 +189,71 @@ async def run_lr_universal_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 trend_type=trend_type,
                 zone_k=zone_k,
                 keep_half=keep_half,
+                run_id=run_id,
             )
         )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     total_inserted = 0
+    total_skipped_existing = 0
+    total_skipped_duplicate = 0
+
     total_long = 0
     total_short = 0
 
     for res in results:
         if isinstance(res, Exception):
             continue
-        ins, longs, shorts = res
+        ins, longs, shorts, skipped_existing, skipped_duplicate = res
         total_inserted += ins
         total_long += longs
         total_short += shorts
+        total_skipped_existing += skipped_existing
+        total_skipped_duplicate += skipped_duplicate
 
-    log.debug(
-        "BT_SIG_LR_UNI: backfill завершён для сигнала id=%s ('%s', key=%s): "
-        "вставлено событий=%s, long=%s, short=%s, окно=[%s .. %s], trend_type=%s, zone_k=%.3f, keep_half=%s",
-        signal_id,
-        name,
-        signal_key,
-        total_inserted,
-        total_long,
-        total_short,
-        from_time,
-        to_time,
-        trend_type,
-        zone_k,
-        keep_half,
-    )
     log.info(
-        "BT_SIG_LR_UNI: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], inserted=%s (long=%s, short=%s)",
+        "BT_SIG_LR_UNI: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], run_id=%s, "
+        "inserted=%s (long=%s, short=%s), skipped_existing=%s, skipped_duplicate=%s",
         signal_id,
         timeframe,
         from_time,
         to_time,
+        run_id,
         total_inserted,
         total_long,
         total_short,
+        total_skipped_existing,
+        total_skipped_duplicate,
     )
 
-    # отправляем уведомление в Redis Stream о готовности сигналов
+    # отправляем уведомление в Redis Stream о готовности сигналов (с run_id)
     finished_at = datetime.utcnow()
 
     try:
-        await redis.xadd(
-            BT_SIGNALS_READY_STREAM,
-            {
-                "signal_id": str(signal_id),
-                "from_time": from_time.isoformat(),
-                "to_time": to_time.isoformat(),
-                "finished_at": finished_at.isoformat(),
-            },
-        )
+        payload = {
+            "signal_id": str(signal_id),
+            "from_time": from_time.isoformat(),
+            "to_time": to_time.isoformat(),
+            "finished_at": finished_at.isoformat(),
+        }
+        if run_id is not None:
+            payload["run_id"] = str(int(run_id))
+
+        await redis.xadd(BT_SIGNALS_READY_STREAM, payload)
+
         log.debug(
-            "BT_SIG_LR_UNI: опубликовано событие готовности в стрим '%s' "
-            "для signal_id=%s, окно=[%s .. %s], finished_at=%s",
+            "BT_SIG_LR_UNI: опубликовано событие готовности в стрим '%s' для signal_id=%s, run_id=%s, окно=[%s .. %s], finished_at=%s",
             BT_SIGNALS_READY_STREAM,
             signal_id,
+            run_id,
             from_time,
             to_time,
             finished_at,
         )
     except Exception as e:
         log.error(
-            "BT_SIG_LR_UNI: не удалось опубликовать событие в стрим '%s' "
-            "для signal_id=%s: %s",
+            "BT_SIG_LR_UNI: не удалось опубликовать событие в стрим '%s' для signal_id=%s: %s",
             BT_SIGNALS_READY_STREAM,
             signal_id,
             e,
@@ -307,7 +316,8 @@ async def _process_symbol(
     trend_type: str,
     zone_k: float,
     keep_half: bool,
-) -> Tuple[int, int, int]:
+    run_id: Optional[int],
+) -> Tuple[int, int, int, int, int]:
     async with sema:
         try:
             return await _process_symbol_inner(
@@ -326,6 +336,7 @@ async def _process_symbol(
                 trend_type=trend_type,
                 zone_k=zone_k,
                 keep_half=keep_half,
+                run_id=run_id,
             )
         except Exception as e:
             log.error(
@@ -336,7 +347,7 @@ async def _process_symbol(
                 e,
                 exc_info=True,
             )
-            return 0, 0, 0
+            return 0, 0, 0, 0, 0
 
 
 # 🔸 Внутренняя логика обработки символа без семафора
@@ -356,41 +367,22 @@ async def _process_symbol_inner(
     trend_type: str,
     zone_k: float,
     keep_half: bool,
-) -> Tuple[int, int, int]:
+    run_id: Optional[int],
+) -> Tuple[int, int, int, int, int]:
     # загружаем LR-канал на m5
     lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
     if not lr_m5_series or len(lr_m5_series) < 2:
-        log.debug(
-            "BT_SIG_LR_UNI: недостаточно данных LR m5 для %s, сигнал id=%s ('%s')",
-            symbol,
-            signal_id,
-            name,
-        )
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     # загружаем OHLCV для m5 (для цен)
     ohlcv_series = await _load_ohlcv_series(pg, symbol, timeframe, from_time, to_time)
     if not ohlcv_series:
-        log.debug(
-            "BT_SIG_LR_UNI: нет OHLCV для %s в окне [%s..%s], сигнал id=%s ('%s')",
-            symbol,
-            from_time,
-            to_time,
-            signal_id,
-            name,
-        )
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     # работаем по общим временным точкам LR m5 + OHLCV
     times = sorted(set(lr_m5_series.keys()) & set(ohlcv_series.keys()))
     if len(times) < 2:
-        log.debug(
-            "BT_SIG_LR_UNI: нет достаточного пересечения LR/OHLCV для %s, сигнал id=%s ('%s')",
-            symbol,
-            signal_id,
-            name,
-        )
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     # precision цены для raw_message
     ticker_info = get_ticker_info(symbol) or {}
@@ -402,17 +394,14 @@ async def _process_symbol_inner(
     # decision_time = open_time + TF (момент закрытия бара)
     tf_delta = _get_timeframe_timedelta(timeframe)
     if tf_delta <= timedelta(0):
-        log.debug(
-            "BT_SIG_LR_UNI: неизвестный TF для decision_time (timeframe=%s), symbol=%s, signal_id=%s",
-            timeframe,
-            symbol,
-            signal_id,
-        )
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     to_insert = []
     long_count = 0
     short_count = 0
+
+    skipped_existing = 0
+    skipped_duplicate = 0
 
     # перебираем пары (prev_ts, ts) для поиска bounce-паттерна
     for i in range(1, len(times)):
@@ -524,6 +513,7 @@ async def _process_symbol_inner(
 
         key_event = (symbol, ts, direction)
         if key_event in existing_events:
+            skipped_existing += 1
             continue
 
         # округляем цену для raw_message
@@ -574,6 +564,7 @@ async def _process_symbol_inner(
                 direction,
                 message,
                 json.dumps(raw_message),
+                int(run_id) if run_id is not None else None,
             )
         )
 
@@ -583,44 +574,23 @@ async def _process_symbol_inner(
             short_count += 1
 
     if not to_insert:
-        log.debug(
-            "BT_SIG_LR_UNI: сигналов не найдено для %s в окне [%s..%s], сигнал id=%s ('%s'), trend_type=%s, zone_k=%.3f, keep_half=%s",
-            symbol,
-            from_time,
-            to_time,
-            signal_id,
-            name,
-            trend_type,
-            zone_k,
-            keep_half,
-        )
-        return 0, 0, 0
+        return 0, 0, 0, skipped_existing, 0
 
+    # вставка: события не перезаписываем, фиксируем first_backfill_run_id только при первом появлении
     async with pg.acquire() as conn:
         await conn.executemany(
             """
             INSERT INTO bt_signals_values
-                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message, first_backfill_run_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+            ON CONFLICT (signal_id, symbol, timeframe, open_time, direction)
+            DO NOTHING
             """,
             to_insert,
         )
 
     inserted = len(to_insert)
-    log.debug(
-        "BT_SIG_LR_UNI: %s → вставлено событий=%s (long=%s, short=%s) "
-        "для сигнала id=%s ('%s'), trend_type=%s, zone_k=%.3f, keep_half=%s",
-        symbol,
-        inserted,
-        long_count,
-        short_count,
-        signal_id,
-        name,
-        trend_type,
-        zone_k,
-        keep_half,
-    )
-    return inserted, long_count, short_count
+    return inserted, long_count, short_count, skipped_existing, skipped_duplicate
 
 
 # 🔸 Загрузка LR-серии (angle/upper/lower/center) для одного инстанса / символа / окна

@@ -4,8 +4,9 @@ import asyncio
 import logging
 import uuid
 import json
+import inspect
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Callable, Awaitable
+from typing import Dict, Any, List, Callable, Awaitable, Optional
 
 # 🔸 Конфиг и кеши backtester_v1
 from backtester_config import get_enabled_signals
@@ -19,8 +20,8 @@ from signals.bt_signals_lr_universal_live import init_lr_universal_live, handle_
 from signals.bt_signals_emacross_live import init_emacross_live, handle_emacross_indicator_ready
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
-BT_TIMER_BACKFILL_START_DELAY_SEC = 60      # старт через минуту после запуска backtester_v1
-BT_TIMER_BACKFILL_INTERVAL_SEC = 86400       # повторный запуск полного цикла раз в Х секунд
+BT_TIMER_BACKFILL_START_DELAY_SEC = 60       # старт через минуту после запуска backtester_v1
+BT_TIMER_BACKFILL_INTERVAL_SEC = 7200       # повторный запуск полного цикла раз в Х секунд
 
 # 🔸 Настройки стримовых backfill-сигналов (по умолчанию)
 BT_STREAM_BACKFILL_BATCH_SIZE = 10
@@ -32,6 +33,9 @@ BT_LIVE_STREAM_BLOCK_MS = 5000
 
 # 🔸 Ограничение параллельной обработки live-сообщений (важно для скорости)
 BT_LIVE_MAX_CONCURRENCY = 50
+
+# 🔸 Таблица прогонов backfill (новая сущность)
+BT_BACKFILL_RUNS_TABLE = "bt_signal_backfill_runs"
 
 # 🔸 Таймшаги TF (в минутах) для decision_time
 TF_STEP_MINUTES = {
@@ -51,7 +55,7 @@ def _get_timeframe_timedelta(timeframe: str) -> timedelta:
 
 
 # 🔸 Типы обработчиков сигналов
-TimerBackfillHandler = Callable[[Dict[str, Any], Any, Any], Awaitable[None]]
+TimerBackfillHandler = Callable[..., Awaitable[None]]
 StreamBackfillHandler = Callable[[Dict[str, Any], Dict[str, Any], Any, Any], Awaitable[None]]
 LiveInitHandler = Callable[[List[Dict[str, Any]], Any, Any], Awaitable[Any]]
 LiveHandleHandler = Callable[[Any, Dict[str, str], Any, Any], Awaitable[List[Dict[str, Any]]]]
@@ -64,7 +68,7 @@ class LiveSignalHandler:
         self.handle = handle
 
 
-# 🔸 Реестр таймерных backfill-сигналов: key → handler(signal, pg, redis)
+# 🔸 Реестр таймерных backfill-сигналов: key → handler(...)
 TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
     "lr_universal": run_lr_universal_backfill,
     "ema_cross": run_emacross_backfill,
@@ -322,39 +326,31 @@ async def _run_timer_backfill_scheduler(
     # основной цикл последовательного запуска всех timer-сигналов
     while True:
         cycle_started_at = datetime.utcnow()
+
         total_signals = len(timer_signals)
         processed_signals = 0
-        total_deleted_rows = 0
+
+        runs_started = 0
+        runs_success = 0
+        runs_error = 0
+        runs_skipped = 0
 
         for signal in timer_signals:
-            sid = signal.get("id")
+            sid_raw = signal.get("id")
             key = str(signal.get("key") or "").strip().lower()
             name = signal.get("name")
             timeframe = signal.get("timeframe")
             mode = signal.get("mode")
+            backfill_days_raw = signal.get("backfill_days") or 0
 
-            # очистка истории по конкретному сигналу перед backfill
-            deleted_rows = 0
-            if sid is not None:
-                try:
-                    deleted_rows = await _delete_signal_values(pg, int(sid))
-                    total_deleted_rows += deleted_rows
-                    log.info(
-                        "BT_SIGNALS_TIMER: очистка bt_signals_values перед backfill: signal_id=%s, deleted_rows=%s",
-                        sid,
-                        deleted_rows,
-                    )
-                except Exception as e:
-                    log.error(
-                        "BT_SIGNALS_TIMER: ошибка очистки bt_signals_values перед backfill для signal_id=%s: %s",
-                        sid,
-                        e,
-                        exc_info=True,
-                    )
+            try:
+                signal_id = int(sid_raw)
+            except Exception:
+                signal_id = 0
 
             log.debug(
                 "BT_SIGNALS_TIMER: старт backfill для timer-сигнала id=%s, key=%s, name=%s, timeframe=%s, mode=%s",
-                sid,
+                signal_id,
                 key,
                 name,
                 timeframe,
@@ -365,22 +361,97 @@ async def _run_timer_backfill_scheduler(
             if handler is None:
                 log.debug(
                     "BT_SIGNALS_TIMER: timer-backfill для сигнала id=%s с key=%s (name=%s) не поддерживается",
-                    sid,
+                    signal_id,
                     key,
                     name,
                 )
-            else:
+                processed_signals += 1
+                continue
+
+            # окно прогона (для сущности run)
+            try:
+                backfill_days = int(backfill_days_raw)
+            except Exception:
+                backfill_days = 0
+
+            if backfill_days <= 0:
+                # backfill_days некорректен — запускаем handler как и раньше (пусть он сам решит), но run не создаём
+                runs_skipped += 1
                 try:
-                    await handler(signal, pg, redis)
+                    await _call_timer_backfill_handler(handler, signal, pg, redis, None, None, None)
                 except Exception as e:
                     log.error(
                         "BT_SIGNALS_TIMER: ошибка при выполнении backfill для timer-сигнала id=%s (key=%s, name=%s): %s",
-                        sid,
+                        signal_id,
                         key,
                         name,
                         e,
                         exc_info=True,
                     )
+                processed_signals += 1
+                continue
+
+            now = datetime.utcnow()
+            from_time = now - timedelta(days=backfill_days)
+            to_time = now
+
+            # создаём сущность прогона в БД
+            run_id: Optional[int] = None
+            try:
+                run_id = await _create_backfill_run(pg, signal_id, from_time, to_time)
+                runs_started += 1
+                log.info(
+                    "BT_SIGNALS_TIMER: backfill run создан — run_id=%s, signal_id=%s, key=%s, TF=%s, window=[%s..%s]",
+                    run_id,
+                    signal_id,
+                    key,
+                    timeframe,
+                    from_time,
+                    to_time,
+                )
+            except Exception as e:
+                # run не создан — всё равно пробуем выполнить backfill, но run_id будет отсутствовать
+                runs_error += 1
+                run_id = None
+                log.error(
+                    "BT_SIGNALS_TIMER: не удалось создать backfill run для signal_id=%s (key=%s, name=%s): %s",
+                    signal_id,
+                    key,
+                    name,
+                    e,
+                    exc_info=True,
+                )
+
+            # запускаем backfill (без очистки bt_signals_values)
+            try:
+                await _call_timer_backfill_handler(handler, signal, pg, redis, run_id, from_time, to_time)
+
+                if run_id is not None:
+                    await _finish_backfill_run(pg, run_id, status="success", error=None)
+                    runs_success += 1
+                    log.info(
+                        "BT_SIGNALS_TIMER: backfill run завершён успешно — run_id=%s, signal_id=%s, key=%s",
+                        run_id,
+                        signal_id,
+                        key,
+                    )
+
+            except Exception as e:
+                log.error(
+                    "BT_SIGNALS_TIMER: ошибка при выполнении backfill для timer-сигнала id=%s (key=%s, name=%s): %s",
+                    signal_id,
+                    key,
+                    name,
+                    e,
+                    exc_info=True,
+                )
+
+                if run_id is not None:
+                    try:
+                        await _finish_backfill_run(pg, run_id, status="error", error=str(e))
+                    except Exception:
+                        pass
+                    runs_error += 1
 
             processed_signals += 1
 
@@ -389,11 +460,14 @@ async def _run_timer_backfill_scheduler(
 
         log.info(
             "BT_SIGNALS_TIMER: цикл timer-backfill завершён: сигналов=%s, обработано=%s, длительность=%.2f сек, "
-            "deleted_rows_total=%s, следующий запуск через %s сек",
+            "runs_started=%s, runs_success=%s, runs_error=%s, runs_skipped=%s, следующий запуск через %s сек",
             total_signals,
             processed_signals,
             duration_sec,
-            total_deleted_rows,
+            runs_started,
+            runs_success,
+            runs_error,
+            runs_skipped,
             BT_TIMER_BACKFILL_INTERVAL_SEC,
         )
 
@@ -763,6 +837,81 @@ async def _ensure_stream_consumer_group(
             raise
 
 
+# 🔸 Вызов timer-backfill handler с обратной совместимостью по сигнатурам
+async def _call_timer_backfill_handler(
+    handler: TimerBackfillHandler,
+    signal: Dict[str, Any],
+    pg,
+    redis,
+    run_id: Optional[int],
+    from_time: Optional[datetime],
+    to_time: Optional[datetime],
+) -> None:
+    # handler может быть старого формата: (signal, pg, redis)
+    # или нового: (signal, pg, redis, run_id) / (signal, pg, redis, run_id, from_time, to_time)
+    try:
+        sig = inspect.signature(handler)
+        argc = len(sig.parameters)
+    except Exception:
+        argc = 3
+
+    # условия достаточности
+    if argc >= 6 and run_id is not None and from_time is not None and to_time is not None:
+        await handler(signal, pg, redis, int(run_id), from_time, to_time)
+        return
+
+    if argc >= 4 and run_id is not None:
+        await handler(signal, pg, redis, int(run_id))
+        return
+
+    await handler(signal, pg, redis)
+
+
+# 🔸 Создание сущности прогона backfill в БД
+async def _create_backfill_run(
+    pg,
+    signal_id: int,
+    from_time: datetime,
+    to_time: datetime,
+) -> int:
+    async with pg.acquire() as conn:
+        run_id = await conn.fetchval(
+            f"""
+            INSERT INTO {BT_BACKFILL_RUNS_TABLE}
+                (signal_id, from_time, to_time, started_at, status)
+            VALUES ($1, $2, $3, NOW(), 'running')
+            RETURNING id
+            """,
+            int(signal_id),
+            from_time,
+            to_time,
+        )
+
+    return int(run_id)
+
+
+# 🔸 Завершение сущности прогона backfill в БД
+async def _finish_backfill_run(
+    pg,
+    run_id: int,
+    status: str,
+    error: Optional[str],
+) -> None:
+    async with pg.acquire() as conn:
+        await conn.execute(
+            f"""
+            UPDATE {BT_BACKFILL_RUNS_TABLE}
+               SET finished_at = NOW(),
+                   status = $2,
+                   error = $3
+             WHERE id = $1
+            """,
+            int(run_id),
+            str(status),
+            error,
+        )
+
+
 # 🔸 Публикация live-сигнала в signals_stream и bt_signals_values
 async def _publish_live_signal(
     live_signal: Dict[str, Any],
@@ -832,11 +981,12 @@ async def _publish_live_signal(
             raw_message.setdefault("decision_time", decision_time.isoformat())
 
         async with pg.acquire() as conn:
-            await conn.execute(
+            res = await conn.execute(
                 """
                 INSERT INTO bt_signals_values
                     (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (signal_id, symbol, timeframe, open_time, direction) DO NOTHING
                 """,
                 signal_uuid,
                 signal_id,
@@ -849,13 +999,30 @@ async def _publish_live_signal(
                 json.dumps(raw_message),
             )
 
-        log.debug(
-            "BT_SIGNALS_LIVE: live-сигнал залогирован в bt_signals_values signal_id=%s, symbol=%s, time=%s, direction=%s",
-            signal_id,
-            symbol,
-            bar_time_iso,
-            direction,
-        )
+        # res обычно вида "INSERT 0 1" или "INSERT 0 0" при DO NOTHING
+        inserted_rows = 0
+        try:
+            inserted_rows = int(str(res).split()[-1])
+        except Exception:
+            inserted_rows = 0
+
+        if inserted_rows > 0:
+            log.debug(
+                "BT_SIGNALS_LIVE: live-сигнал залогирован в bt_signals_values signal_id=%s, symbol=%s, time=%s, direction=%s",
+                signal_id,
+                symbol,
+                bar_time_iso,
+                direction,
+            )
+        else:
+            log.debug(
+                "BT_SIGNALS_LIVE: live-сигнал пропущен (duplicate identity) signal_id=%s, symbol=%s, time=%s, direction=%s",
+                signal_id,
+                symbol,
+                bar_time_iso,
+                direction,
+            )
+
     except Exception as e:
         log.error(
             "BT_SIGNALS_LIVE: не удалось залогировать live-сигнал в bt_signals_values: %s, live_signal=%s",
@@ -863,29 +1030,3 @@ async def _publish_live_signal(
             live_signal,
             exc_info=True,
         )
-
-
-# 🔸 Удаление всех значений конкретного сигнала из bt_signals_values
-async def _delete_signal_values(pg, signal_id: int) -> int:
-    log = logging.getLogger("BT_SIGNALS_TIMER")
-    if not signal_id:
-        return 0
-
-    async with pg.acquire() as conn:
-        res = await conn.execute(
-            "DELETE FROM bt_signals_values WHERE signal_id = $1",
-            signal_id,
-        )
-
-    # res обычно вида "DELETE 123"
-    try:
-        deleted_rows = int(str(res).split()[-1])
-    except Exception:
-        deleted_rows = 0
-        log.debug(
-            "BT_SIGNALS_TIMER: не удалось распарсить результат DELETE для signal_id=%s, res=%s",
-            signal_id,
-            res,
-        )
-
-    return deleted_rows

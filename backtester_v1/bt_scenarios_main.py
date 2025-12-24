@@ -1,4 +1,4 @@
-# bt_scenarios_main.py — оркестратор сценариев backtester_v1
+# bt_scenarios_main.py — оркестратор сценариев backtester_v1 (consumer bt:signals:ready → запуск сценариев)
 
 import asyncio
 import logging
@@ -25,7 +25,7 @@ SCENARIO_HANDLERS: Dict[Tuple[str, str], ScenarioHandler] = {
     ("double_straight_mono", "straight"): run_double_straight_mono_backfill,
 }
 
-# 🔸 Константы стрима сценариев
+# 🔸 Константы стрима сценариев (потребитель backfill-ready сигналов)
 SCENARIO_STREAM_KEY = "bt:signals:ready"
 SCENARIO_CONSUMER_GROUP = "bt_scenarios"
 SCENARIO_CONSUMER_NAME = "bt_scenarios_main"
@@ -70,15 +70,17 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                         continue
 
                     signal_id = signal_ctx["signal_id"]
+                    run_id = signal_ctx.get("run_id")
                     total_signals += 1
 
                     # получаем все связки сценарий ↔ сигнал
                     links = get_scenario_signal_links_for_signal(signal_id)
                     if not links:
                         log.debug(
-                            "BT_SCENARIOS_MAIN: для signal_id=%s нет активных связок сценариев, "
+                            "BT_SCENARIOS_MAIN: для signal_id=%s нет активных связок сценариев, run_id=%s, "
                             "сообщение %s будет помечено как обработанное",
                             signal_id,
+                            run_id,
                             entry_id,
                         )
                         await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
@@ -92,20 +94,20 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                         scenario = get_scenario_instance(scenario_id)
                         if not scenario:
                             log.warning(
-                                "BT_SCENARIOS_MAIN: сценарий id=%s не найден в кеше, "
-                                "signal_id=%s, сообщение %s",
+                                "BT_SCENARIOS_MAIN: сценарий id=%s не найден в кеше, signal_id=%s, run_id=%s, сообщение %s",
                                 scenario_id,
                                 signal_id,
+                                run_id,
                                 entry_id,
                             )
                             continue
 
                         if not scenario.get("enabled"):
                             log.debug(
-                                "BT_SCENARIOS_MAIN: сценарий id=%s отключён, "
-                                "signal_id=%s, сообщение %s",
+                                "BT_SCENARIOS_MAIN: сценарий id=%s отключён, signal_id=%s, run_id=%s, сообщение %s",
                                 scenario_id,
                                 signal_id,
+                                run_id,
                                 entry_id,
                             )
                             continue
@@ -124,23 +126,21 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                     await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
 
                     log.debug(
-                        "BT_SCENARIOS_MAIN: сообщение stream_id=%s для signal_id=%s "
-                        "обработано, сценариев запущено=%s",
+                        "BT_SCENARIOS_MAIN: сообщение stream_id=%s для signal_id=%s (run_id=%s) обработано, сценариев запущено=%s",
                         entry_id,
                         signal_id,
+                        run_id,
                         started_for_message,
                     )
 
             log.debug(
-                "BT_SCENARIOS_MAIN: пакет обработан — сообщений=%s, сигналов=%s, "
-                "сценариев-запусков=%s",
+                "BT_SCENARIOS_MAIN: пакет обработан — сообщений=%s, сигналов=%s, сценариев-запусков=%s",
                 total_msgs,
                 total_signals,
                 total_scenarios,
             )
             log.info(
-                "BT_SCENARIOS_MAIN: итог по пакету — сообщений=%s, сигналов=%s, "
-                "запусков сценариев=%s (последовательный режим)",
+                "BT_SCENARIOS_MAIN: итог по пакету — сообщений=%s, сигналов=%s, запусков сценариев=%s (последовательный режим)",
                 total_msgs,
                 total_signals,
                 total_scenarios,
@@ -230,9 +230,10 @@ async def _read_from_stream(redis) -> List[Any]:
     return parsed
 
 
-# 🔸 Разбор одного сообщения из стрима bt:signals:ready
+# 🔸 Разбор одного сообщения из стрима bt:signals:ready (run-aware)
 def _parse_signal_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
+        # обязательные поля
         signal_id_str = fields.get("signal_id")
         from_time_str = fields.get("from_time")
         to_time_str = fields.get("to_time")
@@ -247,8 +248,18 @@ def _parse_signal_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         to_time = datetime.fromisoformat(to_time_str)
         finished_at = datetime.fromisoformat(finished_at_str)
 
+        # run_id (новый контракт; на всякий случай допускаем отсутствие)
+        run_id = None
+        run_id_str = fields.get("run_id")
+        if run_id_str:
+            try:
+                run_id = int(run_id_str)
+            except Exception:
+                run_id = None
+
         return {
             "signal_id": signal_id,
+            "run_id": run_id,
             "from_time": from_time,
             "to_time": to_time,
             "finished_at": finished_at,
@@ -275,16 +286,17 @@ async def _run_scenario_worker(
     scenario_type = str(scenario.get("type") or "").strip()
 
     signal_id = signal_ctx.get("signal_id")
+    run_id = signal_ctx.get("run_id")
     from_time = signal_ctx.get("from_time")
     to_time = signal_ctx.get("to_time")
 
     log.debug(
-        "BT_SCENARIOS_MAIN: запуск сценарного воркера для scenario_id=%s, "
-        "key=%s, type=%s, signal_id=%s, окно=[%s .. %s]",
+        "BT_SCENARIOS_MAIN: запуск сценарного воркера для scenario_id=%s, key=%s, type=%s, signal_id=%s, run_id=%s, окно=[%s .. %s]",
         scenario_id,
         scenario_key,
         scenario_type,
         signal_id,
+        run_id,
         from_time,
         to_time,
     )
@@ -299,121 +311,26 @@ async def _run_scenario_worker(
         )
         return
 
-    # очистка результатов сценария перед прогоном "с чистого листа"
-    try:
-        cleanup = await _cleanup_scenario_tables(pg, int(scenario_id), int(signal_id))
-        log.info(
-            "BT_SCENARIOS_MAIN: cleanup перед сценарием scenario_id=%s, signal_id=%s — "
-            "deleted_positions=%s, deleted_logs=%s, deleted_daily=%s, deleted_stat=%s, deleted_total=%s",
-            scenario_id,
-            signal_id,
-            cleanup["positions"],
-            cleanup["logs"],
-            cleanup["daily"],
-            cleanup["stat"],
-            cleanup["total"],
-        )
-    except Exception as e:
-        log.error(
-            "BT_SCENARIOS_MAIN: ошибка cleanup перед сценарием scenario_id=%s, signal_id=%s: %s",
-            scenario_id,
-            signal_id,
-            e,
-            exc_info=True,
-        )
-
     try:
         await handler(scenario, signal_ctx, pg, redis)
         log.debug(
-            "BT_SCENARIOS_MAIN: сценарий id=%s (key=%s, type=%s) успешно отработал для signal_id=%s, "
-            "окно=[%s .. %s]",
+            "BT_SCENARIOS_MAIN: сценарий id=%s (key=%s, type=%s) успешно отработал для signal_id=%s, run_id=%s, окно=[%s .. %s]",
             scenario_id,
             scenario_key,
             scenario_type,
             signal_id,
+            run_id,
             from_time,
             to_time,
         )
     except Exception as e:
         log.error(
-            "BT_SCENARIOS_MAIN: ошибка при выполнении сценария id=%s (key=%s, type=%s, signal_id=%s): %s",
+            "BT_SCENARIOS_MAIN: ошибка при выполнении сценария id=%s (key=%s, type=%s, signal_id=%s, run_id=%s): %s",
             scenario_id,
             scenario_key,
             scenario_type,
             signal_id,
+            run_id,
             e,
             exc_info=True,
         )
-
-
-# 🔸 Очистка таблиц сценария перед прогоном (scenario_id + signal_id)
-async def _cleanup_scenario_tables(pg, scenario_id: int, signal_id: int) -> Dict[str, int]:
-    deleted_positions = 0
-    deleted_logs = 0
-    deleted_daily = 0
-    deleted_stat = 0
-
-    async with pg.acquire() as conn:
-        # транзакция очистки
-        async with conn.transaction():
-            res_logs = await conn.execute(
-                """
-                DELETE FROM bt_signals_log l
-                USING bt_signals_values v
-                WHERE l.signal_uuid = v.signal_uuid
-                  AND l.scenario_id = $1
-                  AND v.signal_id = $2
-                """,
-                scenario_id,
-                signal_id,
-            )
-            deleted_logs = _parse_pg_execute_count(res_logs)
-
-            res_pos = await conn.execute(
-                """
-                DELETE FROM bt_scenario_positions
-                WHERE scenario_id = $1
-                  AND signal_id = $2
-                """,
-                scenario_id,
-                signal_id,
-            )
-            deleted_positions = _parse_pg_execute_count(res_pos)
-
-            res_daily = await conn.execute(
-                """
-                DELETE FROM bt_scenario_daily
-                WHERE scenario_id = $1
-                  AND signal_id = $2
-                """,
-                scenario_id,
-                signal_id,
-            )
-            deleted_daily = _parse_pg_execute_count(res_daily)
-
-            res_stat = await conn.execute(
-                """
-                DELETE FROM bt_scenario_stat
-                WHERE scenario_id = $1
-                  AND signal_id = $2
-                """,
-                scenario_id,
-                signal_id,
-            )
-            deleted_stat = _parse_pg_execute_count(res_stat)
-
-    return {
-        "positions": deleted_positions,
-        "logs": deleted_logs,
-        "daily": deleted_daily,
-        "stat": deleted_stat,
-        "total": deleted_positions + deleted_logs + deleted_daily + deleted_stat,
-    }
-
-
-# 🔸 Парсинг результата asyncpg conn.execute вида "DELETE 123"
-def _parse_pg_execute_count(res: Any) -> int:
-    try:
-        return int(str(res).split()[-1])
-    except Exception:
-        return 0

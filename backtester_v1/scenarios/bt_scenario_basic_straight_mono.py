@@ -1,6 +1,5 @@
-# bt_scenario_basic_straight_mono.py — базовый straight-сценарий (mono) для backtester_v1
+# bt_scenario_basic_straight_mono.py — базовый straight-сценарий (mono) с инкрементальной логикой (open/closed + run_id) для backtester_v1
 
-import asyncio
 import logging
 import uuid
 import json
@@ -18,6 +17,9 @@ getcontext().prec = 28
 
 # 🔸 Константы стримов
 BT_SCENARIOS_READY_STREAM = "bt:scenarios:ready"
+
+# 🔸 Комиссия (как в исходной логике)
+COMMISSION_RATE = Decimal("0.0015")  # 0.15% вход+выход
 
 # 🔸 Таймшаги TF (в минутах) для decision_time
 TF_STEP_MINUTES = {
@@ -72,21 +74,53 @@ def _round_price(
     return price
 
 
-# 🔸 Публичная точка входа: backfill для сценария basic_straight_mono по одному окну сигнала
+# 🔸 Публичная точка входа: backfill для сценария basic_straight_mono по одному окну сигнала (run-aware, инкрементально)
 async def run_basic_straight_mono_backfill(
     scenario: Dict[str, Any],
     signal_ctx: Dict[str, Any],
     pg,
     redis,  # оставляем для совместимости сигнатур
 ) -> None:
-    scenario_id = scenario.get("id")
+    scenario_id = int(scenario.get("id") or 0)
     scenario_key = scenario.get("key")
     scenario_type = scenario.get("type")
     params = scenario.get("params") or {}
 
-    signal_id = signal_ctx.get("signal_id")
+    signal_id = int(signal_ctx.get("signal_id") or 0)
+    run_id = signal_ctx.get("run_id")
     from_time = signal_ctx.get("from_time")
     to_time = signal_ctx.get("to_time")
+
+    # условия достаточности
+    if not scenario_id or not signal_id or not isinstance(from_time, datetime) or not isinstance(to_time, datetime):
+        log.error(
+            "BT_SCENARIO_BASIC_MONO: недостаточно данных контекста — scenario_id=%s, signal_id=%s, run_id=%s, from_time=%s, to_time=%s",
+            scenario_id,
+            signal_id,
+            run_id,
+            from_time,
+            to_time,
+        )
+        return
+
+    if run_id is None:
+        log.error(
+            "BT_SCENARIO_BASIC_MONO: отсутствует run_id в signal_ctx для scenario_id=%s, signal_id=%s — сценарий не будет выполнен",
+            scenario_id,
+            signal_id,
+        )
+        return
+
+    try:
+        run_id_i = int(run_id)
+    except Exception:
+        log.error(
+            "BT_SCENARIO_BASIC_MONO: некорректный run_id=%s для scenario_id=%s, signal_id=%s — сценарий не будет выполнен",
+            run_id,
+            scenario_id,
+            signal_id,
+        )
+        return
 
     # базовые параметры сценария
     try:
@@ -100,40 +134,49 @@ async def run_basic_straight_mono_backfill(
         position_limit = Decimal(str(params["position_limit"]["value"]))
     except Exception as e:
         log.error(
-            f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id} — некорректные параметры: {e}",
+            "BT_SCENARIO_BASIC_MONO: сценарий id=%s — некорректные параметры: %s",
+            scenario_id,
+            e,
             exc_info=True,
         )
         return
 
     if direction_mode != "mono":
         log.warning(
-            f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id} ожидает direction='mono', "
-            f"получено '{direction_mode}'"
+            "BT_SCENARIO_BASIC_MONO: сценарий id=%s ожидает direction='mono', получено '%s'",
+            scenario_id,
+            direction_mode,
         )
 
     if sl_type != "percent" or tp_type != "percent":
         log.error(
-            f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id} поддерживает только sl_type/tp_type='percent', "
-            f"получено sl_type='{sl_type}', tp_type='{tp_type}' — сценарий не будет выполнен"
+            "BT_SCENARIO_BASIC_MONO: сценарий id=%s поддерживает только sl_type/tp_type='percent', получено sl_type='%s', tp_type='%s'",
+            scenario_id,
+            sl_type,
+            tp_type,
         )
         return
 
     signal_instance = get_signal_instance(signal_id)
     if not signal_instance:
         log.error(
-            f"BT_SCENARIO_BASIC_MONO: не найден инстанс сигнала id={signal_id} в кеше, сценарий id={scenario_id}"
+            "BT_SCENARIO_BASIC_MONO: не найден инстанс сигнала id=%s в кеше, сценарий id=%s",
+            signal_id,
+            scenario_id,
         )
         return
 
-    timeframe = signal_instance.get("timeframe")
+    timeframe = str(signal_instance.get("timeframe") or "").strip().lower()
     if timeframe not in ("m5", "m15", "h1"):
         log.error(
-            f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
-            f"неподдерживаемый timeframe='{timeframe}'"
+            "BT_SCENARIO_BASIC_MONO: scenario_id=%s, signal_id=%s — неподдерживаемый timeframe='%s'",
+            scenario_id,
+            signal_id,
+            timeframe,
         )
         return
 
-    # условия достаточности: decision_time = entry_time + TF
+    # decision_time = entry_time + TF
     tf_delta = _get_timeframe_timedelta(timeframe)
     if tf_delta <= timedelta(0):
         log.error(
@@ -144,76 +187,88 @@ async def run_basic_straight_mono_backfill(
         )
         return
 
+    # граница для инкрементальной досимуляции open позиций (предыдущий run.to_time)
+    prev_to_time = await _load_previous_run_to_time(pg, signal_id, run_id_i)
+    if prev_to_time is None:
+        prev_to_time = from_time
+
     log.debug(
-        f"BT_SCENARIO_BASIC_MONO: старт обработки сценария id={scenario_id} (key={scenario_key}, type={scenario_type}) "
-        f"для signal_id={signal_id}, TF={timeframe}, окно=[{from_time} .. {to_time}], "
-        f"deposit={deposit}, leverage={leverage}, position_limit={position_limit}, "
-        f"SL={sl_value}% TP={tp_value}%"
+        "BT_SCENARIO_BASIC_MONO: старт сценария id=%s (key=%s, type=%s) для signal_id=%s, run_id=%s, TF=%s, окно=[%s .. %s], prev_to_time=%s",
+        scenario_id,
+        scenario_key,
+        scenario_type,
+        signal_id,
+        run_id_i,
+        timeframe,
+        from_time,
+        to_time,
+        prev_to_time,
     )
 
-    # грузим сигналы для данного signal_id/TF/окна, которые ещё не обрабатывались этим сценарием
-    signals = await _load_signals_for_scenario(pg, scenario_id, signal_id, timeframe, from_time, to_time)
-    if not signals:
-        log.debug(
-            f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
-            f"актуальных сигналов для обработки не найдено"
-        )
-        # всё равно публикуем сообщение о готовности сценария, чтобы цепочка стримов была консистентной
-        finished_at = datetime.utcnow()
-        try:
-            await redis.xadd(
-                BT_SCENARIOS_READY_STREAM,
-                {
-                    "scenario_id": str(scenario_id),
-                    "signal_id": str(signal_id),
-                    "finished_at": finished_at.isoformat(),
-                },
-            )
-            log.debug(
-                f"BT_SCENARIO_BASIC_MONO: опубликовано событие готовности сценария в стрим "
-                f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}, "
-                f"finished_at={finished_at}"
-            )
-        except Exception as e:
-            log.error(
-                f"BT_SCENARIO_BASIC_MONO: не удалось опубликовать событие в стрим "
-                f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}: {e}",
-                exc_info=True,
-            )
-        return
-
-    positions_to_insert: List[Tuple[Any, ...]] = []
-    logs_to_insert: List[Tuple[Any, ...]] = []
     affected_days: Set[date] = set()
 
-    total_signals_processed = 0
-    total_positions_opened = 0
+    total_open_before = 0
+    total_open_closed_now = 0
+    total_open_still_open = 0
+    total_new_signals = 0
+    total_positions_created_open = 0
+    total_positions_created_closed = 0
     total_skipped = 0
-    total_alive = 0
+    total_errors = 0
+
+    # 🔸 1) Досимулируем и закрываем open позиции (если закрылись в новом хвосте)
+    for direction in ("long", "short"):
+        open_positions = await _load_open_positions(pg, scenario_id, signal_id, timeframe, direction)
+        total_open_before += len(open_positions)
+
+        for pos in open_positions:
+            try:
+                closed = await _try_close_open_position(
+                    pg=pg,
+                    pos=pos,
+                    timeframe=timeframe,
+                    direction=direction,
+                    scan_from_time=prev_to_time,
+                    scan_to_time=to_time,
+                    deposit=deposit,
+                    run_id=run_id_i,
+                )
+                if closed is None:
+                    total_open_still_open += 1
+                    continue
+
+                # позиция закрылась
+                affected_days.add(closed["exit_time"].date())
+                total_open_closed_now += 1
+
+            except Exception as e:
+                total_errors += 1
+                log.error(
+                    "BT_SCENARIO_BASIC_MONO: ошибка досимуляции open позиции id=%s: %s",
+                    pos.get("id"),
+                    e,
+                    exc_info=True,
+                )
+
+    # 🔸 2) Обрабатываем новые сигналы (необработанные этим сценарием), открываем позиции и сразу симулируем до текущего to_time
+    signals = await _load_signals_for_scenario(pg, scenario_id, signal_id, timeframe, from_time, to_time)
+    total_new_signals = len(signals)
+
+    if signals:
+        signals.sort(key=lambda s: s["open_time"])
 
     # обрабатываем long и short как две независимые вселенные с одинаковым deposit
-    # и независимыми позициями в разрезе (scenario_id, signal_id, direction)
     for direction in ("long", "short"):
-        # существующие исторические позиции по этому направлению и signal_id
-        existing_positions = await _load_existing_positions(pg, scenario_id, signal_id, timeframe, direction)
-        new_positions: List[Dict[str, Any]] = []
+        # позиции для контроля маржи/активности на момент сигнала (включая open и closed)
+        existing_positions = await _load_positions_for_margin(pg, scenario_id, signal_id, timeframe, direction, from_time, to_time)
+        new_positions_for_margin: List[Dict[str, Any]] = []
 
         # фильтруем сигналы по направлению
         dir_signals = [s for s in signals if s["direction"] == direction]
         if not dir_signals:
             continue
 
-        log.debug(
-            f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id}, direction={direction} — "
-            f"для обработки сигналов={len(dir_signals)}"
-        )
-
-        # сортировка по времени сигнала (open_time)
-        dir_signals.sort(key=lambda s: s["open_time"])
-
         for s_row in dir_signals:
-            total_signals_processed += 1
-
             symbol = s_row["symbol"]
             open_time = s_row["open_time"]
             signal_uuid = s_row["signal_uuid"]
@@ -223,18 +278,11 @@ async def run_basic_straight_mono_backfill(
             decision_time = s_row.get("decision_time") or (open_time + tf_delta)
 
             # активные позиции на момент сигнала (entry_time <= T < exit_time)
-            active_positions = _get_active_positions(existing_positions, new_positions, open_time)
+            active_positions = _get_active_positions(existing_positions, new_positions_for_margin, open_time, to_time)
 
             # тикер уже в позиции по этому направлению?
             if any(p["symbol"] == symbol for p in active_positions):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        f"skipped: ticker already in position (symbol={symbol}, direction={direction})",
-                    )
-                )
+                await _append_log_row(pg, signal_uuid, scenario_id, None, f"skipped: ticker already in position (symbol={symbol}, direction={direction})")
                 total_skipped += 1
                 continue
 
@@ -243,14 +291,7 @@ async def run_basic_straight_mono_backfill(
             free_margin = deposit - used_margin_now
 
             if free_margin <= Decimal("0"):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: no free margin",
-                    )
-                )
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: no free margin")
                 total_skipped += 1
                 continue
 
@@ -258,14 +299,7 @@ async def run_basic_straight_mono_backfill(
             max_margin_per_position = position_limit
             max_margin_for_trade = free_margin if free_margin < max_margin_per_position else max_margin_per_position
             if max_margin_for_trade <= Decimal("0"):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: no per-position margin available",
-                    )
-                )
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: no per-position margin available")
                 total_skipped += 1
                 continue
 
@@ -278,32 +312,13 @@ async def run_basic_straight_mono_backfill(
                     entry_price_val = raw_dict.get("price")
 
                 entry_price = Decimal(str(entry_price_val))
-            except Exception as e:
-                log.error(
-                    f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id}, "
-                    f"symbol={symbol} — ошибка извлечения цены входа из raw_message: {e}",
-                    exc_info=True,
-                )
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: invalid raw_message price",
-                    )
-                )
+            except Exception:
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: invalid raw_message price")
                 total_skipped += 1
                 continue
 
             if entry_price <= Decimal("0"):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: non-positive entry price",
-                    )
-                )
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: non-positive entry price")
                 total_skipped += 1
                 continue
 
@@ -339,47 +354,24 @@ async def run_basic_straight_mono_backfill(
                 except Exception:
                     q_dec = 0
                 quant = Decimal("1").scaleb(-q_dec)
-                qty = qty_raw.quantize(quant, rounding=ROUND_DOWN)
+                entry_qty = qty_raw.quantize(quant, rounding=ROUND_DOWN)
             else:
-                qty = qty_raw
+                entry_qty = qty_raw
 
-            if qty <= Decimal("0"):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: qty <= 0 after rounding",
-                    )
-                )
+            if entry_qty <= Decimal("0"):
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: qty <= 0 after rounding")
                 total_skipped += 1
                 continue
 
-            if qty < min_qty:
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        f"skipped: qty below min_qty (qty={qty}, min_qty={min_qty})",
-                    )
-                )
+            if entry_qty < min_qty:
+                await _append_log_row(pg, signal_uuid, scenario_id, None, f"skipped: qty below min_qty (qty={entry_qty}, min_qty={min_qty})")
                 total_skipped += 1
                 continue
-
-            entry_qty = qty
 
             # notional и маржа
             entry_notional = entry_price * entry_qty
             if entry_notional <= Decimal("0"):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: notional <= 0 after rounding",
-                    )
-                )
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: notional <= 0 after rounding")
                 total_skipped += 1
                 continue
 
@@ -405,20 +397,12 @@ async def run_basic_straight_mono_backfill(
             tp_price = _round_price(tp_price, precision_price, ticksize)
 
             if sl_price <= Decimal("0") or tp_price <= Decimal("0"):
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "skipped: invalid SL/TP price after rounding",
-                    )
-                )
+                await _append_log_row(pg, signal_uuid, scenario_id, None, "skipped: invalid SL/TP price after rounding")
                 total_skipped += 1
                 continue
 
-            # моделируем жизнь сделки ДО to_time:
-            # если TP/SL нет, позиция "жива"
-            sim_result = await _simulate_trade(
+            # симулируем сделку до to_time: если не закрылась — создаём open позицию
+            sim = await _simulate_trade_full(
                 pg=pg,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -432,25 +416,41 @@ async def run_basic_straight_mono_backfill(
                 to_time=to_time,
             )
 
-            if sim_result is None:
-                logs_to_insert.append(
-                    (
-                        signal_uuid,
-                        scenario_id,
-                        None,
-                        "position opened and still alive",
-                    )
+            if sim is None:
+                # создаём open позицию
+                position_uid = uuid.uuid4()
+                await _insert_position_open(
+                    pg=pg,
+                    position_uid=position_uid,
+                    scenario_id=scenario_id,
+                    signal_id=signal_id,
+                    signal_uuid=signal_uuid,
+                    created_run_id=run_id_i,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    direction=direction,
+                    entry_time=open_time,
+                    decision_time=decision_time,
+                    entry_price=entry_price,
+                    entry_qty=entry_qty,
+                    entry_notional=entry_notional,
+                    margin_used=margin_used,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
                 )
-                # для учёта маржи внутри текущего прогона считаем, что она жива до to_time
-                new_positions.append(
+                await _append_log_row(pg, signal_uuid, scenario_id, str(position_uid), "position opened (status=open)")
+                total_positions_created_open += 1
+
+                # для маржи внутри текущего прогона считаем, что позиция активна до to_time
+                new_positions_for_margin.append(
                     {
                         "symbol": symbol,
                         "entry_time": open_time,
-                        "exit_time": to_time,
+                        "exit_time": None,
+                        "status": "open",
                         "margin_used": margin_used,
                     }
                 )
-                total_alive += 1
                 continue
 
             (
@@ -461,129 +461,85 @@ async def run_basic_straight_mono_backfill(
                 duration,
                 max_fav_pct,
                 max_adv_pct,
-            ) = sim_result
+            ) = sim
 
-            # формируем позицию
+            # создаём closed позицию (opened+closed within run)
             position_uid = uuid.uuid4()
-
-            positions_to_insert.append(
-                (
-                    str(position_uid),
-                    scenario_id,
-                    signal_id,
-                    signal_uuid,
-                    symbol,
-                    timeframe,
-                    direction,
-                    open_time,
-                    decision_time,
-                    entry_price,             # цена уже приведена к precision_price/ticksize
-                    entry_qty,               # qty уже приведено к precision_qty
-                    entry_notional,          # деньги обрезаны до 4 знаков
-                    margin_used,             # деньги обрезаны до 4 знаков
-                    sl_price,
-                    tp_price,
-                    exit_time,
-                    exit_price,
-                    exit_reason,
-                    pnl_abs,
-                    duration,
-                    max_fav_pct,             # MFE в процентах от цены входа
-                    max_adv_pct,             # MAE в процентах от цены входа
-                    False,                   # postproc: ещё не обработана постпроцессором
-                )
+            await _insert_position_closed(
+                pg=pg,
+                position_uid=position_uid,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                signal_uuid=signal_uuid,
+                created_run_id=run_id_i,
+                closed_run_id=run_id_i,
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=direction,
+                entry_time=open_time,
+                decision_time=decision_time,
+                entry_price=entry_price,
+                entry_qty=entry_qty,
+                entry_notional=entry_notional,
+                margin_used=margin_used,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                exit_time=exit_time,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                pnl_abs=pnl_abs,
+                duration=duration,
+                max_fav_pct=max_fav_pct,
+                max_adv_pct=max_adv_pct,
             )
+            await _append_log_row(pg, signal_uuid, scenario_id, str(position_uid), "position opened (status=closed)")
+            total_positions_created_closed += 1
 
-            logs_to_insert.append(
-                (
-                    signal_uuid,
-                    scenario_id,
-                    str(position_uid),
-                    "position opened",
-                )
-            )
+            affected_days.add(exit_time.date())
 
-            new_positions.append(
+            # для маржи внутри текущего прогона позиция занята до exit_time
+            new_positions_for_margin.append(
                 {
                     "symbol": symbol,
                     "entry_time": open_time,
                     "exit_time": exit_time,
+                    "status": "closed",
                     "margin_used": margin_used,
                 }
             )
 
-            affected_days.add(open_time.date())
-            total_positions_opened += 1
+    # 🔸 3) Пересчёт daily по дням закрытия (status='closed' + exit_time::date)
+    if affected_days:
+        await _recalc_daily_stats(pg, scenario_id, signal_id, deposit, affected_days)
 
-    # вставляем позиции и логи в БД
-    if positions_to_insert:
-        async with pg.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO bt_scenario_positions (
-                    position_uid,
-                    scenario_id,
-                    signal_id,
-                    signal_uuid,
-                    symbol,
-                    timeframe,
-                    direction,
-                    entry_time,
-                    decision_time,
-                    entry_price,
-                    entry_qty,
-                    entry_notional,
-                    margin_used,
-                    sl_price,
-                    tp_price,
-                    exit_time,
-                    exit_price,
-                    exit_reason,
-                    pnl_abs,
-                    duration,
-                    max_favorable_excursion,
-                    max_adverse_excursion,
-                    postproc,
-                    created_at
-                )
-                VALUES (
-                    $1, $2, $3, $4, $5, $6, $7,
-                    $8, $9, $10, $11, $12, $13, $14, $15,
-                    $16, $17, $18, $19, $20, $21, $22,
-                    $23, now()
-                )
-                """,
-                positions_to_insert,
-            )
-
-    if logs_to_insert:
-        async with pg.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO bt_signals_log (
-                    signal_uuid,
-                    scenario_id,
-                    position_uid,
-                    report,
-                    created_at
-                )
-                VALUES ($1, $2, $3, $4, now())
-                """,
-                logs_to_insert,
-            )
-
-    log.info(
-        f"BT_SCENARIO_BASIC_MONO: сценарий id={scenario_id}, signal_id={signal_id} — "
-        f"обработано сигналов={total_signals_processed}, позиций открыто={total_positions_opened}, "
-        f"пропущено={total_skipped}, живых позиций={total_alive}"
+    # 🔸 4) Пересчёт bt_scenario_stat: all_time + run (по закрытым сделкам)
+    await _recalc_total_stats_all_time_and_run(
+        pg=pg,
+        scenario_id=scenario_id,
+        signal_id=signal_id,
+        deposit=deposit,
+        run_id=run_id_i,
+        run_from=from_time,
+        run_to=to_time,
     )
 
-    # пересчёт суточной статистики и общей статистики по сценарию+сигналу
-    if positions_to_insert:
-        await _recalc_daily_stats(pg, scenario_id, signal_id, deposit, affected_days)
-        await _recalc_total_stats(pg, scenario_id, signal_id, deposit)
+    log.info(
+        "BT_SCENARIO_BASIC_MONO: summary scenario_id=%s, signal_id=%s, run_id=%s — "
+        "open_before=%s, open_closed_now=%s, open_still_open=%s, new_signals=%s, created_open=%s, created_closed=%s, skipped=%s, errors=%s",
+        scenario_id,
+        signal_id,
+        run_id_i,
+        total_open_before,
+        total_open_closed_now,
+        total_open_still_open,
+        total_new_signals,
+        total_positions_created_open,
+        total_positions_created_closed,
+        total_skipped,
+        total_errors,
+    )
 
-    # отправляем уведомление в Redis Stream о завершении обработки сценария
+    # 🔸 5) Событие готовности сценария (run-aware)
     finished_at = datetime.utcnow()
     try:
         await redis.xadd(
@@ -591,23 +547,52 @@ async def run_basic_straight_mono_backfill(
             {
                 "scenario_id": str(scenario_id),
                 "signal_id": str(signal_id),
+                "run_id": str(run_id_i),
                 "finished_at": finished_at.isoformat(),
             },
         )
         log.debug(
-            f"BT_SCENARIO_BASIC_MONO: опубликовано событие готовности сценария в стрим "
-            f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}, "
-            f"finished_at={finished_at}"
+            "BT_SCENARIO_BASIC_MONO: опубликовано событие готовности сценария в стрим '%s' для scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s",
+            BT_SCENARIOS_READY_STREAM,
+            scenario_id,
+            signal_id,
+            run_id_i,
+            finished_at,
         )
     except Exception as e:
         log.error(
-            f"BT_SCENARIO_BASIC_MONO: не удалось опубликовать событие в стрим "
-            f"'{BT_SCENARIOS_READY_STREAM}' для scenario_id={scenario_id}, signal_id={signal_id}: {e}",
+            "BT_SCENARIO_BASIC_MONO: не удалось опубликовать событие в стрим '%s' для scenario_id=%s, signal_id=%s, run_id=%s: %s",
+            BT_SCENARIOS_READY_STREAM,
+            scenario_id,
+            signal_id,
+            run_id_i,
+            e,
             exc_info=True,
         )
 
 
-# 🔸 Загрузка сигналов для сценария (без уже обработанных)
+# 🔸 Получить to_time предыдущего успешного run для данного signal_id
+async def _load_previous_run_to_time(pg, signal_id: int, run_id: int) -> Optional[datetime]:
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT to_time
+            FROM bt_signal_backfill_runs
+            WHERE signal_id = $1
+              AND id < $2
+              AND status = 'success'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            signal_id,
+            run_id,
+        )
+    if not row:
+        return None
+    return row["to_time"]
+
+
+# 🔸 Загрузка сигналов для сценария (только необработанные этим сценарием)
 async def _load_signals_for_scenario(
     pg,
     scenario_id: int,
@@ -659,14 +644,19 @@ async def _load_signals_for_scenario(
         )
 
     log.debug(
-        f"BT_SCENARIO_BASIC_MONO: загружено сигналов для scenario_id={scenario_id}, "
-        f"signal_id={signal_id}, TF={timeframe} в окне [{from_time} .. {to_time}]: {len(signals)}"
+        "BT_SCENARIO_BASIC_MONO: загружено новых сигналов для scenario_id=%s, signal_id=%s, TF=%s в окне [%s .. %s]: %s",
+        scenario_id,
+        signal_id,
+        timeframe,
+        from_time,
+        to_time,
+        len(signals),
     )
     return signals
 
 
-# 🔸 Загрузка всех существующих позиций сценария+сигнала по TF/направлению
-async def _load_existing_positions(
+# 🔸 Загрузка open позиций (для досимуляции)
+async def _load_open_positions(
     pg,
     scenario_id: int,
     signal_id: int,
@@ -676,12 +666,23 @@ async def _load_existing_positions(
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT symbol, entry_time, exit_time, margin_used
+            SELECT
+                id,
+                position_uid,
+                symbol,
+                entry_time,
+                decision_time,
+                entry_price,
+                entry_qty,
+                entry_notional,
+                sl_price,
+                tp_price
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND timeframe   = $3
               AND direction   = $4
+              AND status      = 'open'
             ORDER BY entry_time
             """,
             scenario_id,
@@ -690,38 +691,98 @@ async def _load_existing_positions(
             direction,
         )
 
-    positions: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
-        positions.append(
+        out.append(
+            {
+                "id": r["id"],
+                "position_uid": r["position_uid"],
+                "symbol": r["symbol"],
+                "entry_time": r["entry_time"],
+                "decision_time": r["decision_time"],
+                "entry_price": Decimal(str(r["entry_price"])),
+                "entry_qty": Decimal(str(r["entry_qty"])),
+                "entry_notional": Decimal(str(r["entry_notional"])),
+                "sl_price": Decimal(str(r["sl_price"])),
+                "tp_price": Decimal(str(r["tp_price"])),
+            }
+        )
+    return out
+
+
+# 🔸 Загрузка позиций для расчёта маржи/активности в рамках окна
+async def _load_positions_for_margin(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    timeframe: str,
+    direction: str,
+    from_time: datetime,
+    to_time: datetime,
+) -> List[Dict[str, Any]]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                symbol,
+                entry_time,
+                exit_time,
+                status,
+                margin_used
+            FROM bt_scenario_positions
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND timeframe   = $3
+              AND direction   = $4
+              AND entry_time <= $5
+              AND (status = 'open' OR exit_time >= $6)
+            ORDER BY entry_time
+            """,
+            scenario_id,
+            signal_id,
+            timeframe,
+            direction,
+            to_time,
+            from_time,
+        )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
             {
                 "symbol": r["symbol"],
                 "entry_time": r["entry_time"],
                 "exit_time": r["exit_time"],
+                "status": r["status"],
                 "margin_used": Decimal(str(r["margin_used"])),
             }
         )
-
-    log.debug(
-        f"BT_SCENARIO_BASIC_MONO: загружены существующие позиции для scenario_id={scenario_id}, "
-        f"signal_id={signal_id}, TF={timeframe}, direction={direction}: позиций={len(positions)}"
-    )
-    return positions
+    return out
 
 
-# 🔸 Получение активных позиций на момент T (entry_time <= T < exit_time)
+# 🔸 Получение активных позиций на момент T (entry_time <= T < exit_time); open считаем активными до now_to_time
 def _get_active_positions(
     existing_positions: List[Dict[str, Any]],
     new_positions: List[Dict[str, Any]],
     current_time: datetime,
+    now_to_time: datetime,
 ) -> List[Dict[str, Any]]:
     active: List[Dict[str, Any]] = []
 
+    def _is_active(p: Dict[str, Any]) -> bool:
+        et = p["entry_time"]
+        xt = p.get("exit_time")
+        st = str(p.get("status") or "")
+        if st == "open" or xt is None:
+            return et <= current_time < now_to_time
+        return et <= current_time < xt
+
     for p in existing_positions:
-        if p["entry_time"] <= current_time < p["exit_time"]:
+        if _is_active(p):
             active.append(p)
 
     for p in new_positions:
-        if p["entry_time"] <= current_time < p["exit_time"]:
+        if _is_active(p):
             active.append(p)
 
     return active
@@ -744,8 +805,166 @@ def _calc_sl_tp_percent(
     return sl_price, tp_price
 
 
-# 🔸 Симуляция сделки: TP/SL + PnL, duration, MFE/MAE (в процентах от цены входа)
-async def _simulate_trade(
+# 🔸 Определение таблицы OHLCV по TF
+def _ohlcv_table_for_timeframe(timeframe: str) -> Optional[str]:
+    if timeframe == "m5":
+        return "ohlcv_bb_m5"
+    if timeframe == "m15":
+        return "ohlcv_bb_m15"
+    if timeframe == "h1":
+        return "ohlcv_bb_h1"
+    return None
+
+
+# 🔸 Найти закрытие сделки (TP/SL) в диапазоне (scan_from .. scan_to]
+async def _find_exit_in_range(
+    pg,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    entry_price: Decimal,
+    sl_price: Decimal,
+    tp_price: Decimal,
+    scan_from: datetime,
+    scan_to: datetime,
+) -> Optional[Tuple[datetime, Decimal, str]]:
+    table_name = _ohlcv_table_for_timeframe(timeframe)
+    if not table_name:
+        return None
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT open_time, high, low
+            FROM {table_name}
+            WHERE symbol = $1
+              AND open_time > $2
+              AND open_time <= $3
+            ORDER BY open_time
+            """,
+            symbol,
+            scan_from,
+            scan_to,
+        )
+
+    if not rows:
+        return None
+
+    for r in rows:
+        otime = r["open_time"]
+        high = Decimal(str(r["high"]))
+        low = Decimal(str(r["low"]))
+
+        # правила совпадают с исходной логикой
+        if direction == "long":
+            touched_sl = low <= sl_price
+            touched_tp = high >= tp_price
+
+            if touched_sl and touched_tp:
+                return otime, sl_price, "sl_after_tp"
+            if touched_sl:
+                return otime, sl_price, "full_sl_hit"
+            if touched_tp:
+                return otime, tp_price, "full_tp_hit"
+
+        else:
+            touched_sl = high >= sl_price
+            touched_tp = low <= tp_price
+
+            if touched_sl and touched_tp:
+                return otime, sl_price, "sl_after_tp"
+            if touched_sl:
+                return otime, sl_price, "full_sl_hit"
+            if touched_tp:
+                return otime, tp_price, "full_tp_hit"
+
+    return None
+
+
+# 🔸 Посчитать PnL/MFE/MAE/duration для уже известного закрытия (полный диапазон от entry_time до exit_time)
+async def _compute_closed_trade_stats(
+    pg,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    entry_time: datetime,
+    entry_price: Decimal,
+    entry_qty: Decimal,
+    entry_notional: Decimal,
+    sl_price: Decimal,
+    tp_price: Decimal,
+    exit_time: datetime,
+    exit_price: Decimal,
+    exit_reason: str,
+) -> Tuple[Decimal, timedelta, Decimal, Decimal]:
+    table_name = _ohlcv_table_for_timeframe(timeframe)
+    if not table_name:
+        # fallback
+        raw_pnl = Decimal("0")
+        commission = _q_money(entry_notional * COMMISSION_RATE)
+        pnl_abs = _q_money(raw_pnl - commission)
+        duration = exit_time - entry_time
+        return pnl_abs, duration, Decimal("0"), Decimal("0")
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT open_time, high, low
+            FROM {table_name}
+            WHERE symbol = $1
+              AND open_time > $2
+              AND open_time <= $3
+            ORDER BY open_time
+            """,
+            symbol,
+            entry_time,
+            exit_time,
+        )
+
+    max_fav = Decimal("0")
+    max_adv = Decimal("0")
+
+    for r in rows:
+        high = Decimal(str(r["high"]))
+        low = Decimal(str(r["low"]))
+
+        if direction == "long":
+            fav_move = high - entry_price
+            adv_move = low - entry_price
+        else:
+            fav_move = entry_price - low
+            adv_move = entry_price - high
+
+        if fav_move > max_fav:
+            max_fav = fav_move
+        if adv_move < max_adv:
+            max_adv = adv_move
+
+    # pnl
+    if direction == "long":
+        raw_pnl = (exit_price - entry_price) * entry_qty
+    else:
+        raw_pnl = (entry_price - exit_price) * entry_qty
+
+    raw_pnl = _q_money(raw_pnl)
+
+    commission = _q_money(entry_notional * COMMISSION_RATE)
+    pnl_abs = _q_money(raw_pnl - commission)
+
+    duration = exit_time - entry_time
+
+    if entry_price > Decimal("0"):
+        max_fav_pct = _q_money((max_fav / entry_price) * Decimal("100"))
+        max_adv_pct = _q_money((max_adv / entry_price) * Decimal("100"))
+    else:
+        max_fav_pct = Decimal("0")
+        max_adv_pct = Decimal("0")
+
+    return pnl_abs, duration, max_fav_pct, max_adv_pct
+
+
+# 🔸 Полная симуляция сделки до to_time (для новых сигналов)
+async def _simulate_trade_full(
     pg,
     symbol: str,
     timeframe: str,
@@ -758,137 +977,333 @@ async def _simulate_trade(
     tp_price: Decimal,
     to_time: datetime,
 ) -> Optional[Tuple[datetime, Decimal, str, Decimal, timedelta, Decimal, Decimal]]:
-    table_name = _ohlcv_table_for_timeframe(timeframe)
-    if not table_name:
+    # ищем закрытие с entry_time
+    exit_info = await _find_exit_in_range(
+        pg=pg,
+        symbol=symbol,
+        timeframe=timeframe,
+        direction=direction,
+        entry_price=entry_price,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        scan_from=entry_time,
+        scan_to=to_time,
+    )
+
+    if exit_info is None:
         return None
 
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT open_time, high, low, close
-            FROM {table_name}
-            WHERE symbol = $1
-              AND open_time > $2
-              AND open_time <= $3
-            ORDER BY open_time
-            """,
-            symbol,
-            entry_time,
-            to_time,
-        )
+    exit_time, exit_price, exit_reason = exit_info
 
-    if not rows:
-        return None
-
-    max_fav = Decimal("0")
-    max_adv = Decimal("0")
-
-    exit_time: Optional[datetime] = None
-    exit_price: Optional[Decimal] = None
-    exit_reason: Optional[str] = None
-
-    for r in rows:
-        otime = r["open_time"]
-        high = Decimal(str(r["high"]))
-        low = Decimal(str(r["low"]))
-        close = Decimal(str(r["close"]))
-
-        if direction == "long":
-            fav_move = high - entry_price
-            adv_move = low - entry_price
-            if fav_move > max_fav:
-                max_fav = fav_move
-            if adv_move < max_adv:
-                max_adv = adv_move
-
-            touched_sl = low <= sl_price
-            touched_tp = high >= tp_price
-
-            if touched_sl and touched_tp:
-                exit_time = otime
-                exit_price = sl_price
-                exit_reason = "sl_after_tp"
-                break
-            elif touched_sl:
-                exit_time = otime
-                exit_price = sl_price
-                exit_reason = "full_sl_hit"
-                break
-            elif touched_tp:
-                exit_time = otime
-                exit_price = tp_price
-                exit_reason = "full_tp_hit"
-                break
-        else:
-            fav_move = entry_price - low
-            adv_move = entry_price - high
-            if fav_move > max_fav:
-                max_fav = fav_move
-            if adv_move < max_adv:
-                max_adv = adv_move
-
-            touched_sl = high >= sl_price
-            touched_tp = low <= tp_price
-
-            if touched_sl and touched_tp:
-                exit_time = otime
-                exit_price = sl_price
-                exit_reason = "sl_after_tp"
-                break
-            elif touched_sl:
-                exit_time = otime
-                exit_price = sl_price
-                exit_reason = "full_sl_hit"
-                break
-            elif touched_tp:
-                exit_time = otime
-                exit_price = tp_price
-                exit_reason = "full_tp_hit"
-                break
-
-    if exit_time is None or exit_price is None or exit_reason is None:
-        return None
-
-    if direction == "long":
-        raw_pnl = (exit_price - entry_price) * entry_qty
-    else:
-        raw_pnl = (entry_price - exit_price) * entry_qty
-
-    raw_pnl = _q_money(raw_pnl)
-
-    commission_rate = Decimal("0.0015")  # 0.15% вход+выход
-    commission = _q_money(entry_notional * commission_rate)
-
-    pnl_abs = raw_pnl - commission
-    pnl_abs = _q_money(pnl_abs)
-
-    duration = exit_time - entry_time
-
-    if entry_price > Decimal("0"):
-        max_fav_pct = (max_fav / entry_price) * Decimal("100")
-        max_adv_pct = (max_adv / entry_price) * Decimal("100")
-    else:
-        max_fav_pct = Decimal("0")
-        max_adv_pct = Decimal("0")
-
-    max_fav_pct = _q_money(max_fav_pct)
-    max_adv_pct = _q_money(max_adv_pct)
+    pnl_abs, duration, max_fav_pct, max_adv_pct = await _compute_closed_trade_stats(
+        pg=pg,
+        symbol=symbol,
+        timeframe=timeframe,
+        direction=direction,
+        entry_time=entry_time,
+        entry_price=entry_price,
+        entry_qty=entry_qty,
+        entry_notional=entry_notional,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        exit_time=exit_time,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+    )
 
     return exit_time, exit_price, exit_reason, pnl_abs, duration, max_fav_pct, max_adv_pct
 
 
-# 🔸 Определение таблицы OHLCV по TF
-def _ohlcv_table_for_timeframe(timeframe: str) -> Optional[str]:
-    if timeframe == "m5":
-        return "ohlcv_bb_m5"
-    if timeframe == "m15":
-        return "ohlcv_bb_m15"
-    if timeframe == "h1":
-        return "ohlcv_bb_h1"
-    return None
+# 🔸 Попытка закрыть open позицию (сканируем только хвост; при закрытии считаем полные метрики и обновляем БД)
+async def _try_close_open_position(
+    pg,
+    pos: Dict[str, Any],
+    timeframe: str,
+    direction: str,
+    scan_from_time: datetime,
+    scan_to_time: datetime,
+    deposit: Decimal,
+    run_id: int,
+) -> Optional[Dict[str, Any]]:
+    pos_id = int(pos["id"])
+    symbol = str(pos["symbol"])
+    entry_time: datetime = pos["entry_time"]
+
+    entry_price: Decimal = pos["entry_price"]
+    entry_qty: Decimal = pos["entry_qty"]
+    entry_notional: Decimal = pos["entry_notional"]
+    sl_price: Decimal = pos["sl_price"]
+    tp_price: Decimal = pos["tp_price"]
+
+    # scan_from_time не должен быть раньше entry_time
+    if scan_from_time < entry_time:
+        scan_from_time = entry_time
+
+    # ищем закрытие только в хвосте
+    exit_info = await _find_exit_in_range(
+        pg=pg,
+        symbol=symbol,
+        timeframe=timeframe,
+        direction=direction,
+        entry_price=entry_price,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        scan_from=scan_from_time,
+        scan_to=scan_to_time,
+    )
+
+    if exit_info is None:
+        return None
+
+    exit_time, exit_price, exit_reason = exit_info
+
+    pnl_abs, duration, max_fav_pct, max_adv_pct = await _compute_closed_trade_stats(
+        pg=pg,
+        symbol=symbol,
+        timeframe=timeframe,
+        direction=direction,
+        entry_time=entry_time,
+        entry_price=entry_price,
+        entry_qty=entry_qty,
+        entry_notional=entry_notional,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        exit_time=exit_time,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+    )
+
+    # обновляем позицию → closed
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE bt_scenario_positions
+            SET status = 'closed',
+                closed_run_id = $2,
+                exit_time = $3,
+                exit_price = $4,
+                exit_reason = $5,
+                pnl_abs = $6,
+                duration = $7,
+                max_favorable_excursion = $8,
+                max_adverse_excursion = $9
+            WHERE id = $1
+            """,
+            pos_id,
+            int(run_id),
+            exit_time,
+            exit_price,
+            exit_reason,
+            pnl_abs,
+            duration,
+            max_fav_pct,
+            max_adv_pct,
+        )
+
+    return {
+        "id": pos_id,
+        "symbol": symbol,
+        "exit_time": exit_time,
+        "exit_reason": exit_reason,
+        "pnl_abs": pnl_abs,
+    }
 
 
-# 🔸 Пересчёт суточной статистики по затронутым дням (per scenario_id + signal_id + direction)
+# 🔸 Вставка open позиции
+async def _insert_position_open(
+    pg,
+    position_uid: uuid.UUID,
+    scenario_id: int,
+    signal_id: int,
+    signal_uuid: uuid.UUID,
+    created_run_id: int,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    entry_time: datetime,
+    decision_time: datetime,
+    entry_price: Decimal,
+    entry_qty: Decimal,
+    entry_notional: Decimal,
+    margin_used: Decimal,
+    sl_price: Decimal,
+    tp_price: Decimal,
+) -> None:
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bt_scenario_positions (
+                position_uid,
+                scenario_id,
+                signal_id,
+                signal_uuid,
+                created_run_id,
+                symbol,
+                timeframe,
+                direction,
+                entry_time,
+                decision_time,
+                entry_price,
+                entry_qty,
+                entry_notional,
+                margin_used,
+                sl_price,
+                tp_price,
+                status,
+                postproc,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8,
+                $9, $10,
+                $11, $12, $13, $14, $15, $16,
+                'open',
+                false,
+                now()
+            )
+            """,
+            str(position_uid),
+            scenario_id,
+            signal_id,
+            signal_uuid,
+            created_run_id,
+            symbol,
+            timeframe,
+            direction,
+            entry_time,
+            decision_time,
+            entry_price,
+            entry_qty,
+            entry_notional,
+            margin_used,
+            sl_price,
+            tp_price,
+        )
+
+
+# 🔸 Вставка closed позиции
+async def _insert_position_closed(
+    pg,
+    position_uid: uuid.UUID,
+    scenario_id: int,
+    signal_id: int,
+    signal_uuid: uuid.UUID,
+    created_run_id: int,
+    closed_run_id: int,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    entry_time: datetime,
+    decision_time: datetime,
+    entry_price: Decimal,
+    entry_qty: Decimal,
+    entry_notional: Decimal,
+    margin_used: Decimal,
+    sl_price: Decimal,
+    tp_price: Decimal,
+    exit_time: datetime,
+    exit_price: Decimal,
+    exit_reason: str,
+    pnl_abs: Decimal,
+    duration: timedelta,
+    max_fav_pct: Decimal,
+    max_adv_pct: Decimal,
+) -> None:
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bt_scenario_positions (
+                position_uid,
+                scenario_id,
+                signal_id,
+                signal_uuid,
+                created_run_id,
+                closed_run_id,
+                symbol,
+                timeframe,
+                direction,
+                entry_time,
+                decision_time,
+                entry_price,
+                entry_qty,
+                entry_notional,
+                margin_used,
+                sl_price,
+                tp_price,
+                status,
+                exit_time,
+                exit_price,
+                exit_reason,
+                pnl_abs,
+                duration,
+                max_favorable_excursion,
+                max_adverse_excursion,
+                postproc,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9,
+                $10, $11,
+                $12, $13, $14, $15, $16, $17,
+                'closed',
+                $18, $19, $20,
+                $21, $22, $23, $24,
+                false,
+                now()
+            )
+            """,
+            str(position_uid),
+            scenario_id,
+            signal_id,
+            signal_uuid,
+            created_run_id,
+            closed_run_id,
+            symbol,
+            timeframe,
+            direction,
+            entry_time,
+            decision_time,
+            entry_price,
+            entry_qty,
+            entry_notional,
+            margin_used,
+            sl_price,
+            tp_price,
+            exit_time,
+            exit_price,
+            exit_reason,
+            pnl_abs,
+            duration,
+            max_fav_pct,
+            max_adv_pct,
+        )
+
+
+# 🔸 Запись строки в bt_signals_log (маркер обработки сигнала сценарием)
+async def _append_log_row(
+    pg,
+    signal_uuid: uuid.UUID,
+    scenario_id: int,
+    position_uid: Optional[str],
+    report: str,
+) -> None:
+    async with pg.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bt_signals_log (signal_uuid, scenario_id, position_uid, report, created_at)
+            VALUES ($1, $2, $3, $4, now())
+            ON CONFLICT (scenario_id, signal_uuid) DO NOTHING
+            """,
+            signal_uuid,
+            scenario_id,
+            position_uid,
+            report,
+        )
+
+
+# 🔸 Пересчёт суточной статистики по затронутым дням (day = exit_time::date, только closed)
 async def _recalc_daily_stats(
     pg,
     scenario_id: int,
@@ -913,7 +1328,8 @@ async def _recalc_daily_stats(
                     FROM bt_scenario_positions
                     WHERE scenario_id = $1
                       AND signal_id   = $2
-                      AND entry_time::date = $3
+                      AND status      = 'closed'
+                      AND exit_time::date = $3
                       AND direction   = $4
                     """,
                     scenario_id,
@@ -922,20 +1338,16 @@ async def _recalc_daily_stats(
                     direction,
                 )
 
-                if not row or row["trades"] == 0:
+                trades = int(row["trades"] or 0) if row else 0
+                if trades <= 0:
                     continue
 
-                trades = row["trades"]
-                wins = row["wins"]
+                wins = int(row["wins"] or 0)
                 pnl_abs_total = Decimal(str(row["pnl_abs_total"]))
                 mfe_avg = Decimal(str(row["mfe_avg"]))
                 mae_avg = Decimal(str(row["mae_avg"]))
 
-                if trades > 0:
-                    winrate = _q_money(Decimal(wins) / Decimal(trades))
-                else:
-                    winrate = Decimal("0")
-
+                winrate = _q_money(Decimal(wins) / Decimal(trades)) if trades > 0 else Decimal("0")
                 roi = _q_money(pnl_abs_total / deposit) if deposit != 0 else Decimal("0")
 
                 await conn.execute(
@@ -983,22 +1395,21 @@ async def _recalc_daily_stats(
                     _q_money(mae_avg),
                 )
 
-    log.debug(
-        f"BT_SCENARIO_BASIC_MONO: пересчитана суточная статистика для scenario_id={scenario_id}, "
-        f"signal_id={signal_id}, дней={len(days)}"
-    )
 
-
-# 🔸 Пересчёт общей статистики по сценарию и сигналу
-async def _recalc_total_stats(
+# 🔸 Пересчёт bt_scenario_stat: all_time + run (только закрытые сделки)
+async def _recalc_total_stats_all_time_and_run(
     pg,
     scenario_id: int,
     signal_id: int,
     deposit: Decimal,
+    run_id: int,
+    run_from: datetime,
+    run_to: datetime,
 ) -> None:
     async with pg.acquire() as conn:
         for direction in ("long", "short"):
-            row = await conn.fetchrow(
+            # run-stat: закрыто в этом run (closed_run_id=run_id)
+            row_run = await conn.fetchrow(
                 """
                 SELECT
                     COUNT(*)                                         AS trades,
@@ -1007,30 +1418,26 @@ async def _recalc_total_stats(
                     COALESCE(AVG(max_favorable_excursion), 0)        AS mfe_avg,
                     COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg
                 FROM bt_scenario_positions
-                WHERE scenario_id = $1
-                  AND signal_id   = $2
-                  AND direction   = $3
+                WHERE scenario_id   = $1
+                  AND signal_id     = $2
+                  AND direction     = $3
+                  AND status        = 'closed'
+                  AND closed_run_id = $4
                 """,
                 scenario_id,
                 signal_id,
                 direction,
+                run_id,
             )
 
-            if not row or row["trades"] == 0:
-                continue
+            trades_run = int(row_run["trades"] or 0) if row_run else 0
+            wins_run = int(row_run["wins"] or 0) if row_run else 0
+            pnl_run = Decimal(str(row_run["pnl_abs_total"])) if row_run else Decimal("0")
+            mfe_run = Decimal(str(row_run["mfe_avg"])) if row_run else Decimal("0")
+            mae_run = Decimal(str(row_run["mae_avg"])) if row_run else Decimal("0")
 
-            trades = row["trades"]
-            wins = row["wins"]
-            pnl_abs_total = Decimal(str(row["pnl_abs_total"]))
-            mfe_avg = Decimal(str(row["mfe_avg"]))
-            mae_avg = Decimal(str(row["mae_avg"]))
-
-            if trades > 0:
-                winrate = _q_money(Decimal(wins) / Decimal(trades))
-            else:
-                winrate = Decimal("0")
-
-            roi = _q_money(pnl_abs_total / deposit) if deposit != 0 else Decimal("0")
+            winrate_run = _q_money(Decimal(wins_run) / Decimal(trades_run)) if trades_run > 0 else Decimal("0")
+            roi_run = _q_money(pnl_run / deposit) if deposit != 0 else Decimal("0")
 
             await conn.execute(
                 """
@@ -1038,6 +1445,12 @@ async def _recalc_total_stats(
                     scenario_id,
                     signal_id,
                     direction,
+                    stat_kind,
+                    run_id,
+                    window_from,
+                    window_to,
+                    first_run_id,
+                    last_run_id,
                     trades,
                     pnl_abs,
                     winrate,
@@ -1049,33 +1462,160 @@ async def _recalc_total_stats(
                 )
                 VALUES (
                     $1, $2, $3,
-                    $4, $5, $6, $7,
-                    $8, $9,
+                    'run',
+                    $4,
+                    $5,
+                    $6,
+                    $4,
+                    $4,
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    $11,
+                    $12,
                     NULL,
                     now()
                 )
-                ON CONFLICT (scenario_id, signal_id, direction) DO UPDATE
+                ON CONFLICT (scenario_id, signal_id, direction, stat_kind) DO UPDATE
                 SET
+                    run_id                      = EXCLUDED.run_id,
+                    window_from                 = EXCLUDED.window_from,
+                    window_to                   = EXCLUDED.window_to,
+                    first_run_id                = EXCLUDED.first_run_id,
+                    last_run_id                 = EXCLUDED.last_run_id,
                     trades                      = EXCLUDED.trades,
                     pnl_abs                     = EXCLUDED.pnl_abs,
                     winrate                     = EXCLUDED.winrate,
                     roi                         = EXCLUDED.roi,
                     max_favorable_excursion_avg = EXCLUDED.max_favorable_excursion_avg,
                     max_adverse_excursion_avg   = EXCLUDED.max_adverse_excursion_avg,
+                    raw_stat                    = EXCLUDED.raw_stat,
                     updated_at                  = now()
                 """,
                 scenario_id,
                 signal_id,
                 direction,
-                trades,
-                _q_money(pnl_abs_total),
-                winrate,
-                roi,
-                _q_money(mfe_avg),
-                _q_money(mae_avg),
+                run_id,
+                run_from,
+                run_to,
+                trades_run,
+                _q_money(pnl_run),
+                winrate_run,
+                roi_run,
+                _q_money(mfe_run),
+                _q_money(mae_run),
             )
 
-    log.debug(
-        f"BT_SCENARIO_BASIC_MONO: пересчитана итоговая статистика для scenario_id={scenario_id}, "
-        f"signal_id={signal_id}"
-    )
+            # all-time: все закрытые
+            row_all = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*)                                         AS trades,
+                    COUNT(*) FILTER (WHERE pnl_abs > 0)              AS wins,
+                    COALESCE(SUM(pnl_abs), 0)                        AS pnl_abs_total,
+                    COALESCE(AVG(max_favorable_excursion), 0)        AS mfe_avg,
+                    COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg,
+                    COALESCE(MIN(created_run_id), $4)                AS first_run_id
+                FROM bt_scenario_positions
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                  AND direction   = $3
+                  AND status      = 'closed'
+                """,
+                scenario_id,
+                signal_id,
+                direction,
+                run_id,
+            )
+
+            trades_all = int(row_all["trades"] or 0) if row_all else 0
+            wins_all = int(row_all["wins"] or 0) if row_all else 0
+            pnl_all = Decimal(str(row_all["pnl_abs_total"])) if row_all else Decimal("0")
+            mfe_all = Decimal(str(row_all["mfe_avg"])) if row_all else Decimal("0")
+            mae_all = Decimal(str(row_all["mae_avg"])) if row_all else Decimal("0")
+            first_run_id = int(row_all["first_run_id"] or run_id) if row_all else run_id
+
+            # window_from берём по первому run_id (если не найден — используем run_from)
+            first_bounds = await conn.fetchrow(
+                """
+                SELECT from_time
+                FROM bt_signal_backfill_runs
+                WHERE id = $1
+                """,
+                first_run_id,
+            )
+            all_from = first_bounds["from_time"] if first_bounds and first_bounds["from_time"] is not None else run_from
+            all_to = run_to
+
+            winrate_all = _q_money(Decimal(wins_all) / Decimal(trades_all)) if trades_all > 0 else Decimal("0")
+            roi_all = _q_money(pnl_all / deposit) if deposit != 0 else Decimal("0")
+
+            await conn.execute(
+                """
+                INSERT INTO bt_scenario_stat (
+                    scenario_id,
+                    signal_id,
+                    direction,
+                    stat_kind,
+                    run_id,
+                    window_from,
+                    window_to,
+                    first_run_id,
+                    last_run_id,
+                    trades,
+                    pnl_abs,
+                    winrate,
+                    roi,
+                    max_favorable_excursion_avg,
+                    max_adverse_excursion_avg,
+                    raw_stat,
+                    created_at
+                )
+                VALUES (
+                    $1, $2, $3,
+                    'all_time',
+                    NULL,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    $11,
+                    $12,
+                    $13,
+                    NULL,
+                    now()
+                )
+                ON CONFLICT (scenario_id, signal_id, direction, stat_kind) DO UPDATE
+                SET
+                    run_id                      = EXCLUDED.run_id,
+                    window_from                 = EXCLUDED.window_from,
+                    window_to                   = EXCLUDED.window_to,
+                    first_run_id                = EXCLUDED.first_run_id,
+                    last_run_id                 = EXCLUDED.last_run_id,
+                    trades                      = EXCLUDED.trades,
+                    pnl_abs                     = EXCLUDED.pnl_abs,
+                    winrate                     = EXCLUDED.winrate,
+                    roi                         = EXCLUDED.roi,
+                    max_favorable_excursion_avg = EXCLUDED.max_favorable_excursion_avg,
+                    max_adverse_excursion_avg   = EXCLUDED.max_adverse_excursion_avg,
+                    raw_stat                    = EXCLUDED.raw_stat,
+                    updated_at                  = now()
+                """,
+                scenario_id,
+                signal_id,
+                direction,
+                all_from,
+                all_to,
+                first_run_id,
+                run_id,
+                trades_all,
+                _q_money(pnl_all),
+                winrate_all,
+                roi_all,
+                _q_money(mfe_all),
+                _q_money(mae_all),
+            )

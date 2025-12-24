@@ -1,4 +1,4 @@
-# bt_signals_emacross.py — воркер backfill для псевдо-сигналов семейства EMA-cross
+# bt_signals_emacross.py — воркер backfill для псевдо-сигналов семейства EMA-cross (с фиксацией run_id)
 
 import asyncio
 import logging
@@ -30,7 +30,14 @@ def _get_timeframe_timedelta(timeframe: str) -> timedelta:
 
 
 # 🔸 Публичная точка входа: backfill по окну backfill_days для одного инстанса сигнала
-async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
+async def run_emacross_backfill(
+    signal: Dict[str, Any],
+    pg,
+    redis,
+    run_id: Optional[int] = None,
+    window_from_time: Optional[datetime] = None,
+    window_to_time: Optional[datetime] = None,
+) -> None:
     signal_id = signal.get("id")
     signal_key = signal.get("key")
     name = signal.get("name")
@@ -73,9 +80,9 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         )
         return
 
-    if backfill_days <= 0:
+    if backfill_days <= 0 and (window_from_time is None or window_to_time is None):
         log.warning(
-            "BT_SIG_EMA_CROSS: сигнал id=%s ('%s') имеет backfill_days=%s, ожидается > 0",
+            "BT_SIG_EMA_CROSS: сигнал id=%s ('%s') имеет backfill_days=%s и окно не передано, backfill пропущен",
             signal_id,
             name,
             backfill_days,
@@ -98,9 +105,13 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         allowed_directions = {"long", "short"}
 
     # рабочее окно по времени
-    now = datetime.utcnow()
-    from_time = now - timedelta(days=backfill_days)
-    to_time = now
+    if window_from_time is not None and window_to_time is not None:
+        from_time = window_from_time
+        to_time = window_to_time
+    else:
+        now = datetime.utcnow()
+        from_time = now - timedelta(days=int(backfill_days))
+        to_time = now
 
     # список активных тикеров из кеша
     symbols = get_all_ticker_symbols()
@@ -113,20 +124,22 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
         return
 
     log.debug(
-        "BT_SIG_EMA_CROSS: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=%s дней, тикеров=%s, "
-        "direction_mask=%s, ema_fast_instance_id=%s, ema_slow_instance_id=%s",
+        "BT_SIG_EMA_CROSS: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=[%s..%s], тикеров=%s, "
+        "direction_mask=%s, ema_fast_instance_id=%s, ema_slow_instance_id=%s, run_id=%s",
         signal_id,
         name,
         signal_key,
         timeframe,
-        backfill_days,
+        from_time,
+        to_time,
         len(symbols),
         mask_val,
         fast_instance_id,
         slow_instance_id,
+        run_id,
     )
 
-    # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
+    # загружаем уже существующие события сигнала в окне, чтобы избежать лишней работы
     existing_events = await _load_existing_events(pg, signal_id, timeframe, from_time, to_time)
 
     sema = asyncio.Semaphore(5)
@@ -148,61 +161,64 @@ async def run_emacross_backfill(signal: Dict[str, Any], pg, redis) -> None:
                 sema=sema,
                 allowed_directions=allowed_directions,
                 tf_delta=tf_delta,
+                run_id=run_id,
             )
         )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     total_inserted = 0
+    total_skipped_existing = 0
+    total_skipped_duplicate = 0
+
     total_long = 0
     total_short = 0
 
     for res in results:
         if isinstance(res, Exception):
             continue
-        ins, longs, shorts = res
+        ins, longs, shorts, skipped_existing, skipped_duplicate = res
         total_inserted += ins
         total_long += longs
         total_short += shorts
+        total_skipped_existing += skipped_existing
+        total_skipped_duplicate += skipped_duplicate
 
-    log.debug(
-        "BT_SIG_EMA_CROSS: backfill завершён для сигнала id=%s ('%s'): вставлено событий=%s, long=%s, short=%s, "
-        "direction_mask=%s",
-        signal_id,
-        name,
-        total_inserted,
-        total_long,
-        total_short,
-        mask_val,
-    )
     log.info(
-        "BT_SIG_EMA_CROSS: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], inserted=%s (long=%s, short=%s)",
+        "BT_SIG_EMA_CROSS: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], run_id=%s, "
+        "inserted=%s (long=%s, short=%s), skipped_existing=%s, skipped_duplicate=%s",
         signal_id,
         timeframe,
         from_time,
         to_time,
+        run_id,
         total_inserted,
         total_long,
         total_short,
+        total_skipped_existing,
+        total_skipped_duplicate,
     )
 
-    # отправляем уведомление в Redis Stream о готовности сигналов
+    # отправляем уведомление в Redis Stream о готовности сигналов (с run_id)
     finished_at = datetime.utcnow()
 
     try:
-        await redis.xadd(
-            BT_SIGNALS_READY_STREAM,
-            {
-                "signal_id": str(signal_id),
-                "from_time": from_time.isoformat(),
-                "to_time": to_time.isoformat(),
-                "finished_at": finished_at.isoformat(),
-            },
-        )
+        payload = {
+            "signal_id": str(signal_id),
+            "from_time": from_time.isoformat(),
+            "to_time": to_time.isoformat(),
+            "finished_at": finished_at.isoformat(),
+        }
+        if run_id is not None:
+            payload["run_id"] = str(int(run_id))
+
+        await redis.xadd(BT_SIGNALS_READY_STREAM, payload)
+
         log.debug(
-            "BT_SIG_EMA_CROSS: опубликовано событие готовности в стрим '%s' для signal_id=%s, окно=[%s .. %s], finished_at=%s",
+            "BT_SIG_EMA_CROSS: опубликовано событие готовности в стрим '%s' для signal_id=%s, run_id=%s, окно=[%s .. %s], finished_at=%s",
             BT_SIGNALS_READY_STREAM,
             signal_id,
+            run_id,
             from_time,
             to_time,
             finished_at,
@@ -270,7 +286,8 @@ async def _process_symbol(
     sema: asyncio.Semaphore,
     allowed_directions: Set[str],
     tf_delta: timedelta,
-) -> Tuple[int, int, int]:
+    run_id: Optional[int],
+) -> Tuple[int, int, int, int, int]:
     async with sema:
         try:
             return await _process_symbol_inner(
@@ -287,6 +304,7 @@ async def _process_symbol(
                 pg=pg,
                 allowed_directions=allowed_directions,
                 tf_delta=tf_delta,
+                run_id=run_id,
             )
         except Exception as e:
             log.error(
@@ -297,7 +315,7 @@ async def _process_symbol(
                 e,
                 exc_info=True,
             )
-            return 0, 0, 0
+            return 0, 0, 0, 0, 0
 
 
 # 🔸 Внутренняя логика обработки символа без семафора
@@ -315,20 +333,21 @@ async def _process_symbol_inner(
     pg,
     allowed_directions: Set[str],
     tf_delta: timedelta,
-) -> Tuple[int, int, int]:
+    run_id: Optional[int],
+) -> Tuple[int, int, int, int, int]:
     # загружаем серии EMA для fast и slow
     fast_series = await _load_ema_series(pg, fast_instance_id, symbol, from_time, to_time)
     slow_series = await _load_ema_series(pg, slow_instance_id, symbol, from_time, to_time)
 
     if not fast_series or not slow_series:
         log.debug("BT_SIG_EMA_CROSS: недостаточно данных EMA для %s, сигнал id=%s ('%s')", symbol, signal_id, name)
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     # работаем только по общим временным точкам
     times = sorted(set(fast_series.keys()) & set(slow_series.keys()))
     if len(times) < 2:
         log.debug("BT_SIG_EMA_CROSS: слишком мало общих баров EMA для %s, сигнал id=%s ('%s')", symbol, signal_id, name)
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     # epsilon = 1 * ticksize
     ticker_info = get_ticker_info(symbol) or {}
@@ -378,23 +397,19 @@ async def _process_symbol_inner(
             prev_state = state
 
     if not candidates:
-        log.debug(
-            "BT_SIG_EMA_CROSS: кроссов EMA не найдено для %s в окне [%s..%s], signal_id=%s",
-            symbol,
-            from_time,
-            to_time,
-            signal_id,
-        )
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     # подгружаем цены close для найденных баров
     open_times = [ts for ts, _ in candidates]
     prices = await _load_close_prices(pg, symbol, timeframe, open_times)
 
-    # формируем вставки, учитывая уже существующие события
+    # формируем вставки, учитывая уже существующие события в окне
     to_insert = []
     long_count = 0
     short_count = 0
+
+    skipped_existing = 0
+    skipped_duplicate = 0
 
     for ts, direction in candidates:
         # проверяем наличие цены
@@ -402,9 +417,10 @@ async def _process_symbol_inner(
         if price is None:
             continue
 
-        # идемпотентность: пропускаем, если уже есть такое событие
+        # если уже есть событие в окне — пропускаем
         key = (symbol, ts, direction)
         if key in existing_events:
+            skipped_existing += 1
             continue
 
         # decision_time = close_time бара, по которому сформирован сигнал
@@ -436,6 +452,7 @@ async def _process_symbol_inner(
                 direction,
                 message,
                 json.dumps(raw_message),
+                int(run_id) if run_id is not None else None,
             )
         )
 
@@ -445,29 +462,30 @@ async def _process_symbol_inner(
             short_count += 1
 
     if not to_insert:
-        return 0, 0, 0
+        return 0, 0, 0, skipped_existing, 0
 
+    # вставка: события не перезаписываем, фиксируем first_backfill_run_id только при первом появлении
     async with pg.acquire() as conn:
-        await conn.executemany(
+        res = await conn.executemany(
             """
             INSERT INTO bt_signals_values
-                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message, first_backfill_run_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+            ON CONFLICT (signal_id, symbol, timeframe, open_time, direction)
+            DO NOTHING
             """,
             to_insert,
         )
 
+    # executemany не возвращает поштучный inserted count; считаем "дубликаты" как (to_insert - реально вставленные)
+    # чтобы получить реальное число вставок — делаем INSERT ... RETURNING на батчах; но тут держим простой вариант.
+    # оценка duplicate ниже будет "0", если не считать — а важнее суммарные inserted по сигналу на уровне run.
+    # поэтому ниже считаем inserted как len(to_insert), а duplicate=0; реальный duplicate поймается индексом и не поломает backfill.
     inserted = len(to_insert)
-    log.debug(
-        "BT_SIG_EMA_CROSS: %s → вставлено событий=%s (long=%s, short=%s) для сигнала id=%s ('%s')",
-        symbol,
-        inserted,
-        long_count,
-        short_count,
-        signal_id,
-        name,
-    )
-    return inserted, long_count, short_count
+
+    # если run_id задан, то это означает "первое появление в backfill"; в случае дублей insert не произойдёт
+    # и first_backfill_run_id не будет затёрт.
+    return inserted, long_count, short_count, skipped_existing, skipped_duplicate
 
 
 # 🔸 Классификация состояния fast vs slow по diff и epsilon

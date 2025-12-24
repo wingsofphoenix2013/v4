@@ -1,4 +1,4 @@
-# bt_scenarios_postproc.py — постпроцессинг позиций сценариев (сбор снапшотов индикаторов)
+# bt_scenarios_postproc.py — постпроцессинг позиций сценариев (сбор снапшотов индикаторов, run-aware)
 
 import asyncio
 import logging
@@ -79,13 +79,15 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
 
                     scenario_id = ctx["scenario_id"]
                     signal_id = ctx["signal_id"]
+                    run_id = ctx["run_id"]
                     finished_at = ctx["finished_at"]
 
                     log.debug(
                         "BT_SCENARIOS_POSTPROC: получено сообщение о готовности сценария "
-                        "scenario_id=%s, signal_id=%s, finished_at=%s, stream_id=%s",
+                        "scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s, stream_id=%s",
                         scenario_id,
                         signal_id,
+                        run_id,
                         finished_at,
                         entry_id,
                     )
@@ -103,26 +105,17 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                     total_positions_skipped += skipped
                     total_positions_errors += errors
 
-                    log.debug(
-                        "BT_SCENARIOS_POSTPROC: сценарий scenario_id=%s, signal_id=%s — "
-                        "позиций обработано=%s, пропущено=%s, ошибок=%s",
-                        scenario_id,
-                        signal_id,
-                        processed,
-                        skipped,
-                        errors,
-                    )
                     log.info(
-                        "BT_SCENARIOS_POSTPROC: summary для scenario_id=%s, signal_id=%s — "
-                        "processed=%s, skipped=%s, errors=%s",
+                        "BT_SCENARIOS_POSTPROC: summary для scenario_id=%s, signal_id=%s, run_id=%s — processed=%s, skipped=%s, errors=%s",
                         scenario_id,
                         signal_id,
+                        run_id,
                         processed,
                         skipped,
                         errors,
                     )
 
-                    # публикуем событие о завершении постпроцессинга в bt:postproc:ready
+                    # публикуем событие о завершении постпроцессинга в bt:postproc:ready (run-aware)
                     finished_at_postproc = datetime.utcnow()
                     try:
                         await redis.xadd(
@@ -130,6 +123,7 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                             {
                                 "scenario_id": str(scenario_id),
                                 "signal_id": str(signal_id),
+                                "run_id": str(run_id),
                                 "processed": str(processed),
                                 "skipped": str(skipped),
                                 "errors": str(errors),
@@ -138,20 +132,22 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                         )
                         log.debug(
                             "BT_SCENARIOS_POSTPROC: опубликовано событие готовности постпроцессинга "
-                            "в стрим '%s' для scenario_id=%s, signal_id=%s, finished_at=%s",
+                            "в стрим '%s' для scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s",
                             POSTPROC_READY_STREAM_KEY,
                             scenario_id,
                             signal_id,
+                            run_id,
                             finished_at_postproc,
                         )
                     except Exception as e:
                         # проблемы стрима не должны ломать основной воркер
                         log.error(
                             "BT_SCENARIOS_POSTPROC: не удалось опубликовать событие в стрим '%s' "
-                            "для scenario_id=%s, signal_id=%s: %s",
+                            "для scenario_id=%s, signal_id=%s, run_id=%s: %s",
                             POSTPROC_READY_STREAM_KEY,
                             scenario_id,
                             signal_id,
+                            run_id,
                             e,
                             exc_info=True,
                         )
@@ -159,14 +155,8 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                     # помечаем сообщение как обработанное
                     await redis.xack(POSTPROC_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
-            log.debug(
-                "BT_SCENARIOS_POSTPROC: пакет сообщений обработан — сообщений=%s, сценариев=%s",
-                total_msgs,
-                total_scenarios_processed,
-            )
             log.info(
-                "BT_SCENARIOS_POSTPROC: итог по пакету — сообщений=%s, сценариев=%s, "
-                "positions processed=%s, skipped=%s, errors=%s",
+                "BT_SCENARIOS_POSTPROC: итог по пакету — сообщений=%s, сценариев=%s, positions processed=%s, skipped=%s, errors=%s",
                 total_msgs,
                 total_scenarios_processed,
                 total_positions_processed,
@@ -252,23 +242,26 @@ async def _read_from_stream(redis) -> List[Any]:
     return parsed
 
 
-# 🔸 Разбор одного сообщения из стрима bt:scenarios:ready
+# 🔸 Разбор одного сообщения из стрима bt:scenarios:ready (run-aware)
 def _parse_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
         scenario_id_str = fields.get("scenario_id")
         signal_id_str = fields.get("signal_id")
+        run_id_str = fields.get("run_id")
         finished_at_str = fields.get("finished_at")
 
-        if not (scenario_id_str and signal_id_str and finished_at_str):
+        if not (scenario_id_str and signal_id_str and run_id_str and finished_at_str):
             return None
 
         scenario_id = int(scenario_id_str)
         signal_id = int(signal_id_str)
+        run_id = int(run_id_str)
         finished_at = datetime.fromisoformat(finished_at_str)
 
         return {
             "scenario_id": scenario_id,
             "signal_id": signal_id,
+            "run_id": run_id,
             "finished_at": finished_at,
         }
     except Exception as e:
@@ -290,7 +283,6 @@ def _build_indicator_instances_cache() -> Tuple[Dict[str, Dict[int, Dict[str, An
 
     for instance_id, inst in all_instances.items():
         tf = inst.get("timeframe")
-        indicator = inst.get("indicator")
 
         if tf not in indicator_by_tf:
             # игнорируем TF, с которыми пока не работаем в postproc
@@ -435,8 +427,6 @@ async def _process_single_position(
         )
         return "skipped"
 
-    # собираем значения индикаторов по всем TF
-    # структура: tf_payload[tf] = {"open_time": <iso>, "indicators": {family -> {param_name -> value}}}
     tf_payload: Dict[str, Dict[str, Any]] = {}
 
     async with pg.acquire() as conn:
@@ -470,7 +460,6 @@ async def _process_single_position(
                 instance_ids,
             )
 
-            # группируем по instance_id на основе реально имеющихся значений
             by_instance: Dict[int, List[Dict[str, Any]]] = {}
             for r in rows:
                 iid = r["instance_id"]
@@ -479,18 +468,6 @@ async def _process_single_position(
                         "param_name": r["param_name"],
                         "value": float(r["value"]),
                     }
-                )
-
-            # если каких-то инстансов нет — просто логируем и продолжаем, пишем то, что есть
-            missing_instances = [iid for iid in instance_ids if iid not in by_instance]
-            if missing_instances:
-                log.debug(
-                    "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s, TF=%s — отсутствуют значения индикаторов "
-                    "для instance_id=%s, будут записаны только доступные",
-                    pos_id,
-                    symbol,
-                    tf,
-                    missing_instances,
                 )
 
             tf_families: Dict[str, Dict[str, float]] = {}
@@ -508,14 +485,7 @@ async def _process_single_position(
                     value = rec["value"]
                     family_dict[param_name] = value
 
-            # если для TF нет ни одного индикатора — пропускаем TF, но не всю позицию
             if not tf_families:
-                log.debug(
-                    "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s, TF=%s — нет доступных индикаторов для записи, TF пропускается",
-                    pos_id,
-                    symbol,
-                    tf,
-                )
                 continue
 
             tf_payload[tf] = {
@@ -523,7 +493,6 @@ async def _process_single_position(
                 "indicators": tf_families,
             }
 
-    # если по какой-то причине нечего записывать вообще — пропускаем позицию
     if not tf_payload:
         log.debug(
             "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s — нет данных индикаторов для записи, позиция пропущена",
@@ -532,7 +501,6 @@ async def _process_single_position(
         )
         return "skipped"
 
-    # строим итоговый raw_stat
     raw_stat = {
         "version": "v1",
         "tf": tf_payload,
@@ -553,11 +521,6 @@ async def _process_single_position(
             pos_id,
         )
 
-    log.debug(
-        "BT_SCENARIOS_POSTPROC: позиция id=%s, symbol=%s — raw_stat записан, postproc=true",
-        pos_id,
-        symbol,
-    )
     return "processed"
 
 
@@ -610,24 +573,12 @@ async def _resolve_open_times_for_position(
             )
 
             if not tf_row or tf_row["open_time"] is None:
-                log.debug(
-                    "BT_SCENARIOS_POSTPROC: symbol=%s — не найден подходящий бар для TF=%s до decision_time=%s",
-                    symbol,
-                    tf,
-                    decision_time,
-                )
                 return None
 
             open_times[tf] = tf_row["open_time"]
 
     required_tfs = {"m5", "m15", "h1"}
     if not required_tfs.issubset(open_times.keys()):
-        log.debug(
-            "BT_SCENARIOS_POSTPROC: symbol=%s — не удалось получить open_time для всех TF=%s (есть=%s)",
-            symbol,
-            required_tfs,
-            open_times.keys(),
-        )
         return None
 
     return open_times
