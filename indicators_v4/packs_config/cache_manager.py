@@ -1,4 +1,4 @@
-# packs_config/cache_manager.py — кеши/реестр ind_pack + init/runtime reload (postproc_ready) + run-aware загрузка + refresh m15/h1 adaptive
+# packs_config/cache_manager.py — кеши/реестр ind_pack + init/runtime reload (postproc_ready) + run-aware загрузка + refresh m15/h1 adaptive + current run_id map
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import datetime
 from typing import Any
 
 from packs_config.db_loaders import (
@@ -29,6 +28,7 @@ from packs_config.contract import (
 )
 from packs_config.publish import publish_pair
 from packs_config.redis_ts import IND_TS_PREFIX, ts_get, ts_get_value_at
+
 
 # 🔸 Константы Redis (постпроцессинг бектеста → сигнал обновления словарей)
 POSTPROC_STREAM_KEY = "bt:analysis:postproc_ready"
@@ -64,6 +64,10 @@ adaptive_quantiles_pairs_set: set[tuple[int, int]] = set()
 labels_pairs_index: dict[tuple[int, int], set[LabelsContext]] = {}
 labels_pairs_set: set[tuple[int, int]] = set()
 
+# 🔸 Текущий run_id по signal_id (для мета-записи в PG)
+current_run_by_signal: dict[int, int] = {}
+current_run_lock = asyncio.Lock()
+
 # 🔸 Locks и флаги готовности кешей
 adaptive_lock = asyncio.Lock()
 labels_lock = asyncio.Lock()
@@ -79,6 +83,19 @@ caches_ready = {
 reloading_pairs_bins: set[tuple[int, int]] = set()
 reloading_pairs_quantiles: set[tuple[int, int]] = set()
 reloading_pairs_labels: set[tuple[int, int]] = set()
+
+
+# 🔸 Helpers: current run getters
+def get_current_run_id(signal_id: int) -> int | None:
+    try:
+        return current_run_by_signal.get(int(signal_id))
+    except Exception:
+        return None
+
+
+async def _set_current_run_id(signal_id: int, run_id: int):
+    async with current_run_lock:
+        current_run_by_signal[int(signal_id)] = int(run_id)
 
 
 # 🔸 Helpers: labels cache key + contains
@@ -297,6 +314,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                         str(rt.timeframe),
                         pack_fail("invalid_input_value", base_details),
                         int(rt.ttl_sec),
+                        meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                     )
                     fail_sum += 1
                     continue
@@ -315,6 +333,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                         str(rt.timeframe),
                         pack_fail("missing_inputs", base_details),
                         int(rt.ttl_sec),
+                        meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                     )
                     fail_sum += 1
                     continue
@@ -333,6 +352,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                         str(rt.timeframe),
                         pack_fail("rules_not_loaded_yet", base_details),
                         int(rt.ttl_sec),
+                        meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                     )
                     fail_sum += 1
                     continue
@@ -350,6 +370,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                         str(rt.timeframe),
                         pack_fail("no_rules_adaptive", base_details),
                         int(rt.ttl_sec),
+                        meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                     )
                     fail_sum += 1
                     continue
@@ -369,6 +390,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                         str(rt.timeframe),
                         pack_fail("internal_error", base_details),
                         int(rt.ttl_sec),
+                        meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                     )
                     errors_sum += 1
                     continue
@@ -384,6 +406,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                         str(rt.timeframe),
                         pack_fail("no_candidates", base_details),
                         int(rt.ttl_sec),
+                        meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                     )
                     fail_sum += 1
                     continue
@@ -398,6 +421,7 @@ async def _refresh_pair_adaptive_m15_h1(pg: Any, redis: Any, run_id: int, scenar
                     str(rt.timeframe),
                     pack_ok(str(bin_name)),
                     int(rt.ttl_sec),
+                    meta={"run_id": str(run_id), "open_ts_ms": str(open_ts_ms) if open_ts_ms is not None else "", "open_time": ""},
                 )
                 ok_sum += 1
 
@@ -504,6 +528,11 @@ async def init_pack_runtime(pg: Any):
     all_pairs = set(adaptive_pairs_set) | set(labels_pairs_set) | set(adaptive_quantiles_pairs_set)
     signal_ids = sorted({int(sig) for (_, sig) in all_pairs})
     latest_runs_by_signal = await load_latest_finished_run_ids(pg, signal_ids)
+
+    # обновим current_run_by_signal
+    async with current_run_lock:
+        current_run_by_signal.clear()
+        current_run_by_signal.update({int(k): int(v) for k, v in latest_runs_by_signal.items()})
 
     runs_ok = 0
     runs_missing = 0
@@ -763,6 +792,9 @@ async def watch_postproc_ready(pg: Any, redis: Any):
                     if pair not in adaptive_pairs_set and pair not in labels_pairs_set and pair not in adaptive_quantiles_pairs_set:
                         ignored += 1
                         continue
+
+                    # обновим current_run_by_signal по факту postproc_ready
+                    await _set_current_run_id(int(signal_id), int(run_id))
 
                     asyncio.create_task(_reload_pair(int(run_id), int(scenario_id), int(signal_id)))
                     scheduled += 1

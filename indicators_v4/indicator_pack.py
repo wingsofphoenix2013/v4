@@ -1,4 +1,4 @@
-# indicator_pack.py — оркестратор расчёта и публикации ind_pack (JSON Contract v1): static/adaptive/MTF + кеши rules/labels
+# indicator_pack.py — оркестратор расчёта и публикации ind_pack (JSON Contract v1): static/adaptive/MTF + кеши rules/labels + PG meta
 
 # 🔸 Базовые импорты
 import asyncio
@@ -20,6 +20,7 @@ from packs_config.cache_manager import (
     reloading_pairs_quantiles,
     ensure_stream_group,
     get_adaptive_rules,
+    get_current_run_id,
     init_pack_runtime,
     labels_has_bin,
     watch_postproc_ready,
@@ -78,8 +79,28 @@ MAX_CANDIDATES_IN_DETAILS = 5
 # 🔸 Константы Redis TS (feed_bb)
 BB_TS_PREFIX = "bb:ts"  # bb:ts:{symbol}:{tf}:{field}
 
+
+# 🔸 Publish meta helper (для записи в PG через ind_pack_stream_core)
+def build_publish_meta(open_ts_ms: int | None, open_time: str | None, run_id: int | None) -> dict[str, Any] | None:
+    meta: dict[str, Any] = {}
+    if run_id is not None:
+        meta["run_id"] = str(int(run_id))
+    if open_ts_ms is not None:
+        meta["open_ts_ms"] = str(int(open_ts_ms))
+    if open_time is not None:
+        meta["open_time"] = str(open_time)
+
+    return meta if meta else None
+
+
 # 🔸 Handle MTF runtime: always publish for all pairs + dirs
-async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigger: dict[str, Any], open_ts_ms: int | None) -> tuple[int, int]:
+async def handle_mtf_pack_publish_all(
+    redis,
+    rt: PackRuntime,
+    symbol: str,
+    trigger: dict[str, Any],
+    open_ts_ms: int | None,
+) -> tuple[int, int]:
     log = logging.getLogger("PACK_MTF")
 
     # условия достаточности runtime
@@ -92,6 +113,7 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
     # invalid_trigger_event (open_time unparsable) — можем публиковать, т.к. key однозначен
     if open_ts_ms is None:
         for (scenario_id, signal_id) in rt.mtf_pairs:
+            run_id = get_current_run_id(int(signal_id))
             for direction in ("long", "short"):
                 details = build_fail_details_base(
                     analysis_id=int(rt.analysis_id),
@@ -105,7 +127,18 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                 details["missing_fields"] = ["open_time"]
                 details["parse"] = {"open_time": trigger.get("open_time"), "open_ts_ms": None}
                 payload = pack_fail("invalid_trigger_event", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    payload,
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(None, trigger.get("open_time"), run_id),
+                )
                 published_fail += 1
         return published_ok, published_fail
 
@@ -117,6 +150,7 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
         if rt.mtf_quantiles_key and not caches_ready.get("quantiles", False):
             need.append("quantiles")
         for (scenario_id, signal_id) in rt.mtf_pairs:
+            run_id = get_current_run_id(int(signal_id))
             for direction in ("long", "short"):
                 details = build_fail_details_base(
                     analysis_id=int(rt.analysis_id),
@@ -130,7 +164,18 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                 details["need"] = need
                 details["retry"] = {"recommended": True, "after_sec": int(MTF_RETRY_STEP_SEC)}
                 payload = pack_fail("rules_not_loaded_yet", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    payload,
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                )
                 published_fail += 1
         return published_ok, published_fail
 
@@ -144,7 +189,12 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
         # один параметр на TF
         if isinstance(spec, str):
             pname = str(spec or "").strip()
-            tasks.append(asyncio.create_task(get_mtf_value_decimal(redis, str(symbol), int(open_ts_ms), str(tf), pname) if pname else asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0}))))
+            tasks.append(
+                asyncio.create_task(
+                    get_mtf_value_decimal(redis, str(symbol), int(open_ts_ms), str(tf), pname)
+                    if pname else asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0}))
+                )
+            )
             meta.append((str(tf), None, pname))
 
         # несколько параметров на TF (dict)
@@ -257,6 +307,7 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
             reason = "mtf_boundary_wait" if (styk_m15 or styk_h1) else "mtf_missing_component_values"
 
         for (scenario_id, signal_id) in rt.mtf_pairs:
+            run_id = get_current_run_id(int(signal_id))
             for direction in ("long", "short"):
                 details = build_fail_details_base(
                     analysis_id=int(rt.analysis_id),
@@ -288,11 +339,12 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                     "mtf",
                     payload,
                     int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                 )
                 published_fail += 1
 
         if styk_m15 or styk_h1:
-            log.debug(
+            log.info(
                 "PACK_MTF: boundary wait → fail=%s (symbol=%s, analysis_id=%s, open_ts_ms=%s, styk_m15=%s, styk_h1=%s)",
                 published_fail,
                 symbol,
@@ -310,6 +362,7 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
         price_d = safe_decimal(raw_price)
         if price_d is None:
             for (scenario_id, signal_id) in rt.mtf_pairs:
+                run_id = get_current_run_id(int(signal_id))
                 for direction in ("long", "short"):
                     details = build_fail_details_base(
                         analysis_id=int(rt.analysis_id),
@@ -330,7 +383,18 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                         details["retry"] = {"recommended": False, "after_sec": int(MTF_RETRY_STEP_SEC)}
                         payload = pack_fail("invalid_input_value", details)
 
-                    await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                    await publish_pair(
+                        redis,
+                        int(rt.analysis_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        str(direction),
+                        str(symbol),
+                        "mtf",
+                        payload,
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                    )
                     published_fail += 1
             return published_ok, published_fail
 
@@ -339,6 +403,7 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
     # for each pair and direction compute and publish
     for (scenario_id, signal_id) in rt.mtf_pairs:
         pair_key = (int(scenario_id), int(signal_id))
+        run_id = get_current_run_id(int(signal_id))
 
         # during reload — rules_not_loaded_yet (priority)
         pair_reloading = (pair_key in reloading_pairs_labels) or (pair_key in reloading_pairs_quantiles)
@@ -356,26 +421,22 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                 details["need"] = ["labels", "quantiles"] if rt.mtf_quantiles_key else ["labels"]
                 details["retry"] = {"recommended": True, "after_sec": int(MTF_RETRY_STEP_SEC)}
                 payload = pack_fail("rules_not_loaded_yet", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    payload,
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                )
                 published_fail += 1
             continue
 
         for direction in ("long", "short"):
-            if direction not in ("long", "short"):
-                details = build_fail_details_base(
-                    analysis_id=int(rt.analysis_id),
-                    symbol=str(symbol),
-                    direction=str(direction),
-                    timeframe="mtf",
-                    pair={"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
-                    trigger=trigger,
-                    open_ts_ms=int(open_ts_ms),
-                )
-                payload = pack_fail("invalid_direction", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
-                published_fail += 1
-                continue
-
             rules_by_tf: dict[str, list[Any]] = {}
 
             # static bins rules
@@ -385,7 +446,18 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                     details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
                     details["expected"] = {"bin_type": "bins", "tf": "mtf", "source": "static"}
                     payload = pack_fail("no_rules_static", details)
-                    await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                    await publish_pair(
+                        redis,
+                        int(rt.analysis_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        str(direction),
+                        str(symbol),
+                        "mtf",
+                        payload,
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                    )
                     published_fail += 1
                     continue
             else:
@@ -400,7 +472,18 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                     details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
                     details["expected"] = {"bin_type": "bins", "tf": missing_rules_tfs, "source": "static"}
                     payload = pack_fail("no_rules_static", details)
-                    await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                    await publish_pair(
+                        redis,
+                        int(rt.analysis_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        str(direction),
+                        str(symbol),
+                        "mtf",
+                        payload,
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                    )
                     published_fail += 1
                     continue
 
@@ -411,7 +494,18 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                     details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
                     details["expected"] = {"bin_type": "quantiles", "tf": "mtf", "source": "adaptive"}
                     payload = pack_fail("no_quantiles_rules", details)
-                    await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                    await publish_pair(
+                        redis,
+                        int(rt.analysis_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        str(direction),
+                        str(symbol),
+                        "mtf",
+                        payload,
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                    )
                     published_fail += 1
                     continue
                 rules_by_tf[str(rt.mtf_quantiles_key)] = q_rules
@@ -427,14 +521,36 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                 details["where"] = "handle_mtf_pack/bin_candidates"
                 details["error"] = short_error_str(e)
                 payload = pack_fail("internal_error", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    payload,
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                )
                 published_fail += 1
                 continue
 
             if not candidates:
                 details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
                 payload = pack_fail("no_candidates", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    payload,
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                )
                 published_fail += 1
                 continue
 
@@ -457,15 +573,44 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                     "signal_id": int(signal_id),
                 }
                 payload = pack_fail("no_labels_match", details)
-                await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    payload,
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                )
                 published_fail += 1
                 continue
 
-            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", pack_ok(chosen), int(rt.ttl_sec))
+            await publish_pair(
+                redis,
+                int(rt.analysis_id),
+                int(scenario_id),
+                int(signal_id),
+                str(direction),
+                str(symbol),
+                "mtf",
+                pack_ok(chosen),
+                int(rt.ttl_sec),
+                meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+            )
             published_ok += 1
 
     if published_ok or published_fail:
-        log.debug("PACK_MTF: done (symbol=%s, analysis_id=%s, open_ts_ms=%s, ok=%s, fail=%s)", symbol, rt.analysis_id, open_ts_ms, published_ok, published_fail)
+        log.debug(
+            "PACK_MTF: done (symbol=%s, analysis_id=%s, open_ts_ms=%s, ok=%s, fail=%s)",
+            symbol,
+            rt.analysis_id,
+            open_ts_ms,
+            published_ok,
+            published_fail,
+        )
 
     return published_ok, published_fail
 
@@ -483,7 +628,10 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
 
     # invalid_trigger_event: если нельзя построить ключи (нет symbol/timeframe/indicator) — в Redis не пишем
     if not symbol or not timeframe or not indicator_key:
-        log.debug("PACK_SET: invalid trigger (missing fields) %s", {k: msg.get(k) for k in ("symbol", "timeframe", "indicator", "status", "open_time")})
+        log.debug(
+            "PACK_SET: invalid trigger (missing fields) %s",
+            {k: msg.get(k) for k in ("symbol", "timeframe", "indicator", "status", "open_time")},
+        )
         return {"ok": 0, "fail": 0, "runtimes": 0}
 
     runtimes = pack_registry.get((str(timeframe), str(indicator_key)))
@@ -492,7 +640,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
 
     # supertrend: если есть source_param_name из stream — фильтруем runtimes до точной серии (length+mult)
     if str(indicator_key).startswith("supertrend") and source_param_name:
-        # нормализация серии: supertrend7_2_5_trend -> supertrend7_2_5
+        # нормализация серии: *_trend -> base
         def _st_series(p: Any) -> str | None:
             s = str(p or "").strip()
             if not s:
@@ -538,7 +686,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
             runtimes = filtered
 
             if before_n != len(runtimes):
-                log.debug(
+                log.info(
                     "PACK_SET: supertrend filter (symbol=%s, tf=%s, indicator=%s, series=%s) runtimes %s→%s",
                     symbol,
                     timeframe,
@@ -548,7 +696,6 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                     len(runtimes),
                 )
 
-            # если после фильтра ничего не осталось — считаем, что матчей нет
             if not runtimes:
                 return {"ok": 0, "fail": 0, "runtimes": 0}
 
@@ -569,28 +716,85 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
         for rt in runtimes:
             if rt.is_mtf and rt.mtf_pairs:
                 for (scenario_id, signal_id) in rt.mtf_pairs:
+                    run_id = get_current_run_id(int(signal_id))
                     for direction in ("long", "short"):
-                        details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, open_ts_ms)
+                        details = build_fail_details_base(
+                            int(rt.analysis_id),
+                            str(symbol),
+                            str(direction),
+                            "mtf",
+                            {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                            trigger,
+                            open_ts_ms,
+                        )
                         details["retry"] = {"recommended": True, "after_sec": 5}
                         payload = pack_fail("not_ready_retrying", details)
-                        await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                        await publish_pair(
+                            redis,
+                            int(rt.analysis_id),
+                            int(scenario_id),
+                            int(signal_id),
+                            str(direction),
+                            str(symbol),
+                            "mtf",
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                        )
                         published_fail += 1
 
             elif rt.bins_source == "adaptive" and rt.adaptive_pairs:
                 for (scenario_id, signal_id) in rt.adaptive_pairs:
+                    run_id = get_current_run_id(int(signal_id))
                     for direction in ("long", "short"):
-                        details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), str(rt.timeframe), {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, open_ts_ms)
+                        details = build_fail_details_base(
+                            int(rt.analysis_id),
+                            str(symbol),
+                            str(direction),
+                            str(rt.timeframe),
+                            {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                            trigger,
+                            open_ts_ms,
+                        )
                         details["retry"] = {"recommended": True, "after_sec": 5}
                         payload = pack_fail("not_ready_retrying", details)
-                        await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_pair(
+                            redis,
+                            int(rt.analysis_id),
+                            int(scenario_id),
+                            int(signal_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                        )
                         published_fail += 1
 
             else:
                 for direction in ("long", "short"):
-                    details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), str(rt.timeframe), None, trigger, open_ts_ms)
+                    details = build_fail_details_base(
+                        int(rt.analysis_id),
+                        str(symbol),
+                        str(direction),
+                        str(rt.timeframe),
+                        None,
+                        trigger,
+                        open_ts_ms,
+                    )
                     details["retry"] = {"recommended": True, "after_sec": 5}
                     payload = pack_fail("not_ready_retrying", details)
-                    await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                    await publish_static(
+                        redis,
+                        int(rt.analysis_id),
+                        str(direction),
+                        str(symbol),
+                        str(rt.timeframe),
+                        payload,
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                    )
                     published_fail += 1
 
         return {"ok": published_ok, "fail": published_fail, "runtimes": len(runtimes)}
@@ -609,6 +813,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
             if open_ts_ms is None and rt.analysis_key in ("bb_band_bin", "lr_band_bin", "atr_bin"):
                 if rt.bins_source == "adaptive" and rt.adaptive_pairs:
                     for (scenario_id, signal_id) in rt.adaptive_pairs:
+                        run_id = get_current_run_id(int(signal_id))
                         for direction in ("long", "short"):
                             base = build_fail_details_base(
                                 int(rt.analysis_id),
@@ -634,6 +839,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                                 str(rt.timeframe),
                                 payload,
                                 int(rt.ttl_sec),
+                                meta=build_publish_meta(None, trigger.get("open_time"), run_id),
                             )
                             published_fail += 1
                 else:
@@ -660,6 +866,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                             str(rt.timeframe),
                             payload,
                             int(rt.ttl_sec),
+                            meta=build_publish_meta(None, trigger.get("open_time"), None),
                         )
                         published_fail += 1
 
@@ -725,9 +932,18 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                 for (scenario_id, signal_id) in rt.adaptive_pairs:
                     pair_key = (int(scenario_id), int(signal_id))
                     pair_reloading = pair_key in reloading_pairs_bins
+                    run_id = get_current_run_id(int(signal_id))
 
                     for direction in ("long", "short"):
-                        base = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), str(rt.timeframe), {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, open_ts_ms)
+                        base = build_fail_details_base(
+                            int(rt.analysis_id),
+                            str(symbol),
+                            str(direction),
+                            str(rt.timeframe),
+                            {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                            trigger,
+                            open_ts_ms,
+                        )
 
                         # invalid input
                         if invalid_info is not None:
@@ -735,7 +951,18 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                             base["input"] = invalid_info
                             base["retry"] = {"recommended": True, "after_sec": 5}
                             payload = pack_fail("invalid_input_value", base)
-                            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                            await publish_pair(
+                                redis,
+                                int(rt.analysis_id),
+                                int(scenario_id),
+                                int(signal_id),
+                                str(direction),
+                                str(symbol),
+                                str(rt.timeframe),
+                                payload,
+                                int(rt.ttl_sec),
+                                meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                            )
                             published_fail += 1
                             continue
 
@@ -744,7 +971,18 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                             base["missing"] = missing
                             base["retry"] = {"recommended": True, "after_sec": 5}
                             payload = pack_fail("missing_inputs", base)
-                            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                            await publish_pair(
+                                redis,
+                                int(rt.analysis_id),
+                                int(scenario_id),
+                                int(signal_id),
+                                str(direction),
+                                str(symbol),
+                                str(rt.timeframe),
+                                payload,
+                                int(rt.ttl_sec),
+                                meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                            )
                             published_fail += 1
                             continue
 
@@ -753,7 +991,18 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                             base["need"] = ["adaptive_bins"]
                             base["retry"] = {"recommended": True, "after_sec": 5}
                             payload = pack_fail("rules_not_loaded_yet", base)
-                            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                            await publish_pair(
+                                redis,
+                                int(rt.analysis_id),
+                                int(scenario_id),
+                                int(signal_id),
+                                str(direction),
+                                str(symbol),
+                                str(rt.timeframe),
+                                payload,
+                                int(rt.ttl_sec),
+                                meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                            )
                             published_fail += 1
                             continue
 
@@ -761,7 +1010,18 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                         if not rules:
                             base["expected"] = {"bin_type": "bins", "tf": str(rt.timeframe), "source": "adaptive", "direction": str(direction)}
                             payload = pack_fail("no_rules_adaptive", base)
-                            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                            await publish_pair(
+                                redis,
+                                int(rt.analysis_id),
+                                int(scenario_id),
+                                int(signal_id),
+                                str(direction),
+                                str(symbol),
+                                str(rt.timeframe),
+                                payload,
+                                int(rt.ttl_sec),
+                                meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                            )
                             published_fail += 1
                             continue
 
@@ -771,17 +1031,50 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                             base["where"] = "handle_indicator_event/adaptive/bin_value"
                             base["error"] = short_error_str(e)
                             payload = pack_fail("internal_error", base)
-                            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                            await publish_pair(
+                                redis,
+                                int(rt.analysis_id),
+                                int(scenario_id),
+                                int(signal_id),
+                                str(direction),
+                                str(symbol),
+                                str(rt.timeframe),
+                                payload,
+                                int(rt.ttl_sec),
+                                meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                            )
                             published_fail += 1
                             continue
 
                         if not bin_name:
                             payload = pack_fail("no_candidates", base)
-                            await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                            await publish_pair(
+                                redis,
+                                int(rt.analysis_id),
+                                int(scenario_id),
+                                int(signal_id),
+                                str(direction),
+                                str(symbol),
+                                str(rt.timeframe),
+                                payload,
+                                int(rt.ttl_sec),
+                                meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                            )
                             published_fail += 1
                             continue
 
-                        await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), pack_ok(str(bin_name)), int(rt.ttl_sec))
+                        await publish_pair(
+                            redis,
+                            int(rt.analysis_id),
+                            int(scenario_id),
+                            int(signal_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            pack_ok(str(bin_name)),
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                        )
                         published_ok += 1
 
             else:
@@ -793,7 +1086,16 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                         base["input"] = invalid_info
                         base["retry"] = {"recommended": True, "after_sec": 5}
                         payload = pack_fail("invalid_input_value", base)
-                        await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_static(
+                            redis,
+                            int(rt.analysis_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                        )
                         published_fail += 1
                         continue
 
@@ -801,7 +1103,16 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                         base["missing"] = missing
                         base["retry"] = {"recommended": True, "after_sec": 5}
                         payload = pack_fail("missing_inputs", base)
-                        await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_static(
+                            redis,
+                            int(rt.analysis_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                        )
                         published_fail += 1
                         continue
 
@@ -809,7 +1120,16 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                     if not rules:
                         base["expected"] = {"bin_type": "bins", "tf": str(rt.timeframe), "source": "static", "direction": str(direction)}
                         payload = pack_fail("no_rules_static", base)
-                        await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_static(
+                            redis,
+                            int(rt.analysis_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                        )
                         published_fail += 1
                         continue
 
@@ -819,46 +1139,130 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
                         base["where"] = "handle_indicator_event/static/bin_value"
                         base["error"] = short_error_str(e)
                         payload = pack_fail("internal_error", base)
-                        await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_static(
+                            redis,
+                            int(rt.analysis_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                        )
                         published_fail += 1
                         continue
 
                     if not bin_name:
                         payload = pack_fail("no_candidates", base)
-                        await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_static(
+                            redis,
+                            int(rt.analysis_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                        )
                         published_fail += 1
                         continue
 
-                    await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), pack_ok(str(bin_name)), int(rt.ttl_sec))
+                    await publish_static(
+                        redis,
+                        int(rt.analysis_id),
+                        str(direction),
+                        str(symbol),
+                        str(rt.timeframe),
+                        pack_ok(str(bin_name)),
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                    )
                     published_ok += 1
 
         except Exception as e:
             # internal_error: если runtime сматчился — publish fail на ожидаемые ключи runtime
             if rt.is_mtf and rt.mtf_pairs:
                 for (scenario_id, signal_id) in rt.mtf_pairs:
+                    run_id = get_current_run_id(int(signal_id))
                     for direction in ("long", "short"):
-                        details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, open_ts_ms)
+                        details = build_fail_details_base(
+                            int(rt.analysis_id),
+                            str(symbol),
+                            str(direction),
+                            "mtf",
+                            {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                            trigger,
+                            open_ts_ms,
+                        )
                         details["where"] = "handle_indicator_event/mtf/runtime"
                         details["error"] = short_error_str(e)
                         payload = pack_fail("internal_error", details)
-                        await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), "mtf", payload, int(rt.ttl_sec))
+                        await publish_pair(
+                            redis,
+                            int(rt.analysis_id),
+                            int(scenario_id),
+                            int(signal_id),
+                            str(direction),
+                            str(symbol),
+                            "mtf",
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                        )
                         published_fail += 1
             elif rt.bins_source == "adaptive" and rt.adaptive_pairs:
                 for (scenario_id, signal_id) in rt.adaptive_pairs:
+                    run_id = get_current_run_id(int(signal_id))
                     for direction in ("long", "short"):
-                        details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), str(rt.timeframe), {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, open_ts_ms)
+                        details = build_fail_details_base(
+                            int(rt.analysis_id),
+                            str(symbol),
+                            str(direction),
+                            str(rt.timeframe),
+                            {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                            trigger,
+                            open_ts_ms,
+                        )
                         details["where"] = "handle_indicator_event/adaptive/runtime"
                         details["error"] = short_error_str(e)
                         payload = pack_fail("internal_error", details)
-                        await publish_pair(redis, int(rt.analysis_id), int(scenario_id), int(signal_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                        await publish_pair(
+                            redis,
+                            int(rt.analysis_id),
+                            int(scenario_id),
+                            int(signal_id),
+                            str(direction),
+                            str(symbol),
+                            str(rt.timeframe),
+                            payload,
+                            int(rt.ttl_sec),
+                            meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
+                        )
                         published_fail += 1
             else:
                 for direction in ("long", "short"):
-                    details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), str(rt.timeframe), None, trigger, open_ts_ms)
+                    details = build_fail_details_base(
+                        int(rt.analysis_id),
+                        str(symbol),
+                        str(direction),
+                        str(rt.timeframe),
+                        None,
+                        trigger,
+                        open_ts_ms,
+                    )
                     details["where"] = "handle_indicator_event/static/runtime"
                     details["error"] = short_error_str(e)
                     payload = pack_fail("internal_error", details)
-                    await publish_static(redis, int(rt.analysis_id), str(direction), str(symbol), str(rt.timeframe), payload, int(rt.ttl_sec))
+                    await publish_static(
+                        redis,
+                        int(rt.analysis_id),
+                        str(direction),
+                        str(symbol),
+                        str(rt.timeframe),
+                        payload,
+                        int(rt.ttl_sec),
+                        meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), None),
+                    )
                     published_fail += 1
 
             log.warning("PACK_SET: runtime error (analysis_id=%s): %s", rt.analysis_id, e, exc_info=True)
@@ -922,7 +1326,7 @@ async def watch_indicator_stream(redis):
             await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
 
             # суммирующий лог по батчу
-            log.debug(
+            log.info(
                 "PACK_STREAM: batch done (msgs=%s, runtimes_total=%s, ok=%s, fail=%s, errors=%s)",
                 len(flat),
                 batch_runtimes,
@@ -934,6 +1338,7 @@ async def watch_indicator_stream(redis):
         except Exception as e:
             log.error("PACK_STREAM loop error: %s", e, exc_info=True)
             await asyncio.sleep(2)
+
 
 # 🔸 run worker
 async def run_indicator_pack(pg, redis):
