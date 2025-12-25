@@ -292,7 +292,7 @@ async def handle_mtf_pack_publish_all(redis, rt: PackRuntime, symbol: str, trigg
                 published_fail += 1
 
         if styk_m15 or styk_h1:
-            log.info(
+            log.debug(
                 "PACK_MTF: boundary wait → fail=%s (symbol=%s, analysis_id=%s, open_ts_ms=%s, styk_m15=%s, styk_h1=%s)",
                 published_fail,
                 symbol,
@@ -538,7 +538,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
             runtimes = filtered
 
             if before_n != len(runtimes):
-                log.info(
+                log.debug(
                     "PACK_SET: supertrend filter (symbol=%s, tf=%s, indicator=%s, series=%s) runtimes %s→%s",
                     symbol,
                     timeframe,
@@ -922,7 +922,7 @@ async def watch_indicator_stream(redis):
             await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
 
             # суммирующий лог по батчу
-            log.info(
+            log.debug(
                 "PACK_STREAM: batch done (msgs=%s, runtimes_total=%s, ok=%s, fail=%s, errors=%s)",
                 len(flat),
                 batch_runtimes,
