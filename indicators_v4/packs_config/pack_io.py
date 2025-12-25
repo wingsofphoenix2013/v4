@@ -1,4 +1,4 @@
-# packs_config/pack_io.py — consumer ind_pack_stream_core → запись ind_pack payload в PostgreSQL (state + events) с защитой от deadlock + pending replay + try advisory lock
+# packs_config/pack_io.py — consumer ind_pack_stream_core → запись ind_pack payload в PostgreSQL (state + events)
 
 from __future__ import annotations
 
@@ -9,22 +9,15 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-import asyncpg
-
 
 # 🔸 Константы Redis (stream источника)
 IND_PACK_STREAM_CORE = "ind_pack_stream_core"
 PACK_IO_GROUP = "ind_pack_io_group_v4"
 PACK_IO_CONSUMER = "ind_pack_io_1"
 
-# 🔸 Параметры чтения stream
+# 🔸 Параметры чтения и параллельной обработки stream
 STREAM_READ_COUNT = 500
 STREAM_BLOCK_MS = 2000
-
-# 🔸 Защита от deadlock/конкуренции
-PG_ADVISORY_LOCK_KEY = 84100421
-PG_WRITE_RETRY_ATTEMPTS = 8
-PG_WRITE_RETRY_DELAY_SEC = 0.35
 
 # 🔸 SQL (events)
 SQL_INSERT_EVENT = """
@@ -118,65 +111,16 @@ def _parse_payload(payload_json: Any) -> tuple[bool, str]:
       - payload_json_str (валидная JSON-строка для вставки в jsonb)
     """
     raw = "" if payload_json is None else str(payload_json)
+
+    # нормальный кейс: payload_json уже строка JSON
     try:
         obj = json.loads(raw)
         ok = bool(obj.get("ok", False))
         return ok, json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except Exception:
+        # fallback: сохраняем сырой payload, чтобы не терять данные
         obj = {"ok": False, "reason": "invalid_payload_json", "raw": raw}
         return False, json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
-# 🔸 DB write helper (try advisory lock + retry)
-async def _write_batch_pg(pg: Any, events_rows: list[tuple[Any, ...]], state_pair_rows: list[tuple[Any, ...]], state_static_rows: list[tuple[Any, ...]]):
-    log = logging.getLogger("PACK_IO")
-
-    # фиксируем порядок, чтобы уменьшить вероятность дедлоков на upsert
-    state_pair_rows.sort(key=lambda r: (r[0], r[1], r[2], r[3], r[4], r[5]))
-    state_static_rows.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
-
-    for attempt in range(1, PG_WRITE_RETRY_ATTEMPTS + 1):
-        try:
-            async with pg.acquire() as conn:
-                async with conn.transaction():
-                    # try-lock: не залипаем навсегда, если другой инстанс держит лок
-                    got = await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", int(PG_ADVISORY_LOCK_KEY))
-                    if not got:
-                        raise RuntimeError("advisory_lock_busy")
-
-                    # events
-                    if events_rows:
-                        await conn.executemany(SQL_INSERT_EVENT, events_rows)
-
-                    # state pair
-                    if state_pair_rows:
-                        await conn.executemany(SQL_UPSERT_STATE_PAIR, state_pair_rows)
-
-                    # state static
-                    if state_static_rows:
-                        await conn.executemany(SQL_UPSERT_STATE_STATIC, state_static_rows)
-
-            return
-
-        except asyncpg.exceptions.DeadlockDetectedError as e:
-            log.warning("PACK_IO: deadlock detected (attempt=%s/%s): %s", attempt, PG_WRITE_RETRY_ATTEMPTS, e)
-            if attempt >= PG_WRITE_RETRY_ATTEMPTS:
-                raise
-            await asyncio.sleep(PG_WRITE_RETRY_DELAY_SEC * attempt)
-
-        except RuntimeError as e:
-            # advisory_lock_busy → retry
-            if "advisory_lock_busy" in str(e):
-                if attempt == 1 or attempt % 3 == 0:
-                    log.info("PACK_IO: advisory lock busy, retrying (attempt=%s/%s)", attempt, PG_WRITE_RETRY_ATTEMPTS)
-                if attempt >= PG_WRITE_RETRY_ATTEMPTS:
-                    raise
-                await asyncio.sleep(PG_WRITE_RETRY_DELAY_SEC * attempt)
-                continue
-            raise
-
-        except Exception:
-            raise
 
 
 # 🔸 Основной воркер: stream → PG
@@ -188,25 +132,13 @@ async def run_pack_io(pg: Any, redis: Any):
 
     while True:
         try:
-            # сначала читаем pending (если после ошибок/рестартов что-то осталось в PEL)
             resp = await redis.xreadgroup(
                 PACK_IO_GROUP,
                 PACK_IO_CONSUMER,
-                streams={IND_PACK_STREAM_CORE: "0"},
+                streams={IND_PACK_STREAM_CORE: ">"},
                 count=STREAM_READ_COUNT,
-                block=1,
+                block=STREAM_BLOCK_MS,
             )
-
-            # если pending нет — читаем новые
-            if not resp:
-                resp = await redis.xreadgroup(
-                    PACK_IO_GROUP,
-                    PACK_IO_CONSUMER,
-                    streams={IND_PACK_STREAM_CORE: ">"},
-                    count=STREAM_READ_COUNT,
-                    block=STREAM_BLOCK_MS,
-                )
-
             if not resp:
                 continue
 
@@ -224,6 +156,7 @@ async def run_pack_io(pg: Any, redis: Any):
             to_ack: list[str] = []
 
             skipped = 0
+            parse_errors = 0
 
             for msg_id, data in flat:
                 to_ack.append(msg_id)
@@ -246,8 +179,11 @@ async def run_pack_io(pg: Any, redis: Any):
                 open_time_dt = _parse_open_time(data.get("open_time"))
 
                 ok, payload_str = _parse_payload(data.get("payload_json"))
+                if payload_str is None:
+                    parse_errors += 1
+                    continue
 
-                # events: пишем всегда
+                # events: пишем всегда (и для static, и для pair)
                 events_rows.append((
                     int(analysis_id),
                     int(scenario_id) if scenario_id is not None else None,
@@ -290,15 +226,26 @@ async def run_pack_io(pg: Any, redis: Any):
                         open_time_dt,
                     ))
 
-            # если нечего писать — ack и дальше
-            if not events_rows:
-                if to_ack:
-                    await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
+            # если нечего писать — просто ack и дальше
+            if not events_rows and to_ack:
+                await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
                 log.info("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
                 continue
 
-            # запись в PG (с защитой)
-            await _write_batch_pg(pg, events_rows, state_pair_rows, state_static_rows)
+            # запись в PG одной транзакцией
+            async with pg.acquire() as conn:
+                async with conn.transaction():
+                    # events
+                    if events_rows:
+                        await conn.executemany(SQL_INSERT_EVENT, events_rows)
+
+                    # state pair
+                    if state_pair_rows:
+                        await conn.executemany(SQL_UPSERT_STATE_PAIR, state_pair_rows)
+
+                    # state static
+                    if state_static_rows:
+                        await conn.executemany(SQL_UPSERT_STATE_STATIC, state_static_rows)
 
             # ack после успешной записи
             if to_ack:
@@ -306,12 +253,13 @@ async def run_pack_io(pg: Any, redis: Any):
 
             # суммирующий лог
             log.info(
-                "PACK_IO: batch done (msgs=%s, events=%s, state_pair=%s, state_static=%s, skipped=%s)",
+                "PACK_IO: batch done (msgs=%s, events=%s, state_pair=%s, state_static=%s, skipped=%s, parse_errors=%s)",
                 len(flat),
                 len(events_rows),
                 len(state_pair_rows),
                 len(state_static_rows),
                 skipped,
+                parse_errors,
             )
 
         except Exception as e:
