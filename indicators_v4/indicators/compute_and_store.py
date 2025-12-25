@@ -1,11 +1,11 @@
-# 🔸 indicators/compute_and_store.py
+# indicators/compute_and_store.py — расчёт индикаторов + запись в Redis KV/TS/Stream (core + ready)
 
 import logging
 import asyncio
 import math
 from datetime import datetime
 
-# импорт индикаторов оставляем как было + supertrend
+# 🔸 Импорт индикаторов (как было)
 from indicators import ema, atr, lr, mfi, rsi, adx_dmi, macd, bb, kama, supertrend
 
 # 🔸 Сопоставление имён индикаторов с функциями
@@ -22,6 +22,10 @@ INDICATOR_DISPATCH = {
     "supertrend": supertrend.compute,
 }
 
+# 🔸 Константы Redis (потоки)
+INDICATOR_STREAM_CORE = "indicator_stream_core"
+INDICATOR_STREAM_READY = "indicator_stream"
+
 
 def _is_finite_number(x) -> bool:
     try:
@@ -30,10 +34,27 @@ def _is_finite_number(x) -> bool:
         return False
 
 
+# 🔸 Построение базового имени (base) — как в системе v4
+def _build_base(indicator: str, params: dict) -> str:
+    if indicator == "macd":
+        return f"{indicator}{params['fast']}"
+    if "length" in params:
+        return f"{indicator}{params['length']}"
+    return indicator
+
+
+# 🔸 Уникальный идентификатор серии Supertrend (для indicator_stream ready)
+def _build_supertrend_source_param_name(params: dict) -> str:
+    length = params["length"]
+    mult_raw = round(float(params["mult"]), 2)
+    mult_str = str(mult_raw).replace(".", "_")
+    return f"supertrend{length}_{mult_str}"
+
+
 # 🔸 Расчёт и обработка результата одного расчётного экземпляра
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
     log = logging.getLogger("CALC")
-    log.debug(f"[TRACE] compute_and_store received precision={precision} for {symbol} (instance_id={instance_id})")
+    log.debug("[TRACE] compute_and_store received precision=%s for %s (instance_id=%s)", precision, symbol, instance_id)
 
     indicator = instance["indicator"]
     timeframe = instance["timeframe"]
@@ -42,50 +63,55 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     compute_fn = INDICATOR_DISPATCH.get(indicator)
     if compute_fn is None:
-        log.warning(f"⛔ Неизвестный индикатор: {indicator}")
+        log.warning("⛔ Неизвестный индикатор: %s", indicator)
         return
 
     try:
         raw_result = compute_fn(df, params)
+
         # округление
         result = {}
         for k, v in raw_result.items():
+            # фильтрация нечисловых / inf / nan
             if not _is_finite_number(v):
-                log.debug(f"[SKIP] {indicator} {symbol}/{timeframe} → {k} is non-finite ({v})")
+                log.debug("[SKIP] %s %s/%s → %s is non-finite (%s)", indicator, symbol, timeframe, k, v)
                 continue
+
+            # особая точность для angle
             if "angle" in k:
                 result[k] = round(float(v), 5)
             else:
                 result[k] = round(float(v), precision)
+
     except Exception as e:
-        log.error(f"Ошибка расчёта {indicator} id={instance_id}: {e}")
+        log.error("Ошибка расчёта %s id=%s: %s", indicator, instance_id, e, exc_info=True)
         return
 
     if not result:
-        log.debug(f"[SKIP] {indicator} {symbol}/{timeframe} → пустой результат после фильтрации")
+        log.debug("[SKIP] %s %s/%s → пустой результат после фильтрации", indicator, symbol, timeframe)
         return
 
-    log.debug(f"✅ {indicator.upper()} id={instance_id} {symbol}/{timeframe} → {result}")
+    log.debug("✅ %s id=%s %s/%s → %s", indicator.upper(), instance_id, symbol, timeframe, result)
 
     # 🔸 Базовое имя (label)
-    if indicator == "macd":
-        base = f"{indicator}{params['fast']}"
-    elif "length" in params:
-        base = f"{indicator}{params['length']}"
-    else:
-        base = indicator
+    base = _build_base(indicator, params)
 
-    tasks = []
-    # UTC-naive ISO без таймзоны
+    # 🔸 Время бара (UTC-naive ISO без таймзоны)
     open_time_iso = datetime.utcfromtimestamp(int(ts) / 1000).isoformat()
 
+    tasks = []
+    added_core = 0
+    added_kv = 0
+    added_ts = 0
+
     for param, value in result.items():
+        # приведение имён параметров (контракт param_name v4)
         if param.startswith(f"{base}_") or param == base:
             param_name = param
         else:
             param_name = f"{base}_{param}" if param != "value" else base
 
-        # Форматирование значения в строку по precision
+        # форматирование значения в строку по precision
         if "angle" in param_name:
             str_value = f"{value:.5f}"
         else:
@@ -94,6 +120,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         # Redis KV
         redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
         tasks.append(redis.set(redis_key, str_value))
+        added_kv += 1
 
         # Redis TS
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
@@ -104,30 +131,58 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         )
         if asyncio.iscoroutine(ts_add):
             tasks.append(ts_add)
+            added_ts += 1
 
         # Redis Stream (core)
         stream_precision = 5 if "angle" in param_name else precision
-        tasks.append(redis.xadd("indicator_stream_core", {
+        tasks.append(redis.xadd(INDICATOR_STREAM_CORE, {
             "symbol": symbol,
             "interval": timeframe,
             "instance_id": str(instance_id),
             "open_time": open_time_iso,
             "param_name": param_name,
             "value": str_value,
-            "precision": str(stream_precision)
+            "precision": str(stream_precision),
         }))
+        added_core += 1
 
     # Redis Stream (готовность)
     if stream:
-        tasks.append(redis.xadd("indicator_stream", {
+        ready_payload = {
             "symbol": symbol,
             "indicator": base,
             "timeframe": timeframe,
             "open_time": open_time_iso,
-            "status": "ready"
-        }))
+            "status": "ready",
+        }
 
-    await asyncio.gather(*tasks, return_exceptions=True)
+        # отдельная ветка: Supertrend → добавляем уникальный идентификатор серии (length+mult)
+        if indicator == "supertrend":
+            ready_payload["source_param_name"] = _build_supertrend_source_param_name(params)
+
+        tasks.append(redis.xadd(INDICATOR_STREAM_READY, ready_payload))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # суммирующий результат (по месту): логируем только если публиковали ready, чтобы не шуметь по всем инстансам
+    if stream:
+        errors = sum(1 for r in results if isinstance(r, Exception))
+        extra = ""
+        if indicator == "supertrend":
+            extra = f", source_param_name={_build_supertrend_source_param_name(params)}"
+        log.info(
+            "CALC: done (symbol=%s, tf=%s, indicator=%s, base=%s%s, params=%s, core=%s, kv=%s, ts=%s, errors=%s)",
+            symbol,
+            timeframe,
+            indicator,
+            base,
+            extra,
+            params,
+            added_core,
+            added_kv,
+            added_ts,
+            errors,
+        )
 
 
 # 🔸 Генерация ожидаемых имён параметров для индикатора
@@ -168,7 +223,6 @@ def get_expected_param_names(indicator: str, params: dict) -> list[str]:
 
 # 🔸 Чистый расчёт индикатора (без записи в Redis/PG/стримы)
 def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> dict[str, str]:
-
     log = logging.getLogger("SNAPSHOT")
 
     indicator = instance["indicator"]
@@ -176,13 +230,13 @@ def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> 
 
     compute_fn = INDICATOR_DISPATCH.get(indicator)
     if compute_fn is None:
-        log.warning(f"⛔ Неизвестный индикатор: {indicator}")
+        log.warning("⛔ Неизвестный индикатор: %s", indicator)
         return {}
 
     try:
         raw = compute_fn(df, params)
     except Exception as e:
-        log.error(f"Ошибка расчёта {indicator}: {e}")
+        log.error("Ошибка расчёта %s: %s", indicator, e, exc_info=True)
         return {}
 
     # округление + фильтрация нечисловых значений
@@ -198,18 +252,13 @@ def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> 
                 val = round(float(v), precision)
                 rounded[k] = f"{val:.{precision}f}"
         except Exception as e:
-            log.warning(f"[{indicator}] {symbol}: ошибка округления {k}={v} → {e}")
+            log.warning("[%s] %s: ошибка округления %s=%s → %s", indicator, symbol, k, v, e)
 
     if not rounded:
         return {}
 
     # 🔸 Построение базового имени (base), как в compute_and_store
-    if indicator == "macd":
-        base = f"{indicator}{params['fast']}"
-    elif "length" in params:
-        base = f"{indicator}{params['length']}"
-    else:
-        base = indicator
+    base = _build_base(indicator, params)
 
     # 🔸 Приведение имён параметров
     out: dict[str, str] = {}

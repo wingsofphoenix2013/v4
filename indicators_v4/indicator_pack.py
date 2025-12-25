@@ -479,6 +479,7 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
     indicator_key = msg.get("indicator")
     status = msg.get("status")
     open_time = msg.get("open_time")
+    source_param_name = msg.get("source_param_name")
 
     # invalid_trigger_event: если нельзя построить ключи (нет symbol/timeframe/indicator) — в Redis не пишем
     if not symbol or not timeframe or not indicator_key:
@@ -488,6 +489,68 @@ async def handle_indicator_event(redis, msg: dict[str, Any]) -> dict[str, int]:
     runtimes = pack_registry.get((str(timeframe), str(indicator_key)))
     if not runtimes:
         return {"ok": 0, "fail": 0, "runtimes": 0}
+
+    # supertrend: если есть source_param_name из stream — фильтруем runtimes до точной серии (length+mult)
+    if str(indicator_key).startswith("supertrend") and source_param_name:
+        # нормализация серии: supertrend7_2_5_trend -> supertrend7_2_5
+        def _st_series(p: Any) -> str | None:
+            s = str(p or "").strip()
+            if not s:
+                return None
+            if s.endswith("_trend"):
+                return s[:-6]
+            return s
+
+        stream_series = _st_series(source_param_name)
+
+        # условия достаточности
+        if stream_series:
+            before_n = len(runtimes)
+            filtered: list[PackRuntime] = []
+
+            for rt in runtimes:
+                # MTF: проверяем, что в component_params встречается нужная серия
+                if rt.is_mtf:
+                    spec = rt.mtf_component_params or {}
+                    found = False
+
+                    for _, tf_spec in spec.items():
+                        if isinstance(tf_spec, str):
+                            if _st_series(tf_spec) == stream_series:
+                                found = True
+                                break
+                        elif isinstance(tf_spec, dict):
+                            for _, p in tf_spec.items():
+                                if _st_series(p) == stream_series:
+                                    found = True
+                                    break
+                            if found:
+                                break
+
+                    if found:
+                        filtered.append(rt)
+
+                # single-TF: сравниваем rt.source_param_name с серией
+                else:
+                    if _st_series(getattr(rt, "source_param_name", None)) == stream_series:
+                        filtered.append(rt)
+
+            runtimes = filtered
+
+            if before_n != len(runtimes):
+                log.info(
+                    "PACK_SET: supertrend filter (symbol=%s, tf=%s, indicator=%s, series=%s) runtimes %s→%s",
+                    symbol,
+                    timeframe,
+                    indicator_key,
+                    stream_series,
+                    before_n,
+                    len(runtimes),
+                )
+
+            # если после фильтра ничего не осталось — считаем, что матчей нет
+            if not runtimes:
+                return {"ok": 0, "fail": 0, "runtimes": 0}
 
     open_ts_ms = parse_open_time_to_open_ts_ms(str(open_time) if open_time is not None else None)
 
@@ -816,6 +879,7 @@ async def watch_indicator_stream(redis):
                 "indicator": data.get("indicator"),
                 "open_time": data.get("open_time"),
                 "status": data.get("status"),
+                "source_param_name": data.get("source_param_name"),
             }
             return await handle_indicator_event(redis, msg)
 
