@@ -1,4 +1,4 @@
-# packs_config/pack_io.py — consumer ind_pack_stream_core → запись ind_pack payload в PostgreSQL (state + events) с защитой от deadlock + обработка pending
+# packs_config/pack_io.py — consumer ind_pack_stream_core → запись ind_pack payload в PostgreSQL (state + events) с защитой от deadlock + pending replay + try advisory lock
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ STREAM_BLOCK_MS = 2000
 
 # 🔸 Защита от deadlock/конкуренции
 PG_ADVISORY_LOCK_KEY = 84100421
-PG_WRITE_RETRY_ATTEMPTS = 5
-PG_WRITE_RETRY_DELAY_SEC = 0.4
+PG_WRITE_RETRY_ATTEMPTS = 8
+PG_WRITE_RETRY_DELAY_SEC = 0.35
 
 # 🔸 SQL (events)
 SQL_INSERT_EVENT = """
@@ -127,12 +127,11 @@ def _parse_payload(payload_json: Any) -> tuple[bool, str]:
         return False, json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-# 🔸 DB write helper (с advisory lock + retry)
+# 🔸 DB write helper (try advisory lock + retry)
 async def _write_batch_pg(pg: Any, events_rows: list[tuple[Any, ...]], state_pair_rows: list[tuple[Any, ...]], state_static_rows: list[tuple[Any, ...]]):
     log = logging.getLogger("PACK_IO")
 
-    # чтобы уменьшить вероятность дедлоков между конкурентными процессами — фиксируем порядок апсертов
-    # (одинаковый порядок захвата строк)
+    # фиксируем порядок, чтобы уменьшить вероятность дедлоков на upsert
     state_pair_rows.sort(key=lambda r: (r[0], r[1], r[2], r[3], r[4], r[5]))
     state_static_rows.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
 
@@ -140,8 +139,10 @@ async def _write_batch_pg(pg: Any, events_rows: list[tuple[Any, ...]], state_pai
         try:
             async with pg.acquire() as conn:
                 async with conn.transaction():
-                    # сериализуем записи между инстансами воркера (лучше, чем ловить дедлоки)
-                    await conn.execute("SELECT pg_advisory_xact_lock($1)", int(PG_ADVISORY_LOCK_KEY))
+                    # try-lock: не залипаем навсегда, если другой инстанс держит лок
+                    got = await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", int(PG_ADVISORY_LOCK_KEY))
+                    if not got:
+                        raise RuntimeError("advisory_lock_busy")
 
                     # events
                     if events_rows:
@@ -158,14 +159,23 @@ async def _write_batch_pg(pg: Any, events_rows: list[tuple[Any, ...]], state_pai
             return
 
         except asyncpg.exceptions.DeadlockDetectedError as e:
-            # дедлок → retry
             log.warning("PACK_IO: deadlock detected (attempt=%s/%s): %s", attempt, PG_WRITE_RETRY_ATTEMPTS, e)
             if attempt >= PG_WRITE_RETRY_ATTEMPTS:
                 raise
             await asyncio.sleep(PG_WRITE_RETRY_DELAY_SEC * attempt)
 
+        except RuntimeError as e:
+            # advisory_lock_busy → retry
+            if "advisory_lock_busy" in str(e):
+                if attempt == 1 or attempt % 3 == 0:
+                    log.info("PACK_IO: advisory lock busy, retrying (attempt=%s/%s)", attempt, PG_WRITE_RETRY_ATTEMPTS)
+                if attempt >= PG_WRITE_RETRY_ATTEMPTS:
+                    raise
+                await asyncio.sleep(PG_WRITE_RETRY_DELAY_SEC * attempt)
+                continue
+            raise
+
         except Exception:
-            # прочие ошибки — не ретраим бесконечно, просто пробрасываем
             raise
 
 
@@ -237,7 +247,7 @@ async def run_pack_io(pg: Any, redis: Any):
 
                 ok, payload_str = _parse_payload(data.get("payload_json"))
 
-                # events: пишем всегда (и для static, и для pair)
+                # events: пишем всегда
                 events_rows.append((
                     int(analysis_id),
                     int(scenario_id) if scenario_id is not None else None,
@@ -280,7 +290,7 @@ async def run_pack_io(pg: Any, redis: Any):
                         open_time_dt,
                     ))
 
-            # если нечего писать — просто ack и дальше
+            # если нечего писать — ack и дальше
             if not events_rows:
                 if to_ack:
                     await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
