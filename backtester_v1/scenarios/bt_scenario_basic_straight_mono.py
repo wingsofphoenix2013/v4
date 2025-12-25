@@ -187,6 +187,17 @@ async def run_basic_straight_mono_backfill(
         )
         return
 
+    # допустимые направления (если сигнал моно-направленный — не генерим статистику для другой стороны)
+    allowed_directions: List[str] = ["long", "short"]
+    try:
+        sig_params = signal_instance.get("params") or {}
+        dm_cfg = sig_params.get("direction_mask")
+        dm_val = str((dm_cfg or {}).get("value") or "").strip().lower()
+        if dm_val in ("long", "short"):
+            allowed_directions = [dm_val]
+    except Exception:
+        allowed_directions = ["long", "short"]
+
     # граница для инкрементальной досимуляции open позиций (предыдущий run.to_time)
     prev_to_time = await _load_previous_run_to_time(pg, signal_id, run_id_i)
     if prev_to_time is None:
@@ -217,7 +228,7 @@ async def run_basic_straight_mono_backfill(
     total_errors = 0
 
     # 🔸 1) Досимулируем и закрываем open позиции (если закрылись в новом хвосте)
-    for direction in ("long", "short"):
+    for direction in allowed_directions:
         open_positions = await _load_open_positions(pg, scenario_id, signal_id, timeframe, direction)
         total_open_before += len(open_positions)
 
@@ -258,8 +269,7 @@ async def run_basic_straight_mono_backfill(
         signals.sort(key=lambda s: s["open_time"])
 
     # обрабатываем long и short как две независимые вселенные с одинаковым deposit
-    for direction in ("long", "short"):
-        # позиции для контроля маржи/активности на момент сигнала (включая open и closed)
+    for direction in allowed_directions:
         existing_positions = await _load_positions_for_margin(pg, scenario_id, signal_id, timeframe, direction, from_time, to_time)
         new_positions_for_margin: List[Dict[str, Any]] = []
 
@@ -510,7 +520,7 @@ async def run_basic_straight_mono_backfill(
 
     # 🔸 3) Пересчёт daily по дням закрытия (status='closed' + exit_time::date)
     if affected_days:
-        await _recalc_daily_stats(pg, scenario_id, signal_id, deposit, affected_days)
+        await _recalc_daily_stats(pg, scenario_id, signal_id, deposit, affected_days, allowed_directions)
 
     # 🔸 4) Пересчёт bt_scenario_stat: all_time + run (по закрытым сделкам)
     await _recalc_total_stats_all_time_and_run(
@@ -521,6 +531,7 @@ async def run_basic_straight_mono_backfill(
         run_id=run_id_i,
         run_from=from_time,
         run_to=to_time,
+        directions=allowed_directions,
     )
 
     log.info(
@@ -1310,13 +1321,14 @@ async def _recalc_daily_stats(
     signal_id: int,
     deposit: Decimal,
     days: Set[date],
+    directions: List[str],
 ) -> None:
     if not days:
         return
 
     async with pg.acquire() as conn:
         for d in sorted(days):
-            for direction in ("long", "short"):
+            for direction in directions:
                 row = await conn.fetchrow(
                     """
                     SELECT
@@ -1405,9 +1417,10 @@ async def _recalc_total_stats_all_time_and_run(
     run_id: int,
     run_from: datetime,
     run_to: datetime,
+    directions: List[str],
 ) -> None:
     async with pg.acquire() as conn:
-        for direction in ("long", "short"):
+        for direction in directions:
             # run-stat: закрыто в этом run (closed_run_id=run_id)
             row_run = await conn.fetchrow(
                 """
@@ -1418,16 +1431,17 @@ async def _recalc_total_stats_all_time_and_run(
                     COALESCE(AVG(max_favorable_excursion), 0)        AS mfe_avg,
                     COALESCE(AVG(max_adverse_excursion), 0)          AS mae_avg
                 FROM bt_scenario_positions
-                WHERE scenario_id   = $1
-                  AND signal_id     = $2
-                  AND direction     = $3
-                  AND status        = 'closed'
-                  AND closed_run_id = $4
+                WHERE scenario_id = $1
+                  AND signal_id   = $2
+                  AND direction   = $3
+                  AND status      = 'closed'
+                  AND entry_time BETWEEN $4 AND $5
                 """,
                 scenario_id,
                 signal_id,
                 direction,
-                run_id,
+                run_from,
+                run_to,
             )
 
             trades_run = int(row_run["trades"] or 0) if row_run else 0
