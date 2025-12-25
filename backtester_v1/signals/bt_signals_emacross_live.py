@@ -9,8 +9,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # 🔸 Кеши backtester_v1
 from backtester_config import get_indicator_instance, get_ticker_info
 
-# 🔸 Кеш label-bins (good/bad) для mirror-фильтрации
-from bt_signals_cache_config import get_mirror_label_cache, load_initial_mirror_caches
+# 🔸 Кеш label-bins (good/bad) для mirror-фильтрации (+ applied_run_id)
+from bt_signals_cache_config import (
+    get_mirror_label_cache,
+    get_mirror_run_id,
+    load_initial_mirror_caches,
+)
 
 log = logging.getLogger("BT_SIG_EMA_CROSS_LIVE")
 
@@ -240,7 +244,7 @@ async def init_emacross_live(
         )
         filter_workers.append(task)
 
-    log.info(
+    log.debug(
         "BT_SIG_EMA_CROSS_LIVE: init ok — signals=%s (raw=%s, filtered=%s), tf=%s, fast=%s(id=%s), slow=%s(id=%s), trigger=%s, "
         "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
         len(cfgs),
@@ -381,7 +385,12 @@ async def handle_emacross_indicator_ready(
         if fast_val is None or slow_val is None:
             details = {
                 "event": {"symbol": symbol, "indicator": indicator_base, "timeframe": timeframe, "open_time": open_time_iso},
-                "ts": {"ts_ms": ts_ms, "decision_ms": decision_ms, "open_time": open_time.isoformat(), "decision_time": decision_time.isoformat()},
+                "ts": {
+                    "ts_ms": ts_ms,
+                    "decision_ms": decision_ms,
+                    "open_time": open_time.isoformat(),
+                    "decision_time": decision_time.isoformat(),
+                },
                 "reason": "data_missing",
                 "missing": {"fast": fast_val is None, "slow": slow_val is None},
                 "fast_key": fast_key,
@@ -416,7 +425,12 @@ async def handle_emacross_indicator_ready(
 
         details_base = {
             "event": {"symbol": symbol, "indicator": indicator_base, "timeframe": timeframe, "open_time": open_time_iso},
-            "ts": {"ts_ms": ts_ms, "decision_ms": decision_ms, "open_time": open_time.isoformat(), "decision_time": decision_time.isoformat()},
+            "ts": {
+                "ts_ms": ts_ms,
+                "decision_ms": decision_ms,
+                "open_time": open_time.isoformat(),
+                "decision_time": decision_time.isoformat(),
+            },
             "ema": {
                 "fast": float(fast_val),
                 "slow": float(slow_val),
@@ -562,7 +576,12 @@ async def handle_emacross_indicator_ready(
                                 "message": message,
                                 "source": "backtester_v1",
                                 "mode": "live_raw",
-                                "ema": {"fast": float(fast_val), "slow": float(slow_val), "diff": float(diff), "epsilon": float(epsilon)},
+                                "ema": {
+                                    "fast": float(fast_val),
+                                    "slow": float(slow_val),
+                                    "diff": float(diff),
+                                    "epsilon": float(epsilon),
+                                },
                             },
                         }
                     )
@@ -601,6 +620,12 @@ async def handle_emacross_indicator_ready(
                     inst_dir,
                 )
 
+            applied_run_id = get_mirror_run_id(
+                int(mirror_scenario_id),
+                int(mirror_signal_id),
+                inst_dir,
+            )
+
             # для работы фильтра нужен хотя бы один good (bad может быть пустым)
             if not required_pairs or not good_bins_map:
                 await _upsert_live_log(
@@ -613,8 +638,14 @@ async def handle_emacross_indicator_ready(
                     status="blocked_missing_keys_timeout",
                     details={
                         **details_base,
-                        "signal": {"signal_id": signal_id, "direction": inst_dir, "message": message, "filtered": True},
-                        "filter": {"reason": "mirror_cache_empty"},
+                        "signal": {
+                            "signal_id": signal_id,
+                            "direction": inst_dir,
+                            "message": message,
+                            "filtered": True,
+                            "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
+                        },
+                        "filter": {"reason": "mirror_cache_empty", "applied_run_id": applied_run_id},
                     },
                 )
                 ctx["counters"]["blocked_timeout"] = int(ctx["counters"].get("blocked_timeout", 0)) + 1
@@ -644,6 +675,7 @@ async def handle_emacross_indicator_ready(
                         "deadline_sec": FILTER_WAIT_TOTAL_SEC,
                         "step_sec": FILTER_WAIT_STEP_SEC,
                         "require_good": True,
+                        "applied_run_id": applied_run_id,
                     },
                 },
             )
@@ -658,6 +690,7 @@ async def handle_emacross_indicator_ready(
                 "message": message,
                 "mirror_scenario_id": int(mirror_scenario_id),
                 "mirror_signal_id": int(mirror_signal_id),
+                "applied_run_id": applied_run_id,
                 "required_pairs": set(required_pairs),
                 "bad_bins_map": {k: set(v) for k, v in (bad_bins_map or {}).items()},
                 "good_bins_map": {k: set(v) for k, v in (good_bins_map or {}).items()},
@@ -686,7 +719,7 @@ async def handle_emacross_indicator_ready(
                             "filtered": True,
                             "mirror": {"scenario_id": int(mirror_scenario_id), "signal_id": int(mirror_signal_id)},
                         },
-                        "filter": {"rule": "dropped_overload", "queue_maxsize": FILTER_QUEUE_MAXSIZE},
+                        "filter": {"rule": "dropped_overload", "queue_maxsize": FILTER_QUEUE_MAXSIZE, "applied_run_id": applied_run_id},
                     },
                 )
                 ctx["counters"]["dropped_overload"] = int(ctx["counters"].get("dropped_overload", 0)) + 1
@@ -719,6 +752,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
 
     mirror_scenario_id = int(c["mirror_scenario_id"])
     mirror_signal_id = int(c["mirror_signal_id"])
+    applied_run_id = c.get("applied_run_id")
 
     required_pairs: Set[Tuple[int, str]] = set(c.get("required_pairs") or set())
     bad_bins_map: Dict[Tuple[int, str], Set[str]] = c.get("bad_bins_map") or {}
@@ -748,7 +782,12 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     "filtered": True,
                     "mirror": {"scenario_id": mirror_scenario_id, "signal_id": mirror_signal_id},
                 },
-                "filter": {"rule": "dropped_stale_backlog", "queue_delay_sec": float(queue_delay_sec), "stale_max_sec": STALE_MAX_SEC},
+                "filter": {
+                    "rule": "dropped_stale_backlog",
+                    "queue_delay_sec": float(queue_delay_sec),
+                    "stale_max_sec": STALE_MAX_SEC,
+                    "applied_run_id": applied_run_id,
+                },
             },
         )
         return
@@ -833,6 +872,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                                         "reason": str(fail_reason) if fail_reason is not None else None,
                                         "details": fail_details if isinstance(fail_details, dict) else {},
                                     },
+                                    "applied_run_id": applied_run_id,
                                 },
                             },
                         )
@@ -877,6 +917,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                             "found_total": len(found_bins),
                             "missing_total": required_total - len(found_bins),
                             "hit": {"analysis_id": int(aid), "timeframe": tf, "bin_name": bn},
+                            "applied_run_id": applied_run_id,
                         },
                     },
                 )
@@ -913,6 +954,7 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                             "found_total": len(found_bins),
                             "missing_total": 0,
                             "good_hit": False,
+                            "applied_run_id": applied_run_id,
                         },
                         "result": {"passed": False, "status": "blocked_no_good_bin"},
                     },
@@ -941,12 +983,13 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                         "attempt": attempt,
                         "required_total": required_total,
                         "good_hit": True,
+                        "applied_run_id": applied_run_id,
                     },
                     "result": {"passed": True, "status": "signal_sent"},
                 },
             )
             if should_send:
-                await _publish_to_signals_stream(redis, symbol, open_time, message)
+                await _publish_to_signals_stream(redis, symbol, open_time, message, applied_run_id)
             return
 
         attempt += 1
@@ -996,35 +1039,45 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                 "missing_total": required_total - len(found_bins),
                 "missing_absent": [{"analysis_id": int(a), "timeframe": tf} for a, tf in missing_absent],
                 "missing_explained": missing_explained,
+                "applied_run_id": applied_run_id,
             },
         },
     )
 
 
 # 🔸 Публикация filtered-live сигнала в signals_stream
-async def _publish_to_signals_stream(redis, symbol: str, open_time: datetime, message: str) -> None:
+async def _publish_to_signals_stream(
+    redis,
+    symbol: str,
+    open_time: datetime,
+    message: str,
+    mirror_run_id: Optional[int],
+) -> None:
     now_iso = datetime.utcnow().isoformat()
     bar_time_iso = open_time.isoformat()
 
+    payload: Dict[str, str] = {
+        "message": message,
+        "symbol": symbol,
+        "bar_time": bar_time_iso,
+        "sent_at": now_iso,
+        "received_at": now_iso,
+        "source": "backtester_v1",
+    }
+
+    if mirror_run_id is not None:
+        payload["mirror_run_id"] = str(int(mirror_run_id))
+
     try:
-        await redis.xadd(
-            "signals_stream",
-            {
-                "message": message,
-                "symbol": symbol,
-                "bar_time": bar_time_iso,
-                "sent_at": now_iso,
-                "received_at": now_iso,
-                "source": "backtester_v1",
-            },
-        )
+        await redis.xadd("signals_stream", payload)
     except Exception as e:
         log.error(
-            "BT_SIG_EMA_CROSS_LIVE: failed to publish to signals_stream: %s (symbol=%s, time=%s, msg=%s)",
+            "BT_SIG_EMA_CROSS_LIVE: failed to publish to signals_stream: %s (symbol=%s, time=%s, msg=%s, mirror_run_id=%s)",
             e,
             symbol,
             bar_time_iso,
             message,
+            mirror_run_id,
             exc_info=True,
         )
 

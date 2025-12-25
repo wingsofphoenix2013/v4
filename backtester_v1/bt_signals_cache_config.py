@@ -1,8 +1,7 @@
-# bt_signals_cache_config.py — кеш фильтров live-сигналов (good/bad bins) по mirror (scenario_id/signal_id) для backtester_v1
+# bt_signals_cache_config.py — кеш фильтров live-сигналов (good/bad bins) по mirror (scenario_id/signal_id/run_id) для backtester_v1
 
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 🔸 Кеши и конфиг backtester_v1
@@ -18,10 +17,11 @@ CACHE_CONSUMER_NAME = "bt_signals_cache_main"
 CACHE_STREAM_BATCH_SIZE = 50
 CACHE_STREAM_BLOCK_MS = 5000
 
-# 🔸 Кеш: ключ (scenario_id, signal_id, direction) -> label bins (good/bad)
+# 🔸 Кеш: ключ (scenario_id, signal_id, direction) -> label bins (good/bad) + текущий run_id
 bt_mirror_required_pairs: Dict[Tuple[int, int, str], Set[Tuple[int, str]]] = {}
 bt_mirror_bad_bins_map: Dict[Tuple[int, int, str], Dict[Tuple[int, str], Set[str]]] = {}
 bt_mirror_good_bins_map: Dict[Tuple[int, int, str], Dict[Tuple[int, str], Set[str]]] = {}
+bt_mirror_run_id: Dict[Tuple[int, int, str], int] = {}
 
 # 🔸 Индекс активных mirror-пар (чтобы не грузить лишнее)
 _active_mirrors: Set[Tuple[int, int, str]] = set()
@@ -43,6 +43,17 @@ def get_mirror_label_cache(
         bt_mirror_bad_bins_map.get(key),
         bt_mirror_good_bins_map.get(key),
     )
+
+
+# 🔸 Публичный геттер: получить применяемый run_id для mirror
+def get_mirror_run_id(
+    mirror_scenario_id: int,
+    mirror_signal_id: int,
+    direction: str,
+) -> Optional[int]:
+    key = (int(mirror_scenario_id), int(mirror_signal_id), str(direction).strip().lower())
+    return bt_mirror_run_id.get(key)
+
 
 # 🔸 Публичный геттер (backward-compatible): получить кеш bad bins для mirror (scenario_id, signal_id, direction)
 def get_mirror_bad_cache(
@@ -92,7 +103,8 @@ def rebuild_active_mirrors_index() -> Set[Tuple[int, int, str]]:
     _active_mirrors = mirrors
     return mirrors
 
-# 🔸 Публичный метод: начальная загрузка кеша только для активных mirrors
+
+# 🔸 Публичный метод: начальная загрузка кеша только для активных mirrors (берём последний run_id из labels)
 async def load_initial_mirror_caches(pg) -> None:
     mirrors = rebuild_active_mirrors_index()
 
@@ -106,8 +118,13 @@ async def load_initial_mirror_caches(pg) -> None:
     total_good_bins = 0
 
     for (sc_id, sig_id, direction) in sorted(mirrors):
-        req, bad_map, good_map = await _load_label_bins_for_pair(pg, sc_id, sig_id, direction)
-        _store_cache(sc_id, sig_id, direction, req, bad_map, good_map)
+        run_id = await _load_latest_run_id_for_pair(pg, sc_id, sig_id, direction)
+        if run_id is None:
+            continue
+
+        req, bad_map, good_map = await _load_label_bins_for_pair(pg, sc_id, sig_id, direction, run_id)
+        _store_cache(sc_id, sig_id, direction, req, bad_map, good_map, run_id)
+
         loaded += 1
         total_required += len(req)
         total_bad_bins += sum(len(v) for v in bad_map.values())
@@ -120,6 +137,7 @@ async def load_initial_mirror_caches(pg) -> None:
         total_bad_bins,
         total_good_bins,
     )
+
 
 # 🔸 Воркер обновления кеша по стриму bt:analysis:postproc_ready
 async def run_bt_signals_cache_watcher(pg, redis) -> None:
@@ -157,6 +175,7 @@ async def run_bt_signals_cache_watcher(pg, redis) -> None:
 
                     scenario_id = ctx["scenario_id"]
                     signal_id = ctx["signal_id"]
+                    run_id = ctx["run_id"]
                     source_finished_at = ctx["source_finished_at"]
 
                     # обновляем индекс активных mirrors (на случай добавления/отключения live-инстансов)
@@ -175,15 +194,16 @@ async def run_bt_signals_cache_watcher(pg, redis) -> None:
                         continue
 
                     for (sc_id, sig_id, direction) in targets:
-                        req, bad_map, good_map = await _load_label_bins_for_pair(pg, sc_id, sig_id, direction)
-                        _store_cache(sc_id, sig_id, direction, req, bad_map, good_map)
+                        req, bad_map, good_map = await _load_label_bins_for_pair(pg, sc_id, sig_id, direction, run_id)
+                        _store_cache(sc_id, sig_id, direction, req, bad_map, good_map, run_id)
                         refreshed += 1
 
                         log.info(
-                            "BT_SIG_CACHE: cache refreshed — mirror=%s:%s:%s, required_pairs=%s, bad_bins=%s, good_bins=%s, source_finished_at=%s",
+                            "BT_SIG_CACHE: cache refreshed — mirror=%s:%s:%s, run_id=%s, required_pairs=%s, bad_bins=%s, good_bins=%s, source_finished_at=%s",
                             sc_id,
                             sig_id,
                             direction,
+                            run_id,
                             len(req),
                             sum(len(v) for v in bad_map.values()),
                             sum(len(v) for v in good_map.values()),
@@ -237,7 +257,7 @@ async def _ensure_consumer_group(redis) -> None:
             raise
 
 
-# 🔸 Парсинг сообщения postproc_ready
+# 🔸 Парсинг сообщения postproc_ready (run-aware)
 def _parse_postproc_ready(fields: Dict[Any, Any]) -> Optional[Dict[str, Any]]:
     try:
         # redis может вернуть bytes
@@ -248,6 +268,7 @@ def _parse_postproc_ready(fields: Dict[Any, Any]) -> Optional[Dict[str, Any]]:
 
         scenario_id = int(_s(fields.get("scenario_id")))
         signal_id = int(_s(fields.get("signal_id")))
+        run_id = int(_s(fields.get("run_id")))
 
         sf = fields.get("source_finished_at")
         source_finished_at = _s(sf) if sf is not None else None
@@ -255,17 +276,53 @@ def _parse_postproc_ready(fields: Dict[Any, Any]) -> Optional[Dict[str, Any]]:
         return {
             "scenario_id": scenario_id,
             "signal_id": signal_id,
+            "run_id": run_id,
             "source_finished_at": source_finished_at,
         }
     except Exception:
         return None
 
-# 🔸 Загрузка label bins (good/bad) из bt_analysis_bins_labels для mirror-пары и direction
+
+# 🔸 Загрузка последнего run_id для mirror-пары из labels (state=good/bad)
+async def _load_latest_run_id_for_pair(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+) -> Optional[int]:
+    direction_l = str(direction).strip().lower()
+
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT MAX(run_id) AS run_id
+            FROM bt_analysis_bins_labels
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND direction   = $3
+              AND state      IN ('bad', 'good')
+            """,
+            int(scenario_id),
+            int(signal_id),
+            direction_l,
+        )
+
+    if not row or row["run_id"] is None:
+        return None
+
+    try:
+        return int(row["run_id"])
+    except Exception:
+        return None
+
+
+# 🔸 Загрузка label bins (good/bad) из bt_analysis_bins_labels для mirror-пары и direction, строго по run_id
 async def _load_label_bins_for_pair(
     pg,
     scenario_id: int,
     signal_id: int,
     direction: str,
+    run_id: int,
 ) -> Tuple[
     Set[Tuple[int, str]],
     Dict[Tuple[int, str], Set[str]],
@@ -281,11 +338,13 @@ async def _load_label_bins_for_pair(
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND direction   = $3
+              AND run_id      = $4
               AND state      IN ('bad', 'good')
             """,
             int(scenario_id),
             int(signal_id),
             direction_l,
+            int(run_id),
         )
 
     required_pairs: Set[Tuple[int, str]] = set()
@@ -311,7 +370,8 @@ async def _load_label_bins_for_pair(
 
     return required_pairs, bad_bins_map, good_bins_map
 
-# 🔸 Сохранение кеша
+
+# 🔸 Сохранение кеша (включая применяемый run_id)
 def _store_cache(
     scenario_id: int,
     signal_id: int,
@@ -319,8 +379,10 @@ def _store_cache(
     required_pairs: Set[Tuple[int, str]],
     bad_bins_map: Dict[Tuple[int, str], Set[str]],
     good_bins_map: Dict[Tuple[int, str], Set[str]],
+    run_id: int,
 ) -> None:
     key = (int(scenario_id), int(signal_id), str(direction).strip().lower())
     bt_mirror_required_pairs[key] = set(required_pairs)
     bt_mirror_bad_bins_map[key] = {k: set(v) for k, v in bad_bins_map.items()}
     bt_mirror_good_bins_map[key] = {k: set(v) for k, v in good_bins_map.items()}
+    bt_mirror_run_id[key] = int(run_id)
