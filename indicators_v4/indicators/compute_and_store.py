@@ -170,7 +170,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         extra = ""
         if indicator == "supertrend":
             extra = f", source_param_name={_build_supertrend_source_param_name(params)}"
-        log.info(
+        log.debug(
             "CALC: done (symbol=%s, tf=%s, indicator=%s, base=%s%s, params=%s, core=%s, kv=%s, ts=%s, errors=%s)",
             symbol,
             timeframe,
