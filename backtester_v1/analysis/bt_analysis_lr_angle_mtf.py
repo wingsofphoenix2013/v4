@@ -52,7 +52,7 @@ async def run_lr_angle_mtf_analysis(
     min_share = _get_decimal_param(params, "min_share", DEFAULT_MIN_SHARE)
 
     if analysis_id is None or scenario_id is None or signal_id is None or run_id is None:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_MTF: анализ пропущен (нет обязательных id) analysis_id=%s, scenario_id=%s, signal_id=%s",
             analysis_id,
             scenario_id,
@@ -87,7 +87,7 @@ async def run_lr_angle_mtf_analysis(
 
     # условия достаточности словаря
     if not bins_h1_by_dir or not bins_m15_by_dir:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_MTF: анализ пропущен (нет биннов H1/M15 в bt_analysis_bins_dict) "
             "analysis_id=%s, scenario_id=%s, signal_id=%s, bins_h1=%s, bins_m15=%s",
             analysis_id,
@@ -112,7 +112,7 @@ async def run_lr_angle_mtf_analysis(
 
     positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id), window_from, window_to)
     if not positions:
-        log.info(
+        log.debug(
             "BT_ANALYSIS_LR_ANGLE_MTF: нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s",
             analysis_id,
             scenario_id,
@@ -317,7 +317,7 @@ async def run_lr_angle_mtf_analysis(
             exc_info=True,
         )
 
-    log.info(
+    log.debug(
         "BT_ANALYSIS_LR_ANGLE_MTF: завершено analysis_id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s — "
         "lr_prefix=%s, min_share=%s, pos_total=%s, used=%s, skipped=%s, groups=%s, rows=%s, adaptive_quantiles=%s",
         analysis_id,
