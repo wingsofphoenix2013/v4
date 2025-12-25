@@ -34,6 +34,10 @@ async def run_bb_mtf_analysis(
     scenario_id = analysis_ctx.get("scenario_id")
     signal_id = analysis_ctx.get("signal_id")
 
+    # run-aware поля
+    run_id = analysis_ctx.get("run_id")
+    run_finished_at = analysis_ctx.get("run_finished_at")
+
     # параметры анализатора
     min_share = _get_decimal_param(params, "min_share", DEFAULT_MIN_SHARE)
 
@@ -45,7 +49,7 @@ async def run_bb_mtf_analysis(
     else:
         bb_key = DEFAULT_BB_KEY
 
-    if analysis_id is None or scenario_id is None or signal_id is None:
+    if analysis_id is None or scenario_id is None or signal_id is None or run_id is None:
         log.debug(
             "BT_ANALYSIS_BB_MTF: анализ пропущен (нет обязательных id) analysis_id=%s, scenario_id=%s, signal_id=%s",
             analysis_id,
@@ -100,8 +104,11 @@ async def run_bb_mtf_analysis(
             },
         }
 
-    # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (postproc=true)
-    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
+    # загружаем позиции окна run (status=closed + postproc=true) — строго в границах window_from/window_to
+    window_from = analysis_ctx.get("window_from")
+    window_to = analysis_ctx.get("window_to")
+
+    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id), window_from, window_to)
     if not positions:
         log.debug(
             "BT_ANALYSIS_BB_MTF: нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s",
@@ -224,8 +231,8 @@ async def run_bb_mtf_analysis(
 
     rows: List[Dict[str, Any]] = []
 
-    # source_finished_at для записи adaptive dict на этот проход
-    source_finished_at = datetime.utcnow()
+    # source_finished_at — единый по run: bt_signal_backfill_runs.finished_at
+    source_finished_at = run_finished_at if isinstance(run_finished_at, datetime) else datetime.utcnow()
 
     # собираем адаптивные квантили для записи в bt_analysis_bin_dict_adaptive
     adaptive_to_store: List[Tuple[int, str, int, int, int, Decimal, Decimal, bool]] = []
@@ -370,6 +377,7 @@ async def run_bb_mtf_analysis(
     try:
         adaptive_inserted = await _store_adaptive_quantiles(
             pg=pg,
+            run_id=int(run_id),
             analysis_id=int(analysis_id),
             scenario_id=int(scenario_id),
             signal_id=int(signal_id),
@@ -467,6 +475,7 @@ async def _load_bins_dict_for_analysis(
 # 🔸 Запись адаптивных квантилей в bt_analysis_bin_dict_adaptive (timeframe='mtf', bin_type='quantiles')
 async def _store_adaptive_quantiles(
     pg,
+    run_id: int,
     analysis_id: int,
     scenario_id: int,
     signal_id: int,
@@ -488,6 +497,7 @@ async def _store_adaptive_quantiles(
 
         to_insert.append(
             (
+                run_id,
                 analysis_id,
                 scenario_id,
                 signal_id,
@@ -507,6 +517,7 @@ async def _store_adaptive_quantiles(
         await conn.executemany(
             """
             INSERT INTO bt_analysis_bin_dict_adaptive (
+                run_id,
                 analysis_id,
                 scenario_id,
                 signal_id,
@@ -522,13 +533,13 @@ async def _store_adaptive_quantiles(
                 created_at
             )
             VALUES (
-                $1, $2, $3,
-                $4, $5, $6,
-                $7, $8, $9, $10,
-                $11, $12,
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10, $11,
+                $12, $13,
                 now()
             )
-            ON CONFLICT ON CONSTRAINT bt_analysis_bin_dict_adaptive_uniq_order
+            ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, direction, timeframe, bin_type, bin_order)
             DO UPDATE SET
                 bin_name           = EXCLUDED.bin_name,
                 val_from           = EXCLUDED.val_from,
@@ -583,8 +594,14 @@ async def _load_positions_for_analysis(
     pg,
     scenario_id: int,
     signal_id: int,
+    window_from: Optional[Any],
+    window_to: Optional[Any],
 ) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
+        # условия достаточности
+        if window_from is None or window_to is None:
+            return []
+
         rows = await conn.fetch(
             """
             SELECT
@@ -596,11 +613,15 @@ async def _load_positions_for_analysis(
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
+              AND status      = 'closed'
               AND postproc    = true
+              AND entry_time BETWEEN $3 AND $4
             ORDER BY entry_time
             """,
             scenario_id,
             signal_id,
+            window_from,
+            window_to,
         )
 
     positions: List[Dict[str, Any]] = []

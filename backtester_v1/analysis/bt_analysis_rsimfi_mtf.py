@@ -104,8 +104,11 @@ async def run_rsimfi_mtf_analysis(
             },
         }
 
-    # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (postproc=true)
-    positions = await _load_positions_for_analysis(pg, scenario_id, signal_id)
+    # загружаем позиции окна run (status=closed + postproc=true) — строго в границах window_from/window_to
+    window_from = analysis_ctx.get("window_from")
+    window_to = analysis_ctx.get("window_to")
+
+    positions = await _load_positions_for_analysis(pg, scenario_id, signal_id, window_from, window_to)
     if not positions:
         log.debug(
             "BT_ANALYSIS_RSIMFI_MTF: нет позиций для анализа analysis_id=%s, scenario_id=%s, signal_id=%s",
@@ -348,8 +351,14 @@ async def _load_positions_for_analysis(
     pg,
     scenario_id: int,
     signal_id: int,
+    window_from: Optional[Any],
+    window_to: Optional[Any],
 ) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
+        # условия достаточности
+        if window_from is None or window_to is None:
+            return []
+
         rows = await conn.fetch(
             """
             SELECT
@@ -360,11 +369,15 @@ async def _load_positions_for_analysis(
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
+              AND status      = 'closed'
               AND postproc    = true
+              AND entry_time BETWEEN $3 AND $4
             ORDER BY entry_time
             """,
             scenario_id,
             signal_id,
+            window_from,
+            window_to,
         )
 
     positions: List[Dict[str, Any]] = []

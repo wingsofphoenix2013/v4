@@ -1,4 +1,4 @@
-# bt_analysis_daily.py — суточная агрегация статистики original/filtered по результатам финального postproc (контур v1)
+# bt_analysis_daily.py — суточная агрегация статистики original/filtered по результатам финального postproc (run-aware, строго по окну run)
 
 import asyncio
 import logging
@@ -17,8 +17,8 @@ DAILY_STREAM_BLOCK_MS = 5000
 
 DAILY_MAX_CONCURRENCY = 16
 
-# 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
-_last_daily_source_finished_at: Dict[Tuple[int, int], datetime] = {}
+# 🔸 Кеш последних source_finished_at по (scenario_id, signal_id, run_id) для отсечки дублей
+_last_daily_source_finished_at: Dict[Tuple[int, int, int], datetime] = {}
 
 log = logging.getLogger("BT_ANALYSIS_DAILY")
 
@@ -62,7 +62,7 @@ async def run_bt_analysis_daily_orchestrator(pg, redis):
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_DAILY: обработан пакет сообщений — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
@@ -141,17 +141,24 @@ async def _read_from_stream(redis) -> List[Any]:
     return parsed
 
 
-# 🔸 Разбор одного сообщения из стрима bt:analysis:postproc_ready
+# 🔸 Разбор одного сообщения из стрима bt:analysis:postproc_ready (run-aware)
 def _parse_postproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
         scenario_id_str = fields.get("scenario_id")
         signal_id_str = fields.get("signal_id")
+        run_id_str = fields.get("run_id")
+        window_from_str = fields.get("window_from")
+        window_to_str = fields.get("window_to")
 
-        if not (scenario_id_str and signal_id_str):
+        if not (scenario_id_str and signal_id_str and run_id_str and window_from_str and window_to_str):
             return None
 
         scenario_id = int(scenario_id_str)
         signal_id = int(signal_id_str)
+        run_id = int(run_id_str)
+
+        window_from = datetime.fromisoformat(window_from_str)
+        window_to = datetime.fromisoformat(window_to_str)
 
         source_finished_at = None
         source_finished_at_str = fields.get("source_finished_at") or ""
@@ -172,6 +179,9 @@ def _parse_postproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, 
         return {
             "scenario_id": scenario_id,
             "signal_id": signal_id,
+            "run_id": run_id,
+            "window_from": window_from,
+            "window_to": window_to,
             "source_finished_at": source_finished_at,
             "finished_at": finished_at,
         }
@@ -196,18 +206,23 @@ async def _process_message(
 
         scenario_id = ctx["scenario_id"]
         signal_id = ctx["signal_id"]
+        run_id = ctx["run_id"]
+        window_from = ctx["window_from"]
+        window_to = ctx["window_to"]
+
         source_finished_at = ctx.get("source_finished_at")
         finished_at = ctx.get("finished_at")
 
         dedup_ts = source_finished_at or finished_at or datetime.utcnow()
-        pair_key = (scenario_id, signal_id)
+        pair_key = (scenario_id, signal_id, run_id)
 
         last_finished = _last_daily_source_finished_at.get(pair_key)
         if last_finished is not None and last_finished == dedup_ts:
             log.debug(
-                "BT_ANALYSIS_DAILY: дубликат scenario_id=%s signal_id=%s dedup_ts=%s — пропуск",
+                "BT_ANALYSIS_DAILY: дубликат scenario_id=%s signal_id=%s run_id=%s dedup_ts=%s — пропуск",
                 scenario_id,
                 signal_id,
+                run_id,
                 dedup_ts,
             )
             await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
@@ -223,16 +238,22 @@ async def _process_message(
                 pg=pg,
                 scenario_id=scenario_id,
                 signal_id=signal_id,
+                run_id=run_id,
+                window_from=window_from,
+                window_to=window_to,
                 deposit=deposit,
             )
 
             elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
             log.info(
-                "BT_ANALYSIS_DAILY: пересчёт завершён — scenario_id=%s signal_id=%s deposit=%s days=%s rows=%s "
+                "BT_ANALYSIS_DAILY: done — scenario_id=%s signal_id=%s run_id=%s window=[%s..%s] deposit=%s days=%s rows=%s "
                 "orig_trades=%s filt_trades=%s removed_trades=%s elapsed_ms=%s",
                 scenario_id,
                 signal_id,
+                run_id,
+                window_from,
+                window_to,
                 str(deposit) if deposit is not None else None,
                 result.get("days", 0),
                 result.get("rows_inserted", 0),
@@ -244,9 +265,10 @@ async def _process_message(
 
         except Exception as e:
             log.error(
-                "BT_ANALYSIS_DAILY: ошибка расчёта scenario_id=%s signal_id=%s: %s",
+                "BT_ANALYSIS_DAILY: ошибка расчёта scenario_id=%s signal_id=%s run_id=%s: %s",
                 scenario_id,
                 signal_id,
+                run_id,
                 e,
                 exc_info=True,
             )
@@ -254,18 +276,21 @@ async def _process_message(
             await redis.xack(POSTPROC_READY_STREAM_KEY, DAILY_CONSUMER_GROUP, entry_id)
 
 
-# 🔸 Пересборка суточной статистики v1 для пары (scenario_id, signal_id) по exit_time::date (UTC)
+# 🔸 Пересборка суточной статистики v1 для пары (scenario_id, signal_id) и run_id, по exit_time::date (UTC)
 async def _rebuild_daily_for_pair(
     pg,
     scenario_id: int,
     signal_id: int,
+    run_id: int,
+    window_from: datetime,
+    window_to: datetime,
     deposit: Optional[Decimal],
 ) -> Dict[str, Any]:
-    # orig по дням
-    orig_rows = await _load_orig_daily_rows(pg, scenario_id, signal_id)
+    # orig по дням (строго окно run по entry_time; day = exit_time::date)
+    orig_rows = await _load_orig_daily_rows(pg, scenario_id, signal_id, window_from, window_to)
 
-    # filt по дням (по контейнеру v1)
-    filt_rows = await _load_filt_daily_rows(pg, scenario_id, signal_id)
+    # filt по дням (run-aware контейнер)
+    filt_rows = await _load_filt_daily_rows(pg, scenario_id, signal_id, run_id, window_from, window_to)
 
     filt_map: Dict[Tuple[date, str], Dict[str, Any]] = {}
     for r in filt_rows:
@@ -337,6 +362,7 @@ async def _rebuild_daily_for_pair(
 
         rows_to_insert.append(
             (
+                run_id,
                 scenario_id,
                 signal_id,
                 day,
@@ -353,48 +379,51 @@ async def _rebuild_daily_for_pair(
             )
         )
 
-    async with pg.acquire() as conn:
-        async with conn.transaction():
-            # проход с чистого листа
-            await conn.execute(
+    if rows_to_insert:
+        async with pg.acquire() as conn:
+            await conn.executemany(
                 """
-                DELETE FROM bt_analysis_scenario_daily
-                WHERE scenario_id = $1
-                  AND signal_id   = $2
+                INSERT INTO bt_analysis_scenario_daily (
+                    run_id,
+                    scenario_id,
+                    signal_id,
+                    day,
+                    direction,
+                    orig_trades,
+                    orig_pnl_abs,
+                    orig_winrate,
+                    orig_roi,
+                    filt_trades,
+                    filt_pnl_abs,
+                    filt_winrate,
+                    filt_roi,
+                    removed_accuracy,
+                    created_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6, $7, $8, $9,
+                    $10, $11, $12, $13,
+                    $14,
+                    now()
+                )
+                ON CONFLICT (run_id, scenario_id, signal_id, day, direction)
+                DO UPDATE SET
+                    orig_trades      = EXCLUDED.orig_trades,
+                    orig_pnl_abs     = EXCLUDED.orig_pnl_abs,
+                    orig_winrate     = EXCLUDED.orig_winrate,
+                    orig_roi         = EXCLUDED.orig_roi,
+                    filt_trades      = EXCLUDED.filt_trades,
+                    filt_pnl_abs     = EXCLUDED.filt_pnl_abs,
+                    filt_winrate     = EXCLUDED.filt_winrate,
+                    filt_roi         = EXCLUDED.filt_roi,
+                    removed_accuracy = EXCLUDED.removed_accuracy,
+                    updated_at       = now()
                 """,
-                scenario_id,
-                signal_id,
+                rows_to_insert,
             )
 
-            if rows_to_insert:
-                await conn.executemany(
-                    """
-                    INSERT INTO bt_analysis_scenario_daily (
-                        scenario_id,
-                        signal_id,
-                        day,
-                        direction,
-                        orig_trades,
-                        orig_pnl_abs,
-                        orig_winrate,
-                        orig_roi,
-                        filt_trades,
-                        filt_pnl_abs,
-                        filt_winrate,
-                        filt_roi,
-                        removed_accuracy
-                    )
-                    VALUES (
-                        $1, $2, $3, $4,
-                        $5, $6, $7, $8,
-                        $9, $10, $11, $12,
-                        $13
-                    )
-                    """,
-                    rows_to_insert,
-                )
-
-    days_count = len({r[2] for r in rows_to_insert})
+    days_count = len({r[3] for r in rows_to_insert})
     return {
         "days": days_count,
         "rows_inserted": len(rows_to_insert),
@@ -404,8 +433,14 @@ async def _rebuild_daily_for_pair(
     }
 
 
-# 🔸 Загрузка orig-агрегаций по дням из bt_scenario_positions
-async def _load_orig_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Dict[str, Any]]:
+# 🔸 Загрузка orig-агрегаций по дням из bt_scenario_positions (strict: closed+postproc=true + entry_time in window; day=exit_time::date)
+async def _load_orig_daily_rows(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    window_from: datetime,
+    window_to: datetime,
+) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -418,12 +453,16 @@ async def _load_orig_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Di
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
+              AND status      = 'closed'
               AND postproc    = true
+              AND entry_time BETWEEN $3 AND $4
             GROUP BY (exit_time::date), direction
             ORDER BY (exit_time::date), direction
             """,
             scenario_id,
             signal_id,
+            window_from,
+            window_to,
         )
 
     out: List[Dict[str, Any]] = []
@@ -440,8 +479,15 @@ async def _load_orig_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Di
     return out
 
 
-# 🔸 Загрузка filt-агрегаций по дням из bt_scenario_positions + bt_analysis_positions_postproc
-async def _load_filt_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Dict[str, Any]]:
+# 🔸 Загрузка filt-агрегаций по дням (run-aware): bt_scenario_positions + bt_analysis_positions_postproc (run_id)
+async def _load_filt_daily_rows(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    run_id: int,
+    window_from: datetime,
+    window_to: datetime,
+) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -455,17 +501,23 @@ async def _load_filt_daily_rows(pg, scenario_id: int, signal_id: int) -> List[Di
                 COUNT(*) FILTER (WHERE pp.good_state = false AND p.pnl_abs <= 0)  AS removed_losers
             FROM bt_scenario_positions p
             JOIN bt_analysis_positions_postproc pp
-              ON pp.position_uid = p.position_uid
+              ON pp.run_id       = $3
+             AND pp.position_uid = p.position_uid
              AND pp.scenario_id  = p.scenario_id
              AND pp.signal_id    = p.signal_id
             WHERE p.scenario_id = $1
               AND p.signal_id   = $2
+              AND p.status      = 'closed'
               AND p.postproc    = true
+              AND p.entry_time BETWEEN $4 AND $5
             GROUP BY (p.exit_time::date), p.direction
             ORDER BY (p.exit_time::date), p.direction
             """,
             scenario_id,
             signal_id,
+            run_id,
+            window_from,
+            window_to,
         )
 
     out: List[Dict[str, Any]] = []

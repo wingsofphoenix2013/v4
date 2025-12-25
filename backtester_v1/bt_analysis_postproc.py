@@ -1,4 +1,4 @@
-# bt_analysis_postproc.py — финальная пост-обработка v1 (логика v3; labels: bad/good/neutral/inactive; good_state=(no bad) AND (has good))
+# bt_analysis_postproc.py — финальная пост-обработка v1 (run-aware; без очисток; good_state=(no bad) AND (has good) строго по окну run)
 
 import asyncio
 import json
@@ -19,8 +19,8 @@ POSTPROC_STREAM_BLOCK_MS = 5000
 
 POSTPROC_MAX_CONCURRENCY = 16
 
-# 🔸 Кеш последних source_finished_at по (scenario_id, signal_id) для отсечки дублей
-_last_preproc_source_finished_at: Dict[Tuple[int, int], datetime] = {}
+# 🔸 Кеш последних source_finished_at по (scenario_id, signal_id, run_id) для отсечки дублей
+_last_preproc_source_finished_at: Dict[Tuple[int, int, int], datetime] = {}
 
 log = logging.getLogger("BT_ANALYSIS_POSTPROC")
 
@@ -64,7 +64,7 @@ async def run_bt_analysis_postproc_orchestrator(pg, redis):
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 errors = sum(1 for r in results if isinstance(r, Exception))
-                log.info(
+                log.debug(
                     "BT_ANALYSIS_POSTPROC: обработан пакет сообщений — сообщений=%s, ошибок=%s",
                     total_msgs,
                     errors,
@@ -143,19 +143,26 @@ async def _read_from_stream(redis) -> List[Any]:
     return parsed
 
 
-# 🔸 Разбор одного сообщения preproc_ready
+# 🔸 Разбор одного сообщения preproc_ready (run-aware)
 def _parse_preproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
         scenario_id_str = fields.get("scenario_id")
         signal_id_str = fields.get("signal_id")
+        run_id_str = fields.get("run_id")
+
         finished_at_str = fields.get("finished_at")
         source_finished_at_str = fields.get("source_finished_at")
 
-        if not (scenario_id_str and signal_id_str and finished_at_str):
+        window_from_str = fields.get("window_from")
+        window_to_str = fields.get("window_to")
+
+        if not (scenario_id_str and signal_id_str and run_id_str and finished_at_str and window_from_str and window_to_str):
             return None
 
         scenario_id = int(scenario_id_str)
         signal_id = int(signal_id_str)
+        run_id = int(run_id_str)
+
         finished_at = datetime.fromisoformat(finished_at_str)
 
         source_finished_at = None
@@ -165,14 +172,29 @@ def _parse_preproc_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, A
             except Exception:
                 source_finished_at = None
 
+        window_from = datetime.fromisoformat(window_from_str)
+        window_to = datetime.fromisoformat(window_to_str)
+
         direction_mask = (fields.get("direction_mask") or "").strip().lower() or None
+
+        models_raw = fields.get("models")
+        models = {}
+        if models_raw:
+            try:
+                models = json.loads(models_raw)
+            except Exception:
+                models = {}
 
         return {
             "scenario_id": scenario_id,
             "signal_id": signal_id,
+            "run_id": run_id,
             "finished_at": finished_at,
             "source_finished_at": source_finished_at,
+            "window_from": window_from,
+            "window_to": window_to,
             "direction_mask": direction_mask,
+            "models": models if isinstance(models, dict) else {},
         }
     except Exception as e:
         log.error("BT_ANALYSIS_POSTPROC: ошибка разбора сообщения: %s, fields=%s", e, fields, exc_info=True)
@@ -195,19 +217,27 @@ async def _process_message(
 
         scenario_id = ctx["scenario_id"]
         signal_id = ctx["signal_id"]
+        run_id = ctx["run_id"]
+
         finished_at = ctx["finished_at"]
         source_finished_at = ctx["source_finished_at"]
+
+        window_from = ctx["window_from"]
+        window_to = ctx["window_to"]
+
         direction_mask_from_msg = ctx.get("direction_mask")
+        models_from_msg = ctx.get("models") or {}
 
         dedup_ts = source_finished_at or finished_at
-        pair_key = (scenario_id, signal_id)
+        pair_key = (scenario_id, signal_id, run_id)
 
         last_finished = _last_preproc_source_finished_at.get(pair_key)
         if last_finished is not None and last_finished == dedup_ts:
             log.debug(
-                "BT_ANALYSIS_POSTPROC: дубликат scenario_id=%s signal_id=%s dedup_ts=%s — пропуск",
+                "BT_ANALYSIS_POSTPROC: дубликат scenario_id=%s signal_id=%s run_id=%s dedup_ts=%s — пропуск",
                 scenario_id,
                 signal_id,
+                run_id,
                 dedup_ts,
             )
             await redis.xack(PREPROC_READY_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
@@ -221,13 +251,21 @@ async def _process_message(
             direction_mask = direction_mask_from_msg or await _load_signal_direction_mask(pg, signal_id)
             directions = _directions_from_mask(direction_mask)
 
-            # загрузка моделей по направлениям
-            model_map = await _load_model_opt_map(pg, scenario_id, signal_id, directions)
+            # загрузка model_id по направлениям (строго для run)
+            model_map = await _load_model_map_for_run(
+                pg=pg,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                run_id=run_id,
+                directions=directions,
+                models_hint=models_from_msg,
+            )
             if not model_map:
                 log.warning(
-                    "BT_ANALYSIS_POSTPROC: model_opt не найден для scenario_id=%s signal_id=%s — пропуск",
+                    "BT_ANALYSIS_POSTPROC: model_opt не найден для scenario_id=%s signal_id=%s run_id=%s — пропуск",
                     scenario_id,
                     signal_id,
+                    run_id,
                 )
                 return
 
@@ -236,15 +274,21 @@ async def _process_message(
                 pg=pg,
                 scenario_id=scenario_id,
                 signal_id=signal_id,
+                run_id=run_id,
+                window_from=window_from,
+                window_to=window_to,
                 directions=directions,
                 model_map=model_map,
             )
 
-            # публикуем событие готовности
+            # публикуем событие готовности (run-aware)
             await _publish_postproc_ready(
                 redis=redis,
                 scenario_id=scenario_id,
                 signal_id=signal_id,
+                run_id=run_id,
+                window_from=window_from,
+                window_to=window_to,
                 result=result,
                 model_map=model_map,
                 source_finished_at=dedup_ts,
@@ -253,9 +297,12 @@ async def _process_message(
             elapsed_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
             log.info(
-                "BT_ANALYSIS_POSTPROC: scenario_id=%s signal_id=%s — total=%s good=%s bad=%s no_good=%s models=%s elapsed_ms=%s",
+                "BT_ANALYSIS_POSTPROC: done scenario_id=%s signal_id=%s run_id=%s window=[%s..%s] — total=%s good=%s bad=%s no_good=%s models=%s elapsed_ms=%s",
                 scenario_id,
                 signal_id,
+                run_id,
+                window_from,
+                window_to,
                 result.get("positions_total", 0),
                 result.get("positions_good", 0),
                 result.get("positions_bad", 0),
@@ -266,9 +313,10 @@ async def _process_message(
 
         except Exception as e:
             log.error(
-                "BT_ANALYSIS_POSTPROC: ошибка postproc scenario_id=%s signal_id=%s: %s",
+                "BT_ANALYSIS_POSTPROC: ошибка postproc scenario_id=%s signal_id=%s run_id=%s: %s",
                 scenario_id,
                 signal_id,
+                run_id,
                 e,
                 exc_info=True,
             )
@@ -276,19 +324,19 @@ async def _process_message(
             await redis.xack(PREPROC_READY_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
 
-# 🔸 Основной постпроцессинг v1 (bad => reject; else require good-hit)
+# 🔸 Основной постпроцессинг v1 (bad => reject; else require good-hit) строго по окну run
 async def _process_pair_postproc(
     pg,
     scenario_id: int,
     signal_id: int,
+    run_id: int,
+    window_from: datetime,
+    window_to: datetime,
     directions: List[str],
     model_map: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    # чистим контейнер v1 по паре (проход с чистого листа)
-    await _clear_positions_postproc(pg, scenario_id, signal_id)
-
-    # загружаем позиции (postproc=true) по направлениям
-    positions = await _load_positions_for_pair(pg, scenario_id, signal_id, directions)
+    # загружаем позиции (postproc=true, status=closed) по направлениям строго в окне run
+    positions = await _load_positions_for_pair(pg, scenario_id, signal_id, directions, window_from, window_to)
     if not positions:
         return {"positions_total": 0, "positions_good": 0, "positions_bad": 0, "positions_no_good": 0}
 
@@ -304,7 +352,6 @@ async def _process_pair_postproc(
             "good_reasons": [],
         }
 
-    # статистика причин отбраковки
     removed_stats_bad: Dict[str, Dict[str, Dict[str, Any]]] = {}
     removed_stats_good_missing: Dict[str, Dict[str, Any]] = {}
 
@@ -317,11 +364,11 @@ async def _process_pair_postproc(
             continue
         model_id = int(model["model_id"])
 
-        # грузим bad и good бины из labels
-        # neutral/inactive игнорируются автоматически: мы выбираем только state='bad' и 'good'
+        # грузим bad и good бины из labels (по model_id, run-aware)
         bad_bins = await _load_bins_from_labels(
             pg=pg,
             model_id=model_id,
+            run_id=run_id,
             scenario_id=scenario_id,
             signal_id=signal_id,
             direction=direction,
@@ -330,16 +377,18 @@ async def _process_pair_postproc(
         good_bins = await _load_bins_from_labels(
             pg=pg,
             model_id=model_id,
+            run_id=run_id,
             scenario_id=scenario_id,
             signal_id=signal_id,
             direction=direction,
             state="good",
         )
 
-        # ускорение: грузим raw_index для всех analysis_id, которые встречаются в bad/good
+        # ускорение: грузим raw_index для всех analysis_id, которые встречаются в bad/good (строго по run_id)
         all_analysis_ids = sorted({b["analysis_id"] for b in bad_bins} | {b["analysis_id"] for b in good_bins})
         raw_index = await _load_positions_raw_index_for_analysis_ids(
             pg=pg,
+            run_id=run_id,
             scenario_id=scenario_id,
             signal_id=signal_id,
             direction=direction,
@@ -374,7 +423,6 @@ async def _process_pair_postproc(
                     }
                 )
 
-                # removed_bad агрегаты (с перекрытиями, как диагностика)
                 d_stats = removed_stats_bad.setdefault(direction, {})
                 i_stats = d_stats.setdefault(
                     indicator_key,
@@ -386,7 +434,7 @@ async def _process_pair_postproc(
                 tf_stats["trades"] += 1
                 tf_stats["pnl_abs"] += pos["pnl_abs"]
 
-        # применяем good (независимо от bad; финально good_state потребует no bad)
+        # применяем good
         for b in good_bins:
             key = (b["analysis_id"], b["timeframe"], b["bin_name"])
             pos_uids = raw_index.get(key, [])
@@ -399,7 +447,6 @@ async def _process_pair_postproc(
                     continue
                 pos["has_good"] = True
                 total_good_hits += 1
-                # для дебага достаточно нескольких причин
                 if len(pos["good_reasons"]) < 5:
                     pos["good_reasons"].append(
                         {
@@ -415,7 +462,7 @@ async def _process_pair_postproc(
                         }
                     )
 
-    # финальное бинарное решение (как v3):
+    # финальное бинарное решение:
     # good_state = (no bad hits) AND (has good hit)
     positions_total = len(positions_map)
     positions_good = 0
@@ -437,31 +484,33 @@ async def _process_pair_postproc(
                 info["reject_reason"] = "no_good_hit"
                 positions_no_good += 1
 
-                # агрегируем “no_good_hit” отдельно
                 d = str(info["direction"]).strip().lower()
                 st = removed_stats_good_missing.setdefault(d, {"trades": 0, "pnl_abs": Decimal("0")})
                 st["trades"] += 1
                 st["pnl_abs"] += info["pnl_abs"]
 
-    # пишем контейнер позиций v1
-    await _store_positions_postproc(pg, scenario_id, signal_id, positions_map)
+    # пишем контейнер позиций (run-aware, идемпотентно)
+    await _store_positions_postproc(pg, run_id, scenario_id, signal_id, positions_map)
 
-    # исходная статистика (orig) — из bt_scenario_stat
-    orig_stats = await _load_orig_scenario_stats(pg, scenario_id, signal_id)
+    # orig stats берём из bt_scenario_stat(run) по run_id
+    orig_stats = await _load_orig_scenario_stats(pg, scenario_id, signal_id, run_id)
 
     # депозит для ROI
     deposit = await _load_scenario_deposit(pg, scenario_id)
 
-    # обновляем bt_analysis_scenario_stat
     good_thr_map: Dict[str, Any] = {}
     for d in directions:
         m = model_map.get(d) or {}
         good_thr_map[d] = m.get("good_threshold_selected")
 
-    await _update_analysis_scenario_stats(
+    # обновляем bt_analysis_scenario_stat (run-aware)
+    await _upsert_analysis_scenario_stats(
         pg=pg,
+        run_id=run_id,
         scenario_id=scenario_id,
         signal_id=signal_id,
+        window_from=window_from,
+        window_to=window_to,
         positions_map=positions_map,
         removed_stats_bad=removed_stats_bad,
         removed_stats_no_good=removed_stats_good_missing,
@@ -518,53 +567,100 @@ def _directions_from_mask(mask: Optional[str]) -> List[str]:
     return ["long", "short"]
 
 
-# 🔸 Загрузка моделей bt_analysis_model_opt по направлениям
-async def _load_model_opt_map(
+# 🔸 Загрузка моделей bt_analysis_model_opt по направлениям (строго по run)
+async def _load_model_map_for_run(
     pg,
     scenario_id: int,
     signal_id: int,
+    run_id: int,
     directions: List[str],
+    models_hint: Dict[str, Any],
 ) -> Dict[str, Dict[str, Any]]:
-    if not directions:
-        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+
+    # условия достаточности
+    if models_hint:
+        for d, mid in models_hint.items():
+            try:
+                dl = str(d).strip().lower()
+                out[dl] = {"model_id": int(mid)}
+            except Exception:
+                continue
+
+    # подгружаем недостающие из БД
+    missing_dirs = [d for d in directions if str(d).strip().lower() not in out]
+    if not missing_dirs:
+        # подгрузим good_threshold_selected из meta
+        return await _enrich_model_map(pg, scenario_id, signal_id, run_id, out)
 
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT
-                id,
-                direction,
-                best_threshold,
-                selected_analysis_ids,
-                meta
+            SELECT id, direction, meta
             FROM bt_analysis_model_opt
             WHERE scenario_id = $1
               AND signal_id   = $2
-              AND direction   = ANY($3::text[])
+              AND run_id      = $3
+              AND direction   = ANY($4::text[])
             """,
             scenario_id,
             signal_id,
-            directions,
+            run_id,
+            missing_dirs,
         )
 
-    out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         d = str(r["direction"]).strip().lower()
+        out[d] = {"model_id": int(r["id"])}
 
-        selected = r["selected_analysis_ids"]
-        if isinstance(selected, str):
-            try:
-                selected = json.loads(selected)
-            except Exception:
-                selected = []
+    return await _enrich_model_map(pg, scenario_id, signal_id, run_id, out)
 
+
+# 🔸 Обогащение model_map: вытащить good_threshold_selected из meta
+async def _enrich_model_map(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    run_id: int,
+    model_map: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    if not model_map:
+        return {}
+
+    ids = [int(v.get("model_id")) for v in model_map.values() if v.get("model_id")]
+    ids = sorted(set(ids))
+    if not ids:
+        return model_map
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, direction, meta
+            FROM bt_analysis_model_opt
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND run_id      = $3
+              AND id = ANY($4::int[])
+            """,
+            scenario_id,
+            signal_id,
+            run_id,
+            ids,
+        )
+
+    meta_by_dir: Dict[str, Any] = {}
+    for r in rows:
+        d = str(r["direction"]).strip().lower()
         meta = r["meta"]
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
             except Exception:
                 meta = None
+        meta_by_dir[d] = meta
 
+    for d, v in model_map.items():
+        meta = meta_by_dir.get(d)
         good_thr = None
         if isinstance(meta, dict):
             raw_thr = meta.get("good_threshold_selected")
@@ -573,21 +669,16 @@ async def _load_model_opt_map(
                     good_thr = float(raw_thr)
                 except Exception:
                     good_thr = None
+        v["good_threshold_selected"] = good_thr
 
-        out[d] = {
-            "model_id": int(r["id"]),
-            "best_threshold": _safe_decimal(r["best_threshold"]),
-            "selected_analysis_ids": selected if isinstance(selected, list) else [],
-            "good_threshold_selected": good_thr,
-        }
-
-    return out
+    return model_map
 
 
 # 🔸 Загрузка биннов нужного state из bt_analysis_bins_labels (+ family_key/key)
 async def _load_bins_from_labels(
     pg,
     model_id: int,
+    run_id: int,
     scenario_id: int,
     signal_id: int,
     direction: str,
@@ -610,12 +701,14 @@ async def _load_bins_from_labels(
             JOIN bt_analysis_instances ai
               ON ai.id = l.analysis_id
             WHERE l.model_id    = $1
-              AND l.scenario_id = $2
-              AND l.signal_id   = $3
-              AND l.direction   = $4
-              AND l.state       = $5
+              AND l.run_id      = $2
+              AND l.scenario_id = $3
+              AND l.signal_id   = $4
+              AND l.direction   = $5
+              AND l.state       = $6
             """,
             model_id,
+            run_id,
             scenario_id,
             signal_id,
             direction,
@@ -640,9 +733,10 @@ async def _load_bins_from_labels(
     return out
 
 
-# 🔸 Индекс raw по ключу (analysis_id, timeframe, bin_name) -> list(position_uid) для направления и списка анализаторов
+# 🔸 Индекс raw по ключу (analysis_id, timeframe, bin_name) -> list(position_uid) (строго по run_id)
 async def _load_positions_raw_index_for_analysis_ids(
     pg,
+    run_id: int,
     scenario_id: int,
     signal_id: int,
     direction: str,
@@ -660,11 +754,13 @@ async def _load_positions_raw_index_for_analysis_ids(
                 bin_name,
                 position_uid
             FROM bt_analysis_positions_raw
-            WHERE scenario_id = $1
-              AND signal_id   = $2
-              AND direction   = $3
-              AND analysis_id = ANY($4::int[])
+            WHERE run_id     = $1
+              AND scenario_id = $2
+              AND signal_id   = $3
+              AND direction   = $4
+              AND analysis_id = ANY($5::int[])
             """,
+            run_id,
             scenario_id,
             signal_id,
             direction,
@@ -678,12 +774,14 @@ async def _load_positions_raw_index_for_analysis_ids(
     return index
 
 
-# 🔸 Загрузка позиций сценария/сигнала (postproc=true) по направлениям
+# 🔸 Загрузка позиций сценария/сигнала в окне run (status=closed, postproc=true, entry_time in window)
 async def _load_positions_for_pair(
     pg,
     scenario_id: int,
     signal_id: int,
     directions: List[str],
+    window_from: datetime,
+    window_to: datetime,
 ) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -695,13 +793,17 @@ async def _load_positions_for_pair(
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
+              AND status      = 'closed'
               AND postproc    = true
               AND direction   = ANY($3::text[])
+              AND entry_time BETWEEN $4 AND $5
             ORDER BY entry_time
             """,
             scenario_id,
             signal_id,
             directions,
+            window_from,
+            window_to,
         )
 
     out: List[Dict[str, Any]] = []
@@ -716,23 +818,10 @@ async def _load_positions_for_pair(
     return out
 
 
-# 🔸 Очистка контейнера позиций v1
-async def _clear_positions_postproc(pg, scenario_id: int, signal_id: int) -> None:
-    async with pg.acquire() as conn:
-        await conn.execute(
-            """
-            DELETE FROM bt_analysis_positions_postproc
-            WHERE scenario_id = $1
-              AND signal_id   = $2
-            """,
-            scenario_id,
-            signal_id,
-        )
-
-
-# 🔸 Запись контейнера позиций в bt_analysis_positions_postproc
+# 🔸 Запись контейнера позиций в bt_analysis_positions_postproc (run-aware, идемпотентно)
 async def _store_positions_postproc(
     pg,
+    run_id: int,
     scenario_id: int,
     signal_id: int,
     positions_map: Dict[Any, Dict[str, Any]],
@@ -755,6 +844,7 @@ async def _store_positions_postproc(
 
             to_insert.append(
                 (
+                    run_id,
                     uid,
                     scenario_id,
                     signal_id,
@@ -770,6 +860,7 @@ async def _store_positions_postproc(
         await conn.executemany(
             """
             INSERT INTO bt_analysis_positions_postproc (
+                run_id,
                 position_uid,
                 scenario_id,
                 signal_id,
@@ -778,15 +869,21 @@ async def _store_positions_postproc(
                 good_state
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6
+                $1, $2, $3, $4, $5, $6::jsonb, $7
             )
+            ON CONFLICT (run_id, scenario_id, signal_id, position_uid) DO NOTHING
             """,
             to_insert,
         )
 
 
-# 🔸 Загрузка исходной статистики из bt_scenario_stat
-async def _load_orig_scenario_stats(pg, scenario_id: int, signal_id: int) -> Dict[str, Dict[str, Any]]:
+# 🔸 Загрузка исходной статистики окна из bt_scenario_stat (run)
+async def _load_orig_scenario_stats(
+    pg,
+    scenario_id: int,
+    signal_id: int,
+    run_id: int,
+) -> Dict[str, Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -794,9 +891,12 @@ async def _load_orig_scenario_stats(pg, scenario_id: int, signal_id: int) -> Dic
             FROM bt_scenario_stat
             WHERE scenario_id = $1
               AND signal_id   = $2
+              AND stat_kind   = 'run'
+              AND run_id      = $3
             """,
             scenario_id,
             signal_id,
+            run_id,
         )
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -834,11 +934,14 @@ async def _load_scenario_deposit(pg, scenario_id: int) -> Optional[Decimal]:
     return dep
 
 
-# 🔸 Обновление bt_analysis_scenario_stat (orig vs filt + диагностика причин)
-async def _update_analysis_scenario_stats(
+# 🔸 Upsert bt_analysis_scenario_stat (run-aware)
+async def _upsert_analysis_scenario_stats(
     pg,
+    run_id: int,
     scenario_id: int,
     signal_id: int,
+    window_from: datetime,
+    window_to: datetime,
     positions_map: Dict[Any, Dict[str, Any]],
     removed_stats_bad: Dict[str, Dict[str, Dict[str, Any]]],
     removed_stats_no_good: Dict[str, Dict[str, Any]],
@@ -890,7 +993,7 @@ async def _update_analysis_scenario_stats(
             else:
                 removed_accuracy = Decimal("0")
 
-            # raw_stat
+            # raw_stat (диагностика)
             raw_obj: Dict[str, Any] = {
                 "version": 1,
                 "note": "removed stats are diagnostic and may include overlaps across indicators",
@@ -898,12 +1001,10 @@ async def _update_analysis_scenario_stats(
                 "removed": {},
             }
 
-            # removed by bad-indicators
             bad_dir = removed_stats_bad.get(direction) or {}
             if bad_dir:
                 raw_obj["removed"]["bad_hits"] = _build_removed_block(bad_dir)
 
-            # removed by no_good_hit
             ng = removed_stats_no_good.get(direction)
             if ng:
                 raw_obj["removed"]["no_good_hit"] = {
@@ -916,9 +1017,12 @@ async def _update_analysis_scenario_stats(
             await conn.execute(
                 """
                 INSERT INTO bt_analysis_scenario_stat (
+                    run_id,
                     scenario_id,
                     signal_id,
                     direction,
+                    window_from,
+                    window_to,
                     orig_trades,
                     orig_pnl_abs,
                     orig_winrate,
@@ -928,16 +1032,22 @@ async def _update_analysis_scenario_stats(
                     filt_winrate,
                     filt_roi,
                     removed_accuracy,
-                    raw_stat
+                    raw_stat,
+                    created_at
                 )
                 VALUES (
-                    $1, $2, $3,
-                    $4, $5, $6, $7,
-                    $8, $9, $10, $11,
-                    $12, $13
+                    $1, $2, $3, $4,
+                    $5, $6,
+                    $7, $8, $9, $10,
+                    $11, $12, $13, $14,
+                    $15,
+                    $16::jsonb,
+                    now()
                 )
-                ON CONFLICT (scenario_id, signal_id, direction)
+                ON CONFLICT (run_id, scenario_id, signal_id, direction)
                 DO UPDATE SET
+                    window_from      = EXCLUDED.window_from,
+                    window_to        = EXCLUDED.window_to,
                     orig_trades      = EXCLUDED.orig_trades,
                     orig_pnl_abs     = EXCLUDED.orig_pnl_abs,
                     orig_winrate     = EXCLUDED.orig_winrate,
@@ -950,9 +1060,12 @@ async def _update_analysis_scenario_stats(
                     raw_stat         = EXCLUDED.raw_stat,
                     updated_at       = now()
                 """,
+                run_id,
                 scenario_id,
                 signal_id,
                 direction,
+                window_from,
+                window_to,
                 int(orig["trades"]),
                 orig["pnl_abs"],
                 orig["winrate"],
@@ -987,24 +1100,21 @@ def _build_removed_block(dir_removed: Dict[str, Dict[str, Any]]) -> Dict[str, An
             }
 
         by_indicator[indicator_key] = {
-            "total": {
-                "trades": it_total_trades,
-                "pnl_abs": _decimal_to_json_number(_safe_decimal(it_total_pnl)),
-            },
+            "total": {"trades": it_total_trades, "pnl_abs": _decimal_to_json_number(_safe_decimal(it_total_pnl))},
             "by_tf": by_tf_obj,
         }
 
-    return {
-        "total": {"trades": int(total_trades), "pnl_abs": _decimal_to_json_number(total_pnl)},
-        "by_indicator": by_indicator,
-    }
+    return {"total": {"trades": int(total_trades), "pnl_abs": _decimal_to_json_number(total_pnl)}, "by_indicator": by_indicator}
 
 
-# 🔸 Публикация события готовности postproc v1
+# 🔸 Публикация события готовности postproc v1 (run-aware)
 async def _publish_postproc_ready(
     redis,
     scenario_id: int,
     signal_id: int,
+    run_id: int,
+    window_from: datetime,
+    window_to: datetime,
     result: Dict[str, Any],
     model_map: Dict[str, Dict[str, Any]],
     source_finished_at: datetime,
@@ -1022,6 +1132,9 @@ async def _publish_postproc_ready(
             {
                 "scenario_id": str(scenario_id),
                 "signal_id": str(signal_id),
+                "run_id": str(run_id),
+                "window_from": window_from.isoformat(),
+                "window_to": window_to.isoformat(),
                 "positions_total": str(result.get("positions_total", 0)),
                 "positions_good": str(result.get("positions_good", 0)),
                 "positions_bad": str(result.get("positions_bad", 0)),
@@ -1032,15 +1145,17 @@ async def _publish_postproc_ready(
             },
         )
         log.debug(
-            "BT_ANALYSIS_POSTPROC: опубликовано событие postproc_ready scenario_id=%s signal_id=%s",
+            "BT_ANALYSIS_POSTPROC: опубликовано событие postproc_ready scenario_id=%s signal_id=%s run_id=%s",
             scenario_id,
             signal_id,
+            run_id,
         )
     except Exception as e:
         log.error(
-            "BT_ANALYSIS_POSTPROC: не удалось опубликовать событие scenario_id=%s signal_id=%s: %s",
+            "BT_ANALYSIS_POSTPROC: не удалось опубликовать событие scenario_id=%s signal_id=%s run_id=%s: %s",
             scenario_id,
             signal_id,
+            run_id,
             e,
             exc_info=True,
         )

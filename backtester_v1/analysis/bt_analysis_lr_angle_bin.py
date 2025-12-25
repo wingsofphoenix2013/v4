@@ -29,11 +29,15 @@ async def run_lr_angle_bin_analysis(
     scenario_id = analysis_ctx.get("scenario_id")
     signal_id = analysis_ctx.get("signal_id")
 
+    # run-aware поля
+    run_id = analysis_ctx.get("run_id")
+    run_finished_at = analysis_ctx.get("run_finished_at")
+
     # базовые параметры анализатора
     tf = _get_str_param(params, "tf", default="m5")  # TF из raw_stat["tf"][tf]
     angle_param_name = _get_str_param(params, "param_name", "lr50_angle")  # например lr50_angle
 
-    if analysis_id is None or scenario_id is None or signal_id is None:
+    if analysis_id is None or scenario_id is None or signal_id is None or run_id is None:
         log.debug(
             "BT_ANALYSIS_LR_ANGLE_BIN: нет обязательных идентификаторов (analysis_id=%s, scenario_id=%s, signal_id=%s) — анализ пропущен",
             analysis_id,
@@ -63,8 +67,11 @@ async def run_lr_angle_bin_analysis(
         angle_param_name,
     )
 
-    # загружаем позиции данного сценария/сигнала, прошедшие постпроцессинг (есть raw_stat)
-    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id))
+    # загружаем позиции окна run (status=closed + postproc=true) — строго в границах window_from/window_to
+    window_from = analysis_ctx.get("window_from")
+    window_to = analysis_ctx.get("window_to")
+
+    positions = await _load_positions_for_analysis(pg, int(scenario_id), int(signal_id), window_from, window_to)
     if not positions:
         log.debug(
             "BT_ANALYSIS_LR_ANGLE_BIN: нет позиций для анализа id=%s (family=%s, key=%s, name=%s), scenario_id=%s, signal_id=%s",
@@ -132,10 +139,12 @@ async def run_lr_angle_bin_analysis(
     )
 
     # записываем адаптивный словарь биннов в БД (на каждый проход)
-    source_finished_at = datetime.utcnow()
+    # source_finished_at — единый по run: bt_signal_backfill_runs.finished_at
+    source_finished_at = run_finished_at if isinstance(run_finished_at, datetime) else datetime.utcnow()
     try:
         inserted_rows = await _store_adaptive_bins(
             pg=pg,
+            run_id=int(run_id),
             analysis_id=int(analysis_id),
             scenario_id=int(scenario_id),
             signal_id=int(signal_id),
@@ -238,8 +247,14 @@ async def _load_positions_for_analysis(
     pg,
     scenario_id: int,
     signal_id: int,
+    window_from: Optional[Any],
+    window_to: Optional[Any],
 ) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
+        # условия достаточности
+        if window_from is None or window_to is None:
+            return []
+
         rows = await conn.fetch(
             """
             SELECT
@@ -251,11 +266,15 @@ async def _load_positions_for_analysis(
             FROM bt_scenario_positions
             WHERE scenario_id = $1
               AND signal_id   = $2
+              AND status      = 'closed'
               AND postproc    = true
+              AND entry_time BETWEEN $3 AND $4
             ORDER BY entry_time
             """,
             scenario_id,
             signal_id,
+            window_from,
+            window_to,
         )
 
     positions: List[Dict[str, Any]] = []
@@ -417,6 +436,7 @@ def _assign_bin(
 # 🔸 Запись адаптивных биннов в bt_analysis_bin_dict_adaptive (дублирование под long/short, границы q6)
 async def _store_adaptive_bins(
     pg,
+    run_id: int,
     analysis_id: int,
     scenario_id: int,
     signal_id: int,
@@ -440,6 +460,7 @@ async def _store_adaptive_bins(
 
             to_insert.append(
                 (
+                    run_id,
                     analysis_id,
                     scenario_id,
                     signal_id,
@@ -459,6 +480,7 @@ async def _store_adaptive_bins(
         await conn.executemany(
             """
             INSERT INTO bt_analysis_bin_dict_adaptive (
+                run_id,
                 analysis_id,
                 scenario_id,
                 signal_id,
@@ -474,13 +496,13 @@ async def _store_adaptive_bins(
                 created_at
             )
             VALUES (
-                $1, $2, $3,
-                $4, $5, $6,
-                $7, $8, $9, $10,
-                $11, $12,
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10, $11,
+                $12, $13,
                 now()
             )
-            ON CONFLICT ON CONSTRAINT bt_analysis_bin_dict_adaptive_uniq_order
+            ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, direction, timeframe, bin_type, bin_order)
             DO UPDATE SET
                 bin_name           = EXCLUDED.bin_name,
                 val_from           = EXCLUDED.val_from,
