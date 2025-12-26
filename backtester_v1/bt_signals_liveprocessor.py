@@ -1,4 +1,4 @@
-# bt_signals_liveprocessor.py — воркер переноса live-filtered signal_sent из bt_signals_live в bt_signals_values (run-aware через applied_run_id)
+# bt_signals_liveprocessor.py — воркер переноса live-filtered signal_sent из bt_signals_live в bt_signals_values (auto-drain backlog)
 
 import asyncio
 import json
@@ -21,6 +21,12 @@ LIVE_READY_STREAM_BLOCK_MS = 5000
 # 🔸 Параметры обработки
 PROCESS_BATCH_LIMIT = 500
 
+# 🔸 Авто-дренаж: периодический подбор хвоста (чтобы история подхватилась без ручных XADD)
+DRAIN_IDLE_INTERVAL_SEC = 10
+
+# 🔸 Защита от бесконечных циклов дренажа при отсутствии прогресса
+DRAIN_MAX_ITERATIONS_PER_TICK = 100
+
 # 🔸 RedisTimeSeries ключи (для получения entry price при отсутствии в details)
 BB_TS_CLOSE_KEY = "bb:ts:{symbol}:{tf}:c"
 
@@ -34,70 +40,78 @@ async def run_bt_signals_liveprocessor(pg, redis) -> None:
 
     await _ensure_consumer_group(redis)
 
+    last_idle_drain_at = datetime.utcnow()
+
     # основной цикл
     while True:
         try:
             entries = await _read_from_stream(redis)
 
-            if not entries:
-                continue
-
             total_msgs = 0
             parsed_msgs = 0
             ignored_msgs = 0
 
-            # набор сигналов, по которым будем искать pending rows
+            # набор сигналов, по которым можно сделать таргетированный drain (если пусто — делаем общий drain)
             signal_ids: Set[int] = set()
 
-            for stream_key, messages in entries:
-                if stream_key != LIVE_READY_STREAM_KEY:
-                    continue
-
-                for msg_id, fields in messages:
-                    total_msgs += 1
-
-                    ctx = _parse_live_ready_message(fields)
-                    if not ctx:
-                        ignored_msgs += 1
-                        await redis.xack(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP, msg_id)
+            if entries:
+                for stream_key, messages in entries:
+                    if stream_key != LIVE_READY_STREAM_KEY:
                         continue
 
-                    parsed_msgs += 1
-                    signal_ids.add(ctx["signal_id"])
+                    for msg_id, fields in messages:
+                        total_msgs += 1
 
-                    # ACK делаем сразу: обработка идемпотентная, а зависание pending сообщений нам не нужно
-                    await redis.xack(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP, msg_id)
+                        ctx = _parse_live_ready_message(fields)
+                        if not ctx:
+                            ignored_msgs += 1
+                            await redis.xack(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP, msg_id)
+                            continue
 
-            if not signal_ids:
-                log.info(
-                    "BT_SIG_LIVEPROC: batch done — msgs=%s, parsed=%s, ignored=%s, signal_ids=0",
-                    total_msgs,
-                    parsed_msgs,
-                    ignored_msgs,
-                )
+                        parsed_msgs += 1
+                        signal_ids.add(ctx["signal_id"])
+
+                        # ack сразу — обработка идемпотентная, зависания pending не нужны
+                        await redis.xack(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP, msg_id)
+
+            # условия запуска дренажа:
+            # - пришли сообщения (есть signal_ids)
+            # - или пришло время периодического дренажа (для истории)
+            now = datetime.utcnow()
+            should_idle_drain = (now - last_idle_drain_at).total_seconds() >= DRAIN_IDLE_INTERVAL_SEC
+
+            if (not signal_ids) and (not should_idle_drain):
+                # ничего не делаем, ждём следующий цикл
                 continue
 
-            # обрабатываем pending строки из bt_signals_live
-            processed_total, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total = await _process_pending_for_signal_ids(
+            # если пришли конкретные signal_id — дреним их; иначе дреним всё
+            drain_target_ids = sorted(signal_ids) if signal_ids else []
+
+            drained = await _drain_pending(
                 pg=pg,
                 redis=redis,
-                signal_ids=sorted(signal_ids),
+                signal_ids=drain_target_ids,
+                max_iterations=DRAIN_MAX_ITERATIONS_PER_TICK,
             )
 
+            last_idle_drain_at = now
+
             log.info(
-                "BT_SIG_LIVEPROC: batch done — msgs=%s, parsed=%s, ignored=%s, signal_ids=%s, "
-                "rows_ready=%s, inserted=%s, duplicates=%s, marked_processed=%s, soft_skipped=%s, hard_skipped=%s, errors=%s",
+                "BT_SIG_LIVEPROC: tick summary — msgs=%s, parsed=%s, ignored=%s, targeted_signal_ids=%s, "
+                "drain_iterations=%s, rows_ready=%s, inserted=%s, duplicates=%s, marked_processed=%s, "
+                "soft_skipped=%s, hard_skipped=%s, errors=%s",
                 total_msgs,
                 parsed_msgs,
                 ignored_msgs,
-                len(signal_ids),
-                processed_total,
-                inserted_total,
-                duplicates_total,
-                marked_total,
-                soft_skipped_total,
-                hard_skipped_total,
-                errors_total,
+                len(drain_target_ids),
+                drained["iterations"],
+                drained["rows_ready"],
+                drained["inserted"],
+                drained["duplicates"],
+                drained["marked_processed"],
+                drained["soft_skipped"],
+                drained["hard_skipped"],
+                drained["errors"],
             )
 
         except Exception as e:
@@ -180,19 +194,75 @@ def _parse_live_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]
         if not signal_id_str:
             return None
         signal_id = int(signal_id_str)
-
         return {"signal_id": signal_id}
     except Exception:
         return None
 
 
-# 🔸 Обработка pending строк bt_signals_live -> вставка в bt_signals_values -> processed=true
-async def _process_pending_for_signal_ids(
+# 🔸 Дренаж pending строк: обрабатываем батчами, пока не закончатся или пока нет прогресса
+async def _drain_pending(
+    pg,
+    redis,
+    signal_ids: List[int],
+    max_iterations: int,
+) -> Dict[str, int]:
+    totals = {
+        "iterations": 0,
+        "rows_ready": 0,
+        "inserted": 0,
+        "duplicates": 0,
+        "marked_processed": 0,
+        "soft_skipped": 0,
+        "hard_skipped": 0,
+        "errors": 0,
+    }
+
+    # если signal_ids пустой — это означает "обработать всё"
+    for _ in range(max_iterations):
+        totals["iterations"] += 1
+
+        (
+            rows_ready,
+            inserted,
+            duplicates,
+            marked_processed,
+            soft_skipped,
+            hard_skipped,
+            errors,
+        ) = await _process_pending_batch(
+            pg=pg,
+            redis=redis,
+            signal_ids=signal_ids,
+        )
+
+        totals["rows_ready"] += rows_ready
+        totals["inserted"] += inserted
+        totals["duplicates"] += duplicates
+        totals["marked_processed"] += marked_processed
+        totals["soft_skipped"] += soft_skipped
+        totals["hard_skipped"] += hard_skipped
+        totals["errors"] += errors
+
+        # если в батче не было строк — всё вычищено
+        if rows_ready <= 0:
+            break
+
+        # если не сделали никакого прогресса (ничего не пометили processed=true) — не крутимся бесконечно
+        if marked_processed <= 0:
+            break
+
+        # если был прогресс, продолжаем следующий батч
+
+    return totals
+
+
+# 🔸 Обработка одного батча pending строк bt_signals_live -> вставка в bt_signals_values -> processed=true
+async def _process_pending_batch(
     pg,
     redis,
     signal_ids: List[int],
 ) -> Tuple[int, int, int, int, int, int, int]:
-    processed_total = 0
+    rows_ready = 0
     inserted_total = 0
     duplicates_total = 0
     marked_total = 0
@@ -200,34 +270,51 @@ async def _process_pending_for_signal_ids(
     hard_skipped_total = 0
     errors_total = 0
 
-    if not signal_ids:
-        return processed_total, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
-
     # забираем pending строки из bt_signals_live
     async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                id,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                decision_time,
-                details
-            FROM bt_signals_live
-            WHERE processed = false
-              AND status = 'signal_sent'
-              AND signal_id = ANY($1::int[])
-            ORDER BY open_time
-            LIMIT $2
-            """,
-            signal_ids,
-            int(PROCESS_BATCH_LIMIT),
-        )
+        if signal_ids:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    signal_id,
+                    symbol,
+                    timeframe,
+                    open_time,
+                    decision_time,
+                    details
+                FROM bt_signals_live
+                WHERE processed = false
+                  AND status = 'signal_sent'
+                  AND signal_id = ANY($1::int[])
+                ORDER BY open_time
+                LIMIT $2
+                """,
+                signal_ids,
+                int(PROCESS_BATCH_LIMIT),
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    signal_id,
+                    symbol,
+                    timeframe,
+                    open_time,
+                    decision_time,
+                    details
+                FROM bt_signals_live
+                WHERE processed = false
+                  AND status = 'signal_sent'
+                ORDER BY open_time
+                LIMIT $1
+                """,
+                int(PROCESS_BATCH_LIMIT),
+            )
 
     if not rows:
-        return processed_total, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
+        return rows_ready, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
 
     # нормализуем входные данные
     pending: List[Dict[str, Any]] = []
@@ -246,7 +333,7 @@ async def _process_pending_for_signal_ids(
                     "id": int(r["id"]),
                     "signal_id": int(r["signal_id"]),
                     "symbol": str(r["symbol"]),
-                    "timeframe": str(r["timeframe"]),
+                    "timeframe": str(r["timeframe"]).strip().lower(),
                     "open_time": r["open_time"],
                     "decision_time": r["decision_time"],
                     "details": details_obj,
@@ -256,9 +343,9 @@ async def _process_pending_for_signal_ids(
             errors_total += 1
 
     if not pending:
-        return processed_total, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
+        return rows_ready, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
 
-    processed_total = len(pending)
+    rows_ready = len(pending)
 
     # собираем цену из details или из Redis TS (fallback)
     need_price: List[Dict[str, Any]] = []
@@ -266,6 +353,8 @@ async def _process_pending_for_signal_ids(
         details = p.get("details") or {}
         ohlcv = details.get("ohlcv") if isinstance(details.get("ohlcv"), dict) else {}
         price = None
+
+        # сначала пробуем close_curr из details
         try:
             if isinstance(ohlcv, dict) and "close_curr" in ohlcv:
                 price = float(ohlcv.get("close_curr"))
@@ -277,12 +366,12 @@ async def _process_pending_for_signal_ids(
         else:
             p["price"] = price
 
+    # fallback: читаем close из Redis TS по open_time
     if need_price:
-        # батчем тянем close по open_time из Redis TS
         pipe = redis.pipeline()
         for p in need_price:
             symbol = p["symbol"]
-            tf = str(p["timeframe"]).strip().lower()
+            tf = p["timeframe"]
             ts_ms = _to_ms_utc(p["open_time"])
             close_key = BB_TS_CLOSE_KEY.format(symbol=symbol, tf=tf)
             pipe.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)
@@ -294,7 +383,6 @@ async def _process_pending_for_signal_ids(
             errors_total += len(need_price)
             res = []
 
-        # применяем результаты
         for p, ts_range_result in zip(need_price, res):
             price = _extract_ts_value(ts_range_result)
             if price is None:
@@ -307,6 +395,7 @@ async def _process_pending_for_signal_ids(
 
     for p in pending:
         try:
+            live_id = int(p["id"])
             signal_id = int(p["signal_id"])
             symbol = str(p["symbol"])
             timeframe = str(p["timeframe"]).strip().lower()
@@ -323,18 +412,17 @@ async def _process_pending_for_signal_ids(
 
             # условия достаточности
             if direction not in ("long", "short"):
-                # данные некорректны — помечаем processed=true, чтобы не зависать
-                ids_mark_processed_true.append(int(p["id"]))
+                ids_mark_processed_true.append(live_id)
                 hard_skipped_total += 1
                 continue
 
             if not message:
-                ids_mark_processed_true.append(int(p["id"]))
+                ids_mark_processed_true.append(live_id)
                 hard_skipped_total += 1
                 continue
 
             if price is None:
-                # цена не найдена — оставляем processed=false для ретраев
+                # цена не найдена — оставляем processed=false для следующей попытки
                 soft_skipped_total += 1
                 continue
 
@@ -389,7 +477,7 @@ async def _process_pending_for_signal_ids(
 
             to_insert.append(
                 {
-                    "live_id": int(p["id"]),
+                    "live_id": live_id,
                     "signal_uuid": uuid.uuid4(),
                     "signal_id": signal_id,
                     "symbol": symbol,
@@ -402,6 +490,7 @@ async def _process_pending_for_signal_ids(
                     "first_backfill_run_id": first_backfill_run_id,
                 }
             )
+
         except Exception as e:
             errors_total += 1
             log.error("BT_SIG_LIVEPROC: build insert row error: %s", e, exc_info=True)
@@ -428,7 +517,7 @@ async def _process_pending_for_signal_ids(
             )
         marked_total = len(ids_mark_processed_true)
 
-    return processed_total, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
+    return rows_ready, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
 
 
 # 🔸 Вставка батчем в bt_signals_values с подсчётом inserted/duplicate
