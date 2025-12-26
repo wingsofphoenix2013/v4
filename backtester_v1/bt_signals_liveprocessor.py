@@ -1,4 +1,4 @@
-# bt_signals_liveprocessor.py — воркер переноса live-filtered signal_sent из bt_signals_live в bt_signals_values (auto-drain backlog)
+# bt_signals_liveprocessor.py — воркер переноса live-filtered signal_sent из bt_signals_live в bt_signals_values (auto-drain backlog, без зависимости от processed=false)
 
 import asyncio
 import json
@@ -21,13 +21,13 @@ LIVE_READY_STREAM_BLOCK_MS = 5000
 # 🔸 Параметры обработки
 PROCESS_BATCH_LIMIT = 500
 
-# 🔸 Авто-дренаж: периодический подбор хвоста (чтобы история подхватилась без ручных XADD)
+# 🔸 Авто-дренаж: периодический подбор хвоста (чтобы история подхватилась без ручных XADD/UPDATE циклов)
 DRAIN_IDLE_INTERVAL_SEC = 10
 
 # 🔸 Защита от бесконечных циклов дренажа при отсутствии прогресса
-DRAIN_MAX_ITERATIONS_PER_TICK = 100
+DRAIN_MAX_ITERATIONS_PER_TICK = 200
 
-# 🔸 RedisTimeSeries ключи (для получения entry price при отсутствии в details)
+# 🔸 RedisTimeSeries ключи (fallback: entry price из close)
 BB_TS_CLOSE_KEY = "bb:ts:{symbol}:{tf}:c"
 
 # 🔸 Таймшаги TF (в минутах) для вычисления decision_time (если отсутствует)
@@ -51,7 +51,7 @@ async def run_bt_signals_liveprocessor(pg, redis) -> None:
             parsed_msgs = 0
             ignored_msgs = 0
 
-            # набор сигналов, по которым можно сделать таргетированный drain (если пусто — делаем общий drain)
+            # набор сигналов для таргетированного дренажа (если пусто — дреним всё)
             signal_ids: Set[int] = set()
 
             if entries:
@@ -71,20 +71,18 @@ async def run_bt_signals_liveprocessor(pg, redis) -> None:
                         parsed_msgs += 1
                         signal_ids.add(ctx["signal_id"])
 
-                        # ack сразу — обработка идемпотентная, зависания pending не нужны
+                        # ack сразу — обработка идемпотентная
                         await redis.xack(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP, msg_id)
 
             # условия запуска дренажа:
-            # - пришли сообщения (есть signal_ids)
-            # - или пришло время периодического дренажа (для истории)
+            # - пришли сообщения
+            # - или периодический авто-дренаж (подхват истории и “молча” накопившихся signal_sent)
             now = datetime.utcnow()
             should_idle_drain = (now - last_idle_drain_at).total_seconds() >= DRAIN_IDLE_INTERVAL_SEC
 
             if (not signal_ids) and (not should_idle_drain):
-                # ничего не делаем, ждём следующий цикл
                 continue
 
-            # если пришли конкретные signal_id — дреним их; иначе дреним всё
             drain_target_ids = sorted(signal_ids) if signal_ids else []
 
             drained = await _drain_pending(
@@ -229,7 +227,7 @@ async def _drain_pending(
             soft_skipped,
             hard_skipped,
             errors,
-        ) = await _process_pending_batch(
+        ) = await _process_one_batch(
             pg=pg,
             redis=redis,
             signal_ids=signal_ids,
@@ -247,17 +245,15 @@ async def _drain_pending(
         if rows_ready <= 0:
             break
 
-        # если не сделали никакого прогресса (ничего не пометили processed=true) — не крутимся бесконечно
+        # если нет прогресса — не крутимся бесконечно
         if marked_processed <= 0:
             break
-
-        # если был прогресс, продолжаем следующий батч
 
     return totals
 
 
-# 🔸 Обработка одного батча pending строк bt_signals_live -> вставка в bt_signals_values -> processed=true
-async def _process_pending_batch(
+# 🔸 Обработка одного батча: берём signal_sent, которых ещё нет в bt_signals_values, пишем туда и ставим processed=true
+async def _process_one_batch(
     pg,
     redis,
     signal_ids: List[int],
@@ -270,24 +266,34 @@ async def _process_pending_batch(
     hard_skipped_total = 0
     errors_total = 0
 
-    # забираем pending строки из bt_signals_live
+    # выбираем строки bt_signals_live со status='signal_sent', которые ещё не представлены в bt_signals_values
     async with pg.acquire() as conn:
         if signal_ids:
             rows = await conn.fetch(
                 """
                 SELECT
-                    id,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    decision_time,
-                    details
-                FROM bt_signals_live
-                WHERE processed = false
-                  AND status = 'signal_sent'
-                  AND signal_id = ANY($1::int[])
-                ORDER BY open_time
+                    l.id,
+                    l.signal_id,
+                    l.symbol,
+                    l.timeframe,
+                    l.open_time,
+                    l.decision_time,
+                    l.details,
+                    (l.details->'signal'->>'direction') AS direction
+                FROM bt_signals_live l
+                WHERE l.status = 'signal_sent'
+                  AND l.signal_id = ANY($1::int[])
+                  AND (l.details->'signal'->>'direction') IN ('long','short')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bt_signals_values v
+                      WHERE v.signal_id = l.signal_id
+                        AND v.symbol    = l.symbol
+                        AND v.timeframe = l.timeframe
+                        AND v.open_time = l.open_time
+                        AND v.direction = (l.details->'signal'->>'direction')
+                  )
+                ORDER BY l.open_time
                 LIMIT $2
                 """,
                 signal_ids,
@@ -297,17 +303,27 @@ async def _process_pending_batch(
             rows = await conn.fetch(
                 """
                 SELECT
-                    id,
-                    signal_id,
-                    symbol,
-                    timeframe,
-                    open_time,
-                    decision_time,
-                    details
-                FROM bt_signals_live
-                WHERE processed = false
-                  AND status = 'signal_sent'
-                ORDER BY open_time
+                    l.id,
+                    l.signal_id,
+                    l.symbol,
+                    l.timeframe,
+                    l.open_time,
+                    l.decision_time,
+                    l.details,
+                    (l.details->'signal'->>'direction') AS direction
+                FROM bt_signals_live l
+                WHERE l.status = 'signal_sent'
+                  AND (l.details->'signal'->>'direction') IN ('long','short')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bt_signals_values v
+                      WHERE v.signal_id = l.signal_id
+                        AND v.symbol    = l.symbol
+                        AND v.timeframe = l.timeframe
+                        AND v.open_time = l.open_time
+                        AND v.direction = (l.details->'signal'->>'direction')
+                  )
+                ORDER BY l.open_time
                 LIMIT $1
                 """,
                 int(PROCESS_BATCH_LIMIT),
@@ -315,6 +331,8 @@ async def _process_pending_batch(
 
     if not rows:
         return rows_ready, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
+
+    rows_ready = len(rows)
 
     # нормализуем входные данные
     pending: List[Dict[str, Any]] = []
@@ -336,6 +354,7 @@ async def _process_pending_batch(
                     "timeframe": str(r["timeframe"]).strip().lower(),
                     "open_time": r["open_time"],
                     "decision_time": r["decision_time"],
+                    "direction": str(r["direction"]).strip().lower(),
                     "details": details_obj,
                 }
             )
@@ -345,8 +364,6 @@ async def _process_pending_batch(
     if not pending:
         return rows_ready, inserted_total, duplicates_total, marked_total, soft_skipped_total, hard_skipped_total, errors_total
 
-    rows_ready = len(pending)
-
     # собираем цену из details или из Redis TS (fallback)
     need_price: List[Dict[str, Any]] = []
     for p in pending:
@@ -354,7 +371,6 @@ async def _process_pending_batch(
         ohlcv = details.get("ohlcv") if isinstance(details.get("ohlcv"), dict) else {}
         price = None
 
-        # сначала пробуем close_curr из details
         try:
             if isinstance(ohlcv, dict) and "close_curr" in ohlcv:
                 price = float(ohlcv.get("close_curr"))
@@ -401,14 +417,14 @@ async def _process_pending_batch(
             timeframe = str(p["timeframe"]).strip().lower()
             open_time = p["open_time"]
             decision_time = p.get("decision_time")
+            direction = str(p.get("direction") or "").strip().lower()
+            price = p.get("price")
 
             details = p.get("details") or {}
             sig = details.get("signal") if isinstance(details.get("signal"), dict) else {}
             filt = details.get("filter") if isinstance(details.get("filter"), dict) else {}
 
-            direction = str((sig or {}).get("direction") or "").strip().lower()
             message = str((sig or {}).get("message") or "").strip()
-            price = p.get("price")
 
             # условия достаточности
             if direction not in ("long", "short"):
@@ -422,7 +438,7 @@ async def _process_pending_batch(
                 continue
 
             if price is None:
-                # цена не найдена — оставляем processed=false для следующей попытки
+                # цена не найдена — не помечаем processed, чтобы попробовать позже
                 soft_skipped_total += 1
                 continue
 
