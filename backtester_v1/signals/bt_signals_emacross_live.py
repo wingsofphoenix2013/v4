@@ -29,6 +29,9 @@ IND_PACK_PAIR_KEY = "ind_pack:{analysis_id}:{scenario_id}:{signal_id}:{direction
 FILTER_WAIT_TOTAL_SEC = 90
 FILTER_WAIT_STEP_SEC = 5
 
+# 🔸 Стрим готовности live-filtered сигналов к персисту в bt_signals_values (signal_sent only)
+BT_SIGNALS_LIVE_READY_STREAM = "bt:signals:live_ready"
+
 # 🔸 Защита от “догоняющих” сигналов (не принимаем решения по кандидату позднее этого окна)
 STALE_MAX_SEC = 90
 
@@ -987,9 +990,11 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
                     },
                     "result": {"passed": True, "status": "signal_sent"},
                 },
+                processed=False,
             )
             if should_send:
                 await _publish_to_signals_stream(redis, symbol, open_time, message, applied_run_id)
+                await _publish_live_ready(redis, signal_id, symbol, timeframe, open_time, decision_time, applied_run_id)
             return
 
         attempt += 1
@@ -1078,6 +1083,42 @@ async def _publish_to_signals_stream(
             bar_time_iso,
             message,
             mirror_run_id,
+            exc_info=True,
+        )
+
+
+# 🔸 Публикация события готовности live-filtered сигнала к персисту (signal_sent only)
+async def _publish_live_ready(
+    redis,
+    signal_id: int,
+    symbol: str,
+    timeframe: str,
+    open_time: datetime,
+    decision_time: datetime,
+    applied_run_id: Optional[Any],
+) -> None:
+    now_iso = datetime.utcnow().isoformat()
+
+    try:
+        await redis.xadd(
+            BT_SIGNALS_LIVE_READY_STREAM,
+            {
+                "signal_id": str(int(signal_id)),
+                "symbol": str(symbol),
+                "timeframe": str(timeframe),
+                "open_time": open_time.isoformat(),
+                "decision_time": decision_time.isoformat(),
+                "applied_run_id": str(applied_run_id) if applied_run_id is not None else "",
+                "sent_at": now_iso,
+            },
+        )
+    except Exception as e:
+        log.error(
+            "BT_SIG_EMA_CROSS_LIVE: failed to publish live_ready event: %s (signal_id=%s, symbol=%s, time=%s)",
+            e,
+            signal_id,
+            symbol,
+            open_time.isoformat(),
             exc_info=True,
         )
 
@@ -1191,19 +1232,21 @@ async def _upsert_live_log(
     decision_time: datetime,
     status: str,
     details: Dict[str, Any],
+    processed: bool = True,
 ) -> bool:
     payload = json.dumps(details, ensure_ascii=False)
 
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
-            INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, decision_time, status, details)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            INSERT INTO bt_signals_live (signal_id, symbol, timeframe, open_time, decision_time, status, details, processed)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
             ON CONFLICT (signal_id, symbol, timeframe, open_time)
             DO UPDATE
                SET decision_time = EXCLUDED.decision_time,
                    status = EXCLUDED.status,
-                   details = EXCLUDED.details
+                   details = EXCLUDED.details,
+                   processed = EXCLUDED.processed
             WHERE bt_signals_live.status <> 'signal_sent'
             RETURNING status
             """,
@@ -1214,6 +1257,7 @@ async def _upsert_live_log(
             decision_time,
             status,
             payload,
+            bool(processed),
         )
 
     if not rows:

@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Callable, Awaitable, Tuple
 from backtester_config import (
     get_scenario_signal_links_for_signal,
     get_scenario_instance,
+    get_enabled_signals,
 )
 
 # 🔸 Тип обработчика сценария:
@@ -36,12 +37,56 @@ SCENARIO_STREAM_BLOCK_MS = 5000      # блокировка чтения (мс)
 
 log = logging.getLogger("BT_SCENARIOS_MAIN")
 
+# 🔸 Индекс live-mirror сигналов: (mirror_scenario_id, mirror_signal_id) -> [live_signal_id, ...]
+def _build_live_mirror_index() -> Tuple[Dict[Tuple[int, int], List[int]], int]:
+    index: Dict[Tuple[int, int], List[int]] = {}
+    total_live_mirror = 0
+
+    signals = get_enabled_signals()
+    for s in signals:
+        mode = str(s.get("mode") or "").strip().lower()
+        if mode != "live":
+            continue
+
+        params = s.get("params") or {}
+
+        ms_cfg = params.get("mirror_scenario_id")
+        mi_cfg = params.get("mirror_signal_id")
+        if not ms_cfg or not mi_cfg:
+            continue
+
+        try:
+            mirror_scenario_id = int(ms_cfg.get("value"))
+            mirror_signal_id = int(mi_cfg.get("value"))
+        except Exception:
+            continue
+
+        live_signal_id = int(s.get("id") or 0)
+        if live_signal_id <= 0:
+            continue
+
+        key = (mirror_scenario_id, mirror_signal_id)
+        index.setdefault(key, []).append(live_signal_id)
+        total_live_mirror += 1
+
+    for k in index.keys():
+        index[k] = sorted(set(index[k]))
+
+    return index, total_live_mirror
 
 # 🔸 Публичная точка входа: оркестратор сценариев
 async def run_bt_scenarios_orchestrator(pg, redis):
     log.debug("BT_SCENARIOS_MAIN: оркестратор сценариев запущен")
 
     await _ensure_consumer_group(redis)
+
+    # строим индекс live-mirror сигналов один раз на старте (из кеша enabled сигналов)
+    live_mirror_index, live_mirror_total = _build_live_mirror_index()
+    log.info(
+        "BT_SCENARIOS_MAIN: live-mirror индекс построен — mirror_keys=%s, live_mirror_signals=%s",
+        len(live_mirror_index),
+        live_mirror_total,
+    )
 
     # основной цикл чтения стрима и запуска сценариев
     while True:
@@ -54,6 +99,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
             total_msgs = 0
             total_signals = 0
             total_scenarios = 0
+            total_scenarios_mirror = 0
 
             for stream_key, entries in messages:
                 if stream_key != SCENARIO_STREAM_KEY:
@@ -87,6 +133,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                         continue
 
                     started_for_message = 0
+                    started_mirror_for_message = 0
 
                     # последовательный запуск всех сценариев для данного сообщения
                     for link in links:
@@ -112,7 +159,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                             )
                             continue
 
-                        # выполняем сценарий синхронно (последовательно)
+                        # выполняем сценарий синхронно (последовательно) для backfill сигнала
                         await _run_scenario_worker(
                             scenario=scenario,
                             signal_ctx=signal_ctx,
@@ -122,28 +169,50 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                         started_for_message += 1
                         total_scenarios += 1
 
-                    # помечаем сообщение как обработанное после выполнения всех сценариев
+                        # если у пары (scenario_id, signal_id) есть live-mirror дублёры — запускаем сценарий вторым проходом
+                        mirror_key = (int(scenario_id), int(signal_id))
+                        mirror_live_ids = live_mirror_index.get(mirror_key) or []
+                        if not mirror_live_ids:
+                            continue
+
+                        for live_signal_id in mirror_live_ids:
+                            mirror_ctx = dict(signal_ctx)
+                            mirror_ctx["signal_id"] = int(live_signal_id)
+
+                            await _run_scenario_worker(
+                                scenario=scenario,
+                                signal_ctx=mirror_ctx,
+                                pg=pg,
+                                redis=redis,
+                            )
+                            started_mirror_for_message += 1
+                            total_scenarios_mirror += 1
+
+                    # помечаем сообщение как обработанное после выполнения всех сценариев (включая mirror)
                     await redis.xack(SCENARIO_STREAM_KEY, SCENARIO_CONSUMER_GROUP, entry_id)
 
                     log.debug(
-                        "BT_SCENARIOS_MAIN: сообщение stream_id=%s для signal_id=%s (run_id=%s) обработано, сценариев запущено=%s",
+                        "BT_SCENARIOS_MAIN: сообщение stream_id=%s для signal_id=%s (run_id=%s) обработано, сценариев=%s, mirror=%s",
                         entry_id,
                         signal_id,
                         run_id,
                         started_for_message,
+                        started_mirror_for_message,
                     )
 
             log.debug(
-                "BT_SCENARIOS_MAIN: пакет обработан — сообщений=%s, сигналов=%s, сценариев-запусков=%s",
+                "BT_SCENARIOS_MAIN: пакет обработан — сообщений=%s, сигналов=%s, сценариев-запусков=%s, mirror-запусков=%s",
                 total_msgs,
                 total_signals,
                 total_scenarios,
+                total_scenarios_mirror,
             )
             log.info(
-                "BT_SCENARIOS_MAIN: итог по пакету — сообщений=%s, сигналов=%s, запусков сценариев=%s (последовательный режим)",
+                "BT_SCENARIOS_MAIN: итог по пакету — сообщений=%s, сигналов=%s, запусков сценариев=%s, mirror-запусков=%s (последовательный режим)",
                 total_msgs,
                 total_signals,
                 total_scenarios,
+                total_scenarios_mirror,
             )
 
         except Exception as e:
@@ -154,7 +223,6 @@ async def run_bt_scenarios_orchestrator(pg, redis):
             )
             # небольшая пауза перед повторной попыткой, чтобы не крутить CPU при постоянной ошибке
             await asyncio.sleep(2)
-
 
 # 🔸 Проверка/создание consumer group для стрима сценариев
 async def _ensure_consumer_group(redis) -> None:

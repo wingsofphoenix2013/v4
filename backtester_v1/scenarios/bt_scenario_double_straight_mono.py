@@ -241,12 +241,24 @@ async def run_double_straight_mono_backfill(
         allowed_directions = ["long", "short"]
 
     # граница для инкрементальной досимуляции open позиций (предыдущий run.to_time)
-    prev_to_time = await _load_previous_run_to_time(pg, signal_id, run_id_i)
+    # для live-mirror сигналов (например 19/20) prev_to_time берём по зеркальному backfill сигналу (mirror_signal_id)
+    prev_to_time_signal_id = signal_id
+    try:
+        sig_params = signal_instance.get("params") or {}
+        ms_cfg = sig_params.get("mirror_signal_id")
+        if ms_cfg is not None:
+            ms_val = ms_cfg.get("value")
+            if ms_val is not None:
+                prev_to_time_signal_id = int(ms_val)
+    except Exception:
+        prev_to_time_signal_id = signal_id
+
+    prev_to_time = await _load_previous_run_to_time(pg, prev_to_time_signal_id, run_id_i)
     if prev_to_time is None:
         prev_to_time = from_time
 
     log.debug(
-        "BT_SCENARIO_DOUBLE_MONO: старт сценария id=%s (key=%s, type=%s) для signal_id=%s, run_id=%s, TF=%s, окно=[%s .. %s], prev_to_time=%s",
+        "BT_SCENARIO_DOUBLE_MONO: старт сценария id=%s (key=%s, type=%s) для signal_id=%s, run_id=%s, TF=%s, окно=[%s .. %s], prev_to_time=%s (from_signal_id=%s)",
         scenario_id,
         scenario_key,
         scenario_type,
@@ -256,6 +268,7 @@ async def run_double_straight_mono_backfill(
         from_time,
         to_time,
         prev_to_time,
+        prev_to_time_signal_id,
     )
 
     affected_days: Set[date] = set()

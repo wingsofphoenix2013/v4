@@ -1,7 +1,7 @@
 # backtester_config.py — конфигурация и кеш метаданных для backtester_v1
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_CONFIG")
@@ -15,6 +15,9 @@ bt_scenario_signal_links: List[Dict[str, Any]] = []        # элементы: {
 
 bt_analysis_instances: Dict[int, Dict[str, Any]] = {}      # analysis_id -> {family_key, key, name, enabled, params}
 bt_analysis_connections: List[Dict[str, Any]] = []         # элементы: {id, scenario_id, signal_id, analysis_id, enabled, created_at, updated_at}
+
+# 🔸 Индекс live-mirror сигналов: (mirror_scenario_id, mirror_signal_id) -> [live_signal_id, ...]
+bt_live_mirror_index: Dict[Tuple[int, int], List[int]] = {}
 
 
 # 🔸 Загрузка активных тикеров (status = enabled, tradepermission = enabled)
@@ -111,6 +114,50 @@ async def load_initial_indicators(pg, timeframes: Optional[List[str]] = None) ->
     return count
 
 
+# 🔸 Пересборка индекса live-mirror сигналов по текущему кешу bt_signal_instances
+def rebuild_live_mirror_index() -> Tuple[int, int]:
+    index: Dict[Tuple[int, int], List[int]] = {}
+    total_live_mirror = 0
+
+    for s in bt_signal_instances.values():
+        mode = str(s.get("mode") or "").strip().lower()
+        if mode != "live":
+            continue
+
+        params = s.get("params") or {}
+
+        ms_cfg = params.get("mirror_scenario_id")
+        mi_cfg = params.get("mirror_signal_id")
+        if not ms_cfg or not mi_cfg:
+            continue
+
+        try:
+            mirror_scenario_id = int(ms_cfg.get("value"))
+            mirror_signal_id = int(mi_cfg.get("value"))
+        except Exception:
+            continue
+
+        try:
+            live_signal_id = int(s.get("id") or 0)
+        except Exception:
+            live_signal_id = 0
+
+        if live_signal_id <= 0:
+            continue
+
+        key = (mirror_scenario_id, mirror_signal_id)
+        index.setdefault(key, []).append(live_signal_id)
+        total_live_mirror += 1
+
+    for k in list(index.keys()):
+        index[k] = sorted(set(index[k]))
+
+    bt_live_mirror_index.clear()
+    bt_live_mirror_index.update(index)
+
+    return len(bt_live_mirror_index), total_live_mirror
+
+
 # 🔸 Загрузка инстансов псевдо-сигналов и их параметров
 async def load_initial_signals(
     pg,
@@ -174,6 +221,7 @@ async def load_initial_signals(
 
         if not signal_ids:
             bt_signal_instances.clear()
+            bt_live_mirror_index.clear()
             log.info("BT_CONFIG: инстансов псевдо-сигналов не найдено (фильтр применён)")
             return 0
 
@@ -203,8 +251,16 @@ async def load_initial_signals(
     bt_signal_instances.clear()
     bt_signal_instances.update(signals)
 
+    # пересобираем индекс live-mirror по текущему кешу сигналов
+    mirror_keys, live_mirror_total = rebuild_live_mirror_index()
+
     count = len(bt_signal_instances)
-    log.info(f"BT_CONFIG: загружено инстансов псевдо-сигналов: {count}")
+    log.info(
+        "BT_CONFIG: загружено инстансов псевдо-сигналов: %s (live_mirror_signals=%s, mirror_keys=%s)",
+        count,
+        live_mirror_total,
+        mirror_keys,
+    )
     return count
 
 
@@ -502,6 +558,15 @@ def get_enabled_signals() -> List[Dict[str, Any]]:
     ]
 
 
+# 🔸 Геттер: получить live-mirror сигналы для пары (mirror_scenario_id, mirror_signal_id)
+def get_live_mirror_signals(
+    mirror_scenario_id: int,
+    mirror_signal_id: int,
+) -> List[int]:
+    key = (int(mirror_scenario_id), int(mirror_signal_id))
+    return list(bt_live_mirror_index.get(key) or [])
+
+
 # 🔸 Геттеры для сценариев и связок сценарий ↔ сигнал
 def get_all_scenarios() -> Dict[int, Dict[str, Any]]:
     return bt_scenarios
@@ -552,7 +617,7 @@ def get_signals_for_scenario(scenario_id: int) -> List[int]:
     ]
 
 
-# 🔸 Геттеры для анализаторов и связок сценарий ↔ сигнал ↔ анализатор
+# 🔸 Гetterы для анализаторов и связок сценарий ↔ сигнал ↔ анализатор
 def get_all_analysis_instances() -> Dict[int, Dict[str, Any]]:
     return bt_analysis_instances
 
