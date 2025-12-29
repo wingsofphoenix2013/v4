@@ -148,13 +148,23 @@ async def run_bt_signals_cache_watcher(pg, redis) -> None:
 
     while True:
         try:
-            entries = await redis.xreadgroup(
-                groupname=CACHE_CONSUMER_GROUP,
-                consumername=CACHE_CONSUMER_NAME,
-                streams={ANALYSIS_POSTPROC_STREAM_KEY: ">"},
-                count=CACHE_STREAM_BATCH_SIZE,
-                block=CACHE_STREAM_BLOCK_MS,
-            )
+            try:
+                entries = await redis.xreadgroup(
+                    groupname=CACHE_CONSUMER_GROUP,
+                    consumername=CACHE_CONSUMER_NAME,
+                    streams={ANALYSIS_POSTPROC_STREAM_KEY: ">"},
+                    count=CACHE_STREAM_BATCH_SIZE,
+                    block=CACHE_STREAM_BLOCK_MS,
+                )
+            except Exception as e:
+                msg = str(e)
+                if "NOGROUP" in msg:
+                    log.warning(
+                        "BT_SIG_CACHE: NOGROUP при XREADGROUP — пересоздаём/переинициализируем группу и продолжаем",
+                    )
+                    await _ensure_consumer_group(redis)
+                    continue
+                raise
 
             if not entries:
                 continue
@@ -243,24 +253,20 @@ async def _ensure_consumer_group(redis) -> None:
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.info(
-                "BT_SIG_CACHE: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                "BT_SIG_CACHE: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 CACHE_CONSUMER_GROUP,
             )
 
-            await redis.xgroup_destroy(
+            await redis.execute_command(
+                "XGROUP",
+                "SETID",
                 ANALYSIS_POSTPROC_STREAM_KEY,
                 CACHE_CONSUMER_GROUP,
-            )
-
-            await redis.xgroup_create(
-                name=ANALYSIS_POSTPROC_STREAM_KEY,
-                groupname=CACHE_CONSUMER_GROUP,
-                id="$",
-                mkstream=True,
+                "$",
             )
 
             log.debug(
-                "BT_SIG_CACHE: consumer group '%s' пересоздана для стрима '%s'",
+                "BT_SIG_CACHE: consumer group '%s' SETID='$' для стрима '%s' выполнен",
                 CACHE_CONSUMER_GROUP,
                 ANALYSIS_POSTPROC_STREAM_KEY,
             )

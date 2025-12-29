@@ -383,8 +383,21 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
+            log.info(
+                "BT_ANALYSIS_MAIN: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
+                ANALYSIS_CONSUMER_GROUP,
+            )
+
+            await redis.execute_command(
+                "XGROUP",
+                "SETID",
+                ANALYSIS_STREAM_KEY,
+                ANALYSIS_CONSUMER_GROUP,
+                "$",
+            )
+
             log.debug(
-                "BT_ANALYSIS_MAIN: consumer group '%s' для стрима '%s' уже существует",
+                "BT_ANALYSIS_MAIN: consumer group '%s' SETID='$' для стрима '%s' выполнен",
                 ANALYSIS_CONSUMER_GROUP,
                 ANALYSIS_STREAM_KEY,
             )
@@ -400,13 +413,23 @@ async def _ensure_consumer_group(redis) -> None:
 
 # 🔸 Чтение сообщений из стрима bt:postproc:ready
 async def _read_from_stream(redis) -> List[Any]:
-    entries = await redis.xreadgroup(
-        groupname=ANALYSIS_CONSUMER_GROUP,
-        consumername=ANALYSIS_CONSUMER_NAME,
-        streams={ANALYSIS_STREAM_KEY: ">"},
-        count=ANALYSIS_STREAM_BATCH_SIZE,
-        block=ANALYSIS_STREAM_BLOCK_MS,
-    )
+    try:
+        entries = await redis.xreadgroup(
+            groupname=ANALYSIS_CONSUMER_GROUP,
+            consumername=ANALYSIS_CONSUMER_NAME,
+            streams={ANALYSIS_STREAM_KEY: ">"},
+            count=ANALYSIS_STREAM_BATCH_SIZE,
+            block=ANALYSIS_STREAM_BLOCK_MS,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "NOGROUP" in msg:
+            log.warning(
+                "BT_ANALYSIS_MAIN: NOGROUP при XREADGROUP — переинициализируем группу и продолжаем",
+            )
+            await _ensure_consumer_group(redis)
+            return []
+        raise
 
     if not entries:
         return []

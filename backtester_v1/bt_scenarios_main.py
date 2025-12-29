@@ -245,24 +245,20 @@ async def _ensure_consumer_group(redis) -> None:
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.info(
-                "BT_SCENARIOS_MAIN: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                "BT_SCENARIOS_MAIN: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 SCENARIO_CONSUMER_GROUP,
             )
 
-            await redis.xgroup_destroy(
+            await redis.execute_command(
+                "XGROUP",
+                "SETID",
                 SCENARIO_STREAM_KEY,
                 SCENARIO_CONSUMER_GROUP,
-            )
-
-            await redis.xgroup_create(
-                name=SCENARIO_STREAM_KEY,
-                groupname=SCENARIO_CONSUMER_GROUP,
-                id="$",
-                mkstream=True,
+                "$",
             )
 
             log.debug(
-                "BT_SCENARIOS_MAIN: consumer group '%s' пересоздана для стрима '%s'",
+                "BT_SCENARIOS_MAIN: consumer group '%s' SETID='$' для стрима '%s' выполнен",
                 SCENARIO_CONSUMER_GROUP,
                 SCENARIO_STREAM_KEY,
             )
@@ -277,22 +273,30 @@ async def _ensure_consumer_group(redis) -> None:
 
 # 🔸 Чтение сообщений из стрима сценариев
 async def _read_from_stream(redis) -> List[Any]:
-    # XREADGROUP GROUP <group> <consumer> COUNT N BLOCK M STREAMS key >
-    entries = await redis.xreadgroup(
-        groupname=SCENARIO_CONSUMER_GROUP,
-        consumername=SCENARIO_CONSUMER_NAME,
-        streams={SCENARIO_STREAM_KEY: ">"},
-        count=SCENARIO_STREAM_BATCH_SIZE,
-        block=SCENARIO_STREAM_BLOCK_MS,
-    )
+    try:
+        # XREADGROUP GROUP <group> <consumer> COUNT N BLOCK M STREAMS key >
+        entries = await redis.xreadgroup(
+            groupname=SCENARIO_CONSUMER_GROUP,
+            consumername=SCENARIO_CONSUMER_NAME,
+            streams={SCENARIO_STREAM_KEY: ">"},
+            count=SCENARIO_STREAM_BATCH_SIZE,
+            block=SCENARIO_STREAM_BLOCK_MS,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "NOGROUP" in msg:
+            log.warning(
+                "BT_SCENARIOS_MAIN: NOGROUP при XREADGROUP — пересоздаём/переинициализируем группу и продолжаем",
+            )
+            await _ensure_consumer_group(redis)
+            return []
+        raise
 
     if not entries:
         return []
 
-    # entries: List[Tuple[bytes, List[Tuple[bytes, Dict[bytes, bytes]]]]]
     parsed: List[Any] = []
     for stream_key, messages in entries:
-        # redis-py может возвращать bytes, приводим к str
         if isinstance(stream_key, bytes):
             stream_key = stream_key.decode("utf-8")
 
@@ -301,7 +305,6 @@ async def _read_from_stream(redis) -> List[Any]:
             if isinstance(msg_id, bytes):
                 msg_id = msg_id.decode("utf-8")
 
-            # поля приводим к str
             str_fields: Dict[str, str] = {}
             for k, v in fields.items():
                 key_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
@@ -313,7 +316,6 @@ async def _read_from_stream(redis) -> List[Any]:
         parsed.append((stream_key, stream_entries))
 
     return parsed
-
 
 # 🔸 Разбор одного сообщения из стрима bt:signals:ready (run-aware)
 def _parse_signal_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:

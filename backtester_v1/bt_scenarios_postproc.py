@@ -192,24 +192,20 @@ async def _ensure_consumer_group(redis) -> None:
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.info(
-                "BT_SCENARIOS_POSTPROC: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                "BT_SCENARIOS_POSTPROC: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 POSTPROC_CONSUMER_GROUP,
             )
 
-            await redis.xgroup_destroy(
+            await redis.execute_command(
+                "XGROUP",
+                "SETID",
                 POSTPROC_STREAM_KEY,
                 POSTPROC_CONSUMER_GROUP,
-            )
-
-            await redis.xgroup_create(
-                name=POSTPROC_STREAM_KEY,
-                groupname=POSTPROC_CONSUMER_GROUP,
-                id="$",
-                mkstream=True,
+                "$",
             )
 
             log.debug(
-                "BT_SCENARIOS_POSTPROC: consumer group '%s' пересоздана для стрима '%s'",
+                "BT_SCENARIOS_POSTPROC: consumer group '%s' SETID='$' для стрима '%s' выполнен",
                 POSTPROC_CONSUMER_GROUP,
                 POSTPROC_STREAM_KEY,
             )
@@ -224,13 +220,23 @@ async def _ensure_consumer_group(redis) -> None:
 
 # 🔸 Чтение сообщений из стрима bt:scenarios:ready
 async def _read_from_stream(redis) -> List[Any]:
-    entries = await redis.xreadgroup(
-        groupname=POSTPROC_CONSUMER_GROUP,
-        consumername=POSTPROC_CONSUMER_NAME,
-        streams={POSTPROC_STREAM_KEY: ">"},
-        count=POSTPROC_STREAM_BATCH_SIZE,
-        block=POSTPROC_STREAM_BLOCK_MS,
-    )
+    try:
+        entries = await redis.xreadgroup(
+            groupname=POSTPROC_CONSUMER_GROUP,
+            consumername=POSTPROC_CONSUMER_NAME,
+            streams={POSTPROC_STREAM_KEY: ">"},
+            count=POSTPROC_STREAM_BATCH_SIZE,
+            block=POSTPROC_STREAM_BLOCK_MS,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "NOGROUP" in msg:
+            log.warning(
+                "BT_SCENARIOS_POSTPROC: NOGROUP при XREADGROUP — пересоздаём/переинициализируем группу и продолжаем",
+            )
+            await _ensure_consumer_group(redis)
+            return []
+        raise
 
     if not entries:
         return []

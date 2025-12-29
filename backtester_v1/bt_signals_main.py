@@ -500,13 +500,25 @@ async def _run_stream_backfill_dispatcher(
     # основной цикл чтения стрима и маршрутизации по сигналам
     while True:
         try:
-            entries = await redis.xreadgroup(
-                groupname=group_name,
-                consumername=consumer_name,
-                streams={stream_key: ">"},
-                count=BT_STREAM_BACKFILL_BATCH_SIZE,
-                block=BT_STREAM_BACKFILL_BLOCK_MS,
-            )
+            try:
+                entries = await redis.xreadgroup(
+                    groupname=group_name,
+                    consumername=consumer_name,
+                    streams={stream_key: ">"},
+                    count=BT_STREAM_BACKFILL_BATCH_SIZE,
+                    block=BT_STREAM_BACKFILL_BLOCK_MS,
+                )
+            except Exception as e:
+                msg = str(e)
+                if "NOGROUP" in msg:
+                    log.warning(
+                        "BT_SIGNALS_STREAM: NOGROUP при XREADGROUP — переинициализируем группу и продолжаем (stream=%s, group=%s)",
+                        stream_key,
+                        group_name,
+                    )
+                    await _ensure_stream_consumer_group(stream_key, group_name, consumer_name, log, redis)
+                    continue
+                raise
 
             if not entries:
                 continue
@@ -736,13 +748,25 @@ async def _run_live_stream_dispatcher(
     # основной цикл чтения стрима и параллельной маршрутизации
     while True:
         try:
-            entries = await redis.xreadgroup(
-                groupname=group_name,
-                consumername=consumer_name,
-                streams={stream_key: ">"},
-                count=BT_LIVE_STREAM_BATCH_SIZE,
-                block=BT_LIVE_STREAM_BLOCK_MS,
-            )
+            try:
+                entries = await redis.xreadgroup(
+                    groupname=group_name,
+                    consumername=consumer_name,
+                    streams={stream_key: ">"},
+                    count=BT_LIVE_STREAM_BATCH_SIZE,
+                    block=BT_LIVE_STREAM_BLOCK_MS,
+                )
+            except Exception as e:
+                msg = str(e)
+                if "NOGROUP" in msg:
+                    log.warning(
+                        "BT_SIGNALS_LIVE: NOGROUP при XREADGROUP — переинициализируем группу и продолжаем (stream=%s, group=%s)",
+                        stream_key,
+                        group_name,
+                    )
+                    await _ensure_stream_consumer_group(stream_key, group_name, consumer_name, log, redis)
+                    continue
+                raise
 
             if not entries:
                 continue
@@ -822,25 +846,21 @@ async def _ensure_stream_consumer_group(
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.info(
-                "BT_SIGNALS_STREAM: consumer group '%s' для стрима '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                "BT_SIGNALS_STREAM: consumer group '%s' для стрима '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 group_name,
                 stream_key,
             )
 
-            await redis.xgroup_destroy(
+            await redis.execute_command(
+                "XGROUP",
+                "SETID",
                 stream_key,
                 group_name,
-            )
-
-            await redis.xgroup_create(
-                name=stream_key,
-                groupname=group_name,
-                id="$",
-                mkstream=True,
+                "$",
             )
 
             log.debug(
-                "BT_SIGNALS_STREAM: consumer group '%s' пересоздана для стрима '%s'",
+                "BT_SIGNALS_STREAM: consumer group '%s' SETID='$' для стрима '%s' выполнен",
                 group_name,
                 stream_key,
             )
