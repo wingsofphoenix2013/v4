@@ -19,11 +19,13 @@ ScenarioHandler = Callable[[Dict[str, Any], Dict[str, Any], Any, Any], Awaitable
 # 🔸 Воркеры сценариев (из пакета scenarios/)
 from scenarios.bt_scenario_basic_straight_mono import run_basic_straight_mono_backfill
 from scenarios.bt_scenario_double_straight_mono import run_double_straight_mono_backfill
+from scenarios.bt_scenario_raw_straight_mono import run_raw_straight_mono_backfill
 
 # 🔸 Реестр сценарных воркеров: (key, type) → handler
 SCENARIO_HANDLERS: Dict[Tuple[str, str], ScenarioHandler] = {
     ("basic_straight_mono", "straight"): run_basic_straight_mono_backfill,
     ("double_straight_mono", "straight"): run_double_straight_mono_backfill,
+    ("raw_straight_mono", "straight"): run_raw_straight_mono_backfill,
 }
 
 # 🔸 Константы стрима сценариев (потребитель backfill-ready сигналов)
