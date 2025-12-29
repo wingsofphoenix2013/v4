@@ -1,11 +1,11 @@
-# bt_analysis_preproc.py — препроцессинг анализа: оптимальный порог winrate по биннам + walk-forward стабильность (run-aware)
+# bt_analysis_preproc.py — препроцессинг анализа: оптимальный порог winrate по биннам (run-aware) + флаг active по консенсусу 28/14/7
 
 import asyncio
 import logging
 import json
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("BT_ANALYSIS_PREPROC")
 
@@ -17,29 +17,24 @@ PREPROC_STREAM_KEY = "bt:analysis:ready"
 PREPROC_CONSUMER_GROUP = "bt_analysis_preproc"
 PREPROC_CONSUMER_NAME = "bt_analysis_preproc_main"
 
-# 🔸 Стрим готовности препроцессинга (для следующего этапа)
+# 🔸 Стрим готовности препроцессинга
 PREPROC_READY_STREAM_KEY = "bt:analysis:preproc_ready"
 
 # 🔸 Настройки чтения стрима
 PREPROC_STREAM_BATCH_SIZE = 10
 PREPROC_STREAM_BLOCK_MS = 5000
 
-# 🔸 Таблицы результатов
+# 🔸 Таблица результатов
 PREPROC_TABLE = "bt_analysis_preproc_stat"
-WALK_TABLE = "bt_analysis_preproc_walkforward"
 
-# 🔸 Walk-forward параметры (по умолчанию)
-WF_TRAIN_DAYS = 14
-WF_TEST_DAYS = 2
-WF_STEP_DAYS = 2
-WF_MIN_STEPS_FOR_SCORE = 3
+# 🔸 Окна консенсуса active (по последней дате run)
+CONSENSUS_WINDOWS_DAYS = [28, 14, 7]
 
 # 🔸 Квантизация метрик
 Q4 = Decimal("0.0001")
-DENOM_EPS = Decimal("1")
 
 
-# 🔸 Длительность в Decimal с обрезкой до 4 знаков
+# 🔸 Квантизация Decimal до 4 знаков
 def _q4(value: Decimal) -> Decimal:
     return value.quantize(Q4, rounding=ROUND_DOWN)
 
@@ -50,18 +45,6 @@ def _d(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return default
-
-
-# 🔸 Медиана для Decimal-списка
-def _median_decimal(values: List[Decimal]) -> Decimal:
-    if not values:
-        return Decimal("0")
-    arr = sorted(values)
-    n = len(arr)
-    mid = n // 2
-    if n % 2 == 1:
-        return arr[mid]
-    return (arr[mid - 1] + arr[mid]) / Decimal("2")
 
 
 # 🔸 Публичная точка входа: воркер препроцессинга анализа
@@ -80,7 +63,6 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
             total_pairs = 0
             total_groups = 0
             total_upserts = 0
-            total_steps_upserts = 0
             total_skipped = 0
             total_errors = 0
 
@@ -120,7 +102,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                     window_from = run_window["from_time"]
                     window_to = run_window["to_time"]
 
-                    # загружаем все бины по паре (scenario/signal/run)
+                    # грузим бин-статистику по паре run/scenario/signal
                     try:
                         bins_rows = await _load_bins_stat_rows(pg, run_id, scenario_id, signal_id)
                     except Exception as e:
@@ -138,18 +120,17 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
 
                     # обрабатываем группы (analysis_id/indicator_param/timeframe/direction)
                     try:
-                        groups_processed, upserts_done, steps_upserts_done = await _process_and_store_groups(
+                        groups_processed, upserts_done = await _process_and_store_groups(
                             pg=pg,
                             run_id=run_id,
                             scenario_id=scenario_id,
                             signal_id=signal_id,
-                            window_from=window_from,
-                            window_to=window_to,
-                            bins_rows=bins_rows,
+                            run_from=window_from,
+                            run_to=window_to,
+                            rows=bins_rows,
                         )
                         total_groups += groups_processed
                         total_upserts += upserts_done
-                        total_steps_upserts += steps_upserts_done
                     except Exception as e:
                         total_errors += 1
                         log.error(
@@ -163,19 +144,17 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                         await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    log.info(
-                        "BT_ANALYSIS_PREPROC: pair done — scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s, "
-                        "groups=%s, preproc_upserts=%s, wf_steps_upserts=%s",
+                    log.debug(
+                        "BT_ANALYSIS_PREPROC: pair done — scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s, groups=%s, upserts=%s",
                         scenario_id,
                         signal_id,
                         run_id,
                         finished_at,
                         groups_processed,
                         upserts_done,
-                        steps_upserts_done,
                     )
 
-                    # публикуем событие готовности препроцессинга (run-aware)
+                    # событие готовности (run-aware)
                     finished_at_preproc = datetime.utcnow()
                     try:
                         await redis.xadd(
@@ -186,7 +165,6 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                                 "run_id": str(run_id),
                                 "groups": str(groups_processed),
                                 "upserts": str(upserts_done),
-                                "wf_steps_upserts": str(steps_upserts_done),
                                 "finished_at": finished_at_preproc.isoformat(),
                             },
                         )
@@ -203,13 +181,12 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
 
                     await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
 
-            log.info(
-                "BT_ANALYSIS_PREPROC: batch summary — msgs=%s, pairs=%s, groups=%s, preproc_upserts=%s, wf_steps_upserts=%s, skipped=%s, errors=%s",
+            log.debug(
+                "BT_ANALYSIS_PREPROC: batch summary — msgs=%s, pairs=%s, groups=%s, upserts=%s, skipped=%s, errors=%s",
                 total_msgs,
                 total_pairs,
                 total_groups,
                 total_upserts,
-                total_steps_upserts,
                 total_skipped,
                 total_errors,
             )
@@ -219,7 +196,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
             await asyncio.sleep(2)
 
 
-# 🔸 Проверка/создание consumer group
+# 🔸 Проверка/создание consumer group (Render-safe: SETID '$' вместо DESTROY)
 async def _ensure_consumer_group(redis) -> None:
     try:
         await redis.xgroup_create(
@@ -236,7 +213,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_PREPROC: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 PREPROC_CONSUMER_GROUP,
             )
@@ -264,7 +241,7 @@ async def _ensure_consumer_group(redis) -> None:
             raise
 
 
-# 🔸 Чтение сообщений из стрима bt:analysis:ready
+# 🔸 Чтение сообщений из стрима bt:analysis:ready (Render-safe: NOGROUP recovery)
 async def _read_from_stream(redis) -> List[Any]:
     try:
         entries = await redis.xreadgroup(
@@ -352,7 +329,7 @@ async def _load_run_window(pg, run_id: int) -> Optional[Dict[str, Any]]:
     return {"from_time": row["from_time"], "to_time": row["to_time"]}
 
 
-# 🔸 Загрузка бин-статистики по паре run/scenario/signal
+# 🔸 Загрузка бин-статистики по паре run/scenario/signal (как есть из bt_analysis_bins_stat)
 async def _load_bins_stat_rows(
     pg,
     run_id: int,
@@ -384,10 +361,13 @@ async def _load_bins_stat_rows(
 
     out: List[Dict[str, Any]] = []
     for r in rows:
+        ind = r["indicator_param"]
+        indicator_param_norm = str(ind).strip() if ind is not None else ""
+
         out.append(
             {
                 "analysis_id": int(r["analysis_id"]),
-                "indicator_param": r["indicator_param"],
+                "indicator_param": indicator_param_norm,
                 "timeframe": str(r["timeframe"]).strip().lower(),
                 "direction": str(r["direction"]).strip().lower(),
                 "bin_name": str(r["bin_name"]),
@@ -399,8 +379,8 @@ async def _load_bins_stat_rows(
     return out
 
 
-# 🔸 Выборка агрегированной статистики по биннам из позиций для окна (train)
-async def _load_train_bin_stats(
+# 🔸 Бин-статистика за произвольное окно по позициям (для 14/7 проверок)
+async def _load_bins_stat_by_window(
     pg,
     run_id: int,
     analysis_id: int,
@@ -408,8 +388,8 @@ async def _load_train_bin_stats(
     signal_id: int,
     timeframe: str,
     direction: str,
-    train_from: datetime,
-    train_to: datetime,
+    w_from: datetime,
+    w_to: datetime,
 ) -> List[Dict[str, Any]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
@@ -422,12 +402,14 @@ async def _load_train_bin_stats(
             FROM bt_analysis_positions_raw r
             JOIN bt_scenario_positions p
               ON p.position_uid = r.position_uid
-            WHERE r.run_id     = $1
+            WHERE r.run_id      = $1
               AND r.analysis_id = $2
               AND r.scenario_id = $3
               AND r.signal_id   = $4
               AND r.timeframe   = $5
               AND r.direction   = $6
+              AND p.status      = 'closed'
+              AND p.postproc    = true
               AND p.entry_time BETWEEN $7 AND $8
             GROUP BY r.bin_name
             """,
@@ -437,8 +419,8 @@ async def _load_train_bin_stats(
             int(signal_id),
             str(timeframe),
             str(direction),
-            train_from,
-            train_to,
+            w_from,
+            w_to,
         )
 
     out: List[Dict[str, Any]] = []
@@ -460,86 +442,37 @@ async def _load_train_bin_stats(
     return out
 
 
-# 🔸 Выборка позиций для тестового окна (test): bin_name + pnl_abs
-async def _load_test_positions(
-    pg,
-    run_id: int,
-    analysis_id: int,
-    scenario_id: int,
-    signal_id: int,
-    timeframe: str,
-    direction: str,
-    test_from: datetime,
-    test_to: datetime,
-) -> List[Tuple[str, Decimal]]:
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                r.bin_name AS bin_name,
-                r.pnl_abs  AS pnl_abs
-            FROM bt_analysis_positions_raw r
-            JOIN bt_scenario_positions p
-              ON p.position_uid = r.position_uid
-            WHERE r.run_id     = $1
-              AND r.analysis_id = $2
-              AND r.scenario_id = $3
-              AND r.signal_id   = $4
-              AND r.timeframe   = $5
-              AND r.direction   = $6
-              AND p.entry_time BETWEEN $7 AND $8
-            """,
-            int(run_id),
-            int(analysis_id),
-            int(scenario_id),
-            int(signal_id),
-            str(timeframe),
-            str(direction),
-            test_from,
-            test_to,
-        )
-
-    out: List[Tuple[str, Decimal]] = []
-    for r in rows:
-        out.append((str(r["bin_name"]), _d(r["pnl_abs"])))
-    return out
-
-
-# 🔸 Обработка всех групп и запись результатов в bt_analysis_preproc_stat + walk-forward таблицу
+# 🔸 Обработка всех групп и запись результатов в bt_analysis_preproc_stat (active по правилам 28/14/7)
 async def _process_and_store_groups(
     pg,
     run_id: int,
     scenario_id: int,
     signal_id: int,
-    window_from: datetime,
-    window_to: datetime,
-    bins_rows: List[Dict[str, Any]],
-) -> Tuple[int, int, int]:
-    if not bins_rows:
-        return 0, 0, 0
+    run_from: datetime,
+    run_to: datetime,
+    rows: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    if not rows:
+        return 0, 0
 
-    # группируем по (analysis_id, indicator_param_norm, timeframe, direction)
     grouped: Dict[Tuple[int, str, str, str], List[Dict[str, Any]]] = {}
-    for r in bins_rows:
+    for r in rows:
         analysis_id = int(r["analysis_id"])
-        ind = r.get("indicator_param")
-        indicator_param_norm = str(ind).strip() if ind is not None else ""
-        tf = str(r["timeframe"]).strip().lower()
-        direction = str(r["direction"]).strip().lower()
+        indicator_param = str(r.get("indicator_param") or "").strip()
+        timeframe = str(r.get("timeframe") or "").strip().lower()
+        direction = str(r.get("direction") or "").strip().lower()
 
-        key = (analysis_id, indicator_param_norm, tf, direction)
+        key = (analysis_id, indicator_param, timeframe, direction)
         grouped.setdefault(key, []).append(r)
 
     groups_processed = 0
     upserts_done = 0
-    steps_upserts_done = 0
 
-    for (analysis_id, indicator_param_norm, tf, direction), group_bins in grouped.items():
+    for (analysis_id, indicator_param, timeframe, direction), group_bins in grouped.items():
         groups_processed += 1
 
-        # 1) основной оптимум по полному окну run (из bt_analysis_bins_stat)
-        best = _compute_best_threshold(group_bins)
-        if best is None:
+        best_28 = _compute_best_threshold(group_bins)
+        if best_28 is None:
             continue
 
         (
@@ -551,25 +484,87 @@ async def _process_and_store_groups(
             filt_winrate,
             threshold,
             raw_stat,
-            kept_bins,
-        ) = best
+        ) = best_28
 
-        # 2) walk-forward стабильность внутри окна run
-        stability_score, steps_written = await _compute_walkforward_and_store(
-            pg=pg,
-            run_id=run_id,
-            analysis_id=analysis_id,
-            scenario_id=scenario_id,
-            signal_id=signal_id,
-            indicator_param_norm=indicator_param_norm,
-            timeframe=tf,
-            direction=direction,
-            window_from=window_from,
-            window_to=window_to,
-        )
-        steps_upserts_done += steps_written
+        # правила active
+        active = True
+        active_reason = "ok"
 
-        # 3) upsert в bt_analysis_preproc_stat (включая stability_score)
+        # 1) если filt_pnl_abs < 0 — отключаем
+        if filt_pnl < Decimal("0"):
+            active = False
+            active_reason = "disabled_negative_filt_pnl_28d"
+        else:
+            # 2) консенсус по 28/14/7 (все должны быть > 0)
+            w14_from = run_to - timedelta(days=14)
+            w7_from = run_to - timedelta(days=7)
+
+            if w14_from < run_from:
+                w14_from = run_from
+            if w7_from < run_from:
+                w7_from = run_from
+
+            # считаем лучшие filt_pnl для 14/7 окон
+            filt_pnl_14: Optional[Decimal] = None
+            filt_pnl_7: Optional[Decimal] = None
+
+            bins_14 = await _load_bins_stat_by_window(
+                pg=pg,
+                run_id=run_id,
+                analysis_id=analysis_id,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                timeframe=timeframe,
+                direction=direction,
+                w_from=w14_from,
+                w_to=run_to,
+            )
+            best_14 = _compute_best_threshold(bins_14) if bins_14 else None
+            if best_14 is not None:
+                filt_pnl_14 = best_14[4]
+            else:
+                filt_pnl_14 = None
+
+            bins_7 = await _load_bins_stat_by_window(
+                pg=pg,
+                run_id=run_id,
+                analysis_id=analysis_id,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                timeframe=timeframe,
+                direction=direction,
+                w_from=w7_from,
+                w_to=run_to,
+            )
+            best_7 = _compute_best_threshold(bins_7) if bins_7 else None
+            if best_7 is not None:
+                filt_pnl_7 = best_7[4]
+            else:
+                filt_pnl_7 = None
+
+            consensus_ok = (
+                (filt_pnl > Decimal("0"))
+                and (filt_pnl_14 is not None and filt_pnl_14 > Decimal("0"))
+                and (filt_pnl_7 is not None and filt_pnl_7 > Decimal("0"))
+            )
+
+            if not consensus_ok:
+                active = False
+                active_reason = "disabled_no_28_14_7_consensus"
+
+            # дополняем raw_stat результатами проверок
+            raw_stat["active_checks"] = {
+                "window_to": run_to.isoformat(),
+                "pnl_28d": str(_q4(filt_pnl)),
+                "pnl_14d": str(_q4(filt_pnl_14)) if filt_pnl_14 is not None else None,
+                "pnl_7d": str(_q4(filt_pnl_7)) if filt_pnl_7 is not None else None,
+                "consensus_rule": "filt_pnl_abs > 0 for 28/14/7",
+            }
+
+        # итоговые метки active
+        raw_stat["active"] = bool(active)
+        raw_stat["active_reason"] = str(active_reason)
+
         async with pg.acquire() as conn:
             await conn.execute(
                 f"""
@@ -581,6 +576,7 @@ async def _process_and_store_groups(
                     indicator_param,
                     timeframe,
                     direction,
+                    active,
                     orig_trades,
                     orig_pnl_abs,
                     orig_winrate,
@@ -588,22 +584,22 @@ async def _process_and_store_groups(
                     filt_pnl_abs,
                     filt_winrate,
                     winrate_threshold,
-                    stability_score,
                     raw_stat,
                     created_at
                 )
                 VALUES (
                     $1, $2, $3, $4,
                     $5, $6, $7,
-                    $8, $9, $10,
-                    $11, $12, $13,
-                    $14,
+                    $8,
+                    $9, $10, $11,
+                    $12, $13, $14,
                     $15,
                     $16::jsonb,
                     now()
                 )
                 ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, indicator_param, timeframe, direction)
                 DO UPDATE SET
+                    active            = EXCLUDED.active,
                     orig_trades        = EXCLUDED.orig_trades,
                     orig_pnl_abs       = EXCLUDED.orig_pnl_abs,
                     orig_winrate       = EXCLUDED.orig_winrate,
@@ -611,7 +607,6 @@ async def _process_and_store_groups(
                     filt_pnl_abs       = EXCLUDED.filt_pnl_abs,
                     filt_winrate       = EXCLUDED.filt_winrate,
                     winrate_threshold  = EXCLUDED.winrate_threshold,
-                    stability_score    = EXCLUDED.stability_score,
                     raw_stat           = EXCLUDED.raw_stat,
                     updated_at         = now()
                 """,
@@ -619,9 +614,10 @@ async def _process_and_store_groups(
                 int(analysis_id),
                 int(scenario_id),
                 int(signal_id),
-                str(indicator_param_norm),
-                str(tf),
+                str(indicator_param),
+                str(timeframe),
                 str(direction),
+                bool(active),
                 int(orig_trades),
                 str(_q4(orig_pnl)),
                 str(_q4(orig_winrate)),
@@ -629,21 +625,23 @@ async def _process_and_store_groups(
                 str(_q4(filt_pnl)),
                 str(_q4(filt_winrate)),
                 str(_q4(threshold)) if threshold is not None else None,
-                str(_q4(stability_score)),
                 json.dumps(raw_stat, ensure_ascii=False),
             )
 
         upserts_done += 1
 
-        log.info(
-            "BT_ANALYSIS_PREPROC: group stored — run_id=%s scenario_id=%s signal_id=%s analysis_id=%s tf=%s dir=%s "
-            "orig(trades=%s,pnl=%s,wr=%s) filt(trades=%s,pnl=%s,wr=%s) thr=%s stability=%s steps=%s kept_bins=%s",
+        log.debug(
+            "BT_ANALYSIS_PREPROC: group stored — run_id=%s scenario_id=%s signal_id=%s analysis_id=%s ind='%s' tf=%s dir=%s active=%s reason=%s "
+            "orig(trades=%s,pnl=%s,wr=%s) filt(trades=%s,pnl=%s,wr=%s) thr=%s",
             run_id,
             scenario_id,
             signal_id,
             analysis_id,
-            tf,
+            indicator_param,
+            timeframe,
             direction,
+            active,
+            active_reason,
             orig_trades,
             str(_q4(orig_pnl)),
             str(_q4(orig_winrate)),
@@ -651,403 +649,18 @@ async def _process_and_store_groups(
             str(_q4(filt_pnl)),
             str(_q4(filt_winrate)),
             str(_q4(threshold)) if threshold is not None else None,
-            str(_q4(stability_score)),
-            steps_written,
-            len(kept_bins),
         )
 
-    return groups_processed, upserts_done, steps_upserts_done
-
-
-# 🔸 Walk-forward: train/test rolling внутри одного run, запись шагов + расчёт stability_score
-async def _compute_walkforward_and_store(
-    pg,
-    run_id: int,
-    analysis_id: int,
-    scenario_id: int,
-    signal_id: int,
-    indicator_param_norm: str,
-    timeframe: str,
-    direction: str,
-    window_from: datetime,
-    window_to: datetime,
-) -> Tuple[Decimal, int]:
-    train_days = int(WF_TRAIN_DAYS)
-    test_days = int(WF_TEST_DAYS)
-    step_days = int(WF_STEP_DAYS)
-
-    train_delta = timedelta(days=train_days)
-    test_delta = timedelta(days=test_days)
-    step_delta = timedelta(days=step_days)
-
-    step_no = 0
-    steps_written = 0
-
-    lift_ratios: List[Decimal] = []
-    shares: List[Decimal] = []
-    hit_count = 0
-    valid_steps = 0
-
-    # первый test начинается сразу после первого train
-    train_from = window_from
-    train_to = train_from + train_delta
-
-    while True:
-        test_from = train_to
-        test_to = test_from + test_delta
-
-        # условия остановки
-        if train_to > window_to:
-            break
-        if test_to > window_to:
-            break
-
-        step_no += 1
-
-        # 1) train: бин-статистика по позициям в train окне
-        train_bins = await _load_train_bin_stats(
-            pg=pg,
-            run_id=run_id,
-            analysis_id=analysis_id,
-            scenario_id=scenario_id,
-            signal_id=signal_id,
-            timeframe=timeframe,
-            direction=direction,
-            train_from=train_from,
-            train_to=train_to,
-        )
-
-        # если на train нет данных — записываем шаг как пустой и двигаемся дальше
-        if not train_bins:
-            await _upsert_walk_step(
-                pg=pg,
-                run_id=run_id,
-                analysis_id=analysis_id,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                indicator_param_norm=indicator_param_norm,
-                timeframe=timeframe,
-                direction=direction,
-                step_no=step_no,
-                train_from=train_from,
-                train_to=train_to,
-                test_from=test_from,
-                test_to=test_to,
-                threshold=None,
-                orig_trades=0,
-                orig_pnl=Decimal("0"),
-                orig_winrate=Decimal("0"),
-                filt_trades=0,
-                filt_pnl=Decimal("0"),
-                filt_winrate=Decimal("0"),
-                lift_pnl=Decimal("0"),
-                trades_share=Decimal("0"),
-                raw_stat={"version": "v1", "skipped_reason": "no_train_data"},
-            )
-            steps_written += 1
-            train_from = train_from + step_delta
-            train_to = train_from + train_delta
-            continue
-
-        best_train = _compute_best_threshold(train_bins)
-        if best_train is None:
-            await _upsert_walk_step(
-                pg=pg,
-                run_id=run_id,
-                analysis_id=analysis_id,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                indicator_param_norm=indicator_param_norm,
-                timeframe=timeframe,
-                direction=direction,
-                step_no=step_no,
-                train_from=train_from,
-                train_to=train_to,
-                test_from=test_from,
-                test_to=test_to,
-                threshold=None,
-                orig_trades=0,
-                orig_pnl=Decimal("0"),
-                orig_winrate=Decimal("0"),
-                filt_trades=0,
-                filt_pnl=Decimal("0"),
-                filt_winrate=Decimal("0"),
-                lift_pnl=Decimal("0"),
-                trades_share=Decimal("0"),
-                raw_stat={"version": "v1", "skipped_reason": "train_threshold_failed"},
-            )
-            steps_written += 1
-            train_from = train_from + step_delta
-            train_to = train_from + train_delta
-            continue
-
-        (
-            _orig_trades_train,
-            _orig_pnl_train,
-            _orig_winrate_train,
-            _filt_trades_train,
-            _filt_pnl_train,
-            _filt_winrate_train,
-            threshold_train,
-            raw_stat_train,
-            kept_bins_train,
-        ) = best_train
-
-        # 2) test: применяем kept_bins_train
-        test_positions = await _load_test_positions(
-            pg=pg,
-            run_id=run_id,
-            analysis_id=analysis_id,
-            scenario_id=scenario_id,
-            signal_id=signal_id,
-            timeframe=timeframe,
-            direction=direction,
-            test_from=test_from,
-            test_to=test_to,
-        )
-
-        orig_trades = len(test_positions)
-        if orig_trades <= 0:
-            await _upsert_walk_step(
-                pg=pg,
-                run_id=run_id,
-                analysis_id=analysis_id,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                indicator_param_norm=indicator_param_norm,
-                timeframe=timeframe,
-                direction=direction,
-                step_no=step_no,
-                train_from=train_from,
-                train_to=train_to,
-                test_from=test_from,
-                test_to=test_to,
-                threshold=threshold_train,
-                orig_trades=0,
-                orig_pnl=Decimal("0"),
-                orig_winrate=Decimal("0"),
-                filt_trades=0,
-                filt_pnl=Decimal("0"),
-                filt_winrate=Decimal("0"),
-                lift_pnl=Decimal("0"),
-                trades_share=Decimal("0"),
-                raw_stat={
-                    "version": "v1",
-                    "skipped_reason": "no_test_data",
-                    "train": raw_stat_train,
-                },
-            )
-            steps_written += 1
-            train_from = train_from + step_delta
-            train_to = train_from + train_delta
-            continue
-
-        orig_pnl = Decimal("0")
-        orig_wins = Decimal("0")
-        filt_trades = 0
-        filt_pnl = Decimal("0")
-        filt_wins = Decimal("0")
-
-        for bn, pnl in test_positions:
-            pnl_d = _d(pnl)
-            orig_pnl += pnl_d
-            if pnl_d > 0:
-                orig_wins += Decimal("1")
-
-            if bn in kept_bins_train:
-                filt_trades += 1
-                filt_pnl += pnl_d
-                if pnl_d > 0:
-                    filt_wins += Decimal("1")
-
-        orig_winrate = (orig_wins / Decimal(orig_trades)) if orig_trades > 0 else Decimal("0")
-        filt_winrate = (filt_wins / Decimal(filt_trades)) if filt_trades > 0 else Decimal("0")
-
-        lift_pnl = filt_pnl - orig_pnl
-        trades_share = (Decimal(filt_trades) / Decimal(orig_trades)) if orig_trades > 0 else Decimal("0")
-
-        await _upsert_walk_step(
-            pg=pg,
-            run_id=run_id,
-            analysis_id=analysis_id,
-            scenario_id=scenario_id,
-            signal_id=signal_id,
-            indicator_param_norm=indicator_param_norm,
-            timeframe=timeframe,
-            direction=direction,
-            step_no=step_no,
-            train_from=train_from,
-            train_to=train_to,
-            test_from=test_from,
-            test_to=test_to,
-            threshold=threshold_train,
-            orig_trades=orig_trades,
-            orig_pnl=orig_pnl,
-            orig_winrate=orig_winrate,
-            filt_trades=filt_trades,
-            filt_pnl=filt_pnl,
-            filt_winrate=filt_winrate,
-            lift_pnl=lift_pnl,
-            trades_share=trades_share,
-            raw_stat={
-                "version": "v1",
-                "train": raw_stat_train,
-                "kept_bins_count": len(kept_bins_train),
-            },
-        )
-        steps_written += 1
-
-        # 3) вклад шага в scoring
-        valid_steps += 1
-
-        if lift_pnl > 0:
-            hit_count += 1
-
-        lift_ratio = lift_pnl / (abs(orig_pnl) + DENOM_EPS)
-        lift_ratios.append(_d(lift_ratio))
-        shares.append(_d(trades_share))
-
-        # следующий шаг
-        train_from = train_from + step_delta
-        train_to = train_from + train_delta
-
-    # scoring
-    if valid_steps < WF_MIN_STEPS_FOR_SCORE:
-        return Decimal("0"), steps_written
-
-    hit_rate = Decimal(hit_count) / Decimal(valid_steps) if valid_steps > 0 else Decimal("0")
-    median_share = _median_decimal(shares)
-    median_lift_ratio = _median_decimal(lift_ratios)
-
-    score = hit_rate * median_share * median_lift_ratio
-
-    # clamp 0..1, floor at 0
-    if score < 0:
-        score = Decimal("0")
-    if score > Decimal("1"):
-        score = Decimal("1")
-
-    return _q4(score), steps_written
-
-
-# 🔸 Upsert одного шага walk-forward в bt_analysis_preproc_walkforward
-async def _upsert_walk_step(
-    pg,
-    run_id: int,
-    analysis_id: int,
-    scenario_id: int,
-    signal_id: int,
-    indicator_param_norm: str,
-    timeframe: str,
-    direction: str,
-    step_no: int,
-    train_from: datetime,
-    train_to: datetime,
-    test_from: datetime,
-    test_to: datetime,
-    threshold: Optional[Decimal],
-    orig_trades: int,
-    orig_pnl: Decimal,
-    orig_winrate: Decimal,
-    filt_trades: int,
-    filt_pnl: Decimal,
-    filt_winrate: Decimal,
-    lift_pnl: Decimal,
-    trades_share: Decimal,
-    raw_stat: Dict[str, Any],
-) -> None:
-    async with pg.acquire() as conn:
-        await conn.execute(
-            f"""
-            INSERT INTO {WALK_TABLE} (
-                run_id,
-                analysis_id,
-                scenario_id,
-                signal_id,
-                indicator_param,
-                timeframe,
-                direction,
-                step_no,
-                train_from,
-                train_to,
-                test_from,
-                test_to,
-                winrate_threshold,
-                orig_trades,
-                orig_pnl_abs,
-                orig_winrate,
-                filt_trades,
-                filt_pnl_abs,
-                filt_winrate,
-                lift_pnl_abs,
-                trades_share,
-                raw_stat,
-                created_at
-            )
-            VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7,
-                $8, $9, $10, $11, $12,
-                $13,
-                $14, $15, $16,
-                $17, $18, $19,
-                $20, $21,
-                $22::jsonb,
-                now()
-            )
-            ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, indicator_param, timeframe, direction, step_no)
-            DO UPDATE SET
-                train_from         = EXCLUDED.train_from,
-                train_to           = EXCLUDED.train_to,
-                test_from          = EXCLUDED.test_from,
-                test_to            = EXCLUDED.test_to,
-                winrate_threshold  = EXCLUDED.winrate_threshold,
-                orig_trades        = EXCLUDED.orig_trades,
-                orig_pnl_abs       = EXCLUDED.orig_pnl_abs,
-                orig_winrate       = EXCLUDED.orig_winrate,
-                filt_trades        = EXCLUDED.filt_trades,
-                filt_pnl_abs       = EXCLUDED.filt_pnl_abs,
-                filt_winrate       = EXCLUDED.filt_winrate,
-                lift_pnl_abs       = EXCLUDED.lift_pnl_abs,
-                trades_share       = EXCLUDED.trades_share,
-                raw_stat           = EXCLUDED.raw_stat,
-                updated_at         = now()
-            """,
-            int(run_id),
-            int(analysis_id),
-            int(scenario_id),
-            int(signal_id),
-            str(indicator_param_norm),
-            str(timeframe),
-            str(direction),
-            int(step_no),
-            train_from,
-            train_to,
-            test_from,
-            test_to,
-            str(_q4(threshold)) if threshold is not None else None,
-            int(orig_trades),
-            str(_q4(orig_pnl)),
-            str(_q4(orig_winrate)),
-            int(filt_trades),
-            str(_q4(filt_pnl)),
-            str(_q4(filt_winrate)),
-            str(_q4(lift_pnl)),
-            str(_q4(trades_share)),
-            json.dumps(raw_stat, ensure_ascii=False),
-        )
+    return groups_processed, upserts_done
 
 
 # 🔸 Вычисление оптимального порога winrate для одной группы биннов
 def _compute_best_threshold(
     bins: List[Dict[str, Any]],
-) -> Optional[
-    Tuple[int, Decimal, Decimal, int, Decimal, Decimal, Optional[Decimal], Dict[str, Any], Set[str]]
-]:
+) -> Optional[Tuple[int, Decimal, Decimal, int, Decimal, Decimal, Optional[Decimal], Dict[str, Any]]]:
     if not bins:
         return None
 
-    # нормализуем и фильтруем мусор
     normalized: List[Dict[str, Any]] = []
     for b in bins:
         trades = int(b.get("trades") or 0)
@@ -1075,7 +688,6 @@ def _compute_best_threshold(
 
     n = len(normalized)
 
-    # префиксные суммы по "удаляемым" биннам
     pref_trades: List[int] = [0] * (n + 1)
     pref_pnl: List[Decimal] = [Decimal("0")] * (n + 1)
     pref_wins: List[Decimal] = [Decimal("0")] * (n + 1)
@@ -1119,7 +731,6 @@ def _compute_best_threshold(
 
     removed_bins = [x["bin_name"] for x in normalized[:best_k]]
     kept_bins = [x["bin_name"] for x in normalized[best_k:]]
-    kept_bins_set = set(kept_bins)
 
     raw_stat = {
         "version": "v1",
@@ -1151,5 +762,4 @@ def _compute_best_threshold(
         _q4(filt_winrate),
         _d(best_threshold) if best_threshold is not None else None,
         raw_stat,
-        kept_bins_set,
     )
