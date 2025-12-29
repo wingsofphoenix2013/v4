@@ -822,7 +822,25 @@ async def _ensure_stream_consumer_group(
         msg = str(e)
         if "BUSYGROUP" in msg:
             log.info(
-                "BT_SIGNALS_STREAM: consumer group '%s' для стрима '%s' уже существует",
+                "BT_SIGNALS_STREAM: consumer group '%s' для стрима '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                group_name,
+                stream_key,
+            )
+
+            await redis.xgroup_destroy(
+                stream_key,
+                group_name,
+            )
+
+            await redis.xgroup_create(
+                name=stream_key,
+                groupname=group_name,
+                id="$",
+                mkstream=True,
+            )
+
+            log.debug(
+                "BT_SIGNALS_STREAM: consumer group '%s' пересоздана для стрима '%s'",
                 group_name,
                 stream_key,
             )
@@ -835,7 +853,6 @@ async def _ensure_stream_consumer_group(
                 exc_info=True,
             )
             raise
-
 
 # 🔸 Вызов timer-backfill handler с обратной совместимостью по сигнатурам
 async def _call_timer_backfill_handler(

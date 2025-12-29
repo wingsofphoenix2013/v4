@@ -1,4 +1,4 @@
-# bt_signals_liveprocessor.py — воркер переноса live-filtered signal_sent из bt_signals_live в bt_signals_values (auto-drain backlog, без зависимости от processed=false)
+# bt_signals_liveprocessor.py — воркер переноса live-filtered signal_sent из bt_signals_live в bt_signals_values (strict new-only, без pending/backlog до старта)
 
 import asyncio
 import json
@@ -21,9 +21,6 @@ LIVE_READY_STREAM_BLOCK_MS = 5000
 # 🔸 Параметры обработки
 PROCESS_BATCH_LIMIT = 500
 
-# 🔸 Авто-дренаж: периодический подбор хвоста (чтобы история подхватилась без ручных XADD/UPDATE циклов)
-DRAIN_IDLE_INTERVAL_SEC = 10
-
 # 🔸 Защита от бесконечных циклов дренажа при отсутствии прогресса
 DRAIN_MAX_ITERATIONS_PER_TICK = 200
 
@@ -38,9 +35,13 @@ TF_STEP_MINUTES = {"m5": 5, "m15": 15, "h1": 60}
 async def run_bt_signals_liveprocessor(pg, redis) -> None:
     log.debug("BT_SIG_LIVEPROC: воркер liveprocessor запущен")
 
+    # создаём consumer group “с конца” и сбрасываем её, если она уже существовала,
+    # чтобы не было pending/хвостов до старта
     await _ensure_consumer_group(redis)
 
-    last_idle_drain_at = datetime.utcnow()
+    # граница "только новое": игнорируем все строки bt_signals_live, которые уже существовали до старта воркера
+    min_live_id = await _load_startup_max_live_id(pg)
+    log.info("BT_SIG_LIVEPROC: start boundary установлен — min_live_id=%s (строки <= min_live_id игнорируются)", min_live_id)
 
     # основной цикл
     while True:
@@ -51,7 +52,7 @@ async def run_bt_signals_liveprocessor(pg, redis) -> None:
             parsed_msgs = 0
             ignored_msgs = 0
 
-            # набор сигналов для таргетированного дренажа (если пусто — дреним всё)
+            # набор сигналов для таргетированного дренажа
             signal_ids: Set[int] = set()
 
             if entries:
@@ -74,34 +75,29 @@ async def run_bt_signals_liveprocessor(pg, redis) -> None:
                         # ack сразу — обработка идемпотентная
                         await redis.xack(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP, msg_id)
 
-            # условия запуска дренажа:
-            # - пришли сообщения
-            # - или периодический авто-дренаж (подхват истории и “молча” накопившихся signal_sent)
-            now = datetime.utcnow()
-            should_idle_drain = (now - last_idle_drain_at).total_seconds() >= DRAIN_IDLE_INTERVAL_SEC
-
-            if (not signal_ids) and (not should_idle_drain):
+            # обрабатываем ТОЛЬКО по новым событиям после старта; без авто-дренажа и без подхвата истории
+            if not signal_ids:
                 continue
 
-            drain_target_ids = sorted(signal_ids) if signal_ids else []
+            drain_target_ids = sorted(signal_ids)
 
             drained = await _drain_pending(
                 pg=pg,
                 redis=redis,
                 signal_ids=drain_target_ids,
+                min_live_id=min_live_id,
                 max_iterations=DRAIN_MAX_ITERATIONS_PER_TICK,
             )
 
-            last_idle_drain_at = now
-
             log.info(
-                "BT_SIG_LIVEPROC: tick summary — msgs=%s, parsed=%s, ignored=%s, targeted_signal_ids=%s, "
+                "BT_SIG_LIVEPROC: tick summary — msgs=%s, parsed=%s, ignored=%s, targeted_signal_ids=%s, min_live_id=%s, "
                 "drain_iterations=%s, rows_ready=%s, inserted=%s, duplicates=%s, marked_processed=%s, "
                 "soft_skipped=%s, hard_skipped=%s, errors=%s",
                 total_msgs,
                 parsed_msgs,
                 ignored_msgs,
                 len(drain_target_ids),
+                min_live_id,
                 drained["iterations"],
                 drained["rows_ready"],
                 drained["inserted"],
@@ -117,7 +113,7 @@ async def run_bt_signals_liveprocessor(pg, redis) -> None:
             await asyncio.sleep(2)
 
 
-# 🔸 Проверка/создание consumer group для стрима
+# 🔸 Проверка/создание consumer group для стрима (reset для strict new-only)
 async def _ensure_consumer_group(redis) -> None:
     try:
         await redis.xgroup_create(
@@ -134,8 +130,30 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
+            log.info(
+                "BT_SIG_LIVEPROC: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для старта только с новых сообщений",
+                LIVE_READY_CONSUMER_GROUP,
+            )
+            try:
+                await redis.xgroup_destroy(LIVE_READY_STREAM_KEY, LIVE_READY_CONSUMER_GROUP)
+            except Exception as de:
+                log.error(
+                    "BT_SIG_LIVEPROC: не удалось уничтожить consumer group '%s' для стрима '%s': %s",
+                    LIVE_READY_CONSUMER_GROUP,
+                    LIVE_READY_STREAM_KEY,
+                    de,
+                    exc_info=True,
+                )
+                raise
+
+            await redis.xgroup_create(
+                name=LIVE_READY_STREAM_KEY,
+                groupname=LIVE_READY_CONSUMER_GROUP,
+                id="$",
+                mkstream=True,
+            )
             log.debug(
-                "BT_SIG_LIVEPROC: consumer group '%s' для стрима '%s' уже существует",
+                "BT_SIG_LIVEPROC: consumer group '%s' пересоздана для стрима '%s'",
                 LIVE_READY_CONSUMER_GROUP,
                 LIVE_READY_STREAM_KEY,
             )
@@ -197,11 +215,22 @@ def _parse_live_ready_message(fields: Dict[str, str]) -> Optional[Dict[str, Any]
         return None
 
 
+# 🔸 Получить max(id) в bt_signals_live на момент старта (чтобы игнорировать историю)
+async def _load_startup_max_live_id(pg) -> int:
+    async with pg.acquire() as conn:
+        val = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM bt_signals_live")
+    try:
+        return int(val or 0)
+    except Exception:
+        return 0
+
+
 # 🔸 Дренаж pending строк: обрабатываем батчами, пока не закончатся или пока нет прогресса
 async def _drain_pending(
     pg,
     redis,
     signal_ids: List[int],
+    min_live_id: int,
     max_iterations: int,
 ) -> Dict[str, int]:
     totals = {
@@ -215,7 +244,6 @@ async def _drain_pending(
         "errors": 0,
     }
 
-    # если signal_ids пустой — это означает "обработать всё"
     for _ in range(max_iterations):
         totals["iterations"] += 1
 
@@ -231,6 +259,7 @@ async def _drain_pending(
             pg=pg,
             redis=redis,
             signal_ids=signal_ids,
+            min_live_id=min_live_id,
         )
 
         totals["rows_ready"] += rows_ready
@@ -252,11 +281,12 @@ async def _drain_pending(
     return totals
 
 
-# 🔸 Обработка одного батча: берём signal_sent, которых ещё нет в bt_signals_values, пишем туда и ставим processed=true
+# 🔸 Обработка одного батча: берём signal_sent (>min_live_id), которых ещё нет в bt_signals_values, пишем туда и ставим processed=true
 async def _process_one_batch(
     pg,
     redis,
     signal_ids: List[int],
+    min_live_id: int,
 ) -> Tuple[int, int, int, int, int, int, int]:
     rows_ready = 0
     inserted_total = 0
@@ -266,7 +296,8 @@ async def _process_one_batch(
     hard_skipped_total = 0
     errors_total = 0
 
-    # выбираем строки bt_signals_live со status='signal_sent', которые ещё не представлены в bt_signals_values
+    # выбираем строки bt_signals_live со status='signal_sent' и id>min_live_id,
+    # которые ещё не представлены в bt_signals_values
     async with pg.acquire() as conn:
         if signal_ids:
             rows = await conn.fetch(
@@ -282,6 +313,7 @@ async def _process_one_batch(
                     (l.details->'signal'->>'direction') AS direction
                 FROM bt_signals_live l
                 WHERE l.status = 'signal_sent'
+                  AND l.id > $2
                   AND l.signal_id = ANY($1::int[])
                   AND (l.details->'signal'->>'direction') IN ('long','short')
                   AND NOT EXISTS (
@@ -294,9 +326,10 @@ async def _process_one_batch(
                         AND v.direction = (l.details->'signal'->>'direction')
                   )
                 ORDER BY l.open_time
-                LIMIT $2
+                LIMIT $3
                 """,
                 signal_ids,
+                int(min_live_id),
                 int(PROCESS_BATCH_LIMIT),
             )
         else:
@@ -313,6 +346,7 @@ async def _process_one_batch(
                     (l.details->'signal'->>'direction') AS direction
                 FROM bt_signals_live l
                 WHERE l.status = 'signal_sent'
+                  AND l.id > $1
                   AND (l.details->'signal'->>'direction') IN ('long','short')
                   AND NOT EXISTS (
                       SELECT 1
@@ -324,8 +358,9 @@ async def _process_one_batch(
                         AND v.direction = (l.details->'signal'->>'direction')
                   )
                 ORDER BY l.open_time
-                LIMIT $1
+                LIMIT $2
                 """,
+                int(min_live_id),
                 int(PROCESS_BATCH_LIMIT),
             )
 

@@ -191,8 +191,25 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
+            log.info(
+                "BT_SCENARIOS_POSTPROC: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                POSTPROC_CONSUMER_GROUP,
+            )
+
+            await redis.xgroup_destroy(
+                POSTPROC_STREAM_KEY,
+                POSTPROC_CONSUMER_GROUP,
+            )
+
+            await redis.xgroup_create(
+                name=POSTPROC_STREAM_KEY,
+                groupname=POSTPROC_CONSUMER_GROUP,
+                id="$",
+                mkstream=True,
+            )
+
             log.debug(
-                "BT_SCENARIOS_POSTPROC: consumer group '%s' для стрима '%s' уже существует",
+                "BT_SCENARIOS_POSTPROC: consumer group '%s' пересоздана для стрима '%s'",
                 POSTPROC_CONSUMER_GROUP,
                 POSTPROC_STREAM_KEY,
             )
@@ -204,7 +221,6 @@ async def _ensure_consumer_group(redis) -> None:
                 exc_info=True,
             )
             raise
-
 
 # 🔸 Чтение сообщений из стрима bt:scenarios:ready
 async def _read_from_stream(redis) -> List[Any]:

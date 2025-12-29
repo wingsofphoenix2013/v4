@@ -242,8 +242,25 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
+            log.info(
+                "BT_SIG_CACHE: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                CACHE_CONSUMER_GROUP,
+            )
+
+            await redis.xgroup_destroy(
+                ANALYSIS_POSTPROC_STREAM_KEY,
+                CACHE_CONSUMER_GROUP,
+            )
+
+            await redis.xgroup_create(
+                name=ANALYSIS_POSTPROC_STREAM_KEY,
+                groupname=CACHE_CONSUMER_GROUP,
+                id="$",
+                mkstream=True,
+            )
+
             log.debug(
-                "BT_SIG_CACHE: consumer group '%s' для стрима '%s' уже существует",
+                "BT_SIG_CACHE: consumer group '%s' пересоздана для стрима '%s'",
                 CACHE_CONSUMER_GROUP,
                 ANALYSIS_POSTPROC_STREAM_KEY,
             )
@@ -255,7 +272,6 @@ async def _ensure_consumer_group(redis) -> None:
                 exc_info=True,
             )
             raise
-
 
 # 🔸 Парсинг сообщения postproc_ready (run-aware)
 def _parse_postproc_ready(fields: Dict[Any, Any]) -> Optional[Dict[str, Any]]:

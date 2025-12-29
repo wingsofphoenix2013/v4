@@ -242,11 +242,27 @@ async def _ensure_consumer_group(redis) -> None:
             SCENARIO_STREAM_KEY,
         )
     except Exception as e:
-        # если группа уже существует — Redis вернёт ошибку BUSYGROUP, её игнорируем
         msg = str(e)
         if "BUSYGROUP" in msg:
+            log.info(
+                "BT_SCENARIOS_MAIN: consumer group '%s' уже существует — сбрасываем (DESTROY+CREATE) для игнора pendings до старта",
+                SCENARIO_CONSUMER_GROUP,
+            )
+
+            await redis.xgroup_destroy(
+                SCENARIO_STREAM_KEY,
+                SCENARIO_CONSUMER_GROUP,
+            )
+
+            await redis.xgroup_create(
+                name=SCENARIO_STREAM_KEY,
+                groupname=SCENARIO_CONSUMER_GROUP,
+                id="$",
+                mkstream=True,
+            )
+
             log.debug(
-                "BT_SCENARIOS_MAIN: consumer group '%s' для стрима '%s' уже существует",
+                "BT_SCENARIOS_MAIN: consumer group '%s' пересоздана для стрима '%s'",
                 SCENARIO_CONSUMER_GROUP,
                 SCENARIO_STREAM_KEY,
             )
@@ -258,7 +274,6 @@ async def _ensure_consumer_group(redis) -> None:
                 exc_info=True,
             )
             raise
-
 
 # 🔸 Чтение сообщений из стрима сценариев
 async def _read_from_stream(redis) -> List[Any]:
