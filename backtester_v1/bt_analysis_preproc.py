@@ -1,11 +1,11 @@
-# bt_analysis_preproc.py — препроцессинг анализа: оптимальный порог winrate по биннам (run-aware) + флаг active по консенсусу 28/14/7
+# bt_analysis_preproc.py — препроцессинг анализа: оптимальный порог winrate по биннам (run-aware) + выбор победителя и запись good-бинов в bt_analysis_bins_labels
 
 import asyncio
 import logging
 import json
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 log = logging.getLogger("BT_ANALYSIS_PREPROC")
 
@@ -17,18 +17,19 @@ PREPROC_STREAM_KEY = "bt:analysis:ready"
 PREPROC_CONSUMER_GROUP = "bt_analysis_preproc"
 PREPROC_CONSUMER_NAME = "bt_analysis_preproc_main"
 
-# 🔸 Стрим готовности препроцессинга
+# 🔸 Стрим готовности препроцессинга (внешний потребитель ждёт обновление bt_analysis_bins_labels)
 PREPROC_READY_STREAM_KEY = "bt:analysis:preproc_ready"
 
 # 🔸 Настройки чтения стрима
 PREPROC_STREAM_BATCH_SIZE = 10
 PREPROC_STREAM_BLOCK_MS = 5000
 
-# 🔸 Таблица результатов
+# 🔸 Таблицы результатов
 PREPROC_TABLE = "bt_analysis_preproc_stat"
+LABELS_TABLE = "bt_analysis_bins_labels"
 
-# 🔸 Окна консенсуса active (по последней дате run)
-CONSENSUS_WINDOWS_DAYS = [28, 14, 7]
+# 🔸 Окна консенсуса (28 = базовое run-окно, проверки: 14 и 7)
+CHECK_WINDOWS_DAYS = [14, 7]
 
 # 🔸 Квантизация метрик
 Q4 = Decimal("0.0001")
@@ -99,8 +100,8 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                         total_errors += 1
                         continue
 
-                    window_from = run_window["from_time"]
-                    window_to = run_window["to_time"]
+                    run_from = run_window["from_time"]
+                    run_to = run_window["to_time"]
 
                     # грузим бин-статистику по паре run/scenario/signal
                     try:
@@ -118,15 +119,15 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                         await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # обрабатываем группы (analysis_id/indicator_param/timeframe/direction)
+                    # считаем preproc и выбираем победителя
                     try:
-                        groups_processed, upserts_done = await _process_and_store_groups(
+                        groups_processed, upserts_done, winner = await _process_and_store_groups(
                             pg=pg,
                             run_id=run_id,
                             scenario_id=scenario_id,
                             signal_id=signal_id,
-                            run_from=window_from,
-                            run_to=window_to,
+                            run_from=run_from,
+                            run_to=run_to,
                             rows=bins_rows,
                         )
                         total_groups += groups_processed
@@ -144,17 +145,41 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                         await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    log.debug(
-                        "BT_ANALYSIS_PREPROC: pair done — scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s, groups=%s, upserts=%s",
+                    # пишем labels победителя (или очищаем, если победителя нет)
+                    try:
+                        winner_analysis_id = int(winner["analysis_id"]) if winner else 0
+                        await _rewrite_bins_labels_for_pair(
+                            pg=pg,
+                            run_id=run_id,
+                            scenario_id=scenario_id,
+                            signal_id=signal_id,
+                            winner=winner,
+                        )
+                    except Exception as e:
+                        total_errors += 1
+                        log.error(
+                            "BT_ANALYSIS_PREPROC: ошибка записи bt_analysis_bins_labels для scenario_id=%s, signal_id=%s, run_id=%s: %s",
+                            scenario_id,
+                            signal_id,
+                            run_id,
+                            e,
+                            exc_info=True,
+                        )
+                        await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
+                        continue
+
+                    log.info(
+                        "BT_ANALYSIS_PREPROC: pair done — scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s, groups=%s, upserts=%s, winner_analysis_id=%s",
                         scenario_id,
                         signal_id,
                         run_id,
                         finished_at,
                         groups_processed,
                         upserts_done,
+                        winner_analysis_id,
                     )
 
-                    # событие готовности (run-aware)
+                    # событие готовности: bt_analysis_bins_labels обновлена
                     finished_at_preproc = datetime.utcnow()
                     try:
                         await redis.xadd(
@@ -163,8 +188,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                                 "scenario_id": str(scenario_id),
                                 "signal_id": str(signal_id),
                                 "run_id": str(run_id),
-                                "groups": str(groups_processed),
-                                "upserts": str(upserts_done),
+                                "winner_analysis_id": str(winner_analysis_id),
                                 "finished_at": finished_at_preproc.isoformat(),
                             },
                         )
@@ -181,7 +205,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
 
                     await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
 
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_PREPROC: batch summary — msgs=%s, pairs=%s, groups=%s, upserts=%s, skipped=%s, errors=%s",
                 total_msgs,
                 total_pairs,
@@ -213,7 +237,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.debug(
+            log.info(
                 "BT_ANALYSIS_PREPROC: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 PREPROC_CONSUMER_GROUP,
             )
@@ -379,8 +403,8 @@ async def _load_bins_stat_rows(
     return out
 
 
-# 🔸 Бин-статистика за произвольное окно по позициям (для 14/7 проверок)
-async def _load_bins_stat_by_window(
+# 🔸 Сумма pnl_abs за окно по exit_time, только по kept_bins (фиксированный набор с 28 дней)
+async def _calc_filt_pnl_for_exit_window(
     pg,
     run_id: int,
     analysis_id: int,
@@ -390,15 +414,17 @@ async def _load_bins_stat_by_window(
     direction: str,
     w_from: datetime,
     w_to: datetime,
-) -> List[Dict[str, Any]]:
+    kept_bins: Set[str],
+) -> Decimal:
+    if not kept_bins:
+        return Decimal("0")
+
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT
-                r.bin_name                                      AS bin_name,
-                COUNT(*)                                        AS trades,
-                COUNT(*) FILTER (WHERE r.pnl_abs > 0)           AS wins,
-                COALESCE(SUM(r.pnl_abs), 0)                     AS pnl_abs_total
+                r.bin_name AS bin_name,
+                r.pnl_abs  AS pnl_abs
             FROM bt_analysis_positions_raw r
             JOIN bt_scenario_positions p
               ON p.position_uid = r.position_uid
@@ -410,8 +436,8 @@ async def _load_bins_stat_by_window(
               AND r.direction   = $6
               AND p.status      = 'closed'
               AND p.postproc    = true
-              AND p.entry_time BETWEEN $7 AND $8
-            GROUP BY r.bin_name
+              AND p.exit_time IS NOT NULL
+              AND p.exit_time BETWEEN $7 AND $8
             """,
             int(run_id),
             int(analysis_id),
@@ -423,26 +449,17 @@ async def _load_bins_stat_by_window(
             w_to,
         )
 
-    out: List[Dict[str, Any]] = []
+    total = Decimal("0")
     for r in rows:
-        trades = int(r["trades"] or 0)
-        wins = int(r["wins"] or 0)
-        pnl = _d(r["pnl_abs_total"])
-        winrate = (Decimal(wins) / Decimal(trades)) if trades > 0 else Decimal("0")
+        bn = str(r["bin_name"])
+        if bn not in kept_bins:
+            continue
+        total += _d(r["pnl_abs"])
 
-        out.append(
-            {
-                "bin_name": str(r["bin_name"]),
-                "trades": trades,
-                "pnl_abs": pnl,
-                "winrate": winrate,
-            }
-        )
-
-    return out
+    return total
 
 
-# 🔸 Обработка всех групп и запись результатов в bt_analysis_preproc_stat (active по правилам 28/14/7)
+# 🔸 Обработка всех групп и запись результатов в bt_analysis_preproc_stat + выбор победителя
 async def _process_and_store_groups(
     pg,
     run_id: int,
@@ -451,9 +468,9 @@ async def _process_and_store_groups(
     run_from: datetime,
     run_to: datetime,
     rows: List[Dict[str, Any]],
-) -> Tuple[int, int]:
+) -> Tuple[int, int, Optional[Dict[str, Any]]]:
     if not rows:
-        return 0, 0
+        return 0, 0, None
 
     grouped: Dict[Tuple[int, str, str, str], List[Dict[str, Any]]] = {}
     for r in rows:
@@ -467,6 +484,8 @@ async def _process_and_store_groups(
 
     groups_processed = 0
     upserts_done = 0
+
+    winner: Optional[Dict[str, Any]] = None
 
     for (analysis_id, indicator_param, timeframe, direction), group_bins in grouped.items():
         groups_processed += 1
@@ -484,87 +503,64 @@ async def _process_and_store_groups(
             filt_winrate,
             threshold,
             raw_stat,
+            kept_bins,
         ) = best_28
 
         # правила active
         active = True
         active_reason = "ok"
 
-        # 1) если filt_pnl_abs < 0 — отключаем
-        if filt_pnl < Decimal("0"):
+        # 1) если на 28 днях filt_pnl_abs <= 0 — отключаем
+        if filt_pnl <= Decimal("0"):
             active = False
-            active_reason = "disabled_negative_filt_pnl_28d"
+            active_reason = "disabled_nonpositive_filt_pnl_28d"
         else:
-            # 2) консенсус по 28/14/7 (все должны быть > 0)
-            w14_from = run_to - timedelta(days=14)
-            w7_from = run_to - timedelta(days=7)
+            # 2) перепроверяем ЭТОТ же набор kept_bins на 14 и 7 днях (по exit_time)
+            checks: Dict[str, Optional[Decimal]] = {}
 
-            if w14_from < run_from:
-                w14_from = run_from
-            if w7_from < run_from:
-                w7_from = run_from
+            consensus_ok = True
 
-            # считаем лучшие filt_pnl для 14/7 окон
-            filt_pnl_14: Optional[Decimal] = None
-            filt_pnl_7: Optional[Decimal] = None
+            for days in CHECK_WINDOWS_DAYS:
+                w_from = run_to - timedelta(days=int(days))
+                if w_from < run_from:
+                    w_from = run_from
 
-            bins_14 = await _load_bins_stat_by_window(
-                pg=pg,
-                run_id=run_id,
-                analysis_id=analysis_id,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                timeframe=timeframe,
-                direction=direction,
-                w_from=w14_from,
-                w_to=run_to,
-            )
-            best_14 = _compute_best_threshold(bins_14) if bins_14 else None
-            if best_14 is not None:
-                filt_pnl_14 = best_14[4]
-            else:
-                filt_pnl_14 = None
+                pnl_w = await _calc_filt_pnl_for_exit_window(
+                    pg=pg,
+                    run_id=run_id,
+                    analysis_id=analysis_id,
+                    scenario_id=scenario_id,
+                    signal_id=signal_id,
+                    timeframe=timeframe,
+                    direction=direction,
+                    w_from=w_from,
+                    w_to=run_to,
+                    kept_bins=kept_bins,
+                )
 
-            bins_7 = await _load_bins_stat_by_window(
-                pg=pg,
-                run_id=run_id,
-                analysis_id=analysis_id,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                timeframe=timeframe,
-                direction=direction,
-                w_from=w7_from,
-                w_to=run_to,
-            )
-            best_7 = _compute_best_threshold(bins_7) if bins_7 else None
-            if best_7 is not None:
-                filt_pnl_7 = best_7[4]
-            else:
-                filt_pnl_7 = None
+                checks[f"pnl_{days}d"] = pnl_w
 
-            consensus_ok = (
-                (filt_pnl > Decimal("0"))
-                and (filt_pnl_14 is not None and filt_pnl_14 > Decimal("0"))
-                and (filt_pnl_7 is not None and filt_pnl_7 > Decimal("0"))
-            )
+                if pnl_w <= Decimal("0"):
+                    consensus_ok = False
 
             if not consensus_ok:
                 active = False
-                active_reason = "disabled_no_28_14_7_consensus"
+                active_reason = "disabled_no_14_7_consensus_fixed_bins"
 
-            # дополняем raw_stat результатами проверок
+            # дополняем raw_stat проверками
             raw_stat["active_checks"] = {
                 "window_to": run_to.isoformat(),
                 "pnl_28d": str(_q4(filt_pnl)),
-                "pnl_14d": str(_q4(filt_pnl_14)) if filt_pnl_14 is not None else None,
-                "pnl_7d": str(_q4(filt_pnl_7)) if filt_pnl_7 is not None else None,
-                "consensus_rule": "filt_pnl_abs > 0 for 28/14/7",
+                "pnl_14d": str(_q4(checks.get("pnl_14d") or Decimal("0"))),
+                "pnl_7d": str(_q4(checks.get("pnl_7d") or Decimal("0"))),
+                "check_basis": "exit_time",
+                "consensus_rule": "fixed kept_bins from 28d must have pnl_abs > 0 on 14d and 7d",
             }
 
-        # итоговые метки active
         raw_stat["active"] = bool(active)
         raw_stat["active_reason"] = str(active_reason)
 
+        # upsert в bt_analysis_preproc_stat
         async with pg.acquire() as conn:
             await conn.execute(
                 f"""
@@ -599,7 +595,7 @@ async def _process_and_store_groups(
                 )
                 ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, indicator_param, timeframe, direction)
                 DO UPDATE SET
-                    active            = EXCLUDED.active,
+                    active             = EXCLUDED.active,
                     orig_trades        = EXCLUDED.orig_trades,
                     orig_pnl_abs       = EXCLUDED.orig_pnl_abs,
                     orig_winrate       = EXCLUDED.orig_winrate,
@@ -630,9 +626,8 @@ async def _process_and_store_groups(
 
         upserts_done += 1
 
-        log.debug(
-            "BT_ANALYSIS_PREPROC: group stored — run_id=%s scenario_id=%s signal_id=%s analysis_id=%s ind='%s' tf=%s dir=%s active=%s reason=%s "
-            "orig(trades=%s,pnl=%s,wr=%s) filt(trades=%s,pnl=%s,wr=%s) thr=%s",
+        log.info(
+            "BT_ANALYSIS_PREPROC: group stored — run_id=%s scenario_id=%s signal_id=%s analysis_id=%s ind='%s' tf=%s dir=%s active=%s reason=%s filt_pnl_28=%s",
             run_id,
             scenario_id,
             signal_id,
@@ -642,22 +637,144 @@ async def _process_and_store_groups(
             direction,
             active,
             active_reason,
-            orig_trades,
-            str(_q4(orig_pnl)),
-            str(_q4(orig_winrate)),
-            filt_trades,
             str(_q4(filt_pnl)),
-            str(_q4(filt_winrate)),
-            str(_q4(threshold)) if threshold is not None else None,
         )
 
-    return groups_processed, upserts_done
+        # выбираем победителя: max filt_pnl_abs (только active=true)
+        if active:
+            if winner is None or _d(winner.get("filt_pnl_abs")) < filt_pnl:
+                # готовим карту bin_name -> (trades,pnl,winrate) для записи в labels
+                stats_by_bin: Dict[str, Dict[str, Any]] = {}
+                for b in group_bins:
+                    stats_by_bin[str(b.get("bin_name"))] = {
+                        "trades": int(b.get("trades") or 0),
+                        "pnl_abs": _d(b.get("pnl_abs")),
+                        "winrate": _d(b.get("winrate")),
+                    }
+
+                winner = {
+                    "analysis_id": int(analysis_id),
+                    "indicator_param": str(indicator_param),
+                    "timeframe": str(timeframe),
+                    "direction": str(direction),
+                    "kept_bins": sorted(set(kept_bins)),
+                    "threshold_used": _d(threshold) if threshold is not None else Decimal("0"),
+                    "filt_pnl_abs": _q4(filt_pnl),
+                    "stats_by_bin": stats_by_bin,
+                }
+
+    return groups_processed, upserts_done, winner
 
 
-# 🔸 Вычисление оптимального порога winrate для одной группы биннов
+# 🔸 Перезапись bt_analysis_bins_labels по паре (scenario_id, signal_id): очистка + запись good-бинов победителя
+async def _rewrite_bins_labels_for_pair(
+    pg,
+    run_id: int,
+    scenario_id: int,
+    signal_id: int,
+    winner: Optional[Dict[str, Any]],
+) -> None:
+    async with pg.acquire() as conn:
+        # очищаем старые данные по паре (чтобы не оставались устаревшие комплекты)
+        await conn.execute(
+            f"""
+            DELETE FROM {LABELS_TABLE}
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+            """,
+            int(scenario_id),
+            int(signal_id),
+        )
+
+        if not winner:
+            return
+
+        analysis_id = int(winner["analysis_id"])
+        indicator_param = str(winner.get("indicator_param") or "")
+        timeframe = str(winner.get("timeframe") or "")
+        direction = str(winner.get("direction") or "")
+        threshold_used = _d(winner.get("threshold_used") or Decimal("0"))
+        kept_bins: List[str] = list(winner.get("kept_bins") or [])
+        stats_by_bin: Dict[str, Dict[str, Any]] = winner.get("stats_by_bin") or {}
+
+        to_insert: List[Tuple[Any, ...]] = []
+
+        for bn in kept_bins:
+            st = stats_by_bin.get(bn) or {}
+            trades = int(st.get("trades") or 0)
+            pnl_abs = _d(st.get("pnl_abs"))
+            winrate = _d(st.get("winrate"))
+
+            to_insert.append(
+                (
+                    int(run_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    int(analysis_id),
+                    str(indicator_param),
+                    str(timeframe),
+                    str(bn),
+                    "good",
+                    str(_q4(threshold_used)),
+                    int(trades),
+                    str(_q4(pnl_abs)),
+                    str(_q4(winrate)),
+                )
+            )
+
+        if not to_insert:
+            return
+
+        await conn.executemany(
+            f"""
+            INSERT INTO {LABELS_TABLE} (
+                run_id,
+                scenario_id,
+                signal_id,
+                direction,
+                analysis_id,
+                indicator_param,
+                timeframe,
+                bin_name,
+                state,
+                threshold_used,
+                trades,
+                pnl_abs,
+                winrate,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3,
+                $4,
+                $5, $6, $7,
+                $8,
+                $9,
+                $10,
+                $11,
+                $12,
+                $13,
+                now()
+            )
+            ON CONFLICT (run_id, scenario_id, signal_id, direction, analysis_id, indicator_param, timeframe, bin_name)
+            DO UPDATE SET
+                state          = EXCLUDED.state,
+                threshold_used = EXCLUDED.threshold_used,
+                trades         = EXCLUDED.trades,
+                pnl_abs        = EXCLUDED.pnl_abs,
+                winrate        = EXCLUDED.winrate,
+                updated_at     = now()
+            """,
+            to_insert,
+        )
+
+
+# 🔸 Вычисление оптимального порога winrate для одной группы биннов (возвращает kept_bins)
 def _compute_best_threshold(
     bins: List[Dict[str, Any]],
-) -> Optional[Tuple[int, Decimal, Decimal, int, Decimal, Decimal, Optional[Decimal], Dict[str, Any]]]:
+) -> Optional[
+    Tuple[int, Decimal, Decimal, int, Decimal, Decimal, Optional[Decimal], Dict[str, Any], Set[str]]
+]:
     if not bins:
         return None
 
@@ -730,7 +847,8 @@ def _compute_best_threshold(
     filt_winrate = (best_wins / Decimal(filt_trades)) if filt_trades > 0 else Decimal("0")
 
     removed_bins = [x["bin_name"] for x in normalized[:best_k]]
-    kept_bins = [x["bin_name"] for x in normalized[best_k:]]
+    kept_bins_list = [x["bin_name"] for x in normalized[best_k:]]
+    kept_bins = set(kept_bins_list)
 
     raw_stat = {
         "version": "v1",
@@ -739,7 +857,7 @@ def _compute_best_threshold(
         "bins_total": n,
         "cut_k": int(best_k),
         "winrate_threshold": str(_q4(_d(best_threshold))) if best_threshold is not None else None,
-        "kept_bins": kept_bins,
+        "kept_bins": kept_bins_list,
         "removed_bins": removed_bins,
         "orig": {
             "trades": int(orig_trades),
@@ -762,4 +880,5 @@ def _compute_best_threshold(
         _q4(filt_winrate),
         _d(best_threshold) if best_threshold is not None else None,
         raw_stat,
+        kept_bins,
     )
