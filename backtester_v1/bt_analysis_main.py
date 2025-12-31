@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional, Callable, Awaitable, Tuple, Set
 from backtester_config import (
     get_analysis_connections_for_scenario_signal,
     get_analysis_instance,
+    get_signal_instance,
 )
 
 # 🔸 Тип обработчика анализатора:
@@ -158,17 +159,41 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     window_to = run_info["to_time"]
 
                     # sanity-check: run должен соответствовать этому signal_id
+                    # исключение: производный stream-сигнал может использовать parent run_id
                     if run_signal_id != signal_id:
-                        log.error(
-                            "BT_ANALYSIS_MAIN: run_id=%s принадлежит signal_id=%s, но пришло событие для signal_id=%s (scenario_id=%s). stream_id=%s",
+                        parent_ok = False
+
+                        sig_inst = get_signal_instance(int(signal_id))
+                        if sig_inst:
+                            sig_params = sig_inst.get("params") or {}
+                            p_cfg = sig_params.get("parent_signal_id")
+                            try:
+                                parent_signal_id = int((p_cfg or {}).get("value") or 0)
+                            except Exception:
+                                parent_signal_id = 0
+
+                            if parent_signal_id > 0 and parent_signal_id == run_signal_id:
+                                parent_ok = True
+
+                        if not parent_ok:
+                            log.error(
+                                "BT_ANALYSIS_MAIN: run_id=%s принадлежит signal_id=%s, но пришло событие для signal_id=%s (scenario_id=%s). stream_id=%s",
+                                run_id,
+                                run_signal_id,
+                                signal_id,
+                                scenario_id,
+                                entry_id,
+                            )
+                            await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
+                            continue
+
+                        log.debug(
+                            "BT_ANALYSIS_MAIN: derived signal допускает parent run_id — run_id=%s run.signal_id=%s, derived_signal_id=%s (scenario_id=%s)",
                             run_id,
                             run_signal_id,
                             signal_id,
                             scenario_id,
-                            entry_id,
                         )
-                        await redis.xack(ANALYSIS_STREAM_KEY, ANALYSIS_CONSUMER_GROUP, entry_id)
-                        continue
 
                     # множество позиций окна (защита на уровне storage: чтобы не хранить вне окна)
                     window_position_uids = await _load_window_position_uids(
