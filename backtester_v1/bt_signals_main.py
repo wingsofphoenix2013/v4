@@ -15,6 +15,9 @@ from backtester_config import get_enabled_signals
 from signals.bt_signals_lr_universal import run_lr_universal_backfill
 from signals.bt_signals_emacross import run_emacross_backfill
 
+# 🔸 Воркеры стримовых backfill-сигналов
+from signals.bt_signals_lr_anglemtf import run_lr_anglemtf_stream_backfill
+
 # 🔸 Live-воркеры сигналов
 from signals.bt_signals_lr_universal_live import init_lr_universal_live, handle_lr_universal_indicator_ready
 from signals.bt_signals_emacross_live import init_emacross_live, handle_emacross_indicator_ready
@@ -76,8 +79,7 @@ TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
 
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
 STREAM_BACKFILL_HANDLERS: Dict[str, StreamBackfillHandler] = {
-    # пример для будущего:
-    # "ema_cross_rsislope": run_emacross_rsislope_backfill,
+    "lr_anglemtf": run_lr_anglemtf_stream_backfill,
 }
 
 # 🔸 Реестр live-сигналов: key → LiveSignalHandler(init, handle)
