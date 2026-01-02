@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -45,6 +45,23 @@ def _d(value: Any, default: Decimal = Decimal("0")) -> Decimal:
     except Exception:
         return default
 
+# 🔸 Безопасный json.dumps для дневных рядов (date/Decimal)
+def _json_dumps_daily_row(row: Dict[str, Any]) -> str:
+    # копия для сериализации
+    payload = dict(row or {})
+
+    # exit_day (date) -> ISO string
+    ed = payload.get("exit_day")
+    if isinstance(ed, (datetime, date)):
+        payload["exit_day"] = ed.isoformat()
+
+    # pnl_abs_day (Decimal/anything) -> str(q4)
+    payload["pnl_abs_day"] = str(_q4(_d(payload.get("pnl_abs_day"))))
+
+    # trades_day -> int
+    payload["trades_day"] = int(payload.get("trades_day") or 0)
+
+    return json.dumps(payload, ensure_ascii=False)
 
 # 🔸 Публичная точка входа: воркер препроцессинга v2
 async def run_bt_analysis_preproc_v2_orchestrator(pg, redis) -> None:
@@ -794,7 +811,7 @@ async def _rewrite_daily_rows_v2(
                     r["exit_day"],
                     int(r.get("trades_day") or 0),
                     str(_q4(_d(r.get("pnl_abs_day")))),
-                    json.dumps(r, ensure_ascii=False),
+                    _json_dumps_daily_row(r),
                 )
             )
 
