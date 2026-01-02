@@ -77,7 +77,7 @@ def _clamp01(x: Decimal) -> Decimal:
 # 🔸 MinMax нормировка (0..1) внутри пары
 def _minmax_norm(value: Decimal, vmin: Decimal, vmax: Decimal) -> Decimal:
     if vmax <= vmin:
-        return Decimal("1")
+        return Decimal("0.5")
     return _clamp01((value - vmin) / (vmax - vmin))
 
 
@@ -213,7 +213,8 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                     winner_param = str(best.get("indicator_param") or "")
 
                     log.info(
-                        "BT_ANALYSIS_POSTPROC_V2: pair done — scenario_id=%s signal_id=%s run_id=%s finished_at=%s candidates=%s upserts=%s winner_analysis_id=%s winner_param='%s' best_score=%s best_filt_pnl=%s",
+                        "BT_ANALYSIS_POSTPROC_V2: pair done — scenario_id=%s signal_id=%s run_id=%s finished_at=%s "
+                        "candidates=%s upserts=%s winner_analysis_id=%s winner_param='%s' best_score=%s best_filt_pnl=%s",
                         scenario_id,
                         signal_id,
                         run_id,
@@ -447,6 +448,11 @@ def _score_candidates_in_pair(candidates: List[Dict[str, Any]]) -> List[Dict[str
     cov_min = min(coverages) if coverages else Decimal("0")
     cov_max = max(coverages) if coverages else Decimal("1")
 
+    cov_sqrt_min = Decimal(str(math.sqrt(float(cov_min)))) if cov_min > 0 else Decimal("0")
+    cov_sqrt_max = Decimal(str(math.sqrt(float(cov_max)))) if cov_max > 0 else Decimal("0")
+    cov_sqrt_min = _clamp01(cov_sqrt_min)
+    cov_sqrt_max = _clamp01(cov_sqrt_max)
+
     # stability mins/maxs (lower is better)
     neg_days_list = [Decimal(int(c.get("neg_days") or 0)) for c in candidates]
     streak_list = [Decimal(int(c.get("max_neg_streak") or 0)) for c in candidates]
@@ -476,11 +482,10 @@ def _score_candidates_in_pair(candidates: List[Dict[str, Any]]) -> List[Dict[str
         profit_c = _minmax_norm(profit, p_min, p_max)
 
         cov = coverages[idx]
-        # "средний" штраф: мягче линейного (sqrt)
+        # "средний" штраф: sqrt(coverage), затем min-max внутри пары
         cov_sqrt = Decimal(str(math.sqrt(float(cov)))) if cov > 0 else Decimal("0")
-        # нормируем (чтобы внутри пары использовать весь диапазон)
-        coverage_c = _minmax_norm(_clamp01(cov_sqrt), _clamp01(Decimal(str(math.sqrt(float(cov_min))))) if cov_min > 0 else Decimal("0"),
-                                 _clamp01(Decimal(str(math.sqrt(float(cov_max))))) if cov_max > 0 else Decimal("1"))
+        cov_sqrt = _clamp01(cov_sqrt)
+        coverage_c = _minmax_norm(cov_sqrt, cov_sqrt_min, cov_sqrt_max)
 
         # stability sub-scores (1=лучше, 0=хуже), так как ниже лучше
         neg_days = Decimal(int(c.get("neg_days") or 0))
@@ -538,7 +543,7 @@ def _score_candidates_in_pair(candidates: List[Dict[str, Any]]) -> List[Dict[str
     for i, x in enumerate(scored_sorted, start=1):
         x["rank"] = int(i)
 
-    # добавляем сводную raw_stat (одинаковую по паре) в каждую строку
+    # сводная raw_stat (одинаковая по паре)
     pair_stat = {
         "score_version": SCORE_VERSION,
         "weights": {
@@ -555,8 +560,7 @@ def _score_candidates_in_pair(candidates: List[Dict[str, Any]]) -> List[Dict[str
         },
         "ranges": {
             "profit": {"min": str(_q4(p_min)), "max": str(_q4(p_max))},
-            "coverage_sqrt": {"min": str(_q4(Decimal(str(math.sqrt(float(cov_min)))) if cov_min > 0 else Decimal("0")))),
-                              "max": str(_q4(Decimal(str(math.sqrt(float(cov_max)))) if cov_max > 0 else Decimal("1"))))},
+            "coverage_sqrt": {"min": str(_q4(cov_sqrt_min)), "max": str(_q4(cov_sqrt_max))},
             "neg_days": {"min": str(int(nd_min)), "max": str(int(nd_max))},
             "max_neg_streak": {"min": str(int(st_min)), "max": str(int(st_max))},
             "max_drawdown_abs": {"min": str(_q4(dd_min)), "max": str(_q4(dd_max))},
