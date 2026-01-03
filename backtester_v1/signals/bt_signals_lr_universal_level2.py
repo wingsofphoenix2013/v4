@@ -551,15 +551,25 @@ async def run_lr_universal_level2_stream_backfill(
         )
         return
 
-    # sanity: run должен принадлежать parent_signal_id
-    if int(run_info.get("signal_id") or 0) != int(parent_signal_id):
-        log.warning(
-            "BT_SIG_LR_UNI_L2: run belongs to another signal — run_id=%s run.signal_id=%s expected parent_signal_id=%s",
-            run_id,
-            run_info.get("signal_id"),
-            parent_signal_id,
-        )
-        return
+    # sanity: run должен принадлежать parent_signal_id только для generate
+    if pipeline_mode == "generate":
+        if int(run_info.get("signal_id") or 0) != int(parent_signal_id):
+            log.warning(
+                "BT_SIG_LR_UNI_L2: run belongs to another signal — run_id=%s run.signal_id=%s expected parent_signal_id=%s",
+                run_id,
+                run_info.get("signal_id"),
+                parent_signal_id,
+            )
+            return
+    else:
+        # refilter: run_id может принадлежать исходному timer-сигналу (7/8), это нормально
+        if int(run_info.get("signal_id") or 0) != int(parent_signal_id):
+            log.debug(
+                "BT_SIG_LR_UNI_L2: refilter uses parent run_id — run_id=%s run.signal_id=%s parent_signal_id=%s",
+                run_id,
+                run_info.get("signal_id"),
+                parent_signal_id,
+            )
 
     window_from: datetime = run_info["from_time"]
     window_to: datetime = run_info["to_time"]
