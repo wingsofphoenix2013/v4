@@ -212,7 +212,7 @@ async def run_lr_universal_backfill(
         total_skipped_existing += skipped_existing
         total_skipped_duplicate += skipped_duplicate
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_UNI: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], run_id=%s, "
         "inserted=%s (long=%s, short=%s), skipped_existing=%s, skipped_duplicate=%s",
         signal_id,

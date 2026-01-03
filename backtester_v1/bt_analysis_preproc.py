@@ -168,7 +168,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
                         await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_PREPROC: pair done — scenario_id=%s, signal_id=%s, run_id=%s, finished_at=%s, groups=%s, upserts=%s, winner_analysis_id=%s",
                         scenario_id,
                         signal_id,
@@ -205,7 +205,7 @@ async def run_bt_analysis_preproc_orchestrator(pg, redis) -> None:
 
                     await redis.xack(PREPROC_STREAM_KEY, PREPROC_CONSUMER_GROUP, entry_id)
 
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_PREPROC: batch summary — msgs=%s, pairs=%s, groups=%s, upserts=%s, skipped=%s, errors=%s",
                 total_msgs,
                 total_pairs,
@@ -237,7 +237,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_PREPROC: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 PREPROC_CONSUMER_GROUP,
             )
@@ -626,7 +626,7 @@ async def _process_and_store_groups(
 
         upserts_done += 1
 
-        log.info(
+        log.debug(
             "BT_ANALYSIS_PREPROC: group stored — run_id=%s scenario_id=%s signal_id=%s analysis_id=%s ind='%s' tf=%s dir=%s active=%s reason=%s filt_pnl_28=%s",
             run_id,
             scenario_id,

@@ -234,7 +234,7 @@ async def run_lr_anglemtf_stream_backfill(
     )
 
     if not good_bins:
-        log.info(
+        log.debug(
             "BT_SIG_LR_ANGLEMTF: no good bins — skip generation (parent_scenario_id=%s, parent_signal_id=%s, run_id=%s, winner=%s, dir=%s)",
             scenario_id,
             parent_signal_id,
@@ -249,7 +249,7 @@ async def run_lr_anglemtf_stream_backfill(
     bins_m15 = await _load_bins_dict(pg, winner_analysis_id, direction, "m15")
 
     if not bins_h1 or not bins_m15:
-        log.info(
+        log.debug(
             "BT_SIG_LR_ANGLEMTF: bins_dict missing (h1=%s, m15=%s) — skip generation (analysis_id=%s, dir=%s)",
             bool(bins_h1),
             bool(bins_m15),
@@ -340,7 +340,7 @@ async def run_lr_anglemtf_stream_backfill(
         total_data_skipped += data_skipped
         total_existing += skipped_existing
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_ANGLEMTF: summary signal_id=%s parent_signal_id=%s parent_scenario_id=%s run_id=%s winner=%s dir=%s window=[%s..%s] — candidates=%s, inserted=%s, skipped_existing=%s, skipped_no_data=%s, skipped_not_good_bin=%s",
         signal_id,
         parent_signal_id,

@@ -84,7 +84,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
 
     # строим индекс live-mirror сигналов один раз на старте (из кеша enabled сигналов)
     live_mirror_index, live_mirror_total = _build_live_mirror_index()
-    log.info(
+    log.debug(
         "BT_SCENARIOS_MAIN: live-mirror индекс построен — mirror_keys=%s, live_mirror_signals=%s",
         len(live_mirror_index),
         live_mirror_total,
@@ -209,7 +209,7 @@ async def run_bt_scenarios_orchestrator(pg, redis):
                 total_scenarios,
                 total_scenarios_mirror,
             )
-            log.info(
+            log.debug(
                 "BT_SCENARIOS_MAIN: итог по пакету — сообщений=%s, сигналов=%s, запусков сценариев=%s, mirror-запусков=%s (последовательный режим)",
                 total_msgs,
                 total_signals,
@@ -244,7 +244,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_SCENARIOS_MAIN: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 SCENARIO_CONSUMER_GROUP,
             )

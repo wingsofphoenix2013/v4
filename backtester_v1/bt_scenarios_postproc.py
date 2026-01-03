@@ -105,7 +105,7 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                     total_positions_skipped += skipped
                     total_positions_errors += errors
 
-                    log.info(
+                    log.debug(
                         "BT_SCENARIOS_POSTPROC: summary для scenario_id=%s, signal_id=%s, run_id=%s — processed=%s, skipped=%s, errors=%s",
                         scenario_id,
                         signal_id,
@@ -155,7 +155,7 @@ async def run_bt_scenarios_postproc(pg, redis) -> None:
                     # помечаем сообщение как обработанное
                     await redis.xack(POSTPROC_STREAM_KEY, POSTPROC_CONSUMER_GROUP, entry_id)
 
-            log.info(
+            log.debug(
                 "BT_SCENARIOS_POSTPROC: итог по пакету — сообщений=%s, сценариев=%s, positions processed=%s, skipped=%s, errors=%s",
                 total_msgs,
                 total_scenarios_processed,
@@ -191,7 +191,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_SCENARIOS_POSTPROC: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 POSTPROC_CONSUMER_GROUP,
             )

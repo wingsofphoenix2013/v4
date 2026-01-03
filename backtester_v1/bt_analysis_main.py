@@ -336,7 +336,7 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     total_rows_filtered_out += rows_filtered_out
                     total_bins_rows += bins_rows_for_pair
 
-                    log.info(
+                    log.debug(
                         "BT_ANALYSIS_MAIN: pair done — scenario_id=%s, signal_id=%s, run_id=%s, window=[%s..%s], "
                         "analyses_total=%s, ok=%s, failed=%s, raw_inserted=%s, raw_filtered_out=%s, bins_rows=%s",
                         scenario_id,
@@ -408,7 +408,7 @@ async def _ensure_consumer_group(redis) -> None:
     except Exception as e:
         msg = str(e)
         if "BUSYGROUP" in msg:
-            log.info(
+            log.debug(
                 "BT_ANALYSIS_MAIN: consumer group '%s' уже существует — сдвигаем курсор группы на '$' (SETID) для игнора истории до старта",
                 ANALYSIS_CONSUMER_GROUP,
             )
