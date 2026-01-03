@@ -1,84 +1,56 @@
-# bt_signals_lr_universal_level2.py — stream-backfill воркер уровня 2: после postproc_ready_v2 загружает winner bins, считает bounce-кандидатов (как lr_universal) и вызывает заглушку плагина (без записи в БД)
+# bt_signals_lr_universal_level2.py — stream-backfill воркер уровня 2: после postproc_ready_v2 генерирует LR bounce m5 и фильтрует через winner bins (v2) с помощью плагинов (первый: lr_mtf)
 
 import asyncio
 import logging
 import json
+import uuid
+import os
+import sys
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Set, Tuple, List
+
+# 🔸 Path bootstrap для signals_plugins (директория в корне проекта)
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+# 🔸 Плагин lr_mtf (универсален для analysis_id=91/92)
+from signals_plugins.lr_mtf import (
+    init_lr_mtf_plugin_context,
+    prepare_symbol_series,
+    compute_lr_mtf_bin_name,
+)
 
 # 🔸 Кеши backtester_v1
 from backtester_config import (
     get_all_ticker_symbols,
     get_ticker_info,
     get_signal_instance,
+    get_analysis_instance,
 )
 
 # 🔸 Логгер модуля
 log = logging.getLogger("BT_SIG_LR_UNI_L2")
 
-# 🔸 Стрим-триггер v2
+# 🔸 Стримы
 BT_POSTPROC_READY_STREAM_V2 = "bt:analysis:postproc_ready_v2"
+BT_SIGNALS_READY_STREAM = "bt:signals:ready"
 
-# 🔸 Таблица winner bins v2
+# 🔸 Таблицы
 BT_LABELS_V2_TABLE = "bt_analysis_bins_labels_v2"
+BT_SIGNALS_VALUES_TABLE = "bt_signals_values"
+BT_BACKFILL_RUNS_TABLE = "bt_signal_backfill_runs"
+BT_INDICATOR_VALUES_TABLE = "indicator_values_v4"
+BT_OHLCV_M5_TABLE = "ohlcv_bb_m5"
 
 # 🔸 Таймшаги TF (в минутах)
 TF_STEP_MINUTES = {
     "m5": 5,
 }
 
-# 🔸 Единая точность (как в анализаторах)
-Q6 = Decimal("0.000001")
-
 # 🔸 Ограничение параллелизма по тикерам
 SYMBOL_MAX_CONCURRENCY = 5
-
-# 🔸 Кеш: чтобы не спамить логами об отсутствии плагина
-_warned_missing_plugin: Set[Tuple[int, str]] = set()
-
-
-# 🔸 q6 квантизация (ROUND_DOWN)
-def _q6(value: Any) -> Decimal:
-    try:
-        d = value if isinstance(value, Decimal) else Decimal(str(value))
-        return d.quantize(Q6, rounding=ROUND_DOWN)
-    except Exception:
-        return Decimal("0").quantize(Q6, rounding=ROUND_DOWN)
-
-
-# 🔸 Вспомогательная функция: безопасное чтение str-параметра
-def _get_str_param(params: Dict[str, Any], name: str, default: str) -> str:
-    cfg = params.get(name)
-    if cfg is None:
-        return default
-    raw = cfg.get("value")
-    if raw is None:
-        return default
-    return str(raw).strip()
-
-
-# 🔸 Вспомогательная функция: безопасное чтение bool-параметра
-def _get_bool_param(params: Dict[str, Any], name: str, default: bool) -> bool:
-    cfg = params.get(name)
-    if cfg is None:
-        return default
-    raw = cfg.get("value")
-    if raw is None:
-        return default
-    return str(raw).strip().lower() == "true"
-
-
-# 🔸 Вспомогательная функция: безопасное чтение float-параметра
-def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float:
-    cfg = params.get(name)
-    if cfg is None:
-        return default
-    raw = cfg.get("value")
-    try:
-        return float(str(raw))
-    except Exception:
-        return default
 
 
 # 🔸 Парсер сообщения bt:analysis:postproc_ready_v2
@@ -112,9 +84,9 @@ def _parse_postproc_ready_v2(fields: Dict[str, Any]) -> Optional[Dict[str, Any]]
 async def _load_run_info(pg, run_id: int) -> Optional[Dict[str, Any]]:
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT id, signal_id, from_time, to_time, finished_at, status
-            FROM bt_signal_backfill_runs
+            FROM {BT_BACKFILL_RUNS_TABLE}
             WHERE id = $1
             """,
             int(run_id),
@@ -173,8 +145,39 @@ async def _load_good_bins_v2(
     return bins, tfs
 
 
+# 🔸 Загрузка уже существующих событий сигнала в окне (идемпотентность)
+async def _load_existing_events(
+    pg,
+    signal_id: int,
+    timeframe: str,
+    from_time: datetime,
+    to_time: datetime,
+    direction: str,
+) -> Set[Tuple[str, datetime, str]]:
+    existing: Set[Tuple[str, datetime, str]] = set()
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT symbol, open_time, direction
+            FROM {BT_SIGNALS_VALUES_TABLE}
+            WHERE signal_id = $1
+              AND timeframe = $2
+              AND direction = $3
+              AND open_time BETWEEN $4 AND $5
+            """,
+            int(signal_id),
+            str(timeframe),
+            str(direction),
+            from_time,
+            to_time,
+        )
+    for r in rows:
+        existing.add((str(r["symbol"]), r["open_time"], str(r["direction"])))
+    return existing
+
+
 # 🔸 Загрузка LR-серии (angle/upper/lower/center) для bounce-инстанса
-async def _load_lr_series(
+async def _load_lr_series_for_bounce(
     pg,
     instance_id: int,
     symbol: str,
@@ -183,9 +186,9 @@ async def _load_lr_series(
 ) -> Dict[datetime, Dict[str, float]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT open_time, param_name, value
-            FROM indicator_values_v4
+            FROM {BT_INDICATOR_VALUES_TABLE}
             WHERE instance_id = $1
               AND symbol      = $2
               AND open_time  BETWEEN $3 AND $4
@@ -232,9 +235,9 @@ async def _load_ohlcv_m5(
 ) -> Dict[datetime, Tuple[float, float, float, float]]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT open_time, open, high, low, close
-            FROM ohlcv_bb_m5
+            FROM {BT_OHLCV_M5_TABLE}
             WHERE symbol = $1
               AND open_time BETWEEN $2 AND $3
             ORDER BY open_time
@@ -258,7 +261,7 @@ async def _load_ohlcv_m5(
     return series
 
 
-# 🔸 Поиск bounce-кандидатов LR (логика как в bt_signals_lr_universal.py), только подсчёт
+# 🔸 Поиск bounce-кандидатов (логика как в bt_signals_lr_universal.py)
 def _find_lr_bounce_candidates(
     symbol: str,
     direction: str,
@@ -277,10 +280,8 @@ def _find_lr_bounce_candidates(
     if len(times) < 2:
         return []
 
-    H0 = 0.0  # для типа
-
-    out: List[Dict[str, Any]] = []
     tf_delta = timedelta(minutes=TF_STEP_MINUTES["m5"])
+    out: List[Dict[str, Any]] = []
 
     for i in range(1, len(times)):
         prev_ts = times[i - 1]
@@ -331,12 +332,11 @@ def _find_lr_bounce_candidates(
         except Exception:
             continue
 
-        # высота канала
         H = upper_prev_f - lower_prev_f
         if H <= 0:
             continue
 
-        # условия по тренду (как в lr_universal)
+        # условия по тренду
         if trend_type == "trend":
             dir_ok = (direction == "long" and angle_f > 0.0) or (direction == "short" and angle_f < 0.0)
         elif trend_type == "counter":
@@ -360,7 +360,6 @@ def _find_lr_bounce_candidates(
                 if keep_half and not (close_curr_f <= center_curr_f):
                     continue
                 matched = True
-
         else:
             if zone_k == 0.0:
                 in_zone_prev = close_prev_f >= upper_prev_f
@@ -376,7 +375,7 @@ def _find_lr_bounce_candidates(
         if not matched:
             continue
 
-        # округляем цену для raw_message (как в lr_universal)
+        # цена как в lr_universal: close_curr
         try:
             price_rounded = float(f"{close_curr_f:.{precision_price}f}")
         except Exception:
@@ -392,30 +391,26 @@ def _find_lr_bounce_candidates(
                 "direction": direction,
                 "price": price_rounded,
                 "angle_m5": angle_f,
+                "upper_prev": upper_prev_f,
+                "lower_prev": lower_prev_f,
+                "upper_curr": float(upper_curr),
+                "lower_curr": float(lower_curr),
+                "center_curr": center_curr_f,
             }
         )
 
     return out
 
 
-# 🔸 Заглушка плагина: вычисление bin_name (пока не реализовано)
-def _plugin_stub_compute_bin_name(
-    winner_analysis_id: int,
-    winner_param: str,
-    candidate: Dict[str, Any],
-) -> Optional[str]:
-    # пока всегда None — "плагин не дал бин"
-    return None
-
-
-# 🔸 Публичная точка входа: stream-backfill сигнал (handler для STREAM_BACKFILL_HANDLERS)
+# 🔸 Публичная точка входа: stream-backfill сигнал уровня 2
 async def run_lr_universal_level2_stream_backfill(
     signal: Dict[str, Any],
     msg_ctx: Dict[str, Any],
     pg,
-    redis,  # оставляем для совместимости сигнатур, здесь не используется
+    redis,
 ) -> None:
     signal_id = int(signal.get("id") or 0)
+    signal_key = str(signal.get("key") or "").strip()
     name = signal.get("name")
     timeframe = str(signal.get("timeframe") or "").strip().lower()
     params = signal.get("params") or {}
@@ -496,7 +491,7 @@ async def run_lr_universal_level2_stream_backfill(
     window_from: datetime = run_info["from_time"]
     window_to: datetime = run_info["to_time"]
 
-    # грузим инстанс родительского сигнала (настройки bounce)
+    # загружаем инстанс родительского сигнала (настройки bounce)
     parent_signal = get_signal_instance(parent_signal_id)
     if not parent_signal:
         log.warning(
@@ -520,12 +515,15 @@ async def run_lr_universal_level2_stream_backfill(
         )
         return
 
-    parent_direction_mask = _get_str_param(parent_params, "direction_mask", "both").strip().lower()
-    parent_trend_type = _get_str_param(parent_params, "trend_type", "agnostic").strip().lower()
-    parent_keep_half = _get_bool_param(parent_params, "keep_half", False)
-    parent_zone_k = _get_float_param(parent_params, "zone_k", 0.0)
+    parent_direction_mask = str((parent_params.get("direction_mask") or {}).get("value") or "both").strip().lower()
+    parent_trend_type = str((parent_params.get("trend_type") or {}).get("value") or "agnostic").strip().lower()
+    parent_keep_half = str((parent_params.get("keep_half") or {}).get("value") or "false").strip().lower() == "true"
+    try:
+        parent_zone_k = float(str((parent_params.get("zone_k") or {}).get("value") or "0"))
+    except Exception:
+        parent_zone_k = 0.0
 
-    # моно-направленность (как договорённость в системе)
+    # моно-направленность
     if parent_direction_mask != direction:
         log.warning(
             "BT_SIG_LR_UNI_L2: mismatch direction with parent — level2_signal_id=%s dir=%s parent_direction_mask=%s parent_signal_id=%s",
@@ -536,7 +534,30 @@ async def run_lr_universal_level2_stream_backfill(
         )
         return
 
-    # загружаем свежие good bins победителя
+    # winner analysis cfg (для выбора плагина)
+    analysis_cfg = get_analysis_instance(int(winner_analysis_id))
+    if not analysis_cfg:
+        log.info(
+            "BT_SIG_LR_UNI_L2: winner analysis not in cache — skip (winner_analysis_id=%s)",
+            winner_analysis_id,
+        )
+        return
+
+    family_key = str(analysis_cfg.get("family_key") or "").strip().lower()
+    analysis_key = str(analysis_cfg.get("key") or "").strip().lower()
+
+    # сейчас поддерживаем только lr_mtf (analysis_id 91/92)
+    if not (family_key == "lr" and analysis_key == "lr_mtf"):
+        log.info(
+            "BT_SIG_LR_UNI_L2: winner plugin not supported yet — winner_analysis_id=%s family=%s key=%s winner_param='%s'",
+            winner_analysis_id,
+            family_key,
+            analysis_key,
+            str(winner_param),
+        )
+        return
+
+    # загружаем свежие good bins победителя (v2)
     good_bins, timeframes = await _load_good_bins_v2(
         pg=pg,
         scenario_id=scenario_id,
@@ -549,36 +570,45 @@ async def run_lr_universal_level2_stream_backfill(
     # условий достаточности
     if not good_bins:
         log.info(
-            "BT_SIG_LR_UNI_L2: no good bins — skip bounce scan (level2_signal_id=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s winner=%s dir=%s score_version=%s)",
+            "BT_SIG_LR_UNI_L2: no good bins — skip generation (level2_signal_id=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s winner=%s dir=%s)",
             signal_id,
             scenario_id,
             parent_signal_id,
             run_id,
             winner_analysis_id,
             direction,
-            score_version,
         )
         return
+
+    # init plugin context (run-aware)
+    plugin_ctx = await init_lr_mtf_plugin_context(
+        pg=pg,
+        run_id=int(run_id),
+        scenario_id=int(scenario_id),
+        parent_signal_id=int(parent_signal_id),
+        direction=str(direction),
+        analysis_id=int(winner_analysis_id),
+    )
 
     # список тикеров
     symbols = get_all_ticker_symbols()
     if not symbols:
         return
 
-    # предупреждение один раз: плагина ещё нет
-    warn_key = (int(winner_analysis_id), str(score_version))
-    if warn_key not in _warned_missing_plugin:
-        _warned_missing_plugin.add(warn_key)
-        log.info(
-            "BT_SIG_LR_UNI_L2: plugin stub active — winner_analysis_id=%s winner_param='%s' (no real binning yet)",
-            winner_analysis_id,
-            str(winner_param),
-        )
+    # existing events для идемпотентности
+    existing_events = await _load_existing_events(
+        pg=pg,
+        signal_id=int(signal_id),
+        timeframe="m5",
+        from_time=window_from,
+        to_time=window_to,
+        direction=direction,
+    )
 
     log.debug(
-        "BT_SIG_LR_UNI_L2: start bounce scan — level2_signal_id=%s name='%s' parent_scenario_id=%s parent_signal_id=%s run_id=%s "
+        "BT_SIG_LR_UNI_L2: start generation — level2_signal_id=%s name='%s' parent_scenario_id=%s parent_signal_id=%s run_id=%s "
         "winner_analysis_id=%s winner_param='%s' score_version=%s dir=%s window=[%s..%s] tickers=%s bins=%s timeframes=%s "
-        "bounce_lr_instance_id=%s trend_type=%s zone_k=%.3f keep_half=%s",
+        "bounce_lr_instance_id=%s trend_type=%s zone_k=%.3f keep_half=%s existing=%s",
         signal_id,
         name,
         scenario_id,
@@ -597,6 +627,7 @@ async def run_lr_universal_level2_stream_backfill(
         parent_trend_type,
         float(parent_zone_k),
         bool(parent_keep_half),
+        len(existing_events),
     )
 
     sema = asyncio.Semaphore(SYMBOL_MAX_CONCURRENCY)
@@ -605,22 +636,31 @@ async def run_lr_universal_level2_stream_backfill(
     for symbol in symbols:
         tasks.append(
             asyncio.create_task(
-                _process_symbol_scan(
+                _process_symbol_generate(
                     pg=pg,
                     sema=sema,
                     symbol=symbol,
+                    signal_id=signal_id,
+                    signal_key=signal_key,
+                    timeframe="m5",
+                    run_id=run_id,
+                    parent_signal_id=parent_signal_id,
+                    scenario_id=scenario_id,
                     direction=direction,
+                    # bounce settings
+                    lr_bounce_m5_instance_id=lr_bounce_m5_instance_id,
                     trend_type=parent_trend_type,
                     zone_k=parent_zone_k,
                     keep_half=parent_keep_half,
-                    lr_bounce_m5_instance_id=lr_bounce_m5_instance_id,
                     window_from=window_from,
                     window_to=window_to,
-                    winner_analysis_id=winner_analysis_id,
-                    winner_param=str(winner_param),
+                    # plugin
+                    plugin_ctx=plugin_ctx,
                     good_bins=good_bins,
+                    # idempotency
+                    existing_events=existing_events,
                 ),
-                name=f"BT_SIG_LR_UNI_L2_SCAN_{signal_id}_{symbol}",
+                name=f"BT_SIG_LR_UNI_L2_GEN_{signal_id}_{symbol}",
             )
         )
 
@@ -629,20 +669,38 @@ async def run_lr_universal_level2_stream_backfill(
     candidates_total = 0
     candidates_with_bin = 0
     candidates_good = 0
+    inserted_attempted = 0
+    skipped_existing = 0
     skipped_no_data = 0
+    skipped_no_bin = 0
+    skipped_not_good_bin = 0
 
     for res in results:
         if isinstance(res, Exception):
             continue
-        c_total, c_with_bin, c_good, c_no_data = res
+        (
+            c_total,
+            c_with_bin,
+            c_good,
+            ins_attempted,
+            s_existing,
+            s_no_data,
+            s_no_bin,
+            s_not_good,
+        ) = res
+
         candidates_total += c_total
         candidates_with_bin += c_with_bin
         candidates_good += c_good
-        skipped_no_data += c_no_data
+        inserted_attempted += ins_attempted
+        skipped_existing += s_existing
+        skipped_no_data += s_no_data
+        skipped_no_bin += s_no_bin
+        skipped_not_good_bin += s_not_good
 
     log.info(
-        "BT_SIG_LR_UNI_L2: bounce scan done — level2_signal_id=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s winner=%s dir=%s "
-        "bins=%s candidates=%s plugin_bin=%s would_pass_good=%s skipped_no_data=%s",
+        "BT_SIG_LR_UNI_L2: summary — level2_signal_id=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s winner=%s dir=%s "
+        "bins=%s candidates=%s with_bin=%s good=%s insert_attempted=%s skipped_existing=%s skipped_no_data=%s skipped_no_bin=%s skipped_not_good=%s",
         signal_id,
         scenario_id,
         parent_signal_id,
@@ -653,34 +711,68 @@ async def run_lr_universal_level2_stream_backfill(
         candidates_total,
         candidates_with_bin,
         candidates_good,
+        inserted_attempted,
+        skipped_existing,
         skipped_no_data,
+        skipped_no_bin,
+        skipped_not_good_bin,
     )
 
+    # публикуем готовность сигналов (run-aware, используем родительский run_id)
+    finished_at = datetime.utcnow()
+    try:
+        await redis.xadd(
+            BT_SIGNALS_READY_STREAM,
+            {
+                "signal_id": str(signal_id),
+                "run_id": str(int(run_id)),
+                "from_time": window_from.isoformat(),
+                "to_time": window_to.isoformat(),
+                "finished_at": finished_at.isoformat(),
+            },
+        )
+    except Exception as e:
+        log.error(
+            "BT_SIG_LR_UNI_L2: failed to publish bt:signals:ready — signal_id=%s run_id=%s err=%s",
+            signal_id,
+            run_id,
+            e,
+            exc_info=True,
+        )
 
-# 🔸 Обработка одного символа: поиск bounce-кандидатов + заглушка плагина
-async def _process_symbol_scan(
+
+# 🔸 Генерация по символу: bounce -> bin_name -> good_bins -> insert bt_signals_values
+async def _process_symbol_generate(
     pg,
     sema: asyncio.Semaphore,
     symbol: str,
+    signal_id: int,
+    signal_key: str,
+    timeframe: str,
+    run_id: int,
+    parent_signal_id: int,
+    scenario_id: int,
     direction: str,
+    # bounce settings
+    lr_bounce_m5_instance_id: int,
     trend_type: str,
     zone_k: float,
     keep_half: bool,
-    lr_bounce_m5_instance_id: int,
     window_from: datetime,
     window_to: datetime,
-    winner_analysis_id: int,
-    winner_param: str,
+    # plugin
+    plugin_ctx: Dict[str, Any],
     good_bins: Set[str],
-) -> Tuple[int, int, int, int]:
+    # idempotency
+    existing_events: Set[Tuple[str, datetime, str]],
+) -> Tuple[int, int, int, int, int, int, int, int]:
     async with sema:
-        # загружаем данные
-        lr_series = await _load_lr_series(pg, lr_bounce_m5_instance_id, symbol, window_from, window_to)
+        # загружаем данные для bounce
+        lr_series = await _load_lr_series_for_bounce(pg, lr_bounce_m5_instance_id, symbol, window_from, window_to)
         ohlcv = await _load_ohlcv_m5(pg, symbol, window_from, window_to)
 
-        # если данных нет — считаем как skipped_no_data
         if not lr_series or not ohlcv:
-            return 0, 0, 0, 1
+            return 0, 0, 0, 0, 0, 1, 0, 0
 
         # precision цены
         ticker_info = get_ticker_info(symbol) or {}
@@ -701,23 +793,107 @@ async def _process_symbol_scan(
         )
 
         if not candidates:
-            return 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0, 0, 0
+
+        # готовим серии для плагина (LR bounds по length на m5/m15/h1)
+        symbol_series = await prepare_symbol_series(
+            pg=pg,
+            plugin_ctx=plugin_ctx,
+            symbol=str(symbol),
+            window_from=window_from,
+            window_to=window_to,
+        )
+
+        if not symbol_series:
+            return len(candidates), 0, 0, 0, 0, 1, 0, 0
+
+        to_insert: List[Tuple[Any, ...]] = []
 
         with_bin = 0
-        would_pass_good = 0
+        good = 0
+        skipped_existing = 0
+        skipped_no_bin = 0
+        skipped_not_good = 0
 
         for cand in candidates:
-            # заглушка плагина: пока не вычисляет bin_name
-            bin_name = _plugin_stub_compute_bin_name(
-                winner_analysis_id=winner_analysis_id,
-                winner_param=winner_param,
+            ts: datetime = cand["open_time"]
+            key_event = (symbol, ts, direction)
+
+            if key_event in existing_events:
+                skipped_existing += 1
+                continue
+
+            bin_name = compute_lr_mtf_bin_name(
+                plugin_ctx=plugin_ctx,
+                symbol_series=symbol_series,
                 candidate=cand,
             )
-            if bin_name is None:
+
+            if not bin_name:
+                skipped_no_bin += 1
                 continue
 
             with_bin += 1
-            if bin_name in good_bins:
-                would_pass_good += 1
 
-        return len(candidates), with_bin, would_pass_good, 0
+            if bin_name not in good_bins:
+                skipped_not_good += 1
+                continue
+
+            good += 1
+
+            # message
+            message = "LR_UNI_L2_BOUNCE_LONG" if direction == "long" else "LR_UNI_L2_BOUNCE_SHORT"
+
+            # raw_message: базовое + bin_name + meta
+            raw_message = {
+                "signal_key": signal_key,
+                "signal_id": int(signal_id),
+                "symbol": str(symbol),
+                "timeframe": "m5",
+                "open_time": ts.isoformat(),
+                "decision_time": cand["decision_time"].isoformat(),
+                "direction": direction,
+                "price": cand.get("price"),
+                "pattern": "bounce",
+                "bin_name": str(bin_name),
+                "winner_analysis_id": int(plugin_ctx.get("analysis_id") or 0),
+                "plugin": "lr_mtf",
+                "plugin_param_name": str(plugin_ctx.get("param_name") or ""),
+                "length": int(plugin_ctx.get("length") or 0),
+                "source": "lr_universal_level2",
+                "parent_signal_id": int(parent_signal_id),
+                "parent_scenario_id": int(scenario_id),
+                "parent_run_id": int(run_id),
+            }
+
+            to_insert.append(
+                (
+                    str(uuid.uuid4()),
+                    int(signal_id),
+                    str(symbol),
+                    "m5",
+                    ts,
+                    cand["decision_time"],
+                    str(direction),
+                    str(message),
+                    json.dumps(raw_message),
+                    int(run_id),  # first_backfill_run_id = parent run
+                )
+            )
+
+        if not to_insert:
+            return len(candidates), with_bin, good, 0, skipped_existing, 0, skipped_no_bin, skipped_not_good
+
+        # вставка пачкой (идемпотентность обеспечит unique index)
+        async with pg.acquire() as conn:
+            await conn.executemany(
+                f"""
+                INSERT INTO {BT_SIGNALS_VALUES_TABLE}
+                    (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message, first_backfill_run_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+                ON CONFLICT (signal_id, symbol, timeframe, open_time, direction) DO NOTHING
+                """,
+                to_insert,
+            )
+
+        return len(candidates), with_bin, good, len(to_insert), skipped_existing, 0, skipped_no_bin, skipped_not_good
