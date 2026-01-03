@@ -1,4 +1,4 @@
-# bt_analysis_postproc_v2.py — постпроцессинг v2: расчёт компонентов и финального score (0..1) по кандидатам анализаторов (run-aware)
+# bt_analysis_postproc_v2.py — постпроцессинг v2: расчёт компонентов/score и запись биннов победителя в bt_analysis_bins_labels_v2 (run-aware)
 
 import asyncio
 import logging
@@ -29,8 +29,12 @@ POSTPROC_V2_STREAM_BLOCK_MS = 5000
 # 🔸 Таблицы v2
 PREPROC_V2_TABLE = "bt_analysis_preproc_stat_v2"
 SCORES_V2_TABLE = "bt_analysis_scores_v2"
+LABELS_V2_TABLE = "bt_analysis_bins_labels_v2"
 
-# 🔸 Версия скоринга (ключ в bt_analysis_scores_v2)
+# 🔸 Таблица источника бин-статистики (v1)
+BINS_STAT_TABLE = "bt_analysis_bins_stat"
+
+# 🔸 Версия скоринга (ключ в bt_analysis_scores_v2 / bt_analysis_bins_labels_v2)
 SCORE_VERSION = "v1"
 
 # 🔸 Квантизация
@@ -93,7 +97,7 @@ def _json_dumps_safe(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=_default)
 
 
-# 🔸 Публичная точка входа: воркер постпроцессинга v2 (scoring)
+# 🔸 Публичная точка входа: воркер постпроцессинга v2 (scoring + labels)
 async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
     log.debug("BT_ANALYSIS_POSTPROC_V2: оркестратор v2 запущен")
 
@@ -109,6 +113,7 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
             total_pairs = 0
             total_candidates = 0
             total_upserts = 0
+            total_labels_rows = 0
             total_skipped = 0
             total_errors = 0
 
@@ -165,6 +170,9 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                             run_id=run_id,
                             candidates=0,
                             upserts=0,
+                            labels_rows=0,
+                            winner_analysis_id=0,
+                            winner_param="",
                             score_version=SCORE_VERSION,
                         )
 
@@ -187,7 +195,7 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                         await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # запись результатов
+                    # запись результатов score
                     try:
                         upserts = await _upsert_scores_v2(pg, scored)
                     except Exception as e:
@@ -204,27 +212,60 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                         await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
                         continue
 
+                    # winner
+                    winner = scored[0]  # уже отсортировано по rank
+                    winner_analysis_id = int(winner.get("analysis_id") or 0)
+                    winner_param = str(winner.get("indicator_param") or "")
+                    winner_tf = str(winner.get("timeframe") or "")
+                    winner_dir = str(winner.get("direction") or "")
+
+                    # запись labels победителя (DELETE + INSERT)
+                    labels_rows = 0
+                    try:
+                        labels_rows = await _rewrite_labels_v2_for_winner(
+                            pg=pg,
+                            run_id=run_id,
+                            scenario_id=scenario_id,
+                            signal_id=signal_id,
+                            score_version=SCORE_VERSION,
+                            analysis_id=winner_analysis_id,
+                            indicator_param=winner_param,
+                            timeframe=winner_tf,
+                            direction=winner_dir,
+                        )
+                    except Exception as e:
+                        total_errors += 1
+                        log.error(
+                            "BT_ANALYSIS_POSTPROC_V2: ошибка записи %s scenario_id=%s signal_id=%s run_id=%s winner_analysis_id=%s: %s",
+                            LABELS_V2_TABLE,
+                            scenario_id,
+                            signal_id,
+                            run_id,
+                            winner_analysis_id,
+                            e,
+                            exc_info=True,
+                        )
+                        await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
+                        continue
+
                     total_candidates += len(scored)
                     total_upserts += upserts
-
-                    # winner для лога
-                    best = max(scored, key=lambda x: (_d(x.get("score_01")), _d(x.get("filt_pnl_abs"))))
-                    winner_analysis_id = int(best.get("analysis_id") or 0)
-                    winner_param = str(best.get("indicator_param") or "")
+                    total_labels_rows += labels_rows
 
                     log.info(
                         "BT_ANALYSIS_POSTPROC_V2: pair done — scenario_id=%s signal_id=%s run_id=%s finished_at=%s "
-                        "candidates=%s upserts=%s winner_analysis_id=%s winner_param='%s' best_score=%s best_filt_pnl=%s",
+                        "candidates=%s score_upserts=%s labels_rows=%s winner_analysis_id=%s winner_param='%s' best_score=%s best_filt_pnl=%s",
                         scenario_id,
                         signal_id,
                         run_id,
                         finished_at,
                         len(scored),
                         upserts,
+                        labels_rows,
                         winner_analysis_id,
                         winner_param,
-                        str(_q4(_d(best.get("score_01")))),
-                        str(_q4(_d(best.get("filt_pnl_abs")))),
+                        str(_q4(_d(winner.get("score_01")))),
+                        str(_q4(_d(winner.get("filt_pnl_abs")))),
                     )
 
                     await _publish_postproc_v2_ready(
@@ -234,17 +275,21 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                         run_id=run_id,
                         candidates=len(scored),
                         upserts=upserts,
+                        labels_rows=labels_rows,
+                        winner_analysis_id=winner_analysis_id,
+                        winner_param=winner_param,
                         score_version=SCORE_VERSION,
                     )
 
                     await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
 
             log.info(
-                "BT_ANALYSIS_POSTPROC_V2: batch summary — msgs=%s pairs=%s candidates=%s upserts=%s skipped=%s errors=%s",
+                "BT_ANALYSIS_POSTPROC_V2: batch summary — msgs=%s pairs=%s candidates=%s score_upserts=%s labels_rows=%s skipped=%s errors=%s",
                 total_msgs,
                 total_pairs,
                 total_candidates,
                 total_upserts,
+                total_labels_rows,
                 total_skipped,
                 total_errors,
             )
@@ -465,7 +510,6 @@ def _score_candidates_in_pair(candidates: List[Dict[str, Any]]) -> List[Dict[str
     rc_min, rc_max = min(rec_list), max(rec_list)
 
     # confidence (по filt_trades, без порогов)
-    # confidence = filt_trades / (filt_trades + K)
     conf_list: List[Decimal] = []
     for c in candidates:
         t = Decimal(int(c.get("filt_trades") or 0))
@@ -482,7 +526,6 @@ def _score_candidates_in_pair(candidates: List[Dict[str, Any]]) -> List[Dict[str
         profit_c = _minmax_norm(profit, p_min, p_max)
 
         cov = coverages[idx]
-        # "средний" штраф: sqrt(coverage), затем min-max внутри пары
         cov_sqrt = Decimal(str(math.sqrt(float(cov)))) if cov > 0 else Decimal("0")
         cov_sqrt = _clamp01(cov_sqrt)
         coverage_c = _minmax_norm(cov_sqrt, cov_sqrt_min, cov_sqrt_max)
@@ -678,6 +721,249 @@ async def _upsert_scores_v2(pg, scored_rows: List[Dict[str, Any]]) -> int:
     return len(to_insert)
 
 
+# 🔸 Перезапись bt_analysis_bins_labels_v2 для победителя (DELETE по паре + INSERT good bins)
+async def _rewrite_labels_v2_for_winner(
+    pg,
+    run_id: int,
+    scenario_id: int,
+    signal_id: int,
+    score_version: str,
+    analysis_id: int,
+    indicator_param: str,
+    timeframe: str,
+    direction: str,
+) -> int:
+    # 1) вытаскиваем kept_bins + threshold_used из preproc_v2
+    pre = await _load_preproc_v2_winner_details(
+        pg=pg,
+        run_id=run_id,
+        scenario_id=scenario_id,
+        signal_id=signal_id,
+        analysis_id=analysis_id,
+        indicator_param=indicator_param,
+        timeframe=timeframe,
+        direction=direction,
+    )
+
+    kept_bins: List[str] = list((pre or {}).get("kept_bins") or [])
+    threshold_used: Decimal = _d((pre or {}).get("winrate_threshold"), Decimal("0"))
+
+    # 2) удаляем прошлые данные (как в v1 — актуальный набор на пару)
+    async with pg.acquire() as conn:
+        await conn.execute(
+            f"""
+            DELETE FROM {LABELS_V2_TABLE}
+            WHERE scenario_id = $1
+              AND signal_id   = $2
+              AND direction   = $3
+              AND score_version = $4
+            """,
+            int(scenario_id),
+            int(signal_id),
+            str(direction),
+            str(score_version),
+        )
+
+    # условий достаточности
+    if not kept_bins:
+        return 0
+
+    # 3) подтягиваем статы по биннам из bt_analysis_bins_stat
+    stats_by_bin = await _load_bins_stat_for_bins(
+        pg=pg,
+        run_id=run_id,
+        scenario_id=scenario_id,
+        signal_id=signal_id,
+        analysis_id=analysis_id,
+        indicator_param=indicator_param,
+        timeframe=timeframe,
+        direction=direction,
+        bin_names=kept_bins,
+    )
+
+    # 4) пишем good-бинны победителя
+    to_insert: List[Tuple[Any, ...]] = []
+
+    for bn in kept_bins:
+        st = stats_by_bin.get(bn) or {}
+        trades = int(st.get("trades") or 0)
+        pnl_abs = _d(st.get("pnl_abs"))
+        winrate = _d(st.get("winrate"))
+
+        to_insert.append(
+            (
+                int(run_id),
+                int(scenario_id),
+                int(signal_id),
+                str(direction),
+
+                str(score_version),
+                int(analysis_id),
+                (str(indicator_param) if indicator_param is not None else ""),
+                str(timeframe),
+
+                str(bn),
+                "good",
+                str(_q4(threshold_used)),
+                int(trades),
+                str(_q4(pnl_abs)),
+                str(_q4(winrate)),
+            )
+        )
+
+    async with pg.acquire() as conn:
+        await conn.executemany(
+            f"""
+            INSERT INTO {LABELS_V2_TABLE} (
+                run_id,
+                scenario_id,
+                signal_id,
+                direction,
+
+                score_version,
+                analysis_id,
+                indicator_param,
+                timeframe,
+
+                bin_name,
+                state,
+                threshold_used,
+                trades,
+                pnl_abs,
+                winrate,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3,
+                $4,
+
+                $5, $6, $7, $8,
+
+                $9, $10, $11,
+                $12, $13, $14,
+                now()
+            )
+            ON CONFLICT (run_id, scenario_id, signal_id, direction, score_version, analysis_id, indicator_param, timeframe, bin_name)
+            DO UPDATE SET
+                state          = EXCLUDED.state,
+                threshold_used = EXCLUDED.threshold_used,
+                trades         = EXCLUDED.trades,
+                pnl_abs        = EXCLUDED.pnl_abs,
+                winrate        = EXCLUDED.winrate,
+                updated_at     = now()
+            """,
+            to_insert,
+        )
+
+    return len(to_insert)
+
+
+# 🔸 Загрузка kept_bins + threshold победителя из bt_analysis_preproc_stat_v2
+async def _load_preproc_v2_winner_details(
+    pg,
+    run_id: int,
+    scenario_id: int,
+    signal_id: int,
+    analysis_id: int,
+    indicator_param: str,
+    timeframe: str,
+    direction: str,
+) -> Optional[Dict[str, Any]]:
+    async with pg.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT
+                kept_bins,
+                winrate_threshold
+            FROM {PREPROC_V2_TABLE}
+            WHERE run_id = $1
+              AND scenario_id = $2
+              AND signal_id = $3
+              AND analysis_id = $4
+              AND COALESCE(indicator_param, '') = $5
+              AND timeframe = $6
+              AND direction = $7
+            """,
+            int(run_id),
+            int(scenario_id),
+            int(signal_id),
+            int(analysis_id),
+            str(indicator_param or ""),
+            str(timeframe),
+            str(direction),
+        )
+
+    if not row:
+        return None
+
+    kb = row["kept_bins"]
+    if isinstance(kb, str):
+        try:
+            kb = json.loads(kb)
+        except Exception:
+            kb = []
+
+    return {
+        "kept_bins": kb if isinstance(kb, list) else [],
+        "winrate_threshold": row["winrate_threshold"],
+    }
+
+
+# 🔸 Загрузка статистики биннов из bt_analysis_bins_stat для списка bin_names
+async def _load_bins_stat_for_bins(
+    pg,
+    run_id: int,
+    scenario_id: int,
+    signal_id: int,
+    analysis_id: int,
+    indicator_param: str,
+    timeframe: str,
+    direction: str,
+    bin_names: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    # условий достаточности
+    if not bin_names:
+        return {}
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT
+                bin_name,
+                trades,
+                pnl_abs,
+                winrate
+            FROM {BINS_STAT_TABLE}
+            WHERE run_id = $1
+              AND scenario_id = $2
+              AND signal_id = $3
+              AND analysis_id = $4
+              AND COALESCE(indicator_param, '') = $5
+              AND timeframe = $6
+              AND direction = $7
+              AND bin_name = ANY($8::text[])
+            """,
+            int(run_id),
+            int(scenario_id),
+            int(signal_id),
+            int(analysis_id),
+            str(indicator_param or ""),
+            str(timeframe),
+            str(direction),
+            list(bin_names),
+        )
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        bn = str(r["bin_name"])
+        out[bn] = {
+            "trades": int(r["trades"] or 0),
+            "pnl_abs": _d(r["pnl_abs"]),
+            "winrate": _d(r["winrate"]),
+        }
+    return out
+
+
 # 🔸 Публикация события готовности postproc v2
 async def _publish_postproc_v2_ready(
     redis,
@@ -686,6 +972,9 @@ async def _publish_postproc_v2_ready(
     run_id: int,
     candidates: int,
     upserts: int,
+    labels_rows: int,
+    winner_analysis_id: int,
+    winner_param: str,
     score_version: str,
 ) -> None:
     finished_at = datetime.utcnow()
@@ -698,20 +987,13 @@ async def _publish_postproc_v2_ready(
                 "signal_id": str(int(signal_id)),
                 "run_id": str(int(run_id)),
                 "candidates": str(int(candidates)),
-                "upserts": str(int(upserts)),
+                "score_upserts": str(int(upserts)),
+                "labels_rows": str(int(labels_rows)),
+                "winner_analysis_id": str(int(winner_analysis_id)),
+                "winner_param": str(winner_param or ""),
                 "score_version": str(score_version),
                 "finished_at": finished_at.isoformat(),
             },
-        )
-        log.debug(
-            "BT_ANALYSIS_POSTPROC_V2: published %s scenario_id=%s signal_id=%s run_id=%s candidates=%s upserts=%s score_version=%s",
-            POSTPROC_V2_READY_STREAM_KEY,
-            scenario_id,
-            signal_id,
-            run_id,
-            candidates,
-            upserts,
-            score_version,
         )
     except Exception as e:
         log.error(
