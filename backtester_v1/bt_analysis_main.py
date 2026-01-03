@@ -163,17 +163,29 @@ async def run_bt_analysis_orchestrator(pg, redis):
                     if run_signal_id != signal_id:
                         parent_ok = False
 
-                        sig_inst = get_signal_instance(int(signal_id))
-                        if sig_inst:
+                        # допускаем многослойные derived сигналы: signal -> parent -> parent -> ... -> root
+                        cur_signal_id = int(signal_id)
+                        for _depth in range(6):
+                            sig_inst = get_signal_instance(int(cur_signal_id))
+                            if not sig_inst:
+                                break
+
                             sig_params = sig_inst.get("params") or {}
                             p_cfg = sig_params.get("parent_signal_id")
+
                             try:
                                 parent_signal_id = int((p_cfg or {}).get("value") or 0)
                             except Exception:
                                 parent_signal_id = 0
 
-                            if parent_signal_id > 0 and parent_signal_id == run_signal_id:
+                            if parent_signal_id <= 0:
+                                break
+
+                            if parent_signal_id == run_signal_id:
                                 parent_ok = True
+                                break
+
+                            cur_signal_id = int(parent_signal_id)
 
                         if not parent_ok:
                             log.error(
