@@ -1,4 +1,4 @@
-# packs_config/db_loaders.py — загрузчики конфигурации ind_pack из PostgreSQL (packs/meta/params/rules/labels)
+# packs_config/db_loaders.py — загрузчики конфигурации ind_pack из PostgreSQL (packs/meta/params/rules + winners from labels_v2)
 
 from __future__ import annotations
 
@@ -15,19 +15,21 @@ ANALYSIS_INSTANCES_TABLE = "bt_analysis_instances"
 ANALYSIS_PARAMETERS_TABLE = "bt_analysis_parameters"
 BINS_DICT_TABLE = "bt_analysis_bins_dict"
 ADAPTIVE_BINS_TABLE = "bt_analysis_bin_dict_adaptive"
-BINS_LABELS_TABLE = "bt_analysis_bins_labels"
+BINS_LABELS_TABLE = "bt_analysis_bins_labels_v2"
 RUNS_TABLE = "bt_signal_backfill_runs"
 
 
-# 🔸 DB loaders: packs / analyzers / params / rules / labels
+# 🔸 DB loaders: packs / analyzers / params / rules
 async def load_enabled_packs(pg: Any) -> list[dict[str, Any]]:
     log = logging.getLogger("PACK_INIT")
     async with pg.acquire() as conn:
-        rows = await conn.fetch(f"""
+        rows = await conn.fetch(
+            f"""
             SELECT id, analysis_id, bins_policy, enabled_at
             FROM {PACK_INSTANCES_TABLE}
             WHERE enabled = true
-        """)
+            """
+        )
 
     packs: list[dict[str, Any]] = []
     parsed = 0
@@ -43,12 +45,14 @@ async def load_enabled_packs(pg: Any) -> list[dict[str, Any]]:
             except Exception:
                 policy = None
 
-        packs.append({
-            "id": int(r["id"]),
-            "analysis_id": int(r["analysis_id"]),
-            "bins_policy": policy,
-            "enabled_at": r["enabled_at"],
-        })
+        packs.append(
+            {
+                "id": int(r["id"]),
+                "analysis_id": int(r["analysis_id"]),
+                "bins_policy": policy,
+                "enabled_at": r["enabled_at"],
+            }
+        )
 
     log.info(
         "PACK_INIT: включённых pack-инстансов загружено: %s (bins_policy parsed_from_str=%s)",
@@ -64,11 +68,14 @@ async def load_analysis_instances(pg: Any, analysis_ids: list[int]) -> dict[int,
         return {}
 
     async with pg.acquire() as conn:
-        rows = await conn.fetch(f"""
+        rows = await conn.fetch(
+            f"""
             SELECT id, family_key, "key", "name", enabled
             FROM {ANALYSIS_INSTANCES_TABLE}
             WHERE id = ANY($1::int[])
-        """, analysis_ids)
+            """,
+            analysis_ids,
+        )
 
     out: dict[int, dict[str, Any]] = {}
     for r in rows:
@@ -89,11 +96,14 @@ async def load_analysis_parameters(pg: Any, analysis_ids: list[int]) -> dict[int
         return {}
 
     async with pg.acquire() as conn:
-        rows = await conn.fetch(f"""
+        rows = await conn.fetch(
+            f"""
             SELECT analysis_id, param_name, param_value
             FROM {ANALYSIS_PARAMETERS_TABLE}
             WHERE analysis_id = ANY($1::int[])
-        """, analysis_ids)
+            """,
+            analysis_ids,
+        )
 
     params: dict[int, dict[str, str]] = {}
     for r in rows:
@@ -118,12 +128,15 @@ async def load_static_bins_dict(pg: Any, analysis_ids: list[int]) -> dict[int, d
         return {}
 
     async with pg.acquire() as conn:
-        rows = await conn.fetch(f"""
+        rows = await conn.fetch(
+            f"""
             SELECT analysis_id, direction, timeframe, bin_type, bin_order, bin_name, val_from, val_to, to_inclusive
             FROM {BINS_DICT_TABLE}
             WHERE analysis_id = ANY($1::int[])
               AND bin_type = 'bins'
-        """, analysis_ids)
+            """,
+            analysis_ids,
+        )
 
     out: dict[int, dict[str, dict[str, list[BinRule]]]] = {}
     total = 0
@@ -156,18 +169,88 @@ async def load_static_bins_dict(pg: Any, analysis_ids: list[int]) -> dict[int, d
     return out
 
 
-# 🔸 DB loaders: run registry (стартовое определение актуального run_id)
+# 🔸 DB loaders: winners from labels_v2 (актуальные пары -> run_id + winner analysis_id + indicator_param)
+async def load_winners_from_labels_v2(
+    pg: Any,
+    pairs: list[tuple[int, int]],
+) -> dict[tuple[int, int], dict[str, Any]]:
+    """
+    Возвращает winner-мету по парам (scenario_id, signal_id) из bt_analysis_bins_labels_v2.
+
+    Таблица bt_analysis_bins_labels_v2 считается "актуальным снимком" (перезаписывается целиком).
+    По каждой паре ожидается один run_id и один analysis_id (winner), но много строк по bin_name.
+    """
+    log = logging.getLogger("PACK_INIT")
+
+    # условия достаточности
+    if not pairs:
+        return {}
+
+    uniq_pairs = sorted({(int(sc), int(sig)) for (sc, sig) in pairs})
+    scenario_ids = [int(sc) for sc, _ in uniq_pairs]
+    signal_ids = [int(sig) for _, sig in uniq_pairs]
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            WITH wanted AS (
+                SELECT *
+                FROM unnest($1::int[], $2::int[]) AS t(scenario_id, signal_id)
+            )
+            SELECT DISTINCT ON (l.scenario_id, l.signal_id)
+                   l.scenario_id,
+                   l.signal_id,
+                   l.run_id,
+                   l.analysis_id,
+                   l.indicator_param,
+                   l.timeframe
+            FROM {BINS_LABELS_TABLE} l
+            JOIN wanted w
+              ON w.scenario_id = l.scenario_id
+             AND w.signal_id   = l.signal_id
+            ORDER BY l.scenario_id, l.signal_id, l.created_at DESC, l.id DESC
+            """,
+            scenario_ids,
+            signal_ids,
+        )
+
+    out: dict[tuple[int, int], dict[str, Any]] = {}
+    for r in rows:
+        try:
+            sc = int(r["scenario_id"])
+            sig = int(r["signal_id"])
+            out[(sc, sig)] = {
+                "run_id": int(r["run_id"]),
+                "analysis_id": int(r["analysis_id"]),
+                "indicator_param": str(r["indicator_param"]) if r["indicator_param"] is not None else None,
+                "timeframe": str(r["timeframe"]) if r["timeframe"] is not None else None,
+            }
+        except Exception:
+            continue
+
+    missing = max(0, len(uniq_pairs) - len(out))
+    log.info(
+        "PACK_INIT: winners loaded from labels_v2 — requested_pairs=%s, found=%s, missing=%s",
+        len(uniq_pairs),
+        len(out),
+        missing,
+    )
+    return out
+
+
+# 🔸 DB loaders: run registry (legacy; если нужен fallback)
 async def load_latest_finished_run_ids(pg: Any, signal_ids: list[int]) -> dict[int, int]:
     """
-    Возвращает: signal_id -> run_id (самый свежий завершённый по finished_at).
-    Используется для холодного старта, до прихода bt:analysis:postproc_ready.
+    LEGACY: Возвращает signal_id -> run_id (самый свежий завершённый по finished_at).
+    Оставлено для совместимости/фолбэка.
     """
     log = logging.getLogger("PACK_INIT")
     if not signal_ids:
         return {}
 
     async with pg.acquire() as conn:
-        rows = await conn.fetch(f"""
+        rows = await conn.fetch(
+            f"""
             SELECT DISTINCT ON (signal_id)
                    signal_id,
                    id AS run_id
@@ -176,7 +259,9 @@ async def load_latest_finished_run_ids(pg: Any, signal_ids: list[int]) -> dict[i
               AND finished_at IS NOT NULL
               AND status <> 'running'
             ORDER BY signal_id, finished_at DESC, id DESC
-        """, signal_ids)
+            """,
+            signal_ids,
+        )
 
     out: dict[int, int] = {}
     for r in rows:
@@ -203,7 +288,8 @@ async def load_adaptive_bins_for_pair(
         return {}
 
     async with pg.acquire() as conn:
-        rows = await conn.fetch(f"""
+        rows = await conn.fetch(
+            f"""
             SELECT analysis_id, direction, timeframe, bin_type, bin_order, bin_name, val_from, val_to, to_inclusive
             FROM {ADAPTIVE_BINS_TABLE}
             WHERE run_id      = $1
@@ -212,7 +298,13 @@ async def load_adaptive_bins_for_pair(
               AND signal_id   = $4
               AND bin_type    = $5
             ORDER BY analysis_id, timeframe, direction, bin_order
-        """, int(run_id), analysis_ids, int(scenario_id), int(signal_id), str(bin_type))
+            """,
+            int(run_id),
+            analysis_ids,
+            int(scenario_id),
+            int(signal_id),
+            str(bin_type),
+        )
 
     out: dict[tuple[int, str, str], list[BinRule]] = {}
     for r in rows:
@@ -239,7 +331,7 @@ async def load_adaptive_bins_for_pair(
     return out
 
 
-# 🔸 DB loaders: labels bins (run-aware, без фильтра по state)
+# 🔸 DB loaders: labels bins (legacy; больше не используется для "winner-only" кеша)
 async def load_labels_bins_for_pair(
     pg: Any,
     run_id: int,

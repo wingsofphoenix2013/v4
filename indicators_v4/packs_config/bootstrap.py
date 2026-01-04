@@ -47,18 +47,9 @@ async def load_active_symbols(pg: Any) -> list[str]:
 async def bootstrap_current_state(pg: Any, redis: Any):
     log = logging.getLogger("PACK_BOOT")
 
-    runtimes: list[PackRuntime] = []
-    for lst in pack_registry.values():
-        runtimes.extend(lst)
-
-    if not runtimes:
-        log.info("PACK_BOOT: нет активных pack-инстансов, bootstrap пропущен")
-        return
-
-    symbols = await load_active_symbols(pg)
-    if not symbols:
-        log.info("PACK_BOOT: нет активных тикеров, bootstrap пропущен")
-        return
+    # bootstrap отключён: по новой логике публикуем только synced (labels_v2) pair-ключи
+    log.info("PACK_BOOT: bootstrap disabled (static publish skipped)")
+    return
 
     sem = asyncio.Semaphore(BOOTSTRAP_MAX_PARALLEL)
     ok_sum = 0
