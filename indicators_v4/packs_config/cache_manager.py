@@ -67,17 +67,13 @@ reloading_pairs_labels: set[tuple[int, int]] = set()  # legacy name: испол�
 
 
 # 🔸 Consumer-group helper
-async def ensure_stream_group(redis: Any, stream: str, group: str) -> bool:
+async def ensure_stream_group(redis: Any, stream: str, group: str):
     log = logging.getLogger("PACK_STREAM")
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
-        log.info("PACK_STREAM: group created %s/%s (start=$)", stream, group)
-        return True
     except Exception as e:
-        if "BUSYGROUP" in str(e):
-            return False
-        log.warning("xgroup_create error for %s/%s: %s", stream, group, e)
-        return False
+        if "BUSYGROUP" not in str(e):
+            log.warning("xgroup_create error for %s/%s: %s", stream, group, e)
 
 
 # 🔸 Helpers: winner getters

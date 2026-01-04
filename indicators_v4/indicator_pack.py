@@ -1,4 +1,4 @@
-# indicator_pack.py — оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta
+# indicator_pack.py — ++ оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta
 
 from __future__ import annotations
 
@@ -750,7 +750,7 @@ async def watch_indicator_stream(redis: Any):
             await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
 
             # суммирующий лог по батчу
-            log.debug(
+            log.info(
                 "PACK_STREAM: batch done (msgs=%s, runtimes_total=%s, ok=%s, fail=%s, skipped_tf=%s, skipped_trigger=%s, errors=%s)",
                 len(flat),
                 batch_runtimes,
@@ -768,26 +768,12 @@ async def watch_indicator_stream(redis: Any):
 
 # 🔸 run worker
 async def run_indicator_pack(pg: Any, redis: Any):
-    log = logging.getLogger("PACK_INIT")
+    # первичная загрузка (registry + winners + rules)
+    await init_pack_runtime(pg)
 
     # создать группы заранее
-    created_ind = await ensure_stream_group(redis, INDICATOR_STREAM, IND_PACK_GROUP)
-    created_pp = await ensure_stream_group(redis, POSTPROC_STREAM_KEY, POSTPROC_GROUP)
-
-    # мягкий режим: SETID $ только при первом создании группы
-    if created_ind:
-        try:
-            await redis.execute_command("XGROUP", "SETID", INDICATOR_STREAM, IND_PACK_GROUP, "$")
-            log.info("PACK_INIT: %s/%s cursor set to $ (new messages only)", INDICATOR_STREAM, IND_PACK_GROUP)
-        except Exception as e:
-            log.warning("PACK_INIT: XGROUP SETID error for %s/%s: %s", INDICATOR_STREAM, IND_PACK_GROUP, e)
-
-    if created_pp:
-        try:
-            await redis.execute_command("XGROUP", "SETID", POSTPROC_STREAM_KEY, POSTPROC_GROUP, "$")
-            log.info("PACK_INIT: %s/%s cursor set to $ (new messages only)", POSTPROC_STREAM_KEY, POSTPROC_GROUP)
-        except Exception as e:
-            log.warning("PACK_INIT: XGROUP SETID error for %s/%s: %s", POSTPROC_STREAM_KEY, POSTPROC_GROUP, e)
+    await ensure_stream_group(redis, INDICATOR_STREAM, IND_PACK_GROUP)
+    await ensure_stream_group(redis, POSTPROC_STREAM_KEY, POSTPROC_GROUP)
 
     # холодный старт (в текущей схеме отключён внутри bootstrap.py)
     await bootstrap_current_state(pg, redis)

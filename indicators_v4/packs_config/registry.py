@@ -307,7 +307,7 @@ def build_pack_registry(
         registry.setdefault((tf, stream_indicator), []).append(rt)
         total += 1
 
-    log.debug(
+    log.info(
         "PACK_INIT: registry построен — match_keys=%s, runtimes_total=%s, static=%s, adaptive=%s, mtf=%s",
         len(registry),
         total,

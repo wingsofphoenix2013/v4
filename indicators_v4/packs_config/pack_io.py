@@ -32,17 +32,13 @@ SQL_INSERT_EVENT = """
 
 
 # 🔸 Consumer-group helper
-async def ensure_stream_group(redis: Any, stream: str, group: str) -> bool:
+async def ensure_stream_group(redis: Any, stream: str, group: str):
     log = logging.getLogger("PACK_IO")
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
-        log.info("PACK_IO: group created %s/%s (start=$)", stream, group)
-        return True
     except Exception as e:
-        if "BUSYGROUP" in str(e):
-            return False
-        log.warning("xgroup_create error for %s/%s: %s", stream, group, e)
-        return False
+        if "BUSYGROUP" not in str(e):
+            log.warning("xgroup_create error for %s/%s: %s", stream, group, e)
 
 
 # 🔸 Parse helpers
@@ -93,15 +89,7 @@ async def run_pack_io(pg: Any, redis: Any):
     log = logging.getLogger("PACK_IO")
 
     # создать группу заранее
-    created = await ensure_stream_group(redis, IND_PACK_STREAM_CORE, PACK_IO_GROUP)
-
-    # мягкий режим: SETID $ только при первом создании группы
-    if created:
-        try:
-            await redis.execute_command("XGROUP", "SETID", IND_PACK_STREAM_CORE, PACK_IO_GROUP, "$")
-            log.info("PACK_IO: %s/%s cursor set to $ (new messages only)", IND_PACK_STREAM_CORE, PACK_IO_GROUP)
-        except Exception as e:
-            log.warning("PACK_IO: XGROUP SETID error for %s/%s: %s", IND_PACK_STREAM_CORE, PACK_IO_GROUP, e)
+    await ensure_stream_group(redis, IND_PACK_STREAM_CORE, PACK_IO_GROUP)
 
     while True:
         try:
@@ -166,7 +154,7 @@ async def run_pack_io(pg: Any, redis: Any):
             if not events_rows:
                 if to_ack:
                     await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
-                log.debug("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
+                log.info("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
                 continue
 
             # запись в PG одной транзакцией
@@ -180,7 +168,7 @@ async def run_pack_io(pg: Any, redis: Any):
             if to_ack:
                 await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
 
-            log.debug(
+            log.info(
                 "PACK_IO: batch done (msgs=%s, events=%s, skipped=%s)",
                 len(flat),
                 len(events_rows),
