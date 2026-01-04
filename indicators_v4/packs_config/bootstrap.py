@@ -40,7 +40,7 @@ async def load_active_symbols(pg: Any) -> list[str]:
             WHERE status = 'enabled' AND tradepermission = 'enabled'
         """)
     symbols = [str(r["symbol"]) for r in rows if r.get("symbol")]
-    log.info("PACK_BOOT: активных тикеров загружено: %s", len(symbols))
+    log.debug("PACK_BOOT: активных тикеров загружено: %s", len(symbols))
     return symbols
 
 
@@ -48,7 +48,7 @@ async def bootstrap_current_state(pg: Any, redis: Any):
     log = logging.getLogger("PACK_BOOT")
 
     # bootstrap отключён: по новой логике публикуем только synced (labels_v2) pair-ключи
-    log.info("PACK_BOOT: bootstrap disabled (static publish skipped)")
+    log.debug("PACK_BOOT: bootstrap disabled (static publish skipped)")
     return
 
     sem = asyncio.Semaphore(BOOTSTRAP_MAX_PARALLEL)
@@ -200,4 +200,4 @@ async def bootstrap_current_state(pg: Any, redis: Any):
     tasks = [asyncio.create_task(_process_one(sym, rt)) for sym in symbols for rt in runtimes]
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    log.info("PACK_BOOT: bootstrap done — packs=%s, symbols=%s, ok=%s, fail=%s", len(runtimes), len(symbols), ok_sum, fail_sum)
+    log.debug("PACK_BOOT: bootstrap done — packs=%s, symbols=%s, ok=%s, fail=%s", len(runtimes), len(symbols), ok_sum, fail_sum)

@@ -54,7 +54,7 @@ async def load_enabled_packs(pg: Any) -> list[dict[str, Any]]:
             }
         )
 
-    log.info(
+    log.debug(
         "PACK_INIT: включённых pack-инстансов загружено: %s (bins_policy parsed_from_str=%s)",
         len(packs),
         parsed,
@@ -86,7 +86,7 @@ async def load_analysis_instances(pg: Any, analysis_ids: list[int]) -> dict[int,
             "enabled": bool(r["enabled"]),
         }
 
-    log.info("PACK_INIT: bt_analysis_instances загружено: %s", len(out))
+    log.debug("PACK_INIT: bt_analysis_instances загружено: %s", len(out))
     return out
 
 
@@ -118,7 +118,7 @@ async def load_analysis_parameters(pg: Any, analysis_ids: list[int]) -> dict[int
         else:
             missing += 1
 
-    log.info("PACK_INIT: bt_analysis_parameters (param_name) OK=%s, missing=%s", ok, missing)
+    log.debug("PACK_INIT: bt_analysis_parameters (param_name) OK=%s, missing=%s", ok, missing)
     return params
 
 
@@ -165,7 +165,7 @@ async def load_static_bins_dict(pg: Any, analysis_ids: list[int]) -> dict[int, d
             for direction in out[aid][tf]:
                 out[aid][tf][direction].sort(key=lambda x: x.bin_order)
 
-    log.info("PACK_INIT: static bins загружено: rules=%s", total)
+    log.debug("PACK_INIT: static bins загружено: rules=%s", total)
     return out
 
 
@@ -229,7 +229,7 @@ async def load_winners_from_labels_v2(
             continue
 
     missing = max(0, len(uniq_pairs) - len(out))
-    log.info(
+    log.debug(
         "PACK_INIT: winners loaded from labels_v2 — requested_pairs=%s, found=%s, missing=%s",
         len(uniq_pairs),
         len(out),
@@ -270,7 +270,7 @@ async def load_latest_finished_run_ids(pg: Any, signal_ids: list[int]) -> dict[i
         except Exception:
             continue
 
-    log.info("PACK_INIT: latest finished runs loaded — signals=%s, runs=%s", len(signal_ids), len(out))
+    log.debug("PACK_INIT: latest finished runs loaded — signals=%s, runs=%s", len(signal_ids), len(out))
     return out
 
 

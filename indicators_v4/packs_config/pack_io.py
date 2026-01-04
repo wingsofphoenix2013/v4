@@ -91,6 +91,13 @@ async def run_pack_io(pg: Any, redis: Any):
     # создать группу заранее
     await ensure_stream_group(redis, IND_PACK_STREAM_CORE, PACK_IO_GROUP)
 
+    # стартуем только с новых сообщений (не разгребаем хвост)
+    try:
+        await redis.execute_command("XGROUP", "SETID", IND_PACK_STREAM_CORE, PACK_IO_GROUP, "$")
+        log.info("PACK_IO: %s/%s cursor set to $ (new messages only)", IND_PACK_STREAM_CORE, PACK_IO_GROUP)
+    except Exception as e:
+        log.warning("PACK_IO: XGROUP SETID error for %s/%s: %s", IND_PACK_STREAM_CORE, PACK_IO_GROUP, e)
+
     while True:
         try:
             resp = await redis.xreadgroup(
@@ -154,7 +161,7 @@ async def run_pack_io(pg: Any, redis: Any):
             if not events_rows:
                 if to_ack:
                     await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
-                log.info("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
+                log.debug("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
                 continue
 
             # запись в PG одной транзакцией
@@ -168,7 +175,7 @@ async def run_pack_io(pg: Any, redis: Any):
             if to_ack:
                 await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
 
-            log.info(
+            log.debug(
                 "PACK_IO: batch done (msgs=%s, events=%s, skipped=%s)",
                 len(flat),
                 len(events_rows),
