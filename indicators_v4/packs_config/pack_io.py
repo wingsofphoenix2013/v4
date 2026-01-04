@@ -154,7 +154,7 @@ async def run_pack_io(pg: Any, redis: Any):
             if not events_rows:
                 if to_ack:
                     await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
-                log.info("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
+                log.debug("PACK_IO: batch skipped (msgs=%s, skipped=%s)", len(flat), skipped)
                 continue
 
             # запись в PG одной транзакцией
@@ -168,7 +168,7 @@ async def run_pack_io(pg: Any, redis: Any):
             if to_ack:
                 await redis.xack(IND_PACK_STREAM_CORE, PACK_IO_GROUP, *to_ack)
 
-            log.info(
+            log.debug(
                 "PACK_IO: batch done (msgs=%s, events=%s, skipped=%s)",
                 len(flat),
                 len(events_rows),

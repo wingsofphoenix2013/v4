@@ -750,7 +750,7 @@ async def watch_indicator_stream(redis: Any):
             await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
 
             # суммирующий лог по батчу
-            log.info(
+            log.debug(
                 "PACK_STREAM: batch done (msgs=%s, runtimes_total=%s, ok=%s, fail=%s, skipped_tf=%s, skipped_trigger=%s, errors=%s)",
                 len(flat),
                 batch_runtimes,
