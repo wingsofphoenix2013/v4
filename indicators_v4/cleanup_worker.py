@@ -1,4 +1,4 @@
-# cleanup_worker.py — регулярная очистка TS/DB/Streams для indicators_v4 + pack retention (ind_pack_stream_core / ind_pack_events_v4)
+# cleanup_worker.py — регулярная очистка TS/DB/Streams для indicators_v4 + pack retention (ind_pack_stream_core / ind_pack_events_v4) + очистка indicator_gap_v4 (healed_ts)
 
 import asyncio
 import logging
@@ -17,6 +17,9 @@ STREAM_LIMITS = {
     "indicator_request":     10000,
     "indicator_response":    10000,
 }
+
+# 🔸 Политика очистки indicator_gap_v4
+GAP_KEEP_HOURS = 48                                    # 48 часов (только healed_ts, считаем от healed_ts_at)
 
 # 🔸 Политика retention (packs)
 PACK_STREAM_KEY = "ind_pack_stream_core"
@@ -119,6 +122,36 @@ async def cleanup_pack_events_db(pg):
         return None
 
 
+# 🔸 Удалить вылеченные дырки из indicator_gap_v4 (status=healed_ts и healed_ts_at < NOW()-48h)
+async def cleanup_indicator_gap_healed_ts_db(pg):
+    """
+    Удаляем только полностью вылеченные (healed_ts) и старше GAP_KEEP_HOURS часов от момента healed_ts_at.
+    Возвращает количество удалённых строк (если возможно определить), иначе None.
+    """
+    try:
+        async with pg.acquire() as conn:
+            res = await conn.execute(
+                f"""
+                DELETE FROM indicator_gap_v4
+                WHERE status = 'healed_ts'
+                  AND healed_ts_at IS NOT NULL
+                  AND healed_ts_at < NOW() - INTERVAL '{int(GAP_KEEP_HOURS)} hours'
+                """
+            )
+
+        # res обычно строка формата 'DELETE <n>'
+        try:
+            deleted = int(res.split()[-1])
+        except Exception:
+            deleted = None
+
+        log.debug(f"[DB] indicator_gap_v4 (healed_ts) удалено: {res}")
+        return deleted
+    except Exception as e:
+        log.error(f"[DB] cleanup_indicator_gap_healed_ts_db error: {e}", exc_info=True)
+        return None
+
+
 # 🔸 Трим всех стримов indicators_v4 до разумного хвоста (MAXLEN)
 async def trim_streams(redis):
     """
@@ -161,6 +194,7 @@ async def run_indicators_cleanup(pg, redis):
 
     last_db_ind = datetime.min
     last_db_pack = datetime.min
+    last_db_gap = datetime.min
     last_info = datetime.min
 
     while True:
@@ -196,18 +230,39 @@ async def run_indicators_cleanup(pg, redis):
             if (now - last_db_pack) >= timedelta(hours=1):
                 deleted = await cleanup_pack_events_db(pg)
                 if deleted is not None:
-                    log.info(f"IND_CLEANUP: DB purge ind_pack_events_v4 — deleted={deleted} rows (older than {PACK_EVENTS_KEEP_HOURS}h)")
+                    log.info(
+                        f"IND_CLEANUP: DB purge ind_pack_events_v4 — deleted={deleted} rows (older than {PACK_EVENTS_KEEP_HOURS}h)"
+                    )
                 else:
-                    log.info(f"IND_CLEANUP: DB purge ind_pack_events_v4 — completed (older than {PACK_EVENTS_KEEP_HOURS}h)")
+                    log.info(
+                        f"IND_CLEANUP: DB purge ind_pack_events_v4 — completed (older than {PACK_EVENTS_KEEP_HOURS}h)"
+                    )
                 last_db_pack = now
+
+            # раз в час — очистка indicator_gap_v4 (healed_ts, healed_ts_at older than 48h)
+            if (now - last_db_gap) >= timedelta(hours=1):
+                deleted = await cleanup_indicator_gap_healed_ts_db(pg)
+                if deleted is not None:
+                    log.info(
+                        f"IND_CLEANUP: DB purge indicator_gap_v4 — deleted={deleted} rows (status=healed_ts, older than {GAP_KEEP_HOURS}h from healed_ts_at)"
+                    )
+                else:
+                    log.info(
+                        f"IND_CLEANUP: DB purge indicator_gap_v4 — completed (status=healed_ts, older than {GAP_KEEP_HOURS}h from healed_ts_at)"
+                    )
+                last_db_gap = now
 
             # раз в сутки — очистка indicator_values_v4 (60 суток)
             if (now - last_db_ind) >= timedelta(days=1):
                 deleted = await cleanup_indicators_db(pg)
                 if deleted is not None:
-                    log.info(f"IND_CLEANUP: DB purge indicator_values_v4 — deleted={deleted} rows (older than {DB_KEEP_DAYS}d)")
+                    log.info(
+                        f"IND_CLEANUP: DB purge indicator_values_v4 — deleted={deleted} rows (older than {DB_KEEP_DAYS}d)"
+                    )
                 else:
-                    log.info(f"IND_CLEANUP: DB purge indicator_values_v4 — completed (older than {DB_KEEP_DAYS}d)")
+                    log.info(
+                        f"IND_CLEANUP: DB purge indicator_values_v4 — completed (older than {DB_KEEP_DAYS}d)"
+                    )
                 last_db_ind = now
 
             await asyncio.sleep(300)  # пауза 5 минут
