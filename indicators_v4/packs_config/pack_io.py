@@ -32,13 +32,17 @@ SQL_INSERT_EVENT = """
 
 
 # 🔸 Consumer-group helper
-async def ensure_stream_group(redis: Any, stream: str, group: str):
+async def ensure_stream_group(redis: Any, stream: str, group: str) -> bool:
     log = logging.getLogger("PACK_IO")
     try:
         await redis.xgroup_create(stream, group, id="$", mkstream=True)
+        log.info("PACK_IO: group created %s/%s (start=$)", stream, group)
+        return True
     except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            log.warning("xgroup_create error for %s/%s: %s", stream, group, e)
+        if "BUSYGROUP" in str(e):
+            return False
+        log.warning("xgroup_create error for %s/%s: %s", stream, group, e)
+        return False
 
 
 # 🔸 Parse helpers
@@ -89,14 +93,15 @@ async def run_pack_io(pg: Any, redis: Any):
     log = logging.getLogger("PACK_IO")
 
     # создать группу заранее
-    await ensure_stream_group(redis, IND_PACK_STREAM_CORE, PACK_IO_GROUP)
+    created = await ensure_stream_group(redis, IND_PACK_STREAM_CORE, PACK_IO_GROUP)
 
-    # стартуем только с новых сообщений (не разгребаем хвост)
-    try:
-        await redis.execute_command("XGROUP", "SETID", IND_PACK_STREAM_CORE, PACK_IO_GROUP, "$")
-        log.info("PACK_IO: %s/%s cursor set to $ (new messages only)", IND_PACK_STREAM_CORE, PACK_IO_GROUP)
-    except Exception as e:
-        log.warning("PACK_IO: XGROUP SETID error for %s/%s: %s", IND_PACK_STREAM_CORE, PACK_IO_GROUP, e)
+    # мягкий режим: SETID $ только при первом создании группы
+    if created:
+        try:
+            await redis.execute_command("XGROUP", "SETID", IND_PACK_STREAM_CORE, PACK_IO_GROUP, "$")
+            log.info("PACK_IO: %s/%s cursor set to $ (new messages only)", IND_PACK_STREAM_CORE, PACK_IO_GROUP)
+        except Exception as e:
+            log.warning("PACK_IO: XGROUP SETID error for %s/%s: %s", IND_PACK_STREAM_CORE, PACK_IO_GROUP, e)
 
     while True:
         try:

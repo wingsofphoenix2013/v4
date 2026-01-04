@@ -771,21 +771,23 @@ async def run_indicator_pack(pg: Any, redis: Any):
     log = logging.getLogger("PACK_INIT")
 
     # создать группы заранее
-    await ensure_stream_group(redis, INDICATOR_STREAM, IND_PACK_GROUP)
-    await ensure_stream_group(redis, POSTPROC_STREAM_KEY, POSTPROC_GROUP)
+    created_ind = await ensure_stream_group(redis, INDICATOR_STREAM, IND_PACK_GROUP)
+    created_pp = await ensure_stream_group(redis, POSTPROC_STREAM_KEY, POSTPROC_GROUP)
 
-    # стартуем только с новых сообщений (не разгребаем хвост)
-    try:
-        await redis.execute_command("XGROUP", "SETID", INDICATOR_STREAM, IND_PACK_GROUP, "$")
-        log.info("PACK_INIT: %s/%s cursor set to $ (new messages only)", INDICATOR_STREAM, IND_PACK_GROUP)
-    except Exception as e:
-        log.warning("PACK_INIT: XGROUP SETID error for %s/%s: %s", INDICATOR_STREAM, IND_PACK_GROUP, e)
+    # мягкий режим: SETID $ только при первом создании группы
+    if created_ind:
+        try:
+            await redis.execute_command("XGROUP", "SETID", INDICATOR_STREAM, IND_PACK_GROUP, "$")
+            log.info("PACK_INIT: %s/%s cursor set to $ (new messages only)", INDICATOR_STREAM, IND_PACK_GROUP)
+        except Exception as e:
+            log.warning("PACK_INIT: XGROUP SETID error for %s/%s: %s", INDICATOR_STREAM, IND_PACK_GROUP, e)
 
-    try:
-        await redis.execute_command("XGROUP", "SETID", POSTPROC_STREAM_KEY, POSTPROC_GROUP, "$")
-        log.info("PACK_INIT: %s/%s cursor set to $ (new messages only)", POSTPROC_STREAM_KEY, POSTPROC_GROUP)
-    except Exception as e:
-        log.warning("PACK_INIT: XGROUP SETID error for %s/%s: %s", POSTPROC_STREAM_KEY, POSTPROC_GROUP, e)
+    if created_pp:
+        try:
+            await redis.execute_command("XGROUP", "SETID", POSTPROC_STREAM_KEY, POSTPROC_GROUP, "$")
+            log.info("PACK_INIT: %s/%s cursor set to $ (new messages only)", POSTPROC_STREAM_KEY, POSTPROC_GROUP)
+        except Exception as e:
+            log.warning("PACK_INIT: XGROUP SETID error for %s/%s: %s", POSTPROC_STREAM_KEY, POSTPROC_GROUP, e)
 
     # холодный старт (в текущей схеме отключён внутри bootstrap.py)
     await bootstrap_current_state(pg, redis)
