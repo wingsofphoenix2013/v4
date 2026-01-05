@@ -36,6 +36,9 @@ FILTER_WAIT_STEP_SEC = 3
 # 🔸 Защита от “догоняющих” событий
 FILTER_STALE_MAX_SEC = 90
 
+# 🔸 Таймаут обработки одного кандидата фильтра (защита от зависаний воркера)
+FILTER_CANDIDATE_TIMEOUT_SEC = 90
+
 # 🔸 Ограничение ресурсов фильтрации
 FILTER_MAX_CONCURRENCY = 50
 FILTER_QUEUE_MAXSIZE = 800
@@ -856,11 +859,110 @@ async def handle_lr_universal_indicator_ready_v2(
 async def _filter_worker_loop(pg, redis, queue: asyncio.Queue, sema: asyncio.Semaphore) -> None:
     while True:
         candidate = await queue.get()
+
+        # базовые поля кандидата (нужны для финального статуса при ошибке/таймауте)
+        signal_id = int((candidate or {}).get("signal_id") or 0)
+        symbol = str((candidate or {}).get("symbol") or "")
+        timeframe = str((candidate or {}).get("timeframe") or "")
+        direction = str((candidate or {}).get("direction") or "")
+        open_time = (candidate or {}).get("open_time")
+        decision_time = (candidate or {}).get("decision_time") or open_time
+        message = str((candidate or {}).get("message") or "")
+        filter_mode = str((candidate or {}).get("filter_mode") or "")
+        mirror1 = (candidate or {}).get("mirror1")
+        mirror2 = (candidate or {}).get("mirror2")
+        detected_at = (candidate or {}).get("detected_at")
+        base_details = (candidate or {}).get("base_details") or {}
+
         try:
             async with sema:
-                await _process_filter_candidate(pg, redis, candidate)
+                # таймаут нужен, чтобы зависшие await (Redis/PG) не оставляли filter_waiting навсегда
+                await asyncio.wait_for(
+                    _process_filter_candidate(pg, redis, candidate),
+                    timeout=FILTER_CANDIDATE_TIMEOUT_SEC,
+                )
+
+        except asyncio.TimeoutError:
+            # если обработка кандидата зависла — фиксируем финальный статус в bt_signals_live
+            try:
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="filter_timeout",
+                    details={
+                        **base_details,
+                        "signal": {
+                            "signal_id": signal_id,
+                            "direction": direction,
+                            "message": message,
+                            "filter_mode": filter_mode,
+                            "mirror1": mirror1,
+                            "mirror2": mirror2,
+                        },
+                        "filter": {
+                            "rule": "worker_timeout",
+                            "timeout_sec": int(FILTER_CANDIDATE_TIMEOUT_SEC),
+                            "detected_at": (detected_at.isoformat() if isinstance(detected_at, datetime) else None),
+                        },
+                    },
+                    processed=True,
+                )
+                log.info(
+                    "BT_SIG_LR_UNI_LIVE_V2: filter candidate timeout — signal_id=%s %s %s %s mode=%s",
+                    signal_id,
+                    symbol,
+                    direction,
+                    (open_time.isoformat() if isinstance(open_time, datetime) else str(open_time)),
+                    filter_mode,
+                )
+            except Exception as e:
+                log.error("BT_SIG_LR_UNI_LIVE_V2: failed to persist filter_timeout status: %s", e, exc_info=True)
+
         except Exception as e:
+            # любая ошибка воркера должна приводить к финальному статусу, иначе filter_waiting остаётся навсегда
             log.error("BT_SIG_LR_UNI_LIVE_V2: filter worker error: %s", e, exc_info=True)
+            try:
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="filter_error",
+                    details={
+                        **base_details,
+                        "signal": {
+                            "signal_id": signal_id,
+                            "direction": direction,
+                            "message": message,
+                            "filter_mode": filter_mode,
+                            "mirror1": mirror1,
+                            "mirror2": mirror2,
+                        },
+                        "filter": {
+                            "rule": "worker_exception",
+                            "error": str(e),
+                            "detected_at": (detected_at.isoformat() if isinstance(detected_at, datetime) else None),
+                        },
+                    },
+                    processed=True,
+                )
+                log.info(
+                    "BT_SIG_LR_UNI_LIVE_V2: filter candidate error marked — signal_id=%s %s %s %s mode=%s",
+                    signal_id,
+                    symbol,
+                    direction,
+                    (open_time.isoformat() if isinstance(open_time, datetime) else str(open_time)),
+                    filter_mode,
+                )
+            except Exception as ee:
+                log.error("BT_SIG_LR_UNI_LIVE_V2: failed to persist filter_error status: %s", ee, exc_info=True)
+
         finally:
             queue.task_done()
 
