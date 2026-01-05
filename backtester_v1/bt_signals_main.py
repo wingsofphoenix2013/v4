@@ -22,6 +22,7 @@ from signals.bt_signals_lr_universal_level2 import run_lr_universal_level2_strea
 # 🔸 Live-воркеры сигналов
 from signals.bt_signals_lr_universal_live import init_lr_universal_live, handle_lr_universal_indicator_ready
 from signals.bt_signals_emacross_live import init_emacross_live, handle_emacross_indicator_ready
+from signals.bt_signals_lr_universal_live_v2 import init_lr_universal_live_v2, handle_lr_universal_indicator_ready_v2
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60       # старт через минуту после запуска backtester_v1
@@ -88,6 +89,7 @@ STREAM_BACKFILL_HANDLERS: Dict[str, StreamBackfillHandler] = {
 LIVE_SIGNAL_HANDLERS: Dict[str, LiveSignalHandler] = {
     "lr_universal": LiveSignalHandler(init_lr_universal_live, handle_lr_universal_indicator_ready),
     "emacross": LiveSignalHandler(init_emacross_live, handle_emacross_indicator_ready),
+    "lr_universal_v2": LiveSignalHandler(init_lr_universal_live_v2, handle_lr_universal_indicator_ready_v2),
 }
 
 
