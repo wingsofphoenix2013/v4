@@ -30,14 +30,14 @@ IND_PACK_PAIR_KEY = "ind_pack:{analysis_id}:{scenario_id}:{signal_id}:{direction
 TF_STEP_MINUTES = {"m5": 5}
 
 # 🔸 Ожидание ind_pack (общий дедлайн на слой)
-FILTER_WAIT_TOTAL_SEC = 60
+FILTER_WAIT_TOTAL_SEC = 90
 FILTER_WAIT_STEP_SEC = 3
 
 # 🔸 Защита от “догоняющих” событий
-FILTER_STALE_MAX_SEC = 90
+FILTER_STALE_MAX_SEC = 120
 
 # 🔸 Таймаут обработки одного кандидата фильтра (защита от зависаний воркера)
-FILTER_CANDIDATE_TIMEOUT_SEC = 90
+FILTER_CANDIDATE_TIMEOUT_SEC = 120
 
 # 🔸 Ограничение ресурсов фильтрации
 FILTER_MAX_CONCURRENCY = 50
