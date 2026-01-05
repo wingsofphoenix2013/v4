@@ -1,4 +1,4 @@
-# packs_config/cache_manager.py — кеши/реестр ind_pack + init winners-cache (labels_v2) + reload rules on postproc_ready_v2 (winner-driven)
+# packs_config/cache_manager.py — кеши/реестр ind_pack + init winners-cache (labels_v2) + reload rules on postproc_ready_v2 (winner-driven) + signal direction masks
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from packs_config.db_loaders import (
     load_enabled_packs,
     load_static_bins_dict,
     load_winners_from_labels_v2,
+    load_signal_direction_masks,
 )
 from packs_config.models import PackRuntime, BinRule
 from packs_config.registry import build_pack_registry
@@ -39,6 +40,11 @@ adaptive_quantiles_cache: dict[tuple[int, int, int, str, str], list[BinRule]] = 
 # 🔸 Кеш победителей (winner-driven, из bt_analysis_bins_labels_v2)
 winners_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
 # key: (scenario_id, signal_id) -> {"run_id": int, "analysis_id": int, "winner_param": str|None, "timeframe": str|None}
+
+
+# 🔸 Кеш направлений сигналов (mono-direction): signal_id -> 'long'|'short'|...
+signal_direction_mask: dict[int, str] = {}
+signal_dir_lock = asyncio.Lock()
 
 
 # 🔸 Набор “интересующих” пар (берётся из bins_policy.pairs включённых pack-инстансов)
@@ -102,6 +108,29 @@ def get_winner_run_id(scenario_id: int, signal_id: int) -> int | None:
         return int(m.get("run_id"))
     except Exception:
         return None
+
+
+# 🔸 Helpers: signal directions
+def get_allowed_directions(signal_id: int) -> list[str]:
+    """
+    Возвращает список разрешённых направлений для signal_id на основе bt_signals_parameters.direction_mask.
+    По умолчанию (если неизвестно) — ['long','short'].
+    """
+    try:
+        dm = str(signal_direction_mask.get(int(signal_id), "") or "").strip().lower()
+    except Exception:
+        dm = ""
+
+    if dm == "long":
+        return ["long"]
+    if dm == "short":
+        return ["short"]
+
+    # на будущее: если когда-то появится мульти-маска
+    if dm in ("both", "all", "long,short", "short,long"):
+        return ["long", "short"]
+
+    return ["long", "short"]
 
 
 # 🔸 Helpers: active m5 trigger keys (winner-driven)
@@ -171,7 +200,7 @@ def get_adaptive_quantiles(analysis_id: int, scenario_id: int, signal_id: int, t
     return adaptive_quantiles_cache.get((int(analysis_id), int(scenario_id), int(signal_id), str(timeframe), str(direction)), [])
 
 
-# 🔸 Cache init: registry + configured_pairs + winners + rules (winner-driven)
+# 🔸 Cache init: registry + configured_pairs + signal directions + winners + rules (winner-driven)
 async def init_pack_runtime(pg: Any):
     global pack_registry, configured_pairs_set
 
@@ -193,6 +222,9 @@ async def init_pack_runtime(pg: Any):
     reloading_pairs_quantiles.clear()
     reloading_pairs_labels.clear()
 
+    async with signal_dir_lock:
+        signal_direction_mask.clear()
+
     # 1) загрузка pack-конфига и построение registry
     packs = await load_enabled_packs(pg)
     analysis_ids = sorted({int(p["analysis_id"]) for p in packs})
@@ -213,7 +245,6 @@ async def init_pack_runtime(pg: Any):
         all_runtimes.extend(lst)
 
     mtf_runtimes = 0
-    pairs_total = 0
 
     for rt in all_runtimes:
         if rt.is_mtf and rt.mtf_pairs:
@@ -222,8 +253,13 @@ async def init_pack_runtime(pg: Any):
                 configured_pairs_set.add((int(pair[0]), int(pair[1])))
 
     pairs_total = len(configured_pairs_set)
-
     log.info("PACK_INIT: mtf runtimes=%s, configured_pairs=%s", mtf_runtimes, pairs_total)
+
+    # 2.1) направления сигналов (direction_mask)
+    signal_ids = sorted({int(sig) for (_, sig) in configured_pairs_set})
+    dm = await load_signal_direction_masks(pg, signal_ids)
+    async with signal_dir_lock:
+        signal_direction_mask.update(dm)
 
     # 3) загрузка winners из labels_v2 (актуальный снимок)
     winners = await load_winners_from_labels_v2(pg, sorted(list(configured_pairs_set)))
@@ -270,12 +306,13 @@ async def init_pack_runtime(pg: Any):
 
     # итоговый лог старта
     log.info(
-        "PACK_INIT: winners cache ready — pairs=%s, found=%s, missing=%s; rules loaded — bins=%s, quantiles=%s",
+        "PACK_INIT: winners cache ready — pairs=%s, found=%s, missing=%s; rules loaded — bins=%s, quantiles=%s; signal_dirs=%s",
         pairs_total,
         winners_found,
         winners_missing,
         bins_rules_total,
         quant_rules_total,
+        len(signal_direction_mask),
     )
 
     # пересобираем активные m5-триггеры победителей
@@ -336,7 +373,7 @@ async def watch_postproc_ready(pg: Any, redis: Any):
                         quant_loaded += len(rules)
 
                 log.info(
-                    "PACK_WINNER: updated (scenario_id=%s, signal_id=%s, run_id=%s, winner_analysis_id=%s, winner_param=%s, bins_rules=%s, quant_rules=%s)",
+                    "PACK_WINNER: updated (scenario_id=%s, signal_id=%s, run_id=%s, winner_analysis_id=%s, winner_param=%s, bins_rules=%s, quantiles_rules=%s)",
                     scenario_id,
                     signal_id,
                     run_id,

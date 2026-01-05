@@ -1,4 +1,4 @@
-# indicator_pack.py — оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta + optional full trace
+# indicator_pack.py — оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta + optional full trace + mono-direction signals
 
 from __future__ import annotations
 
@@ -15,28 +15,29 @@ from packs_config.cache_manager import (
     POSTPROC_GROUP,
     POSTPROC_STREAM_KEY,
     caches_ready,
+    ensure_stream_group,
+    get_active_trigger_keys_m5,
+    get_adaptive_quantiles,
+    get_adaptive_rules,
+    get_allowed_directions,
+    get_winner_analysis_id,
+    get_winner_run_id,
+    init_pack_runtime,
     pack_registry,
     reloading_pairs_bins,
     reloading_pairs_labels,
     reloading_pairs_quantiles,
-    ensure_stream_group,
-    get_active_trigger_keys_m5,
-    get_adaptive_rules,
-    get_adaptive_quantiles,
-    get_winner_analysis_id,
-    get_winner_run_id,
-    init_pack_runtime,
     watch_postproc_ready,
 )
 
 # 🔸 Imports: packs_config (models + contract)
 from packs_config.models import PackRuntime
 from packs_config.contract import (
-    pack_ok,
-    pack_fail,
-    short_error_str,
     build_fail_details_base,
+    pack_fail,
+    pack_ok,
     parse_open_time_to_open_ts_ms,
+    short_error_str,
 )
 
 # 🔸 Imports: packs_config (redis ts helpers)
@@ -263,7 +264,7 @@ async def handle_mtf_runtime(
     published_ok = 0
     published_fail = 0
 
-    # helper: publish fail for winner pairs only
+    # helper: publish fail for winner pairs only (только разрешённые направления по signal_id)
     async def _publish_fail_for_winner_pairs(reason: str, details_extra: dict[str, Any], open_ts_for_details: int | None):
         nonlocal published_fail
 
@@ -279,7 +280,8 @@ async def handle_mtf_runtime(
 
             run_id = get_winner_run_id(int(scenario_id), int(signal_id))
 
-            for direction in ("long", "short"):
+            # ограничения направлений по direction_mask
+            for direction in get_allowed_directions(int(signal_id)):
                 details = build_fail_details_base(
                     analysis_id=int(rt.analysis_id),
                     symbol=str(symbol),
@@ -537,7 +539,7 @@ async def handle_mtf_runtime(
 
         values_by_tf["price"] = price_d
 
-    # for each winner pair and direction compute and publish
+    # for each winner pair compute and publish (только разрешённые направления по signal_id)
     for (scenario_id, signal_id) in rt.mtf_pairs:
         # winner gating
         if get_winner_analysis_id(int(scenario_id), int(signal_id)) != int(rt.analysis_id):
@@ -549,7 +551,7 @@ async def handle_mtf_runtime(
         # during reload — rules_not_loaded_yet (priority)
         pair_reloading = (pair_key in reloading_pairs_labels) or (pair_key in reloading_pairs_bins) or (pair_key in reloading_pairs_quantiles)
         if pair_reloading:
-            for direction in ("long", "short"):
+            for direction in get_allowed_directions(int(signal_id)):
                 details = build_fail_details_base(
                     analysis_id=int(rt.analysis_id),
                     symbol=str(symbol),
@@ -589,7 +591,7 @@ async def handle_mtf_runtime(
                 published_fail += 1
             continue
 
-        for direction in ("long", "short"):
+        for direction in get_allowed_directions(int(signal_id)):
             rules_by_tf: dict[str, list[Any]] = {}
 
             # static bins rules
@@ -951,7 +953,7 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
     published_ok = 0
     published_fail = 0
 
-    # status != ready → not_ready_retrying (winner pairs only)
+    # status != ready → not_ready_retrying (winner pairs only; только разрешённые направления)
     if status != "ready":
         for rt in runtimes:
             if not rt.is_mtf or not rt.mtf_pairs:
@@ -963,7 +965,7 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
 
                 run_id = get_winner_run_id(int(scenario_id), int(signal_id))
 
-                for direction in ("long", "short"):
+                for direction in get_allowed_directions(int(signal_id)):
                     details = build_fail_details_base(
                         int(rt.analysis_id),
                         str(symbol),
@@ -1106,7 +1108,7 @@ async def watch_indicator_stream(redis: Any):
 
 # 🔸 run worker
 async def run_indicator_pack(pg: Any, redis: Any):
-    # первичная загрузка (registry + winners + rules)
+    # первичная загрузка (registry + winners + rules + direction_mask)
     await init_pack_runtime(pg)
 
     # создать группы заранее

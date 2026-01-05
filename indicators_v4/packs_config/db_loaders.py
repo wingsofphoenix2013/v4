@@ -1,4 +1,4 @@
-# packs_config/db_loaders.py — загрузчики конфигурации ind_pack из PostgreSQL (packs/meta/params/rules + winners from labels_v2)
+# packs_config/db_loaders.py — загрузчики конфигурации ind_pack из PostgreSQL (packs/meta/params/rules + winners from labels_v2 + signal directions)
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ BINS_DICT_TABLE = "bt_analysis_bins_dict"
 ADAPTIVE_BINS_TABLE = "bt_analysis_bin_dict_adaptive"
 BINS_LABELS_TABLE = "bt_analysis_bins_labels_v2"
 RUNS_TABLE = "bt_signal_backfill_runs"
+SIGNALS_PARAMETERS_TABLE = "bt_signals_parameters"
 
 
 # 🔸 DB loaders: packs / analyzers / params / rules
@@ -235,6 +236,46 @@ async def load_winners_from_labels_v2(
         len(out),
         missing,
     )
+    return out
+
+
+# 🔸 DB loaders: signal direction masks (mono-direction signals)
+async def load_signal_direction_masks(pg: Any, signal_ids: list[int]) -> dict[int, str]:
+    """
+    Возвращает signal_id -> direction_mask ('long'|'short'|...).
+    Источник: bt_signals_parameters.param_name='direction_mask'
+    """
+    log = logging.getLogger("PACK_INIT")
+
+    # условия достаточности
+    if not signal_ids:
+        return {}
+
+    uniq_ids = sorted({int(x) for x in signal_ids})
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT signal_id, lower(param_value) AS direction_mask
+            FROM {SIGNALS_PARAMETERS_TABLE}
+            WHERE param_name = 'direction_mask'
+              AND signal_id = ANY($1::int[])
+            """,
+            uniq_ids,
+        )
+
+    out: dict[int, str] = {}
+    for r in rows:
+        try:
+            sid = int(r["signal_id"])
+            dm = str(r["direction_mask"] or "").strip().lower()
+            if dm:
+                out[sid] = dm
+        except Exception:
+            continue
+
+    missing = max(0, len(uniq_ids) - len(out))
+    log.info("PACK_INIT: signal directions loaded — signals=%s, found=%s, missing=%s", len(uniq_ids), len(out), missing)
     return out
 
 
