@@ -1,10 +1,12 @@
-# indicator_pack.py — оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta
+# indicator_pack.py — оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta + optional full trace
 
 from __future__ import annotations
 
 # 🔸 Базовые импорты
 import asyncio
+import json
 import logging
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -53,6 +55,9 @@ from packs_config.publish import publish_pair
 # 🔸 Imports: packs_config (bootstrap)
 from packs_config.bootstrap import bootstrap_current_state
 
+# 🔸 Константы / флаги трассировки
+PACK_TRACE_ENABLED = True  # включить/выключить запись полного трейса в payload_json (ok/fail)
+
 # 🔸 Константы Redis (индикаторы)
 INDICATOR_STREAM = "indicator_stream"          # входной стрим готовности индикаторов
 IND_PACK_GROUP = "ind_pack_group_v4"           # consumer-group для indicator_stream
@@ -68,6 +73,11 @@ MAX_CANDIDATES_IN_DETAILS = 5
 
 # 🔸 Константы Redis TS (feed_bb)
 BB_TS_PREFIX = "bb:ts"  # bb:ts:{symbol}:{tf}:{field}
+
+
+# 🔸 JSON helper (compact)
+def _json_dumps(obj: dict[str, Any]) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
 # 🔸 Publish meta helper (для записи в PG через ind_pack_stream_core)
@@ -86,7 +96,7 @@ def build_publish_meta(open_ts_ms: int | None, open_time: str | None, run_id: in
 def choose_candidate(candidates: Any) -> str | None:
     """
     Pack workers возвращают кандидатов в порядке приоритета.
-    Нельзя делать sort/min по строке: это ломает приоритеты (пример: 'M15_0' < 'M15_bin_0').
+    Нельзя делать sort/min по строке: это ломает приоритеты (пример: 'A_0' < 'A_bin_0').
     """
     if not candidates:
         return None
@@ -116,6 +126,126 @@ def choose_candidate(candidates: Any) -> str | None:
     return uniq[0] if uniq else None
 
 
+# 🔸 Trace helpers
+def _to_trace_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return str(v)
+    if isinstance(v, dict):
+        out: dict[str, Any] = {}
+        for k, vv in v.items():
+            out[str(k)] = _to_trace_value(vv)
+        return out
+    if isinstance(v, (list, tuple)):
+        return [_to_trace_value(x) for x in v]
+    return v
+
+
+def _parse_bin_idx(token: str, prefix: str) -> int | None:
+    try:
+        m = re.match(rf"^{re.escape(prefix)}(\d+)$", str(token).strip())
+        if not m:
+            return None
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _extract_bin_parts(bin_name: str) -> dict[str, Any]:
+    parts = [p.strip() for p in str(bin_name or "").split("|")]
+    out: dict[str, Any] = {
+        "bin_name": str(bin_name),
+        "h1": parts[0] if len(parts) > 0 else None,
+        "m15": parts[1] if len(parts) > 1 else None,
+        "m5": parts[2] if len(parts) > 2 else None,
+    }
+    out["h1_idx"] = _parse_bin_idx(out["h1"] or "", "H1_bin_")
+    out["m15_idx"] = _parse_bin_idx(out["m15"] or "", "M15_bin_")
+    # M5_Qk или M5_bin_k
+    if isinstance(out["m5"], str) and out["m5"].startswith("M5_Q"):
+        out["m5_q_idx"] = _parse_bin_idx(out["m5"].replace("M5_Q", "M5_bin_"), "M5_bin_")
+    else:
+        out["m5_q_idx"] = None
+    return out
+
+
+def _build_quantiles_group_debug(q_rules: list[Any], h1_idx: int | None, m15_idx: int | None) -> dict[str, Any] | None:
+    # условия достаточности
+    if not q_rules or h1_idx is None or m15_idx is None:
+        return None
+
+    group: list[dict[str, Any]] = []
+    for r in q_rules:
+        try:
+            bo = int(getattr(r, "bin_order"))
+        except Exception:
+            continue
+
+        if (bo // 100) != int(h1_idx):
+            continue
+        if ((bo % 100) // 10) != int(m15_idx):
+            continue
+
+        q_idx = int(bo % 10)
+        group.append(
+            {
+                "bin_order": bo,
+                "q_idx": q_idx,
+                "bin_name": getattr(r, "bin_name", None),
+                "val_from": str(getattr(r, "val_from", None)) if getattr(r, "val_from", None) is not None else None,
+                "val_to": str(getattr(r, "val_to", None)) if getattr(r, "val_to", None) is not None else None,
+                "to_inclusive": bool(getattr(r, "to_inclusive", False)),
+            }
+        )
+
+    if not group:
+        return {"h1_idx": int(h1_idx), "m15_idx": int(m15_idx), "rules": [], "rules_count": 0}
+
+    group.sort(key=lambda x: int(x.get("bin_order") or 0))
+    return {"h1_idx": int(h1_idx), "m15_idx": int(m15_idx), "rules": group, "rules_count": len(group)}
+
+
+def _build_trace_base(
+    rt: PackRuntime,
+    symbol: str,
+    trigger: dict[str, Any],
+    open_ts_ms: int | None,
+) -> dict[str, Any]:
+    return {
+        "analysis_id": int(rt.analysis_id) if getattr(rt, "analysis_id", None) is not None else None,
+        "analysis_key": str(getattr(rt, "analysis_key", "")),
+        "family_key": str(getattr(rt, "family_key", "")),
+        "symbol": str(symbol),
+        "timeframe": "mtf",
+        "open_time": trigger.get("open_time"),
+        "open_ts_ms": int(open_ts_ms) if open_ts_ms is not None else None,
+        "trigger": trigger,
+        "runtime": {
+            "mtf_component_tfs": list(getattr(rt, "mtf_component_tfs", []) or []),
+            "mtf_needs_price": bool(getattr(rt, "mtf_needs_price", False)),
+            "mtf_price_tf": str(getattr(rt, "mtf_price_tf", "m5")),
+            "mtf_price_field": str(getattr(rt, "mtf_price_field", "c")),
+            "mtf_bins_tf": str(getattr(rt, "mtf_bins_tf", "")),
+            "mtf_quantiles_key": str(getattr(rt, "mtf_quantiles_key", "")) if getattr(rt, "mtf_quantiles_key", None) else None,
+            "ttl_sec": int(getattr(rt, "ttl_sec", 0)) if getattr(rt, "ttl_sec", None) is not None else None,
+        },
+    }
+
+
+def _pack_ok_json(bin_name: str, trace: dict[str, Any] | None) -> str:
+    if not PACK_TRACE_ENABLED:
+        return pack_ok(bin_name)
+    obj = {"ok": True, "bin_name": str(bin_name), "debug": (trace or {})}
+    return _json_dumps(obj)
+
+
+def _pack_fail_json(reason: str, details: dict[str, Any], trace: dict[str, Any] | None) -> str:
+    if PACK_TRACE_ENABLED and isinstance(details, dict):
+        details["debug"] = trace or {}
+    return pack_fail(reason, details)
+
+
 # 🔸 Handle MTF runtime: publish only for winner pairs (scenario_id, signal_id) where winner_analysis_id == rt.analysis_id
 async def handle_mtf_runtime(
     redis: Any,
@@ -136,6 +266,11 @@ async def handle_mtf_runtime(
     # helper: publish fail for winner pairs only
     async def _publish_fail_for_winner_pairs(reason: str, details_extra: dict[str, Any], open_ts_for_details: int | None):
         nonlocal published_fail
+
+        # базовая трасса на fail (даже если чего-то не хватает)
+        trace_base = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+        trace_base["phase"] = "fail"
+        trace_base["reason"] = str(reason)
 
         for (scenario_id, signal_id) in rt.mtf_pairs:
             # winner gating
@@ -158,6 +293,11 @@ async def handle_mtf_runtime(
                 for k, v in (details_extra or {}).items():
                     details[k] = v
 
+                trace = dict(trace_base)
+                trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                trace["direction"] = str(direction)
+                trace["run_id"] = int(run_id) if run_id is not None else None
+
                 await publish_pair(
                     redis,
                     int(rt.analysis_id),
@@ -166,7 +306,7 @@ async def handle_mtf_runtime(
                     str(direction),
                     str(symbol),
                     "mtf",
-                    pack_fail(str(reason), details),
+                    _pack_fail_json(str(reason), details, trace),
                     int(rt.ttl_sec),
                     meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
                 )
@@ -230,9 +370,7 @@ async def handle_mtf_runtime(
             for name, param_name in spec.items():
                 pname = str(param_name or "").strip()
                 if not pname:
-                    tasks.append(
-                        asyncio.create_task(asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0})))
-                    )
+                    tasks.append(asyncio.create_task(asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0}))))
                     meta.append((str(tf), str(name), ""))
                     continue
 
@@ -251,6 +389,7 @@ async def handle_mtf_runtime(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     values_by_tf: dict[str, Any] = {}
+    components_trace: list[dict[str, Any]] = []
     missing_items: list[Any] = []
     invalid_items: list[Any] = []
     styk_m15 = False
@@ -260,6 +399,7 @@ async def handle_mtf_runtime(
     for (tf, name, param), r in zip(meta, results):
         if isinstance(r, Exception):
             missing_items.append({"tf": tf, "param": param or None, "error": short_error_str(r)})
+            components_trace.append({"tf": tf, "name": name, "param": param or None, "error": short_error_str(r)})
             continue
 
         # нормализуем формат return
@@ -285,6 +425,17 @@ async def handle_mtf_runtime(
             if str(tf) == "h1":
                 styk_h1 = True
         waited_total += int(meta_info.get("waited_sec") or 0)
+
+        components_trace.append(
+            {
+                "tf": str(tf),
+                "name": (str(name) if name is not None else None),
+                "param": (str(param) if param else None),
+                "raw": (str(raw_val) if raw_val is not None else None),
+                "value": (str(d_val) if isinstance(d_val, Decimal) else None),
+                "meta": meta_info,
+            }
+        )
 
         # значение отсутствует
         if d_val is None:
@@ -344,6 +495,7 @@ async def handle_mtf_runtime(
                 "input": invalid_items if invalid_items else None,
                 "styk": {"m15": bool(styk_m15), "h1": bool(styk_h1), "waited_sec": int(waited_total)},
                 "retry": {"recommended": True, "after_sec": int(MTF_RETRY_STEP_SEC)},
+                "trace_components": components_trace if PACK_TRACE_ENABLED else None,
             },
             int(open_ts_ms),
         )
@@ -360,24 +512,26 @@ async def handle_mtf_runtime(
             )
         return published_ok, published_fail
 
-    # price for *_mtf where needed (например lr_mtf)
+    # price for *_mtf where needed (например lr_mtf / bb_mtf)
+    price_raw: str | None = None
     if rt.mtf_needs_price:
         price_key = f"{BB_TS_PREFIX}:{symbol}:{rt.mtf_price_tf}:{rt.mtf_price_field}"
-        raw_price = await ts_get_value_at(redis, price_key, int(open_ts_ms))
-        price_d = safe_decimal(raw_price)
+        price_raw = await ts_get_value_at(redis, price_key, int(open_ts_ms))
+        price_d = safe_decimal(price_raw)
 
         if price_d is None:
             # missing/invalid price
-            reason = "missing_inputs" if raw_price is None else "invalid_input_value"
+            reason = "missing_inputs" if price_raw is None else "invalid_input_value"
             extra = {}
-            if raw_price is None:
+            if price_raw is None:
                 extra["missing"] = [{"tf": str(rt.mtf_price_tf), "field": str(rt.mtf_price_field), "source": "bb:ts", "open_ts_ms": int(open_ts_ms)}]
                 extra["retry"] = {"recommended": True, "after_sec": int(MTF_RETRY_STEP_SEC)}
             else:
                 extra["kind"] = "price_value"
-                extra["input"] = {"tf": str(rt.mtf_price_tf), "param": f"bb:{rt.mtf_price_field}", "raw": str(raw_price)}
+                extra["input"] = {"tf": str(rt.mtf_price_tf), "param": f"bb:{rt.mtf_price_field}", "raw": str(price_raw)}
                 extra["retry"] = {"recommended": False, "after_sec": int(MTF_RETRY_STEP_SEC)}
 
+            extra["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
             await _publish_fail_for_winner_pairs(reason, extra, int(open_ts_ms))
             return published_ok, published_fail
 
@@ -407,6 +561,19 @@ async def handle_mtf_runtime(
                 )
                 details["need"] = ["winner", "rules"]
                 details["retry"] = {"recommended": True, "after_sec": int(MTF_RETRY_STEP_SEC)}
+                details["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
+
+                trace = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+                trace["phase"] = "fail"
+                trace["reason"] = "rules_not_loaded_yet"
+                trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                trace["direction"] = str(direction)
+                trace["run_id"] = int(run_id) if run_id is not None else None
+                trace["styk"] = {"m15": bool(styk_m15), "h1": bool(styk_h1), "waited_sec": int(waited_total)}
+                trace["values_by_tf"] = _to_trace_value(values_by_tf)
+                trace["components"] = components_trace
+                trace["price_raw"] = str(price_raw) if price_raw is not None else None
+
                 await publish_pair(
                     redis,
                     int(rt.analysis_id),
@@ -415,7 +582,7 @@ async def handle_mtf_runtime(
                     str(direction),
                     str(symbol),
                     "mtf",
-                    pack_fail("rules_not_loaded_yet", details),
+                    _pack_fail_json("rules_not_loaded_yet", details, trace),
                     int(rt.ttl_sec),
                     meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                 )
@@ -429,8 +596,28 @@ async def handle_mtf_runtime(
             if str(rt.mtf_bins_tf) == "mtf":
                 rules_by_tf["mtf"] = (rt.mtf_bins_static.get("mtf", {}) or {}).get(direction, []) or []
                 if not rules_by_tf["mtf"]:
-                    details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
+                    details = build_fail_details_base(
+                        int(rt.analysis_id),
+                        str(symbol),
+                        str(direction),
+                        "mtf",
+                        {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                        trigger,
+                        int(open_ts_ms),
+                    )
                     details["expected"] = {"bin_type": "bins", "tf": "mtf", "source": "static"}
+                    details["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
+
+                    trace = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+                    trace["phase"] = "fail"
+                    trace["reason"] = "no_rules_static"
+                    trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                    trace["direction"] = str(direction)
+                    trace["run_id"] = int(run_id) if run_id is not None else None
+                    trace["values_by_tf"] = _to_trace_value(values_by_tf)
+                    trace["components"] = components_trace
+                    trace["rules_counts"] = {"mtf": len(rules_by_tf["mtf"])}
+
                     await publish_pair(
                         redis,
                         int(rt.analysis_id),
@@ -439,7 +626,7 @@ async def handle_mtf_runtime(
                         str(direction),
                         str(symbol),
                         "mtf",
-                        pack_fail("no_rules_static", details),
+                        _pack_fail_json("no_rules_static", details, trace),
                         int(rt.ttl_sec),
                         meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                     )
@@ -453,9 +640,30 @@ async def handle_mtf_runtime(
                     rules_by_tf[str(tf)] = rules
                     if not rules:
                         missing_rules_tfs.append(str(tf))
+
                 if missing_rules_tfs:
-                    details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
+                    details = build_fail_details_base(
+                        int(rt.analysis_id),
+                        str(symbol),
+                        str(direction),
+                        "mtf",
+                        {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                        trigger,
+                        int(open_ts_ms),
+                    )
                     details["expected"] = {"bin_type": "bins", "tf": missing_rules_tfs, "source": "static"}
+                    details["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
+
+                    trace = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+                    trace["phase"] = "fail"
+                    trace["reason"] = "no_rules_static"
+                    trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                    trace["direction"] = str(direction)
+                    trace["run_id"] = int(run_id) if run_id is not None else None
+                    trace["values_by_tf"] = _to_trace_value(values_by_tf)
+                    trace["components"] = components_trace
+                    trace["rules_counts"] = {k: len(v or []) for k, v in rules_by_tf.items()}
+
                     await publish_pair(
                         redis,
                         int(rt.analysis_id),
@@ -464,7 +672,7 @@ async def handle_mtf_runtime(
                         str(direction),
                         str(symbol),
                         "mtf",
-                        pack_fail("no_rules_static", details),
+                        _pack_fail_json("no_rules_static", details, trace),
                         int(rt.ttl_sec),
                         meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                     )
@@ -472,11 +680,33 @@ async def handle_mtf_runtime(
                     continue
 
             # quantiles rules (adaptive; winner-driven cache)
+            q_rules: list[Any] = []
             if rt.mtf_quantiles_key:
                 q_rules = get_adaptive_quantiles(int(rt.analysis_id), int(scenario_id), int(signal_id), "mtf", str(direction))
                 if not q_rules:
-                    details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
+                    details = build_fail_details_base(
+                        int(rt.analysis_id),
+                        str(symbol),
+                        str(direction),
+                        "mtf",
+                        {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                        trigger,
+                        int(open_ts_ms),
+                    )
                     details["expected"] = {"bin_type": "quantiles", "tf": "mtf", "source": "adaptive"}
+                    details["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
+
+                    trace = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+                    trace["phase"] = "fail"
+                    trace["reason"] = "no_quantiles_rules"
+                    trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                    trace["direction"] = str(direction)
+                    trace["run_id"] = int(run_id) if run_id is not None else None
+                    trace["values_by_tf"] = _to_trace_value(values_by_tf)
+                    trace["components"] = components_trace
+                    trace["rules_counts"] = {k: len(v or []) for k, v in rules_by_tf.items()}
+                    trace["quantiles_rules_count"] = 0
+
                     await publish_pair(
                         redis,
                         int(rt.analysis_id),
@@ -485,7 +715,7 @@ async def handle_mtf_runtime(
                         str(direction),
                         str(symbol),
                         "mtf",
-                        pack_fail("no_quantiles_rules", details),
+                        _pack_fail_json("no_quantiles_rules", details, trace),
                         int(rt.ttl_sec),
                         meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                     )
@@ -494,15 +724,36 @@ async def handle_mtf_runtime(
                 rules_by_tf[str(rt.mtf_quantiles_key)] = q_rules
 
             # candidates
+            candidates: Any = None
             try:
                 try:
                     candidates = rt.worker.bin_candidates(values_by_tf=values_by_tf, rules_by_tf=rules_by_tf, direction=str(direction))
                 except TypeError:
                     candidates = rt.worker.bin_candidates(values_by_tf=values_by_tf, rules_by_tf=rules_by_tf)
             except Exception as e:
-                details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
+                details = build_fail_details_base(
+                    int(rt.analysis_id),
+                    str(symbol),
+                    str(direction),
+                    "mtf",
+                    {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                    trigger,
+                    int(open_ts_ms),
+                )
                 details["where"] = "handle_mtf_runtime/bin_candidates"
                 details["error"] = short_error_str(e)
+                details["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
+
+                trace = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+                trace["phase"] = "fail"
+                trace["reason"] = "internal_error"
+                trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                trace["direction"] = str(direction)
+                trace["run_id"] = int(run_id) if run_id is not None else None
+                trace["values_by_tf"] = _to_trace_value(values_by_tf)
+                trace["components"] = components_trace
+                trace["error"] = short_error_str(e)
+
                 await publish_pair(
                     redis,
                     int(rt.analysis_id),
@@ -511,7 +762,7 @@ async def handle_mtf_runtime(
                     str(direction),
                     str(symbol),
                     "mtf",
-                    pack_fail("internal_error", details),
+                    _pack_fail_json("internal_error", details, trace),
                     int(rt.ttl_sec),
                     meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                 )
@@ -522,8 +773,28 @@ async def handle_mtf_runtime(
             chosen = choose_candidate(candidates)
 
             if not chosen:
-                details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))
+                details = build_fail_details_base(
+                    int(rt.analysis_id),
+                    str(symbol),
+                    str(direction),
+                    "mtf",
+                    {"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                    trigger,
+                    int(open_ts_ms),
+                )
                 details["candidates"] = [str(x) for x in list(candidates or [])[:MAX_CANDIDATES_IN_DETAILS]]
+                details["trace_components"] = components_trace if PACK_TRACE_ENABLED else None
+
+                trace = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+                trace["phase"] = "fail"
+                trace["reason"] = "no_candidates"
+                trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                trace["direction"] = str(direction)
+                trace["run_id"] = int(run_id) if run_id is not None else None
+                trace["values_by_tf"] = _to_trace_value(values_by_tf)
+                trace["components"] = components_trace
+                trace["candidates"] = [str(x) for x in list(candidates or [])]
+
                 await publish_pair(
                     redis,
                     int(rt.analysis_id),
@@ -532,12 +803,32 @@ async def handle_mtf_runtime(
                     str(direction),
                     str(symbol),
                     "mtf",
-                    pack_fail("no_candidates", details),
+                    _pack_fail_json("no_candidates", details, trace),
                     int(rt.ttl_sec),
                     meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
                 )
                 published_fail += 1
                 continue
+
+            # trace ok
+            trace_ok = _build_trace_base(rt, symbol, trigger, open_ts_ms)
+            trace_ok["phase"] = "ok"
+            trace_ok["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+            trace_ok["direction"] = str(direction)
+            trace_ok["run_id"] = int(run_id) if run_id is not None else None
+            trace_ok["values_by_tf"] = _to_trace_value(values_by_tf)
+            trace_ok["components"] = components_trace
+            trace_ok["styk"] = {"m15": bool(styk_m15), "h1": bool(styk_h1), "waited_sec": int(waited_total)}
+            trace_ok["price_raw"] = str(price_raw) if price_raw is not None else None
+            trace_ok["rules_counts"] = {k: len(v or []) for k, v in rules_by_tf.items()}
+            trace_ok["quantiles_rules_count"] = len(q_rules or [])
+            trace_ok["candidates"] = [str(x) for x in list(candidates or [])]
+            trace_ok["chosen"] = str(chosen)
+
+            parts = _extract_bin_parts(str(chosen))
+            trace_ok["chosen_parts"] = parts
+            if q_rules and parts.get("h1_idx") is not None and parts.get("m15_idx") is not None:
+                trace_ok["quantiles_group"] = _build_quantiles_group_debug(q_rules, int(parts["h1_idx"]), int(parts["m15_idx"]))
 
             await publish_pair(
                 redis,
@@ -547,7 +838,7 @@ async def handle_mtf_runtime(
                 str(direction),
                 str(symbol),
                 "mtf",
-                pack_ok(chosen),
+                _pack_ok_json(chosen, trace_ok),
                 int(rt.ttl_sec),
                 meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
             )
@@ -683,6 +974,14 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
                         open_ts_ms,
                     )
                     details["retry"] = {"recommended": True, "after_sec": 5}
+
+                    trace = _build_trace_base(rt, str(symbol), trigger, open_ts_ms)
+                    trace["phase"] = "fail"
+                    trace["reason"] = "not_ready_retrying"
+                    trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                    trace["direction"] = str(direction)
+                    trace["run_id"] = int(run_id) if run_id is not None else None
+
                     await publish_pair(
                         redis,
                         int(rt.analysis_id),
@@ -691,7 +990,7 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
                         str(direction),
                         str(symbol),
                         "mtf",
-                        pack_fail("not_ready_retrying", details),
+                        _pack_fail_json("not_ready_retrying", details, trace),
                         int(rt.ttl_sec),
                         meta=build_publish_meta(open_ts_ms, trigger.get("open_time"), run_id),
                     )
