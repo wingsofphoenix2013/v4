@@ -1,9 +1,10 @@
-# packs/rsi_mtf.py — pack-воркер: MTF RSI (h1+m15+m5) → кандидаты bin_name (full → M5_0 → tail)
+# packs/rsi_mtf.py — pack-воркер: MTF RSI (h1+m15+m5) → кандидаты bin_name (full → M5_0)
 
 # 🔸 Базовые импорты
 import logging
 from decimal import Decimal
 from typing import Any
+
 
 # 🔸 Вспомогательная функция: биннинг по правилам bt_analysis_bins_dict
 def _assign_bin(rules: list[Any], value: Decimal) -> str | None:
@@ -73,9 +74,8 @@ class RsiMtfPack:
         if not h_bin or not m15_bin or not m5_bin:
             return []
 
-        # full → схлопнуть m5 → схлопнуть m15+m5
+        # full → схлопнуть m5
         return [
             f"{h_bin}|{m15_bin}|{m5_bin}",
             f"{h_bin}|{m15_bin}|M5_0",
-            f"{h_bin}|M15_0|M5_0",
         ]

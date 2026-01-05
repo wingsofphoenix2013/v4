@@ -1,4 +1,4 @@
-# packs/mfi_mtf.py — pack-воркер: MTF MFI (h1+m15+m5) → кандидаты bin_name (full → M5_0 → tail)
+# packs/mfi_mtf.py — pack-воркер: MTF MFI (h1+m15+m5) → кандидаты bin_name (full → M5_0)
 
 # 🔸 Базовые импорты
 import logging
@@ -79,9 +79,8 @@ class MfiMtfPack:
         if not h_bin or not m15_bin or not m5_bin:
             return []
 
-        # full → схлопнуть m5 → схлопнуть m15+m5
+        # full → схлопнуть m5
         return [
             f"{h_bin}|{m15_bin}|{m5_bin}",
             f"{h_bin}|{m15_bin}|M5_0",
-            f"{h_bin}|M15_0|M5_0",
         ]

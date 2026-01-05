@@ -1,4 +1,4 @@
-# indicator_pack.py — ++ оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta
+# indicator_pack.py — оркестратор расчёта и публикации ind_pack (winner-driven): MTF only + кеш rules (adaptive) + static bins in runtime + PG meta
 
 from __future__ import annotations
 
@@ -82,6 +82,40 @@ def build_publish_meta(open_ts_ms: int | None, open_time: str | None, run_id: in
     return meta if meta else None
 
 
+# 🔸 Candidate chooser (preserve pack priority; avoid lexicographic sort)
+def choose_candidate(candidates: Any) -> str | None:
+    """
+    Pack workers возвращают кандидатов в порядке приоритета.
+    Нельзя делать sort/min по строке: это ломает приоритеты (пример: 'M15_0' < 'M15_bin_0').
+    """
+    if not candidates:
+        return None
+
+    # нормализуем в список строк
+    items: list[str] = []
+    try:
+        for x in candidates:
+            s = str(x).strip()
+            if s:
+                items.append(s)
+    except Exception:
+        return None
+
+    if not items:
+        return None
+
+    # dedupe, сохраняя порядок
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in items:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+
+    return uniq[0] if uniq else None
+
+
 # 🔸 Handle MTF runtime: publish only for winner pairs (scenario_id, signal_id) where winner_analysis_id == rt.analysis_id
 async def handle_mtf_runtime(
     redis: Any,
@@ -152,7 +186,11 @@ async def handle_mtf_runtime(
         return published_ok, published_fail
 
     # rules_not_loaded_yet: winners / rules cache not ready
-    if not caches_ready.get("winners", False) or not caches_ready.get("adaptive_bins", False) or (rt.mtf_quantiles_key and not caches_ready.get("quantiles", False)):
+    if (
+        not caches_ready.get("winners", False)
+        or not caches_ready.get("adaptive_bins", False)
+        or (rt.mtf_quantiles_key and not caches_ready.get("quantiles", False))
+    ):
         need: list[str] = []
         if not caches_ready.get("winners", False):
             need.append("winners")
@@ -181,7 +219,8 @@ async def handle_mtf_runtime(
             tasks.append(
                 asyncio.create_task(
                     get_mtf_value_decimal(redis, str(symbol), int(open_ts_ms), str(tf), pname)
-                    if pname else asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0}))
+                    if pname
+                    else asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0}))
                 )
             )
             meta.append((str(tf), None, pname))
@@ -191,7 +230,9 @@ async def handle_mtf_runtime(
             for name, param_name in spec.items():
                 pname = str(param_name or "").strip()
                 if not pname:
-                    tasks.append(asyncio.create_task(asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0}))))
+                    tasks.append(
+                        asyncio.create_task(asyncio.sleep(0, result=(None, None, {"styk": False, "waited_sec": 0})))
+                    )
                     meta.append((str(tf), str(name), ""))
                     continue
 
@@ -477,10 +518,8 @@ async def handle_mtf_runtime(
                 published_fail += 1
                 continue
 
-            # choose deterministically (labels больше не используются)
-            cand_list = [str(x) for x in list(candidates or [])]
-            cand_list.sort()
-            chosen = cand_list[0] if cand_list else None
+            # choose candidate in pack-defined priority order (do not lexicographically sort)
+            chosen = choose_candidate(candidates)
 
             if not chosen:
                 details = build_fail_details_base(int(rt.analysis_id), str(symbol), str(direction), "mtf", {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}, trigger, int(open_ts_ms))

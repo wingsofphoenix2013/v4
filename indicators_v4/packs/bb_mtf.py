@@ -244,7 +244,7 @@ class BbMtfPack:
             "quantiles_key": "quantiles",
         }
 
-    # 🔸 Вернуть список кандидатов bin_name (full → M5_0 → tail)
+    # 🔸 Вернуть список кандидатов bin_name (full → M5_0)
     def bin_candidates(self, values_by_tf: dict[str, Any], rules_by_tf: dict[str, list[Any]], direction: str) -> list[str]:
         # условия достаточности
         if not isinstance(values_by_tf, dict) or not isinstance(rules_by_tf, dict):
@@ -327,10 +327,8 @@ class BbMtfPack:
             return [
                 full,
                 f"{h1_bin}|{m15_bin}|M5_0",
-                f"{h1_bin}|M15_0|M5_0",
             ]
 
         return [
             f"{h1_bin}|{m15_bin}|M5_0",
-            f"{h1_bin}|M15_0|M5_0",
         ]
