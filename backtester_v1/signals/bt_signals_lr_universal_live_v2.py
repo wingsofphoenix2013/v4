@@ -1,5 +1,6 @@
 # bt_signals_lr_universal_live_v2.py — live-воркер LR universal bounce (raw) + v2-фильтрация (1/2 слоя AND) через ind_pack KV и bt_analysis_bins_labels_v2 кеш
 
+# 🔸 Базовые импорты
 import asyncio
 import json
 import logging
@@ -39,14 +40,17 @@ FILTER_STALE_MAX_SEC = 120
 # 🔸 Таймаут обработки одного кандидата фильтра (защита от зависаний воркера)
 FILTER_CANDIDATE_TIMEOUT_SEC = 120
 
-# 🔸 Ограничение ресурсов фильтрации
-FILTER_MAX_CONCURRENCY = 50
+# 🔸 Таймаут для одиночных Redis-вызовов внутри слоя (защита от зависаний await)
+REDIS_OP_TIMEOUT_SEC = 5
+
+# 🔸 Ограничения ресурсов фильтрации
 FILTER_QUEUE_MAXSIZE = 800
 FILTER_WORKERS = 20
 
 # 🔸 Таблицы
 BT_SIGNALS_VALUES_TABLE = "bt_signals_values"
 BT_SIGNALS_LIVE_TABLE = "bt_signals_live"
+
 
 # 🔸 Контракт ind_pack v1 (success/fail)
 #    {"ok": true, "bin_name": "..."}
@@ -70,7 +74,12 @@ def _parse_ind_pack_value(raw: Optional[str]) -> Dict[str, Any]:
     if ok is True:
         bn = obj.get("bin_name")
         if bn is None:
-            return {"state": "fail", "bin_name": None, "reason": "internal_error", "details": {"kind": "missing_bin_name"}}
+            return {
+                "state": "fail",
+                "bin_name": None,
+                "reason": "internal_error",
+                "details": {"kind": "missing_bin_name"},
+            }
         return {"state": "ok", "bin_name": str(bn), "reason": None, "details": None}
 
     if ok is False:
@@ -83,7 +92,12 @@ def _parse_ind_pack_value(raw: Optional[str]) -> Dict[str, Any]:
             "details": details if isinstance(details, dict) else {},
         }
 
-    return {"state": "fail", "bin_name": None, "reason": "internal_error", "details": {"kind": "invalid_payload_shape"}}
+    return {
+        "state": "fail",
+        "bin_name": None,
+        "reason": "internal_error",
+        "details": {"kind": "invalid_payload_shape"},
+    }
 
 
 # 🔸 Определение “permanent” причины (v2: каталог размечен; делаем эвристику)
@@ -323,7 +337,14 @@ async def _persist_live_signal(
 
 
 # 🔸 Сборка ind_pack ключа
-def _ind_pack_key(analysis_id: int, scenario_id: int, signal_id: int, direction: str, symbol: str, timeframe: str) -> str:
+def _ind_pack_key(
+    analysis_id: int,
+    scenario_id: int,
+    signal_id: int,
+    direction: str,
+    symbol: str,
+    timeframe: str,
+) -> str:
     return IND_PACK_PAIR_KEY.format(
         analysis_id=int(analysis_id),
         scenario_id=int(scenario_id),
@@ -526,19 +547,18 @@ async def init_lr_universal_live_v2(
 
     # фильтрация: очередь + воркеры
     filter_queue: asyncio.Queue = asyncio.Queue(maxsize=FILTER_QUEUE_MAXSIZE)
-    filter_sema = asyncio.Semaphore(FILTER_MAX_CONCURRENCY)
 
     filter_workers: List[asyncio.Task] = []
     for i in range(FILTER_WORKERS):
         task = asyncio.create_task(
-            _filter_worker_loop(pg, redis, filter_queue, filter_sema),
+            _filter_worker_loop(pg, redis, filter_queue),
             name=f"BT_LR_UNI_V2_FILTER_WORKER_{i}",
         )
         filter_workers.append(task)
 
     log.info(
         "BT_SIG_LR_UNI_LIVE_V2: init ok — signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, lr_instance_id=%s, indicator_base=%s, "
-        "filter_workers=%s, filter_queue_max=%s, filter_max_concurrency=%s",
+        "filter_workers=%s, filter_queue_max=%s, candidate_timeout_sec=%s",
         len(cfgs),
         raw_cnt,
         filt1_cnt,
@@ -548,7 +568,7 @@ async def init_lr_universal_live_v2(
         indicator_base,
         FILTER_WORKERS,
         FILTER_QUEUE_MAXSIZE,
-        FILTER_MAX_CONCURRENCY,
+        FILTER_CANDIDATE_TIMEOUT_SEC,
     )
 
     return {
@@ -575,6 +595,8 @@ async def init_lr_universal_live_v2(
             "dropped_overload": 0,
             "ignored_total": 0,
             "errors_total": 0,
+            "filter_timeout_total": 0,
+            "filter_error_total": 0,
         },
     }
 
@@ -720,14 +742,32 @@ async def handle_lr_universal_indicator_ready_v2(
     if missing:
         details = {**base_details, "result": {"passed": False, "status": "data_missing", "missing": missing}}
         for scfg in ctx.get("signals") or []:
-            await _upsert_live_log(pg, int(scfg["signal_id"]), symbol, timeframe, open_time, decision_time, "data_missing", {**details, "signal": scfg})
+            await _upsert_live_log(
+                pg,
+                int(scfg["signal_id"]),
+                symbol,
+                timeframe,
+                open_time,
+                decision_time,
+                "data_missing",
+                {**details, "signal": scfg},
+            )
         return []
 
     H = float(upper_prev) - float(lower_prev)
     if H <= 0:
         details = {**base_details, "result": {"passed": False, "status": "invalid_channel_height", "H": float(H)}}
         for scfg in ctx.get("signals") or []:
-            await _upsert_live_log(pg, int(scfg["signal_id"]), symbol, timeframe, open_time, decision_time, "invalid_channel_height", {**details, "signal": scfg})
+            await _upsert_live_log(
+                pg,
+                int(scfg["signal_id"]),
+                symbol,
+                timeframe,
+                open_time,
+                decision_time,
+                "invalid_channel_height",
+                {**details, "signal": scfg},
+            )
         return []
 
     # Один read → обработка всех инстансов (raw + filter1 + filter2)
@@ -856,7 +896,7 @@ async def handle_lr_universal_indicator_ready_v2(
 
 
 # 🔸 Воркер фильтрации: отдельные задачи, дедлайн (общий на слой), без блокировки indicator_stream
-async def _filter_worker_loop(pg, redis, queue: asyncio.Queue, sema: asyncio.Semaphore) -> None:
+async def _filter_worker_loop(pg, redis, queue: asyncio.Queue) -> None:
     while True:
         candidate = await queue.get()
 
@@ -875,12 +915,11 @@ async def _filter_worker_loop(pg, redis, queue: asyncio.Queue, sema: asyncio.Sem
         base_details = (candidate or {}).get("base_details") or {}
 
         try:
-            async with sema:
-                # таймаут нужен, чтобы зависшие await (Redis/PG) не оставляли filter_waiting навсегда
-                await asyncio.wait_for(
-                    _process_filter_candidate(pg, redis, candidate),
-                    timeout=FILTER_CANDIDATE_TIMEOUT_SEC,
-                )
+            # таймаут покрывает всю обработку кандидата (включая любые await внутри)
+            await asyncio.wait_for(
+                _process_filter_candidate(pg, redis, candidate),
+                timeout=FILTER_CANDIDATE_TIMEOUT_SEC,
+            )
 
         except asyncio.TimeoutError:
             # если обработка кандидата зависла — фиксируем финальный статус в bt_signals_live
@@ -1011,7 +1050,13 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             layers.append({"layer": 1, "scenario_id": int(mirror1["scenario_id"]), "signal_id": int(mirror1["signal_id"])})
         else:
             await _upsert_live_log(
-                pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_no_cache",
+                pg,
+                signal_id,
+                symbol,
+                timeframe,
+                open_time,
+                decision_time,
+                "blocked_no_cache",
                 {**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror1"}},
             )
             return
@@ -1021,7 +1066,13 @@ async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
             layers.append({"layer": 2, "scenario_id": int(mirror2["scenario_id"]), "signal_id": int(mirror2["signal_id"])})
         else:
             await _upsert_live_log(
-                pg, signal_id, symbol, timeframe, open_time, decision_time, "blocked_no_cache",
+                pg,
+                signal_id,
+                symbol,
+                timeframe,
+                open_time,
+                decision_time,
+                "blocked_no_cache",
                 {**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror2"}},
             )
             return
@@ -1154,11 +1205,17 @@ async def _wait_and_check_layer(
         # читаем пачкой все missing keys
         missing = [p for p in required_pairs if p not in found_bins]
         if missing:
-            keys = []
+            keys: List[str] = []
             for aid, tf in missing:
                 keys.append(_ind_pack_key(int(aid), ms, si, direction, symbol, str(tf)))
 
-            values = await redis.mget(keys)
+            # таймаут на Redis mget, чтобы await не мог зависнуть навсегда
+            try:
+                values = await asyncio.wait_for(redis.mget(keys), timeout=REDIS_OP_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                attempt += 1
+                await asyncio.sleep(FILTER_WAIT_STEP_SEC)
+                continue
 
             for (aid, tf), raw in zip(missing, values):
                 parsed = _parse_ind_pack_value(raw)
