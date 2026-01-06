@@ -513,7 +513,7 @@ async def handle_mtf_runtime(
         )
 
         if styk_m15 or styk_h1:
-            log.info(
+            log.debug(
                 "PACK_MTF: boundary wait → fail=%s (symbol=%s, analysis_id=%s, open_ts_ms=%s, styk_m15=%s, styk_h1=%s)",
                 published_fail,
                 symbol,
@@ -938,7 +938,7 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
             runtimes = filtered
 
             if before_n != len(runtimes):
-                log.info(
+                log.debug(
                     "PACK_SET: supertrend filter (symbol=%s, tf=%s, indicator=%s, series=%s) runtimes %s→%s",
                     symbol,
                     timeframe,
@@ -1157,7 +1157,7 @@ async def watch_indicator_stream(redis: Any):
                     total = 0
                     for p in timed_out:
                         total += await publish_mtf_timeout(redis, p)
-                    log.info("PACK_STREAM: mtf_ready timeouts handled=%s, published_fail=%s", len(timed_out), total)
+                    log.debug("PACK_STREAM: mtf_ready timeouts handled=%s, published_fail=%s", len(timed_out), total)
                 await asyncio.sleep(MTF_READY_POLL_SEC)
             except Exception as e:
                 log.error("PACK_STREAM: mtf_ready timeout loop error: %s", e, exc_info=True)

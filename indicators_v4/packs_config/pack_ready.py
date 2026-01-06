@@ -333,14 +333,14 @@ async def run_pack_ready(pg: Any, redis: Any):
 
     # ждём, пока pack runtime инициализируется (configured_pairs_set должен быть готов)
     while not caches_ready.get("registry", False) or not configured_pairs_set:
-        log.info("PACK_READY: waiting for pack runtime init (registry/pairs not ready yet)")
+        log.debug("PACK_READY: waiting for pack runtime init (registry/pairs not ready yet)")
         await asyncio.sleep(1.0)
 
     expected = _expected_tokens()
     expected_count = len(expected)
     expected_csv = ",".join(expected)
 
-    log.info("PACK_READY: started — expected_pairs=%s (%s)", expected_count, expected_csv)
+    log.debug("PACK_READY: started — expected_pairs=%s (%s)", expected_count, expected_csv)
 
     # создать группы заранее
     await ensure_stream_group(redis, IND_PACK_STREAM_CORE, READY_GROUP)
@@ -476,7 +476,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                                 await redis.delete(meta_key)
                                 await redis.delete(res_key)
                                 ready_emitted += 1
-                                log.info(
+                                log.debug(
                                     "PACK_READY: OK (symbol=%s, open_ts_ms=%s, open_time=%s, expected=%s, received=%s)",
                                     symbol,
                                     open_ts_ms,
@@ -552,7 +552,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                             # race: complete but not finalized yet
                             open_time_iso = await redis.hget(meta_key, "open_time")
                             if await _finalize_ok(pg, redis, symbol, open_ts_ms, expected_count, expected_count, expected_csv, str(open_time_iso) if open_time_iso else None):
-                                log.info(
+                                log.debug(
                                     "PACK_READY: OK (race) (symbol=%s, open_ts_ms=%s, open_time=%s)",
                                     symbol,
                                     open_ts_ms,
@@ -569,7 +569,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                         open_time_iso = await redis.hget(meta_key, "open_time")
                         if await _finalize_error(pg, redis, symbol, open_ts_ms, expected_count, received_count, str(open_time_iso) if open_time_iso else None):
                             errors_logged += 1
-                            log.info(
+                            log.debug(
                                 "PACK_READY: ERROR timeout (symbol=%s, open_ts_ms=%s, open_time=%s, expected=%s, received=%s)",
                                 symbol,
                                 open_ts_ms,

@@ -150,7 +150,7 @@ class MtfReadyGate:
                 self._pending.pop(pkey, None)
 
         if unlocked:
-            self.log.info(
+            self.log.debug(
                 "MTF_READY: unlocked pending=%s by ready tf=%s (symbol=%s, indicator=%s, open_ts_ms=%s)",
                 len(unlocked),
                 tf,
@@ -241,7 +241,7 @@ class MtfReadyGate:
                 self._pending.pop(pkey, None)
 
         if out:
-            self.log.info("MTF_READY: timeouts=%s (timeout_sec=%s)", len(out), self.timeout_sec)
+            self.log.debug("MTF_READY: timeouts=%s (timeout_sec=%s)", len(out), self.timeout_sec)
 
         # заодно чистим старые ready-отметки
         self._cleanup_ready(nowt)
