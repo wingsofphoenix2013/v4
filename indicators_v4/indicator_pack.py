@@ -941,6 +941,40 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
             if not runtimes:
                 return {"ok": 0, "fail": 0, "runtimes": 0}
 
+    # winner-driven filter: считаем только те runtimes, которые являются winner хотя бы по одной паре
+    before_winners = len(runtimes)
+    winner_runtimes: list[PackRuntime] = []
+
+    for rt in runtimes:
+        if not rt.is_mtf or not rt.mtf_pairs:
+            continue
+
+        is_winner = False
+        for (scenario_id, signal_id) in rt.mtf_pairs:
+            try:
+                if get_winner_analysis_id(int(scenario_id), int(signal_id)) == int(rt.analysis_id):
+                    is_winner = True
+                    break
+            except Exception:
+                continue
+
+        if is_winner:
+            winner_runtimes.append(rt)
+
+    runtimes = winner_runtimes
+    if before_winners != len(runtimes):
+        log.debug(
+            "PACK_SET: runtimes filtered by winners (symbol=%s, tf=%s, indicator=%s) %s→%s",
+            symbol,
+            timeframe,
+            indicator_key,
+            before_winners,
+            len(runtimes),
+        )
+
+    if not runtimes:
+        return {"ok": 0, "fail": 0, "runtimes": 0}
+
     open_ts_ms = parse_open_time_to_open_ts_ms(str(open_time) if open_time is not None else None)
 
     trigger = {
@@ -956,10 +990,7 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
     # status != ready → not_ready_retrying (winner pairs only; только разрешённые направления)
     if status != "ready":
         for rt in runtimes:
-            if not rt.is_mtf or not rt.mtf_pairs:
-                continue
-
-            for (scenario_id, signal_id) in rt.mtf_pairs:
+            for (scenario_id, signal_id) in rt.mtf_pairs or []:
                 if get_winner_analysis_id(int(scenario_id), int(signal_id)) != int(rt.analysis_id):
                     continue
 
@@ -1000,16 +1031,13 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
 
         return {"ok": published_ok, "fail": published_fail, "runtimes": len(runtimes)}
 
-    # ready: process runtimes
+    # ready: process runtimes (уже отфильтрованы до winners)
     for rt in runtimes:
-        if not rt.is_mtf:
-            continue
         ok_n, fail_n = await handle_mtf_runtime(redis, rt, str(symbol), trigger, open_ts_ms)
         published_ok += ok_n
         published_fail += fail_n
 
     return {"ok": published_ok, "fail": published_fail, "runtimes": len(runtimes)}
-
 
 # 🔸 Watch indicator_stream (parallel + фильтры m5/active triggers)
 async def watch_indicator_stream(redis: Any):
