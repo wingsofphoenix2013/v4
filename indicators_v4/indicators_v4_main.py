@@ -16,6 +16,7 @@ from indicators.compute_and_store import compute_and_store, compute_snapshot_val
 from cleanup_worker import run_indicators_cleanup
 from indicator_pack import run_indicator_pack
 from packs_config.pack_io import run_pack_io
+from packs_config.pack_ready import run_pack_ready
 
 # 🔸 Глобальные переменные
 active_tickers = {}         # symbol -> precision_price
@@ -428,6 +429,7 @@ async def main():
         run_safe_loop(lambda: run_indicators_cleanup(pg, redis), "IND_CLEANUP"),
         run_safe_loop(lambda: run_indicator_pack(pg, redis), "IND_PACK"),
         run_safe_loop(lambda: run_pack_io(pg, redis), "PACK_IO"),
+        run_safe_loop(lambda: run_pack_ready(pg, redis), "PACK_READY"),
     )
 
 
