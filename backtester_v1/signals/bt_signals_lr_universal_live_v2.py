@@ -1,4 +1,4 @@
-# bt_signals_lr_universal_live_v2.py — live-воркер LR universal bounce (raw) + v2-фильтрация (1/2 слоя AND) через ind_pack KV и bt_analysis_bins_labels_v2 кеш
+# bt_signals_lr_universal_live_v2.py — live-воркер LR universal bounce: RAW от indicator_stream + FILTER(1/2) от ind_pack_stream_ready (results_json), без ожиданий ind_pack KV
 
 # 🔸 Базовые импорты
 import asyncio
@@ -20,103 +20,26 @@ from bt_signals_cache_config_v2 import (
 
 log = logging.getLogger("BT_SIG_LR_UNI_LIVE_V2")
 
+# 🔸 Stream keys (в live_stream_key инстанса)
+INDICATOR_STREAM_KEY = "indicator_stream"
+IND_PACK_READY_STREAM_KEY = "ind_pack_stream_ready"
+
 # 🔸 RedisTimeSeries ключи
 BB_TS_CLOSE_KEY = "bb:ts:{symbol}:{tf}:c"
 IND_TS_KEY = "ts_ind:{symbol}:{tf}:{param_name}"
 
-# 🔸 Redis KV ключи ind_pack (winner-driven pair key)
-IND_PACK_PAIR_KEY = "ind_pack:{analysis_id}:{scenario_id}:{signal_id}:{direction}:{symbol}:{timeframe}"
-
 # 🔸 Таймшаги TF (в минутах)
 TF_STEP_MINUTES = {"m5": 5}
-
-# 🔸 Ожидание ind_pack (общий дедлайн на слой)
-FILTER_WAIT_TOTAL_SEC = 90
-FILTER_WAIT_STEP_SEC = 3
 
 # 🔸 Защита от “догоняющих” событий
 FILTER_STALE_MAX_SEC = 120
 
-# 🔸 Таймаут обработки одного кандидата фильтра (защита от зависаний воркера)
-FILTER_CANDIDATE_TIMEOUT_SEC = 120
-
-# 🔸 Таймаут для одиночных Redis-вызовов внутри слоя (защита от зависаний await)
+# 🔸 Таймаут для одиночных Redis-вызовов (защита от зависаний await)
 REDIS_OP_TIMEOUT_SEC = 5
-
-# 🔸 Ограничения ресурсов фильтрации
-FILTER_QUEUE_MAXSIZE = 800
-FILTER_WORKERS = 20
 
 # 🔸 Таблицы
 BT_SIGNALS_VALUES_TABLE = "bt_signals_values"
 BT_SIGNALS_LIVE_TABLE = "bt_signals_live"
-
-
-# 🔸 Контракт ind_pack v1 (success/fail)
-#    {"ok": true, "bin_name": "..."}
-#    {"ok": false, "reason": "...", "details": {...}}
-def _parse_ind_pack_value(raw: Optional[str]) -> Dict[str, Any]:
-    if raw is None:
-        return {"state": "absent", "bin_name": None, "reason": None, "details": None}
-
-    s = str(raw)
-    try:
-        obj = json.loads(s)
-    except Exception:
-        return {
-            "state": "fail",
-            "bin_name": None,
-            "reason": "invalid_input_value",
-            "details": {"kind": "invalid_json", "raw": s[:500]},
-        }
-
-    ok = obj.get("ok")
-    if ok is True:
-        bn = obj.get("bin_name")
-        if bn is None:
-            return {
-                "state": "fail",
-                "bin_name": None,
-                "reason": "internal_error",
-                "details": {"kind": "missing_bin_name"},
-            }
-        return {"state": "ok", "bin_name": str(bn), "reason": None, "details": None}
-
-    if ok is False:
-        reason = obj.get("reason")
-        details = obj.get("details")
-        return {
-            "state": "fail",
-            "bin_name": None,
-            "reason": str(reason) if reason is not None else "internal_error",
-            "details": details if isinstance(details, dict) else {},
-        }
-
-    return {
-        "state": "fail",
-        "bin_name": None,
-        "reason": "internal_error",
-        "details": {"kind": "invalid_payload_shape"},
-    }
-
-
-# 🔸 Определение “permanent” причины (v2: каталог размечен; делаем эвристику)
-def _is_permanent_reason(reason: Optional[str], details: Optional[Dict[str, Any]]) -> bool:
-    r = str(reason or "").strip().lower()
-    d = details if isinstance(details, dict) else {}
-
-    # флаг из внешнего модуля (если есть)
-    if d.get("permanent") is True:
-        return True
-
-    # эвристики по имени причины
-    if r.startswith("permanent_") or r.startswith("perm_"):
-        return True
-    if "permanent" in r:
-        return True
-
-    # не распознали -> считаем transient (ждём)
-    return False
 
 
 # 🔸 Парсинг open_time ISO (UTC-naive)
@@ -124,6 +47,14 @@ def _parse_open_time_iso(open_time_iso: str) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(open_time_iso)
         return dt.replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+# 🔸 open_ts_ms -> naive UTC datetime
+def _from_ms_utc(ms: int) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc).replace(tzinfo=None)
     except Exception:
         return None
 
@@ -336,26 +267,7 @@ async def _persist_live_signal(
     return inserted
 
 
-# 🔸 Сборка ind_pack ключа
-def _ind_pack_key(
-    analysis_id: int,
-    scenario_id: int,
-    signal_id: int,
-    direction: str,
-    symbol: str,
-    timeframe: str,
-) -> str:
-    return IND_PACK_PAIR_KEY.format(
-        analysis_id=int(analysis_id),
-        scenario_id=int(scenario_id),
-        signal_id=int(signal_id),
-        direction=str(direction),
-        symbol=str(symbol),
-        timeframe=str(timeframe),
-    )
-
-
-# 🔸 Структура слоя фильтра
+# 🔸 Получение слоя фильтра из кеша v2 (mirror -> required_pairs/good_bins_map/run_id)
 def _build_filter_layer_from_cache(
     mirror_scenario_id: int,
     mirror_signal_id: int,
@@ -368,18 +280,160 @@ def _build_filter_layer_from_cache(
     if not req or not good_map:
         return None
 
-    # в winner-driven режиме обычно одна пара (analysis_id, timeframe)
     return {
         "mirror_scenario_id": int(mirror_scenario_id),
         "mirror_signal_id": int(mirror_signal_id),
-        "direction": str(direction),
+        "direction": str(direction).strip().lower(),
         "applied_run_id": int(run_id) if run_id is not None else None,
         "required_pairs": set(req),
         "good_bins_map": {k: set(v) for k, v in good_map.items()},
     }
 
 
-# 🔸 Инициализация live-контекста (один ctx на key=lr_universal_v2)
+# 🔸 Парсер results_json из ind_pack_stream_ready (v4)
+def _parse_results_json(raw: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    if raw is None:
+        return {}
+    s = str(raw).strip()
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in obj.items():
+        if not isinstance(k, str):
+            continue
+        if not isinstance(v, dict):
+            continue
+        out[k.strip()] = v
+    return out
+
+
+# 🔸 Проверка слоя фильтра по готовому results_json (без ожиданий)
+def _check_layer_by_pack_results(
+    layer_cache: Dict[str, Any],
+    results_by_pair: Dict[str, Dict[str, Any]],
+    pack_timeframe: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    ms = int(layer_cache["mirror_scenario_id"])
+    si = int(layer_cache["mirror_signal_id"])
+    direction = str(layer_cache["direction"])
+    applied_run_id = layer_cache.get("applied_run_id")
+
+    pair_key = f"{si}:{ms}"
+    rec = results_by_pair.get(pair_key)
+
+    # условий достаточности
+    if not rec:
+        return False, {
+            "status": "blocked_pack_pair_missing",
+            "rule": "pack_pair_missing",
+            "pair_key": pair_key,
+            "mirror": {"scenario_id": ms, "signal_id": si},
+            "applied_run_id": applied_run_id,
+        }
+
+    ok = rec.get("ok")
+    analysis_id = rec.get("analysis_id")
+    run_id = rec.get("run_id")
+
+    # ok=false -> блокируем сразу
+    if ok is not True:
+        reason = rec.get("reason")
+        return False, {
+            "status": "blocked_pack_fail",
+            "rule": "pack_result_fail",
+            "pair_key": pair_key,
+            "mirror": {"scenario_id": ms, "signal_id": si},
+            "pack_result": {
+                "ok": bool(ok) if isinstance(ok, bool) else None,
+                "reason": str(reason) if reason is not None else None,
+                "analysis_id": analysis_id,
+                "run_id": run_id,
+            },
+            "applied_run_id": applied_run_id,
+        }
+
+    bin_name = rec.get("bin_name")
+    if bin_name is None or str(bin_name).strip() == "":
+        return False, {
+            "status": "blocked_pack_fail",
+            "rule": "pack_missing_bin_name",
+            "pair_key": pair_key,
+            "mirror": {"scenario_id": ms, "signal_id": si},
+            "pack_result": {"ok": True, "analysis_id": analysis_id, "run_id": run_id},
+            "applied_run_id": applied_run_id,
+        }
+
+    bn = str(bin_name).strip()
+
+    # good-hit: хотя бы одно совпадение по required_pairs
+    required_pairs: Set[Tuple[int, str]] = set(layer_cache.get("required_pairs") or set())
+    good_bins_map: Dict[Tuple[int, str], Set[str]] = layer_cache.get("good_bins_map") or {}
+
+    try:
+        aid_i = int(analysis_id) if analysis_id is not None else None
+    except Exception:
+        aid_i = None
+
+    candidate_pairs: List[Tuple[int, str]] = []
+    for (aid, tf) in required_pairs:
+        if str(tf).strip().lower() != str(pack_timeframe).strip().lower():
+            continue
+        if aid_i is None or int(aid) == int(aid_i):
+            candidate_pairs.append((int(aid), str(tf).strip().lower()))
+
+    # если required_pairs пустой или не сошёлся по времени/analysis_id — считаем, что good-hit невозможен
+    if not candidate_pairs:
+        return False, {
+            "status": "blocked_no_labels_match",
+            "rule": "no_required_pairs_match",
+            "pair_key": pair_key,
+            "mirror": {"scenario_id": ms, "signal_id": si},
+            "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
+            "applied_run_id": applied_run_id,
+            "required_pairs_total": len(required_pairs),
+        }
+
+    good_hit = False
+    checked_pairs: List[Dict[str, Any]] = []
+
+    for (aid, tf) in candidate_pairs:
+        good_set = good_bins_map.get((aid, tf)) or set()
+        hit = bn in good_set
+        checked_pairs.append(
+            {"analysis_id": int(aid), "timeframe": str(tf), "hit": bool(hit), "good_bins_count": len(good_set)}
+        )
+        if hit:
+            good_hit = True
+
+    if not good_hit:
+        return False, {
+            "status": "blocked_no_labels_match",
+            "rule": "no_good_match",
+            "pair_key": pair_key,
+            "mirror": {"scenario_id": ms, "signal_id": si},
+            "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
+            "applied_run_id": applied_run_id,
+            "checked_pairs": checked_pairs,
+        }
+
+    return True, {
+        "status": "ok",
+        "rule": "good_match",
+        "pair_key": pair_key,
+        "mirror": {"scenario_id": ms, "signal_id": si},
+        "applied_run_id": applied_run_id,
+        "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
+        "checked_pairs": checked_pairs,
+    }
+
+
+# 🔸 Инициализация live-контекста (ctx на key=lr_universal_v2 + stream group)
 async def init_lr_universal_live_v2(
     signals: List[Dict[str, Any]],
     pg,
@@ -388,13 +442,11 @@ async def init_lr_universal_live_v2(
     if not signals:
         raise RuntimeError("init_lr_universal_live_v2: empty signals list")
 
-    # стартовая загрузка кешей (вдруг watcher ещё не успел)
-    await load_initial_mirror_caches_v2(pg)
-
     cfgs: List[Dict[str, Any]] = []
 
     timeframe = None
     lr_instance_id = None
+    stream_key = None
 
     raw_cnt = 0
     filt1_cnt = 0
@@ -404,6 +456,12 @@ async def init_lr_universal_live_v2(
         sid = int(s.get("id") or 0)
         tf = str(s.get("timeframe") or "").strip().lower()
         params = s.get("params") or {}
+
+        # live_stream_key (одинаковый для группы)
+        lsk_cfg = params.get("live_stream_key") or params.get("stream_key")
+        lsk = str((lsk_cfg or {}).get("value") or "").strip()
+        if stream_key is None:
+            stream_key = lsk
 
         # indicator (LR instance_id)
         try:
@@ -519,6 +577,14 @@ async def init_lr_universal_live_v2(
         if c["lr_instance_id"] != lr_instance_id:
             raise RuntimeError("init_lr_universal_live_v2: mixed lr_instance_id in signals")
 
+    stream_key = str(stream_key or "").strip()
+    if stream_key not in (INDICATOR_STREAM_KEY, IND_PACK_READY_STREAM_KEY):
+        raise RuntimeError(f"init_lr_universal_live_v2: unsupported live_stream_key='{stream_key}'")
+
+    # initial load caches только если поток фильтров
+    if stream_key == IND_PACK_READY_STREAM_KEY:
+        await load_initial_mirror_caches_v2(pg)
+
     # indicator naming: base = f"{indicator}{length}" (как в indicators_v4)
     ind_inst = get_indicator_instance(int(lr_instance_id))
     if not ind_inst:
@@ -545,20 +611,9 @@ async def init_lr_universal_live_v2(
     if step_min <= 0:
         raise RuntimeError(f"init_lr_universal_live_v2: unknown timeframe step for tf={timeframe}")
 
-    # фильтрация: очередь + воркеры
-    filter_queue: asyncio.Queue = asyncio.Queue(maxsize=FILTER_QUEUE_MAXSIZE)
-
-    filter_workers: List[asyncio.Task] = []
-    for i in range(FILTER_WORKERS):
-        task = asyncio.create_task(
-            _filter_worker_loop(pg, redis, filter_queue),
-            name=f"BT_LR_UNI_V2_FILTER_WORKER_{i}",
-        )
-        filter_workers.append(task)
-
     log.info(
-        "BT_SIG_LR_UNI_LIVE_V2: init ok — signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, lr_instance_id=%s, indicator_base=%s, "
-        "filter_workers=%s, filter_queue_max=%s, candidate_timeout_sec=%s",
+        "BT_SIG_LR_UNI_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, lr_instance_id=%s, indicator_base=%s",
+        stream_key,
         len(cfgs),
         raw_cnt,
         filt1_cnt,
@@ -566,12 +621,10 @@ async def init_lr_universal_live_v2(
         timeframe,
         lr_instance_id,
         indicator_base,
-        FILTER_WORKERS,
-        FILTER_QUEUE_MAXSIZE,
-        FILTER_CANDIDATE_TIMEOUT_SEC,
     )
 
     return {
+        "stream_key": stream_key,
         "timeframe": timeframe,
         "step_delta": timedelta(minutes=step_min),
         "lr_instance_id": int(lr_instance_id),
@@ -581,34 +634,48 @@ async def init_lr_universal_live_v2(
         "param_lower": param_lower,
         "param_center": param_center,
         "signals": cfgs,
-        "filter_queue": filter_queue,
-        "filter_workers": filter_workers,
         "counters": {
             "messages_total": 0,
+            "ignored_total": 0,
+            "dropped_stale": 0,
+            "errors_total": 0,
             "raw_sent_total": 0,
             "filtered_sent_total": 0,
-            "blocked_no_cache": 0,
-            "blocked_timeout": 0,
-            "blocked_no_good": 0,
-            "blocked_not_good": 0,
-            "dropped_stale": 0,
-            "dropped_overload": 0,
-            "ignored_total": 0,
-            "errors_total": 0,
-            "filter_timeout_total": 0,
-            "filter_error_total": 0,
         },
     }
 
 
-# 🔸 Обработка одного ready-сообщения из indicator_stream (быстро, без ожиданий)
+# 🔸 Единый обработчик live-сообщений для key=lr_universal_v2 (ветвление по stream_key ctx)
 async def handle_lr_universal_indicator_ready_v2(
     ctx: Dict[str, Any],
     fields: Dict[str, str],
     pg,
     redis,
 ) -> List[Dict[str, Any]]:
-    # live dispatcher ожидает список, но мы пишем всё сами (в БД и live-лог), поэтому возвращаем []
+    # live dispatcher ожидает список, но мы пишем всё сами (в БД и signals_stream), поэтому возвращаем []
+    ctx["counters"]["messages_total"] = int(ctx["counters"].get("messages_total", 0)) + 1
+
+    stream_key = str(ctx.get("stream_key") or "").strip()
+
+    if stream_key == INDICATOR_STREAM_KEY:
+        await _handle_indicator_ready_message(ctx, fields, pg, redis)
+        return []
+
+    if stream_key == IND_PACK_READY_STREAM_KEY:
+        await _handle_pack_ready_message(ctx, fields, pg, redis)
+        return []
+
+    ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
+    return []
+
+
+# 🔸 Обработка indicator_stream (RAW): поиск bounce и немедленная отправка
+async def _handle_indicator_ready_message(
+    ctx: Dict[str, Any],
+    fields: Dict[str, str],
+    pg,
+    redis,
+) -> None:
     tf_expected = str(ctx.get("timeframe") or "m5")
     base_expected = str(ctx.get("indicator_base") or "")
 
@@ -618,22 +685,20 @@ async def handle_lr_universal_indicator_ready_v2(
     open_time_iso = (fields.get("open_time") or "").strip()
     status = (fields.get("status") or "").strip().lower()
 
-    ctx["counters"]["messages_total"] = int(ctx["counters"].get("messages_total", 0)) + 1
-
     # условия достаточности
     if not symbol or not open_time_iso or not timeframe:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        return []
+        return
 
     open_time = _parse_open_time_iso(open_time_iso)
     if open_time is None:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        return []
+        return
 
     # жёсткая фильтрация входного события
     if status != "ready" or timeframe != tf_expected or indicator_base != base_expected:
         ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
-        return []
+        return
 
     step_delta: timedelta = ctx["step_delta"]
     prev_time = open_time - step_delta
@@ -643,13 +708,13 @@ async def handle_lr_universal_indicator_ready_v2(
     now_utc = datetime.utcnow().replace(tzinfo=None)
     if (now_utc - decision_time).total_seconds() > FILTER_STALE_MAX_SEC:
         ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
-        return []
+        return
 
+    # читаем OHLCV close и LR-канал из Redis TS по prev/curr
     ts_ms = _to_ms_utc(open_time)
     prev_ms = _to_ms_utc(prev_time)
     decision_ms = _to_ms_utc(decision_time)
 
-    # читаем OHLCV close и LR-канал из Redis TS по prev/curr
     close_key = BB_TS_CLOSE_KEY.format(symbol=symbol, tf=tf_expected)
 
     angle_name = str(ctx["param_angle"])
@@ -673,17 +738,17 @@ async def handle_lr_universal_indicator_ready_v2(
     pipe.execute_command("TS.RANGE", lower_key, ts_ms, ts_ms)       # lower_curr (details)
 
     try:
-        res = await pipe.execute()
+        res = await asyncio.wait_for(pipe.execute(), timeout=REDIS_OP_TIMEOUT_SEC)
     except Exception as e:
         ctx["counters"]["errors_total"] = int(ctx["counters"].get("errors_total", 0)) + 1
         log.error(
-            "BT_SIG_LR_UNI_LIVE_V2: redis pipeline error — symbol=%s, open_time=%s, err=%s",
+            "BT_SIG_LR_UNI_LIVE_V2: redis pipeline error (indicator_stream) — symbol=%s, open_time=%s, err=%s",
             symbol,
             open_time_iso,
             e,
             exc_info=True,
         )
-        return []
+        return
 
     close_prev = _extract_ts_value(res[0])
     close_curr = _extract_ts_value(res[1])
@@ -716,6 +781,7 @@ async def handle_lr_universal_indicator_ready_v2(
         precision_price = 8
 
     base_details = {
+        "source_stream": INDICATOR_STREAM_KEY,
         "event": {"status": status, "symbol": symbol, "indicator": indicator_base, "open_time": open_time_iso, "timeframe": timeframe},
         "ts": {
             "ts_ms": ts_ms,
@@ -742,6 +808,9 @@ async def handle_lr_universal_indicator_ready_v2(
     if missing:
         details = {**base_details, "result": {"passed": False, "status": "data_missing", "missing": missing}}
         for scfg in ctx.get("signals") or []:
+            # raw-only: если сюда попал filter инстанс, игнорируем
+            if str(scfg.get("filter_mode") or "") != "raw":
+                continue
             await _upsert_live_log(
                 pg,
                 int(scfg["signal_id"]),
@@ -752,12 +821,14 @@ async def handle_lr_universal_indicator_ready_v2(
                 "data_missing",
                 {**details, "signal": scfg},
             )
-        return []
+        return
 
     H = float(upper_prev) - float(lower_prev)
     if H <= 0:
         details = {**base_details, "result": {"passed": False, "status": "invalid_channel_height", "H": float(H)}}
         for scfg in ctx.get("signals") or []:
+            if str(scfg.get("filter_mode") or "") != "raw":
+                continue
             await _upsert_live_log(
                 pg,
                 int(scfg["signal_id"]),
@@ -768,17 +839,20 @@ async def handle_lr_universal_indicator_ready_v2(
                 "invalid_channel_height",
                 {**details, "signal": scfg},
             )
-        return []
+        return
 
-    # Один read → обработка всех инстансов (raw + filter1 + filter2)
+    # Один read → обработка всех RAW инстансов
     for scfg in ctx.get("signals") or []:
+        filter_mode = str(scfg.get("filter_mode") or "raw")
+        if filter_mode != "raw":
+            continue
+
         signal_id = int(scfg["signal_id"])
         direction = str(scfg["direction"])
         message = str(scfg["message"])
         trend_type = str(scfg["trend_type"])
         zone_k = float(scfg["zone_k"])
         keep_half = bool(scfg["keep_half"])
-        filter_mode = str(scfg.get("filter_mode") or "raw")
 
         passed, eval_status, eval_extra = _evaluate_lr_bounce(
             direction=direction,
@@ -805,468 +879,436 @@ async def handle_lr_universal_indicator_ready_v2(
                 status=eval_status,
                 details={
                     **base_details,
-                    "signal": {"signal_id": signal_id, "direction": direction, "message": message, "trend_type": trend_type, "zone_k": zone_k, "keep_half": keep_half, "filter_mode": filter_mode},
+                    "signal": {"signal_id": signal_id, "direction": direction, "message": message, "trend_type": trend_type, "zone_k": zone_k, "keep_half": keep_half, "filter_mode": "raw"},
                     "result": {"passed": False, "status": eval_status, "extra": eval_extra},
                 },
             )
             continue
 
-        # bounce прошёл
-        if filter_mode == "raw":
-            details = {
-                **base_details,
-                "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": "raw"},
-                "result": {"passed": True, "status": "signal_sent"},
-            }
-            should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "signal_sent", details)
-            if should_send:
-                raw_message = {
-                    "signal_id": signal_id,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "open_time": open_time.isoformat(),
-                    "decision_time": decision_time.isoformat(),
-                    "direction": direction,
-                    "message": message,
-                    "source": "backtester_v1",
-                    "mode": "live_raw_v2",
-                }
-                await _persist_live_signal(pg, redis, signal_id, symbol, timeframe, direction, open_time, decision_time, message, raw_message)
-                ctx["counters"]["raw_sent_total"] = int(ctx["counters"].get("raw_sent_total", 0)) + 1
-                log.info(
-                    "BT_SIG_LR_UNI_LIVE_V2: signal_sent RAW — signal_id=%s %s %s %s",
-                    signal_id,
-                    symbol,
-                    direction,
-                    open_time.isoformat(),
-                )
+        details = {
+            **base_details,
+            "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": "raw"},
+            "result": {"passed": True, "status": "signal_sent"},
+        }
+
+        should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "signal_sent", details)
+        if not should_send:
             continue
 
-        # filter1 / filter2 — enqueue на фильтрацию (не блокируем indicator_stream)
-        q: asyncio.Queue = ctx["filter_queue"]
-        try:
-            q.put_nowait(
-                {
-                    "signal_id": signal_id,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "direction": direction,
-                    "open_time": open_time,
-                    "decision_time": decision_time,
-                    "message": message,
-                    "filter_mode": filter_mode,
-                    "mirror1": scfg.get("mirror1"),
-                    "mirror2": scfg.get("mirror2"),
-                    "detected_at": now_utc,
-                    "base_details": base_details,
-                }
-            )
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                decision_time=decision_time,
-                status="filter_waiting",
-                details={
-                    **base_details,
-                    "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode, "mirror1": scfg.get("mirror1"), "mirror2": scfg.get("mirror2")},
-                    "filter": {"rule": "enqueued", "deadline_sec": FILTER_WAIT_TOTAL_SEC, "step_sec": FILTER_WAIT_STEP_SEC},
-                },
-            )
-        except asyncio.QueueFull:
-            ctx["counters"]["dropped_overload"] = int(ctx["counters"].get("dropped_overload", 0)) + 1
-            await _upsert_live_log(
-                pg=pg,
-                signal_id=signal_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                open_time=open_time,
-                decision_time=decision_time,
-                status="dropped_overload",
-                details={
-                    **base_details,
-                    "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
-                    "filter": {"rule": "queue_full", "queue_maxsize": FILTER_QUEUE_MAXSIZE},
-                },
-            )
+        raw_message = {
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "open_time": open_time.isoformat(),
+            "decision_time": decision_time.isoformat(),
+            "direction": direction,
+            "message": message,
+            "source": "backtester_v1",
+            "mode": "live_raw_v2",
+        }
 
-    return []
+        await _persist_live_signal(pg, redis, signal_id, symbol, timeframe, direction, open_time, decision_time, message, raw_message)
 
-
-# 🔸 Воркер фильтрации: отдельные задачи, дедлайн (общий на слой), без блокировки indicator_stream
-async def _filter_worker_loop(pg, redis, queue: asyncio.Queue) -> None:
-    while True:
-        candidate = await queue.get()
-
-        # базовые поля кандидата (нужны для финального статуса при ошибке/таймауте)
-        signal_id = int((candidate or {}).get("signal_id") or 0)
-        symbol = str((candidate or {}).get("symbol") or "")
-        timeframe = str((candidate or {}).get("timeframe") or "")
-        direction = str((candidate or {}).get("direction") or "")
-        open_time = (candidate or {}).get("open_time")
-        decision_time = (candidate or {}).get("decision_time") or open_time
-        message = str((candidate or {}).get("message") or "")
-        filter_mode = str((candidate or {}).get("filter_mode") or "")
-        mirror1 = (candidate or {}).get("mirror1")
-        mirror2 = (candidate or {}).get("mirror2")
-        detected_at = (candidate or {}).get("detected_at")
-        base_details = (candidate or {}).get("base_details") or {}
-
-        try:
-            # таймаут покрывает всю обработку кандидата (включая любые await внутри)
-            await asyncio.wait_for(
-                _process_filter_candidate(pg, redis, candidate),
-                timeout=FILTER_CANDIDATE_TIMEOUT_SEC,
-            )
-
-        except asyncio.TimeoutError:
-            # если обработка кандидата зависла — фиксируем финальный статус в bt_signals_live
-            try:
-                await _upsert_live_log(
-                    pg=pg,
-                    signal_id=signal_id,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    open_time=open_time,
-                    decision_time=decision_time,
-                    status="filter_timeout",
-                    details={
-                        **base_details,
-                        "signal": {
-                            "signal_id": signal_id,
-                            "direction": direction,
-                            "message": message,
-                            "filter_mode": filter_mode,
-                            "mirror1": mirror1,
-                            "mirror2": mirror2,
-                        },
-                        "filter": {
-                            "rule": "worker_timeout",
-                            "timeout_sec": int(FILTER_CANDIDATE_TIMEOUT_SEC),
-                            "detected_at": (detected_at.isoformat() if isinstance(detected_at, datetime) else None),
-                        },
-                    },
-                    processed=True,
-                )
-                log.info(
-                    "BT_SIG_LR_UNI_LIVE_V2: filter candidate timeout — signal_id=%s %s %s %s mode=%s",
-                    signal_id,
-                    symbol,
-                    direction,
-                    (open_time.isoformat() if isinstance(open_time, datetime) else str(open_time)),
-                    filter_mode,
-                )
-            except Exception as e:
-                log.error("BT_SIG_LR_UNI_LIVE_V2: failed to persist filter_timeout status: %s", e, exc_info=True)
-
-        except Exception as e:
-            # любая ошибка воркера должна приводить к финальному статусу, иначе filter_waiting остаётся навсегда
-            log.error("BT_SIG_LR_UNI_LIVE_V2: filter worker error: %s", e, exc_info=True)
-            try:
-                await _upsert_live_log(
-                    pg=pg,
-                    signal_id=signal_id,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    open_time=open_time,
-                    decision_time=decision_time,
-                    status="filter_error",
-                    details={
-                        **base_details,
-                        "signal": {
-                            "signal_id": signal_id,
-                            "direction": direction,
-                            "message": message,
-                            "filter_mode": filter_mode,
-                            "mirror1": mirror1,
-                            "mirror2": mirror2,
-                        },
-                        "filter": {
-                            "rule": "worker_exception",
-                            "error": str(e),
-                            "detected_at": (detected_at.isoformat() if isinstance(detected_at, datetime) else None),
-                        },
-                    },
-                    processed=True,
-                )
-                log.info(
-                    "BT_SIG_LR_UNI_LIVE_V2: filter candidate error marked — signal_id=%s %s %s %s mode=%s",
-                    signal_id,
-                    symbol,
-                    direction,
-                    (open_time.isoformat() if isinstance(open_time, datetime) else str(open_time)),
-                    filter_mode,
-                )
-            except Exception as ee:
-                log.error("BT_SIG_LR_UNI_LIVE_V2: failed to persist filter_error status: %s", ee, exc_info=True)
-
-        finally:
-            queue.task_done()
-
-
-# 🔸 Обработка одного кандидата фильтра (1 сигнал) с дедлайном
-async def _process_filter_candidate(pg, redis, c: Dict[str, Any]) -> None:
-    signal_id = int(c["signal_id"])
-    symbol = str(c["symbol"])
-    timeframe = str(c["timeframe"])
-    direction = str(c["direction"])
-    open_time: datetime = c["open_time"]
-    decision_time: datetime = c.get("decision_time") or open_time
-    message = str(c.get("message") or "")
-    filter_mode = str(c.get("filter_mode") or "filter1")
-
-    mirror1 = c.get("mirror1") or {}
-    mirror2 = c.get("mirror2") or {}
-
-    detected_at: datetime = c.get("detected_at") or datetime.utcnow().replace(tzinfo=None)
-    base_details = c.get("base_details") or {}
-
-    started_at = datetime.utcnow().replace(tzinfo=None)
-    queue_delay_sec = (started_at - detected_at).total_seconds()
-
-    if queue_delay_sec > FILTER_STALE_MAX_SEC:
-        await _upsert_live_log(
-            pg,
+        ctx["counters"]["raw_sent_total"] = int(ctx["counters"].get("raw_sent_total", 0)) + 1
+        log.info(
+            "BT_SIG_LR_UNI_LIVE_V2: signal_sent RAW — signal_id=%s %s %s %s",
             signal_id,
             symbol,
-            timeframe,
-            open_time,
-            decision_time,
-            "dropped_stale_backlog",
-            {
-                **base_details,
-                "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
-                "filter": {"rule": "dropped_stale_backlog", "queue_delay_sec": float(queue_delay_sec), "stale_max_sec": FILTER_STALE_MAX_SEC},
-            },
+            direction,
+            open_time.isoformat(),
+        )
+
+
+# 🔸 Обработка ind_pack_stream_ready: bounce + фильтрация по results_json (без ожиданий)
+async def _handle_pack_ready_message(
+    ctx: Dict[str, Any],
+    fields: Dict[str, str],
+    pg,
+    redis,
+) -> None:
+    tf_expected = str(ctx.get("timeframe") or "m5")
+
+    symbol = (fields.get("symbol") or "").strip()
+    pack_tf = (fields.get("timeframe") or "").strip().lower()          # ожидается "mtf"
+    status = (fields.get("status") or "").strip().lower()              # ожидается "ok"
+    open_time_iso = (fields.get("open_time") or "").strip()
+    open_ts_ms_raw = (fields.get("open_ts_ms") or "").strip()
+    results_json_raw = (fields.get("results_json") or "").strip()
+    pairs_raw = (fields.get("pairs") or "").strip()
+    expected_count = (fields.get("expected_count") or "").strip()
+    received_count = (fields.get("received_count") or "").strip()
+
+    # условия достаточности
+    if not symbol or status != "ok":
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
+        return
+    if pack_tf != "mtf":
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
+        return
+
+    open_time: Optional[datetime] = None
+    if open_time_iso:
+        open_time = _parse_open_time_iso(open_time_iso)
+
+    if open_time is None and open_ts_ms_raw:
+        try:
+            open_time = _from_ms_utc(int(open_ts_ms_raw))
+        except Exception:
+            open_time = None
+
+    if open_time is None:
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
+        return
+
+    step_delta: timedelta = ctx["step_delta"]
+    prev_time = open_time - step_delta
+    decision_time = open_time + step_delta
+
+    # stale: если событие слишком старое относительно decision_time
+    now_utc = datetime.utcnow().replace(tzinfo=None)
+    if (now_utc - decision_time).total_seconds() > FILTER_STALE_MAX_SEC:
+        ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
+        return
+
+    # parse results_json
+    results_by_pair = _parse_results_json(results_json_raw)
+
+    base_details_pack = {
+        "source_stream": IND_PACK_READY_STREAM_KEY,
+        "pack": {
+            "status": status,
+            "symbol": symbol,
+            "timeframe": pack_tf,
+            "open_ts_ms": open_ts_ms_raw,
+            "open_time": open_time_iso,
+            "expected_count": expected_count,
+            "received_count": received_count,
+            "pairs": pairs_raw,
+            "results_keys": sorted(list(results_by_pair.keys()))[:200],
+        },
+    }
+
+    # читаем OHLCV close и LR-канал из Redis TS по prev/curr
+    ts_ms = _to_ms_utc(open_time)
+    prev_ms = _to_ms_utc(prev_time)
+    decision_ms = _to_ms_utc(decision_time)
+
+    close_key = BB_TS_CLOSE_KEY.format(symbol=symbol, tf=tf_expected)
+
+    angle_name = str(ctx["param_angle"])
+    upper_name = str(ctx["param_upper"])
+    lower_name = str(ctx["param_lower"])
+    center_name = str(ctx["param_center"])
+
+    angle_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=angle_name)
+    upper_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=upper_name)
+    lower_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=lower_name)
+    center_key = IND_TS_KEY.format(symbol=symbol, tf=tf_expected, param_name=center_name)
+
+    pipe = redis.pipeline()
+    pipe.execute_command("TS.RANGE", close_key, prev_ms, prev_ms)   # close_prev
+    pipe.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)       # close_curr
+    pipe.execute_command("TS.RANGE", upper_key, prev_ms, prev_ms)   # upper_prev
+    pipe.execute_command("TS.RANGE", lower_key, prev_ms, prev_ms)   # lower_prev
+    pipe.execute_command("TS.RANGE", angle_key, ts_ms, ts_ms)       # angle_curr
+    pipe.execute_command("TS.RANGE", center_key, ts_ms, ts_ms)      # center_curr
+    pipe.execute_command("TS.RANGE", upper_key, ts_ms, ts_ms)       # upper_curr (details)
+    pipe.execute_command("TS.RANGE", lower_key, ts_ms, ts_ms)       # lower_curr (details)
+
+    try:
+        res = await asyncio.wait_for(pipe.execute(), timeout=REDIS_OP_TIMEOUT_SEC)
+    except Exception as e:
+        ctx["counters"]["errors_total"] = int(ctx["counters"].get("errors_total", 0)) + 1
+        log.error(
+            "BT_SIG_LR_UNI_LIVE_V2: redis pipeline error (pack_ready) — symbol=%s, open_time=%s, err=%s",
+            symbol,
+            (open_time.isoformat() if isinstance(open_time, datetime) else str(open_time)),
+            e,
+            exc_info=True,
         )
         return
 
-    # layers list (1 or 2)
-    layers: List[Dict[str, Any]] = []
-    if filter_mode in ("filter1", "filter2"):
-        if mirror1.get("scenario_id") and mirror1.get("signal_id"):
-            layers.append({"layer": 1, "scenario_id": int(mirror1["scenario_id"]), "signal_id": int(mirror1["signal_id"])})
-        else:
-            await _upsert_live_log(
-                pg,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                decision_time,
-                "blocked_no_cache",
-                {**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror1"}},
-            )
-            return
+    close_prev = _extract_ts_value(res[0])
+    close_curr = _extract_ts_value(res[1])
+    upper_prev = _extract_ts_value(res[2])
+    lower_prev = _extract_ts_value(res[3])
+    angle_curr = _extract_ts_value(res[4])
+    center_curr = _extract_ts_value(res[5])
+    upper_curr = _extract_ts_value(res[6])
+    lower_curr = _extract_ts_value(res[7])
 
-    if filter_mode == "filter2":
-        if mirror2.get("scenario_id") and mirror2.get("signal_id"):
-            layers.append({"layer": 2, "scenario_id": int(mirror2["scenario_id"]), "signal_id": int(mirror2["signal_id"])})
-        else:
-            await _upsert_live_log(
-                pg,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                decision_time,
-                "blocked_no_cache",
-                {**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror2"}},
-            )
-            return
+    missing = []
+    if close_prev is None:
+        missing.append("close_prev")
+    if close_curr is None:
+        missing.append("close_curr")
+    if upper_prev is None:
+        missing.append("upper_prev")
+    if lower_prev is None:
+        missing.append("lower_prev")
+    if angle_curr is None:
+        missing.append("angle_curr")
+    if center_curr is None:
+        missing.append("center_curr")
 
-    # по каждому слою: ждём ind_pack и проверяем good
-    layer_results: List[Dict[str, Any]] = []
+    # precision цены для logs/details
+    ticker_info = get_ticker_info(symbol) or {}
+    try:
+        precision_price = int(ticker_info.get("precision_price") or 8)
+    except Exception:
+        precision_price = 8
 
-    for layer in layers:
-        layer_no = int(layer["layer"])
-        ms = int(layer["scenario_id"])
-        si = int(layer["signal_id"])
-
-        cache_layer = _build_filter_layer_from_cache(ms, si, direction)
-
-        if cache_layer is None:
-            # пробуем освежить кеши (watcher может ещё не прогрузил)
-            await load_initial_mirror_caches_v2(pg)
-            cache_layer = _build_filter_layer_from_cache(ms, si, direction)
-
-        if cache_layer is None:
-            await _upsert_live_log(
-                pg,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                decision_time,
-                "blocked_no_cache",
-                {
-                    **base_details,
-                    "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
-                    "filter": {"layer": layer_no, "reason": "mirror_cache_missing", "mirror": {"scenario_id": ms, "signal_id": si}},
-                },
-            )
-            return
-
-        ok, info = await _wait_and_check_layer(redis, cache_layer, symbol, direction, decision_time)
-        layer_results.append({"layer": layer_no, **info})
-
-        if not ok:
-            # записываем отказ и выходим
-            await _upsert_live_log(
-                pg,
-                signal_id,
-                symbol,
-                timeframe,
-                open_time,
-                decision_time,
-                str(info.get("status") or "blocked_timeout"),
-                {
-                    **base_details,
-                    "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
-                    "filter": {"layer": layer_no, "mirror": {"scenario_id": ms, "signal_id": si}, **info},
-                },
-            )
-            return
-
-    # все слои прошли
-    details = {
-        **base_details,
-        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode, "mirror1": mirror1, "mirror2": mirror2 if filter_mode == "filter2" else None},
-        "filter": {"rule": "passed_all_layers", "layers": layer_results},
-        "result": {"passed": True, "status": "signal_sent"},
+    base_details = {
+        **base_details_pack,
+        "ts": {
+            "ts_ms": ts_ms,
+            "prev_ms": prev_ms,
+            "decision_ms": decision_ms,
+            "open_time": open_time.isoformat(),
+            "prev_time": prev_time.isoformat(),
+            "decision_time": decision_time.isoformat(),
+        },
+        "ohlcv": {
+            "close_prev": _round_price(float(close_prev), precision_price) if close_prev is not None else None,
+            "close_curr": _round_price(float(close_curr), precision_price) if close_curr is not None else None,
+        },
+        "lr": {
+            "angle_curr": float(angle_curr) if angle_curr is not None else None,
+            "upper_prev": float(upper_prev) if upper_prev is not None else None,
+            "lower_prev": float(lower_prev) if lower_prev is not None else None,
+            "center_curr": float(center_curr) if center_curr is not None else None,
+            "upper_curr": float(upper_curr) if upper_curr is not None else None,
+            "lower_curr": float(lower_curr) if lower_curr is not None else None,
+        },
     }
 
-    should_send = await _upsert_live_log(pg, signal_id, symbol, timeframe, open_time, decision_time, "signal_sent", details)
-    if not should_send:
+    if missing:
+        details = {**base_details, "result": {"passed": False, "status": "data_missing", "missing": missing}}
+        for scfg in ctx.get("signals") or []:
+            # filter-only: если сюда попал raw инстанс, игнорируем
+            if str(scfg.get("filter_mode") or "") == "raw":
+                continue
+            await _upsert_live_log(
+                pg,
+                int(scfg["signal_id"]),
+                symbol,
+                tf_expected,
+                open_time,
+                decision_time,
+                "data_missing",
+                {**details, "signal": scfg},
+            )
         return
 
-    # формируем raw_message, пишем в bt_signals_values
-    raw_message = {
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "open_time": open_time.isoformat(),
-        "decision_time": decision_time.isoformat(),
-        "direction": direction,
-        "message": message,
-        "source": "backtester_v1",
-        "mode": "live_filtered_v2",
-        "filter_mode": filter_mode,
-        "layers": layer_results,
-    }
+    H = float(upper_prev) - float(lower_prev)
+    if H <= 0:
+        details = {**base_details, "result": {"passed": False, "status": "invalid_channel_height", "H": float(H)}}
+        for scfg in ctx.get("signals") or []:
+            if str(scfg.get("filter_mode") or "") == "raw":
+                continue
+            await _upsert_live_log(
+                pg,
+                int(scfg["signal_id"]),
+                symbol,
+                tf_expected,
+                open_time,
+                decision_time,
+                "invalid_channel_height",
+                {**details, "signal": scfg},
+            )
+        return
 
-    await _persist_live_signal(pg, redis, signal_id, symbol, timeframe, direction, open_time, decision_time, message, raw_message)
+    # Один read → обработка всех FILTER инстансов
+    for scfg in ctx.get("signals") or []:
+        filter_mode = str(scfg.get("filter_mode") or "raw")
+        if filter_mode not in ("filter1", "filter2"):
+            continue
 
-    log.info(
-        "BT_SIG_LR_UNI_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s mode=%s",
-        signal_id,
-        symbol,
-        direction,
-        open_time.isoformat(),
-        filter_mode,
-    )
+        signal_id = int(scfg["signal_id"])
+        direction = str(scfg["direction"])
+        message = str(scfg["message"])
+        trend_type = str(scfg["trend_type"])
+        zone_k = float(scfg["zone_k"])
+        keep_half = bool(scfg["keep_half"])
+        mirror1 = scfg.get("mirror1")
+        mirror2 = scfg.get("mirror2")
 
+        passed, eval_status, eval_extra = _evaluate_lr_bounce(
+            direction=direction,
+            close_prev=float(close_prev),
+            close_curr=float(close_curr),
+            angle_curr=float(angle_curr),
+            upper_prev=float(upper_prev),
+            lower_prev=float(lower_prev),
+            center_curr=float(center_curr),
+            trend_type=trend_type,
+            zone_k=zone_k,
+            keep_half=keep_half,
+            H=float(H),
+        )
 
-# 🔸 Ожидание ind_pack по слою и проверка good bins
-async def _wait_and_check_layer(
-    redis,
-    layer_cache: Dict[str, Any],
-    symbol: str,
-    direction: str,
-    decision_time: datetime,
-) -> Tuple[bool, Dict[str, Any]]:
-    ms = int(layer_cache["mirror_scenario_id"])
-    si = int(layer_cache["mirror_signal_id"])
-    applied_run_id = layer_cache.get("applied_run_id")
-    required_pairs: Set[Tuple[int, str]] = set(layer_cache.get("required_pairs") or set())
-    good_bins_map: Dict[Tuple[int, str], Set[str]] = layer_cache.get("good_bins_map") or {}
+        if not passed:
+            await _upsert_live_log(
+                pg=pg,
+                signal_id=signal_id,
+                symbol=symbol,
+                timeframe=tf_expected,
+                open_time=open_time,
+                decision_time=decision_time,
+                status=eval_status,
+                details={
+                    **base_details,
+                    "signal": {
+                        "signal_id": signal_id,
+                        "direction": direction,
+                        "message": message,
+                        "trend_type": trend_type,
+                        "zone_k": zone_k,
+                        "keep_half": keep_half,
+                        "filter_mode": filter_mode,
+                        "mirror1": mirror1,
+                        "mirror2": mirror2 if filter_mode == "filter2" else None,
+                    },
+                    "result": {"passed": False, "status": eval_status, "extra": eval_extra},
+                },
+            )
+            continue
 
-    deadline = datetime.utcnow().replace(tzinfo=None) + timedelta(seconds=FILTER_WAIT_TOTAL_SEC)
-
-    # ждём все required_pairs; pass = есть хотя бы один good-hit
-    found_bins: Dict[Tuple[int, str], str] = {}
-    good_hit = False
-
-    attempt = 0
-    while True:
-        now = datetime.utcnow().replace(tzinfo=None)
-        if now > deadline:
-            return False, {
-                "status": "blocked_missing_keys_timeout",
-                "rule": "timeout_missing_keys",
-                "attempt": attempt,
-                "required_total": len(required_pairs),
-                "found_total": len(found_bins),
-                "applied_run_id": applied_run_id,
-            }
-
-        # читаем пачкой все missing keys
-        missing = [p for p in required_pairs if p not in found_bins]
-        if missing:
-            keys: List[str] = []
-            for aid, tf in missing:
-                keys.append(_ind_pack_key(int(aid), ms, si, direction, symbol, str(tf)))
-
-            # таймаут на Redis mget, чтобы await не мог зависнуть навсегда
-            try:
-                values = await asyncio.wait_for(redis.mget(keys), timeout=REDIS_OP_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                attempt += 1
-                await asyncio.sleep(FILTER_WAIT_STEP_SEC)
+        # bounce прошёл -> проверяем слои по results_json
+        layers: List[Dict[str, Any]] = []
+        if filter_mode in ("filter1", "filter2"):
+            if mirror1 and mirror1.get("scenario_id") and mirror1.get("signal_id"):
+                layers.append({"layer": 1, "scenario_id": int(mirror1["scenario_id"]), "signal_id": int(mirror1["signal_id"])})
+            else:
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=tf_expected,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_no_cache",
+                    details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror1"}},
+                )
                 continue
 
-            for (aid, tf), raw in zip(missing, values):
-                parsed = _parse_ind_pack_value(raw)
-                st = str(parsed.get("state") or "absent")
+        if filter_mode == "filter2":
+            if mirror2 and mirror2.get("scenario_id") and mirror2.get("signal_id"):
+                layers.append({"layer": 2, "scenario_id": int(mirror2["scenario_id"]), "signal_id": int(mirror2["signal_id"])})
+            else:
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=tf_expected,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_no_cache",
+                    details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror2"}},
+                )
+                continue
 
-                if st == "ok":
-                    bn = parsed.get("bin_name")
-                    if bn is not None:
-                        found_bins[(aid, tf)] = str(bn)
-                    continue
+        layer_results: List[Dict[str, Any]] = []
+        blocked = False
 
-                if st == "fail":
-                    reason = parsed.get("reason")
-                    details = parsed.get("details") if isinstance(parsed.get("details"), dict) else {}
-                    if _is_permanent_reason(reason, details):
-                        return False, {
-                            "status": "blocked_permanent_pack_fail",
-                            "rule": "permanent_pack_fail",
-                            "attempt": attempt,
-                            "permanent_fail": {"analysis_id": int(aid), "timeframe": str(tf), "reason": str(reason), "details": details},
-                            "applied_run_id": applied_run_id,
-                        }
-                    # transient fail -> ждём дальше
-                    continue
+        for layer in layers:
+            layer_no = int(layer["layer"])
+            ms = int(layer["scenario_id"])
+            si = int(layer["signal_id"])
 
-                # absent -> ждём
+            cache_layer = _build_filter_layer_from_cache(ms, si, direction)
+            if cache_layer is None:
+                # пробуем освежить кеши (watcher может ещё не успел)
+                await load_initial_mirror_caches_v2(pg)
+                cache_layer = _build_filter_layer_from_cache(ms, si, direction)
 
-        # если все пришли — проверяем good_hit
-        if len(found_bins) == len(required_pairs) and required_pairs:
-            for (aid, tf), bn in found_bins.items():
-                good_set = good_bins_map.get((aid, tf)) or set()
-                if bn in good_set:
-                    good_hit = True
+            if cache_layer is None:
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=tf_expected,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status="blocked_no_cache",
+                    details={
+                        **base_details,
+                        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
+                        "filter": {"layer": layer_no, "reason": "mirror_cache_missing", "mirror": {"scenario_id": ms, "signal_id": si}},
+                    },
+                )
+                blocked = True
+                break
 
-            if not good_hit:
-                return False, {
-                    "status": "blocked_no_labels_match",
-                    "rule": "no_good_match",
-                    "attempt": attempt,
-                    "required_total": len(required_pairs),
-                    "found_total": len(found_bins),
-                    "applied_run_id": applied_run_id,
-                }
+            ok_layer, info = _check_layer_by_pack_results(cache_layer, results_by_pair, pack_timeframe=pack_tf)
+            layer_results.append({"layer": layer_no, **info})
 
-            return True, {
-                "status": "ok",
-                "rule": "all_keys_ready_and_good_hit",
-                "attempt": attempt,
-                "applied_run_id": applied_run_id,
-                "found_bins": [{"analysis_id": int(a), "timeframe": str(tf), "bin_name": str(bn)} for (a, tf), bn in found_bins.items()],
-            }
+            if not ok_layer:
+                await _upsert_live_log(
+                    pg=pg,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    timeframe=tf_expected,
+                    open_time=open_time,
+                    decision_time=decision_time,
+                    status=str(info.get("status") or "blocked_no_labels_match"),
+                    details={
+                        **base_details,
+                        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
+                        "filter": {"layer": layer_no, "mirror": {"scenario_id": ms, "signal_id": si}, **info},
+                    },
+                )
+                blocked = True
+                break
 
-        attempt += 1
-        await asyncio.sleep(FILTER_WAIT_STEP_SEC)
+        if blocked:
+            continue
+
+        details = {
+            **base_details,
+            "signal": {
+                "signal_id": signal_id,
+                "direction": direction,
+                "message": message,
+                "filter_mode": filter_mode,
+                "mirror1": mirror1,
+                "mirror2": mirror2 if filter_mode == "filter2" else None,
+            },
+            "filter": {"rule": "passed_all_layers", "layers": layer_results},
+            "result": {"passed": True, "status": "signal_sent"},
+        }
+
+        should_send = await _upsert_live_log(pg, signal_id, symbol, tf_expected, open_time, decision_time, "signal_sent", details)
+        if not should_send:
+            continue
+
+        raw_message = {
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "timeframe": tf_expected,
+            "open_time": open_time.isoformat(),
+            "decision_time": decision_time.isoformat(),
+            "direction": direction,
+            "message": message,
+            "source": "backtester_v1",
+            "mode": "live_filtered_v2",
+            "filter_mode": filter_mode,
+            "pack": {
+                "stream": IND_PACK_READY_STREAM_KEY,
+                "open_ts_ms": open_ts_ms_raw,
+                "pairs": pairs_raw,
+            },
+            "layers": layer_results,
+        }
+
+        await _persist_live_signal(pg, redis, signal_id, symbol, tf_expected, direction, open_time, decision_time, message, raw_message)
+
+        ctx["counters"]["filtered_sent_total"] = int(ctx["counters"].get("filtered_sent_total", 0)) + 1
+        log.info(
+            "BT_SIG_LR_UNI_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s mode=%s",
+            signal_id,
+            symbol,
+            direction,
+            open_time.isoformat(),
+            filter_mode,
+        )
