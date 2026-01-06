@@ -5,7 +5,7 @@ from __future__ import annotations
 # 🔸 Базовые импорты
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 # 🔸 Imports: pack runtime caches
@@ -27,6 +27,7 @@ READY_DEADLINES_ZSET = "ind_pack_ready_deadlines"   # ZSET: score=deadline_ms, m
 
 # 🔸 Политики
 TIMEOUT_SEC = 120
+BAR_STEP_MS = 300_000  # m5 бар: 5 минут (используем для latency от закрытия)
 POLL_DEADLINES_SEC = 1.0
 STATE_TTL_SEC = 5 * 60  # 5 минут держим ключи состояния
 READ_COUNT = 500
@@ -79,21 +80,26 @@ def _parse_open_time_to_ts_ms(open_time: Any) -> int | None:
         return None
     return int(dt.timestamp() * 1000)
 
-
 def _calc_latency_ms(published_at: datetime, open_time_dt: datetime | None, open_ts_ms: int | None) -> int | None:
-    # published_at / open_time_dt — naive UTC
+    """
+    latency_ms считаем от ЗАКРЫТИЯ m5 бара:
+      close_time = open_time + 5 минут
+    """
     try:
         if open_time_dt is not None:
-            ms = int((published_at - open_time_dt).total_seconds() * 1000)
+            close_dt = open_time_dt + timedelta(milliseconds=BAR_STEP_MS)
+            ms = int((published_at - close_dt).total_seconds() * 1000)
             return max(0, ms)
+
         if open_ts_ms is not None:
             open_dt = datetime.utcfromtimestamp(int(open_ts_ms) / 1000).replace(tzinfo=None)
-            ms = int((published_at - open_dt).total_seconds() * 1000)
+            close_dt = open_dt + timedelta(milliseconds=BAR_STEP_MS)
+            ms = int((published_at - close_dt).total_seconds() * 1000)
             return max(0, ms)
     except Exception:
         return None
-    return None
 
+    return None
 
 # 🔸 Pack pair token helper (signal:scenario)
 def _pair_token(signal_id: int, scenario_id: int) -> str:
