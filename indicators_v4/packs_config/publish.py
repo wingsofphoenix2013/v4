@@ -1,10 +1,12 @@
-# packs_config/publish.py — публикация результатов ind_pack в Redis KV + дублирование в Redis Stream (core) для записи в PG
+# packs_config/publish.py — публикация результатов ind_pack в Redis KV (optional) + дублирование в Redis Stream (core) для записи в PG
 
 from __future__ import annotations
 
 # 🔸 Imports
 from typing import Any
 
+# 🔸 Feature flags
+PUBLISH_KV_ENABLED = True  # выключить, когда downstream будет потреблять результаты из ind_pack_stream_ready.results_json
 
 # 🔸 Константы Redis (результаты pack)
 IND_PACK_PREFIX = "ind_pack"  # префикс ключей результата
@@ -25,7 +27,10 @@ async def publish_static(
     meta: dict[str, Any] | None = None,
 ):
     key = f"{IND_PACK_PREFIX}:{analysis_id}:{direction}:{symbol}:{timeframe}"
-    await redis.set(key, payload_json, ex=int(ttl_sec))
+
+    # KV (optional)
+    if PUBLISH_KV_ENABLED:
+        await redis.set(key, payload_json, ex=int(ttl_sec))
 
     # stream mirror (best-effort)
     try:
@@ -52,7 +57,7 @@ async def publish_static(
 
         await redis.xadd(IND_PACK_STREAM_CORE, fields)
     except Exception:
-        # не ломаем hot-path публикации в KV
+        # не ломаем hot-path
         pass
 
 
@@ -69,7 +74,10 @@ async def publish_pair(
     meta: dict[str, Any] | None = None,
 ):
     key = f"{IND_PACK_PREFIX}:{analysis_id}:{scenario_id}:{signal_id}:{direction}:{symbol}:{timeframe}"
-    await redis.set(key, payload_json, ex=int(ttl_sec))
+
+    # KV (optional)
+    if PUBLISH_KV_ENABLED:
+        await redis.set(key, payload_json, ex=int(ttl_sec))
 
     # stream mirror (best-effort)
     try:
@@ -96,5 +104,5 @@ async def publish_pair(
 
         await redis.xadd(IND_PACK_STREAM_CORE, fields)
     except Exception:
-        # не ломаем hot-path публикации в KV
+        # не ломаем hot-path
         pass

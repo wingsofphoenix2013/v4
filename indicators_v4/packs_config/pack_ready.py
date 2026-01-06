@@ -1,9 +1,10 @@
-# packs_config/pack_ready.py — воркер готовности ind_pack: 4/4 по тикеру и m5-бару (таймаут 120с) → stream ind_pack_stream_ready + PG ind_pack_log_v4 (+ latency_ms)
+# packs_config/pack_ready.py — воркер готовности ind_pack: 4/4 по тикеру и m5-бару (таймаут 120с) → stream ind_pack_stream_ready (с результатами без debug) + PG ind_pack_log_v4 (+ latency_ms)
 
 from __future__ import annotations
 
 # 🔸 Базовые импорты
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -21,13 +22,14 @@ READY_CONSUMER = "ind_pack_ready_1"
 # 🔸 Константы Redis (keys)
 READY_SET_PREFIX = "ind_pack_ready"                 # ind_pack_ready:{symbol}:{open_ts_ms} -> SET of "signal_id:scenario_id"
 READY_META_PREFIX = "ind_pack_ready_meta"           # ind_pack_ready_meta:{symbol}:{open_ts_ms} -> HASH
+READY_RES_PREFIX = "ind_pack_ready_res"             # ind_pack_ready_res:{symbol}:{open_ts_ms} -> HASH token -> compact json
 READY_FINAL_PREFIX = "ind_pack_ready_final"         # ind_pack_ready_final:{symbol}:{open_ts_ms} -> "ok"/"error"
 
 READY_DEADLINES_ZSET = "ind_pack_ready_deadlines"   # ZSET: score=deadline_ms, member="{symbol}:{open_ts_ms}"
 
 # 🔸 Политики
 TIMEOUT_SEC = 120
-BAR_STEP_MS = 300_000  # m5 бар: 5 минут (используем для latency от закрытия)
+BAR_STEP_MS = 300_000  # m5 бар: 5 минут (latency считаем от закрытия)
 POLL_DEADLINES_SEC = 1.0
 STATE_TTL_SEC = 5 * 60  # 5 минут держим ключи состояния
 READ_COUNT = 500
@@ -80,7 +82,8 @@ def _parse_open_time_to_ts_ms(open_time: Any) -> int | None:
         return None
     return int(dt.timestamp() * 1000)
 
-def _calc_latency_ms(published_at: datetime, open_time_dt: datetime | None, open_ts_ms: int | None) -> int | None:
+
+def _calc_latency_ms_from_close(published_at: datetime, open_time_dt: datetime | None, open_ts_ms: int | None) -> int | None:
     """
     latency_ms считаем от ЗАКРЫТИЯ m5 бара:
       close_time = open_time + 5 минут
@@ -101,6 +104,12 @@ def _calc_latency_ms(published_at: datetime, open_time_dt: datetime | None, open
 
     return None
 
+
+# 🔸 JSON helper (compact)
+def _json_dumps(obj: dict[str, Any]) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
 # 🔸 Pack pair token helper (signal:scenario)
 def _pair_token(signal_id: int, scenario_id: int) -> str:
     return f"{int(signal_id)}:{int(scenario_id)}"
@@ -118,6 +127,10 @@ def _ready_meta_key(symbol: str, open_ts_ms: int) -> str:
     return f"{READY_META_PREFIX}:{symbol}:{int(open_ts_ms)}"
 
 
+def _ready_res_key(symbol: str, open_ts_ms: int) -> str:
+    return f"{READY_RES_PREFIX}:{symbol}:{int(open_ts_ms)}"
+
+
 def _ready_final_key(symbol: str, open_ts_ms: int) -> str:
     return f"{READY_FINAL_PREFIX}:{symbol}:{int(open_ts_ms)}"
 
@@ -132,6 +145,57 @@ def _expected_tokens() -> list[str]:
     return out
 
 
+# 🔸 Parse compact result from pack payload_json (remove debug)
+def _compact_result_from_payload(payload_json: Any, analysis_id: Any, run_id: Any) -> dict[str, Any]:
+    """
+    Возвращает компактный результат без debug:
+      ok=true  -> {ok:true, bin_name, analysis_id, run_id}
+      ok=false -> {ok:false, reason, analysis_id, run_id}
+      invalid  -> {ok:false, reason:'invalid_payload_json', analysis_id, run_id}
+    """
+    aid = None
+    rid = None
+    try:
+        if analysis_id is not None and str(analysis_id).strip() != "":
+            aid = int(str(analysis_id))
+    except Exception:
+        aid = None
+    try:
+        if run_id is not None and str(run_id).strip() != "":
+            rid = int(str(run_id))
+    except Exception:
+        rid = None
+
+    raw = "" if payload_json is None else str(payload_json)
+    try:
+        obj = json.loads(raw)
+        ok = bool(obj.get("ok", False))
+
+        if ok:
+            bn = obj.get("bin_name")
+            return {
+                "ok": True,
+                "bin_name": str(bn) if bn is not None else None,
+                "analysis_id": aid,
+                "run_id": rid,
+            }
+
+        reason = obj.get("reason")
+        return {
+            "ok": False,
+            "reason": str(reason) if reason is not None else "unknown",
+            "analysis_id": aid,
+            "run_id": rid,
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "reason": "invalid_payload_json",
+            "analysis_id": aid,
+            "run_id": rid,
+        }
+
+
 # 🔸 Insert log row to PG
 async def _write_pg_log(
     pg: Any,
@@ -143,7 +207,7 @@ async def _write_pg_log(
     received_count: int,
     published_at: datetime,
 ):
-    latency_ms = _calc_latency_ms(published_at, open_time_dt, open_ts_ms)
+    latency_ms = _calc_latency_ms_from_close(published_at, open_time_dt, open_ts_ms)
 
     async with pg.acquire() as conn:
         await conn.execute(
@@ -169,6 +233,7 @@ async def _publish_ready_stream(
     expected_count: int,
     received_count: int,
     pairs_csv: str,
+    results_json: str,
 ):
     fields = {
         "symbol": str(symbol),
@@ -179,6 +244,7 @@ async def _publish_ready_stream(
         "expected_count": str(int(expected_count)),
         "received_count": str(int(received_count)),
         "pairs": str(pairs_csv),
+        "results_json": str(results_json),
     }
     await redis.xadd(IND_PACK_STREAM_READY, fields)
 
@@ -202,11 +268,39 @@ async def _finalize_ok(
     published_at = _now_utc_naive()
     open_time_dt = _parse_open_time(open_time_iso)
 
+    # собрать результаты 4/4
+    res_key = _ready_res_key(symbol, open_ts_ms)
+    raw_map = await redis.hgetall(res_key)  # token -> json
+    results: dict[str, Any] = {}
+
+    for token, raw in (raw_map or {}).items():
+        try:
+            results[str(token)] = json.loads(str(raw))
+        except Exception:
+            results[str(token)] = {"ok": False, "reason": "invalid_compact_result"}
+
+    # на всякий: обеспечить наличие ключей expected tokens
+    # (если по какой-то причине значение не записалось)
+    # missing -> mark as unknown
+    for token in [t.strip() for t in pairs_csv.split(",") if t.strip()]:
+        results.setdefault(token, {"ok": False, "reason": "missing_compact_result"})
+
+    results_json = _json_dumps(results)
+
     # PG write
     await _write_pg_log(pg, str(symbol), int(open_ts_ms), open_time_dt, "ok", int(expected_count), int(received_count), published_at)
 
-    # Stream publish
-    await _publish_ready_stream(redis, str(symbol), int(open_ts_ms), open_time_iso, int(expected_count), int(received_count), pairs_csv)
+    # Stream publish (без debug, published_at не пишем в stream)
+    await _publish_ready_stream(
+        redis,
+        str(symbol),
+        int(open_ts_ms),
+        open_time_iso,
+        int(expected_count),
+        int(received_count),
+        pairs_csv,
+        results_json,
+    )
 
     return True
 
@@ -239,16 +333,16 @@ async def run_pack_ready(pg: Any, redis: Any):
 
     # ждём, пока pack runtime инициализируется (configured_pairs_set должен быть готов)
     while not caches_ready.get("registry", False) or not configured_pairs_set:
-        log.debug("PACK_READY: waiting for pack runtime init (registry/pairs not ready yet)")
+        log.info("PACK_READY: waiting for pack runtime init (registry/pairs not ready yet)")
         await asyncio.sleep(1.0)
 
     expected = _expected_tokens()
     expected_count = len(expected)
     expected_csv = ",".join(expected)
 
-    log.debug("PACK_READY: started — expected_pairs=%s (%s)", expected_count, expected_csv)
+    log.info("PACK_READY: started — expected_pairs=%s (%s)", expected_count, expected_csv)
 
-    # создать группу заранее
+    # создать группы заранее
     await ensure_stream_group(redis, IND_PACK_STREAM_CORE, READY_GROUP)
 
     # loop tasks
@@ -335,6 +429,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                         # set keys
                         set_key = _ready_set_key(symbol, open_ts_ms)
                         meta_key = _ready_meta_key(symbol, open_ts_ms)
+                        res_key = _ready_res_key(symbol, open_ts_ms)
 
                         token = _pair_token(sig, sc)
 
@@ -348,6 +443,15 @@ async def run_pack_ready(pg: Any, redis: Any):
                             await redis.hset(meta_key, mapping={"open_time": str(open_time_iso)})
                             await redis.expire(meta_key, STATE_TTL_SEC)
 
+                        # compact result (без debug) в HASH
+                        compact = _compact_result_from_payload(
+                            data.get("payload_json"),
+                            data.get("analysis_id"),
+                            data.get("run_id"),
+                        )
+                        await redis.hset(res_key, token, _json_dumps(compact))
+                        await redis.expire(res_key, STATE_TTL_SEC)
+
                         # add token to set
                         await redis.sadd(set_key, token)
                         await redis.expire(set_key, STATE_TTL_SEC)
@@ -356,7 +460,6 @@ async def run_pack_ready(pg: Any, redis: Any):
 
                         # finalize ok when complete
                         if received_count >= expected_count:
-                            pairs_csv = expected_csv
                             if await _finalize_ok(
                                 pg,
                                 redis,
@@ -364,15 +467,16 @@ async def run_pack_ready(pg: Any, redis: Any):
                                 open_ts_ms,
                                 expected_count,
                                 expected_count,
-                                pairs_csv,
+                                expected_csv,
                                 str(open_time_iso) if open_time_iso else None,
                             ):
                                 # cleanup redis state keys (keep final flag)
                                 await redis.zrem(READY_DEADLINES_ZSET, member)
                                 await redis.delete(set_key)
                                 await redis.delete(meta_key)
+                                await redis.delete(res_key)
                                 ready_emitted += 1
-                                log.debug(
+                                log.info(
                                     "PACK_READY: OK (symbol=%s, open_ts_ms=%s, open_time=%s, expected=%s, received=%s)",
                                     symbol,
                                     open_ts_ms,
@@ -441,13 +545,14 @@ async def run_pack_ready(pg: Any, redis: Any):
 
                         set_key = _ready_set_key(symbol, open_ts_ms)
                         meta_key = _ready_meta_key(symbol, open_ts_ms)
+                        res_key = _ready_res_key(symbol, open_ts_ms)
 
                         received_count = int(await redis.scard(set_key))
                         if received_count >= expected_count:
                             # race: complete but not finalized yet
                             open_time_iso = await redis.hget(meta_key, "open_time")
                             if await _finalize_ok(pg, redis, symbol, open_ts_ms, expected_count, expected_count, expected_csv, str(open_time_iso) if open_time_iso else None):
-                                log.debug(
+                                log.info(
                                     "PACK_READY: OK (race) (symbol=%s, open_ts_ms=%s, open_time=%s)",
                                     symbol,
                                     open_ts_ms,
@@ -456,6 +561,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                             await redis.zrem(READY_DEADLINES_ZSET, m)
                             await redis.delete(set_key)
                             await redis.delete(meta_key)
+                            await redis.delete(res_key)
                             cleaned += 1
                             continue
 
@@ -463,7 +569,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                         open_time_iso = await redis.hget(meta_key, "open_time")
                         if await _finalize_error(pg, redis, symbol, open_ts_ms, expected_count, received_count, str(open_time_iso) if open_time_iso else None):
                             errors_logged += 1
-                            log.debug(
+                            log.info(
                                 "PACK_READY: ERROR timeout (symbol=%s, open_ts_ms=%s, open_time=%s, expected=%s, received=%s)",
                                 symbol,
                                 open_ts_ms,
@@ -475,6 +581,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                         await redis.zrem(READY_DEADLINES_ZSET, m)
                         await redis.delete(set_key)
                         await redis.delete(meta_key)
+                        await redis.delete(res_key)
                         cleaned += 1
 
                     except Exception as e:
