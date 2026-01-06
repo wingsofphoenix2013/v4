@@ -56,6 +56,9 @@ from packs_config.publish import publish_pair
 # 🔸 Imports: packs_config (bootstrap)
 from packs_config.bootstrap import bootstrap_current_state
 
+# 🔸 Imports: packs_config (mtf readiness gate)
+from packs_config.mtf_ready import MtfReadyGate, normalize_series
+
 # 🔸 Константы / флаги трассировки
 PACK_TRACE_ENABLED = True  # включить/выключить запись полного трейса в payload_json (ok/fail)
 
@@ -68,6 +71,13 @@ IND_PACK_CONSUMER = "ind_pack_consumer_1"      # consumer name
 STREAM_READ_COUNT = 500          # сколько сообщений читать за раз
 STREAM_BLOCK_MS = 2000           # блокировка XREADGROUP (мс)
 MAX_PARALLEL_MESSAGES = 200      # сколько сообщений обрабатывать параллельно
+
+# 🔸 Константы политики MTF gate
+MTF_READY_TIMEOUT_SEC = 120
+MTF_READY_POLL_SEC = 1.0
+
+# 🔸 MTF readiness gate (event-driven)
+mtf_gate = MtfReadyGate(timeout_sec=MTF_READY_TIMEOUT_SEC)
 
 # 🔸 Ограничения диагностики (не заливаем Redis)
 MAX_CANDIDATES_IN_DETAILS = 5
