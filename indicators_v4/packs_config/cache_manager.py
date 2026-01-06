@@ -15,6 +15,7 @@ from packs_config.db_loaders import (
     load_static_bins_dict,
     load_winners_from_labels_v2,
     load_signal_direction_masks,
+    load_active_symbols_from_tickers_bb,
 )
 from packs_config.models import PackRuntime, BinRule
 from packs_config.registry import build_pack_registry
@@ -46,6 +47,14 @@ winners_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
 signal_direction_mask: dict[int, str] = {}
 signal_dir_lock = asyncio.Lock()
 
+# 🔸 Кеш активных тикеров (стартовый снимок из tickers_bb)
+active_symbols: set[str] = set()
+symbols_lock = asyncio.Lock()
+
+
+def get_active_symbols() -> set[str]:
+    # возвращаем копию, чтобы снаружи не модифицировали внутренний set
+    return set(active_symbols)
 
 # 🔸 Набор “интересующих” пар (берётся из bins_policy.pairs включённых pack-инстансов)
 configured_pairs_set: set[tuple[int, int]] = set()
@@ -199,8 +208,7 @@ def get_adaptive_rules(analysis_id: int, scenario_id: int, signal_id: int, timef
 def get_adaptive_quantiles(analysis_id: int, scenario_id: int, signal_id: int, timeframe: str, direction: str) -> list[BinRule]:
     return adaptive_quantiles_cache.get((int(analysis_id), int(scenario_id), int(signal_id), str(timeframe), str(direction)), [])
 
-
-# 🔸 Cache init: registry + configured_pairs + signal directions + winners + rules (winner-driven)
+# 🔸 Cache init: registry + configured_pairs + active symbols + signal directions + winners + rules (winner-driven)
 async def init_pack_runtime(pg: Any):
     global pack_registry, configured_pairs_set
 
@@ -224,6 +232,9 @@ async def init_pack_runtime(pg: Any):
 
     async with signal_dir_lock:
         signal_direction_mask.clear()
+
+    async with symbols_lock:
+        active_symbols.clear()
 
     # 1) загрузка pack-конфига и построение registry
     packs = await load_enabled_packs(pg)
@@ -254,6 +265,11 @@ async def init_pack_runtime(pg: Any):
 
     pairs_total = len(configured_pairs_set)
     log.info("PACK_INIT: mtf runtimes=%s, configured_pairs=%s", mtf_runtimes, pairs_total)
+
+    # 2.0) активные тикеры (стартовый снимок)
+    symbols = await load_active_symbols_from_tickers_bb(pg)
+    async with symbols_lock:
+        active_symbols.update(set(symbols))
 
     # 2.1) направления сигналов (direction_mask)
     signal_ids = sorted({int(sig) for (_, sig) in configured_pairs_set})
@@ -290,13 +306,27 @@ async def init_pack_runtime(pg: Any):
                 continue
 
             # bins
-            loaded_bins = await load_adaptive_bins_for_pair(pg, int(run_id), [int(winner_aid)], int(scenario_id), int(signal_id), "bins")
+            loaded_bins = await load_adaptive_bins_for_pair(
+                pg,
+                int(run_id),
+                [int(winner_aid)],
+                int(scenario_id),
+                int(signal_id),
+                "bins",
+            )
             for (aid, tf, direction), rules in loaded_bins.items():
                 adaptive_bins_cache[(int(aid), int(scenario_id), int(signal_id), str(tf), str(direction))] = rules
                 bins_rules_total += len(rules)
 
             # quantiles
-            loaded_q = await load_adaptive_bins_for_pair(pg, int(run_id), [int(winner_aid)], int(scenario_id), int(signal_id), "quantiles")
+            loaded_q = await load_adaptive_bins_for_pair(
+                pg,
+                int(run_id),
+                [int(winner_aid)],
+                int(scenario_id),
+                int(signal_id),
+                "quantiles",
+            )
             for (aid, tf, direction), rules in loaded_q.items():
                 adaptive_quantiles_cache[(int(aid), int(scenario_id), int(signal_id), str(tf), str(direction))] = rules
                 quant_rules_total += len(rules)
@@ -306,18 +336,18 @@ async def init_pack_runtime(pg: Any):
 
     # итоговый лог старта
     log.info(
-        "PACK_INIT: winners cache ready — pairs=%s, found=%s, missing=%s; rules loaded — bins=%s, quantiles=%s; signal_dirs=%s",
+        "PACK_INIT: winners cache ready — pairs=%s, found=%s, missing=%s; rules loaded — bins=%s, quantiles=%s; signal_dirs=%s; active_symbols=%s",
         pairs_total,
         winners_found,
         winners_missing,
         bins_rules_total,
         quant_rules_total,
         len(signal_direction_mask),
+        len(active_symbols),
     )
 
     # пересобираем активные m5-триггеры победителей
     await _rebuild_active_triggers_m5()
-
 
 # 🔸 Reload on postproc_ready_v2: обновляем winner по паре + перезагружаем rules из bt_analysis_bin_dict_adaptive
 async def watch_postproc_ready(pg: Any, redis: Any):

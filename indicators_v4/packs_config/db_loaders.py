@@ -17,6 +17,7 @@ BINS_DICT_TABLE = "bt_analysis_bins_dict"
 ADAPTIVE_BINS_TABLE = "bt_analysis_bin_dict_adaptive"
 BINS_LABELS_TABLE = "bt_analysis_bins_labels_v2"
 RUNS_TABLE = "bt_signal_backfill_runs"
+BB_TICKERS_TABLE = "tickers_bb"
 SIGNALS_PARAMETERS_TABLE = "bt_signals_parameters"
 
 
@@ -238,6 +239,22 @@ async def load_winners_from_labels_v2(
     )
     return out
 
+# 🔸 DB loaders: active symbols from tickers_bb (for pack runtime context)
+async def load_active_symbols_from_tickers_bb(pg: Any) -> list[str]:
+    log = logging.getLogger("PACK_INIT")
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT symbol
+            FROM {BB_TICKERS_TABLE}
+            WHERE status = 'enabled' AND tradepermission = 'enabled'
+            ORDER BY symbol
+            """
+        )
+
+    symbols = [str(r["symbol"]) for r in rows if r.get("symbol")]
+    log.info("PACK_INIT: active symbols loaded — %s", len(symbols))
+    return symbols
 
 # 🔸 DB loaders: signal direction masks (mono-direction signals)
 async def load_signal_direction_masks(pg: Any, signal_ids: list[int]) -> dict[int, str]:
