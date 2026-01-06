@@ -611,7 +611,7 @@ async def init_lr_universal_live_v2(
     if step_min <= 0:
         raise RuntimeError(f"init_lr_universal_live_v2: unknown timeframe step for tf={timeframe}")
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_UNI_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, lr_instance_id=%s, indicator_base=%s",
         stream_key,
         len(cfgs),
@@ -910,7 +910,7 @@ async def _handle_indicator_ready_message(
         await _persist_live_signal(pg, redis, signal_id, symbol, timeframe, direction, open_time, decision_time, message, raw_message)
 
         ctx["counters"]["raw_sent_total"] = int(ctx["counters"].get("raw_sent_total", 0)) + 1
-        log.info(
+        log.debug(
             "BT_SIG_LR_UNI_LIVE_V2: signal_sent RAW — signal_id=%s %s %s %s",
             signal_id,
             symbol,
@@ -1304,7 +1304,7 @@ async def _handle_pack_ready_message(
         await _persist_live_signal(pg, redis, signal_id, symbol, tf_expected, direction, open_time, decision_time, message, raw_message)
 
         ctx["counters"]["filtered_sent_total"] = int(ctx["counters"].get("filtered_sent_total", 0)) + 1
-        log.info(
+        log.debug(
             "BT_SIG_LR_UNI_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s mode=%s",
             signal_id,
             symbol,

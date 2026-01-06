@@ -631,7 +631,7 @@ async def run_lr_universal_level2_stream_backfill(
     # winner analysis cfg (для выбора плагина)
     analysis_cfg = get_analysis_instance(int(winner_analysis_id))
     if not analysis_cfg:
-        log.info(
+        log.debug(
             "BT_SIG_LR_UNI_L2: winner analysis not in cache — skip (winner_analysis_id=%s)",
             winner_analysis_id,
         )
@@ -665,7 +665,7 @@ async def run_lr_universal_level2_stream_backfill(
         compute_bin_fn = compute_bb_mtf_bin_name
 
     else:
-        log.info(
+        log.debug(
             "BT_SIG_LR_UNI_L2: winner plugin not supported yet — winner_analysis_id=%s family=%s key=%s winner_param='%s'",
             winner_analysis_id,
             family_key,
@@ -686,7 +686,7 @@ async def run_lr_universal_level2_stream_backfill(
 
     # условий достаточности
     if not good_bins:
-        log.info(
+        log.debug(
             "BT_SIG_LR_UNI_L2: no good bins — skip generation (level2_signal_id=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s winner=%s dir=%s)",
             signal_id,
             scenario_id,
@@ -722,7 +722,7 @@ async def run_lr_universal_level2_stream_backfill(
         direction=direction,
     )
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_UNI_L2: start — level2_signal_id=%s name='%s' pipeline_mode=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s "
         "winner_analysis_id=%s winner_param='%s' score_version=%s dir=%s plugin=%s window=[%s..%s] tickers=%s bins=%s timeframes=%s existing=%s",
         signal_id,
@@ -817,7 +817,7 @@ async def run_lr_universal_level2_stream_backfill(
         skipped_no_bin += s_no_bin
         skipped_not_good_bin += s_not_good
 
-    log.info(
+    log.debug(
         "BT_SIG_LR_UNI_L2: summary — level2_signal_id=%s pipeline_mode=%s parent_scenario_id=%s parent_signal_id=%s run_id=%s winner=%s dir=%s "
         "plugin=%s bins=%s candidates=%s with_bin=%s good=%s insert_attempted=%s skipped_existing=%s skipped_no_data=%s skipped_no_bin=%s skipped_not_good=%s",
         signal_id,

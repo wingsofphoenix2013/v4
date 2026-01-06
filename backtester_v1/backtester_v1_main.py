@@ -20,11 +20,6 @@ from backtester_config import (
 # 🔸 Оркестратор псевдо-сигналов
 from bt_signals_main import run_bt_signals_orchestrator
 
-# 🔸 Управление загрузки в кеш таблицы labels
-from bt_signals_cache_config import run_bt_signals_cache_watcher
-# 🔸 Воркер переноса live-filtered сигналов в bt_signals_values
-from bt_signals_liveprocessor import run_bt_signals_liveprocessor
-
 # 🔸 Управление загрузки в кеш таблицы labels (v2)
 from bt_signals_cache_config_v2 import run_bt_signals_cache_watcher_v2
 
@@ -35,8 +30,6 @@ from bt_scenarios_postproc import run_bt_scenarios_postproc
 # 🔸 Оркестратор анализаторов
 from bt_analysis_main import run_bt_analysis_orchestrator
 
-# 🔸 Оркестратор препроцессинга анализов v1 (поиск оптимального порога)
-from bt_analysis_preproc import run_bt_analysis_preproc_orchestrator
 
 # 🔸 Оркестратор препроцессинга анализов v2 (stability + kept_bins)
 from bt_analysis_preproc_v2 import run_bt_analysis_preproc_v2_orchestrator
@@ -87,13 +80,10 @@ async def main():
     # запуск воркеров в безопасных циклах
     await asyncio.gather(
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
-        run_safe_loop(lambda: run_bt_signals_cache_watcher(pg, redis), "BT_SIGNALS_CACHE"),
-        run_safe_loop(lambda: run_bt_signals_liveprocessor(pg, redis), "BT_SIGNALS_LIVEPROCESSOR"),
         run_safe_loop(lambda: run_bt_signals_cache_watcher_v2(pg, redis), "BT_SIGNALS_CACHE_V2"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
-        run_safe_loop(lambda: run_bt_analysis_preproc_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC"),
         run_safe_loop(lambda: run_bt_analysis_preproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_postproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC_V2"),
     )
