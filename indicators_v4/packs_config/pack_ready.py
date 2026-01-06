@@ -1,4 +1,4 @@
-# packs_config/pack_ready.py — воркер готовности ind_pack: 4/4 по тикеру и m5-бару (таймаут 120с) → stream ind_pack_stream_ready + PG ind_pack_log_v4
+# packs_config/pack_ready.py — воркер готовности ind_pack: 4/4 по тикеру и m5-бару (таймаут 120с) → stream ind_pack_stream_ready + PG ind_pack_log_v4 (+ latency_ms)
 
 from __future__ import annotations
 
@@ -28,16 +28,16 @@ READY_DEADLINES_ZSET = "ind_pack_ready_deadlines"   # ZSET: score=deadline_ms, m
 # 🔸 Политики
 TIMEOUT_SEC = 120
 POLL_DEADLINES_SEC = 1.0
-STATE_TTL_SEC = 5 * 60  # 5 минут держим ключи состояния на всякий случай
+STATE_TTL_SEC = 5 * 60  # 5 минут держим ключи состояния
 READ_COUNT = 500
 BLOCK_MS = 2000
 
 # 🔸 SQL (PG)
 SQL_INSERT_LOG = """
     INSERT INTO ind_pack_log_v4
-        (symbol, timeframe, open_ts_ms, open_time, status, expected_count, received_count, published_at)
+        (symbol, timeframe, open_ts_ms, open_time, status, expected_count, received_count, published_at, latency_ms)
     VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8)
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     ON CONFLICT (symbol, timeframe, open_ts_ms) DO NOTHING
 """
 
@@ -61,16 +61,38 @@ def _now_ms() -> int:
     return int(datetime.utcnow().timestamp() * 1000)
 
 
-def _parse_open_time_to_ts_ms(open_time: Any) -> int | None:
+def _parse_open_time(open_time: Any) -> datetime | None:
     if open_time is None:
         return None
     try:
         dt = datetime.fromisoformat(str(open_time))
         if dt.tzinfo is not None:
             dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return int(dt.timestamp() * 1000)
+        return dt
     except Exception:
         return None
+
+
+def _parse_open_time_to_ts_ms(open_time: Any) -> int | None:
+    dt = _parse_open_time(open_time)
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _calc_latency_ms(published_at: datetime, open_time_dt: datetime | None, open_ts_ms: int | None) -> int | None:
+    # published_at / open_time_dt — naive UTC
+    try:
+        if open_time_dt is not None:
+            ms = int((published_at - open_time_dt).total_seconds() * 1000)
+            return max(0, ms)
+        if open_ts_ms is not None:
+            open_dt = datetime.utcfromtimestamp(int(open_ts_ms) / 1000).replace(tzinfo=None)
+            ms = int((published_at - open_dt).total_seconds() * 1000)
+            return max(0, ms)
+    except Exception:
+        return None
+    return None
 
 
 # 🔸 Pack pair token helper (signal:scenario)
@@ -109,27 +131,30 @@ async def _write_pg_log(
     pg: Any,
     symbol: str,
     open_ts_ms: int,
-    open_time: datetime | None,
+    open_time_dt: datetime | None,
     status: str,
     expected_count: int,
     received_count: int,
     published_at: datetime,
 ):
+    latency_ms = _calc_latency_ms(published_at, open_time_dt, open_ts_ms)
+
     async with pg.acquire() as conn:
         await conn.execute(
             SQL_INSERT_LOG,
             str(symbol),
             "mtf",
             int(open_ts_ms),
-            open_time,
+            open_time_dt,
             str(status),
             int(expected_count),
             int(received_count),
             published_at,
+            int(latency_ms) if latency_ms is not None else None,
         )
 
 
-# 🔸 Publish ready to Redis Stream
+# 🔸 Publish ready to Redis Stream (ok only)
 async def _publish_ready_stream(
     redis: Any,
     symbol: str,
@@ -169,17 +194,9 @@ async def _finalize_ok(
         return False
 
     published_at = _now_utc_naive()
+    open_time_dt = _parse_open_time(open_time_iso)
 
     # PG write
-    open_time_dt = None
-    try:
-        if open_time_iso:
-            open_time_dt = datetime.fromisoformat(str(open_time_iso))
-            if open_time_dt.tzinfo is not None:
-                open_time_dt = open_time_dt.astimezone(timezone.utc).replace(tzinfo=None)
-    except Exception:
-        open_time_dt = None
-
     await _write_pg_log(pg, str(symbol), int(open_ts_ms), open_time_dt, "ok", int(expected_count), int(received_count), published_at)
 
     # Stream publish
@@ -204,16 +221,7 @@ async def _finalize_error(
         return False
 
     published_at = _now_utc_naive()
-
-    # PG write
-    open_time_dt = None
-    try:
-        if open_time_iso:
-            open_time_dt = datetime.fromisoformat(str(open_time_iso))
-            if open_time_dt.tzinfo is not None:
-                open_time_dt = open_time_dt.astimezone(timezone.utc).replace(tzinfo=None)
-    except Exception:
-        open_time_dt = None
+    open_time_dt = _parse_open_time(open_time_iso)
 
     await _write_pg_log(pg, str(symbol), int(open_ts_ms), open_time_dt, "error", int(expected_count), int(received_count), published_at)
     return True
@@ -225,16 +233,16 @@ async def run_pack_ready(pg: Any, redis: Any):
 
     # ждём, пока pack runtime инициализируется (configured_pairs_set должен быть готов)
     while not caches_ready.get("registry", False) or not configured_pairs_set:
-        log.info("PACK_READY: waiting for pack runtime init (registry/pairs not ready yet)")
+        log.debug("PACK_READY: waiting for pack runtime init (registry/pairs not ready yet)")
         await asyncio.sleep(1.0)
 
     expected = _expected_tokens()
     expected_count = len(expected)
     expected_csv = ",".join(expected)
 
-    log.info("PACK_READY: started — expected_pairs=%s (%s)", expected_count, expected_csv)
+    log.debug("PACK_READY: started — expected_pairs=%s (%s)", expected_count, expected_csv)
 
-    # создать группы заранее
+    # создать группу заранее
     await ensure_stream_group(redis, IND_PACK_STREAM_CORE, READY_GROUP)
 
     # loop tasks
@@ -324,10 +332,9 @@ async def run_pack_ready(pg: Any, redis: Any):
 
                         token = _pair_token(sig, sc)
 
-                        # first-seen: register deadline + meta (best-effort)
+                        # first-seen: register deadline + meta
                         member = _member_key(symbol, open_ts_ms)
                         deadline_ms = _now_ms() + TIMEOUT_SEC * 1000
-                        # deadline only once
                         await redis.zadd(READY_DEADLINES_ZSET, {member: deadline_ms}, nx=True)
 
                         # meta: keep open_time if present
@@ -343,15 +350,23 @@ async def run_pack_ready(pg: Any, redis: Any):
 
                         # finalize ok when complete
                         if received_count >= expected_count:
-                            # build pairs in canonical order
                             pairs_csv = expected_csv
-                            if await _finalize_ok(pg, redis, symbol, open_ts_ms, expected_count, expected_count, pairs_csv, str(open_time_iso) if open_time_iso else None):
-                                # cleanup redis state keys (optional; keep final flag)
+                            if await _finalize_ok(
+                                pg,
+                                redis,
+                                symbol,
+                                open_ts_ms,
+                                expected_count,
+                                expected_count,
+                                pairs_csv,
+                                str(open_time_iso) if open_time_iso else None,
+                            ):
+                                # cleanup redis state keys (keep final flag)
                                 await redis.zrem(READY_DEADLINES_ZSET, member)
                                 await redis.delete(set_key)
                                 await redis.delete(meta_key)
                                 ready_emitted += 1
-                                log.info(
+                                log.debug(
                                     "PACK_READY: OK (symbol=%s, open_ts_ms=%s, open_time=%s, expected=%s, received=%s)",
                                     symbol,
                                     open_ts_ms,
@@ -387,7 +402,6 @@ async def run_pack_ready(pg: Any, redis: Any):
         while True:
             try:
                 now_ms = _now_ms()
-                # берём небольшими пачками
                 members = await redis.zrangebyscore(READY_DEADLINES_ZSET, min="-inf", max=now_ms, start=0, num=200)
                 if not members:
                     await asyncio.sleep(POLL_DEADLINES_SEC)
@@ -427,7 +441,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                             # race: complete but not finalized yet
                             open_time_iso = await redis.hget(meta_key, "open_time")
                             if await _finalize_ok(pg, redis, symbol, open_ts_ms, expected_count, expected_count, expected_csv, str(open_time_iso) if open_time_iso else None):
-                                log.info(
+                                log.debug(
                                     "PACK_READY: OK (race) (symbol=%s, open_ts_ms=%s, open_time=%s)",
                                     symbol,
                                     open_ts_ms,
@@ -443,7 +457,7 @@ async def run_pack_ready(pg: Any, redis: Any):
                         open_time_iso = await redis.hget(meta_key, "open_time")
                         if await _finalize_error(pg, redis, symbol, open_ts_ms, expected_count, received_count, str(open_time_iso) if open_time_iso else None):
                             errors_logged += 1
-                            log.info(
+                            log.debug(
                                 "PACK_READY: ERROR timeout (symbol=%s, open_ts_ms=%s, open_time=%s, expected=%s, received=%s)",
                                 symbol,
                                 open_ts_ms,
