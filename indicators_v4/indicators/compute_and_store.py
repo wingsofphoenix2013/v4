@@ -5,7 +5,7 @@ import asyncio
 import math
 from datetime import datetime
 
-# 🔸 Импорт индикаторов (как было)
+# 🔸 Импорт индикаторов
 from indicators import ema, atr, lr, mfi, rsi, adx_dmi, macd, bb, kama, supertrend
 
 # 🔸 Сопоставление имён индикаторов с функциями
@@ -27,6 +27,7 @@ INDICATOR_STREAM_CORE = "indicator_stream_core"
 INDICATOR_STREAM_READY = "indicator_stream"
 
 
+# 🔸 Валидация чисел
 def _is_finite_number(x) -> bool:
     try:
         return x is not None and isinstance(x, (int, float)) and math.isfinite(float(x))
@@ -51,7 +52,7 @@ def _build_supertrend_source_param_name(params: dict) -> str:
     return f"supertrend{length}_{mult_str}"
 
 
-# 🔸 Расчёт и обработка результата одного расчётного экземпляра
+# 🔸 Расчёт и обработка результата одного расчётного экземпляра (pipeline + MSET)
 async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, precision):
     log = logging.getLogger("CALC")
     log.debug("[TRACE] compute_and_store received precision=%s for %s (instance_id=%s)", precision, symbol, instance_id)
@@ -66,13 +67,13 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         log.warning("⛔ Неизвестный индикатор: %s", indicator)
         return
 
+    # расчёт индикатора
     try:
         raw_result = compute_fn(df, params)
 
-        # округление
+        # округление + фильтрация
         result = {}
         for k, v in raw_result.items():
-            # фильтрация нечисловых / inf / nan
             if not _is_finite_number(v):
                 log.debug("[SKIP] %s %s/%s → %s is non-finite (%s)", indicator, symbol, timeframe, k, v)
                 continue
@@ -99,7 +100,12 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
     # 🔸 Время бара (UTC-naive ISO без таймзоны)
     open_time_iso = datetime.utcfromtimestamp(int(ts) / 1000).isoformat()
 
-    tasks = []
+    # 🔸 Подготовка пачки команд (pipeline)
+    pipe = redis.pipeline(transaction=False)
+
+    # подготовка mset для KV
+    kv_map = {}
+
     added_core = 0
     added_kv = 0
     added_ts = 0
@@ -117,25 +123,23 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         else:
             str_value = f"{value:.{precision}f}"
 
-        # Redis KV
+        # Redis KV (выполним через MSET одной командой)
         redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
-        tasks.append(redis.set(redis_key, str_value))
+        kv_map[redis_key] = str_value
         added_kv += 1
 
-        # Redis TS
+        # Redis TS (как было: TS.ADD с retention + duplicate_policy)
         ts_key = f"ts_ind:{symbol}:{timeframe}:{param_name}"
-        ts_add = redis.execute_command(
+        pipe.execute_command(
             "TS.ADD", ts_key, int(ts), str_value,
             "RETENTION", 1209600000,  # 14 дней
             "DUPLICATE_POLICY", "last"
         )
-        if asyncio.iscoroutine(ts_add):
-            tasks.append(ts_add)
-            added_ts += 1
+        added_ts += 1
 
-        # Redis Stream (core)
+        # Redis Stream (core) — по одному сообщению на параметр
         stream_precision = 5 if "angle" in param_name else precision
-        tasks.append(redis.xadd(INDICATOR_STREAM_CORE, {
+        pipe.xadd(INDICATOR_STREAM_CORE, {
             "symbol": symbol,
             "interval": timeframe,
             "instance_id": str(instance_id),
@@ -143,8 +147,12 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
             "param_name": param_name,
             "value": str_value,
             "precision": str(stream_precision),
-        }))
+        })
         added_core += 1
+
+    # mset после подготовки всех ключей
+    if kv_map:
+        pipe.mset(kv_map)
 
     # Redis Stream (готовность)
     if stream:
@@ -160,17 +168,24 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
         if indicator == "supertrend":
             ready_payload["source_param_name"] = _build_supertrend_source_param_name(params)
 
-        tasks.append(redis.xadd(INDICATOR_STREAM_READY, ready_payload))
+        pipe.xadd(INDICATOR_STREAM_READY, ready_payload)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # выполнение пачки
+    results = await pipe.execute(raise_on_error=False)
 
-    # суммирующий результат (по месту): логируем только если публиковали ready, чтобы не шуметь по всем инстансам
+    # суммирование ошибок (как раньше через return_exceptions=True)
+    errors = 0
+    for r in results:
+        if isinstance(r, Exception):
+            errors += 1
+
+    # 🔸 Суммирующий лог (чтобы не шуметь — только если публиковали ready)
     if stream:
-        errors = sum(1 for r in results if isinstance(r, Exception))
         extra = ""
         if indicator == "supertrend":
             extra = f", source_param_name={_build_supertrend_source_param_name(params)}"
-        log.debug(
+
+        log.info(
             "CALC: done (symbol=%s, tf=%s, indicator=%s, base=%s%s, params=%s, core=%s, kv=%s, ts=%s, errors=%s)",
             symbol,
             timeframe,
@@ -233,6 +248,7 @@ def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> 
         log.warning("⛔ Неизвестный индикатор: %s", indicator)
         return {}
 
+    # расчёт индикатора
     try:
         raw = compute_fn(df, params)
     except Exception as e:
