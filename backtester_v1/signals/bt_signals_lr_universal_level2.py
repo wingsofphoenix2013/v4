@@ -25,6 +25,11 @@ from signals_plugins.lr_angle_mtf import (
     prepare_symbol_series as prepare_lr_angle_mtf_symbol_series,
     compute_lr_angle_mtf_bin_name,
 )
+from signals_plugins.bb_mtf import (
+    init_bb_mtf_plugin_context,
+    prepare_symbol_series as prepare_bb_mtf_symbol_series,
+    compute_bb_mtf_bin_name,
+)
 
 # 🔸 Кеши backtester_v1
 from backtester_config import (
@@ -652,6 +657,12 @@ async def run_lr_universal_level2_stream_backfill(
         init_plugin = init_lr_angle_mtf_plugin_context
         prepare_series_fn = prepare_lr_angle_mtf_symbol_series
         compute_bin_fn = compute_lr_angle_mtf_bin_name
+
+    elif family_key == "bb" and analysis_key == "bb_mtf":
+        plugin_name = "bb_mtf"
+        init_plugin = init_bb_mtf_plugin_context
+        prepare_series_fn = prepare_bb_mtf_symbol_series
+        compute_bin_fn = compute_bb_mtf_bin_name
 
     else:
         log.info(
