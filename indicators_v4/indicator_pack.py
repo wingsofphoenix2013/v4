@@ -1039,100 +1039,196 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
 
     return {"ok": published_ok, "fail": published_fail, "runtimes": len(runtimes)}
 
-# 🔸 Watch indicator_stream (parallel + фильтры m5/active triggers)
+# 🔸 Watch indicator_stream (parallel + фильтры m5/active triggers + event-driven styk m15/h1)
 async def watch_indicator_stream(redis: Any):
     log = logging.getLogger("PACK_STREAM")
     sem = asyncio.Semaphore(MAX_PARALLEL_MESSAGES)
 
     async def _process_one(data: dict, active_keys_m5: set[str]) -> dict[str, int]:
         async with sem:
-            tf = data.get("timeframe")
-            ind = data.get("indicator")
+            tf = str(data.get("timeframe") or "")
+            ind = str(data.get("indicator") or "")
+            status = str(data.get("status") or "")
+            symbol = str(data.get("symbol") or "")
+            open_time = data.get("open_time")
+            source_param_name = data.get("source_param_name")
 
-            # фильтр: нас интересует только m5
-            if tf != "m5":
-                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_tf": 1, "skipped_trigger": 0}
+            # нас интересуют только ready (indicator_stream по факту и так ready, но страхуемся)
+            if status != "ready":
+                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_status": 1, "skipped_tf": 0, "skipped_trigger": 0, "pending": 0, "unlocked": 0}
+
+            # фильтр tf: m5 — считаем, m15/h1 — только отмечаем ready (event-driven)
+            if tf not in ("m5", "m15", "h1"):
+                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_status": 0, "skipped_tf": 1, "skipped_trigger": 0, "pending": 0, "unlocked": 0}
 
             # фильтр: только активные триггеры победителей
-            if not ind or str(ind) not in active_keys_m5:
-                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_tf": 0, "skipped_trigger": 1}
+            # (для m15/h1 это тоже базовый indicator_key, например lr100)
+            if not ind or ind not in active_keys_m5:
+                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_status": 0, "skipped_tf": 0, "skipped_trigger": 1, "pending": 0, "unlocked": 0}
+
+            # open_ts_ms
+            open_ts_ms = parse_open_time_to_open_ts_ms(str(open_time) if open_time is not None else None)
+            if open_ts_ms is None:
+                # не можем ключить бар
+                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_status": 0, "skipped_tf": 0, "skipped_trigger": 0, "pending": 0, "unlocked": 0}
+
+            series = normalize_series(ind, source_param_name)
+
+            # m15/h1: только mark_ready и разблокировать pending
+            if tf in ("m15", "h1"):
+                unlocked = mtf_gate.mark_ready(symbol=str(symbol), timeframe=str(tf), indicator_key=str(ind), series=series, open_ts_ms=int(open_ts_ms))
+                unlocked_cnt = 0
+                ok_sum = 0
+                fail_sum = 0
+                runtimes_sum = 0
+
+                for p in unlocked:
+                    # запускаем расчёт как будто пришло m5 ready (именно это ждём на стыках)
+                    msg = {
+                        "symbol": str(p.symbol),
+                        "timeframe": "m5",
+                        "indicator": str(p.indicator_key),
+                        "open_time": str(p.open_time_iso) if p.open_time_iso is not None else None,
+                        "status": "ready",
+                        "source_param_name": str(p.series) if p.series is not None else None,
+                    }
+                    r = await handle_indicator_event(redis, msg)
+                    ok_sum += int(r.get("ok", 0))
+                    fail_sum += int(r.get("fail", 0))
+                    runtimes_sum += int(r.get("runtimes", 0))
+                    unlocked_cnt += 1
+
+                return {
+                    "ok": ok_sum,
+                    "fail": fail_sum,
+                    "runtimes": runtimes_sum,
+                    "skipped_status": 0,
+                    "skipped_tf": 0,
+                    "skipped_trigger": 0,
+                    "pending": 0,
+                    "unlocked": unlocked_cnt,
+                }
+
+            # m5: event-driven gate на стыках
+            can_run, pending = mtf_gate.register_m5(
+                symbol=str(symbol),
+                indicator_key=str(ind),
+                series=series,
+                open_ts_ms=int(open_ts_ms),
+                open_time_iso=str(open_time) if open_time is not None else None,
+            )
+
+            if not can_run:
+                # ждём m15/h1 ready, расчёт запустится позже
+                return {"ok": 0, "fail": 0, "runtimes": 0, "skipped_status": 0, "skipped_tf": 0, "skipped_trigger": 0, "pending": 1, "unlocked": 0}
 
             msg = {
-                "symbol": data.get("symbol"),
-                "timeframe": str(tf),
+                "symbol": str(symbol),
+                "timeframe": "m5",
                 "indicator": str(ind),
-                "open_time": data.get("open_time"),
-                "status": data.get("status"),
-                "source_param_name": data.get("source_param_name"),
+                "open_time": str(open_time) if open_time is not None else None,
+                "status": "ready",
+                "source_param_name": str(source_param_name) if source_param_name is not None else None,
             }
 
             r = await handle_indicator_event(redis, msg)
+            r.setdefault("skipped_status", 0)
             r.setdefault("skipped_tf", 0)
             r.setdefault("skipped_trigger", 0)
+            r.setdefault("pending", 0)
+            r.setdefault("unlocked", 0)
             return r
 
-    while True:
-        try:
-            resp = await redis.xreadgroup(
-                IND_PACK_GROUP,
-                IND_PACK_CONSUMER,
-                streams={INDICATOR_STREAM: ">"},
-                count=STREAM_READ_COUNT,
-                block=STREAM_BLOCK_MS,
-            )
-            if not resp:
-                continue
+    async def _timeout_loop():
+        while True:
+            try:
+                timed_out = mtf_gate.pop_timeouts()
+                if timed_out:
+                    total = 0
+                    for p in timed_out:
+                        total += await publish_mtf_timeout(redis, p)
+                    log.info("PACK_STREAM: mtf_ready timeouts handled=%s, published_fail=%s", len(timed_out), total)
+                await asyncio.sleep(MTF_READY_POLL_SEC)
+            except Exception as e:
+                log.error("PACK_STREAM: mtf_ready timeout loop error: %s", e, exc_info=True)
+                await asyncio.sleep(2)
 
-            flat: list[tuple[str, dict[str, Any]]] = []
-            for _, messages in resp:
-                for msg_id, data in messages:
-                    flat.append((msg_id, data))
-            if not flat:
-                continue
-
-            to_ack = [msg_id for msg_id, _ in flat]
-
-            # активные m5-триггеры победителей (снимок на батч)
-            active_keys_m5 = get_active_trigger_keys_m5()
-
-            tasks = [asyncio.create_task(_process_one(data, active_keys_m5)) for _, data in flat]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            batch_ok = 0
-            batch_fail = 0
-            batch_runtimes = 0
-            batch_skipped_tf = 0
-            batch_skipped_trigger = 0
-            errors = 0
-
-            for r in results:
-                if isinstance(r, Exception):
-                    errors += 1
+    async def _stream_loop():
+        while True:
+            try:
+                resp = await redis.xreadgroup(
+                    IND_PACK_GROUP,
+                    IND_PACK_CONSUMER,
+                    streams={INDICATOR_STREAM: ">"},
+                    count=STREAM_READ_COUNT,
+                    block=STREAM_BLOCK_MS,
+                )
+                if not resp:
                     continue
-                batch_ok += int(r.get("ok", 0))
-                batch_fail += int(r.get("fail", 0))
-                batch_runtimes += int(r.get("runtimes", 0))
-                batch_skipped_tf += int(r.get("skipped_tf", 0))
-                batch_skipped_trigger += int(r.get("skipped_trigger", 0))
 
-            await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
+                flat: list[tuple[str, dict[str, Any]]] = []
+                for _, messages in resp:
+                    for msg_id, data in messages:
+                        flat.append((msg_id, data))
+                if not flat:
+                    continue
 
-            # суммирующий лог по батчу
-            log.debug(
-                "PACK_STREAM: batch done (msgs=%s, runtimes_total=%s, ok=%s, fail=%s, skipped_tf=%s, skipped_trigger=%s, errors=%s)",
-                len(flat),
-                batch_runtimes,
-                batch_ok,
-                batch_fail,
-                batch_skipped_tf,
-                batch_skipped_trigger,
-                errors,
-            )
+                to_ack = [msg_id for msg_id, _ in flat]
 
-        except Exception as e:
-            log.error("PACK_STREAM loop error: %s", e, exc_info=True)
-            await asyncio.sleep(2)
+                # активные m5-триггеры победителей (снимок на батч)
+                active_keys_m5 = get_active_trigger_keys_m5()
 
+                tasks = [asyncio.create_task(_process_one(data, active_keys_m5)) for _, data in flat]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                batch_ok = 0
+                batch_fail = 0
+                batch_runtimes = 0
+                batch_skipped_status = 0
+                batch_skipped_tf = 0
+                batch_skipped_trigger = 0
+                batch_pending = 0
+                batch_unlocked = 0
+                errors = 0
+
+                for r in results:
+                    if isinstance(r, Exception):
+                        errors += 1
+                        continue
+                    batch_ok += int(r.get("ok", 0))
+                    batch_fail += int(r.get("fail", 0))
+                    batch_runtimes += int(r.get("runtimes", 0))
+                    batch_skipped_status += int(r.get("skipped_status", 0))
+                    batch_skipped_tf += int(r.get("skipped_tf", 0))
+                    batch_skipped_trigger += int(r.get("skipped_trigger", 0))
+                    batch_pending += int(r.get("pending", 0))
+                    batch_unlocked += int(r.get("unlocked", 0))
+
+                await redis.xack(INDICATOR_STREAM, IND_PACK_GROUP, *to_ack)
+
+                # суммирующий лог по батчу
+                log.debug(
+                    "PACK_STREAM: batch done (msgs=%s, runtimes_total=%s, ok=%s, fail=%s, pending=%s, unlocked=%s, skipped_status=%s, skipped_tf=%s, skipped_trigger=%s, errors=%s)",
+                    len(flat),
+                    batch_runtimes,
+                    batch_ok,
+                    batch_fail,
+                    batch_pending,
+                    batch_unlocked,
+                    batch_skipped_status,
+                    batch_skipped_tf,
+                    batch_skipped_trigger,
+                    errors,
+                )
+
+            except Exception as e:
+                log.error("PACK_STREAM loop error: %s", e, exc_info=True)
+                await asyncio.sleep(2)
+
+    await asyncio.gather(
+        _stream_loop(),
+        _timeout_loop(),
+    )
 
 # 🔸 run worker
 async def run_indicator_pack(pg: Any, redis: Any):
