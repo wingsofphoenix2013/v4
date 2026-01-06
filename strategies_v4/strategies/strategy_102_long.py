@@ -1,18 +1,18 @@
-# strategy_250_short.py
+# strategy_102_long.py
 
 import logging
 import json
 
-log = logging.getLogger("strategy_250_short")
+log = logging.getLogger("strategy_102_long")
 
-class Strategy250Short:
+class Strategy102Long:
     async def validate_signal(self, signal, context):
         direction = signal["direction"].lower()
 
-        if direction == "short":
+        if direction == "long":
             return True
-        elif direction == "long":
-            return ("ignore", "long сигналы отключены")
+        elif direction == "short":
+            return ("ignore", "short сигналы отключены")
         else:
             return ("ignore", f"неизвестное направление: {direction}")
 
