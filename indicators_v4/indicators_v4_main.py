@@ -1,4 +1,4 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (OHLCV worker-пул для параллельной обработки)
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (worker-пул OHLCV + ограничение конкурентности Redis + улучшенные логи)
 
 # 🔸 Импорты и зависимости
 import os
@@ -49,6 +49,9 @@ TF_STEP_MS = {
 OHLCV_WORKERS = int(os.getenv("IV4_OHLCV_WORKERS", "8"))
 OHLCV_QUEUE_MAXSIZE = int(os.getenv("IV4_OHLCV_QUEUE_MAXSIZE", "5000"))
 OHLCV_STATS_PERIOD_SEC = int(os.getenv("IV4_OHLCV_STATS_PERIOD_SEC", "60"))
+
+# 🔸 Ограничение конкурентности записи индикаторов в Redis (защита от connect timeouts)
+OHLCV_CALC_CONCURRENCY = int(os.getenv("IV4_CALC_CONCURRENCY", "32"))
 
 
 # 🔸 Вспомогательные геттеры для воркеров
@@ -372,7 +375,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
 
 
 # 🔸 Worker: обработка одного OHLCV-события (загрузка TS → compute_and_store)
-async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, stats: dict):
+async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, stats: dict, calc_sem: asyncio.Semaphore):
     log = logging.getLogger(f"OHLCV_WORKER:{worker_id}")
 
     while True:
@@ -411,9 +414,13 @@ async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, s
                 stats["skipped_no_data"] += 1
                 continue
 
-            # расчёт и запись индикаторов
+            # ограничение конкурентности по Redis pipeline execute (защита от Timeout connecting)
+            async def _run_instance(iid: int):
+                async with calc_sem:
+                    await compute_and_store(iid, indicator_instances[iid], symbol, df, int(ts), pg, redis, precision)
+
             await asyncio.gather(*[
-                compute_and_store(iid, indicator_instances[iid], symbol, df, int(ts), pg, redis, precision)
+                _run_instance(iid)
                 for iid in relevant_instances
             ])
 
@@ -423,8 +430,10 @@ async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, s
             stats[f"processed_{interval}"] += 1
             stats["lag_ms_sum"] += lag_ms
             stats["proc_ms_sum"] += proc_ms
-            stats["lag_ms_max"] = max(stats["lag_ms_max"], lag_ms)
-            stats["proc_ms_max"] = max(stats["proc_ms_max"], proc_ms)
+            stats["lag_ms_max_period"] = max(stats["lag_ms_max_period"], lag_ms)
+            stats["proc_ms_max_period"] = max(stats["proc_ms_max_period"], proc_ms)
+            stats["lag_ms_max_life"] = max(stats["lag_ms_max_life"], lag_ms)
+            stats["proc_ms_max_life"] = max(stats["proc_ms_max_life"], proc_ms)
 
         except Exception as e:
             stats["errors"] += 1
@@ -433,7 +442,7 @@ async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, s
             queue.task_done()
 
 
-# 🔸 Reporter: суммирующий log.info по OHLCV-очереди и метрикам обработки
+# 🔸 Reporter: суммирующий log.info (только когда есть активность)
 async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
     log = logging.getLogger("OHLCV_STATS")
 
@@ -442,13 +451,16 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
         "enqueued": 0,
         "queue_blocked": 0,
         "processed": 0,
+        "processed_m5": 0,
+        "processed_m15": 0,
+        "processed_h1": 0,
         "skipped_inactive": 0,
         "skipped_no_instances": 0,
         "skipped_no_data": 0,
         "skipped_m1": 0,
         "errors": 0,
         "lag_ms_sum": 0,
-        "proc_ms_sum": 0,
+        "proc_ms_sum": 0.0,
     }
 
     while True:
@@ -467,8 +479,6 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
 
         lag_sum = stats["lag_ms_sum"]
         proc_sum = stats["proc_ms_sum"]
-        lag_max = stats["lag_ms_max"]
-        proc_max = stats["proc_ms_max"]
 
         # дельты за период
         d_rec = rec - prev["received"]
@@ -484,19 +494,30 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
         d_lag_sum = lag_sum - prev["lag_ms_sum"]
         d_proc_sum = proc_sum - prev["proc_ms_sum"]
 
+        # ничего не произошло за период — не шумим логами
+        if (d_rec + d_enq + d_qbk + d_prc + d_ski + d_skn + d_skd + d_skm + d_err) == 0:
+            continue
+
         # средние за период
         lag_avg_s = (d_lag_sum / max(1, d_prc)) / 1000.0
         proc_avg_ms = d_proc_sum / max(1, d_prc)
 
-        # per-tf за период (приблизительно)
-        d_m5 = stats["processed_m5"] - prev.get("processed_m5", 0)
-        d_m15 = stats["processed_m15"] - prev.get("processed_m15", 0)
-        d_h1 = stats["processed_h1"] - prev.get("processed_h1", 0)
+        # per-tf за период
+        d_m5 = stats["processed_m5"] - prev["processed_m5"]
+        d_m15 = stats["processed_m15"] - prev["processed_m15"]
+        d_h1 = stats["processed_h1"] - prev["processed_h1"]
+
+        # max за период (сбросим после логирования)
+        lag_max_period_s = stats["lag_ms_max_period"] / 1000.0
+        proc_max_period_ms = stats["proc_ms_max_period"]
+        stats["lag_ms_max_period"] = 0
+        stats["proc_ms_max_period"] = 0.0
 
         log.info(
             "OHLCV: qsize=%s recv=%s enq=%s blocked=%s proc=%s (m5=%s,m15=%s,h1=%s) "
             "skip[inactive=%s,noinst=%s,nodata=%s,m1=%s] err=%s "
-            "lag_avg=%.2fs lag_max=%.2fs proc_avg=%.1fms proc_max=%.1fms",
+            "lag_avg=%.2fs lag_max=%.2fs proc_avg=%.1fms proc_max=%.1fms "
+            "life[lag_max=%.2fs proc_max=%.1fms]",
             queue.qsize(),
             d_rec,
             d_enq,
@@ -511,9 +532,11 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
             d_skm,
             d_err,
             lag_avg_s,
-            lag_max / 1000.0,
+            lag_max_period_s,
             proc_avg_ms,
-            proc_max,
+            proc_max_period_ms,
+            stats["lag_ms_max_life"] / 1000.0,
+            stats["proc_ms_max_life"],
         )
 
         # обновляем prev
@@ -521,6 +544,9 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
         prev["enqueued"] = enq
         prev["queue_blocked"] = qblk
         prev["processed"] = prc
+        prev["processed_m5"] = stats["processed_m5"]
+        prev["processed_m15"] = stats["processed_m15"]
+        prev["processed_h1"] = stats["processed_h1"]
         prev["skipped_inactive"] = ski
         prev["skipped_no_instances"] = skn
         prev["skipped_no_data"] = skd
@@ -528,11 +554,6 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
         prev["errors"] = err
         prev["lag_ms_sum"] = lag_sum
         prev["proc_ms_sum"] = proc_sum
-        prev["processed_m5"] = stats["processed_m5"]
-        prev["processed_m15"] = stats["processed_m15"]
-        prev["processed_h1"] = stats["processed_h1"]
-
-        # после отчёта сбрасывать max не будем — пусть отражает худший кейс за аптайм
 
 
 # 🔸 Обработка событий из канала OHLCV (Bybit pub/sub) — listener + очередь + worker-пул
@@ -559,21 +580,26 @@ async def watch_ohlcv_events(pg, redis):
         "errors": 0,
         "lag_ms_sum": 0,
         "proc_ms_sum": 0.0,
-        "lag_ms_max": 0,
-        "proc_ms_max": 0.0,
+        "lag_ms_max_period": 0,
+        "proc_ms_max_period": 0.0,
+        "lag_ms_max_life": 0,
+        "proc_ms_max_life": 0.0,
     }
+
+    calc_sem = asyncio.Semaphore(OHLCV_CALC_CONCURRENCY)
 
     # стартуем воркеры и репортинг
     workers = [
-        asyncio.create_task(_ohlcv_event_worker(i + 1, queue, pg, redis, stats))
+        asyncio.create_task(_ohlcv_event_worker(i + 1, queue, pg, redis, stats, calc_sem))
         for i in range(OHLCV_WORKERS)
     ]
     reporter = asyncio.create_task(_ohlcv_stats_reporter(queue, stats))
 
     log.info(
-        "OHLCV_EVENTS: started (workers=%s, queue_max=%s, stats_period=%ss)",
+        "OHLCV_EVENTS: started (workers=%s, queue_max=%s, calc_concurrency=%s, stats_period=%ss)",
         OHLCV_WORKERS,
         OHLCV_QUEUE_MAXSIZE,
+        OHLCV_CALC_CONCURRENCY,
         OHLCV_STATS_PERIOD_SEC,
     )
 
@@ -666,7 +692,6 @@ async def main():
     await load_initial_indicators(pg)
     await load_initial_strategies(pg)
 
-    # инструкции по включению в общий оркестратор:
     # - модуль запускается как часть общего процесса (через run_safe_loop)
     # - все воркеры ниже самостоятельны и перезапускаются при ошибках
     await asyncio.gather(
