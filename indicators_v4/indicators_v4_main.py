@@ -52,7 +52,7 @@ TF_PRIORITY = {
 }
 
 # 🔸 Конфиг воркеров OHLCV (параллельная обработка событий закрытия свечи)
-OHLCV_WORKERS = int(os.getenv("IV4_OHLCV_WORKERS", "8"))
+OHLCV_WORKERS = int(os.getenv("IV4_OHLCV_WORKERS", "6"))
 OHLCV_QUEUE_MAXSIZE = int(os.getenv("IV4_OHLCV_QUEUE_MAXSIZE", "5000"))
 OHLCV_STATS_PERIOD_SEC = int(os.getenv("IV4_OHLCV_STATS_PERIOD_SEC", "60"))
 

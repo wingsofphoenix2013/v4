@@ -15,7 +15,7 @@ CORE_STREAM = "indicator_stream_core"
 CORE_GROUP = os.getenv("IV4_CORE_IO_GROUP", "group_core_io")
 CONSUMER_PREFIX = os.getenv("IV4_CORE_IO_CONSUMER_PREFIX", "core_io")
 
-CORE_IO_CONSUMERS = int(os.getenv("IV4_CORE_IO_CONSUMERS", "2"))
+CORE_IO_CONSUMERS = int(os.getenv("IV4_CORE_IO_CONSUMERS", "3"))
 CORE_IO_BATCH = int(os.getenv("IV4_CORE_IO_BATCH", "2000"))
 CORE_IO_BLOCK_MS = int(os.getenv("IV4_CORE_IO_BLOCK_MS", "500"))
 

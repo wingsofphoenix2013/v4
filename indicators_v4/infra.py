@@ -20,7 +20,7 @@ async def init_redis_client():
         REDIS_URL,
         decode_responses=True,
         encoding="utf-8",
-        socket_connect_timeout=3,
+        socket_connect_timeout=10,
         socket_keepalive=True,
     )
     # health-check с короткими ретраями
