@@ -14,7 +14,7 @@ from indicator_auditor import run_indicator_auditor
 from indicator_healer import run_indicator_healer
 from indicator_ts_filler import run_indicator_ts_filler
 from core_io import run_core_io
-from indicators.compute_and_store import compute_and_store, compute_snapshot_values_async
+from indicators.compute_and_store import compute_indicator_values, append_writes_to_pipeline
 from cleanup_worker import run_indicators_cleanup
 # from indicator_pack import run_indicator_pack
 # from packs_config.pack_io import run_pack_io
@@ -28,7 +28,6 @@ required_candles = {
     "m15": 800,
     "h1": 800,
 }
-active_strategies = {}      # стратегия id -> market_watcher: bool
 
 AUDIT_WINDOW_HOURS = 72
 
@@ -53,7 +52,7 @@ TF_PRIORITY = {
 }
 
 # 🔸 Конфиг воркеров OHLCV (параллельная обработка событий закрытия свечи)
-OHLCV_WORKERS = int(os.getenv("IV4_OHLCV_WORKERS", "8"))
+OHLCV_WORKERS = int(os.getenv("IV4_OHLCV_WORKERS", "12"))
 OHLCV_QUEUE_MAXSIZE = int(os.getenv("IV4_OHLCV_QUEUE_MAXSIZE", "5000"))
 OHLCV_STATS_PERIOD_SEC = int(os.getenv("IV4_OHLCV_STATS_PERIOD_SEC", "60"))
 
@@ -83,9 +82,13 @@ def get_precision(symbol: str) -> int:
 def get_active_symbols():
     return list(active_tickers.keys())
 
-
-def get_strategy_mw(strategy_id: int) -> bool:
-    return bool(active_strategies.get(int(strategy_id), False))
+# 🔸 Построение базового имени (base) — как в системе v4
+def build_base_name(indicator: str, params: dict) -> str:
+    if indicator == "macd":
+        return f"{indicator}{params['fast']}"
+    if "length" in params:
+        return f"{indicator}{params['length']}"
+    return indicator
 
 
 # 🔸 Загрузка тикеров из PostgreSQL при старте (Bybit)
@@ -130,22 +133,6 @@ async def load_initial_indicators(pg):
             }
             log.debug(f"Loaded instance id={inst['id']} → {inst['indicator']} {param_map}, enabled_at={inst['enabled_at']}")
     log.info(f"INIT: активных инстансов индикаторов загружено: {len(indicator_instances)}")
-
-
-# 🔸 Загрузка стратегий (market_watcher) при старте
-async def load_initial_strategies(pg):
-    log = logging.getLogger("INIT")
-    async with pg.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, market_watcher
-            FROM strategies_v4
-            WHERE enabled = true AND archived = false
-        """)
-        for row in rows:
-            active_strategies[int(row["id"])] = bool(row["market_watcher"])
-            log.debug(f"Loaded strategy: id={row['id']} → market_watcher={row['market_watcher']}")
-    log.info(f"INIT: стратегий (enabled & not archived) загружено: {len(active_strategies)}")
-
 
 # 🔸 Подписка на обновления тикеров (Bybit stream) + периодический рефреш precision из tickers_bb
 async def watch_ticker_updates(pg, redis):
@@ -419,16 +406,76 @@ async def _ohlcv_event_worker(worker_id: int, queue: asyncio.PriorityQueue, pg, 
                 stats["skipped_no_data"] += 1
                 continue
 
-            # ограничение конкурентности по Redis pipeline execute (защита от Timeout connecting)
-            async def _run_instance(iid: int):
-                async with calc_sem:
-                    await compute_and_store(iid, indicator_instances[iid], symbol, df, int(ts), pg, redis, precision)
+            # подготовка единого pipeline на (symbol, tf, ts) — один execute вместо N
+            open_time_iso = datetime.utcfromtimestamp(int(ts) / 1000).isoformat()
+            pipe = redis.pipeline(transaction=False)
+            kv_map = {}
 
-            await asyncio.gather(*[
-                _run_instance(iid)
-                for iid in relevant_instances
-            ])
+            total_core = 0
+            total_kv = 0
+            total_ts = 0
+            total_ready = 0
+            total_instances = 0
 
+            for iid in relevant_instances:
+                inst = indicator_instances[iid]
+
+                # расчёт значений (compute-only)
+                values = compute_indicator_values(inst, symbol, df, precision)
+                if not values:
+                    continue
+
+                base = build_base_name(inst["indicator"], inst["params"])
+
+                # добавление команд записи в общий pipeline (без execute)
+                counts = append_writes_to_pipeline(
+                    pipe=pipe,
+                    kv_map=kv_map,
+                    instance_id=iid,
+                    instance=inst,
+                    symbol=symbol,
+                    timeframe=interval,
+                    ts=int(ts),
+                    open_time_iso=open_time_iso,
+                    base=base,
+                    values=values,
+                    precision=precision,
+                )
+
+                total_core += counts["core"]
+                total_kv += counts["kv"]
+                total_ts += counts["ts"]
+                total_ready += counts["ready"]
+                total_instances += 1
+
+            # MSET — одной командой в конце
+            if kv_map:
+                pipe.mset(kv_map)
+
+            # execute под семафором (защита от Redis connect timeouts)
+            async with calc_sem:
+                pipe_results = await pipe.execute(raise_on_error=False)
+
+            # суммирование ошибок Redis (суммирующий log.info при наличии)
+            redis_errors = 0
+            for r in pipe_results:
+                if isinstance(r, Exception):
+                    redis_errors += 1
+
+            if redis_errors:
+                stats["errors"] += 1
+                log.info(
+                    "REDIS_WRITE: errors=%s symbol=%s tf=%s ts=%s instances=%s core=%s kv=%s ts=%s ready=%s",
+                    redis_errors,
+                    symbol,
+                    interval,
+                    int(ts),
+                    total_instances,
+                    total_core,
+                    total_kv,
+                    total_ts,
+                    total_ready,
+                )
             # обновление статистики
             proc_ms = (asyncio.get_event_loop().time() - start_s) * 1000.0
             stats["processed"] += 1
@@ -708,7 +755,6 @@ async def main():
 
     await load_initial_tickers(pg)
     await load_initial_indicators(pg)
-    await load_initial_strategies(pg)
 
     await asyncio.gather(
         run_safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
