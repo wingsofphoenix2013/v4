@@ -1,4 +1,4 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (worker-пул OHLCV + ограничение конкурентности Redis + улучшенные логи)
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (приоритет m5, worker-пул OHLCV, защита Redis semaphore, понятные логи)
 
 # 🔸 Импорты и зависимости
 import os
@@ -43,6 +43,13 @@ TF_STEP_MS = {
     "m5": 300_000,
     "m15": 900_000,
     "h1": 3_600_000,
+}
+
+# 🔸 Приоритеты обработки TF (m5 важнее всего)
+TF_PRIORITY = {
+    "m5": 0,
+    "m15": 1,
+    "h1": 2,
 }
 
 # 🔸 Конфиг воркеров OHLCV (параллельная обработка событий закрытия свечи)
@@ -375,17 +382,15 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
 
 
 # 🔸 Worker: обработка одного OHLCV-события (загрузка TS → compute_and_store)
-async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, stats: dict, calc_sem: asyncio.Semaphore):
+async def _ohlcv_event_worker(worker_id: int, queue: asyncio.PriorityQueue, pg, redis, stats: dict, calc_sem: asyncio.Semaphore):
     log = logging.getLogger(f"OHLCV_WORKER:{worker_id}")
 
     while True:
-        symbol, interval, ts = await queue.get()
+        prio, close_ts_ms, symbol, interval, ts = await queue.get()
         try:
             # стартовые метрики
             now_ms = int(datetime.utcnow().timestamp() * 1000)
-            step_ms = TF_STEP_MS.get(interval, 0)
-            close_ts_ms = int(ts) + int(step_ms)
-            lag_ms = max(0, now_ms - close_ts_ms)
+            lag_ms = max(0, now_ms - int(close_ts_ms))
 
             # базовые фильтры безопасности
             if interval == "m1":
@@ -442,8 +447,8 @@ async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, s
             queue.task_done()
 
 
-# 🔸 Reporter: суммирующий log.info (только когда есть активность)
-async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
+# 🔸 Reporter: суммирующий log.info (только когда есть активность) + ready метрики
+async def _ohlcv_stats_reporter(queue: asyncio.PriorityQueue, stats: dict):
     log = logging.getLogger("OHLCV_STATS")
 
     prev = {
@@ -513,10 +518,15 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
         stats["lag_ms_max_period"] = 0
         stats["proc_ms_max_period"] = 0.0
 
+        # готовность индикаторов (простая и понятная метрика)
+        ready_avg_s = lag_avg_s + (proc_avg_ms / 1000.0)
+        ready_max_s = lag_max_period_s + (proc_max_period_ms / 1000.0)
+
         log.info(
             "OHLCV: qsize=%s recv=%s enq=%s blocked=%s proc=%s (m5=%s,m15=%s,h1=%s) "
             "skip[inactive=%s,noinst=%s,nodata=%s,m1=%s] err=%s "
             "lag_avg=%.2fs lag_max=%.2fs proc_avg=%.1fms proc_max=%.1fms "
+            "ready_avg=%.2fs ready_max=%.2fs "
             "life[lag_max=%.2fs proc_max=%.1fms]",
             queue.qsize(),
             d_rec,
@@ -535,6 +545,8 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
             lag_max_period_s,
             proc_avg_ms,
             proc_max_period_ms,
+            ready_avg_s,
+            ready_max_s,
             stats["lag_ms_max_life"] / 1000.0,
             stats["proc_ms_max_life"],
         )
@@ -556,13 +568,13 @@ async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
         prev["proc_ms_sum"] = proc_sum
 
 
-# 🔸 Обработка событий из канала OHLCV (Bybit pub/sub) — listener + очередь + worker-пул
+# 🔸 Обработка событий из канала OHLCV (Bybit pub/sub) — listener + PriorityQueue + worker-пул
 async def watch_ohlcv_events(pg, redis):
     log = logging.getLogger("OHLCV_EVENTS")
     pubsub = redis.pubsub()
     await pubsub.subscribe(BB_OHLCV_CHANNEL)
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=OHLCV_QUEUE_MAXSIZE)
+    queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=OHLCV_QUEUE_MAXSIZE)
 
     # общая статистика (на аптайм воркера)
     stats = {
@@ -596,7 +608,7 @@ async def watch_ohlcv_events(pg, redis):
     reporter = asyncio.create_task(_ohlcv_stats_reporter(queue, stats))
 
     log.info(
-        "OHLCV_EVENTS: started (workers=%s, queue_max=%s, calc_concurrency=%s, stats_period=%ss)",
+        "OHLCV_EVENTS: started (workers=%s, queue_max=%s, calc_concurrency=%s, stats_period=%ss, priority=m5>m15>h1)",
         OHLCV_WORKERS,
         OHLCV_QUEUE_MAXSIZE,
         OHLCV_CALC_CONCURRENCY,
@@ -640,12 +652,18 @@ async def watch_ohlcv_events(pg, redis):
 
                 ts = int(timestamp)
 
+                # приоритет и close_ts_ms для сортировки задач
+                prio = TF_PRIORITY.get(interval, 9)
+                close_ts_ms = ts + TF_STEP_MS.get(interval, 0)
+
+                item = (prio, close_ts_ms, symbol, interval, ts)
+
                 # кладём событие в очередь; закрытые бары не дропаем → при переполнении ждём
                 if queue.full():
                     stats["queue_blocked"] += 1
-                    await queue.put((symbol, interval, ts))
+                    await queue.put(item)
                 else:
-                    queue.put_nowait((symbol, interval, ts))
+                    queue.put_nowait(item)
 
                 stats["enqueued"] += 1
 
@@ -692,8 +710,6 @@ async def main():
     await load_initial_indicators(pg)
     await load_initial_strategies(pg)
 
-    # - модуль запускается как часть общего процесса (через run_safe_loop)
-    # - все воркеры ниже самостоятельны и перезапускаются при ошибках
     await asyncio.gather(
         run_safe_loop(lambda: watch_ticker_updates(pg, redis), "TICKER_UPDATES"),
         run_safe_loop(lambda: watch_indicator_updates(pg, redis), "INDICATOR_UPDATES"),
