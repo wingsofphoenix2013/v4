@@ -1,5 +1,7 @@
-# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4
+# indicators_v4_main.py — управляющий модуль расчёта индикаторов v4 (OHLCV worker-пул для параллельной обработки)
 
+# 🔸 Импорты и зависимости
+import os
 import asyncio
 import json
 import logging
@@ -28,13 +30,25 @@ required_candles = {
 }
 active_strategies = {}      # стратегия id -> market_watcher: bool
 
-AUDIT_WINDOW_HOURS = 1344
+AUDIT_WINDOW_HOURS = 72
 
 # 🔸 Константы источника данных (Bybit/feed_bb)
 BB_TS_PREFIX = "bb:ts"                  # bb:ts:{symbol}:{interval}:{field}
 BB_OHLCV_CHANNEL = "bb:ohlcv_channel"   # pub/sub канал закрытых баров
 BB_TICKERS_TABLE = "tickers_bb"         # таблица тикеров Bybit
 BB_TICKERS_STREAM = "bb:tickers_status_stream"  # stream со статусами тикеров
+
+# 🔸 Таймшаги TF (мс)
+TF_STEP_MS = {
+    "m5": 300_000,
+    "m15": 900_000,
+    "h1": 3_600_000,
+}
+
+# 🔸 Конфиг воркеров OHLCV (параллельная обработка событий закрытия свечи)
+OHLCV_WORKERS = int(os.getenv("IV4_OHLCV_WORKERS", "8"))
+OHLCV_QUEUE_MAXSIZE = int(os.getenv("IV4_OHLCV_QUEUE_MAXSIZE", "5000"))
+OHLCV_STATS_PERIOD_SEC = int(os.getenv("IV4_OHLCV_STATS_PERIOD_SEC", "60"))
 
 
 # 🔸 Вспомогательные геттеры для воркеров
@@ -304,7 +318,7 @@ async def watch_indicator_updates(pg, redis):
             log.warning(f"Ошибка в indicator event: {e}")
 
 
-# 🔸 Загрузка свечей из Redis TimeSeries (Bybit TS префикс)
+# 🔸 Загрузка свечей из Redis TimeSeries (Bybit TS префикс) — pipeline TS.RANGE
 async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, count: int):
     log = logging.getLogger("REDIS_LOAD")
 
@@ -312,12 +326,7 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     if interval == "m1":
         return None
 
-    step_ms_map = {
-        "m5": 300_000,
-        "m15": 900_000,
-        "h1": 3_600_000
-    }
-    step_ms = step_ms_map.get(interval)
+    step_ms = TF_STEP_MS.get(interval)
     if step_ms is None:
         return None
 
@@ -325,14 +334,16 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
 
     fields = ["o", "h", "l", "c", "v"]
     keys = {field: f"{BB_TS_PREFIX}:{symbol}:{interval}:{field}" for field in fields}
-    tasks = {
-        field: redis.execute_command("TS.RANGE", key, start_ts, end_ts)
-        for field, key in keys.items()
-    }
 
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    # pipeline: один execute на все TS.RANGE
+    pipe = redis.pipeline(transaction=False)
+    for field in fields:
+        pipe.execute_command("TS.RANGE", keys[field], start_ts, end_ts)
+
+    results = await pipe.execute(raise_on_error=False)
+
     series = {}
-    for field, result in zip(tasks.keys(), results):
+    for field, result in zip(fields, results):
         if isinstance(result, Exception):
             log.warning(f"Ошибка чтения {keys[field]}: {result}")
             continue
@@ -360,26 +371,26 @@ async def load_ohlcv_from_redis(redis, symbol: str, interval: str, end_ts: int, 
     return df
 
 
-# 🔸 Обработка событий из канала OHLCV (Bybit pub/sub)
-async def watch_ohlcv_events(pg, redis):
-    log = logging.getLogger("OHLCV_EVENTS")
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(BB_OHLCV_CHANNEL)
+# 🔸 Worker: обработка одного OHLCV-события (загрузка TS → compute_and_store)
+async def _ohlcv_event_worker(worker_id: int, queue: asyncio.Queue, pg, redis, stats: dict):
+    log = logging.getLogger(f"OHLCV_WORKER:{worker_id}")
 
-    async for msg in pubsub.listen():
-        if msg["type"] != "message":
-            continue
+    while True:
+        symbol, interval, ts = await queue.get()
         try:
-            data = json.loads(msg["data"])
-            symbol = data.get("symbol")
-            interval = data.get("interval")
-            timestamp = data.get("timestamp")
+            # стартовые метрики
+            now_ms = int(datetime.utcnow().timestamp() * 1000)
+            step_ms = TF_STEP_MS.get(interval, 0)
+            close_ts_ms = int(ts) + int(step_ms)
+            lag_ms = max(0, now_ms - close_ts_ms)
 
-            # страховка: m1 не поддерживаем
+            # базовые фильтры безопасности
             if interval == "m1":
+                stats["skipped_m1"] += 1
                 continue
 
             if symbol not in active_tickers:
+                stats["skipped_inactive"] += 1
                 continue
 
             relevant_instances = [
@@ -387,22 +398,262 @@ async def watch_ohlcv_events(pg, redis):
                 if inst["timeframe"] == interval
             ]
             if not relevant_instances:
+                stats["skipped_no_instances"] += 1
                 continue
 
             precision = active_tickers.get(symbol, 8)
             depth = required_candles.get(interval, 200)
 
-            ts = int(timestamp)
-            df = await load_ohlcv_from_redis(redis, symbol, interval, ts, depth)
+            # загрузка данных для расчёта
+            start_s = asyncio.get_event_loop().time()
+            df = await load_ohlcv_from_redis(redis, symbol, interval, int(ts), depth)
             if df is None:
+                stats["skipped_no_data"] += 1
                 continue
 
+            # расчёт и запись индикаторов
             await asyncio.gather(*[
-                compute_and_store(iid, indicator_instances[iid], symbol, df, ts, pg, redis, precision)
+                compute_and_store(iid, indicator_instances[iid], symbol, df, int(ts), pg, redis, precision)
                 for iid in relevant_instances
             ])
+
+            # обновление статистики
+            proc_ms = (asyncio.get_event_loop().time() - start_s) * 1000.0
+            stats["processed"] += 1
+            stats[f"processed_{interval}"] += 1
+            stats["lag_ms_sum"] += lag_ms
+            stats["proc_ms_sum"] += proc_ms
+            stats["lag_ms_max"] = max(stats["lag_ms_max"], lag_ms)
+            stats["proc_ms_max"] = max(stats["proc_ms_max"], proc_ms)
+
         except Exception as e:
-            log.warning(f"Ошибка в {BB_OHLCV_CHANNEL}: {e}")
+            stats["errors"] += 1
+            log.warning(f"worker error: {e}", exc_info=True)
+        finally:
+            queue.task_done()
+
+
+# 🔸 Reporter: суммирующий log.info по OHLCV-очереди и метрикам обработки
+async def _ohlcv_stats_reporter(queue: asyncio.Queue, stats: dict):
+    log = logging.getLogger("OHLCV_STATS")
+
+    prev = {
+        "received": 0,
+        "enqueued": 0,
+        "queue_blocked": 0,
+        "processed": 0,
+        "skipped_inactive": 0,
+        "skipped_no_instances": 0,
+        "skipped_no_data": 0,
+        "skipped_m1": 0,
+        "errors": 0,
+        "lag_ms_sum": 0,
+        "proc_ms_sum": 0,
+    }
+
+    while True:
+        await asyncio.sleep(OHLCV_STATS_PERIOD_SEC)
+
+        # снимок
+        rec = stats["received"]
+        enq = stats["enqueued"]
+        qblk = stats["queue_blocked"]
+        prc = stats["processed"]
+        ski = stats["skipped_inactive"]
+        skn = stats["skipped_no_instances"]
+        skd = stats["skipped_no_data"]
+        skm = stats["skipped_m1"]
+        err = stats["errors"]
+
+        lag_sum = stats["lag_ms_sum"]
+        proc_sum = stats["proc_ms_sum"]
+        lag_max = stats["lag_ms_max"]
+        proc_max = stats["proc_ms_max"]
+
+        # дельты за период
+        d_rec = rec - prev["received"]
+        d_enq = enq - prev["enqueued"]
+        d_qbk = qblk - prev["queue_blocked"]
+        d_prc = prc - prev["processed"]
+        d_ski = ski - prev["skipped_inactive"]
+        d_skn = skn - prev["skipped_no_instances"]
+        d_skd = skd - prev["skipped_no_data"]
+        d_skm = skm - prev["skipped_m1"]
+        d_err = err - prev["errors"]
+
+        d_lag_sum = lag_sum - prev["lag_ms_sum"]
+        d_proc_sum = proc_sum - prev["proc_ms_sum"]
+
+        # средние за период
+        lag_avg_s = (d_lag_sum / max(1, d_prc)) / 1000.0
+        proc_avg_ms = d_proc_sum / max(1, d_prc)
+
+        # per-tf за период (приблизительно)
+        d_m5 = stats["processed_m5"] - prev.get("processed_m5", 0)
+        d_m15 = stats["processed_m15"] - prev.get("processed_m15", 0)
+        d_h1 = stats["processed_h1"] - prev.get("processed_h1", 0)
+
+        log.info(
+            "OHLCV: qsize=%s recv=%s enq=%s blocked=%s proc=%s (m5=%s,m15=%s,h1=%s) "
+            "skip[inactive=%s,noinst=%s,nodata=%s,m1=%s] err=%s "
+            "lag_avg=%.2fs lag_max=%.2fs proc_avg=%.1fms proc_max=%.1fms",
+            queue.qsize(),
+            d_rec,
+            d_enq,
+            d_qbk,
+            d_prc,
+            d_m5,
+            d_m15,
+            d_h1,
+            d_ski,
+            d_skn,
+            d_skd,
+            d_skm,
+            d_err,
+            lag_avg_s,
+            lag_max / 1000.0,
+            proc_avg_ms,
+            proc_max,
+        )
+
+        # обновляем prev
+        prev["received"] = rec
+        prev["enqueued"] = enq
+        prev["queue_blocked"] = qblk
+        prev["processed"] = prc
+        prev["skipped_inactive"] = ski
+        prev["skipped_no_instances"] = skn
+        prev["skipped_no_data"] = skd
+        prev["skipped_m1"] = skm
+        prev["errors"] = err
+        prev["lag_ms_sum"] = lag_sum
+        prev["proc_ms_sum"] = proc_sum
+        prev["processed_m5"] = stats["processed_m5"]
+        prev["processed_m15"] = stats["processed_m15"]
+        prev["processed_h1"] = stats["processed_h1"]
+
+        # после отчёта сбрасывать max не будем — пусть отражает худший кейс за аптайм
+
+
+# 🔸 Обработка событий из канала OHLCV (Bybit pub/sub) — listener + очередь + worker-пул
+async def watch_ohlcv_events(pg, redis):
+    log = logging.getLogger("OHLCV_EVENTS")
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(BB_OHLCV_CHANNEL)
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=OHLCV_QUEUE_MAXSIZE)
+
+    # общая статистика (на аптайм воркера)
+    stats = {
+        "received": 0,
+        "enqueued": 0,
+        "queue_blocked": 0,
+        "processed": 0,
+        "processed_m5": 0,
+        "processed_m15": 0,
+        "processed_h1": 0,
+        "skipped_inactive": 0,
+        "skipped_no_instances": 0,
+        "skipped_no_data": 0,
+        "skipped_m1": 0,
+        "errors": 0,
+        "lag_ms_sum": 0,
+        "proc_ms_sum": 0.0,
+        "lag_ms_max": 0,
+        "proc_ms_max": 0.0,
+    }
+
+    # стартуем воркеры и репортинг
+    workers = [
+        asyncio.create_task(_ohlcv_event_worker(i + 1, queue, pg, redis, stats))
+        for i in range(OHLCV_WORKERS)
+    ]
+    reporter = asyncio.create_task(_ohlcv_stats_reporter(queue, stats))
+
+    log.info(
+        "OHLCV_EVENTS: started (workers=%s, queue_max=%s, stats_period=%ss)",
+        OHLCV_WORKERS,
+        OHLCV_QUEUE_MAXSIZE,
+        OHLCV_STATS_PERIOD_SEC,
+    )
+
+    try:
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+
+            stats["received"] += 1
+
+            try:
+                data = json.loads(msg["data"])
+                symbol = data.get("symbol")
+                interval = data.get("interval")
+                timestamp = data.get("timestamp")
+
+                # быстрые фильтры (на стороне listener)
+                if not symbol or not interval or timestamp is None:
+                    continue
+
+                # страховка: m1 не поддерживаем
+                if interval == "m1":
+                    stats["skipped_m1"] += 1
+                    continue
+
+                if interval not in TF_STEP_MS:
+                    continue
+
+                # фильтруем по активным тикерам уже на входе, чтобы не раздувать очередь
+                if symbol not in active_tickers:
+                    stats["skipped_inactive"] += 1
+                    continue
+
+                # если вообще нет инстансов на TF — тоже не кладём
+                if not any(inst["timeframe"] == interval for inst in indicator_instances.values()):
+                    stats["skipped_no_instances"] += 1
+                    continue
+
+                ts = int(timestamp)
+
+                # кладём событие в очередь; закрытые бары не дропаем → при переполнении ждём
+                if queue.full():
+                    stats["queue_blocked"] += 1
+                    await queue.put((symbol, interval, ts))
+                else:
+                    queue.put_nowait((symbol, interval, ts))
+
+                stats["enqueued"] += 1
+
+            except Exception as e:
+                stats["errors"] += 1
+                log.warning(f"Ошибка в {BB_OHLCV_CHANNEL}: {e}", exc_info=True)
+
+    finally:
+        # корректное завершение воркеров и pubsub
+        try:
+            await pubsub.unsubscribe(BB_OHLCV_CHANNEL)
+        except Exception:
+            pass
+        try:
+            await pubsub.close()
+        except Exception:
+            pass
+
+        reporter.cancel()
+        for t in workers:
+            t.cancel()
+
+        try:
+            await reporter
+        except Exception:
+            pass
+
+        for t in workers:
+            try:
+                await t
+            except Exception:
+                pass
+
+        log.info("OHLCV_EVENTS: stopped")
 
 
 # 🔸 Точка входа
