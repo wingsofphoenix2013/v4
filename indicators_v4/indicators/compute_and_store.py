@@ -1,4 +1,4 @@
-# indicators/compute_and_store.py — расчёт индикаторов + подготовка/запись в Redis KV/TS/Stream (core + ready) + snapshot API
+# indicators/compute_and_store.py — расчёт индикаторов + подготовка/запись в Redis KV/TS/Stream (core=batched per instance, ready) + snapshot API
 
 # 🔸 Импорты и зависимости
 import logging
@@ -6,7 +6,6 @@ import asyncio
 import math
 import json
 from datetime import datetime
-from typing import Any
 
 # 🔸 Импорт индикаторов
 from indicators import ema, atr, lr, mfi, rsi, adx_dmi, macd, bb, kama, supertrend
@@ -26,8 +25,8 @@ INDICATOR_DISPATCH = {
 }
 
 # 🔸 Константы Redis (потоки)
-INDICATOR_STREAM_CORE = "indicator_stream_core"
-INDICATOR_STREAM_READY = "indicator_stream"
+INDICATOR_STREAM_CORE = "indicator_stream_core"   # core: 1 msg per instance (values_json)
+INDICATOR_STREAM_READY = "indicator_stream"       # ready: 1 msg per instance (как было)
 
 
 # 🔸 Валидация чисел
@@ -86,7 +85,7 @@ def _build_ready_payload(indicator: str, base: str, timeframe: str, symbol: str,
     return payload
 
 
-# 🔸 Чистый расчёт индикатора (compute-only): result_map[param_name] = str_value
+# 🔸 Чистый расчёт индикатора (compute-only): out[param_name] = str_value
 def compute_indicator_values(instance: dict, symbol: str, df, precision: int) -> dict[str, str]:
     log = logging.getLogger("CALC")
 
@@ -156,6 +155,7 @@ def append_writes_to_pipeline(
     added_ts = 0
     added_ready = 0
 
+    # KV + TS — по одному на параметр (контракт не меняем)
     for param_name, str_value in values.items():
         # Redis KV (через общий MSET)
         redis_key = f"ind:{symbol}:{timeframe}:{param_name}"
@@ -171,20 +171,20 @@ def append_writes_to_pipeline(
         )
         added_ts += 1
 
-        # Redis Stream (core) — по одному сообщению на параметр
-        stream_precision = 5 if "angle" in param_name else precision
-        pipe.xadd(INDICATOR_STREAM_CORE, {
+    # core stream — 1 сообщение на instance (values_json)
+    if values:
+        core_payload = {
             "symbol": symbol,
             "interval": timeframe,
             "instance_id": str(instance_id),
             "open_time": open_time_iso,
-            "param_name": param_name,
-            "value": str_value,
-            "precision": str(stream_precision),
-        })
+            "precision": str(int(precision)),
+            "values_json": json.dumps(values, ensure_ascii=False, separators=(",", ":")),
+        }
+        pipe.xadd(INDICATOR_STREAM_CORE, core_payload)
         added_core += 1
 
-    # Redis Stream (ready) — один на instance (если включено)
+    # ready stream — как было: 1 сообщение на instance (если включено)
     if stream_publish:
         pipe.xadd(INDICATOR_STREAM_READY, _build_ready_payload(indicator, base, timeframe, symbol, open_time_iso, params))
         added_ready += 1
@@ -209,7 +209,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
     open_time_iso = datetime.utcfromtimestamp(int(ts) / 1000).isoformat()
 
     # расчёт (compute-only)
-    values = compute_indicator_values(instance, symbol, df, precision)
+    values = compute_indicator_values(instance, symbol, df, int(precision))
     if not values:
         return
 
@@ -352,19 +352,21 @@ def compute_snapshot_values(instance: dict, symbol: str, df, precision: int) -> 
         try:
             if v is None or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
                 continue
+
             if "angle" in str(k):
                 val = round(float(v), 5)
                 rounded[str(k)] = f"{val:.5f}"
             else:
                 val = round(float(v), precision)
                 rounded[str(k)] = f"{val:.{precision}f}"
+
         except Exception as e:
             log.warning("[%s] %s: ошибка округления %s=%s → %s", indicator, symbol, k, v, e)
 
     if not rounded:
         return {}
 
-    # базовое имя (как в compute_and_store)
+    # базовое имя (как в compute_indicator_values)
     base = _build_base(indicator, params)
 
     # приведение имён параметров
