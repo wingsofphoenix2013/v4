@@ -519,11 +519,11 @@ def _find_bounce_candidates(
         if direction is None:
             continue
 
-        # округляем цену
+        # округляем цену (важно: не конвертируем в float, чтобы не получать длинные хвосты в numeric)
         try:
-            price_rounded = float(f"{close_curr_f:.{precision_price}f}")
+            price_rounded = f"{close_curr_f:.{precision_price}f}"
         except Exception:
-            price_rounded = close_curr_f
+            price_rounded = str(close_curr_f)
 
         decision_time = ts + tf_delta
 
@@ -588,7 +588,7 @@ async def _upsert_events(
                 c["open_time"],
                 c["decision_time"],
                 str(c["direction"]),
-                c.get("price"),
+                str(c.get("price") or ""),
                 str(c.get("pattern") or ""),
                 json.dumps(c.get("payload_stable") or {}),
                 str(event_key),
@@ -604,7 +604,7 @@ async def _upsert_events(
             f"""
             INSERT INTO {BT_SIGNAL_EVENTS_TABLE}
                 (signal_uuid, symbol, timeframe, open_time, decision_time, direction, price, pattern, payload_stable, event_key, event_params_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8,''), $9::jsonb, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7,'')::numeric, NULLIF($8,''), $9::jsonb, $10, $11)
             ON CONFLICT (event_key, event_params_hash, symbol, timeframe, open_time, direction)
             DO NOTHING
             """,
