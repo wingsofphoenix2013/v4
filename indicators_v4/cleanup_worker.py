@@ -249,7 +249,7 @@ async def run_indicators_cleanup(pg, redis):
 
             # суммирующий info-лог раз в час (не шумим)
             if (now - last_info) >= timedelta(hours=1):
-                log.info(
+                log.debug(
                     "IND_CLEANUP: hourly summary — ts_retention_changed=%s, ts_full_pass=%s, streams_trimmed=%s, pack_core_trimmed=%s, pack_ready_trimmed=%s",
                     changed,
                     finished,
@@ -263,11 +263,11 @@ async def run_indicators_cleanup(pg, redis):
             if (now - last_db_pack_events) >= timedelta(hours=1):
                 deleted = await cleanup_pack_events_db(pg)
                 if deleted is not None:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge ind_pack_events_v4 — deleted={deleted} rows (older than {PACK_EVENTS_KEEP_HOURS}h)"
                     )
                 else:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge ind_pack_events_v4 — completed (older than {PACK_EVENTS_KEEP_HOURS}h)"
                     )
                 last_db_pack_events = now
@@ -276,11 +276,11 @@ async def run_indicators_cleanup(pg, redis):
             if (now - last_db_pack_log) >= timedelta(hours=1):
                 deleted = await cleanup_pack_log_db(pg)
                 if deleted is not None:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge ind_pack_log_v4 — deleted={deleted} rows (older than {PACK_LOG_KEEP_HOURS}h)"
                     )
                 else:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge ind_pack_log_v4 — completed (older than {PACK_LOG_KEEP_HOURS}h)"
                     )
                 last_db_pack_log = now
@@ -289,11 +289,11 @@ async def run_indicators_cleanup(pg, redis):
             if (now - last_db_gap) >= timedelta(hours=1):
                 deleted = await cleanup_indicator_gap_healed_ts_db(pg)
                 if deleted is not None:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge indicator_gap_v4 — deleted={deleted} rows (status=healed_ts, older than {GAP_KEEP_HOURS}h from healed_ts_at)"
                     )
                 else:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge indicator_gap_v4 — completed (status=healed_ts, older than {GAP_KEEP_HOURS}h from healed_ts_at)"
                     )
                 last_db_gap = now
@@ -302,11 +302,11 @@ async def run_indicators_cleanup(pg, redis):
             if (now - last_db_ind) >= timedelta(days=1):
                 deleted = await cleanup_indicators_db(pg)
                 if deleted is not None:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge indicator_values_v4 — deleted={deleted} rows (older than {DB_KEEP_DAYS}d)"
                     )
                 else:
-                    log.info(
+                    log.debug(
                         f"IND_CLEANUP: DB purge indicator_values_v4 — completed (older than {DB_KEEP_DAYS}d)"
                     )
                 last_db_ind = now

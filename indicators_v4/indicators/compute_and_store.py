@@ -249,7 +249,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
 
     # суммирующий лог (по желанию + всегда при ошибках)
     if errors > 0:
-        log.info(
+        log.debug(
             "CALC: errors=%s (symbol=%s, tf=%s, indicator=%s, base=%s, params=%s, core=%s, kv=%s, ts=%s, ready=%s)",
             errors,
             symbol,
@@ -263,7 +263,7 @@ async def compute_and_store(instance_id, instance, symbol, df, ts, pg, redis, pr
             counts["ready"],
         )
     elif log_info:
-        log.info(
+        log.debug(
             "CALC: done (symbol=%s, tf=%s, indicator=%s, base=%s, params=%s, core=%s, kv=%s, ts=%s, ready=%s)",
             symbol,
             timeframe,

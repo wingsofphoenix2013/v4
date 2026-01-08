@@ -156,7 +156,7 @@ async def _core_io_consumer_loop(pg, redis, consumer: str):
                         await _bulk_upsert_indicator_values(conn, records)
 
                 # суммирующий лог (info)
-                log.info(
+                log.debug(
                     "batch stored (msgs=%s bad=%s params=%s records=%s keys=%s)",
                     msg_total,
                     msg_bad,
@@ -208,7 +208,7 @@ async def run_core_io(pg, redis):
         consumer = f"{CONSUMER_PREFIX}:{host}:{pid}:{i}"
         tasks.append(asyncio.create_task(_core_io_consumer_loop(pg, redis, consumer)))
 
-    log.info(
+    log.debug(
         "CORE_IO: started (group=%s consumers=%s batch=%s block_ms=%s)",
         CORE_GROUP,
         len(tasks),

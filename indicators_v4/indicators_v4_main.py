@@ -569,7 +569,7 @@ async def _ohlcv_stats_reporter(queue: asyncio.PriorityQueue, stats: dict):
         ready_avg_s = lag_avg_s + (proc_avg_ms / 1000.0)
         ready_max_s = lag_max_period_s + (proc_max_period_ms / 1000.0)
 
-        log.info(
+        log.debug(
             "OHLCV: qsize=%s recv=%s enq=%s blocked=%s proc=%s (m5=%s,m15=%s,h1=%s) "
             "skip[inactive=%s,noinst=%s,nodata=%s,m1=%s] err=%s "
             "lag_avg=%.2fs lag_max=%.2fs proc_avg=%.1fms proc_max=%.1fms "
