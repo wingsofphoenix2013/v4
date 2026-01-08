@@ -569,42 +569,95 @@ async def _upsert_events(
     event_params_hash: str,
     candidates: List[Dict[str, Any]],
 ) -> int:
-    to_insert: List[Tuple[Any, ...]] = []
-    for c in candidates:
-        to_insert.append(
-            (
-                str(uuid.uuid4()),
-                str(symbol),
-                str(timeframe),
-                c["open_time"],
-                c["decision_time"],
-                str(c["direction"]),
-                str(c.get("price") or ""),
-                str(c.get("pattern") or ""),
-                json.dumps(c.get("payload_stable") or {}),
-                str(event_key),
-                str(event_params_hash),
-            )
-        )
-
-    if not to_insert:
+    # условия достаточности
+    if not candidates:
         return 0
 
+    uuids: List[str] = []
+    symbols: List[str] = []
+    tfs: List[str] = []
+    open_times: List[datetime] = []
+    decision_times: List[datetime] = []
+    directions: List[str] = []
+    prices: List[str] = []
+    patterns: List[str] = []
+    payloads: List[str] = []
+    event_keys: List[str] = []
+    hashes: List[str] = []
+
+    for c in candidates:
+        uuids.append(str(uuid.uuid4()))
+        symbols.append(str(symbol))
+        tfs.append(str(timeframe))
+        open_times.append(c["open_time"])
+        decision_times.append(c["decision_time"])
+        directions.append(str(c["direction"]))
+        prices.append(str(c.get("price") or ""))
+        patterns.append(str(c.get("pattern") or ""))
+        payloads.append(json.dumps(c.get("payload_stable") or {}))
+        event_keys.append(str(event_key))
+        hashes.append(str(event_params_hash))
+
     async with pg.acquire() as conn:
-        await conn.executemany(
+        rows = await conn.fetch(
             f"""
             INSERT INTO {BT_SIGNAL_EVENTS_TABLE}
                 (signal_uuid, symbol, timeframe, open_time, decision_time, direction, price, pattern, payload_stable, event_key, event_params_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7,'')::numeric, NULLIF($8,''), $9::jsonb, $10, $11)
+            SELECT
+                u.signal_uuid,
+                u.symbol,
+                u.timeframe,
+                u.open_time,
+                u.decision_time,
+                u.direction,
+                NULLIF(u.price,'')::numeric,
+                NULLIF(u.pattern,''),
+                u.payload_stable::jsonb,
+                u.event_key,
+                u.event_params_hash
+            FROM unnest(
+                $1::uuid[],
+                $2::text[],
+                $3::text[],
+                $4::timestamp[],
+                $5::timestamp[],
+                $6::text[],
+                $7::text[],
+                $8::text[],
+                $9::text[],
+                $10::text[],
+                $11::text[]
+            ) AS u(
+                signal_uuid,
+                symbol,
+                timeframe,
+                open_time,
+                decision_time,
+                direction,
+                price,
+                pattern,
+                payload_stable,
+                event_key,
+                event_params_hash
+            )
             ON CONFLICT (event_key, event_params_hash, symbol, timeframe, open_time, direction)
             DO NOTHING
+            RETURNING id
             """,
-            to_insert,
+            uuids,
+            symbols,
+            tfs,
+            open_times,
+            decision_times,
+            directions,
+            prices,
+            patterns,
+            payloads,
+            event_keys,
+            hashes,
         )
 
-    # точное число вставленных строк через executemany не получить без доп. запросов
-    return 0
-
+    return len(rows)
 
 # 🔸 Загрузка id событий для кандидатов (для membership)
 async def _load_event_ids_for_candidates(
@@ -651,26 +704,120 @@ async def _load_event_ids_for_candidates(
 
 # 🔸 Вставка membership (идемпотентно)
 async def _insert_membership(pg, rows: List[Tuple[Any, ...]]) -> int:
+    # условия достаточности
+    if not rows:
+        return 0
+
+    run_ids: List[int] = []
+    signal_ids: List[int] = []
+    value_ids: List[int] = []
+    scenario_ids: List[Optional[int]] = []
+    parent_run_ids: List[int] = []
+    parent_signal_ids: List[int] = []
+    winner_ids: List[Optional[int]] = []
+    score_versions: List[str] = []
+    winner_params: List[Optional[str]] = []
+    bin_names: List[str] = []
+    plugins: List[Optional[str]] = []
+    plugin_params: List[Optional[str]] = []
+    lr_prefixes: List[Optional[str]] = []
+    lengths: List[Optional[int]] = []
+    pipeline_modes: List[str] = []
+
+    for r in rows:
+        run_ids.append(int(r[0]))
+        signal_ids.append(int(r[1]))
+        value_ids.append(int(r[2]))
+        scenario_ids.append(r[3] if r[3] is None else int(r[3]))
+        parent_run_ids.append(int(r[4]))
+        parent_signal_ids.append(int(r[5]))
+        winner_ids.append(r[6] if r[6] is None else int(r[6]))
+        score_versions.append(str(r[7]))
+        winner_params.append(None if r[8] is None else str(r[8]))
+        bin_names.append(str(r[9]))
+        plugins.append(None if r[10] is None else str(r[10]))
+        plugin_params.append(None if r[11] is None else str(r[11]))
+        lr_prefixes.append(None if r[12] is None else str(r[12]))
+        lengths.append(None if r[13] is None else int(r[13]))
+        pipeline_modes.append(str(r[14]))
+
     async with pg.acquire() as conn:
-        res = await conn.executemany(
+        inserted_rows = await conn.fetch(
             f"""
             INSERT INTO {BT_SIGNAL_MEMBERSHIP_TABLE}
                 (run_id, signal_id, signal_value_id, scenario_id, parent_run_id, parent_signal_id,
                  winner_analysis_id, score_version, winner_param, bin_name,
                  plugin, plugin_param_name, lr_prefix, length, pipeline_mode)
-            VALUES
-                ($1, $2, $3, $4, $5, $6,
-                 $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15)
+            SELECT
+                u.run_id,
+                u.signal_id,
+                u.signal_value_id,
+                u.scenario_id,
+                u.parent_run_id,
+                u.parent_signal_id,
+                u.winner_analysis_id,
+                u.score_version,
+                u.winner_param,
+                u.bin_name,
+                u.plugin,
+                u.plugin_param_name,
+                u.lr_prefix,
+                u.length,
+                u.pipeline_mode
+            FROM unnest(
+                $1::bigint[],
+                $2::int[],
+                $3::int[],
+                $4::int[],
+                $5::bigint[],
+                $6::int[],
+                $7::int[],
+                $8::text[],
+                $9::text[],
+                $10::text[],
+                $11::text[],
+                $12::text[],
+                $13::text[],
+                $14::int[],
+                $15::text[]
+            ) AS u(
+                run_id,
+                signal_id,
+                signal_value_id,
+                scenario_id,
+                parent_run_id,
+                parent_signal_id,
+                winner_analysis_id,
+                score_version,
+                winner_param,
+                bin_name,
+                plugin,
+                plugin_param_name,
+                lr_prefix,
+                length,
+                pipeline_mode
+            )
             ON CONFLICT (run_id, signal_id, signal_value_id) DO NOTHING
+            RETURNING id
             """,
-            rows,
+            run_ids,
+            signal_ids,
+            value_ids,
+            scenario_ids,
+            parent_run_ids,
+            parent_signal_ids,
+            winner_ids,
+            score_versions,
+            winner_params,
+            bin_names,
+            plugins,
+            plugin_params,
+            lr_prefixes,
+            lengths,
+            pipeline_modes,
         )
 
-    # executemany не возвращает количество вставок; считаем как "попытки"
-    return len(rows)
-
-
+    return len(inserted_rows)
 # 🔸 Загрузка LR-серии (angle/upper/lower/center) для одного инстанса / символа / окна
 async def _load_lr_series(
     pg,

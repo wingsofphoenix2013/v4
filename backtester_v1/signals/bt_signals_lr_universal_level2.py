@@ -275,30 +275,121 @@ async def _load_parent_candidates_for_symbol(
 
 # 🔸 Вставка membership для текущего run (идемпотентно)
 async def _insert_membership(pg, rows: List[Tuple[Any, ...]]) -> int:
+    # условия достаточности
     if not rows:
         return 0
 
+    run_ids: List[int] = []
+    signal_ids: List[int] = []
+    value_ids: List[int] = []
+    scenario_ids: List[int] = []
+    parent_run_ids: List[int] = []
+    parent_signal_ids: List[int] = []
+    winner_ids: List[int] = []
+    score_versions: List[str] = []
+    winner_params: List[Optional[str]] = []
+    bin_names: List[str] = []
+    plugins: List[Optional[str]] = []
+    plugin_params: List[Optional[str]] = []
+    lr_prefixes: List[Optional[str]] = []
+    lengths: List[int] = []
+    pipeline_modes: List[str] = []
+
+    for r in rows:
+        run_ids.append(int(r[0]))
+        signal_ids.append(int(r[1]))
+        value_ids.append(int(r[2]))
+        scenario_ids.append(int(r[3]))
+        parent_run_ids.append(int(r[4]))
+        parent_signal_ids.append(int(r[5]))
+        winner_ids.append(int(r[6]))
+        score_versions.append(str(r[7]))
+        winner_params.append(None if r[8] is None else str(r[8]))
+        bin_names.append(str(r[9]))
+        plugins.append(None if r[10] is None else str(r[10]))
+        plugin_params.append(None if r[11] is None else str(r[11]))
+        lr_prefixes.append(None if r[12] is None else str(r[12]))
+        lengths.append(int(r[13]))
+        pipeline_modes.append(str(r[14]))
+
     async with pg.acquire() as conn:
-        await conn.executemany(
+        inserted_rows = await conn.fetch(
             f"""
             INSERT INTO {BT_MEMBERSHIP_TABLE}
                 (run_id, signal_id, signal_value_id,
                  scenario_id, parent_run_id, parent_signal_id,
                  winner_analysis_id, score_version, winner_param,
                  bin_name, plugin, plugin_param_name, lr_prefix, length, pipeline_mode)
-            VALUES
-                ($1, $2, $3,
-                 $4, $5, $6,
-                 $7, $8, $9,
-                 $10, $11, $12, $13, $14, $15)
+            SELECT
+                u.run_id,
+                u.signal_id,
+                u.signal_value_id,
+                u.scenario_id,
+                u.parent_run_id,
+                u.parent_signal_id,
+                u.winner_analysis_id,
+                u.score_version,
+                u.winner_param,
+                u.bin_name,
+                u.plugin,
+                u.plugin_param_name,
+                u.lr_prefix,
+                u.length,
+                u.pipeline_mode
+            FROM unnest(
+                $1::bigint[],
+                $2::int[],
+                $3::int[],
+                $4::int[],
+                $5::bigint[],
+                $6::int[],
+                $7::int[],
+                $8::text[],
+                $9::text[],
+                $10::text[],
+                $11::text[],
+                $12::text[],
+                $13::text[],
+                $14::int[],
+                $15::text[]
+            ) AS u(
+                run_id,
+                signal_id,
+                signal_value_id,
+                scenario_id,
+                parent_run_id,
+                parent_signal_id,
+                winner_analysis_id,
+                score_version,
+                winner_param,
+                bin_name,
+                plugin,
+                plugin_param_name,
+                lr_prefix,
+                length,
+                pipeline_mode
+            )
             ON CONFLICT (run_id, signal_id, signal_value_id) DO NOTHING
+            RETURNING id
             """,
-            rows,
+            run_ids,
+            signal_ids,
+            value_ids,
+            scenario_ids,
+            parent_run_ids,
+            parent_signal_ids,
+            winner_ids,
+            score_versions,
+            winner_params,
+            bin_names,
+            plugins,
+            plugin_params,
+            lr_prefixes,
+            lengths,
+            pipeline_modes,
         )
 
-    # executemany не возвращает количество вставок; считаем как "попытки"
-    return len(rows)
-
+    return len(inserted_rows)
 
 # 🔸 Публичная точка входа: stream-backfill сигнал уровня 2
 async def run_lr_universal_level2_stream_backfill(
@@ -555,7 +646,7 @@ async def run_lr_universal_level2_stream_backfill(
         candidates_total = 0
         candidates_with_bin = 0
         candidates_good = 0
-        membership_attempted = 0
+        membership_inserted = 0
         skipped_no_data = 0
         skipped_no_bin = 0
         skipped_not_good = 0
@@ -567,7 +658,7 @@ async def run_lr_universal_level2_stream_backfill(
                 c_total,
                 c_with_bin,
                 c_good,
-                mem_attempted,
+                mem_inserted,
                 s_no_data,
                 s_no_bin,
                 s_not_good,
@@ -576,14 +667,14 @@ async def run_lr_universal_level2_stream_backfill(
             candidates_total += c_total
             candidates_with_bin += c_with_bin
             candidates_good += c_good
-            membership_attempted += mem_attempted
+            membership_inserted += mem_inserted
             skipped_no_data += s_no_data
             skipped_no_bin += s_no_bin
             skipped_not_good += s_not_good
 
         log.info(
             "BT_SIG_LR_UNI_L2: done — level2_signal_id=%s level2_run_id=%s parent_signal_id=%s parent_run_id=%s scenario_id=%s dir=%s pipeline_mode=%s "
-            "winner=%s score_version=%s winner_param='%s' plugin=%s good_bins=%s candidates=%s with_bin=%s good=%s membership_attempted=%s "
+            "winner=%s score_version=%s winner_param='%s' plugin=%s good_bins=%s candidates=%s with_bin=%s good=%s membership_inserted=%s "
             "skipped_no_data=%s skipped_no_bin=%s skipped_not_good=%s",
             signal_id,
             level2_run_id,
@@ -600,7 +691,7 @@ async def run_lr_universal_level2_stream_backfill(
             candidates_total,
             candidates_with_bin,
             candidates_good,
-            membership_attempted,
+            membership_inserted,
             skipped_no_data,
             skipped_no_bin,
             skipped_not_good,
@@ -756,8 +847,8 @@ async def _process_symbol(
                 )
             )
 
-        mem_attempted = 0
+        mem_inserted = 0
         if to_membership:
-            mem_attempted = await _insert_membership(pg, to_membership)
+            mem_inserted = await _insert_membership(pg, to_membership)
 
-        return len(candidates), with_bin, good, mem_attempted, 0, skipped_no_bin, skipped_not_good
+        return len(candidates), with_bin, good, mem_inserted, 0, skipped_no_bin, skipped_not_good
