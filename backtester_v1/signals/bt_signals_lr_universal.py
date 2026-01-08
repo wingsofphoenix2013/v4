@@ -1,35 +1,56 @@
-# bt_signals_lr_universal.py — воркер backfill для LR-bounce сигналов (trend / counter / agnostic) на m5 (с фиксацией run_id)
+# bt_signals_lr_universal.py — timer-backfill воркер RAW (LR bounce) для m5: пишет events + membership + ready_v2
 
 import asyncio
 import logging
-import uuid
+import hashlib
 import json
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
+
 
 # 🔸 Кеши backtester_v1
 from backtester_config import get_all_ticker_symbols, get_ticker_info
 
-# 🔸 Константы и логгер
-BT_SIGNALS_READY_STREAM = "bt:signals:ready"
+# 🔸 Логгер модуля
 log = logging.getLogger("BT_SIG_LR_UNI")
 
-# 🔸 Таймшаги TF (в минутах) для расчёта окон по барам
+# 🔸 Стрим готовности датасета сигналов (v2)
+BT_SIGNALS_READY_STREAM_V2 = "bt:signals:ready_v2"
+
+# 🔸 Таблицы
+BT_SIGNAL_EVENTS_TABLE = "bt_signals_values"
+BT_SIGNAL_MEMBERSHIP_TABLE = "bt_signals_membership"
+BT_RUNS_TABLE = "bt_signal_backfill_runs"
+
+# 🔸 Системные справочные сущности для RAW membership (чтобы пройти FK)
+SYS_SCENARIO_KEY = "sys_raw"
+SYS_SCENARIO_NAME = "SYS RAW"
+SYS_SCENARIO_TYPE = "system"
+
+SYS_ANALYSIS_FAMILY = "sys"
+SYS_ANALYSIS_KEY = "none"
+SYS_ANALYSIS_NAME = "none"
+
+# 🔸 Таймшаги TF (в минутах)
 TF_STEP_MINUTES = {
     "m5": 5,
 }
 
+# 🔸 Ограничение параллелизма по тикерам
+SYMBOL_MAX_CONCURRENCY = 5
+
 
 # 🔸 Длительность таймфрейма в виде timedelta
 def _get_timeframe_timedelta(timeframe: str) -> timedelta:
-    tf = (timeframe or "").lower()
+    tf = (timeframe or "").strip().lower()
     step_min = TF_STEP_MINUTES.get(tf)
     if not step_min:
         return timedelta(0)
     return timedelta(minutes=step_min)
 
 
-# 🔸 Публичная точка входа: backfill по окну backfill_days для одного инстанса LR-сигнала
+# 🔸 Публичная точка входа: backfill по окну run для одного инстанса LR-сигнала
 async def run_lr_universal_backfill(
     signal: Dict[str, Any],
     pg,
@@ -38,23 +59,27 @@ async def run_lr_universal_backfill(
     window_from_time: Optional[datetime] = None,
     window_to_time: Optional[datetime] = None,
 ) -> None:
-    signal_id = signal.get("id")
-    signal_key = signal.get("key")
+    signal_id = int(signal.get("id") or 0)
+    signal_key = str(signal.get("key") or "").strip()
     name = signal.get("name")
-    timeframe = signal.get("timeframe")
-    backfill_days = signal.get("backfill_days") or 0
+    timeframe = str(signal.get("timeframe") or "").strip().lower()
     params = signal.get("params") or {}
 
-    if timeframe != "m5":
+    # условия достаточности
+    if signal_id <= 0 or timeframe != "m5":
+        return
+    if run_id is None or window_from_time is None or window_to_time is None:
         log.warning(
-            "BT_SIG_LR_UNI: сигнал id=%s ('%s') имеет неподдерживаемый timeframe=%s, ожидается 'm5'",
+            "BT_SIG_LR_UNI: пропуск backfill — signal_id=%s ('%s'), run_id/window отсутствуют (run_id=%s, from=%s, to=%s)",
             signal_id,
             name,
-            timeframe,
+            run_id,
+            window_from_time,
+            window_to_time,
         )
         return
 
-    # читаем инстанс LR на m5 (обязательный)
+    # читаем LR instance (обязательный)
     try:
         lr_cfg = params["indicator"]
         lr_m5_instance_id = int(lr_cfg["value"])
@@ -64,15 +89,6 @@ async def run_lr_universal_backfill(
             signal_id,
             name,
             e,
-        )
-        return
-
-    if backfill_days <= 0 and (window_from_time is None or window_to_time is None):
-        log.warning(
-            "BT_SIG_LR_UNI: сигнал id=%s ('%s') имеет backfill_days=%s и окно не передано, backfill пропущен",
-            signal_id,
-            name,
-            backfill_days,
         )
         return
 
@@ -126,31 +142,37 @@ async def run_lr_universal_backfill(
     # паттерн — только bounce
     pattern = "bounce"
 
-    # рабочее окно по времени
-    if window_from_time is not None and window_to_time is not None:
-        from_time = window_from_time
-        to_time = window_to_time
-    else:
-        now = datetime.utcnow()
-        from_time = now - timedelta(days=int(backfill_days))
-        to_time = now
+    from_time = window_from_time
+    to_time = window_to_time
+
+    # идентификатор типа события (общий event-layer, без signal_id)
+    event_key = f"lr_universal_bounce_{timeframe}"
+
+    # подпись параметров детектора (стабильная часть идентичности событий)
+    event_params_hash = _make_event_params_hash(
+        lr_instance_id=lr_m5_instance_id,
+        timeframe=timeframe,
+        trend_type=trend_type,
+        zone_k=zone_k,
+        keep_half=keep_half,
+    )
+
+    # системные FK-объекты для RAW membership
+    sys_scenario_id, sys_analysis_id = await _ensure_sys_refs(pg)
 
     # список активных тикеров из кеша
     symbols = get_all_ticker_symbols()
     if not symbols:
-        log.debug(
-            "BT_SIG_LR_UNI: нет активных тикеров для обработки, сигнал id=%s ('%s')",
-            signal_id,
-            name,
-        )
+        log.debug("BT_SIG_LR_UNI: нет активных тикеров для обработки, signal_id=%s ('%s')", signal_id, name)
         return
 
     log.debug(
-        "BT_SIG_LR_UNI: старт backfill для сигнала id=%s ('%s', key=%s), TF=%s, окно=[%s..%s], "
-        "тикеров=%s, direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, trend_type=%s, zone_k=%.3f, keep_half=%s, run_id=%s",
+        "BT_SIG_LR_UNI: старт backfill — signal_id=%s ('%s', key=%s), run_id=%s, TF=%s, окно=[%s..%s], тикеров=%s, "
+        "direction_mask=%s, lr_m5_instance_id=%s, pattern=%s, trend_type=%s, zone_k=%.3f, keep_half=%s, event_key=%s, hash=%s",
         signal_id,
         name,
         signal_key,
+        int(run_id),
         timeframe,
         from_time,
         to_time,
@@ -161,349 +183,335 @@ async def run_lr_universal_backfill(
         trend_type,
         zone_k,
         keep_half,
-        run_id,
+        event_key,
+        event_params_hash,
     )
 
-    # загружаем уже существующие события сигнала в окне, чтобы избежать дублей
-    existing_events = await _load_existing_events(pg, signal_id, timeframe, from_time, to_time)
-
-    sema = asyncio.Semaphore(5)
+    sema = asyncio.Semaphore(SYMBOL_MAX_CONCURRENCY)
     tasks: List[asyncio.Task] = []
 
     for symbol in symbols:
         tasks.append(
-            _process_symbol(
-                signal_id=signal_id,
-                signal_key=signal_key,
-                name=name,
-                timeframe=timeframe,
-                symbol=symbol,
-                lr_m5_instance_id=lr_m5_instance_id,
-                from_time=from_time,
-                to_time=to_time,
-                existing_events=existing_events,
-                pg=pg,
-                sema=sema,
-                allowed_directions=allowed_directions,
-                pattern=pattern,
-                trend_type=trend_type,
-                zone_k=zone_k,
-                keep_half=keep_half,
-                run_id=run_id,
+            asyncio.create_task(
+                _process_symbol(
+                    pg=pg,
+                    sema=sema,
+                    run_id=int(run_id),
+                    signal_id=signal_id,
+                    scenario_id=sys_scenario_id,
+                    winner_analysis_id=sys_analysis_id,
+                    parent_run_id=int(run_id),
+                    parent_signal_id=signal_id,
+                    symbol=str(symbol),
+                    timeframe=timeframe,
+                    from_time=from_time,
+                    to_time=to_time,
+                    lr_m5_instance_id=lr_m5_instance_id,
+                    allowed_directions=allowed_directions,
+                    trend_type=trend_type,
+                    zone_k=zone_k,
+                    keep_half=keep_half,
+                    pattern=pattern,
+                    event_key=event_key,
+                    event_params_hash=event_params_hash,
+                ),
+                name=f"BT_SIG_LR_UNI_{signal_id}_{symbol}",
             )
         )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    total_inserted = 0
-    total_skipped_existing = 0
-    total_skipped_duplicate = 0
-
+    total_candidates = 0
+    total_events_inserted = 0
+    total_membership_inserted = 0
     total_long = 0
     total_short = 0
+    total_no_data = 0
 
     for res in results:
         if isinstance(res, Exception):
             continue
-        ins, longs, shorts, skipped_existing, skipped_duplicate = res
-        total_inserted += ins
+        cands, ev_ins, mem_ins, longs, shorts, no_data = res
+        total_candidates += cands
+        total_events_inserted += ev_ins
+        total_membership_inserted += mem_ins
         total_long += longs
         total_short += shorts
-        total_skipped_existing += skipped_existing
-        total_skipped_duplicate += skipped_duplicate
+        total_no_data += no_data
 
-    log.debug(
-        "BT_SIG_LR_UNI: итоги backfill — signal_id=%s, TF=%s, window=[%s..%s], run_id=%s, "
-        "inserted=%s (long=%s, short=%s), skipped_existing=%s, skipped_duplicate=%s",
+    finished_at = datetime.utcnow()
+
+    log.info(
+        "BT_SIG_LR_UNI: backfill готов — signal_id=%s run_id=%s TF=%s window=[%s..%s] tickers=%s "
+        "candidates=%s (long=%s short=%s) events_inserted=%s membership_inserted=%s no_data=%s",
         signal_id,
+        int(run_id),
         timeframe,
         from_time,
         to_time,
-        run_id,
-        total_inserted,
+        len(symbols),
+        total_candidates,
         total_long,
         total_short,
-        total_skipped_existing,
-        total_skipped_duplicate,
+        total_events_inserted,
+        total_membership_inserted,
+        total_no_data,
     )
 
-    # отправляем уведомление в Redis Stream о готовности сигналов (с run_id)
-    finished_at = datetime.utcnow()
-
+    # публикуем ready_v2: downstream читает датасет через membership(run_id, signal_id)
     try:
-        payload = {
-            "signal_id": str(signal_id),
-            "from_time": from_time.isoformat(),
-            "to_time": to_time.isoformat(),
-            "finished_at": finished_at.isoformat(),
-        }
-        if run_id is not None:
-            payload["run_id"] = str(int(run_id))
-
-        await redis.xadd(BT_SIGNALS_READY_STREAM, payload)
-
-        log.debug(
-            "BT_SIG_LR_UNI: опубликовано событие готовности в стрим '%s' для signal_id=%s, run_id=%s, окно=[%s .. %s], finished_at=%s",
-            BT_SIGNALS_READY_STREAM,
-            signal_id,
-            run_id,
-            from_time,
-            to_time,
-            finished_at,
+        await redis.xadd(
+            BT_SIGNALS_READY_STREAM_V2,
+            {
+                "signal_id": str(signal_id),
+                "run_id": str(int(run_id)),
+                "from_time": from_time.isoformat(),
+                "to_time": to_time.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "dataset_kind": "membership",
+                "parent_run_id": str(int(run_id)),
+                "parent_signal_id": str(int(signal_id)),
+                "scenario_id": str(int(sys_scenario_id)),
+            },
         )
     except Exception as e:
         log.error(
-            "BT_SIG_LR_UNI: не удалось опубликовать событие в стрим '%s' для signal_id=%s: %s",
-            BT_SIGNALS_READY_STREAM,
+            "BT_SIG_LR_UNI: не удалось опубликовать ready_v2 (signal_id=%s run_id=%s): %s",
             signal_id,
+            int(run_id),
             e,
             exc_info=True,
         )
 
 
-# 🔸 Загрузка уже существующих событий сигнала в окне (для идемпотентности)
-async def _load_existing_events(
-    pg,
-    signal_id: int,
-    timeframe: str,
-    from_time: datetime,
-    to_time: datetime,
-) -> set[Tuple[str, datetime, str]]:
-    existing: set[Tuple[str, datetime, str]] = set()
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT symbol, open_time, direction
-            FROM bt_signals_values
-            WHERE signal_id = $1
-              AND timeframe = $2
-              AND open_time BETWEEN $3 AND $4
-            """,
-            signal_id,
-            timeframe,
-            from_time,
-            to_time,
-        )
-    for r in rows:
-        existing.add((r["symbol"], r["open_time"], r["direction"]))
-    log.debug(
-        "BT_SIG_LR_UNI: уже существующих событий в окне [%s .. %s] "
-        "для signal_id=%s, TF=%s: %s",
-        from_time,
-        to_time,
-        signal_id,
-        timeframe,
-        len(existing),
-    )
-    return existing
-
-
-# 🔸 Обработка одного символа: поиск LR bounce-сигналов и запись в bt_signals_values
+# 🔸 Обработка одного символа: поиск bounce-кандидатов -> upsert events -> insert membership
 async def _process_symbol(
-    signal_id: int,
-    signal_key: str,
-    name: str,
-    timeframe: str,
-    symbol: str,
-    lr_m5_instance_id: int,
-    from_time: datetime,
-    to_time: datetime,
-    existing_events: set[Tuple[str, datetime, str]],
     pg,
     sema: asyncio.Semaphore,
-    allowed_directions: Set[str],
-    pattern: str,
-    trend_type: str,
-    zone_k: float,
-    keep_half: bool,
-    run_id: Optional[int],
-) -> Tuple[int, int, int, int, int]:
-    async with sema:
-        try:
-            return await _process_symbol_inner(
-                signal_id=signal_id,
-                signal_key=signal_key,
-                name=name,
-                timeframe=timeframe,
-                symbol=symbol,
-                lr_m5_instance_id=lr_m5_instance_id,
-                from_time=from_time,
-                to_time=to_time,
-                existing_events=existing_events,
-                pg=pg,
-                allowed_directions=allowed_directions,
-                pattern=pattern,
-                trend_type=trend_type,
-                zone_k=zone_k,
-                keep_half=keep_half,
-                run_id=run_id,
-            )
-        except Exception as e:
-            log.error(
-                "BT_SIG_LR_UNI: ошибка обработки символа %s для сигнала id=%s ('%s'): %s",
-                symbol,
-                signal_id,
-                name,
-                e,
-                exc_info=True,
-            )
-            return 0, 0, 0, 0, 0
-
-
-# 🔸 Внутренняя логика обработки символа без семафора
-async def _process_symbol_inner(
+    run_id: int,
     signal_id: int,
-    signal_key: str,
-    name: str,
-    timeframe: str,
+    scenario_id: int,
+    winner_analysis_id: int,
+    parent_run_id: int,
+    parent_signal_id: int,
     symbol: str,
-    lr_m5_instance_id: int,
+    timeframe: str,
     from_time: datetime,
     to_time: datetime,
-    existing_events: set[Tuple[str, datetime, str]],
-    pg,
+    lr_m5_instance_id: int,
     allowed_directions: Set[str],
-    pattern: str,
     trend_type: str,
     zone_k: float,
     keep_half: bool,
-    run_id: Optional[int],
-) -> Tuple[int, int, int, int, int]:
-    # загружаем LR-канал на m5
-    lr_m5_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
-    if not lr_m5_series or len(lr_m5_series) < 2:
-        return 0, 0, 0, 0, 0
+    pattern: str,
+    event_key: str,
+    event_params_hash: str,
+) -> Tuple[int, int, int, int, int, int]:
+    async with sema:
+        # грузим LR-канал на m5
+        lr_series = await _load_lr_series(pg, lr_m5_instance_id, symbol, from_time, to_time)
+        if not lr_series or len(lr_series) < 2:
+            return 0, 0, 0, 0, 0, 1
 
-    # загружаем OHLCV для m5 (для цен)
-    ohlcv_series = await _load_ohlcv_series(pg, symbol, timeframe, from_time, to_time)
-    if not ohlcv_series:
-        return 0, 0, 0, 0, 0
+        # грузим OHLCV для m5 (для цен)
+        ohlcv = await _load_ohlcv_series(pg, symbol, timeframe, from_time, to_time)
+        if not ohlcv:
+            return 0, 0, 0, 0, 0, 1
 
-    # работаем по общим временным точкам LR m5 + OHLCV
-    times = sorted(set(lr_m5_series.keys()) & set(ohlcv_series.keys()))
+        # precision цены
+        ticker_info = get_ticker_info(symbol) or {}
+        try:
+            precision_price = int(ticker_info.get("precision_price") or 8)
+        except Exception:
+            precision_price = 8
+
+        tf_delta = _get_timeframe_timedelta(timeframe)
+        if tf_delta <= timedelta(0):
+            return 0, 0, 0, 0, 0, 1
+
+        # генерируем bounce-кандидаты (для разрешённых направлений)
+        candidates, long_count, short_count = _find_bounce_candidates(
+            symbol=symbol,
+            allowed_directions=allowed_directions,
+            trend_type=trend_type,
+            zone_k=zone_k,
+            keep_half=keep_half,
+            precision_price=precision_price,
+            lr_series=lr_series,
+            ohlcv=ohlcv,
+            tf_delta=tf_delta,
+            pattern=pattern,
+            lr_m5_instance_id=lr_m5_instance_id,
+        )
+
+        if not candidates:
+            return 0, 0, 0, 0, 0, 0
+
+        # вставляем events (идемпотентно)
+        events_inserted = await _upsert_events(
+            pg=pg,
+            symbol=symbol,
+            timeframe=timeframe,
+            event_key=event_key,
+            event_params_hash=event_params_hash,
+            candidates=candidates,
+        )
+
+        # получаем id событий для membership (по open_time+direction)
+        event_ids_by_key = await _load_event_ids_for_candidates(
+            pg=pg,
+            symbol=symbol,
+            timeframe=timeframe,
+            event_key=event_key,
+            event_params_hash=event_params_hash,
+            candidates=candidates,
+        )
+
+        # формируем membership rows
+        to_membership: List[Tuple[Any, ...]] = []
+        for cand in candidates:
+            key = (cand["open_time"], cand["direction"])
+            ev_id = event_ids_by_key.get(key)
+            if not ev_id:
+                continue
+
+            to_membership.append(
+                (
+                    int(run_id),
+                    int(signal_id),
+                    int(ev_id),
+                    int(scenario_id),
+                    int(parent_run_id),
+                    int(parent_signal_id),
+                    int(winner_analysis_id),
+                    "v1",          # score_version
+                    None,          # winner_param
+                    "raw",         # bin_name
+                    None,          # plugin
+                    None,          # plugin_param_name
+                    None,          # lr_prefix
+                    None,          # length
+                    "generate",    # pipeline_mode
+                )
+            )
+
+        membership_inserted = 0
+        if to_membership:
+            membership_inserted = await _insert_membership(pg, to_membership)
+
+        return len(candidates), int(events_inserted), int(membership_inserted), int(long_count), int(short_count), 0
+
+
+# 🔸 Поиск bounce-кандидатов (логика как раньше, но результат — список dict)
+def _find_bounce_candidates(
+    symbol: str,
+    allowed_directions: Set[str],
+    trend_type: str,
+    zone_k: float,
+    keep_half: bool,
+    precision_price: int,
+    lr_series: Dict[datetime, Dict[str, float]],
+    ohlcv: Dict[datetime, Tuple[float, float, float, float]],
+    tf_delta: timedelta,
+    pattern: str,
+    lr_m5_instance_id: int,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    # условия достаточности
+    if not lr_series or not ohlcv:
+        return [], 0, 0
+
+    times = sorted(set(lr_series.keys()) & set(ohlcv.keys()))
     if len(times) < 2:
-        return 0, 0, 0, 0, 0
+        return [], 0, 0
 
-    # precision цены для raw_message
-    ticker_info = get_ticker_info(symbol) or {}
-    try:
-        precision_price = int(ticker_info.get("precision_price") or 8)
-    except Exception:
-        precision_price = 8
-
-    # decision_time = open_time + TF (момент закрытия бара)
-    tf_delta = _get_timeframe_timedelta(timeframe)
-    if tf_delta <= timedelta(0):
-        return 0, 0, 0, 0, 0
-
-    to_insert = []
+    out: List[Dict[str, Any]] = []
     long_count = 0
     short_count = 0
 
-    skipped_existing = 0
-    skipped_duplicate = 0
-
-    # перебираем пары (prev_ts, ts) для поиска bounce-паттерна
     for i in range(1, len(times)):
         prev_ts = times[i - 1]
         ts = times[i]
 
-        lr_prev = lr_m5_series.get(prev_ts)
-        lr_curr = lr_m5_series.get(ts)
-        if lr_prev is None or lr_curr is None:
+        lr_prev = lr_series.get(prev_ts)
+        lr_curr = lr_series.get(ts)
+        if not lr_prev or not lr_curr:
             continue
 
-        ohlcv_prev = ohlcv_series.get(prev_ts)
-        ohlcv_curr = ohlcv_series.get(ts)
-        if ohlcv_prev is None or ohlcv_curr is None:
+        ohlcv_prev = ohlcv.get(prev_ts)
+        ohlcv_curr = ohlcv.get(ts)
+        if not ohlcv_prev or not ohlcv_curr:
             continue
 
-        _, _, _, close_prev = ohlcv_prev
-        _, _, _, close_curr = ohlcv_curr
-
+        close_prev = ohlcv_prev[3]
+        close_curr = ohlcv_curr[3]
         if close_curr is None or close_curr == 0:
             continue
 
-        angle_m5 = lr_curr.get("angle")
+        angle = lr_curr.get("angle")
         upper_curr = lr_curr.get("upper")
         lower_curr = lr_curr.get("lower")
         upper_prev = lr_prev.get("upper")
         lower_prev = lr_prev.get("lower")
         center_curr = lr_curr.get("center")
 
-        if (
-            angle_m5 is None
-            or upper_curr is None
-            or lower_curr is None
-            or upper_prev is None
-            or lower_prev is None
-        ):
+        if angle is None or upper_curr is None or lower_curr is None or upper_prev is None or lower_prev is None:
             continue
 
-        # если keep_half включён, но нет center_curr — не можем применить правило половины
+        # если keep_half включён, но нет center_curr — пропускаем
         if keep_half and center_curr is None:
             continue
 
         try:
-            angle_m5_f = float(angle_m5)
-            upper_curr_f = float(upper_curr)
-            lower_curr_f = float(lower_curr)
+            angle_f = float(angle)
             upper_prev_f = float(upper_prev)
             lower_prev_f = float(lower_prev)
+            upper_curr_f = float(upper_curr)
+            lower_curr_f = float(lower_curr)
             close_prev_f = float(close_prev)
             close_curr_f = float(close_curr)
             center_curr_f = float(center_curr) if center_curr is not None else 0.0
         except Exception:
             continue
 
-        # высота канала
         H = upper_prev_f - lower_prev_f
         if H <= 0:
             continue
 
-        # определяем условия по тренду
+        # условия по тренду
         if trend_type == "trend":
-            long_trend_ok = angle_m5_f > 0.0
-            short_trend_ok = angle_m5_f < 0.0
+            long_trend_ok = angle_f > 0.0
+            short_trend_ok = angle_f < 0.0
         elif trend_type == "counter":
-            long_trend_ok = angle_m5_f < 0.0
-            short_trend_ok = angle_m5_f > 0.0
+            long_trend_ok = angle_f < 0.0
+            short_trend_ok = angle_f > 0.0
         else:
             long_trend_ok = True
             short_trend_ok = True
 
         direction: Optional[str] = None
 
-        # LONG bounce: отскок от нижней границы
+        # LONG bounce
         if "long" in allowed_directions and long_trend_ok:
             if zone_k == 0.0:
-                # поведение: любой close_prev ниже/на границе
                 in_zone_prev = close_prev_f <= lower_prev_f
             else:
-                zone_up = zone_k * H
-                threshold = lower_prev_f + zone_up
-                # позволяем глубокие выносы ниже lower_prev, но не слишком далеко выше
+                threshold = lower_prev_f + (float(zone_k) * H)
                 in_zone_prev = close_prev_f <= threshold
 
             if in_zone_prev and close_curr_f > lower_prev_f:
-                # если keep_half включён — цена после отскока должна быть в нижней половине канала
                 if keep_half and not (close_curr_f <= center_curr_f):
                     continue
                 direction = "long"
 
-        # SHORT bounce: отскок от верхней границы
+        # SHORT bounce
         if direction is None and "short" in allowed_directions and short_trend_ok:
             if zone_k == 0.0:
-                # поведение: любой close_prev выше/на границе
                 in_zone_prev = close_prev_f >= upper_prev_f
             else:
-                zone_down = zone_k * H
-                threshold = upper_prev_f - zone_down
-                # позволяем глубокие выносы выше upper_prev, но не слишком далеко ниже
+                threshold = upper_prev_f - (float(zone_k) * H)
                 in_zone_prev = close_prev_f >= threshold
 
             if in_zone_prev and close_curr_f < upper_prev_f:
-                # если keep_half включён — цена после отскока должна быть в верхней половине канала
                 if keep_half and not (close_curr_f >= center_curr_f):
                     continue
                 direction = "short"
@@ -511,61 +519,46 @@ async def _process_symbol_inner(
         if direction is None:
             continue
 
-        key_event = (symbol, ts, direction)
-        if key_event in existing_events:
-            skipped_existing += 1
-            continue
-
-        # округляем цену для raw_message
+        # округляем цену
         try:
             price_rounded = float(f"{close_curr_f:.{precision_price}f}")
         except Exception:
             price_rounded = close_curr_f
 
-        signal_uuid = uuid.uuid4()
-        if direction == "long":
-            message = "LR_UNI_BOUNCE_LONG"
-        else:
-            message = "LR_UNI_BOUNCE_SHORT"
-
-        # decision_time = close_time бара, по которому сформирован сигнал
         decision_time = ts + tf_delta
 
-        raw_message = {
-            "signal_key": signal_key,
-            "signal_id": signal_id,
+        # стабильный payload для отладки (не зависит от run/winner/bins)
+        payload_stable = {
+            "pattern": pattern,
             "symbol": symbol,
-            "timeframe": timeframe,
+            "timeframe": "m5",
             "open_time": ts.isoformat(),
             "decision_time": decision_time.isoformat(),
             "direction": direction,
             "price": price_rounded,
-            "pattern": pattern,
-            "angle_m5": angle_m5_f,
+            "angle_m5": angle_f,
             "upper_prev": upper_prev_f,
             "lower_prev": lower_prev_f,
             "upper_curr": upper_curr_f,
             "lower_curr": lower_curr_f,
             "center_curr": center_curr_f,
             "zone_k": float(zone_k),
-            "trend_type": trend_type,
-            "keep_half": keep_half,
-            "lr_m5_instance_id": lr_m5_instance_id,
+            "trend_type": str(trend_type),
+            "keep_half": bool(keep_half),
+            "lr_m5_instance_id": int(lr_m5_instance_id),
         }
 
-        to_insert.append(
-            (
-                str(signal_uuid),
-                signal_id,
-                symbol,
-                timeframe,
-                ts,
-                decision_time,
-                direction,
-                message,
-                json.dumps(raw_message),
-                int(run_id) if run_id is not None else None,
-            )
+        out.append(
+            {
+                "symbol": symbol,
+                "timeframe": "m5",
+                "open_time": ts,
+                "decision_time": decision_time,
+                "direction": direction,
+                "price": price_rounded,
+                "pattern": pattern,
+                "payload_stable": payload_stable,
+            }
         )
 
         if direction == "long":
@@ -573,24 +566,118 @@ async def _process_symbol_inner(
         else:
             short_count += 1
 
-    if not to_insert:
-        return 0, 0, 0, skipped_existing, 0
+    return out, long_count, short_count
 
-    # вставка: события не перезаписываем, фиксируем first_backfill_run_id только при первом появлении
+
+# 🔸 Upsert events в bt_signals_values (общий event-layer)
+async def _upsert_events(
+    pg,
+    symbol: str,
+    timeframe: str,
+    event_key: str,
+    event_params_hash: str,
+    candidates: List[Dict[str, Any]],
+) -> int:
+    to_insert: List[Tuple[Any, ...]] = []
+    for c in candidates:
+        to_insert.append(
+            (
+                str(uuid.uuid4()),
+                str(symbol),
+                str(timeframe),
+                c["open_time"],
+                c["decision_time"],
+                str(c["direction"]),
+                c.get("price"),
+                str(c.get("pattern") or ""),
+                json.dumps(c.get("payload_stable") or {}),
+                str(event_key),
+                str(event_params_hash),
+            )
+        )
+
+    if not to_insert:
+        return 0
+
     async with pg.acquire() as conn:
         await conn.executemany(
-            """
-            INSERT INTO bt_signals_values
-                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message, first_backfill_run_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
-            ON CONFLICT (signal_id, symbol, timeframe, open_time, direction)
+            f"""
+            INSERT INTO {BT_SIGNAL_EVENTS_TABLE}
+                (signal_uuid, symbol, timeframe, open_time, decision_time, direction, price, pattern, payload_stable, event_key, event_params_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8,''), $9::jsonb, $10, $11)
+            ON CONFLICT (event_key, event_params_hash, symbol, timeframe, open_time, direction)
             DO NOTHING
             """,
             to_insert,
         )
 
-    inserted = len(to_insert)
-    return inserted, long_count, short_count, skipped_existing, skipped_duplicate
+    # точное число вставленных строк через executemany не получить без доп. запросов
+    return 0
+
+
+# 🔸 Загрузка id событий для кандидатов (для membership)
+async def _load_event_ids_for_candidates(
+    pg,
+    symbol: str,
+    timeframe: str,
+    event_key: str,
+    event_params_hash: str,
+    candidates: List[Dict[str, Any]],
+) -> Dict[Tuple[datetime, str], int]:
+    # условия достаточности
+    if not candidates:
+        return {}
+
+    open_times: List[datetime] = [c["open_time"] for c in candidates]
+    directions: List[str] = [str(c["direction"]) for c in candidates]
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, open_time, direction
+            FROM {BT_SIGNAL_EVENTS_TABLE}
+            WHERE event_key = $1
+              AND event_params_hash = $2
+              AND symbol = $3
+              AND timeframe = $4
+              AND (open_time, direction) IN (
+                    SELECT * FROM unnest($5::timestamp[], $6::text[])
+              )
+            """,
+            str(event_key),
+            str(event_params_hash),
+            str(symbol),
+            str(timeframe),
+            open_times,
+            directions,
+        )
+
+    out: Dict[Tuple[datetime, str], int] = {}
+    for r in rows:
+        out[(r["open_time"], str(r["direction"]))] = int(r["id"])
+    return out
+
+
+# 🔸 Вставка membership (идемпотентно)
+async def _insert_membership(pg, rows: List[Tuple[Any, ...]]) -> int:
+    async with pg.acquire() as conn:
+        res = await conn.executemany(
+            f"""
+            INSERT INTO {BT_SIGNAL_MEMBERSHIP_TABLE}
+                (run_id, signal_id, signal_value_id, scenario_id, parent_run_id, parent_signal_id,
+                 winner_analysis_id, score_version, winner_param, bin_name,
+                 plugin, plugin_param_name, lr_prefix, length, pipeline_mode)
+            VALUES
+                ($1, $2, $3, $4, $5, $6,
+                 $7, $8, $9, $10,
+                 $11, $12, $13, $14, $15)
+            ON CONFLICT (run_id, signal_id, signal_value_id) DO NOTHING
+            """,
+            rows,
+        )
+
+    # executemany не возвращает количество вставок; считаем как "попытки"
+    return len(rows)
 
 
 # 🔸 Загрузка LR-серии (angle/upper/lower/center) для одного инстанса / символа / окна
@@ -611,8 +698,8 @@ async def _load_lr_series(
               AND open_time  BETWEEN $3 AND $4
             ORDER BY open_time
             """,
-            instance_id,
-            symbol,
+            int(instance_id),
+            str(symbol),
             from_time,
             to_time,
         )
@@ -651,6 +738,7 @@ async def _load_ohlcv_series(
     from_time: datetime,
     to_time: datetime,
 ) -> Dict[datetime, Tuple[float, float, float, float]]:
+    # условия достаточности
     if timeframe != "m5":
         return {}
 
@@ -665,7 +753,7 @@ async def _load_ohlcv_series(
               AND open_time BETWEEN $2 AND $3
             ORDER BY open_time
             """,
-            symbol,
+            str(symbol),
             from_time,
             to_time,
         )
@@ -695,3 +783,89 @@ def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float
         return float(str(raw))
     except Exception:
         return default
+
+
+# 🔸 Формирование стабильного hash набора параметров детектора (для event_params_hash)
+def _make_event_params_hash(
+    lr_instance_id: int,
+    timeframe: str,
+    trend_type: str,
+    zone_k: float,
+    keep_half: bool,
+) -> str:
+    s = f"lr={int(lr_instance_id)}|tf={str(timeframe)}|trend={str(trend_type)}|zone_k={float(zone_k)}|keep_half={bool(keep_half)}"
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
+# 🔸 Ensure системных сущностей для RAW membership (scenario + analysis), с кешированием
+_sys_cache: Dict[str, int] = {}
+
+
+async def _ensure_sys_refs(pg) -> Tuple[int, int]:
+    # условия достаточности
+    if "scenario_id" in _sys_cache and "analysis_id" in _sys_cache:
+        return int(_sys_cache["scenario_id"]), int(_sys_cache["analysis_id"])
+
+    async with pg.acquire() as conn:
+        # ensure scenario
+        row = await conn.fetchrow(
+            """
+            SELECT id
+            FROM bt_scenario_instances
+            WHERE key = $1
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            SYS_SCENARIO_KEY,
+        )
+
+        if row:
+            scenario_id = int(row["id"])
+        else:
+            scenario_id = int(
+                await conn.fetchval(
+                    """
+                    INSERT INTO bt_scenario_instances (key, name, type, enabled, created_at)
+                    VALUES ($1, $2, $3, true, NOW())
+                    RETURNING id
+                    """,
+                    SYS_SCENARIO_KEY,
+                    SYS_SCENARIO_NAME,
+                    SYS_SCENARIO_TYPE,
+                )
+            )
+
+        # ensure analysis
+        row = await conn.fetchrow(
+            """
+            SELECT id
+            FROM bt_analysis_instances
+            WHERE family_key = $1 AND key = $2 AND name = $3
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            SYS_ANALYSIS_FAMILY,
+            SYS_ANALYSIS_KEY,
+            SYS_ANALYSIS_NAME,
+        )
+
+        if row:
+            analysis_id = int(row["id"])
+        else:
+            analysis_id = int(
+                await conn.fetchval(
+                    """
+                    INSERT INTO bt_analysis_instances (family_key, key, name, enabled, created_at)
+                    VALUES ($1, $2, $3, false, NOW())
+                    RETURNING id
+                    """,
+                    SYS_ANALYSIS_FAMILY,
+                    SYS_ANALYSIS_KEY,
+                    SYS_ANALYSIS_NAME,
+                )
+            )
+
+    _sys_cache["scenario_id"] = int(scenario_id)
+    _sys_cache["analysis_id"] = int(analysis_id)
+
+    return int(scenario_id), int(analysis_id)
