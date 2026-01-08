@@ -23,15 +23,6 @@ BT_SIGNAL_EVENTS_TABLE = "bt_signals_values"
 BT_SIGNAL_MEMBERSHIP_TABLE = "bt_signals_membership"
 BT_RUNS_TABLE = "bt_signal_backfill_runs"
 
-# 🔸 Системные справочные сущности для RAW membership (чтобы пройти FK)
-SYS_SCENARIO_KEY = "sys_raw"
-SYS_SCENARIO_NAME = "SYS RAW"
-SYS_SCENARIO_TYPE = "system"
-
-SYS_ANALYSIS_FAMILY = "sys"
-SYS_ANALYSIS_KEY = "none"
-SYS_ANALYSIS_NAME = "none"
-
 # 🔸 Таймшаги TF (в минутах)
 TF_STEP_MINUTES = {
     "m5": 5,
@@ -157,8 +148,9 @@ async def run_lr_universal_backfill(
         keep_half=keep_half,
     )
 
-    # системные FK-объекты для RAW membership
-    sys_scenario_id, sys_analysis_id = await _ensure_sys_refs(pg)
+    # RAW membership не требует scenario/winner
+    sys_scenario_id = None
+    sys_analysis_id = None
 
     # список активных тикеров из кеша
     symbols = get_all_ticker_symbols()
@@ -271,7 +263,6 @@ async def run_lr_universal_backfill(
                 "dataset_kind": "membership",
                 "parent_run_id": str(int(run_id)),
                 "parent_signal_id": str(int(signal_id)),
-                "scenario_id": str(int(sys_scenario_id)),
             },
         )
     except Exception as e:
@@ -380,10 +371,10 @@ async def _process_symbol(
                     int(run_id),
                     int(signal_id),
                     int(ev_id),
-                    int(scenario_id),
+                    None,          # scenario_id
                     int(parent_run_id),
                     int(parent_signal_id),
-                    int(winner_analysis_id),
+                    None,          # winner_analysis_id
                     "v1",          # score_version
                     None,          # winner_param
                     "raw",         # bin_name
@@ -795,77 +786,3 @@ def _make_event_params_hash(
 ) -> str:
     s = f"lr={int(lr_instance_id)}|tf={str(timeframe)}|trend={str(trend_type)}|zone_k={float(zone_k)}|keep_half={bool(keep_half)}"
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
-
-
-# 🔸 Ensure системных сущностей для RAW membership (scenario + analysis), с кешированием
-_sys_cache: Dict[str, int] = {}
-
-
-async def _ensure_sys_refs(pg) -> Tuple[int, int]:
-    # условия достаточности
-    if "scenario_id" in _sys_cache and "analysis_id" in _sys_cache:
-        return int(_sys_cache["scenario_id"]), int(_sys_cache["analysis_id"])
-
-    async with pg.acquire() as conn:
-        # ensure scenario
-        row = await conn.fetchrow(
-            """
-            SELECT id
-            FROM bt_scenario_instances
-            WHERE key = $1
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            SYS_SCENARIO_KEY,
-        )
-
-        if row:
-            scenario_id = int(row["id"])
-        else:
-            scenario_id = int(
-                await conn.fetchval(
-                    """
-                    INSERT INTO bt_scenario_instances (key, name, type, enabled, created_at)
-                    VALUES ($1, $2, $3, true, NOW())
-                    RETURNING id
-                    """,
-                    SYS_SCENARIO_KEY,
-                    SYS_SCENARIO_NAME,
-                    SYS_SCENARIO_TYPE,
-                )
-            )
-
-        # ensure analysis
-        row = await conn.fetchrow(
-            """
-            SELECT id
-            FROM bt_analysis_instances
-            WHERE family_key = $1 AND key = $2 AND name = $3
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            SYS_ANALYSIS_FAMILY,
-            SYS_ANALYSIS_KEY,
-            SYS_ANALYSIS_NAME,
-        )
-
-        if row:
-            analysis_id = int(row["id"])
-        else:
-            analysis_id = int(
-                await conn.fetchval(
-                    """
-                    INSERT INTO bt_analysis_instances (family_key, key, name, enabled, created_at)
-                    VALUES ($1, $2, $3, false, NOW())
-                    RETURNING id
-                    """,
-                    SYS_ANALYSIS_FAMILY,
-                    SYS_ANALYSIS_KEY,
-                    SYS_ANALYSIS_NAME,
-                )
-            )
-
-    _sys_cache["scenario_id"] = int(scenario_id)
-    _sys_cache["analysis_id"] = int(analysis_id)
-
-    return int(scenario_id), int(analysis_id)
