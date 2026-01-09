@@ -1,6 +1,8 @@
-# bt_scenario_raw_straight_mono_v2.py — raw straight-сценарий (mono) v2: 1 event = 1 позиция-объект (positions_v2) + membership_v2 (run-aware), без stat/daily
+# bt_scenario_raw_straight_mono_v2.py — raw straight-сценарий (mono) v2: positions_v2 (объект) + membership_v2 (run-aware), без stat/daily, с батчами и семафором
 
+import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -27,6 +29,11 @@ BT_MEMBERSHIP_V2_TABLE = "bt_scenario_membership_v2"
 # 🔸 Таблицы сигналов (входной датасет)
 BT_SIGNAL_MEMBERSHIP_TABLE = "bt_signals_membership"
 BT_SIGNAL_EVENTS_TABLE = "bt_signals_values"
+
+# 🔸 Параллелизм и батчи (под 8–10k events/run)
+EVENTS_BATCH_SIZE = 500
+CLOSE_BATCH_SIZE = 200
+MAX_CONCURRENCY = 8
 
 # 🔸 Таймшаги TF (в минутах) для decision_time
 TF_STEP_MINUTES = {
@@ -107,6 +114,17 @@ def _ohlcv_table_for_timeframe(timeframe: str) -> Optional[str]:
     if timeframe == "h1":
         return "ohlcv_bb_h1"
     return None
+
+
+# 🔸 Парсер rowcount из asyncpg execute tag ("UPDATE 1", "UPDATE 0", ...)
+def _parse_rowcount(cmd_tag: str) -> int:
+    try:
+        parts = str(cmd_tag).strip().split()
+        if not parts:
+            return 0
+        return int(parts[-1])
+    except Exception:
+        return 0
 
 
 # 🔸 Найти закрытие сделки (TP/SL) в диапазоне (scan_from .. scan_to]
@@ -378,7 +396,6 @@ async def _create_or_get_position_v2(
         if row and row["id"] is not None:
             return int(row["id"]), True
 
-        # конфликт — достаём существующую позицию
         existing_id = await conn.fetchval(
             f"""
             SELECT id
@@ -459,7 +476,7 @@ async def _try_close_position_v2(
     run_id: int,
     position: Dict[str, Any],
     run_to_time: datetime,
-) -> Optional[Dict[str, Any]]:
+) -> bool:
     pos_id = int(position["id"])
     symbol = str(position["symbol"])
     timeframe = str(position["timeframe"])
@@ -474,7 +491,7 @@ async def _try_close_position_v2(
 
     # условия достаточности
     if run_to_time <= entry_time:
-        return None
+        return False
 
     exit_info = await _find_exit_in_range(
         pg=pg,
@@ -488,7 +505,7 @@ async def _try_close_position_v2(
     )
 
     if exit_info is None:
-        return None
+        return False
 
     exit_time, exit_price, exit_reason = exit_info
 
@@ -505,9 +522,8 @@ async def _try_close_position_v2(
         exit_price=exit_price,
     )
 
-    # закрываем только если всё ещё open (идемпотентность)
     async with pg.acquire() as conn:
-        updated = await conn.execute(
+        cmd = await conn.execute(
             f"""
             UPDATE {BT_POSITIONS_V2_TABLE}
             SET status = 'closed',
@@ -534,19 +550,10 @@ async def _try_close_position_v2(
             max_adv_pct,
         )
 
-    # если строка не обновилась — значит позиция уже закрыта параллельно/ранее
-    if not isinstance(updated, str) or not updated.startswith("UPDATE"):
-        return None
-
-    return {
-        "id": pos_id,
-        "exit_time": exit_time,
-        "exit_reason": str(exit_reason),
-        "pnl_abs": pnl_abs,
-    }
+    return _parse_rowcount(cmd) > 0
 
 
-# 🔸 Получить актуальные статусы позиций (для заполнения membership.status_at_end)
+# 🔸 Получить актуальные статусы позиций (для membership.status_at_end)
 async def _load_positions_status_by_ids(
     pg,
     position_ids: List[int],
@@ -631,6 +638,187 @@ async def _insert_membership_v2(
     return len(inserted)
 
 
+# 🔸 Обработка одного event: создать/получить позицию-объект (под семафором)
+async def _process_one_event_with_semaphore(
+    pg,
+    sema: asyncio.Semaphore,
+    scenario_id: int,
+    signal_id: int,
+    run_id: int,
+    timeframe: str,
+    tf_delta: timedelta,
+    allowed_directions: List[str],
+    leverage: Decimal,
+    sl_value: Decimal,
+    tp_value: Decimal,
+    position_limit: Decimal,
+    ev: Dict[str, Any],
+) -> Tuple[str, Optional[int], bool]:
+    async with sema:
+        try:
+            # условия достаточности
+            direction = str(ev.get("direction") or "").strip().lower()
+            if direction not in ("long", "short"):
+                return "skipped", None, False
+            if direction not in allowed_directions:
+                return "skipped", None, False
+
+            symbol = str(ev.get("symbol") or "")
+            open_time: datetime = ev["open_time"]
+            signal_value_id = int(ev["signal_value_id"])
+
+            # decision_time берём из event, если есть; иначе вычисляем
+            decision_time = ev.get("decision_time") or (open_time + tf_delta)
+
+            # entry_price берём из event.price
+            price_val = ev.get("price")
+            if price_val is None:
+                return "skipped", None, False
+
+            entry_price = Decimal(str(price_val))
+            if entry_price <= Decimal("0"):
+                return "skipped", None, False
+
+            # настройки тикера
+            ticker_info = get_ticker_info(symbol) or {}
+            min_qty_val = ticker_info.get("min_qty")
+            precision_qty = ticker_info.get("precision_qty")
+            precision_price = ticker_info.get("precision_price")
+            ticksize_val = ticker_info.get("ticksize")
+
+            try:
+                min_qty = Decimal(str(min_qty_val)) if min_qty_val is not None else Decimal("0")
+            except Exception:
+                min_qty = Decimal("0")
+
+            try:
+                ticksize = Decimal(str(ticksize_val)) if ticksize_val is not None else None
+            except Exception:
+                ticksize = None
+
+            # округляем entry_price по тикеру
+            entry_price = _round_price(entry_price, precision_price, ticksize)
+
+            # фиксированная маржа на сделку = position_limit
+            margin_used = _q_money(position_limit)
+            if margin_used <= Decimal("0"):
+                return "skipped", None, False
+
+            # notional
+            entry_notional = _q_money(margin_used * leverage)
+            if entry_notional <= Decimal("0"):
+                return "skipped", None, False
+
+            # qty
+            qty_raw = entry_notional / entry_price
+
+            if precision_qty is not None:
+                try:
+                    q_dec = int(precision_qty)
+                except Exception:
+                    q_dec = 0
+                quant = Decimal("1").scaleb(-q_dec)
+                entry_qty = qty_raw.quantize(quant, rounding=ROUND_DOWN)
+            else:
+                entry_qty = qty_raw
+
+            if entry_qty <= Decimal("0"):
+                return "skipped", None, False
+
+            if entry_qty < min_qty:
+                return "skipped", None, False
+
+            # пересчёт notional по округлённому qty
+            entry_notional = _q_money(entry_price * entry_qty)
+            if entry_notional <= Decimal("0"):
+                return "skipped", None, False
+
+            # SL/TP
+            sl_price, tp_price = _calc_sl_tp_percent(
+                entry_price=entry_price,
+                sl_percent=sl_value,
+                tp_percent=tp_value,
+                direction=direction,
+            )
+
+            sl_price = _round_price(sl_price, precision_price, ticksize)
+            tp_price = _round_price(tp_price, precision_price, ticksize)
+
+            if sl_price <= Decimal("0") or tp_price <= Decimal("0"):
+                return "skipped", None, False
+
+            pos_id, created_now = await _create_or_get_position_v2(
+                pg=pg,
+                scenario_id=scenario_id,
+                signal_id=signal_id,
+                signal_value_id=signal_value_id,
+                opened_run_id=run_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=direction,
+                entry_time=open_time,
+                decision_time=decision_time,
+                entry_price=entry_price,
+                entry_qty=entry_qty,
+                entry_notional=entry_notional,
+                margin_used=margin_used,
+                sl_price=sl_price,
+                tp_price=tp_price,
+            )
+
+            return "ok", int(pos_id), bool(created_now)
+
+        except Exception as e:
+            log.error(
+                "BT_SCENARIO_RAW_MONO_V2: ошибка обработки event (scenario_id=%s, signal_id=%s, run_id=%s): %s, ev=%s",
+                scenario_id,
+                signal_id,
+                run_id,
+                e,
+                ev,
+                exc_info=True,
+            )
+            return "error", None, False
+
+
+# 🔸 Обработка одной open позиции: попытка закрытия (под семафором)
+async def _process_one_close_with_semaphore(
+    pg,
+    sema: asyncio.Semaphore,
+    run_id: int,
+    to_time: datetime,
+    pos: Dict[str, Any],
+) -> Tuple[str, Optional[int]]:
+    async with sema:
+        try:
+            # условия достаточности
+            pos_id = int(pos.get("id") or 0)
+            if pos_id <= 0:
+                return "skipped", None
+
+            closed_now = await _try_close_position_v2(
+                pg=pg,
+                run_id=run_id,
+                position=pos,
+                run_to_time=to_time,
+            )
+
+            if not closed_now:
+                return "ok", None
+
+            return "ok", pos_id
+
+        except Exception as e:
+            log.error(
+                "BT_SCENARIO_RAW_MONO_V2: ошибка закрытия позиции id=%s (run_id=%s): %s",
+                pos.get("id"),
+                run_id,
+                e,
+                exc_info=True,
+            )
+            return "error", None
+
+
 # 🔸 Публичная точка входа: backfill для сценария raw_straight_mono_v2 по одному окну датасета сигналов (membership run-aware)
 async def run_raw_straight_mono_backfill_v2(
     scenario: Dict[str, Any],
@@ -638,6 +826,8 @@ async def run_raw_straight_mono_backfill_v2(
     pg,
     redis,
 ) -> None:
+    t0 = time.perf_counter()
+
     scenario_id = int(scenario.get("id") or 0)
     scenario_key = scenario.get("key")
     scenario_type = scenario.get("type")
@@ -674,7 +864,6 @@ async def run_raw_straight_mono_backfill_v2(
     # базовые параметры сценария (stat/daily не считаем, но параметры нужны для симуляции)
     try:
         direction_mode = (params["direction"]["value"] or "").strip().lower()
-        deposit = Decimal(str(params.get("deposit", {}).get("value", "0")))  # не используется в v2
         leverage = Decimal(str(params["leverage"]["value"]))
         sl_type = (params["sl_type"]["value"] or "").strip().lower()
         sl_value = Decimal(str(params["sl_value"]["value"]))
@@ -690,7 +879,6 @@ async def run_raw_straight_mono_backfill_v2(
         )
         return
 
-    # direction=mono ожидается, но не жёстко блокируем
     if direction_mode != "mono":
         log.warning(
             "BT_SCENARIO_RAW_MONO_V2: сценарий id=%s ожидает direction='mono', получено '%s'",
@@ -726,7 +914,6 @@ async def run_raw_straight_mono_backfill_v2(
         )
         return
 
-    # decision_time = entry_time + TF (если в event нет decision_time)
     tf_delta = _get_timeframe_timedelta(timeframe)
     if tf_delta <= timedelta(0):
         log.error(
@@ -749,7 +936,7 @@ async def run_raw_straight_mono_backfill_v2(
         allowed_directions = ["long", "short"]
 
     log.debug(
-        "BT_SCENARIO_RAW_MONO_V2: старт scenario_id=%s (key=%s, type=%s) signal_id=%s run_id=%s TF=%s window=[%s..%s] allowed_directions=%s",
+        "BT_SCENARIO_RAW_MONO_V2: старт scenario_id=%s (key=%s, type=%s) signal_id=%s run_id=%s TF=%s window=[%s..%s] batch=%s close_batch=%s conc=%s",
         scenario_id,
         scenario_key,
         scenario_type,
@@ -758,9 +945,12 @@ async def run_raw_straight_mono_backfill_v2(
         timeframe,
         from_time,
         to_time,
-        allowed_directions,
+        EVENTS_BATCH_SIZE,
+        CLOSE_BATCH_SIZE,
+        MAX_CONCURRENCY,
     )
 
+    # 🔸 Счётчики
     total_events = 0
     positions_created = 0
     positions_existing = 0
@@ -769,7 +959,8 @@ async def run_raw_straight_mono_backfill_v2(
     skipped = 0
     errors = 0
 
-    # 🔸 1) Загружаем входной датасет (events через signals membership)
+    # 🔸 1) Загружаем входной датасет
+    t_load0 = time.perf_counter()
     try:
         events = await _load_signal_events_for_run(
             pg=pg,
@@ -790,158 +981,72 @@ async def run_raw_straight_mono_backfill_v2(
             exc_info=True,
         )
         return
+    t_load_ms = int((time.perf_counter() - t_load0) * 1000)
 
-    # позиция -> opened_in_run (для membership)
+    # 🔸 2) Создание/получение позиций по событиям (батчи + семафор)
+    t_open0 = time.perf_counter()
+    sema = asyncio.Semaphore(MAX_CONCURRENCY)
+
     opened_in_run_by_pos: Dict[int, bool] = {}
-    # позиции, которые нужно зафиксировать в membership текущего run
     positions_in_run: Set[int] = set()
 
-    # 🔸 2) Создаём позиции-объекты (если нужно) по событиям датасета
-    for ev in events:
-        try:
-            symbol = str(ev["symbol"])
-            open_time: datetime = ev["open_time"]
-            signal_value_id = int(ev["signal_value_id"])
+    for i in range(0, len(events), EVENTS_BATCH_SIZE):
+        batch = events[i : i + EVENTS_BATCH_SIZE]
 
-            direction = str(ev.get("direction") or "").strip().lower()
-            if direction not in ("long", "short"):
-                skipped += 1
-                continue
-
-            # если сигнал моно-направленный — пропускаем чужие направления
-            if direction not in allowed_directions:
-                skipped += 1
-                continue
-
-            # decision_time берём из event, если есть; иначе вычисляем
-            decision_time = ev.get("decision_time") or (open_time + tf_delta)
-
-            # entry_price берём из event.price (numeric)
-            price_val = ev.get("price")
-            if price_val is None:
-                skipped += 1
-                continue
-
-            entry_price = Decimal(str(price_val))
-            if entry_price <= Decimal("0"):
-                skipped += 1
-                continue
-
-            # загрузка настроек тикера
-            ticker_info = get_ticker_info(symbol) or {}
-            min_qty_val = ticker_info.get("min_qty")
-            precision_qty = ticker_info.get("precision_qty")
-            precision_price = ticker_info.get("precision_price")
-            ticksize_val = ticker_info.get("ticksize")
-
-            try:
-                min_qty = Decimal(str(min_qty_val)) if min_qty_val is not None else Decimal("0")
-            except Exception:
-                min_qty = Decimal("0")
-
-            try:
-                ticksize = Decimal(str(ticksize_val)) if ticksize_val is not None else None
-            except Exception:
-                ticksize = None
-
-            # выравниваем цену входа по тикеру
-            entry_price = _round_price(entry_price, precision_price, ticksize)
-
-            # фиксированная маржа на сделку = position_limit
-            margin_used = _q_money(position_limit)
-            if margin_used <= Decimal("0"):
-                skipped += 1
-                continue
-
-            # notional
-            entry_notional = _q_money(margin_used * leverage)
-            if entry_notional <= Decimal("0"):
-                skipped += 1
-                continue
-
-            # qty
-            qty_raw = entry_notional / entry_price
-
-            if precision_qty is not None:
-                try:
-                    q_dec = int(precision_qty)
-                except Exception:
-                    q_dec = 0
-                quant = Decimal("1").scaleb(-q_dec)
-                entry_qty = qty_raw.quantize(quant, rounding=ROUND_DOWN)
-            else:
-                entry_qty = qty_raw
-
-            if entry_qty <= Decimal("0"):
-                skipped += 1
-                continue
-
-            if entry_qty < min_qty:
-                skipped += 1
-                continue
-
-            # пересчёт notional по округлённому qty
-            entry_notional = _q_money(entry_price * entry_qty)
-            if entry_notional <= Decimal("0"):
-                skipped += 1
-                continue
-
-            # расчёт уровней SL/TP в процентах
-            sl_price, tp_price = _calc_sl_tp_percent(
-                entry_price=entry_price,
-                sl_percent=sl_value,
-                tp_percent=tp_value,
-                direction=direction,
+        # создаём задачи батча
+        tasks: List[asyncio.Task] = []
+        for ev in batch:
+            tasks.append(
+                asyncio.create_task(
+                    _process_one_event_with_semaphore(
+                        pg=pg,
+                        sema=sema,
+                        scenario_id=scenario_id,
+                        signal_id=signal_id,
+                        run_id=run_id,
+                        timeframe=timeframe,
+                        tf_delta=tf_delta,
+                        allowed_directions=allowed_directions,
+                        leverage=leverage,
+                        sl_value=sl_value,
+                        tp_value=tp_value,
+                        position_limit=position_limit,
+                        ev=ev,
+                    ),
+                    name=f"BT_SCN_RAW_V2_EVT_{scenario_id}_{signal_id}_{run_id}",
+                )
             )
 
-            # приводим цены SL/TP к precision_price и ticksize
-            sl_price = _round_price(sl_price, precision_price, ticksize)
-            tp_price = _round_price(tp_price, precision_price, ticksize)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if sl_price <= Decimal("0") or tp_price <= Decimal("0"):
+        # собираем результаты батча (без мутаций внутри корутин)
+        for r in results:
+            if isinstance(r, Exception):
+                errors += 1
+                continue
+            status, pos_id, opened_now = r
+            if status == "skipped":
                 skipped += 1
                 continue
-
-            # создаём (или получаем) позицию-объект
-            pos_id, created_now = await _create_or_get_position_v2(
-                pg=pg,
-                scenario_id=scenario_id,
-                signal_id=signal_id,
-                signal_value_id=signal_value_id,
-                opened_run_id=run_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                direction=direction,
-                entry_time=open_time,
-                decision_time=decision_time,
-                entry_price=entry_price,
-                entry_qty=entry_qty,
-                entry_notional=entry_notional,
-                margin_used=margin_used,
-                sl_price=sl_price,
-                tp_price=tp_price,
-            )
+            if status == "error":
+                errors += 1
+                continue
+            if pos_id is None:
+                skipped += 1
+                continue
 
             positions_in_run.add(int(pos_id))
-            opened_in_run_by_pos[int(pos_id)] = bool(created_now)
+            opened_in_run_by_pos[int(pos_id)] = bool(opened_now)
 
-            if created_now:
+            if opened_now:
                 positions_created += 1
             else:
                 positions_existing += 1
 
-        except Exception as e:
-            errors += 1
-            log.error(
-                "BT_SCENARIO_RAW_MONO_V2: ошибка обработки event (scenario_id=%s, signal_id=%s, run_id=%s): %s",
-                scenario_id,
-                signal_id,
-                run_id,
-                e,
-                exc_info=True,
-            )
+    t_open_ms = int((time.perf_counter() - t_open0) * 1000)
 
-    # 🔸 3) Прогрессивное закрытие open позиций (без lookahead; закрываем, если exit попал в (entry_time..to_time])
+    # 🔸 3) Прогрессивное закрытие open позиций (батчи + семафор)
+    t_close0 = time.perf_counter()
     closed_in_run_by_pos: Dict[int, bool] = {}
 
     try:
@@ -952,39 +1057,11 @@ async def run_raw_straight_mono_backfill_v2(
             timeframe=timeframe,
             directions=allowed_directions,
         )
-
-        for pos in open_positions:
-            try:
-                closed = await _try_close_position_v2(
-                    pg=pg,
-                    run_id=run_id,
-                    position=pos,
-                    run_to_time=to_time,
-                )
-                if closed is None:
-                    continue
-
-                pos_id = int(pos["id"])
-                closed_in_run_by_pos[pos_id] = True
-                positions_closed_now += 1
-
-                # если позиция закрылась в этом run, зафиксируем её в membership этого run
-                positions_in_run.add(pos_id)
-
-            except Exception as e:
-                errors += 1
-                log.error(
-                    "BT_SCENARIO_RAW_MONO_V2: ошибка прогрессивного закрытия позиции id=%s (run_id=%s): %s",
-                    pos.get("id"),
-                    run_id,
-                    e,
-                    exc_info=True,
-                )
-
     except Exception as e:
+        open_positions = []
         errors += 1
         log.error(
-            "BT_SCENARIO_RAW_MONO_V2: ошибка загрузки/обработки open позиций для scenario_id=%s signal_id=%s run_id=%s: %s",
+            "BT_SCENARIO_RAW_MONO_V2: ошибка загрузки open позиций (scenario_id=%s signal_id=%s run_id=%s): %s",
             scenario_id,
             signal_id,
             run_id,
@@ -992,7 +1069,47 @@ async def run_raw_straight_mono_backfill_v2(
             exc_info=True,
         )
 
-    # 🔸 4) Записываем membership_v2 для текущего run
+    for i in range(0, len(open_positions), CLOSE_BATCH_SIZE):
+        batch = open_positions[i : i + CLOSE_BATCH_SIZE]
+
+        tasks: List[asyncio.Task] = []
+        for pos in batch:
+            tasks.append(
+                asyncio.create_task(
+                    _process_one_close_with_semaphore(
+                        pg=pg,
+                        sema=sema,
+                        run_id=run_id,
+                        to_time=to_time,
+                        pos=pos,
+                    ),
+                    name=f"BT_SCN_RAW_V2_CLOSE_{scenario_id}_{signal_id}_{run_id}",
+                )
+            )
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in results:
+            if isinstance(r, Exception):
+                errors += 1
+                continue
+            status, closed_pos_id = r
+            if status == "error":
+                errors += 1
+                continue
+            if closed_pos_id is None:
+                continue
+
+            pid = int(closed_pos_id)
+            closed_in_run_by_pos[pid] = True
+            positions_closed_now += 1
+            # если позиция закрылась в этом run — обязательно зафиксируем membership
+            positions_in_run.add(pid)
+
+    t_close_ms = int((time.perf_counter() - t_close0) * 1000)
+
+    # 🔸 4) Membership_v2 (bulk)
+    t_memb0 = time.perf_counter()
     try:
         pos_ids_list = sorted(list(positions_in_run))
         status_by_id = await _load_positions_status_by_ids(pg, pos_ids_list)
@@ -1023,11 +1140,17 @@ async def run_raw_straight_mono_backfill_v2(
             e,
             exc_info=True,
         )
+        membership_inserted = 0
+
+    t_memb_ms = int((time.perf_counter() - t_memb0) * 1000)
 
     # 🔸 5) Итог и событие готовности сценария v2
+    total_ms = int((time.perf_counter() - t0) * 1000)
+
     log.info(
         "BT_SCENARIO_RAW_MONO_V2: summary scenario_id=%s signal_id=%s run_id=%s TF=%s window=[%s..%s] — "
-        "events=%s positions_created=%s positions_existing=%s positions_closed_now=%s membership_inserted=%s skipped=%s errors=%s",
+        "events=%s created=%s existing=%s closed_now=%s memb_inserted=%s skipped=%s errors=%s "
+        "timing_ms(load=%s open=%s close=%s memb=%s total=%s)",
         scenario_id,
         signal_id,
         run_id,
@@ -1041,6 +1164,11 @@ async def run_raw_straight_mono_backfill_v2(
         membership_inserted,
         skipped,
         errors,
+        t_load_ms,
+        t_open_ms,
+        t_close_ms,
+        t_memb_ms,
+        total_ms,
     )
 
     finished_at = datetime.utcnow()
@@ -1054,10 +1182,16 @@ async def run_raw_straight_mono_backfill_v2(
                 "finished_at": finished_at.isoformat(),
                 "events": str(int(total_events)),
                 "positions_created": str(int(positions_created)),
+                "positions_existing": str(int(positions_existing)),
                 "positions_closed_now": str(int(positions_closed_now)),
                 "membership_inserted": str(int(membership_inserted)),
                 "skipped": str(int(skipped)),
                 "errors": str(int(errors)),
+                "timing_ms_load": str(int(t_load_ms)),
+                "timing_ms_open": str(int(t_open_ms)),
+                "timing_ms_close": str(int(t_close_ms)),
+                "timing_ms_membership": str(int(t_memb_ms)),
+                "timing_ms_total": str(int(total_ms)),
             },
         )
         log.debug(
