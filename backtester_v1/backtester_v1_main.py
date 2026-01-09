@@ -19,7 +19,6 @@ from backtester_config import (
 
 # 🔸 Оркестратор псевдо-сигналов
 from bt_signals_main import run_bt_signals_orchestrator
-
 # 🔸 Управление загрузки в кеш таблицы labels (v2)
 from bt_signals_cache_config_v2 import run_bt_signals_cache_watcher_v2
 
@@ -27,10 +26,9 @@ from bt_signals_cache_config_v2 import run_bt_signals_cache_watcher_v2
 from bt_scenarios_main import run_bt_scenarios_orchestrator
 # 🔸 Постпроцессор сценариев
 from bt_scenarios_postproc import run_bt_scenarios_postproc
+
 # 🔸 Оркестратор анализаторов
 from bt_analysis_main import run_bt_analysis_orchestrator
-
-
 # 🔸 Оркестратор препроцессинга анализов v2 (stability + kept_bins)
 from bt_analysis_preproc_v2 import run_bt_analysis_preproc_v2_orchestrator
 # 🔸 Оркестратор постпроцессинга v2 (финальный score)
