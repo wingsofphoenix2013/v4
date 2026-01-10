@@ -48,8 +48,11 @@ BT_STAT_V2_TABLE = "bt_scenario_stat_v2"
 # 🔸 Таблицы индикаторов
 INDICATOR_VALUES_TABLE = "indicator_values_v4"
 
-# 🔸 Таблица runs
+# 🔸 Таблицы runs
 BT_RUNS_TABLE = "bt_signal_backfill_runs"
+
+# 🔸 Таблица membership окна run (истина состава окна)
+BT_SIGNAL_MEMBERSHIP_TABLE = "bt_signals_membership"
 
 
 # 🔸 Утилита: обрезка денег/метрик до 4 знаков после запятой
@@ -604,21 +607,24 @@ async def _process_daily_and_stat(
 
     window_from, window_to = run_window
 
-    # позиции run (только закрытые)
+    # позиции в окне run (истина окна = bt_signals_membership для (run_id, signal_id))
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT
-                direction,
-                pnl_abs,
-                max_favorable_excursion,
-                max_adverse_excursion,
-                exit_time
-            FROM {BT_POSITIONS_V2_TABLE}
-            WHERE scenario_id = $1
-              AND signal_id = $2
-              AND opened_run_id = $3
-              AND status = 'closed'
+                p.direction,
+                p.pnl_abs,
+                p.max_favorable_excursion,
+                p.max_adverse_excursion,
+                p.exit_time
+            FROM {BT_SIGNAL_MEMBERSHIP_TABLE} m
+            JOIN {BT_POSITIONS_V2_TABLE} p
+              ON p.signal_value_id = m.signal_value_id
+             AND p.scenario_id = $1
+             AND p.signal_id = $2
+            WHERE m.run_id = $3
+              AND m.signal_id = $2
+              AND p.status = 'closed'
             """,
             int(scenario_id),
             int(signal_id),
