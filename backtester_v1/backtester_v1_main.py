@@ -24,8 +24,8 @@ from bt_signals_cache_config_v2 import run_bt_signals_cache_watcher_v2
 
 # 🔸 Оркестратор сценариев
 from bt_scenarios_main import run_bt_scenarios_orchestrator
-# 🔸 Постпроцессор сценариев
-from bt_scenarios_postproc import run_bt_scenarios_postproc
+# 🔸 Постпроцессор сценариев v2 (raw_stat + daily/stat)
+from bt_scenarios_postproc_v2 import run_bt_scenarios_postproc_v2
 
 # 🔸 Оркестратор анализаторов
 from bt_analysis_main import run_bt_analysis_orchestrator
@@ -80,7 +80,7 @@ async def main():
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
         run_safe_loop(lambda: run_bt_signals_cache_watcher_v2(pg, redis), "BT_SIGNALS_CACHE_V2"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
-        run_safe_loop(lambda: run_bt_scenarios_postproc(pg, redis), "BT_SCENARIOS_POSTPROC"),
+        run_safe_loop(lambda: run_bt_scenarios_postproc_v2(pg, redis), "BT_SCENARIOS_POSTPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
         run_safe_loop(lambda: run_bt_analysis_preproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_postproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC_V2"),
