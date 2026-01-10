@@ -1,4 +1,4 @@
-# bt_scenario_raw_straight_mono_v2.py — raw straight-сценарий (mono) v2: positions_v2 (объект) + membership_v2 (run-aware), без stat/daily, с батчами и семафором
+# bt_scenario_raw_straight_mono_v2.py — raw straight-сценарий (mono) v2: фиксируем только сделки open+close внутри run + bt_signals_log_v2 (upsert)
 
 import asyncio
 import logging
@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 # 🔸 Кеши backtester_v1
 from backtester_config import get_signal_instance, get_ticker_info
 
+# 🔸 Логгер модуля
 log = logging.getLogger("BT_SCENARIO_RAW_MONO_V2")
 
 # 🔸 Настройки Decimal
@@ -19,12 +20,15 @@ getcontext().prec = 28
 # 🔸 Стрим готовности сценария v2
 BT_SCENARIOS_READY_STREAM_V2 = "bt:scenarios:ready_v2"
 
-# 🔸 Комиссия (0.2% вход+выход, как в v1: списываем на entry_notional)
+# 🔸 Комиссия (0.2% вход+выход, списываем на entry_notional)
 COMMISSION_RATE = Decimal("0.002")
 
 # 🔸 Таблицы v2
 BT_POSITIONS_V2_TABLE = "bt_scenario_positions_v2"
 BT_MEMBERSHIP_V2_TABLE = "bt_scenario_membership_v2"
+
+# 🔸 Таблица логов v2
+BT_SIGNALS_LOG_V2_TABLE = "bt_signals_log_v2"
 
 # 🔸 Таблицы сигналов (входной датасет)
 BT_SIGNAL_MEMBERSHIP_TABLE = "bt_signals_membership"
@@ -32,8 +36,8 @@ BT_SIGNAL_EVENTS_TABLE = "bt_signals_values"
 
 # 🔸 Параллелизм и батчи (под 8–10k events/run)
 EVENTS_BATCH_SIZE = 500
-CLOSE_BATCH_SIZE = 200
 MAX_CONCURRENCY = 8
+LOGS_BATCH_SIZE = 1000
 
 # 🔸 Таймшаги TF (в минутах) для decision_time
 TF_STEP_MINUTES = {
@@ -318,13 +322,88 @@ async def _load_signal_events_for_run(
     return out
 
 
-# 🔸 Создание позиции-объекта v2 (если не существует) и получение её id
-async def _create_or_get_position_v2(
+# 🔸 Upsert сигнал-логов v2 (bulk, report накапливаем через перенос строки)
+async def _upsert_signals_log_v2_bulk(
+    pg,
+    rows: List[Tuple[int, int, int, int, Optional[int], str]],
+) -> int:
+    # rows: (run_id, scenario_id, signal_id, signal_value_id, position_id, report)
+    # условия достаточности
+    if not rows:
+        return 0
+
+    run_ids: List[int] = []
+    scenario_ids: List[int] = []
+    signal_ids: List[int] = []
+    value_ids: List[int] = []
+    position_ids: List[Optional[int]] = []
+    reports: List[str] = []
+
+    for (run_id, scenario_id, signal_id, signal_value_id, position_id, report) in rows:
+        run_ids.append(int(run_id))
+        scenario_ids.append(int(scenario_id))
+        signal_ids.append(int(signal_id))
+        value_ids.append(int(signal_value_id))
+        position_ids.append(None if position_id is None else int(position_id))
+        reports.append(str(report))
+
+    async with pg.acquire() as conn:
+        affected = await conn.fetch(
+            f"""
+            INSERT INTO {BT_SIGNALS_LOG_V2_TABLE}
+                (run_id, scenario_id, signal_id, signal_value_id, position_id, report, report_json, created_at)
+            SELECT
+                u.run_id,
+                u.scenario_id,
+                u.signal_id,
+                u.signal_value_id,
+                u.position_id,
+                u.report,
+                NULL::jsonb,
+                now()
+            FROM unnest(
+                $1::bigint[],
+                $2::int[],
+                $3::int[],
+                $4::int[],
+                $5::bigint[],
+                $6::text[]
+            ) AS u(
+                run_id,
+                scenario_id,
+                signal_id,
+                signal_value_id,
+                position_id,
+                report
+            )
+            ON CONFLICT (scenario_id, run_id, signal_value_id)
+            DO UPDATE SET
+                position_id = COALESCE(EXCLUDED.position_id, {BT_SIGNALS_LOG_V2_TABLE}.position_id),
+                report = CASE
+                    WHEN {BT_SIGNALS_LOG_V2_TABLE}.report IS NULL OR {BT_SIGNALS_LOG_V2_TABLE}.report = ''
+                    THEN EXCLUDED.report
+                    ELSE {BT_SIGNALS_LOG_V2_TABLE}.report || E'\\n' || EXCLUDED.report
+                END
+            RETURNING id
+            """,
+            run_ids,
+            scenario_ids,
+            signal_ids,
+            value_ids,
+            position_ids,
+            reports,
+        )
+
+    return len(affected)
+
+
+# 🔸 Создание позиции v2 сразу в статусе closed (идемпотентно по (scenario_id, signal_id, signal_value_id))
+async def _create_or_get_closed_position_v2(
     pg,
     scenario_id: int,
     signal_id: int,
     signal_value_id: int,
-    opened_run_id: int,
+    run_id: int,
     symbol: str,
     timeframe: str,
     direction: str,
@@ -336,7 +415,22 @@ async def _create_or_get_position_v2(
     margin_used: Decimal,
     sl_price: Decimal,
     tp_price: Decimal,
-) -> Tuple[int, bool]:
+    exit_time: datetime,
+    exit_price: Decimal,
+    exit_reason: str,
+    pnl_abs: Decimal,
+    duration: timedelta,
+    max_fav_pct: Decimal,
+    max_adv_pct: Decimal,
+) -> Tuple[Optional[int], bool, bool]:
+    """
+    Returns:
+      position_id, created_now, belongs_to_this_run
+
+    belongs_to_this_run:
+      True  -> позиция относится к текущему run (opened_run_id=run_id AND closed_run_id=run_id AND status='closed')
+      False -> позиция уже существует, но относится к другому run или имеет невалидный статус для "closed in run"
+    """
     position_uid = uuid.uuid4()
 
     async with pg.acquire() as conn:
@@ -348,6 +442,7 @@ async def _create_or_get_position_v2(
                 signal_id,
                 signal_value_id,
                 opened_run_id,
+                closed_run_id,
                 symbol,
                 timeframe,
                 direction,
@@ -360,16 +455,27 @@ async def _create_or_get_position_v2(
                 sl_price,
                 tp_price,
                 status,
+                exit_time,
+                exit_price,
+                exit_reason,
+                pnl_abs,
+                duration,
+                max_favorable_excursion,
+                max_adverse_excursion,
                 raw_stat,
-                created_at
+                created_at,
+                updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, $8,
-                $9, $10,
-                $11, $12, $13, $14, $15, $16,
-                'open',
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9,
+                $10, $11,
+                $12, $13, $14, $15, $16, $17,
+                'closed',
+                $18, $19, $20,
+                $21, $22, $23, $24,
                 NULL,
+                now(),
                 now()
             )
             ON CONFLICT (scenario_id, signal_id, signal_value_id) DO NOTHING
@@ -379,7 +485,8 @@ async def _create_or_get_position_v2(
             int(scenario_id),
             int(signal_id),
             int(signal_value_id),
-            int(opened_run_id),
+            int(run_id),
+            int(run_id),
             str(symbol),
             str(timeframe),
             str(direction),
@@ -391,14 +498,21 @@ async def _create_or_get_position_v2(
             margin_used,
             sl_price,
             tp_price,
+            exit_time,
+            exit_price,
+            str(exit_reason),
+            pnl_abs,
+            duration,
+            max_fav_pct,
+            max_adv_pct,
         )
 
         if row and row["id"] is not None:
-            return int(row["id"]), True
+            return int(row["id"]), True, True
 
-        existing_id = await conn.fetchval(
+        existing = await conn.fetchrow(
             f"""
-            SELECT id
+            SELECT id, status, opened_run_id, closed_run_id
             FROM {BT_POSITIONS_V2_TABLE}
             WHERE scenario_id = $1
               AND signal_id = $2
@@ -409,172 +523,27 @@ async def _create_or_get_position_v2(
             int(signal_value_id),
         )
 
-    return int(existing_id), False
+    # условий достаточности
+    if not existing:
+        return None, False, False
 
+    try:
+        ex_id = int(existing["id"])
+    except Exception:
+        return None, False, False
 
-# 🔸 Загрузка open позиций v2 для сценария/сигнала (для прогрессивного закрытия)
-async def _load_open_positions_v2(
-    pg,
-    scenario_id: int,
-    signal_id: int,
-    timeframe: str,
-    directions: List[str],
-) -> List[Dict[str, Any]]:
-    if not directions:
-        return []
+    ex_status = str(existing["status"] or "").strip().lower()
+    try:
+        ex_opened_run_id = int(existing["opened_run_id"] or 0)
+    except Exception:
+        ex_opened_run_id = 0
+    try:
+        ex_closed_run_id = int(existing["closed_run_id"] or 0)
+    except Exception:
+        ex_closed_run_id = 0
 
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT
-                id,
-                symbol,
-                timeframe,
-                direction,
-                entry_time,
-                entry_price,
-                entry_qty,
-                entry_notional,
-                sl_price,
-                tp_price
-            FROM {BT_POSITIONS_V2_TABLE}
-            WHERE scenario_id = $1
-              AND signal_id = $2
-              AND timeframe = $3
-              AND direction = ANY($4::text[])
-              AND status = 'open'
-            ORDER BY entry_time
-            """,
-            int(scenario_id),
-            int(signal_id),
-            str(timeframe),
-            [str(d) for d in directions],
-        )
-
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        out.append(
-            {
-                "id": int(r["id"]),
-                "symbol": str(r["symbol"]),
-                "timeframe": str(r["timeframe"]),
-                "direction": str(r["direction"]),
-                "entry_time": r["entry_time"],
-                "entry_price": Decimal(str(r["entry_price"])),
-                "entry_qty": Decimal(str(r["entry_qty"])),
-                "entry_notional": Decimal(str(r["entry_notional"])),
-                "sl_price": Decimal(str(r["sl_price"])),
-                "tp_price": Decimal(str(r["tp_price"])),
-            }
-        )
-    return out
-
-
-# 🔸 Попытка закрыть open позицию v2 в пределах доступного окна (.. run_to]
-async def _try_close_position_v2(
-    pg,
-    run_id: int,
-    position: Dict[str, Any],
-    run_to_time: datetime,
-) -> bool:
-    pos_id = int(position["id"])
-    symbol = str(position["symbol"])
-    timeframe = str(position["timeframe"])
-    direction = str(position["direction"])
-
-    entry_time: datetime = position["entry_time"]
-    entry_price: Decimal = position["entry_price"]
-    entry_qty: Decimal = position["entry_qty"]
-    entry_notional: Decimal = position["entry_notional"]
-    sl_price: Decimal = position["sl_price"]
-    tp_price: Decimal = position["tp_price"]
-
-    # условия достаточности
-    if run_to_time <= entry_time:
-        return False
-
-    exit_info = await _find_exit_in_range(
-        pg=pg,
-        symbol=symbol,
-        timeframe=timeframe,
-        direction=direction,
-        sl_price=sl_price,
-        tp_price=tp_price,
-        scan_from=entry_time,
-        scan_to=run_to_time,
-    )
-
-    if exit_info is None:
-        return False
-
-    exit_time, exit_price, exit_reason = exit_info
-
-    pnl_abs, duration, max_fav_pct, max_adv_pct = await _compute_closed_trade_stats(
-        pg=pg,
-        symbol=symbol,
-        timeframe=timeframe,
-        direction=direction,
-        entry_time=entry_time,
-        entry_price=entry_price,
-        entry_qty=entry_qty,
-        entry_notional=entry_notional,
-        exit_time=exit_time,
-        exit_price=exit_price,
-    )
-
-    async with pg.acquire() as conn:
-        cmd = await conn.execute(
-            f"""
-            UPDATE {BT_POSITIONS_V2_TABLE}
-            SET status = 'closed',
-                closed_run_id = $2,
-                exit_time = $3,
-                exit_price = $4,
-                exit_reason = $5,
-                pnl_abs = $6,
-                duration = $7,
-                max_favorable_excursion = $8,
-                max_adverse_excursion = $9,
-                updated_at = now()
-            WHERE id = $1
-              AND status = 'open'
-            """,
-            pos_id,
-            int(run_id),
-            exit_time,
-            exit_price,
-            str(exit_reason),
-            pnl_abs,
-            duration,
-            max_fav_pct,
-            max_adv_pct,
-        )
-
-    return _parse_rowcount(cmd) > 0
-
-
-# 🔸 Получить актуальные статусы позиций (для membership.status_at_end)
-async def _load_positions_status_by_ids(
-    pg,
-    position_ids: List[int],
-) -> Dict[int, str]:
-    if not position_ids:
-        return {}
-
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT id, status
-            FROM {BT_POSITIONS_V2_TABLE}
-            WHERE id = ANY($1::bigint[])
-            """,
-            [int(pid) for pid in position_ids],
-        )
-
-    out: Dict[int, str] = {}
-    for r in rows:
-        out[int(r["id"])] = str(r["status"])
-    return out
+    belongs = (ex_status == "closed" and ex_opened_run_id == int(run_id) and ex_closed_run_id == int(run_id))
+    return ex_id, False, belongs
 
 
 # 🔸 Вставка membership_v2 для текущего run (идемпотентно)
@@ -584,6 +553,7 @@ async def _insert_membership_v2(
     rows: List[Tuple[int, bool, bool, str]],
 ) -> int:
     # rows: (position_id, opened_in_run, closed_in_run, status_at_end)
+    # условия достаточности
     if not rows:
         return 0
 
@@ -638,7 +608,7 @@ async def _insert_membership_v2(
     return len(inserted)
 
 
-# 🔸 Обработка одного event: создать/получить позицию-объект (под семафором)
+# 🔸 Обработка одного event: пытаемся получить “полную сделку” (open+close в пределах run)
 async def _process_one_event_with_semaphore(
     pg,
     sema: asyncio.Semaphore,
@@ -652,20 +622,35 @@ async def _process_one_event_with_semaphore(
     sl_value: Decimal,
     tp_value: Decimal,
     position_limit: Decimal,
+    to_time: datetime,
     ev: Dict[str, Any],
-) -> Tuple[str, Optional[int], bool]:
+) -> Tuple[str, int, Optional[int], bool, str]:
+    """
+    Returns:
+      status, signal_value_id, position_id, created_now, report_line
+
+    status:
+      closed      -> closed in this run (belongs_to_this_run == True)
+      unresolved  -> open but not closed in this run (no DB фиксации позиции)
+      skipped     -> не обработан по причинам (bad price, qty < min, direction не подходит, etc)
+      error       -> exception
+    """
     async with sema:
         try:
+            signal_value_id = int(ev.get("signal_value_id") or 0)
+
             # условия достаточности
             direction = str(ev.get("direction") or "").strip().lower()
             if direction not in ("long", "short"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_direction"
             if direction not in allowed_directions:
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:direction_not_allowed"
 
             symbol = str(ev.get("symbol") or "")
-            open_time: datetime = ev["open_time"]
-            signal_value_id = int(ev["signal_value_id"])
+            open_time: datetime = ev.get("open_time")
+
+            if not symbol or signal_value_id <= 0 or not isinstance(open_time, datetime):
+                return "skipped", signal_value_id, None, False, "skip:bad_event_fields"
 
             # decision_time берём из event, если есть; иначе вычисляем
             decision_time = ev.get("decision_time") or (open_time + tf_delta)
@@ -673,11 +658,11 @@ async def _process_one_event_with_semaphore(
             # entry_price берём из event.price
             price_val = ev.get("price")
             if price_val is None:
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:no_price"
 
             entry_price = Decimal(str(price_val))
             if entry_price <= Decimal("0"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_price"
 
             # настройки тикера
             ticker_info = get_ticker_info(symbol) or {}
@@ -702,12 +687,12 @@ async def _process_one_event_with_semaphore(
             # фиксированная маржа на сделку = position_limit
             margin_used = _q_money(position_limit)
             if margin_used <= Decimal("0"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_position_limit"
 
             # notional
             entry_notional = _q_money(margin_used * leverage)
             if entry_notional <= Decimal("0"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_notional"
 
             # qty
             qty_raw = entry_notional / entry_price
@@ -723,15 +708,15 @@ async def _process_one_event_with_semaphore(
                 entry_qty = qty_raw
 
             if entry_qty <= Decimal("0"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_qty"
 
             if entry_qty < min_qty:
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:qty_lt_min"
 
             # пересчёт notional по округлённому qty
             entry_notional = _q_money(entry_price * entry_qty)
             if entry_notional <= Decimal("0"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_notional_after_qty"
 
             # SL/TP
             sl_price, tp_price = _calc_sl_tp_percent(
@@ -745,14 +730,47 @@ async def _process_one_event_with_semaphore(
             tp_price = _round_price(tp_price, precision_price, ticksize)
 
             if sl_price <= Decimal("0") or tp_price <= Decimal("0"):
-                return "skipped", None, False
+                return "skipped", signal_value_id, None, False, "skip:bad_sl_tp"
 
-            pos_id, created_now = await _create_or_get_position_v2(
+            # окно прогона: позиция должна закрыться в рамках run
+            if to_time <= open_time:
+                return "skipped", signal_value_id, None, False, "skip:bad_window"
+
+            exit_info = await _find_exit_in_range(
+                pg=pg,
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=direction,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                scan_from=open_time,
+                scan_to=to_time,
+            )
+
+            if exit_info is None:
+                return "unresolved", signal_value_id, None, False, "result:open_unresolved_in_run"
+
+            exit_time, exit_price, exit_reason = exit_info
+
+            pnl_abs, duration, max_fav_pct, max_adv_pct = await _compute_closed_trade_stats(
+                pg=pg,
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=direction,
+                entry_time=open_time,
+                entry_price=entry_price,
+                entry_qty=entry_qty,
+                entry_notional=entry_notional,
+                exit_time=exit_time,
+                exit_price=exit_price,
+            )
+
+            pos_id, created_now, belongs = await _create_or_get_closed_position_v2(
                 pg=pg,
                 scenario_id=scenario_id,
                 signal_id=signal_id,
                 signal_value_id=signal_value_id,
-                opened_run_id=run_id,
+                run_id=run_id,
                 symbol=symbol,
                 timeframe=timeframe,
                 direction=direction,
@@ -764,9 +782,25 @@ async def _process_one_event_with_semaphore(
                 margin_used=margin_used,
                 sl_price=sl_price,
                 tp_price=tp_price,
+                exit_time=exit_time,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                pnl_abs=pnl_abs,
+                duration=duration,
+                max_fav_pct=max_fav_pct,
+                max_adv_pct=max_adv_pct,
             )
 
-            return "ok", int(pos_id), bool(created_now)
+            # условий достаточности
+            if pos_id is None or int(pos_id) <= 0:
+                return "error", signal_value_id, None, False, "result:error_position_missing"
+
+            if not belongs:
+                # позиция уже существует, но не относится к этому run -> не фиксируем membership, но логируем как skipped
+                return "skipped", signal_value_id, int(pos_id), False, "skip:position_exists_other_run"
+
+            rep = f"result:closed_in_run exit_reason={exit_reason} pnl_abs={pnl_abs}"
+            return "closed", signal_value_id, int(pos_id), bool(created_now), rep
 
         except Exception as e:
             log.error(
@@ -778,48 +812,11 @@ async def _process_one_event_with_semaphore(
                 ev,
                 exc_info=True,
             )
-            return "error", None, False
+            sid = int(ev.get("signal_value_id") or 0) if isinstance(ev, dict) else 0
+            return "error", sid, None, False, "result:error"
 
 
-# 🔸 Обработка одной open позиции: попытка закрытия (под семафором)
-async def _process_one_close_with_semaphore(
-    pg,
-    sema: asyncio.Semaphore,
-    run_id: int,
-    to_time: datetime,
-    pos: Dict[str, Any],
-) -> Tuple[str, Optional[int]]:
-    async with sema:
-        try:
-            # условия достаточности
-            pos_id = int(pos.get("id") or 0)
-            if pos_id <= 0:
-                return "skipped", None
-
-            closed_now = await _try_close_position_v2(
-                pg=pg,
-                run_id=run_id,
-                position=pos,
-                run_to_time=to_time,
-            )
-
-            if not closed_now:
-                return "ok", None
-
-            return "ok", pos_id
-
-        except Exception as e:
-            log.error(
-                "BT_SCENARIO_RAW_MONO_V2: ошибка закрытия позиции id=%s (run_id=%s): %s",
-                pos.get("id"),
-                run_id,
-                e,
-                exc_info=True,
-            )
-            return "error", None
-
-
-# 🔸 Публичная точка входа: backfill для сценария raw_straight_mono_v2 по одному окну датасета сигналов (membership run-aware)
+# 🔸 Публичная точка входа: backfill для сценария raw_straight_mono_v2 по одному окну датасета сигналов
 async def run_raw_straight_mono_backfill_v2(
     scenario: Dict[str, Any],
     signal_ctx: Dict[str, Any],
@@ -861,7 +858,7 @@ async def run_raw_straight_mono_backfill_v2(
         )
         return
 
-    # базовые параметры сценария (stat/daily не считаем, но параметры нужны для симуляции)
+    # базовые параметры сценария (минимально, без stat/daily)
     try:
         direction_mode = (params["direction"]["value"] or "").strip().lower()
         leverage = Decimal(str(params["leverage"]["value"]))
@@ -936,7 +933,7 @@ async def run_raw_straight_mono_backfill_v2(
         allowed_directions = ["long", "short"]
 
     log.debug(
-        "BT_SCENARIO_RAW_MONO_V2: старт scenario_id=%s (key=%s, type=%s) signal_id=%s run_id=%s TF=%s window=[%s..%s] batch=%s close_batch=%s conc=%s",
+        "BT_SCENARIO_RAW_MONO_V2: старт scenario_id=%s (key=%s, type=%s) signal_id=%s run_id=%s TF=%s window=[%s..%s] batch=%s conc=%s",
         scenario_id,
         scenario_key,
         scenario_type,
@@ -946,18 +943,19 @@ async def run_raw_straight_mono_backfill_v2(
         from_time,
         to_time,
         EVENTS_BATCH_SIZE,
-        CLOSE_BATCH_SIZE,
         MAX_CONCURRENCY,
     )
 
     # 🔸 Счётчики
     total_events = 0
+    closed_in_run_total = 0
     positions_created = 0
     positions_existing = 0
-    positions_closed_now = 0
-    membership_inserted = 0
+    unresolved = 0
     skipped = 0
     errors = 0
+    membership_inserted = 0
+    logs_upserted = 0
 
     # 🔸 1) Загружаем входной датасет
     t_load0 = time.perf_counter()
@@ -983,17 +981,16 @@ async def run_raw_straight_mono_backfill_v2(
         return
     t_load_ms = int((time.perf_counter() - t_load0) * 1000)
 
-    # 🔸 2) Создание/получение позиций по событиям (батчи + семафор)
-    t_open0 = time.perf_counter()
+    # 🔸 2) Обработка событий: фиксируем только closed_in_run (батчи + семафор)
+    t_proc0 = time.perf_counter()
     sema = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    opened_in_run_by_pos: Dict[int, bool] = {}
-    positions_in_run: Set[int] = set()
+    membership_rows: List[Tuple[int, bool, bool, str]] = []
+    log_rows: List[Tuple[int, int, int, int, Optional[int], str]] = []
 
     for i in range(0, len(events), EVENTS_BATCH_SIZE):
         batch = events[i : i + EVENTS_BATCH_SIZE]
 
-        # создаём задачи батча
         tasks: List[asyncio.Task] = []
         for ev in batch:
             tasks.append(
@@ -1011,6 +1008,7 @@ async def run_raw_straight_mono_backfill_v2(
                         sl_value=sl_value,
                         tp_value=tp_value,
                         position_limit=position_limit,
+                        to_time=to_time,
                         ev=ev,
                     ),
                     name=f"BT_SCN_RAW_V2_EVT_{scenario_id}_{signal_id}_{run_id}",
@@ -1019,119 +1017,91 @@ async def run_raw_straight_mono_backfill_v2(
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # собираем результаты батча (без мутаций внутри корутин)
         for r in results:
             if isinstance(r, Exception):
                 errors += 1
                 continue
-            status, pos_id, opened_now = r
+
+            status, signal_value_id, pos_id, created_now, report = r
+
+            # условия достаточности
+            if not signal_value_id:
+                signal_value_id = 0
+
+            if status == "closed":
+                closed_in_run_total += 1
+                if created_now:
+                    positions_created += 1
+                else:
+                    positions_existing += 1
+
+                if pos_id is not None and int(pos_id) > 0:
+                    membership_rows.append((int(pos_id), True, True, "closed"))
+
+                log_rows.append(
+                    (
+                        int(run_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        int(signal_value_id),
+                        int(pos_id) if pos_id is not None and int(pos_id) > 0 else None,
+                        str(report),
+                    )
+                )
+                continue
+
+            if status == "unresolved":
+                unresolved += 1
+                log_rows.append(
+                    (
+                        int(run_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        int(signal_value_id),
+                        None,
+                        str(report),
+                    )
+                )
+                continue
+
             if status == "skipped":
                 skipped += 1
+                log_rows.append(
+                    (
+                        int(run_id),
+                        int(scenario_id),
+                        int(signal_id),
+                        int(signal_value_id),
+                        int(pos_id) if pos_id is not None and int(pos_id) > 0 else None,
+                        str(report),
+                    )
+                )
                 continue
-            if status == "error":
-                errors += 1
-                continue
-            if pos_id is None:
-                skipped += 1
-                continue
 
-            positions_in_run.add(int(pos_id))
-            opened_in_run_by_pos[int(pos_id)] = bool(opened_now)
-
-            if opened_now:
-                positions_created += 1
-            else:
-                positions_existing += 1
-
-    t_open_ms = int((time.perf_counter() - t_open0) * 1000)
-
-    # 🔸 3) Прогрессивное закрытие open позиций (батчи + семафор)
-    t_close0 = time.perf_counter()
-    closed_in_run_by_pos: Dict[int, bool] = {}
-
-    try:
-        open_positions = await _load_open_positions_v2(
-            pg=pg,
-            scenario_id=scenario_id,
-            signal_id=signal_id,
-            timeframe=timeframe,
-            directions=allowed_directions,
-        )
-    except Exception as e:
-        open_positions = []
-        errors += 1
-        log.error(
-            "BT_SCENARIO_RAW_MONO_V2: ошибка загрузки open позиций (scenario_id=%s signal_id=%s run_id=%s): %s",
-            scenario_id,
-            signal_id,
-            run_id,
-            e,
-            exc_info=True,
-        )
-
-    for i in range(0, len(open_positions), CLOSE_BATCH_SIZE):
-        batch = open_positions[i : i + CLOSE_BATCH_SIZE]
-
-        tasks: List[asyncio.Task] = []
-        for pos in batch:
-            tasks.append(
-                asyncio.create_task(
-                    _process_one_close_with_semaphore(
-                        pg=pg,
-                        sema=sema,
-                        run_id=run_id,
-                        to_time=to_time,
-                        pos=pos,
-                    ),
-                    name=f"BT_SCN_RAW_V2_CLOSE_{scenario_id}_{signal_id}_{run_id}",
+            # error
+            errors += 1
+            log_rows.append(
+                (
+                    int(run_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    int(signal_value_id),
+                    None,
+                    str(report),
                 )
             )
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    t_proc_ms = int((time.perf_counter() - t_proc0) * 1000)
 
-        for r in results:
-            if isinstance(r, Exception):
-                errors += 1
-                continue
-            status, closed_pos_id = r
-            if status == "error":
-                errors += 1
-                continue
-            if closed_pos_id is None:
-                continue
-
-            pid = int(closed_pos_id)
-            closed_in_run_by_pos[pid] = True
-            positions_closed_now += 1
-            # если позиция закрылась в этом run — обязательно зафиксируем membership
-            positions_in_run.add(pid)
-
-    t_close_ms = int((time.perf_counter() - t_close0) * 1000)
-
-    # 🔸 4) Membership_v2 (bulk)
+    # 🔸 3) Membership_v2 (фиксируем только сделки, закрывшиеся в run)
     t_memb0 = time.perf_counter()
     try:
-        pos_ids_list = sorted(list(positions_in_run))
-        status_by_id = await _load_positions_status_by_ids(pg, pos_ids_list)
-
-        membership_rows: List[Tuple[int, bool, bool, str]] = []
-        for pid in pos_ids_list:
-            opened_flag = bool(opened_in_run_by_pos.get(pid, False))
-            closed_flag = bool(closed_in_run_by_pos.get(pid, False))
-            status_at_end = str(status_by_id.get(pid, "open")).strip().lower()
-            if status_at_end not in ("open", "closed"):
-                status_at_end = "open"
-
-            membership_rows.append((pid, opened_flag, closed_flag, status_at_end))
-
         membership_inserted = await _insert_membership_v2(
             pg=pg,
             run_id=run_id,
             rows=membership_rows,
         )
-
     except Exception as e:
-        errors += 1
         log.error(
             "BT_SCENARIO_RAW_MONO_V2: ошибка записи membership_v2 для scenario_id=%s signal_id=%s run_id=%s: %s",
             scenario_id,
@@ -1141,16 +1111,37 @@ async def run_raw_straight_mono_backfill_v2(
             exc_info=True,
         )
         membership_inserted = 0
-
+        errors += 1
     t_memb_ms = int((time.perf_counter() - t_memb0) * 1000)
+
+    # 🔸 4) bt_signals_log_v2 (bulk upsert)
+    t_log0 = time.perf_counter()
+    try:
+        total_upsert = 0
+        for i in range(0, len(log_rows), LOGS_BATCH_SIZE):
+            chunk = log_rows[i : i + LOGS_BATCH_SIZE]
+            total_upsert += await _upsert_signals_log_v2_bulk(pg=pg, rows=chunk)
+        logs_upserted = total_upsert
+    except Exception as e:
+        log.error(
+            "BT_SCENARIO_RAW_MONO_V2: ошибка записи bt_signals_log_v2 для scenario_id=%s signal_id=%s run_id=%s: %s",
+            scenario_id,
+            signal_id,
+            run_id,
+            e,
+            exc_info=True,
+        )
+        logs_upserted = 0
+        errors += 1
+    t_log_ms = int((time.perf_counter() - t_log0) * 1000)
 
     # 🔸 5) Итог и событие готовности сценария v2
     total_ms = int((time.perf_counter() - t0) * 1000)
 
     log.info(
         "BT_SCENARIO_RAW_MONO_V2: summary scenario_id=%s signal_id=%s run_id=%s TF=%s window=[%s..%s] — "
-        "events=%s created=%s existing=%s closed_now=%s memb_inserted=%s skipped=%s errors=%s "
-        "timing_ms(load=%s open=%s close=%s memb=%s total=%s)",
+        "events=%s closed_in_run=%s created=%s existing=%s unresolved=%s skipped=%s errors=%s memb_inserted=%s logs_upserted=%s "
+        "timing_ms(load=%s proc=%s memb=%s logs=%s total=%s)",
         scenario_id,
         signal_id,
         run_id,
@@ -1158,16 +1149,18 @@ async def run_raw_straight_mono_backfill_v2(
         from_time,
         to_time,
         total_events,
+        closed_in_run_total,
         positions_created,
         positions_existing,
-        positions_closed_now,
-        membership_inserted,
+        unresolved,
         skipped,
         errors,
+        membership_inserted,
+        logs_upserted,
         t_load_ms,
-        t_open_ms,
-        t_close_ms,
+        t_proc_ms,
         t_memb_ms,
+        t_log_ms,
         total_ms,
     )
 
@@ -1183,15 +1176,19 @@ async def run_raw_straight_mono_backfill_v2(
                 "events": str(int(total_events)),
                 "positions_created": str(int(positions_created)),
                 "positions_existing": str(int(positions_existing)),
-                "positions_closed_now": str(int(positions_closed_now)),
+                "positions_closed_now": str(int(closed_in_run_total)),
                 "membership_inserted": str(int(membership_inserted)),
-                "skipped": str(int(skipped)),
+                "skipped": str(int(skipped + unresolved)),
                 "errors": str(int(errors)),
                 "timing_ms_load": str(int(t_load_ms)),
-                "timing_ms_open": str(int(t_open_ms)),
-                "timing_ms_close": str(int(t_close_ms)),
+                "timing_ms_open": str(int(t_proc_ms)),
+                "timing_ms_close": str(0),
                 "timing_ms_membership": str(int(t_memb_ms)),
                 "timing_ms_total": str(int(total_ms)),
+                # дополнительные поля (downstream может игнорировать)
+                "positions_unresolved": str(int(unresolved)),
+                "logs_upserted": str(int(logs_upserted)),
+                "timing_ms_logs": str(int(t_log_ms)),
             },
         )
         log.debug(
