@@ -15,21 +15,15 @@ from backtester_config import (
 #    (scenario, signal_ctx, pg_pool, redis_client) -> None
 ScenarioHandler = Callable[[Dict[str, Any], Dict[str, Any], Any, Any], Awaitable[None]]
 
-# 🔸 Воркеры сценариев (из пакета scenarios/)
-from scenarios.bt_scenario_raw_straight_mono import run_raw_straight_mono_backfill
-from scenarios.bt_scenario_basic_straight_mono import run_basic_straight_mono_backfill
-from scenarios.bt_scenario_double_straight_mono import run_double_straight_mono_backfill
-
 # 🔸 Воркеры сценариев v2
 from scenarios.bt_scenario_raw_straight_mono_v2 import run_raw_straight_mono_backfill_v2
+from scenarios.bt_scenario_basic_straight_mono_v2 import run_basic_straight_mono_backfill_v2
 
 # 🔸 Реестр сценарных воркеров: (key, type) → handler
 #    (остальные сценарии временно не включаем, чтобы не запускать старую логику)
 SCENARIO_HANDLERS: Dict[Tuple[str, str], ScenarioHandler] = {
-    ("raw_straight_mono", "straight"): run_raw_straight_mono_backfill,
-    ("basic_straight_mono", "straight"): run_basic_straight_mono_backfill,
-    ("double_straight_mono", "straight"): run_double_straight_mono_backfill,
     ("raw_straight_mono_v2", "straight"): run_raw_straight_mono_backfill_v2,
+    ("basic_straight_mono_v2", "straight"): run_basic_straight_mono_backfill_v2,
 }
 
 # 🔸 Константы стрима сценариев (потребитель ready датасета сигналов)
