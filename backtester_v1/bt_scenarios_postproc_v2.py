@@ -607,7 +607,7 @@ async def _process_daily_and_stat(
 
     window_from, window_to = run_window
 
-    # позиции в окне run (истина окна = bt_signals_membership для (run_id, signal_id))
+    # позиции в окне run (истина окна = bt_signals_membership), но учитываем только сделки, закрытые не позже run.to_time
     async with pg.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -618,6 +618,8 @@ async def _process_daily_and_stat(
                 p.max_adverse_excursion,
                 p.exit_time
             FROM {BT_SIGNAL_MEMBERSHIP_TABLE} m
+            JOIN {BT_RUNS_TABLE} r
+              ON r.id = m.run_id
             JOIN {BT_POSITIONS_V2_TABLE} p
               ON p.signal_value_id = m.signal_value_id
              AND p.scenario_id = $1
@@ -625,6 +627,7 @@ async def _process_daily_and_stat(
             WHERE m.run_id = $3
               AND m.signal_id = $2
               AND p.status = 'closed'
+              AND p.exit_time <= r.to_time
             """,
             int(scenario_id),
             int(signal_id),
