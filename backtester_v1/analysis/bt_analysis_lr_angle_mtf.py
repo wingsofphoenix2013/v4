@@ -496,11 +496,11 @@ async def _load_positions_for_analysis(
                 direction,
                 pnl_abs,
                 raw_stat
-            FROM bt_scenario_positions
+            FROM bt_scenario_positions_v2
             WHERE scenario_id = $1
               AND signal_id   = $2
               AND status      = 'closed'
-              AND postproc    = true
+              AND postproc_v2 = true
               AND entry_time BETWEEN $3 AND $4
             ORDER BY entry_time
             """,
