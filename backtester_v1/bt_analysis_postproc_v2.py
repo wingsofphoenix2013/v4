@@ -1,5 +1,6 @@
 # bt_analysis_postproc_v2.py — постпроцессинг v2: расчёт компонентов/score и запись биннов победителя в bt_analysis_bins_labels_v2 (run-aware)
 
+# 🔸 Базовые импорты
 import asyncio
 import logging
 import json
@@ -31,7 +32,7 @@ PREPROC_V2_TABLE = "bt_analysis_preproc_stat_v2"
 SCORES_V2_TABLE = "bt_analysis_scores_v2"
 LABELS_V2_TABLE = "bt_analysis_bins_labels_v2"
 
-# 🔸 Таблица источника бин-статистики (v1)
+# 🔸 Таблица источника бин-статистики (run-aware, storage)
 BINS_STAT_TABLE = "bt_analysis_bins_stat"
 
 # 🔸 Версия скоринга (ключ в bt_analysis_scores_v2 / bt_analysis_bins_labels_v2)
@@ -53,7 +54,7 @@ W_STAB_STREAK = Decimal("0.20")
 W_STAB_NEGDAYS = Decimal("0.10")
 
 # 🔸 Параметры confidence (плавная насыщаемость)
-CONF_TRADES_K = Decimal("500")   # чем больше — тем мягче доверие
+CONF_TRADES_K = Decimal("500")  # чем больше — тем мягче доверие
 
 
 # 🔸 Квантизация Decimal до 4 знаков
@@ -174,6 +175,7 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                             winner_analysis_id=0,
                             winner_param="",
                             score_version=SCORE_VERSION,
+                            finished_at=finished_at,
                         )
 
                         await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
@@ -212,10 +214,11 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                         await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # winner
+                    # winner (один победитель на пару run/scenario/signal)
                     winner = scored[0]  # уже отсортировано по rank
                     winner_analysis_id = int(winner.get("analysis_id") or 0)
-                    winner_param = str(winner.get("indicator_param") or "")
+                    winner_indicator_param: Optional[str] = winner.get("indicator_param")
+                    winner_param_str = str(winner_indicator_param or "")
                     winner_tf = str(winner.get("timeframe") or "")
                     winner_dir = str(winner.get("direction") or "")
 
@@ -229,7 +232,7 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                             signal_id=signal_id,
                             score_version=SCORE_VERSION,
                             analysis_id=winner_analysis_id,
-                            indicator_param=winner_param,
+                            indicator_param=winner_indicator_param,
                             timeframe=winner_tf,
                             direction=winner_dir,
                         )
@@ -263,7 +266,7 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                         upserts,
                         labels_rows,
                         winner_analysis_id,
-                        winner_param,
+                        winner_param_str,
                         str(_q4(_d(winner.get("score_01")))),
                         str(_q4(_d(winner.get("filt_pnl_abs")))),
                     )
@@ -277,8 +280,9 @@ async def run_bt_analysis_postproc_v2_orchestrator(pg, redis) -> None:
                         upserts=upserts,
                         labels_rows=labels_rows,
                         winner_analysis_id=winner_analysis_id,
-                        winner_param=winner_param,
+                        winner_param=winner_param_str,
                         score_version=SCORE_VERSION,
+                        finished_at=finished_at,
                     )
 
                     await redis.xack(POSTPROC_V2_STREAM_KEY, POSTPROC_V2_CONSUMER_GROUP, entry_id)
@@ -422,7 +426,7 @@ async def _load_preproc_v2_candidates(
                 scenario_id,
                 signal_id,
                 analysis_id,
-                COALESCE(indicator_param, '') AS indicator_param,
+                indicator_param,
                 timeframe,
                 direction,
 
@@ -440,7 +444,7 @@ async def _load_preproc_v2_candidates(
             WHERE run_id = $1
               AND scenario_id = $2
               AND signal_id = $3
-            ORDER BY analysis_id, COALESCE(indicator_param, ''), timeframe, direction
+            ORDER BY analysis_id, indicator_param NULLS FIRST, timeframe, direction
             """,
             int(run_id),
             int(scenario_id),
@@ -449,13 +453,16 @@ async def _load_preproc_v2_candidates(
 
     out: List[Dict[str, Any]] = []
     for r in rows:
+        ind = r["indicator_param"]
+        indicator_param_norm = str(ind).strip() if ind is not None else None
+
         out.append(
             {
                 "run_id": int(r["run_id"]),
                 "scenario_id": int(r["scenario_id"]),
                 "signal_id": int(r["signal_id"]),
                 "analysis_id": int(r["analysis_id"]),
-                "indicator_param": str(r["indicator_param"] or ""),
+                "indicator_param": indicator_param_norm,
                 "timeframe": str(r["timeframe"]).strip().lower(),
                 "direction": str(r["direction"]).strip().lower(),
                 "orig_trades": int(r["orig_trades"] or 0),
@@ -627,13 +634,15 @@ async def _upsert_scores_v2(pg, scored_rows: List[Dict[str, Any]]) -> int:
 
     to_insert: List[Tuple[Any, ...]] = []
     for r in scored_rows:
+        indicator_param: Optional[str] = r.get("indicator_param")
+
         to_insert.append(
             (
                 int(r["run_id"]),
                 int(r["scenario_id"]),
                 int(r["signal_id"]),
                 int(r["analysis_id"]),
-                str(r.get("indicator_param") or ""),
+                indicator_param,
                 str(r.get("timeframe") or ""),
                 str(r.get("direction") or ""),
 
@@ -729,7 +738,7 @@ async def _rewrite_labels_v2_for_winner(
     signal_id: int,
     score_version: str,
     analysis_id: int,
-    indicator_param: str,
+    indicator_param: Optional[str],
     timeframe: str,
     direction: str,
 ) -> int:
@@ -748,19 +757,19 @@ async def _rewrite_labels_v2_for_winner(
     kept_bins: List[str] = list((pre or {}).get("kept_bins") or [])
     threshold_used: Decimal = _d((pre or {}).get("winrate_threshold"), Decimal("0"))
 
-    # 2) удаляем прошлые данные (как в v1 — актуальный набор на пару)
+    # 2) удаляем прошлые данные — только для ЭТОГО run и ЭТОЙ пары (один winner на run/scenario/signal)
     async with pg.acquire() as conn:
         await conn.execute(
             f"""
             DELETE FROM {LABELS_V2_TABLE}
-            WHERE scenario_id = $1
-              AND signal_id   = $2
-              AND direction   = $3
+            WHERE run_id = $1
+              AND scenario_id = $2
+              AND signal_id   = $3
               AND score_version = $4
             """,
+            int(run_id),
             int(scenario_id),
             int(signal_id),
-            str(direction),
             str(score_version),
         )
 
@@ -799,7 +808,7 @@ async def _rewrite_labels_v2_for_winner(
 
                 str(score_version),
                 int(analysis_id),
-                (str(indicator_param) if indicator_param is not None else ""),
+                indicator_param,
                 str(timeframe),
 
                 str(bn),
@@ -865,7 +874,7 @@ async def _load_preproc_v2_winner_details(
     scenario_id: int,
     signal_id: int,
     analysis_id: int,
-    indicator_param: str,
+    indicator_param: Optional[str],
     timeframe: str,
     direction: str,
 ) -> Optional[Dict[str, Any]]:
@@ -880,7 +889,7 @@ async def _load_preproc_v2_winner_details(
               AND scenario_id = $2
               AND signal_id = $3
               AND analysis_id = $4
-              AND COALESCE(indicator_param, '') = $5
+              AND indicator_param IS NOT DISTINCT FROM $5
               AND timeframe = $6
               AND direction = $7
             """,
@@ -888,7 +897,7 @@ async def _load_preproc_v2_winner_details(
             int(scenario_id),
             int(signal_id),
             int(analysis_id),
-            str(indicator_param or ""),
+            indicator_param,
             str(timeframe),
             str(direction),
         )
@@ -916,7 +925,7 @@ async def _load_bins_stat_for_bins(
     scenario_id: int,
     signal_id: int,
     analysis_id: int,
-    indicator_param: str,
+    indicator_param: Optional[str],
     timeframe: str,
     direction: str,
     bin_names: List[str],
@@ -938,7 +947,7 @@ async def _load_bins_stat_for_bins(
               AND scenario_id = $2
               AND signal_id = $3
               AND analysis_id = $4
-              AND COALESCE(indicator_param, '') = $5
+              AND indicator_param IS NOT DISTINCT FROM $5
               AND timeframe = $6
               AND direction = $7
               AND bin_name = ANY($8::text[])
@@ -947,7 +956,7 @@ async def _load_bins_stat_for_bins(
             int(scenario_id),
             int(signal_id),
             int(analysis_id),
-            str(indicator_param or ""),
+            indicator_param,
             str(timeframe),
             str(direction),
             list(bin_names),
@@ -976,8 +985,9 @@ async def _publish_postproc_v2_ready(
     winner_analysis_id: int,
     winner_param: str,
     score_version: str,
+    finished_at: datetime,
 ) -> None:
-    finished_at = datetime.utcnow()
+    finished_at_postproc = datetime.utcnow()
 
     try:
         await redis.xadd(
@@ -992,7 +1002,9 @@ async def _publish_postproc_v2_ready(
                 "winner_analysis_id": str(int(winner_analysis_id)),
                 "winner_param": str(winner_param or ""),
                 "score_version": str(score_version),
-                "finished_at": finished_at.isoformat(),
+                "finished_at": finished_at_postproc.isoformat(),
+                # дополнительные поля (downstream может игнорировать)
+                "source_finished_at": finished_at.isoformat(),
             },
         )
     except Exception as e:

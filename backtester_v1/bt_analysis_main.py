@@ -72,6 +72,11 @@ ANALYSIS_STREAM_BLOCK_MS = 5000
 # 🔸 Ограничение параллелизма анализаторов
 ANALYSIS_MAX_CONCURRENCY = 12
 
+# 🔸 Таблицы (v2)
+BT_SCENARIO_POSITIONS_V2_TABLE = "bt_scenario_positions_v2"
+BT_SIGNALS_MEMBERSHIP_TABLE = "bt_signals_membership"
+BT_SIGNAL_RUNS_TABLE = "bt_signal_backfill_runs"
+
 # 🔸 Кеш последних finished_at по (scenario_id, signal_id, run_id) для отсечки дублей
 _last_postproc_finished_at: Dict[Tuple[int, int, int], datetime] = {}
 
@@ -212,8 +217,8 @@ async def run_bt_analysis_orchestrator(pg, redis):
                         pg=pg,
                         scenario_id=scenario_id,
                         signal_id=signal_id,
-                        window_from=window_from,
-                        window_to=window_to,
+                        run_id=run_id,
+                        run_signal_id=run_signal_id,
                     )
 
                     log.debug(
@@ -795,7 +800,12 @@ async def _recalc_bins_stat(
                 $5, $6, $7, $8,
                 $9, $10, $11
             )
-            ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, indicator_param, timeframe, direction, bin_name) DO NOTHING
+            ON CONFLICT (run_id, analysis_id, scenario_id, signal_id, indicator_param, timeframe, direction, bin_name)
+            DO UPDATE SET
+                trades = EXCLUDED.trades,
+                pnl_abs = EXCLUDED.pnl_abs,
+                winrate = EXCLUDED.winrate,
+                updated_at = now()
             """,
             to_insert,
         )
@@ -885,28 +895,39 @@ async def _load_run_info(pg, run_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
-# 🔸 Загрузка position_uid в окне run (только closed и postproc=true)
+# 🔸 Загрузка position_uid в окне run (v2, membership-aware, строго в рамках run.to_time)
 async def _load_window_position_uids(
     pg,
     scenario_id: int,
     signal_id: int,
-    window_from: datetime,
-    window_to: datetime,
+    run_id: int,
+    run_signal_id: int,
 ) -> Set[Any]:
     async with pg.acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT position_uid
-            FROM bt_scenario_positions
-            WHERE scenario_id = $1
-              AND signal_id   = $2
-              AND status      = 'closed'
-              AND postproc    = true
-              AND entry_time BETWEEN $3 AND $4
+            f"""
+            SELECT DISTINCT p.position_uid
+            FROM {BT_SIGNALS_MEMBERSHIP_TABLE} m
+            JOIN {BT_SIGNAL_RUNS_TABLE} r
+              ON r.id = $3
+            JOIN {BT_SCENARIO_POSITIONS_V2_TABLE} p
+              ON p.signal_value_id = m.signal_value_id
+             AND p.scenario_id = $1
+             AND p.signal_id = $2
+            WHERE
+                (
+                    (m.run_id = $3 AND m.signal_id = $2)
+                    OR
+                    (m.parent_run_id = $3 AND m.parent_signal_id = $4 AND m.signal_id = $2)
+                )
+              AND p.status = 'closed'
+              AND p.postproc_v2 = true
+              AND p.exit_time <= r.to_time
             """,
             int(scenario_id),
             int(signal_id),
-            window_from,
-            window_to,
+            int(run_id),
+            int(run_signal_id),
         )
+
     return {r["position_uid"] for r in rows}

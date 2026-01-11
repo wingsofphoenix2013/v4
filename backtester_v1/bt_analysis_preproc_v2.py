@@ -384,7 +384,7 @@ async def _load_bins_stat_rows(
     out: List[Dict[str, Any]] = []
     for r in rows:
         ind = r["indicator_param"]
-        indicator_param_norm = str(ind).strip() if ind is not None else ""
+        indicator_param_norm = str(ind).strip() if ind is not None else None
 
         out.append(
             {
@@ -415,7 +415,8 @@ async def _process_groups_v2(
 
     for r in rows:
         analysis_id = int(r["analysis_id"])
-        indicator_param = str(r.get("indicator_param") or "").strip()
+        ind = r.get("indicator_param")
+        indicator_param = str(ind).strip() if ind is not None else None
         timeframe = str(r.get("timeframe") or "").strip().lower()
         direction = str(r.get("direction") or "").strip().lower()
 
@@ -646,7 +647,7 @@ async def _load_daily_rows_for_kept_bins(
                 COUNT(*)                                AS trades_day,
                 COALESCE(SUM(r.pnl_abs), 0)             AS pnl_abs_day
             FROM bt_analysis_positions_raw r
-            JOIN bt_scenario_positions p
+            JOIN bt_scenario_positions_v2 p
               ON p.position_uid = r.position_uid
             WHERE r.run_id      = $1
               AND r.analysis_id = $2
@@ -656,7 +657,7 @@ async def _load_daily_rows_for_kept_bins(
               AND r.direction   = $6
               AND r.bin_name    = ANY($9::text[])
               AND p.status      = 'closed'
-              AND p.postproc    = true
+              AND p.postproc_v2 = true
               AND p.exit_time IS NOT NULL
               AND p.exit_time BETWEEN $7 AND $8
             GROUP BY (p.exit_time::date)
@@ -767,7 +768,7 @@ async def _rewrite_daily_rows_v2(
     analysis_id: int,
     scenario_id: int,
     signal_id: int,
-    indicator_param: str,
+    indicator_param: Optional[str],
     timeframe: str,
     direction: str,
     day_rows: List[Dict[str, Any]],
@@ -781,7 +782,7 @@ async def _rewrite_daily_rows_v2(
               AND analysis_id = $2
               AND scenario_id = $3
               AND signal_id = $4
-              AND indicator_param = $5
+              AND indicator_param IS NOT DISTINCT FROM $5
               AND timeframe = $6
               AND direction = $7
             """,
@@ -789,7 +790,7 @@ async def _rewrite_daily_rows_v2(
             int(analysis_id),
             int(scenario_id),
             int(signal_id),
-            str(indicator_param),
+            indicator_param,
             str(timeframe),
             str(direction),
         )
@@ -805,7 +806,7 @@ async def _rewrite_daily_rows_v2(
                     int(analysis_id),
                     int(scenario_id),
                     int(signal_id),
-                    str(indicator_param),
+                    indicator_param,
                     str(timeframe),
                     str(direction),
                     r["exit_day"],
@@ -959,7 +960,7 @@ async def _upsert_preproc_v2_row(
             int(analysis_id),
             int(scenario_id),
             int(signal_id),
-            str(indicator_param),
+            indicator_param,
             str(timeframe),
             str(direction),
 
