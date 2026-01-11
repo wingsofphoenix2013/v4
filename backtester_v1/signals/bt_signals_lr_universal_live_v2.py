@@ -200,8 +200,7 @@ async def _upsert_live_log(
     st = str(rows[0]["status"] or "")
     return st == "signal_sent"
 
-
-# 🔸 Вставка live-сигнала в bt_signals_values (idempotent), публикация в signals_stream только при новом insert
+# 🔸 Вставка live-сигнала в bt_signals_values (event-layer: event_key+event_params_hash), публикация в signals_stream только при новом insert
 async def _persist_live_signal(
     pg,
     redis,
@@ -215,28 +214,64 @@ async def _persist_live_signal(
     raw_message: Dict[str, Any],
 ) -> bool:
     signal_uuid = str(uuid.uuid4())
-    raw_json = json.dumps(raw_message, ensure_ascii=False)
+
+    # event-layer идентичность для live (чтобы не плодить дубликаты)
+    # key отражает режим (raw/filter) + направление базового детектора
+    mode = str((raw_message or {}).get("mode") or "live_v2").strip().lower()
+    event_key = f"lr_universal_live_{mode}_{timeframe}"
+
+    # hash параметров детектора (стабильная часть) — используем поля из raw_message, если есть
+    # если чего-то нет, fallback на пустые значения (не упадём)
+    trend_type = str((raw_message or {}).get("trend_type") or (raw_message or {}).get("trend") or "").strip().lower()
+    zone_k = str((raw_message or {}).get("zone_k") or "")
+    keep_half = str((raw_message or {}).get("keep_half") or "")
+
+    # зеркала (если filtered): фиксируем, чтобы отличать разные конфиги фильтра в identity
+    filter_mode = str((raw_message or {}).get("filter_mode") or "").strip().lower()
+    mirror1 = (raw_message or {}).get("layers") or []
+    mirrors_sig = ""
+    try:
+        # очень короткая подпись: layer_count + first mirror pair ids (для различения конфигов)
+        if isinstance(mirror1, list) and mirror1:
+            ms = str(((mirror1[0] or {}).get("mirror") or {}).get("scenario_id") or "")
+            si = str(((mirror1[0] or {}).get("mirror") or {}).get("signal_id") or "")
+            mirrors_sig = f"{si}:{ms}"
+    except Exception:
+        mirrors_sig = ""
+
+    # event_params_hash — стабильная подпись конфигурации live-детектора/фильтра
+    event_params_hash = f"trend={trend_type}|zone_k={zone_k}|keep_half={keep_half}|filter={filter_mode}|mirror={mirrors_sig}"
+    # укоротим до 32 (как принято), но без hashlib тоже ок — используем uuid namespace? сделаем sha1 для стабильности
+    import hashlib
+    event_params_hash = hashlib.sha1(event_params_hash.encode("utf-8")).hexdigest()[:16]
+
+    # payload_stable: всё важное кладём сюда (это и есть "raw_message")
+    payload_stable_json = json.dumps(raw_message or {}, ensure_ascii=False)
 
     inserted = False
     async with pg.acquire() as conn:
         row = await conn.fetchrow(
             f"""
             INSERT INTO {BT_SIGNALS_VALUES_TABLE}
-                (signal_uuid, signal_id, symbol, timeframe, open_time, decision_time, direction, message, raw_message, first_backfill_run_id)
+                (signal_uuid, symbol, timeframe, open_time, decision_time, direction,
+                 payload_stable, event_key, event_params_hash, pattern, price)
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NULL)
-            ON CONFLICT (signal_id, symbol, timeframe, open_time, direction) DO NOTHING
+                ($1, $2, $3, $4, $5, $6,
+                 $7::jsonb, $8, $9, $10, $11::numeric)
+            ON CONFLICT (event_key, event_params_hash, symbol, timeframe, open_time, direction) DO NOTHING
             RETURNING id
             """,
             signal_uuid,
-            int(signal_id),
             str(symbol),
             str(timeframe),
             open_time,
             decision_time,
             str(direction),
-            str(message),
-            raw_json,
+            payload_stable_json,
+            str(event_key),
+            str(event_params_hash),
+            "bounce",
+            (raw_message or {}).get("price"),
         )
         inserted = row is not None
 
@@ -265,7 +300,6 @@ async def _persist_live_signal(
             )
 
     return inserted
-
 
 # 🔸 Получение слоя фильтра из кеша v2 (mirror -> required_pairs/good_bins_map/run_id)
 def _build_filter_layer_from_cache(
@@ -905,6 +939,10 @@ async def _handle_indicator_ready_message(
             "message": message,
             "source": "backtester_v1",
             "mode": "live_raw_v2",
+            "price": _round_price(float(close_curr), precision_price) if close_curr is not None else None,
+            "trend_type": trend_type,
+            "zone_k": zone_k,
+            "keep_half": keep_half,
         }
 
         await _persist_live_signal(pg, redis, signal_id, symbol, timeframe, direction, open_time, decision_time, message, raw_message)
@@ -1293,6 +1331,10 @@ async def _handle_pack_ready_message(
             "source": "backtester_v1",
             "mode": "live_filtered_v2",
             "filter_mode": filter_mode,
+            "price": _round_price(float(close_curr), precision_price) if close_curr is not None else None,
+            "trend_type": trend_type,
+            "zone_k": zone_k,
+            "keep_half": keep_half,
             "pack": {
                 "stream": IND_PACK_READY_STREAM_KEY,
                 "open_ts_ms": open_ts_ms_raw,
