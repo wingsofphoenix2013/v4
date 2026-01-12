@@ -37,6 +37,7 @@ from analysis.bt_analysis_rsi_mtf import run_rsi_mtf_analysis
 from analysis.bt_analysis_mfi_mtf import run_mfi_mtf_analysis
 from analysis.bt_analysis_lr_mtf import run_lr_mtf_analysis
 from analysis.bt_analysis_bb_mtf import run_bb_mtf_analysis
+from analysis.bt_analysis_emastate_mtf import run_emastate_mtf_analysis
 
 # 🔸 Реестр анализаторов: (family_key, key) → handler
 ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
@@ -55,6 +56,7 @@ ANALYSIS_HANDLERS: Dict[Tuple[str, str], AnalysisHandler] = {
     ("mfi", "mfi_mtf"): run_mfi_mtf_analysis,
     ("lr", "lr_mtf"): run_lr_mtf_analysis,
     ("bb", "bb_mtf"): run_bb_mtf_analysis,
+    ("ema", "emastate_mtf"): run_emastate_mtf_analysis,
 }
 
 # 🔸 Константы стрима анализа
