@@ -1049,6 +1049,170 @@ async def handle_indicator_event(redis: Any, msg: dict[str, Any]) -> dict[str, i
 
     return {"ok": published_ok, "fail": published_fail, "runtimes": len(runtimes)}
 
+# 🔸 Publish MTF timeout (pending expired): publish FAIL for winner pairs only
+async def publish_mtf_timeout(redis: Any, p: Any) -> int:
+    log = logging.getLogger("PACK_STREAM")
+
+    symbol = str(getattr(p, "symbol", "") or "").strip()
+    indicator_key = str(getattr(p, "indicator_key", "") or "").strip()
+    series = getattr(p, "series", None)
+
+    open_ts_ms = getattr(p, "open_ts_ms", None)
+    open_time_iso = getattr(p, "open_time_iso", None)
+
+    need_m15 = getattr(p, "need_m15_open_ts_ms", None)
+    need_h1 = getattr(p, "need_h1_open_ts_ms", None)
+    deadline_ms = getattr(p, "deadline_ms", None)
+
+    # условия достаточности
+    if not symbol or not indicator_key or open_ts_ms is None:
+        return 0
+
+    # registry match (как в handle_indicator_event)
+    runtimes = pack_registry.get(("m5", str(indicator_key)))
+    if not runtimes:
+        return 0
+
+    # supertrend: фильтруем runtimes до точной серии (как в handle_indicator_event)
+    if str(indicator_key).startswith("supertrend") and series:
+        def _st_series(x: Any) -> str | None:
+            s = str(x or "").strip()
+            if not s:
+                return None
+            if s.endswith("_trend"):
+                return s[:-6]
+            return s
+
+        want = _st_series(series)
+
+        # условия достаточности
+        if want:
+            filtered: list[PackRuntime] = []
+            for rt in runtimes:
+                if not rt.is_mtf:
+                    continue
+
+                spec = rt.mtf_component_params or {}
+                found = False
+
+                for _, tf_spec in spec.items():
+                    if isinstance(tf_spec, str):
+                        if _st_series(tf_spec) == want:
+                            found = True
+                            break
+                    elif isinstance(tf_spec, dict):
+                        for _, pname in tf_spec.items():
+                            if _st_series(pname) == want:
+                                found = True
+                                break
+                        if found:
+                            break
+
+                if found:
+                    filtered.append(rt)
+
+            runtimes = filtered
+
+    # winner-driven filter: считаем только те runtimes, которые являются winner хотя бы по одной паре
+    winner_runtimes: list[PackRuntime] = []
+    for rt in runtimes:
+        if not rt.is_mtf or not rt.mtf_pairs:
+            continue
+
+        is_winner = False
+        for (scenario_id, signal_id) in rt.mtf_pairs:
+            try:
+                if get_winner_analysis_id(int(scenario_id), int(signal_id)) == int(rt.analysis_id):
+                    is_winner = True
+                    break
+            except Exception:
+                continue
+
+        if is_winner:
+            winner_runtimes.append(rt)
+
+    runtimes = winner_runtimes
+
+    # условия достаточности
+    if not runtimes:
+        return 0
+
+    trigger = {
+        "indicator": str(indicator_key),
+        "timeframe": "m5",
+        "open_time": (str(open_time_iso) if open_time_iso is not None else None),
+        "status": "mtf_timeout",
+    }
+
+    published_fail = 0
+
+    for rt in runtimes:
+        for (scenario_id, signal_id) in rt.mtf_pairs or []:
+            # winner gating
+            if get_winner_analysis_id(int(scenario_id), int(signal_id)) != int(rt.analysis_id):
+                continue
+
+            run_id = get_winner_run_id(int(scenario_id), int(signal_id))
+
+            # ограничения направлений по direction_mask
+            for direction in get_allowed_directions(int(signal_id)):
+                details = build_fail_details_base(
+                    analysis_id=int(rt.analysis_id),
+                    symbol=str(symbol),
+                    direction=str(direction),
+                    timeframe="mtf",
+                    pair={"scenario_id": int(scenario_id), "signal_id": int(signal_id)},
+                    trigger=trigger,
+                    open_ts_ms=int(open_ts_ms),
+                )
+
+                # диагностический блок по стыку/ожиданию
+                details["styk"] = {
+                    "need_m15_open_ts_ms": int(need_m15) if need_m15 is not None else None,
+                    "need_h1_open_ts_ms": int(need_h1) if need_h1 is not None else None,
+                    "deadline_ms": int(deadline_ms) if deadline_ms is not None else None,
+                    "series": (str(series) if series is not None else None),
+                }
+
+                # по смыслу: gate уже решил, что дальше ждать нельзя
+                details["retry"] = {"recommended": False, "after_sec": 0}
+
+                trace = _build_trace_base(rt, str(symbol), trigger, int(open_ts_ms))
+                trace["phase"] = "fail"
+                trace["reason"] = "mtf_boundary_wait"
+                trace["pair"] = {"scenario_id": int(scenario_id), "signal_id": int(signal_id)}
+                trace["direction"] = str(direction)
+                trace["run_id"] = int(run_id) if run_id is not None else None
+                trace["styk"] = details["styk"]
+
+                await publish_pair(
+                    redis,
+                    int(rt.analysis_id),
+                    int(scenario_id),
+                    int(signal_id),
+                    str(direction),
+                    str(symbol),
+                    "mtf",
+                    _pack_fail_json("mtf_boundary_wait", details, trace),
+                    int(rt.ttl_sec),
+                    meta=build_publish_meta(int(open_ts_ms), trigger.get("open_time"), run_id),
+                )
+                published_fail += 1
+
+    # суммирующий лог (таймауты редкие, поэтому info уместен)
+    if published_fail:
+        log.info(
+            "PACK_STREAM: mtf_ready timeout published (symbol=%s, indicator=%s, open_ts_ms=%s, fail=%s, need_m15=%s, need_h1=%s)",
+            symbol,
+            indicator_key,
+            int(open_ts_ms),
+            published_fail,
+            int(need_m15) if need_m15 is not None else None,
+            int(need_h1) if need_h1 is not None else None,
+        )
+
+    return published_fail
+
 # 🔸 Watch indicator_stream (parallel + фильтры m5/active triggers + event-driven styk m15/h1)
 async def watch_indicator_stream(redis: Any):
     log = logging.getLogger("PACK_STREAM")
@@ -1152,12 +1316,19 @@ async def watch_indicator_stream(redis: Any):
     async def _timeout_loop():
         while True:
             try:
+                # обработка таймаутов pending m5 (экстремальный кейс)
                 timed_out = mtf_gate.pop_timeouts()
                 if timed_out:
                     total = 0
                     for p in timed_out:
                         total += await publish_mtf_timeout(redis, p)
-                    log.debug("PACK_STREAM: mtf_ready timeouts handled=%s, published_fail=%s", len(timed_out), total)
+
+                    # суммирующий результат по циклу
+                    log.info(
+                        "PACK_STREAM: mtf_ready timeouts handled=%s, published_fail=%s",
+                        len(timed_out),
+                        total,
+                    )
                 await asyncio.sleep(MTF_READY_POLL_SEC)
             except Exception as e:
                 log.error("PACK_STREAM: mtf_ready timeout loop error: %s", e, exc_info=True)
