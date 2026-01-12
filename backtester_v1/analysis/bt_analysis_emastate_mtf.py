@@ -1,8 +1,8 @@
-# bt_analysis_emastate_mtf.py — анализатор MTF-состояний EMA относительно close (H1/M15/M5) по истории 12 свечей
+# bt_analysis_emastate_mtf.py — анализатор MTF-состояний EMA относительно close (H1/M15/M5) по истории 12 свечей (prefetch по диапазону)
 
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from decimal import Decimal, InvalidOperation
 
@@ -21,6 +21,13 @@ OHLCV_TABLES_BY_TF: Dict[str, str] = {
     "h1": "ohlcv_bb_h1",
 }
 
+# 🔸 Шаг времени TF
+TF_STEP: Dict[str, timedelta] = {
+    "m5": timedelta(minutes=5),
+    "m15": timedelta(minutes=15),
+    "h1": timedelta(hours=1),
+}
+
 # 🔸 Каталог соответствий состояния -> bin_idx (0..6)
 STATE_TO_BIN_IDX: Dict[str, int] = {
     "ABOVE_AWAY": 0,
@@ -33,7 +40,7 @@ STATE_TO_BIN_IDX: Dict[str, int] = {
 }
 
 
-# 🔸 Публичная точка входа анализатора EMA state MTF
+# 🔸 Публичная точка входа анализатора EMA state MTF (батч-подход: prefetch по диапазону)
 async def run_emastate_mtf_analysis(
     analysis: Dict[str, Any],
     analysis_ctx: Dict[str, Any],
@@ -49,7 +56,7 @@ async def run_emastate_mtf_analysis(
     scenario_id = analysis_ctx.get("scenario_id")
     signal_id = analysis_ctx.get("signal_id")
 
-    # параметры анализатора (храним в bt_analysis_parameters)
+    # параметры анализатора (в bt_analysis_parameters)
     instance_id_m5 = _get_int_param(params, "instance_id_m5", 0)
     instance_id_m15 = _get_int_param(params, "instance_id_m15", 0)
     instance_id_h1 = _get_int_param(params, "instance_id_h1", 0)
@@ -136,27 +143,24 @@ async def run_emastate_mtf_analysis(
             },
         }
 
+    # предварительная нарезка по symbol + парсинг anchor_open_time по TF
     positions_total = 0
     positions_skipped = 0
 
-    # базовый список (без tail): для каждой позиции — индексы биннов на H1/M15/M5
-    base_list: List[Dict[str, Any]] = []
-
-    # основной цикл расчёта состояния
+    positions_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
     for p in positions:
         positions_total += 1
 
         position_uid = p["position_uid"]
+        symbol = str(p["symbol"] or "").strip()
         direction = str(p["direction"] or "").strip().lower()
         pnl_abs = p["pnl_abs"]
         raw_stat = p["raw_stat"]
-        symbol = str(p["symbol"] or "").strip()
 
         if not position_uid or not symbol:
             positions_skipped += 1
             continue
 
-        # якорные open_time из raw_stat
         anchor_h1 = _extract_anchor_open_time(raw_stat, "h1")
         anchor_m15 = _extract_anchor_open_time(raw_stat, "m15")
         anchor_m5 = _extract_anchor_open_time(raw_stat, "m5")
@@ -166,61 +170,124 @@ async def run_emastate_mtf_analysis(
             positions_skipped += 1
             continue
 
-        # считаем состояния для каждого TF
-        h1_state = await _calc_tf_state(
-            pg=pg,
-            tf="h1",
-            symbol=symbol,
-            anchor_open_time=anchor_h1,
-            ema_instance_id=instance_id_h1,
-            ema_param_name=param_name,
-            n_bars=n_bars,
-            eps_k=eps_k,
-        )
-        m15_state = await _calc_tf_state(
-            pg=pg,
-            tf="m15",
-            symbol=symbol,
-            anchor_open_time=anchor_m15,
-            ema_instance_id=instance_id_m15,
-            ema_param_name=param_name,
-            n_bars=n_bars,
-            eps_k=eps_k,
-        )
-        m5_state = await _calc_tf_state(
-            pg=pg,
-            tf="m5",
-            symbol=symbol,
-            anchor_open_time=anchor_m5,
-            ema_instance_id=instance_id_m5,
-            ema_param_name=param_name,
-            n_bars=n_bars,
-            eps_k=eps_k,
-        )
-
-        # если хотя бы один TF не смог дать состояние — позицию пропускаем
-        if h1_state is None or m15_state is None or m5_state is None:
-            positions_skipped += 1
-            continue
-
-        h1_idx = STATE_TO_BIN_IDX.get(h1_state)
-        m15_idx = STATE_TO_BIN_IDX.get(m15_state)
-        m5_idx = STATE_TO_BIN_IDX.get(m5_state)
-
-        if h1_idx is None or m15_idx is None or m5_idx is None:
-            positions_skipped += 1
-            continue
-
-        base_list.append(
+        positions_by_symbol.setdefault(symbol, []).append(
             {
                 "position_uid": position_uid,
+                "symbol": symbol,
                 "direction": direction,
                 "pnl_abs": pnl_abs,
-                "h1_idx": int(h1_idx),
-                "m15_idx": int(m15_idx),
-                "m5_idx": int(m5_idx),
+                "anchor_h1": anchor_h1,
+                "anchor_m15": anchor_m15,
+                "anchor_m5": anchor_m5,
             }
         )
+
+    # базовый список (без tail): для каждой позиции — индексы биннов на H1/M15/M5
+    base_list: List[Dict[str, Any]] = []
+
+    # счётчики batched-прохода
+    symbols_total = len(positions_by_symbol)
+    symbols_prefetched = 0
+    symbols_skipped = 0
+
+    # основной проход по symbol: prefetch данных по диапазону и расчёт состояний в памяти
+    for symbol, plist in positions_by_symbol.items():
+        if not plist:
+            continue
+
+        # условия достаточности
+        if symbol == "":
+            symbols_skipped += 1
+            continue
+
+        try:
+            # считаем диапазоны времени для prefetch по каждому TF
+            t_from_h1, t_to_h1 = _compute_prefetch_range(plist, "anchor_h1", "h1", n_bars)
+            t_from_m15, t_to_m15 = _compute_prefetch_range(plist, "anchor_m15", "m15", n_bars)
+            t_from_m5, t_to_m5 = _compute_prefetch_range(plist, "anchor_m5", "m5", n_bars)
+
+            # prefetch OHLCV close и EMA по каждому TF
+            closes_h1 = await _prefetch_close_map(pg, "h1", symbol, t_from_h1, t_to_h1)
+            closes_m15 = await _prefetch_close_map(pg, "m15", symbol, t_from_m15, t_to_m15)
+            closes_m5 = await _prefetch_close_map(pg, "m5", symbol, t_from_m5, t_to_m5)
+
+            emas_h1 = await _prefetch_ema_map(pg, instance_id_h1, symbol, param_name, t_from_h1, t_to_h1)
+            emas_m15 = await _prefetch_ema_map(pg, instance_id_m15, symbol, param_name, t_from_m15, t_to_m15)
+            emas_m5 = await _prefetch_ema_map(pg, instance_id_m5, symbol, param_name, t_from_m5, t_to_m5)
+
+            symbols_prefetched += 1
+
+        except Exception as e:
+            log.error(
+                "BT_ANALYSIS_EMASTATE_MTF: ошибка prefetch symbol=%s analysis_id=%s scenario_id=%s signal_id=%s: %s",
+                symbol,
+                analysis_id,
+                scenario_id,
+                signal_id,
+                e,
+                exc_info=True,
+            )
+            symbols_skipped += 1
+            continue
+
+        # считаем состояние для каждой позиции данного symbol
+        for rec in plist:
+            position_uid = rec["position_uid"]
+            direction = rec["direction"]
+            pnl_abs = rec["pnl_abs"]
+
+            anchor_h1 = rec["anchor_h1"]
+            anchor_m15 = rec["anchor_m15"]
+            anchor_m5 = rec["anchor_m5"]
+
+            h1_state = _calc_tf_state_from_maps(
+                tf="h1",
+                anchor_open_time=anchor_h1,
+                ema_map=emas_h1,
+                close_map=closes_h1,
+                n_bars=n_bars,
+                eps_k=eps_k,
+            )
+            m15_state = _calc_tf_state_from_maps(
+                tf="m15",
+                anchor_open_time=anchor_m15,
+                ema_map=emas_m15,
+                close_map=closes_m15,
+                n_bars=n_bars,
+                eps_k=eps_k,
+            )
+            m5_state = _calc_tf_state_from_maps(
+                tf="m5",
+                anchor_open_time=anchor_m5,
+                ema_map=emas_m5,
+                close_map=closes_m5,
+                n_bars=n_bars,
+                eps_k=eps_k,
+            )
+
+            # если хотя бы один TF не смог дать состояние — позицию пропускаем
+            if h1_state is None or m15_state is None or m5_state is None:
+                positions_skipped += 1
+                continue
+
+            h1_idx = STATE_TO_BIN_IDX.get(h1_state)
+            m15_idx = STATE_TO_BIN_IDX.get(m15_state)
+            m5_idx = STATE_TO_BIN_IDX.get(m5_state)
+
+            if h1_idx is None or m15_idx is None or m5_idx is None:
+                positions_skipped += 1
+                continue
+
+            base_list.append(
+                {
+                    "position_uid": position_uid,
+                    "direction": direction,
+                    "pnl_abs": pnl_abs,
+                    "h1_idx": int(h1_idx),
+                    "m15_idx": int(m15_idx),
+                    "m5_idx": int(m5_idx),
+                }
+            )
 
     positions_used = len(base_list)
 
@@ -278,7 +345,7 @@ async def run_emastate_mtf_analysis(
                 tail_h1_rows += 1
             continue
 
-        # иначе — внутри H1-группы применяем tail по M15 (доля считается от total_for_share, как в других MTF-анализах)
+        # иначе — внутри H1-группы применяем tail по M15 (доля считается от total_for_share)
         by_m15: Dict[int, List[Dict[str, Any]]] = {}
         for rec in group_h:
             by_m15.setdefault(int(rec["m15_idx"]), []).append(rec)
@@ -334,11 +401,15 @@ async def run_emastate_mtf_analysis(
         "eps_k": str(eps_k),
         "min_share": str(min_share),
         "param_name": param_name,
+        "symbols_total": symbols_total,
+        "symbols_prefetched": symbols_prefetched,
+        "symbols_skipped": symbols_skipped,
     }
 
     log.info(
         "BT_ANALYSIS_EMASTATE_MTF: done analysis_id=%s (family=%s, key=%s, name=%s) scenario_id=%s signal_id=%s — "
-        "param=%s n_bars=%s eps_k=%s min_share=%s pos_total=%s used=%s skipped=%s rows=%s (tail_h1=%s tail_m15=%s full=%s)",
+        "param=%s n_bars=%s eps_k=%s min_share=%s pos_total=%s used=%s skipped=%s rows=%s (tail_h1=%s tail_m15=%s full=%s) "
+        "symbols_total=%s prefetched=%s skipped=%s",
         analysis_id,
         family_key,
         analysis_key,
@@ -356,52 +427,147 @@ async def run_emastate_mtf_analysis(
         tail_h1_rows,
         tail_m15_rows,
         full_rows,
+        symbols_total,
+        symbols_prefetched,
+        symbols_skipped,
     )
 
     return {"rows": rows, "summary": summary}
 
 
-# 🔸 Расчёт состояния на одном TF по истории EMA и close
-async def _calc_tf_state(
+# 🔸 Расчёт диапазона prefetch по списку позиций (min_anchor - (N-1)*step .. max_anchor)
+def _compute_prefetch_range(
+    positions: List[Dict[str, Any]],
+    anchor_key: str,
+    tf: str,
+    n_bars: int,
+) -> Tuple[datetime, datetime]:
+    step = TF_STEP.get(tf)
+    if step is None:
+        raise RuntimeError(f"Unsupported tf: {tf}")
+
+    anchors: List[datetime] = []
+    for p in positions:
+        t = p.get(anchor_key)
+        if isinstance(t, datetime):
+            anchors.append(t)
+
+    if not anchors:
+        raise RuntimeError(f"No anchors for tf={tf} key={anchor_key}")
+
+    t_min = min(anchors)
+    t_max = max(anchors)
+
+    # захватываем N-1 бар назад, включая якорь
+    lookback = step * max(int(n_bars) - 1, 0)
+    t_from = t_min - lookback
+    t_to = t_max
+
+    return t_from, t_to
+
+
+# 🔸 Prefetch: загрузка close для symbol+tf в диапазоне времени
+async def _prefetch_close_map(
     pg,
     tf: str,
     symbol: str,
+    time_from: datetime,
+    time_to: datetime,
+) -> Dict[datetime, Decimal]:
+    table = OHLCV_TABLES_BY_TF.get(tf)
+    if not table:
+        return {}
+
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT open_time, "close"
+            FROM {table}
+            WHERE symbol = $1
+              AND open_time BETWEEN $2 AND $3
+            ORDER BY open_time
+            """,
+            symbol,
+            time_from,
+            time_to,
+        )
+
+    out: Dict[datetime, Decimal] = {}
+    for r in rows:
+        out[r["open_time"]] = _safe_decimal(r["close"])
+    return out
+
+
+# 🔸 Prefetch: загрузка EMA для instance_id+symbol+param_name в диапазоне времени
+async def _prefetch_ema_map(
+    pg,
+    instance_id: int,
+    symbol: str,
+    param_name: str,
+    time_from: datetime,
+    time_to: datetime,
+) -> Dict[datetime, Decimal]:
+    async with pg.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT open_time, value
+            FROM indicator_values_v4
+            WHERE instance_id = $1
+              AND symbol      = $2
+              AND param_name  = $3
+              AND open_time BETWEEN $4 AND $5
+            ORDER BY open_time
+            """,
+            int(instance_id),
+            symbol,
+            param_name,
+            time_from,
+            time_to,
+        )
+
+    out: Dict[datetime, Decimal] = {}
+    for r in rows:
+        out[r["open_time"]] = _safe_decimal(r["value"])
+    return out
+
+
+# 🔸 Расчёт состояния на одном TF по заранее загруженным series map'ам (EMA/close)
+def _calc_tf_state_from_maps(
+    tf: str,
     anchor_open_time: datetime,
-    ema_instance_id: int,
-    ema_param_name: str,
+    ema_map: Dict[datetime, Decimal],
+    close_map: Dict[datetime, Decimal],
     n_bars: int,
     eps_k: Decimal,
 ) -> Optional[str]:
-    # условия достаточности
-    table = OHLCV_TABLES_BY_TF.get(tf)
-    if not table:
+    step = TF_STEP.get(tf)
+    if step is None:
         return None
 
-    # грузим историю close и EMA
-    closes = await _load_close_series(pg, table, symbol, anchor_open_time, n_bars)
-    emas = await _load_ema_series(pg, ema_instance_id, symbol, ema_param_name, anchor_open_time, n_bars)
+    # собираем список времен последних N баров включая anchor
+    times: List[datetime] = []
+    for i in range(int(n_bars) - 1, -1, -1):
+        times.append(anchor_open_time - (step * i))
 
-    # условия достаточности
-    if not closes or not emas:
-        return None
+    # условия достаточности: все времена должны присутствовать и в EMA, и в close
+    ema_series: List[Decimal] = []
+    close_series: List[Decimal] = []
 
-    # выравниваем по open_time (inner join)
-    aligned = _align_series_by_open_time(emas, closes)
-    if len(aligned) < n_bars:
-        return None
+    for t in times:
+        e = ema_map.get(t)
+        c = close_map.get(t)
+        if e is None or c is None:
+            return None
+        ema_series.append(e)
+        close_series.append(c)
 
-    # берём последние n_bars в хронологическом порядке
-    aligned = aligned[-n_bars:]
-
-    # считаем состояния
-    ema_last = aligned[-1][1]
-    close_last = aligned[-1][2]
+    ema_last = ema_series[-1]
+    close_last = close_series[-1]
 
     d_last = ema_last - close_last
     a_last = _abs(d_last)
 
-    eps = _safe_decimal(close_last) * eps_k
-    eps = _safe_decimal(eps)
+    eps = _safe_decimal(close_last) * _safe_decimal(eps_k)
 
     # near имеет приоритет над всем
     if a_last <= eps:
@@ -409,8 +575,8 @@ async def _calc_tf_state(
 
     # ряд расстояний |ema-close| по окну
     a_series: List[Decimal] = []
-    for _, e, c in aligned:
-        a_series.append(_abs(e - c))
+    for i in range(len(ema_series)):
+        a_series.append(_abs(ema_series[i] - close_series[i]))
 
     slope = _linreg_slope(a_series)
 
@@ -523,92 +689,6 @@ def _extract_anchor_open_time(raw_stat: Any, tf: str) -> Optional[datetime]:
         return datetime.fromisoformat(str(open_time_str))
     except Exception:
         return None
-
-
-# 🔸 Загрузка истории close по symbol + open_time (последние N до anchor включительно)
-async def _load_close_series(
-    pg,
-    ohlcv_table: str,
-    symbol: str,
-    anchor_open_time: datetime,
-    limit_n: int,
-) -> List[Tuple[datetime, Decimal]]:
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT open_time, "close"
-            FROM {ohlcv_table}
-            WHERE symbol = $1
-              AND open_time <= $2
-            ORDER BY open_time DESC
-            LIMIT $3
-            """,
-            symbol,
-            anchor_open_time,
-            int(limit_n),
-        )
-
-    out: List[Tuple[datetime, Decimal]] = []
-    for r in rows:
-        out.append((r["open_time"], _safe_decimal(r["close"])))
-
-    # приводим к хронологическому порядку
-    out.reverse()
-    return out
-
-
-# 🔸 Загрузка истории EMA по indicator_values_v4 (последние N до anchor включительно)
-async def _load_ema_series(
-    pg,
-    instance_id: int,
-    symbol: str,
-    param_name: str,
-    anchor_open_time: datetime,
-    limit_n: int,
-) -> List[Tuple[datetime, Decimal]]:
-    async with pg.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT open_time, value
-            FROM indicator_values_v4
-            WHERE instance_id = $1
-              AND symbol      = $2
-              AND param_name  = $3
-              AND open_time  <= $4
-            ORDER BY open_time DESC
-            LIMIT $5
-            """,
-            int(instance_id),
-            symbol,
-            param_name,
-            anchor_open_time,
-            int(limit_n),
-        )
-
-    out: List[Tuple[datetime, Decimal]] = []
-    for r in rows:
-        out.append((r["open_time"], _safe_decimal(r["value"])))
-
-    # приводим к хронологическому порядку
-    out.reverse()
-    return out
-
-
-# 🔸 Выравнивание EMA и close по open_time (inner join)
-def _align_series_by_open_time(
-    ema_series: List[Tuple[datetime, Decimal]],
-    close_series: List[Tuple[datetime, Decimal]],
-) -> List[Tuple[datetime, Decimal, Decimal]]:
-    ema_map: Dict[datetime, Decimal] = {t: v for t, v in ema_series}
-    out: List[Tuple[datetime, Decimal, Decimal]] = []
-
-    for t, c in close_series:
-        e = ema_map.get(t)
-        if e is None:
-            continue
-        out.append((t, e, c))
-
-    return out
 
 
 # 🔸 Наклон линейной регрессии y(t) по t=0..n-1 (в единицах y на бар)
