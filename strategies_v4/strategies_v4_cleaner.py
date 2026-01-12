@@ -2,9 +2,10 @@
 
 # 🔸 Импорты
 import os
+import json
+import uuid
 import asyncio
 import logging
-import json
 from typing import List, Tuple
 
 from infra import infra
@@ -19,7 +20,7 @@ DELETE_GRACE_SEC = int(os.getenv("CLEANER_DELETE_GRACE_SEC", "5"))  # пауза
 log = logging.getLogger("STRATEGY_CLEANER")
 
 
-# 🔹 Вспомогательная: получить количество строк из статуса asyncpg ("DELETE 123")
+# 🔸 Вспомогательная: получить количество строк из статуса asyncpg ("DELETE 123")
 def _rows_affected(status: str) -> int:
     try:
         return int(status.split()[-1])
@@ -27,15 +28,27 @@ def _rows_affected(status: str) -> int:
         return 0
 
 
-# 🔹 Стратегии-кандидаты на удаление
+# 🔸 Вспомогательная: конвертировать список строковых UID в UUID (для uuid-колонок)
+def _to_uuid_list(uids: List[str]) -> Tuple[List[uuid.UUID], int]:
+    uuids: List[uuid.UUID] = []
+    bad = 0
+
+    for s in uids:
+        try:
+            uuids.append(uuid.UUID(str(s)))
+        except Exception:
+            bad += 1
+
+    return uuids, bad
+
+
+# 🔸 Стратегии-кандидаты на обработку (deathrow)
 async def _fetch_deathrow_strategies() -> List[int]:
-    rows = await infra.pg_pool.fetch(
-        "SELECT id FROM strategies_v4 WHERE deathrow = TRUE"
-    )
-    return [r["id"] for r in rows]
+    rows = await infra.pg_pool.fetch("SELECT id FROM strategies_v4 WHERE deathrow = TRUE")
+    return [int(r["id"]) for r in rows]
 
 
-# 🔹 Счётчики позиций по стратегии: (n_closed, n_active)
+# 🔸 Счётчики позиций по стратегии: (n_closed, n_active)
 async def _get_position_counts(strategy_id: int) -> Tuple[int, int]:
     row = await infra.pg_pool.fetchrow(
         """
@@ -50,7 +63,7 @@ async def _get_position_counts(strategy_id: int) -> Tuple[int, int]:
     return int(row["n_closed"]), int(row["n_active"])
 
 
-# 🔹 Выбрать батч закрытых позиций для удаления
+# 🔸 Выбрать батч закрытых позиций для удаления
 async def _fetch_closed_position_uids(strategy_id: int, limit: int) -> List[str]:
     rows = await infra.pg_pool.fetch(
         """
@@ -63,44 +76,64 @@ async def _fetch_closed_position_uids(strategy_id: int, limit: int) -> List[str]
         strategy_id,
         limit,
     )
-    return [r["position_uid"] for r in rows]
+    return [str(r["position_uid"]) for r in rows]
 
 
-# 🔹 Удалить один батч связанных данных по позициям (в транзакции)
-async def _delete_positions_batch(strategy_id: int, uids: List[str]) -> int:
+# 🔸 Удалить один батч связанных данных по позициям (в транзакции)
+async def _delete_positions_batch(strategy_id: int, uids: List[str]) -> Tuple[int, int, int, int]:
+    """
+    Возвращает: (deleted_positions, deleted_targets, deleted_pos_logs, deleted_signal_logs)
+    """
     if not uids:
-        return 0
+        return 0, 0, 0, 0
+
+    pos_deleted = 0
+    targets_deleted = 0
+    pos_logs_deleted = 0
+    signal_logs_deleted = 0
 
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # 1) Цели позиции (TP/SL)
-            await conn.execute(
+            # цели позиции (TP/SL)
+            targets_status = await conn.execute(
                 """
                 DELETE FROM public.position_targets_v4
                  WHERE position_uid = ANY ($1::text[])
                 """,
                 uids,
             )
+            targets_deleted = _rows_affected(targets_status)
 
-            # 2) Логи позиции (uuid)
-            await conn.execute(
-                """
-                DELETE FROM public.positions_log_v4
-                 WHERE position_uid = ANY (SELECT unnest($1::text[])::uuid)
-                """,
-                uids,
-            )
+            # логи позиции (uuid) — аккуратно конвертируем в UUID, чтобы не падать на касте в SQL
+            uids_uuid, bad_uuid = _to_uuid_list(uids)
+            if bad_uuid:
+                log.warning(
+                    "⚠️ batch(strategy=%s): %d position_uid не смогли конвертироваться в UUID для positions_log_v4",
+                    strategy_id,
+                    bad_uuid,
+                )
 
-            # 3) Логи сигналов по позиции
-            await conn.execute(
+            if uids_uuid:
+                pos_logs_status = await conn.execute(
+                    """
+                    DELETE FROM public.positions_log_v4
+                     WHERE position_uid = ANY ($1::uuid[])
+                    """,
+                    uids_uuid,
+                )
+                pos_logs_deleted = _rows_affected(pos_logs_status)
+
+            # логи сигналов по позиции
+            signal_logs_status = await conn.execute(
                 """
                 DELETE FROM public.signal_log_entries_v4
                  WHERE position_uid = ANY ($1::text[])
                 """,
                 uids,
             )
+            signal_logs_deleted = _rows_affected(signal_logs_status)
 
-            # 4) Сами позиции (страховка по статусу)
+            # сами позиции (страховка по статусу)
             pos_status = await conn.execute(
                 """
                 DELETE FROM public.positions_v4
@@ -109,53 +142,32 @@ async def _delete_positions_batch(strategy_id: int, uids: List[str]) -> int:
                 """,
                 uids,
             )
-
-    deleted = _rows_affected(pos_status)
-    log.debug(
-        "🧹 batch(strategy=%s): POS_DELETED=%d (uids=%d)",
-        strategy_id, deleted, len(uids)
-    )
-    return deleted
-
-
-# 🔹 Очистка зависимых данных стратегии перед финальным удалением
-async def _purge_strategy_related_data(conn, strategy_id: int) -> Tuple[int, int, int]:
-    # удаляем processed-таблицы (не имеют FK, но содержат следы вычислений)
-    cp_pack_status = await conn.execute(
-        "DELETE FROM public.oracle_pack_conf_processed WHERE strategy_id = $1",
-        strategy_id,
-    )
-    cp_plain_status = await conn.execute(
-        "DELETE FROM public.oracle_conf_processed WHERE strategy_id = $1",
-        strategy_id,
-    )
-
-    # удаляем отчёты по стратегии — каскадом удалит *mw/*pack aggregated/sense и их whitelists
-    reports_status = await conn.execute(
-        "DELETE FROM public.oracle_report_stat WHERE strategy_id = $1",
-        strategy_id,
-    )
-
-    cp_pack = _rows_affected(cp_pack_status)
-    cp_plain = _rows_affected(cp_plain_status)
-    reports = _rows_affected(reports_status)
+            pos_deleted = _rows_affected(pos_status)
 
     log.info(
-        "🗂️ Очистка зависимостей (sid=%s): report_stat=%d, conf_processed(pack)=%d, conf_processed=%d",
-        strategy_id, reports, cp_pack, cp_plain
+        "🧹 batch(strategy=%s): positions=%d, targets=%d, pos_logs=%d, signal_logs=%d (uids=%d)",
+        strategy_id,
+        pos_deleted,
+        targets_deleted,
+        pos_logs_deleted,
+        signal_logs_deleted,
+        len(uids),
     )
-    return reports, cp_pack, cp_plain
+    return pos_deleted, targets_deleted, pos_logs_deleted, signal_logs_deleted
 
 
-# 🔹 Выключить стратегию, оповестить системы и удалить её
-async def _disable_and_drop_strategy(strategy_id: int):
-    # 1) выключить стратегию в БД
+# 🔸 Выключить стратегию, оповестить системы и удалить её
+async def _disable_and_drop_strategy(strategy_id: int) -> int:
+    """
+    Возвращает: сколько строк стратегии удалено (0/1)
+    """
+    # выключить стратегию в БД
     await infra.pg_pool.execute(
         "UPDATE strategies_v4 SET enabled = FALSE WHERE id = $1",
         strategy_id,
     )
 
-    # 2) Pub/Sub оповещение о выключении (формат как в UI)
+    # Pub/Sub оповещение о выключении (формат как в UI)
     event = {
         "id": strategy_id,
         "type": "enabled",
@@ -165,17 +177,14 @@ async def _disable_and_drop_strategy(strategy_id: int):
     await infra.redis_client.publish("strategies_v4_events", json.dumps(event))
     log.info("📨 [PubSub] Отключение стратегии id=%s", strategy_id)
 
-    # 3) Пауза — даём слушателям (LAB/филлеру) «додренить» in-flight операции
+    # пауза — даём слушателям (LAB/филлеру) «додренить» in-flight операции
     log.info("⏳ Пауза перед удалением стратегии id=%s: %ss", strategy_id, DELETE_GRACE_SEC)
     await asyncio.sleep(DELETE_GRACE_SEC)
 
-    # 4) Очистка зависимостей и финальный DELETE стратегии — в одной транзакции
+    # финальный DELETE стратегии — в транзакции
     async with infra.pg_pool.acquire() as conn:
         async with conn.transaction():
-            # очищаем зависимые данные (reports → каскад на aggregated/sense/whitelists; + processed-таблицы)
-            await _purge_strategy_related_data(conn, strategy_id)
-
-            # финально удаляем запись стратегии (FK больше не мешают)
+            # удаляем запись стратегии
             del_status = await conn.execute(
                 "DELETE FROM public.strategies_v4 WHERE id = $1",
                 strategy_id,
@@ -183,47 +192,66 @@ async def _disable_and_drop_strategy(strategy_id: int):
             deleted = _rows_affected(del_status)
 
     log.info("🗑️ Стратегия удалена из БД: id=%s (rows=%d)", strategy_id, deleted)
+    return deleted
 
 
-# 🔹 Обработка одной стратегии в deathrow
-async def _process_strategy(strategy_id: int) -> Tuple[int, bool]:
+# 🔸 Обработка одной стратегии в deathrow
+async def _process_strategy(strategy_id: int) -> Tuple[int, int]:
     """
-    Возвращает: (сколько позиций удалено, была_ли_стратегия_удалена)
+    Возвращает: (сколько позиций удалено, была_ли_стратегия_удалена_строками)
     """
-    total_deleted = 0
+    total_pos_deleted = 0
+    total_targets_deleted = 0
+    total_pos_logs_deleted = 0
+    total_signal_logs_deleted = 0
+    batches = 0
 
-    # 1) Удаляем закрытые позиции батчами
+    # удаляем закрытые позиции батчами
     while True:
         uids = await _fetch_closed_position_uids(strategy_id, BATCH_LIMIT)
         if not uids:
             break
 
-        deleted = await _delete_positions_batch(strategy_id, uids)
-        total_deleted += deleted
+        # удаление батча
+        pos_deleted, targets_deleted, pos_logs_deleted, signal_logs_deleted = await _delete_positions_batch(strategy_id, uids)
+        batches += 1
 
-        log.info(
-            "🧹 Стратегия %s: удалён батч закрытых позиций: %d (batch=%d)",
-            strategy_id, deleted, len(uids)
-        )
+        total_pos_deleted += pos_deleted
+        total_targets_deleted += targets_deleted
+        total_pos_logs_deleted += pos_logs_deleted
+        total_signal_logs_deleted += signal_logs_deleted
 
-        # Если батч меньше лимита — вероятно, закрытых позиций больше нет
+        # если батч меньше лимита — вероятно, закрытых позиций больше нет
         if len(uids) < BATCH_LIMIT:
             break
 
-    # 2) Проверяем оставшиеся позиции
+    # проверяем оставшиеся позиции
     n_closed, n_active = await _get_position_counts(strategy_id)
-    log.debug("ℹ️ Стратегия %s: осталось closed=%d, active=%d", strategy_id, n_closed, n_active)
+    log.info(
+        "ℹ️ Стратегия %s: итог по позициям: batches=%d, deleted_pos=%d (targets=%d, pos_logs=%d, signal_logs=%d), осталось closed=%d, active=%d",
+        strategy_id,
+        batches,
+        total_pos_deleted,
+        total_targets_deleted,
+        total_pos_logs_deleted,
+        total_signal_logs_deleted,
+        n_closed,
+        n_active,
+    )
 
-    # 3) Если вообще ничего не осталось — выключаем и удаляем стратегию
+    # если вообще ничего не осталось — отключаем и удаляем стратегию
     if n_closed == 0 and n_active == 0:
         log.info("✅ Стратегия %s: позиций не осталось — отключаем и удаляем", strategy_id)
-        await _disable_and_drop_strategy(strategy_id)
-        return total_deleted, True
+        deleted_rows = await _disable_and_drop_strategy(strategy_id)
+        return total_pos_deleted, deleted_rows
 
-    # 4) Иначе — есть активные/partial, ждём следующего цикла
+    # иначе — есть активные/partial, ждём следующего цикла
     if n_active > 0 and n_closed == 0:
-        log.info("⏸️ Стратегия %s: есть активные позиции (%d), повторная проверка через 5 минут", strategy_id, n_active)
-    return total_deleted, False
+        log.info("⏸️ Стратегия %s: есть активные позиции (%d), повторная проверка через %d секунд", strategy_id, n_active, SLEEP_CYCLE_SEC)
+    elif n_closed > 0:
+        log.info("⏸️ Стратегия %s: остались закрытые позиции (%d), повторная проверка через %d секунд", strategy_id, n_closed, SLEEP_CYCLE_SEC)
+
+    return total_pos_deleted, 0
 
 
 # 🔸 Публичный воркер
@@ -243,22 +271,27 @@ async def run_strategies_v4_cleaner():
 
             total_positions_deleted = 0
             total_strategies_deleted = 0
+            total_strategies_processed = 0
 
             for sid in strategy_ids:
                 try:
-                    deleted, dropped = await _process_strategy(sid)
-                    total_positions_deleted += deleted
-                    total_strategies_deleted += 1 if dropped else 0
+                    total_strategies_processed += 1
+                    pos_deleted, strategy_deleted_rows = await _process_strategy(int(sid))
+                    total_positions_deleted += pos_deleted
+                    if strategy_deleted_rows > 0:
+                        total_strategies_deleted += 1
                 except Exception:
                     log.exception("❌ Ошибка обработки стратегии id=%s", sid)
 
             log.info(
-                "📊 Итог прохода: удалено позиций=%d, удалено стратегий=%d",
-                total_positions_deleted, total_strategies_deleted
+                "📊 Итог прохода: processed=%d, strategies_deleted=%d, positions_deleted=%d",
+                total_strategies_processed,
+                total_strategies_deleted,
+                total_positions_deleted,
             )
 
         except Exception:
             log.exception("❌ Критическая ошибка в цикле cleaner")
 
-        # Всегда ждём 5 минут до следующего прохода
+        # всегда ждём до следующего прохода
         await asyncio.sleep(SLEEP_CYCLE_SEC)
