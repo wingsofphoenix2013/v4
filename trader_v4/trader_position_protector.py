@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Dict, Tuple, Optional
 
 from trader_infra import infra
+from bybit_proxy import urllib_opener
 
 # 🔸 Логгер
 log = logging.getLogger("TRADER_POS_PROTECTOR")
@@ -286,7 +287,8 @@ async def _fetch_last_price_from_bybit(symbol: str) -> Optional[Decimal]:
             qs = urllib.parse.urlencode({"category": "linear", "symbol": symbol})
             url = f"{BYBIT_REST_BASE}/v5/market/tickers?{qs}"
             req = urllib.request.Request(url, headers={"User-Agent": "tv4-protector/1.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            opener = urllib_opener()
+            with opener.open(req, timeout=5) as resp:
                 data = resp.read().decode("utf-8", "ignore")
             j = json.loads(data)
             if (j or {}).get("retCode") == 0:

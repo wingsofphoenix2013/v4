@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Dict, Tuple, Optional, Any
 
 from trader_infra import infra
+from bybit_proxy import httpx_async_client
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_ACTIVATOR")
@@ -359,7 +360,7 @@ async def _set_position_stop_loss_live(
         raise ValueError("invalid SL trigger price")
 
     # подготовка и подпись запроса
-    import os, time, hmac, hashlib, json, httpx
+    import os, time, hmac, hashlib, json
 
     API_KEY     = os.getenv("BYBIT_API_KEY", "")
     API_SECRET  = os.getenv("BYBIT_API_SECRET", "")
@@ -390,7 +391,7 @@ async def _set_position_stop_loss_live(
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()

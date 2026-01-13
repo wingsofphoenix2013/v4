@@ -8,10 +8,9 @@ import json
 import hashlib
 import asyncio
 import logging
-import websockets
-import httpx
 
 from trader_infra import infra
+from bybit_proxy import ws_connect, httpx_async_client
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_SYNC")
@@ -44,7 +43,7 @@ async def run_bybit_private_ws_sync_loop():
 
     while True:
         try:
-            async with websockets.connect(WS_PRIVATE, ping_interval=None, close_timeout=5) as ws:
+            async with ws_connect(WS_PRIVATE, ping_interval=None, close_timeout=5) as ws:
                 # auth
                 expires = int((time.time() + 5) * 1000)
                 sign_payload = f"GET/realtime{expires}"
@@ -246,7 +245,7 @@ async def _get_wallet_balance(account_type: str) -> dict:
         "X-BAPI-RECV-WINDOW": RECV_WINDOW,
         "X-BAPI-SIGN": sign,
     }
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.json()
@@ -263,7 +262,7 @@ async def _get_positions_list() -> dict:
         "X-BAPI-RECV-WINDOW": RECV_WINDOW,
         "X-BAPI-SIGN": sign,
     }
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.json()

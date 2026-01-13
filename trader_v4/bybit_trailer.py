@@ -9,9 +9,8 @@ import logging
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Dict, Optional, Tuple
 
-import httpx
-
 from trader_infra import infra
+from bybit_proxy import httpx_async_client
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_TRAILER")
@@ -274,7 +273,7 @@ async def _get_step_price(symbol: str) -> Optional[Decimal]:
 async def _get_last_price_linear(symbol: str) -> Optional[Decimal]:
     url = f"{BYBIT_BASE_URL}/v5/market/tickers?category={CATEGORY}&symbol={symbol}"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx_async_client(timeout=10) as client:
             r = await client.get(url)
             r.raise_for_status()
             data = r.json()
@@ -326,7 +325,7 @@ async def _set_position_stop_loss_live(symbol: str, trigger_price: Decimal) -> d
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()

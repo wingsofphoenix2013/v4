@@ -17,6 +17,7 @@ from trader_position_closer import run_trader_position_closer
 from trader_position_protector import run_trader_position_protector
 
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
+from bybit_proxy import init_bybit_proxy
 
 from bybit_processor import run_bybit_processor
 from bybit_activator import run_bybit_activator
@@ -78,6 +79,10 @@ async def run_periodic(coro_factory, label: str, start_delay: float = 0.0, inter
 # 🔸 Главная точка входа
 async def main():
     setup_logging()
+
+    # 🔸 Инициализация прокси для Bybit (контролируемо через ENV)
+    init_bybit_proxy()
+
     log.info("📦 Запуск воркера trader v4")
 
     try:

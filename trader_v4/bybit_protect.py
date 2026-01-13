@@ -11,9 +11,8 @@ import logging
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Optional, Any
 
-import httpx
-
 from trader_infra import infra
+from bybit_proxy import httpx_async_client
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_PROTECT")
@@ -278,7 +277,7 @@ async def _set_position_stop_loss(symbol: str, trigger_price: Decimal) -> dict:
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()

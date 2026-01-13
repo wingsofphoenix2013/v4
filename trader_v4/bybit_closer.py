@@ -11,9 +11,8 @@ import logging
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Optional, Any
 
-import httpx
-
 from trader_infra import infra
+from bybit_proxy import httpx_async_client
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_CLOSER")
@@ -216,7 +215,7 @@ async def _handle_order_entry(sem: asyncio.Semaphore, entry_id: str, fields: Dic
                     ts    = int(time.time() * 1000)
                     signed = _rest_sign(ts, query)
                     headers = _private_headers(ts, signed)
-                    async with httpx.AsyncClient(timeout=10) as client:
+                    async with httpx_async_client(timeout=10) as client:
                         r = await client.get(url, headers=headers)
                         r.raise_for_status()
                         data = r.json()
@@ -369,7 +368,7 @@ async def _get_position_size_linear(symbol: str) -> Optional[Decimal]:
     signed = _rest_sign(ts, query)
     headers = _private_headers(ts, signed)
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx_async_client(timeout=10) as client:
             r = await client.get(url, headers=headers)
             r.raise_for_status()
             data = r.json()
@@ -405,7 +404,7 @@ async def _close_reduce_only_market(symbol: str, side: str, qty: Decimal, order_
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -425,7 +424,7 @@ async def _cancel_all_orders_for_symbol(symbol: str) -> dict:
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -447,7 +446,7 @@ async def _clear_position_stop_loss(symbol: str) -> dict:
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()

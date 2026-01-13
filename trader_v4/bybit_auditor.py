@@ -11,9 +11,8 @@ import logging
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Optional, Any
 
-import httpx
-
 from trader_infra import infra
+from bybit_proxy import httpx_async_client
 
 # 🔸 Логгер
 log = logging.getLogger("BYBIT_AUDITOR")
@@ -407,7 +406,7 @@ async def _get_position_size_linear(symbol: str) -> Optional[Decimal]:
     sign = _rest_sign(ts, query)
     headers = _private_headers(ts, sign)
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx_async_client(timeout=10) as client:
             r = await client.get(url, headers=headers)
             r.raise_for_status()
             data = r.json()
@@ -443,7 +442,7 @@ async def _close_reduce_only_market(symbol: str, side: str, qty: Decimal, order_
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
