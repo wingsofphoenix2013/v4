@@ -13,6 +13,7 @@ from backtester_config import get_enabled_signals
 # 🔸 Воркеры timer-backfill сигналов
 from signals.bt_signals_lr_universal import run_lr_universal_backfill
 from signals.bt_signals_emacross import run_emacross_backfill
+from signals.bt_signals_rsi_reentry import run_rsi_reentry_backfill
 
 # 🔸 Воркеры stream-backfill сигналов
 from signals.bt_signals_lr_universal_level2 import run_lr_universal_level2_stream_backfill
@@ -77,6 +78,7 @@ class LiveSignalHandler:
 TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
     "lr_universal": run_lr_universal_backfill,
     "ema_cross": run_emacross_backfill,
+    "rsi_reentry": run_rsi_reentry_backfill,
 }
 
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
