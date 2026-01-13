@@ -12,9 +12,8 @@ import hmac
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Tuple, Optional, Any, List
 
-import httpx
-
 from trader_infra import infra
+from bybit_proxy import httpx_async_client
 from trader_config import config  # политики стратегий из in-memory кэша
 
 # 🔸 Логгер
@@ -1226,7 +1225,7 @@ async def _publish_audit(event: str, data: dict):
 async def _get_last_price_linear(symbol: str) -> Optional[Decimal]:
     url = f"{BASE_URL}/v5/market/tickers?category={CATEGORY}&symbol={symbol}"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx_async_client(timeout=10) as client:
             r = await client.get(url)
             r.raise_for_status()
             data = r.json()
@@ -1326,7 +1325,7 @@ async def _create_market_order(symbol: str, side: str, qty: Decimal, order_link_
     body_json = json.dumps(body, separators=(",", ":"))
     sign = _rest_sign(ts, body_json)
     headers = _private_headers(ts, sign)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -1355,7 +1354,7 @@ async def _create_limit_ro_order(symbol: str, side: str, qty: Decimal, price: De
     body_json = json.dumps(body, separators=(",", ":"))
     sign = _rest_sign(ts, body_json)
     headers = _private_headers(ts, sign)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -1387,7 +1386,7 @@ async def _create_stop_ro_order(symbol: str, side: str, qty: Decimal, trigger_pr
     body_json = json.dumps(body, separators=(",", ":"))
     sign = _rest_sign(ts, body_json)
     headers = _private_headers(ts, sign)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -1423,7 +1422,7 @@ async def _set_position_stop_loss(
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -1455,7 +1454,7 @@ async def _close_reduce_only_market(symbol: str, side: str, qty: Decimal, order_
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -1481,7 +1480,7 @@ async def _set_leverage_live(symbol: str, leverage: Decimal) -> dict:
     signed = _rest_sign(ts, body_json)
     headers = _private_headers(ts, signed)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.post(url, headers=headers, content=body_json)
         r.raise_for_status()
         return r.json()
@@ -1716,7 +1715,7 @@ async def _place_immediate_orders_for_position(position_uid: str, symbol: str, d
                 sign = _rest_sign(ts, body_json)
                 headers = _private_headers(ts, sign)
 
-                async with httpx.AsyncClient(timeout=10) as client:
+                async with httpx_async_client(timeout=10) as client:
                     resp = await client.post(url, headers=headers, content=body_json)
                     resp.raise_for_status()
                     data = resp.json()
@@ -1842,7 +1841,7 @@ async def _get_order_realtime_by_link(order_link_id: str) -> dict:
     ts = int(time.time() * 1000)
     sign = _rest_sign(ts, query)
     headers = _private_headers(ts, sign)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx_async_client(timeout=10) as client:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.json()
