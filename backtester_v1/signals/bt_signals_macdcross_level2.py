@@ -30,6 +30,12 @@ from signals_plugins.bb_mtf import (
     compute_bb_mtf_bin_name,
 )
 
+from signals_plugins.emastate import (
+    init_emastate_mtf_plugin_context,
+    prepare_symbol_series as prepare_emastate_mtf_symbol_series,
+    compute_emastate_mtf_bin_name,
+)
+
 # 🔸 Кеши backtester_v1
 from backtester_config import (
     get_all_ticker_symbols,
@@ -518,6 +524,12 @@ async def run_macdcross_level2_stream_backfill(
         init_plugin = init_bb_mtf_plugin_context
         prepare_series_fn = prepare_bb_mtf_symbol_series
         compute_bin_fn = compute_bb_mtf_bin_name
+
+    elif family_key == "ema" and analysis_key == "emastate_mtf":
+        plugin_name = "emastate_mtf"
+        init_plugin = init_emastate_mtf_plugin_context
+        prepare_series_fn = prepare_emastate_mtf_symbol_series
+        compute_bin_fn = compute_emastate_mtf_bin_name
 
     else:
         log.debug(
