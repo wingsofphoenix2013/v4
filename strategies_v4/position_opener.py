@@ -9,7 +9,7 @@ from dataclasses import dataclass, asdict
 from decimal import Decimal, ROUND_DOWN
 import time
 
-from infra import infra, get_price, get_indicator
+from infra import infra, get_price
 from config_loader import config
 from position_state_loader import position_registry, PositionState, Target
 
@@ -71,13 +71,7 @@ async def calculate_position_size(data: dict):
     if sl_type == "percent":
         delta = (entry_price * sl_value / Decimal("100")).quantize(factor_price, rounding=ROUND_DOWN)
     elif sl_type == "atr":
-        tf = strategy.get("timeframe").lower()
-        log.debug(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
-        atr_raw = await get_indicator(symbol, tf, "atr14")
-        if atr_raw is None:
-            return "skip", "ATR not available"
-        atr = Decimal(str(atr_raw))
-        delta = (atr * sl_value).quantize(factor_price, rounding=ROUND_DOWN)
+        return "skip", "SL atr disabled (indicators not used)"
     else:
         return "skip", f"unknown sl_type: {sl_type}"
 
@@ -90,7 +84,6 @@ async def calculate_position_size(data: dict):
     log.debug(f"[STAGE 2] sl_type={sl_type} stop_price={stop_loss_price} risk_per_unit={risk_per_unit}")
     # === Этап 3: Расчёт TP ===
     tp_targets = []
-    atr = None
 
     for level_conf in strategy["tp_levels"]:
         level = level_conf["level"]
@@ -105,16 +98,7 @@ async def calculate_position_size(data: dict):
             price = entry_price + delta if direction == "long" else entry_price - delta
 
         elif tp_type == "atr":
-            tp_value = Decimal(str(level_conf["tp_value"]))
-            if atr is None:
-                tf = strategy.get("timeframe").lower()
-                log.debug(f"[TP] strategy_id={strategy_id} timeframe={tf} — querying atr14")
-                atr_raw = await get_indicator(symbol, tf, "atr14")
-                if atr_raw is None:
-                    return "skip", "ATR not available for TP"
-                atr = Decimal(str(atr_raw))
-            delta = (atr * tp_value).quantize(factor_price, rounding=ROUND_DOWN)
-            price = entry_price + delta if direction == "long" else entry_price - delta
+            return "skip", "TP atr disabled (indicators not used)"
 
         else:
             return "skip", f"unknown tp_type: {tp_type}"
