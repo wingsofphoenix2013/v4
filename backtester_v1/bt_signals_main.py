@@ -26,6 +26,10 @@ from signals.bt_signals_lr_universal_live_v2 import (
     handle_lr_universal_indicator_ready_v2,
 )
 
+from signals.bt_signals_macdcross_live_v2 import (
+    init_macdcross_live_v2,
+    handle_macdcross_indicator_ready_v2,
+)
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60       # старт через минуту после запуска backtester_v1
@@ -93,6 +97,7 @@ STREAM_BACKFILL_HANDLERS: Dict[str, StreamBackfillHandler] = {
 # 🔸 Реестр live-сигналов: key → LiveSignalHandler(init, handle)
 LIVE_SIGNAL_HANDLERS: Dict[str, LiveSignalHandler] = {
     "lr_universal_v2": LiveSignalHandler(init_lr_universal_live_v2, handle_lr_universal_indicator_ready_v2),
+    "macd_cross_v2": LiveSignalHandler(init_macdcross_live_v2, handle_macdcross_indicator_ready_v2),
 }
 
 
