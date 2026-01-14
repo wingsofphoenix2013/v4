@@ -18,6 +18,7 @@ from signals.bt_signals_macdcross import run_macdcross_backfill
 
 # 🔸 Воркеры stream-backfill сигналов
 from signals.bt_signals_lr_universal_level2 import run_lr_universal_level2_stream_backfill
+from signals.bt_signals_macdcross_level2 import run_macdcross_level2_stream_backfill
 
 # 🔸 Live-воркеры сигналов
 from signals.bt_signals_lr_universal_live_v2 import (
@@ -86,6 +87,7 @@ TIMER_BACKFILL_HANDLERS: Dict[str, TimerBackfillHandler] = {
 # 🔸 Реестр стримовых backfill-сигналов: key → handler(signal, msg_ctx, pg, redis)
 STREAM_BACKFILL_HANDLERS: Dict[str, StreamBackfillHandler] = {
     "lr_universal_level2": run_lr_universal_level2_stream_backfill,
+    "macd_cross_level2": run_macdcross_level2_stream_backfill,
 }
 
 # 🔸 Реестр live-сигналов: key → LiveSignalHandler(init, handle)
