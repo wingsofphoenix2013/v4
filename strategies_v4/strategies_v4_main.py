@@ -38,7 +38,6 @@ async def main():
     try:
         await setup_pg()
         await setup_redis_client()
-        await init_indicator_cache_via_redis()
     except Exception:
         log.exception("❌ Ошибка инициализации внешних сервисов")
         return
@@ -76,7 +75,6 @@ async def main():
         run_safe_loop(run_signal_loop, "SIGNAL_PROCESSOR"),
         run_safe_loop(config_event_listener, "CONFIG_LOADER"),
         run_safe_loop(run_signal_log_writer, "CORE_IO"),
-        run_safe_loop(listen_indicator_stream, "INDICATOR_CACHE"),
         run_safe_loop(run_position_opener_loop, "POSITION_OPENER"),
         run_safe_loop(run_position_open_writer, "POSITION_DB_WRITER"),
         run_safe_loop(run_position_handler, "POSITION_HANDLER"),
