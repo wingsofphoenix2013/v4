@@ -594,7 +594,7 @@ async def init_macdcross_live_v2(
     if step_min <= 0:
         raise RuntimeError(f"init_macdcross_live_v2: unknown timeframe step for tf={timeframe}")
 
-    log.info(
+    log.debug(
         "BT_SIG_MACD_CROSS_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, bases=%s, instances=%s",
         stream_key,
         len(cfgs),
@@ -887,7 +887,7 @@ async def _handle_indicator_ready_message(
         ctx["counters"]["raw_sent_total"] += 1
         sent_now += 1
 
-        log.info(
+        log.debug(
             "BT_SIG_MACD_CROSS_LIVE_V2: signal_sent RAW — signal_id=%s %s %s %s base=%s",
             signal_id,
             symbol,
@@ -898,7 +898,7 @@ async def _handle_indicator_ready_message(
 
     # суммарный лог по событию (если что-то отправили)
     if sent_now > 0:
-        log.info(
+        log.debug(
             "BT_SIG_MACD_CROSS_LIVE_V2: RAW batch result — symbol=%s open_time=%s base=%s sent_now=%s (raw_sent_total=%s)",
             symbol,
             open_time.isoformat(),
@@ -1299,7 +1299,7 @@ async def _handle_pack_ready_message(
             ctx["counters"]["filtered_sent_total"] += 1
             sent_now += 1
 
-            log.info(
+            log.debug(
                 "BT_SIG_MACD_CROSS_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s base=%s mode=%s",
                 signal_id,
                 symbol,
@@ -1311,7 +1311,7 @@ async def _handle_pack_ready_message(
 
     # суммарный лог по pack-событию (если что-то отправили)
     if sent_now > 0:
-        log.info(
+        log.debug(
             "BT_SIG_MACD_CROSS_LIVE_V2: FILTER batch result — symbol=%s open_time=%s sent_now=%s (filtered_sent_total=%s)",
             symbol,
             open_time.isoformat(),

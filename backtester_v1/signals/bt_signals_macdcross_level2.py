@@ -555,7 +555,7 @@ async def run_macdcross_level2_stream_backfill(
 
     # условий достаточности
     if not good_bins:
-        log.info(
+        log.debug(
             "BT_SIG_MACD_CROSS_L2: no good bins — skip (level2_signal_id=%s parent_signal_id=%s scenario_id=%s parent_run_id=%s winner=%s dir=%s score_version=%s winner_param='%s')",
             signal_id,
             parent_signal_id,
@@ -687,7 +687,7 @@ async def run_macdcross_level2_stream_backfill(
             skipped_no_bin += s_no_bin
             skipped_not_good += s_not_good
 
-        log.info(
+        log.debug(
             "BT_SIG_MACD_CROSS_L2: done — level2_signal_id=%s level2_run_id=%s parent_signal_id=%s parent_run_id=%s scenario_id=%s dir=%s pipeline_mode=%s "
             "winner=%s score_version=%s winner_param='%s' plugin=%s good_bins=%s candidates=%s with_bin=%s good=%s membership_inserted=%s "
             "skipped_no_data=%s skipped_no_bin=%s skipped_not_good=%s",

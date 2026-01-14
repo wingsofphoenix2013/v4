@@ -216,7 +216,7 @@ async def run_macdcross_backfill(
 
     finished_at = datetime.utcnow()
 
-    log.info(
+    log.debug(
         "BT_SIG_MACD_CROSS: backfill готов — signal_id=%s run_id=%s TF=%s window=[%s..%s] tickers=%s "
         "candidates=%s (long=%s short=%s) events_inserted=%s membership_inserted=%s no_data=%s",
         signal_id,
