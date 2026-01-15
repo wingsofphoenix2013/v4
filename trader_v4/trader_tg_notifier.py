@@ -14,7 +14,6 @@ from typing import Optional, Iterable, Any, Dict, Tuple, List
 import httpx
 
 from trader_infra import infra
-from bybit_proxy import httpx_async_client
 
 # 🔸 Логгер телеграм-уведомлений
 log = logging.getLogger("TRADER_TG")
@@ -33,9 +32,8 @@ def _normalize_mode(v: Optional[str]) -> str:
 
 _TG_MODE = _normalize_mode(os.getenv("TRADER_TG_MODE"))
 
-# 🔸 Redis Streams (источник событий + источник исполнений)
+# 🔸 Redis Streams (источник событий)
 AUDIT_STREAM = "positions_bybit_audit"         # события системы (entry_filled, position_closed_*)
-EXECUTION_STREAM = "bybit_execution_stream"    # приватные executions от bybit_sync
 
 # 🔸 Consumer Group для TG-воркера
 TG_CG = "trader_tg_cg"
@@ -43,17 +41,8 @@ TG_CONSUMER = os.getenv("TRADER_TG_CONSUMER", "tg-1")
 
 # 🔸 Параметры воркера
 MAX_PARALLEL_TASKS = int(os.getenv("TRADER_TG_MAX_TASKS", "50"))
-SCAN_EXEC_MAX = int(os.getenv("TRADER_TG_EXEC_SCAN_MAX", "3000"))                  # сколько execution-сообщений смотреть с хвоста
-SCAN_EXEC_LOOKBACK_SEC = int(os.getenv("TRADER_TG_EXEC_LOOKBACK_SEC", "7200"))     # максимум «в прошлое» для скана (2 часа)
 DEDUP_TTL_SEC = int(os.getenv("TRADER_TG_DEDUP_TTL_SEC", "604800"))                # TTL ключа дедупликации (7 дней)
 CLOSE_DEDUP_TTL_SEC = int(os.getenv("TRADER_TG_CLOSE_DEDUP_TTL_SEC", "604800"))    # TTL дедупа закрытия (7 дней)
-
-# 🔸 BYBIT ENV (для PnL fallback через /v5/position/closed-pnl)
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
-BYBIT_RECV_WINDOW = os.getenv("BYBIT_RECV_WINDOW", "5000")
-BYBIT_CATEGORY = "linear"
 
 # 🔸 Наборы заголовков (ротируются случайно)
 _OPEN_HEADERS = [
@@ -276,25 +265,11 @@ async def _handle_close_event(payload: dict, entry_id: str, *, close_event: str)
     direction, created_at, source_stream_id = await _load_position_basics(position_uid)
     closed_at = await _load_position_closed_at(position_uid)
 
-    # PnL по executions (gross, без комиссий)
+    # PnL: отключено (не показываем и не считаем)
     pnl = None
-    if source_stream_id:
-        pnl = await _calc_pnl_from_executions(source_stream_id, direction)
 
-    # fallback для SL/trading-stop: /v5/position/closed-pnl
-    if pnl is None:
-        pnl = await _fetch_closed_pnl_from_bybit(
-            symbol=symbol,
-            created_at=created_at,
-            closed_at=closed_at or datetime.utcnow(),
-        )
-
-    # заголовок
-    if pnl is None:
-        # если закрыто по SL и pnl неизвестен — считаем loss
-        hdr = random.choice(_LOSS_HEADERS) if close_event == "position_closed_by_sl" else random.choice(_NEUTRAL_HEADERS)
-    else:
-        hdr = random.choice(_WIN_HEADERS if pnl >= 0 else _LOSS_HEADERS)
+    # заголовок: нейтральный (без попыток классифицировать результат)
+    hdr = random.choice(_NEUTRAL_HEADERS)
 
     text = build_closed_message(
         header=hdr,
@@ -419,168 +394,6 @@ async def _load_tp_sl_targets(position_uid: str) -> Tuple[List[dict], List[dict]
         sls = [sls[0]] if sls else []
 
     return tps, sls
-
-# 🔸 PnL по executions: фильтруем orderLinkId по префиксу tv4-{source_stream_id}
-async def _calc_pnl_from_executions(source_stream_id: str, direction: Optional[str]) -> Optional[Decimal]:
-    redis = infra.redis_client
-
-    # условия достаточности
-    if not source_stream_id:
-        return None
-
-    prefix = f"tv4-{source_stream_id}"
-    d = (direction or "").strip().lower()
-
-    # если направление неизвестно — не считаем, чтобы не ошибиться со знаком
-    if d not in ("long", "short"):
-        return None
-
-    now_ms = int(time.time() * 1000)
-    min_ms = now_ms - (SCAN_EXEC_LOOKBACK_SEC * 1000)
-
-    entry_notional = Decimal("0")
-    exit_notional = Decimal("0")
-    entry_qty = Decimal("0")
-    exit_qty = Decimal("0")
-
-    # читаем с хвоста, пока не ушли глубже окна
-    try:
-        rows = await redis.xrevrange(EXECUTION_STREAM, max="+", min="-", count=SCAN_EXEC_MAX)
-    except Exception:
-        log.debug("TG PnL: xrevrange failed (exec stream)")
-        return None
-
-    for rid, fields in rows or []:
-        # rid вида "1736...-0"
-        try:
-            rid_ms = int(str(rid).split("-", 1)[0])
-        except Exception:
-            rid_ms = now_ms
-
-        # выходим, если ушли за окно
-        if rid_ms < min_ms:
-            break
-
-        # парсим payload
-        try:
-            data_raw = fields.get("data")
-            if isinstance(data_raw, bytes):
-                data_raw = data_raw.decode("utf-8", errors="ignore")
-            ex = json.loads(data_raw or "{}")
-        except Exception:
-            continue
-
-        # только торговые исполнения
-        exec_type = (ex.get("execType") or "").strip().lower()
-        if exec_type and exec_type != "trade":
-            continue
-
-        olink = ex.get("orderLinkId")
-        if not olink or not str(olink).startswith(prefix):
-            continue
-
-        q = _as_decimal(ex.get("execQty")) or Decimal("0")
-        p = _as_decimal(ex.get("execPrice")) or Decimal("0")
-        if q <= 0 or p <= 0:
-            continue
-
-        notional = q * p
-
-        # entry — ожидаем суффикс "-e"; всё остальное считаем выходом
-        if str(olink).endswith("-e"):
-            entry_qty += q
-            entry_notional += notional
-        else:
-            exit_qty += q
-            exit_notional += notional
-
-    # условия достаточности: нужен хотя бы вход и выход
-    if entry_qty <= 0 or exit_qty <= 0:
-        return None
-
-    # gross pnl (без комиссии)
-    if d == "long":
-        return exit_notional - entry_notional
-    return entry_notional - exit_notional
-
-# 🔸 Подпись приватных запросов Bybit v5 (для closed-pnl)
-def _bybit_rest_sign(timestamp_ms: int, query_or_body: str) -> str:
-    import hmac
-    import hashlib
-    payload = f"{timestamp_ms}{BYBIT_API_KEY}{BYBIT_RECV_WINDOW}{query_or_body}"
-    return hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def _bybit_private_headers(ts_ms: int, signed: str) -> dict:
-    return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": str(ts_ms),
-        "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
-        "X-BAPI-SIGN": signed,
-    }
-
-# 🔸 PnL fallback: Bybit REST /v5/position/closed-pnl (net = closedPnl - openFee - closeFee)
-async def _fetch_closed_pnl_from_bybit(
-    *,
-    symbol: str,
-    created_at: Optional[datetime],
-    closed_at: Optional[datetime],
-) -> Optional[Decimal]:
-    # условия достаточности
-    if not (BYBIT_API_KEY and BYBIT_API_SECRET and symbol):
-        return None
-
-    now_ms = int(time.time() * 1000)
-    ca_ms = int(created_at.timestamp() * 1000) if created_at else (now_ms - 2 * 60 * 60 * 1000)
-    cl_ms = int(closed_at.timestamp() * 1000) if closed_at else now_ms
-
-    # окно поиска вокруг сделки (буфер ±15 минут)
-    start_ms = max(0, ca_ms - 15 * 60 * 1000)
-    end_ms = cl_ms + 15 * 60 * 1000
-
-    query = f"category={BYBIT_CATEGORY}&symbol={symbol}&startTime={start_ms}&endTime={end_ms}&limit=50"
-    url = f"{BYBIT_BASE_URL}/v5/position/closed-pnl?{query}"
-
-    ts = int(time.time() * 1000)
-    sign = _bybit_rest_sign(ts, query)
-    headers = _bybit_private_headers(ts, sign)
-
-    try:
-        async with httpx_async_client(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-            r.raise_for_status()
-            j = r.json()
-    except Exception:
-        log.exception("TG PnL fallback failed: closed-pnl request (symbol=%s)", symbol)
-        return None
-
-    lst = (((j.get("result") or {}).get("list")) or [])
-    if not lst:
-        return None
-
-    # берём самый свежий в окне (по updatedTime, если есть)
-    best = None
-    best_ts = -1
-    for it in lst:
-        try:
-            uts = int(it.get("updatedTime") or it.get("createdTime") or 0)
-        except Exception:
-            uts = 0
-        if uts >= best_ts:
-            best_ts = uts
-            best = it
-
-    if not best:
-        return None
-
-    try:
-        closed_pnl = _as_decimal(best.get("closedPnl"))
-        if closed_pnl is None:
-            return None
-        open_fee = _as_decimal(best.get("openFee")) or Decimal("0")
-        close_fee = _as_decimal(best.get("closeFee")) or Decimal("0")
-        return closed_pnl - open_fee - close_fee
-    except Exception:
-        return None
 
 # 🔸 ACK helper
 async def _ack_ok(entry_id: str):
@@ -718,8 +531,6 @@ def build_closed_message(
         f"{header}",
         "",
         f"{arrow} {side} on <b>{symbol}</b>",
-        "",
-        f"💵 PnL: <b>{_fmt_signed(pnl)}</b>",
         "",
         held_line,
         "",
