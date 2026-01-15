@@ -15,6 +15,7 @@ from trader_config import (
 from trader_position_opener import run_trader_position_opener
 from trader_position_closer import run_trader_position_closer
 from trader_position_protector import run_trader_position_protector
+from trader_tg_notifier import run_trader_tg_notifier
 
 from bybit_sync import run_bybit_private_ws_sync_loop, run_bybit_rest_resync_job
 from bybit_proxy import init_bybit_proxy
@@ -44,6 +45,7 @@ BYBIT_CLOSER_START_DELAY_SEC = 45.0
 BYBIT_PROTECT_START_DELAY_SEC = 45.0
 POS_PROTECTOR_START_DELAY_SEC = 45.0
 BYBIT_TRAILER_START_DELAY_SEC = 45.0
+TG_NOTIFIER_START_DELAY_SEC = 60.0
 
 # 🔸 Обёртка с автоперезапуском для воркеров
 async def run_safe_loop(coro_factory, label: str):
@@ -190,6 +192,12 @@ async def main():
             "BYBIT_RESYNC",
             start_delay=BYBIT_RESYNC_START_DELAY_SEC,
             interval=BYBIT_RESYNC_INTERVAL_SEC,
+        ),
+        # Telegram notifier: уведомления по audit-stream (open/close)
+        run_with_delay(
+            run_trader_tg_notifier,
+            "TRADER_TG_NOTIFIER",
+            start_delay=TG_NOTIFIER_START_DELAY_SEC,
         ),
     )
 
