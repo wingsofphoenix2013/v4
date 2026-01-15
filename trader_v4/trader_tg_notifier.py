@@ -722,7 +722,6 @@ def build_closed_message(
         f"💵 PnL: <b>{_fmt_signed(pnl)}</b>",
         "",
         held_line,
-        f"🔎 Cause: <code>{close_event}</code>",
         "",
         f"⏳ {_fmt_dt_utc(closed_at)}",
     ]
