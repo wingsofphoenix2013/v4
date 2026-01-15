@@ -49,23 +49,53 @@ DEDUP_TTL_SEC = int(os.getenv("TRADER_TG_DEDUP_TTL_SEC", "604800"))           # 
 
 # 🔸 Наборы заголовков (ротируются случайно)
 _OPEN_HEADERS = [
-    "🚀 Entry confirmed",
-    "🎯 New position opened",
-    "🧭 Position live",
-    "⚙️ Trade engaged",
-    "🥷 Silent entry",
+    "🚀 We’re in — fresh entry on the board",
+    "🎯 Button pressed. Position live.",
+    "🧭 New position deployed — let’s navigate",
+    "⚙️ Switch flipped — trade engaged",
+    "🥷 Silent entry — let’s hunt",
+    "🧠 Thesis locked — sending it",
+    "🧩 Setup aligned — taking the shot",
+    "🛰️ Signal pinged — we answered",
+    "🧯 Risk set, breathe in — execute",
+    "🪙 Coins on the table — let’s dance",
+    "🦾 Machine says go — we go",
+    "🧊 Calm entry — hot market",
+    "🧪 Test passed — now we trade",
+    "🧱 Brick placed — building position",
+    "🎮 New level unlocked — position entered",
 ]
 
 _WIN_HEADERS = [
-    "🟢 Closed in profit 💚",
-    "🟢 Winner secured 💰",
-    "🟢 Green close 😎",
+    "🟢 Profit secured — the market blinked first 😎",
+    "🟢 Winner winner, crypto dinner 🍽️",
+    "🟢 Green ink day — we got paid 💚",
+    "🟢 That exit slapped — bag secured 💰",
+    "🟢 Trend befriended, wallet defended 🛡️",
+    "🟢 Clean close — no drama, just numbers ✅",
+    "🟢 Took what we came for — out we go 🚪",
+    "🟢 Smooth landing — nice one ✈️",
+    "🟢 Cash register noise intensifies 🧾",
+    "🟢 Market donated — we accepted 🎁",
+    "🟢 Green is a nice color today 🎨",
+    "🟢 Another brick in the vault 🧱💰",
+    "🟢 Secured. Next. 🔁",
 ]
 
 _LOSS_HEADERS = [
-    "🔴 Closed with loss 🧊",
-    "🔴 Loss logged — next 🔁",
-    "🔴 Red close 📉",
+    "🔴 Ouch. Market said “nope.” Moving on. 🧊",
+    "🔴 Tuition paid to Mr. Market. Class dismissed. 📉",
+    "🔴 We took one on the chin — next one’s ours 👊",
+    "🔴 Red day, cool head. Reset and reload 🔁",
+    "🔴 Loss logged, ego intact. Back to the lab 🧪",
+    "🔴 Took the L — kept the plan ✅",
+    "🔴 Small cut, big lesson 🩹",
+    "🔴 Stop hit — discipline kept 🧭",
+    "🔴 Not our wave — paddle back 🏄",
+    "🔴 Market 1 — Us 0. Rematch soon 🥊",
+    "🔴 A scratch, not a scar 🗒️",
+    "🔴 Wrong door — we don’t live there 🚪",
+    "🔴 Data collected — onward 📚",
 ]
 
 _NEUTRAL_HEADERS = [
