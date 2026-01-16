@@ -3,7 +3,6 @@ import json
 import logging
 from decimal import Decimal
 from datetime import datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo
 from collections import defaultdict
 import re
 from markupsafe import Markup, escape
@@ -91,43 +90,38 @@ def highlight_amounts(text):
 
 templates.env.filters["highlight_amounts"] = highlight_amounts
 
-# 🔸 Временная зона и фильтрация по локальному времени (Киев)
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
+# 🔸 Временная зона и фильтрация по UTC (как в базе)
+UTC_TZ = timezone.utc
 
-def get_kyiv_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
+def get_utc_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
     """
-    Возвращает границы суток по Киеву в naive-UTC формате (для SQL через asyncpg).
-    days_ago = 0 → сегодня, 1 → вчера и т.д.
+    Возвращает границы суток по UTC в naive-UTC формате (для SQL через asyncpg).
+    days_ago = 0 → сегодня (UTC), 1 → вчера (UTC) и т.д.
     """
-    # Получаем "текущий момент" по UTC и преобразуем в Киев
-    now_kyiv = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
-    target_day = now_kyiv.date() - timedelta(days=days_ago)
+    now_utc = datetime.now(UTC_TZ)
+    target_day = now_utc.date() - timedelta(days=days_ago)
 
-    # Создаём границы дня в Киевском времени
-    start_kyiv = datetime.combine(target_day, time.min).replace(tzinfo=KYIV_TZ)
-    end_kyiv = datetime.combine(target_day, time.max).replace(tzinfo=KYIV_TZ)
+    start_utc = datetime.combine(target_day, time.min).replace(tzinfo=UTC_TZ)
+    end_utc = datetime.combine(target_day, time.max).replace(tzinfo=UTC_TZ)
 
-    # Преобразуем в UTC и убираем tzinfo (для SQL)
     return (
-        start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
-        end_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        start_utc.replace(tzinfo=None),
+        end_utc.replace(tzinfo=None)
     )
 
-def get_kyiv_range_backwards(days: int) -> tuple[datetime, datetime]:
+def get_utc_range_backwards(days: int) -> tuple[datetime, datetime]:
     """
-    Возвращает диапазон последних N суток по Киеву в naive-UTC формате (для SQL).
+    Возвращает диапазон последних N суток по UTC в naive-UTC формате (для SQL через asyncpg).
     """
-    # Получаем "текущий момент" по UTC и переводим в Киев
-    now_kyiv = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
-    end_kyiv = now_kyiv
+    now_utc = datetime.now(UTC_TZ)
+    end_utc = now_utc
 
-    # Начало диапазона: (N дней назад, в 00:00:00 по Киеву)
-    start_day = (now_kyiv - timedelta(days=days)).date()
-    start_kyiv = datetime.combine(start_day, time.min).replace(tzinfo=KYIV_TZ)
+    start_day = (now_utc - timedelta(days=days)).date()
+    start_utc = datetime.combine(start_day, time.min).replace(tzinfo=UTC_TZ)
 
     return (
-        start_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
-        end_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        start_utc.replace(tzinfo=None),
+        end_utc.replace(tzinfo=None)
     )
 
 # 🔸 Инициализация пула при запуске приложения

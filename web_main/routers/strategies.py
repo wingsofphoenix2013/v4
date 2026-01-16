@@ -1,4 +1,4 @@
-# 🔸 Маршруты стратегий (strategies)
+# strategies.py — Маршруты стратегий и казначейства (UTC без локальных преобразований)
 
 import logging
 import json
@@ -9,10 +9,7 @@ from fastapi.templating import Jinja2Templates
 from starlette import status
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from pydantic import BaseModel, condecimal
-
-from main import KYIV_TZ
 
 # 🔸 Инициализация
 router = APIRouter()
@@ -331,11 +328,8 @@ async def strategy_details(
             WHERE strategy_id = $1
         """, strategy["id"])
 
-        # 🔹 Конвертация времени в Europe/Kyiv
+        # время отдаём как в базе (UTC)
         trades = [dict(row) for row in trades]
-        for row in trades:
-            row["created_at"] = row["created_at"].replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
-            row["closed_at"] = row["closed_at"].replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ)
 
     return templates.TemplateResponse("strategy_details.html", {
         "request": request,

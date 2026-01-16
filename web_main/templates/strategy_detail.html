@@ -251,7 +251,9 @@
           {{ p.close_reason if p.close_reason else "открыта" }}
         </td>
         <td class="py-2 text-center">
-{% set duration = (now - p.created_at).total_seconds() | int %}
+{% set now_ts = now.replace(tzinfo=None) %}
+{% set created_ts = p.created_at.replace(tzinfo=None) %}
+{% set duration = (now_ts - created_ts).total_seconds() | int %}
 {% set hours = duration // 3600 %}
 {% set minutes = (duration % 3600) // 60 %}
 {{ hours }} ч {{ minutes }} мин

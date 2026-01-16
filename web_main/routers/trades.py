@@ -1,4 +1,4 @@
-# 🔸 Маршруты торгов
+# trades.py — Маршруты торгов и статистики по стратегиям (UTC без локальных преобразований)
 
 import logging
 from fastapi import APIRouter, Request, HTTPException
@@ -6,11 +6,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from collections import defaultdict
 from decimal import Decimal
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 from starlette.status import HTTP_303_SEE_OTHER
 
-from main import KYIV_TZ, get_kyiv_day_bounds, get_kyiv_range_backwards
+from main import get_utc_day_bounds, get_utc_range_backwards
 
 router = APIRouter()
 log = logging.getLogger("TRADES")
@@ -68,7 +67,7 @@ async def get_trading_summary(filter: str) -> list[dict]:
             ORDER BY id
         """)
 
-        # Диапазон по фильтру
+        # Диапазон по фильтру (UTC как в базе)
         if filter == "3h":
             end = datetime.utcnow()
             start = end - timedelta(hours=3)
@@ -76,15 +75,11 @@ async def get_trading_summary(filter: str) -> list[dict]:
             end = datetime.utcnow()
             start = end - timedelta(hours=24)
         elif filter == "yesterday":
-            start, end = get_kyiv_day_bounds(1)
+            start, end = get_utc_day_bounds(1)
         elif filter == "7days":
-            start, end = get_kyiv_range_backwards(7)
+            start, end = get_utc_range_backwards(7)
         else:
             start, end = None, None
-
-        if start and end:
-            start = start.replace(tzinfo=None)
-            end = end.replace(tzinfo=None)
 
         result = []
         for strat in strategies:
@@ -174,7 +169,7 @@ async def strategy_detail_page(
         open_positions = [
             {
                 **dict(p),
-                "created_at": p["created_at"].astimezone(KYIV_TZ) if p["created_at"] else None
+                "created_at": p["created_at"] if p["created_at"] else None
             }
             for p in open_positions_raw
         ]
@@ -217,8 +212,8 @@ async def strategy_detail_page(
         closed_positions = [
             {
                 **dict(p),
-                "created_at": p["created_at"].astimezone(KYIV_TZ) if p["created_at"] else None,
-                "closed_at": p["closed_at"].astimezone(KYIV_TZ) if p["closed_at"] else None,
+                "created_at": p["created_at"] if p["created_at"] else None,
+                "closed_at": p["closed_at"] if p["closed_at"] else None,
             }
             for p in closed_positions_raw
         ]
@@ -242,7 +237,7 @@ async def strategy_detail_page(
         })
 
         for i in range(days):
-            day_start, day_end = get_kyiv_day_bounds(i)
+            day_start, day_end = get_utc_day_bounds(i)
             rows = await conn.fetch("""
                 SELECT pnl
                 FROM positions_v4
@@ -250,7 +245,7 @@ async def strategy_detail_page(
                   AND closed_at BETWEEN $2 AND $3
             """, strategy_id, day_start, day_end)
 
-            date_key = day_start.replace(tzinfo=ZoneInfo("UTC")).astimezone(KYIV_TZ).strftime('%Y-%m-%d')
+            date_key = day_start.strftime("%Y-%m-%d")
             for row in rows:
                 pnl = row["pnl"]
                 daily_stats[date_key]["count"] += 1
@@ -271,20 +266,11 @@ async def strategy_detail_page(
         roi = (total_stats["pnl"] / deposit * 100) if deposit else None
 
         stat_dates = [
-            get_kyiv_day_bounds(i)[0]
-                .replace(tzinfo=ZoneInfo("UTC"))
-                .astimezone(KYIV_TZ)
-                .strftime('%Y-%m-%d')
+            get_utc_day_bounds(i)[0].strftime("%Y-%m-%d")
             for i in reversed(range(days))
         ]
         today_key = stat_dates[-1]
-        now = datetime.now(KYIV_TZ)
-
-        # 🔍 Отладочный лог
-        log.debug(f"[STATS] Сегодня: {get_kyiv_day_bounds(0)[0].replace(tzinfo=ZoneInfo('UTC')).astimezone(KYIV_TZ).strftime('%Y-%m-%d')}")
-        log.debug(f"[STATS] Список дат: {stat_dates}")
-        log.debug(f"[TIME] now() = {datetime.now()}")
-        log.debug(f"[TIME] now(KYIV) = {datetime.now(KYIV_TZ)}")
+        now = datetime.utcnow()
 
     return templates.TemplateResponse("strategy_detail.html", {
         "request": request,
