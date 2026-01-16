@@ -1,4 +1,4 @@
-# trader_informer.py — воркер мгновенных уведомлений о жизненных событиях позиций (opened v2 + выборочная публикация v1.4)
+# trader_informer.py — воркер мгновенных уведомлений о жизненных событиях позиций (opened v2 + выборочная публикация v1.4) + bootstrap кэша из БД после рестарта
 
 # 🔸 Импорты
 import asyncio
@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from dataclasses import dataclass
-from typing import Optional, Dict, Set, Any, List
+from typing import Optional, Dict, Set, Any, List, Iterable
 
 from infra import infra
 from config_loader import config
@@ -148,6 +148,91 @@ def _message_for_event(event: str, tp_level: Optional[int] = None) -> str:
     if event == "closed.sl_protect_stop":
         return "closed by sl-protect"
     return "position event"
+
+def _init_watchlist_from_config() -> Set[int]:
+    return {sid for sid, s in (config.strategies or {}).items() if s.get("trader_winner", False)}
+
+# 🔸 BOOTSTRAP: восстановление кэша позиций из БД после рестарта
+async def bootstrap_pos_cache_from_db(strategy_ids: Optional[Set[int]] = None) -> None:
+    # грузим позиции open/partial из positions_v4 и заполняем _pos_cache
+    try:
+        if not infra.pg_pool:
+            log.info("⚠️ BOOTSTRAP: pg_pool не инициализирован — пропуск")
+            return
+
+        # собираем условия фильтра по strategy_id (если передано)
+        ids: Optional[List[int]] = None
+        if strategy_ids is not None:
+            ids = [int(x) for x in strategy_ids if x is not None]
+
+        if ids is not None and len(ids) == 0:
+            log.info("ℹ️ BOOTSTRAP: watchlist пуст — позиции не загружаются")
+            return
+
+        # запрос в БД
+        if ids is None:
+            rows = await infra.pg_pool.fetch(
+                """
+                SELECT position_uid, strategy_id, symbol, direction, entry_price, quantity, quantity_left
+                FROM positions_v4
+                WHERE status IN ('open', 'partial')
+                """
+            )
+        else:
+            rows = await infra.pg_pool.fetch(
+                """
+                SELECT position_uid, strategy_id, symbol, direction, entry_price, quantity, quantity_left
+                FROM positions_v4
+                WHERE status IN ('open', 'partial')
+                  AND strategy_id = ANY($1)
+                """,
+                ids,
+            )
+
+        loaded = 0
+        skipped = 0
+
+        for r in rows:
+            uid = str(r.get("position_uid") or "")
+            sid = r.get("strategy_id")
+            symbol = r.get("symbol")
+            direction = r.get("direction")
+
+            entry_price = _to_dec(r.get("entry_price"))
+            quantity = _to_dec(r.get("quantity"))
+            quantity_left = _to_dec(r.get("quantity_left")) or quantity
+
+            # условия достаточности
+            if not uid or not sid or not symbol or not direction:
+                skipped += 1
+                continue
+            if direction not in ("long", "short"):
+                skipped += 1
+                continue
+            if entry_price is None or quantity is None or quantity_left is None:
+                skipped += 1
+                continue
+
+            # не перетираем уже заполненное из opened/реестра
+            if uid in _pos_cache:
+                continue
+
+            _pos_cache[uid] = _PosSnap(
+                entry_price=entry_price,
+                quantity=quantity,
+                quantity_left=quantity_left,
+                direction=str(direction),
+                symbol=str(symbol),
+            )
+            loaded += 1
+
+        # суммарный лог результата
+        scope = "all_strategies" if ids is None else f"watch_strategies={len(ids)}"
+        log.info("🧩 BOOTSTRAP: pos_cache восстановлен (%s) — loaded=%d, skipped=%d, cache_size=%d",
+                 scope, loaded, skipped, len(_pos_cache))
+
+    except Exception:
+        log.exception("❌ BOOTSTRAP: ошибка при восстановлении pos_cache из БД")
 
 # 🔸 Запись события в БД (таблица trader_signals) — с сохранением stream_id
 async def _persist_signal(
@@ -597,10 +682,8 @@ async def _read_state_loop():
             log.exception("❌ Ошибка создания CG для %s", STRATEGY_STATE_STREAM)
             return
 
-    # один раз при старте — собрать и залогировать размер watchlist
-    global _watch_ids
-    _watch_ids = {sid for sid, s in (config.strategies or {}).items() if s.get("trader_winner", False)}
-    log.debug("🔎 TRADER_INFORMER: watchlist initialized — %d strategies", len(_watch_ids))
+    # один раз при старте — залогировать размер watchlist
+    log.info("🔎 TRADER_INFORMER: watchlist initialized — %d strategies", len(_watch_ids))
 
     while True:
         try:
@@ -619,15 +702,20 @@ async def _read_state_loop():
                     try:
                         if data.get("type") == "strategy" and data.get("action") == "applied":
                             # при каждом 'applied' пересобираем watchlist из config
-                            new_ids = {sid for sid, s in (config.strategies or {}).items() if s.get("trader_winner", False)}
+                            new_ids = _init_watchlist_from_config()
                             added = new_ids - _watch_ids
                             removed = _watch_ids - new_ids
 
                             if added:
-                                log.debug("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
-                            if removed:
-                                log.debug("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
+                                log.info("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
+                                # подтянуть открытые позиции для новых стратегий, чтобы не терять direction после applied
+                                await bootstrap_pos_cache_from_db(strategy_ids=added)
 
+                            if removed:
+                                log.info("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
+
+                            # обновляем watchlist
+                            global _watch_ids
                             _watch_ids = new_ids
 
                         await redis.xack(STRATEGY_STATE_STREAM, CG_STATE, record_id)
@@ -639,6 +727,14 @@ async def _read_state_loop():
 
 # 🔸 Публичная точка запуска воркера
 async def run_trader_informer():
+    # инициализация watchlist
+    global _watch_ids
+    _watch_ids = _init_watchlist_from_config()
+    log.info("📢 TRADER_INFORMER: старт — watchlist=%d", len(_watch_ids))
+
+    # bootstrap кэша позиций (после рестарта, до обработки UPDATE)
+    await bootstrap_pos_cache_from_db(strategy_ids=_watch_ids)
+
     log.debug("🚀 Запуск воркера TRADER_INFORMER → %s", STREAM_OUT)
     await asyncio.gather(
         _read_open_loop(),
