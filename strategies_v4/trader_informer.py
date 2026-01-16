@@ -671,6 +671,8 @@ async def _read_update_loop():
 
 # 🔸 Слежение за применёнными изменениями стратегий (Streams)
 async def _read_state_loop():
+    global _watch_ids
+
     redis = infra.redis_client
     try:
         await redis.xgroup_create(STRATEGY_STATE_STREAM, CG_STATE, id="$", mkstream=True)
@@ -708,14 +710,12 @@ async def _read_state_loop():
 
                             if added:
                                 log.info("✅ watchlist: added %s (total=%d)", sorted(added), len(new_ids))
-                                # подтянуть открытые позиции для новых стратегий, чтобы не терять direction после applied
+                                # подтянуть открытые позиции для новых стратегий
                                 await bootstrap_pos_cache_from_db(strategy_ids=added)
 
                             if removed:
                                 log.info("🗑️ watchlist: removed %s (total=%d)", sorted(removed), len(new_ids))
 
-                            # обновляем watchlist
-                            global _watch_ids
                             _watch_ids = new_ids
 
                         await redis.xack(STRATEGY_STATE_STREAM, CG_STATE, record_id)
