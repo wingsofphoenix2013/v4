@@ -33,6 +33,8 @@ from bt_analysis_main import run_bt_analysis_orchestrator
 from bt_analysis_preproc_v2 import run_bt_analysis_preproc_v2_orchestrator
 # 🔸 Оркестратор постпроцессинга v2 (финальный score)
 from bt_analysis_postproc_v2 import run_bt_analysis_postproc_v2_orchestrator
+# 🔸 Оркестратор stabproc v2 (consensus по укороченным окнам)
+from bt_analysis_stabproc_v2 import run_bt_analysis_stabproc_v2_orchestrator
 
 # 🔸 Таймфреймы, которые используем в backtester_v1 для индикаторов/сигналов
 BT_TIMEFRAMES = ["m5", "m15", "h1"]
@@ -84,6 +86,7 @@ async def main():
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
         run_safe_loop(lambda: run_bt_analysis_preproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_PREPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_postproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_POSTPROC_V2"),
+        run_safe_loop(lambda: run_bt_analysis_stabproc_v2_orchestrator(pg, redis), "BT_ANALYSIS_STABPROC_V2"),
     )
 
 
