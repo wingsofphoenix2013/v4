@@ -1,4 +1,4 @@
-# bt_signals_lr_universal_level2.py — stream-backfill воркер уровня 2: создаёт собственный run, формирует membership по good bins (v2)
+# bt_signals_lr_universal_level2.py — stream-backfill воркер уровня 2: создаёт собственный run, формирует membership по good bins (v2), опционально учитывает consensus=true
 
 import asyncio
 import logging
@@ -47,6 +47,7 @@ log = logging.getLogger("BT_SIG_LR_UNI_L2")
 
 # 🔸 Стримы
 BT_POSTPROC_READY_STREAM_V2 = "bt:analysis:postproc_ready_v2"
+BT_STABPROC_READY_STREAM_V2 = "bt:analysis:stabproc_ready_v2"
 BT_SIGNALS_READY_STREAM_V2 = "bt:signals:ready_v2"
 
 # 🔸 Таблицы
@@ -59,7 +60,7 @@ BT_RUNS_TABLE = "bt_signal_backfill_runs"
 SYMBOL_MAX_CONCURRENCY = 5
 
 
-# 🔸 Парсер сообщения bt:analysis:postproc_ready_v2
+# 🔸 Парсер сообщения bt:analysis:postproc_ready_v2 / bt:analysis:stabproc_ready_v2
 def _parse_postproc_ready_v2(fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         scenario_id = int(str(fields.get("scenario_id") or "").strip())
@@ -153,7 +154,7 @@ async def _finish_run(pg, run_id: int, status: str, error: Optional[str]) -> Non
         )
 
 
-# 🔸 Загрузка whitelist good bins из bt_analysis_bins_labels_v2 (строго по parent_run_id)
+# 🔸 Загрузка whitelist good bins из bt_analysis_bins_labels_v2 (строго по parent_run_id), опционально consensus=true
 async def _load_good_bins_v2(
     pg,
     parent_run_id: int,
@@ -163,22 +164,27 @@ async def _load_good_bins_v2(
     score_version: str,
     analysis_id: int,
     winner_param: str,
+    use_consensus: bool,
 ) -> Set[str]:
     async with pg.acquire() as conn:
+        # условия достаточности
+        consensus_clause = "AND consensus = true" if use_consensus else ""
+
         # если winner_param задан — считаем, что это indicator_param
         if winner_param:
             rows = await conn.fetch(
                 f"""
                 SELECT bin_name
                 FROM {BT_LABELS_V2_TABLE}
-                WHERE run_id       = $1
-                  AND scenario_id  = $2
-                  AND signal_id    = $3
-                  AND direction    = $4
-                  AND score_version= $5
-                  AND analysis_id  = $6
+                WHERE run_id        = $1
+                  AND scenario_id   = $2
+                  AND signal_id     = $3
+                  AND direction     = $4
+                  AND score_version = $5
+                  AND analysis_id   = $6
                   AND indicator_param = $7
-                  AND state        = 'good'
+                  AND state         = 'good'
+                  {consensus_clause}
                 """,
                 int(parent_run_id),
                 int(scenario_id),
@@ -193,14 +199,15 @@ async def _load_good_bins_v2(
                 f"""
                 SELECT bin_name
                 FROM {BT_LABELS_V2_TABLE}
-                WHERE run_id       = $1
-                  AND scenario_id  = $2
-                  AND signal_id    = $3
-                  AND direction    = $4
-                  AND score_version= $5
-                  AND analysis_id  = $6
+                WHERE run_id        = $1
+                  AND scenario_id   = $2
+                  AND signal_id     = $3
+                  AND direction     = $4
+                  AND score_version = $5
+                  AND analysis_id   = $6
                   AND indicator_param IS NULL
-                  AND state        = 'good'
+                  AND state         = 'good'
+                  {consensus_clause}
                 """,
                 int(parent_run_id),
                 int(scenario_id),
@@ -397,6 +404,7 @@ async def _insert_membership(pg, rows: List[Tuple[Any, ...]]) -> int:
 
     return len(inserted_rows)
 
+
 # 🔸 Публичная точка входа: stream-backfill сигнал уровня 2
 async def run_lr_universal_level2_stream_backfill(
     signal: Dict[str, Any],
@@ -414,12 +422,20 @@ async def run_lr_universal_level2_stream_backfill(
     if signal_id <= 0 or timeframe != "m5":
         return
 
-    # сообщение должно приходить из bt:analysis:postproc_ready_v2
+    # stream_key берём из params (как и в bt_signals_main)
+    stream_key_cfg = params.get("backfill_stream_key") or params.get("stream_key")
+    configured_stream_key = str((stream_key_cfg or {}).get("value") or "").strip() or BT_POSTPROC_READY_STREAM_V2
+
+    # use_consensus (по умолчанию false)
+    use_cons_cfg = params.get("use_consensus")
+    use_consensus = str((use_cons_cfg or {}).get("value") or "").strip().lower() == "true"
+
+    # сообщение должно приходить из stream_key инстанса
     stream_key = str((msg_ctx or {}).get("stream_key") or "")
     fields = (msg_ctx or {}).get("fields") or {}
     origin_msg_id = str((msg_ctx or {}).get("msg_id") or "").strip()
 
-    if stream_key != BT_POSTPROC_READY_STREAM_V2:
+    if stream_key != configured_stream_key:
         return
     if not origin_msg_id:
         return
@@ -538,7 +554,7 @@ async def run_lr_universal_level2_stream_backfill(
         )
         return
 
-    # загружаем good bins (строго по parent_run_id)
+    # загружаем good bins (строго по parent_run_id), опционально consensus=true
     good_bins = await _load_good_bins_v2(
         pg=pg,
         parent_run_id=int(parent_run_id),
@@ -548,12 +564,13 @@ async def run_lr_universal_level2_stream_backfill(
         score_version=str(score_version),
         analysis_id=int(winner_analysis_id),
         winner_param=str(winner_param),
+        use_consensus=bool(use_consensus),
     )
 
     # условий достаточности
     if not good_bins:
         log.debug(
-            "BT_SIG_LR_UNI_L2: no good bins — skip (level2_signal_id=%s parent_signal_id=%s scenario_id=%s parent_run_id=%s winner=%s dir=%s score_version=%s winner_param='%s')",
+            "BT_SIG_LR_UNI_L2: no good bins — skip (level2_signal_id=%s parent_signal_id=%s scenario_id=%s parent_run_id=%s winner=%s dir=%s score_version=%s winner_param='%s' use_consensus=%s stream_key=%s)",
             signal_id,
             parent_signal_id,
             scenario_id,
@@ -562,6 +579,8 @@ async def run_lr_universal_level2_stream_backfill(
             direction,
             score_version,
             winner_param,
+            use_consensus,
+            configured_stream_key,
         )
         return
 
@@ -590,11 +609,13 @@ async def run_lr_universal_level2_stream_backfill(
         return
 
     log.debug(
-        "BT_SIG_LR_UNI_L2: start — level2_signal_id=%s name='%s' pipeline_mode=%s scenario_id=%s parent_signal_id=%s parent_run_id=%s "
+        "BT_SIG_LR_UNI_L2: start — level2_signal_id=%s name='%s' pipeline_mode=%s use_consensus=%s stream_key=%s scenario_id=%s parent_signal_id=%s parent_run_id=%s "
         "level2_run_id=%s winner_analysis_id=%s score_version=%s winner_param='%s' dir=%s plugin=%s window=[%s..%s] tickers=%s good_bins=%s origin_msg_id=%s",
         signal_id,
         name,
         pipeline_mode,
+        use_consensus,
+        configured_stream_key,
         scenario_id,
         parent_signal_id,
         parent_run_id,
@@ -652,16 +673,16 @@ async def run_lr_universal_level2_stream_backfill(
     status = "success"
     error_text: Optional[str] = None
 
+    candidates_total = 0
+    candidates_with_bin = 0
+    candidates_good = 0
+    membership_inserted = 0
+    skipped_no_data = 0
+    skipped_no_bin = 0
+    skipped_not_good = 0
+
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        candidates_total = 0
-        candidates_with_bin = 0
-        candidates_good = 0
-        membership_inserted = 0
-        skipped_no_data = 0
-        skipped_no_bin = 0
-        skipped_not_good = 0
 
         for res in results:
             if isinstance(res, Exception):
@@ -685,7 +706,7 @@ async def run_lr_universal_level2_stream_backfill(
             skipped_not_good += s_not_good
 
         log.debug(
-            "BT_SIG_LR_UNI_L2: done — level2_signal_id=%s level2_run_id=%s parent_signal_id=%s parent_run_id=%s scenario_id=%s dir=%s pipeline_mode=%s "
+            "BT_SIG_LR_UNI_L2: done — level2_signal_id=%s level2_run_id=%s parent_signal_id=%s parent_run_id=%s scenario_id=%s dir=%s pipeline_mode=%s use_consensus=%s stream_key=%s "
             "winner=%s score_version=%s winner_param='%s' plugin=%s good_bins=%s candidates=%s with_bin=%s good=%s membership_inserted=%s "
             "skipped_no_data=%s skipped_no_bin=%s skipped_not_good=%s",
             signal_id,
@@ -695,6 +716,8 @@ async def run_lr_universal_level2_stream_backfill(
             scenario_id,
             direction,
             pipeline_mode,
+            use_consensus,
+            configured_stream_key,
             winner_analysis_id,
             score_version,
             winner_param,
@@ -707,6 +730,22 @@ async def run_lr_universal_level2_stream_backfill(
             skipped_no_data,
             skipped_no_bin,
             skipped_not_good,
+        )
+
+        log.info(
+            "BT_SIG_LR_UNI_L2: run ready — level2_signal_id=%s level2_run_id=%s parent_run_id=%s scenario_id=%s dir=%s pipeline_mode=%s use_consensus=%s good_bins=%s "
+            "candidates=%s good=%s membership_inserted=%s",
+            signal_id,
+            level2_run_id,
+            parent_run_id,
+            scenario_id,
+            direction,
+            pipeline_mode,
+            use_consensus,
+            len(good_bins),
+            candidates_total,
+            candidates_good,
+            membership_inserted,
         )
 
     except Exception as e:
@@ -747,6 +786,8 @@ async def run_lr_universal_level2_stream_backfill(
                 "winner_analysis_id": str(int(winner_analysis_id)),
                 "score_version": str(score_version),
                 "winner_param": str(winner_param),
+                "use_consensus": "true" if use_consensus else "false",
+                "source_stream": str(configured_stream_key),
             },
         )
     except Exception as e:

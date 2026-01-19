@@ -1,4 +1,4 @@
-# bt_signals_lr_universal_live_v2.py — live-воркер LR universal bounce: RAW от indicator_stream + FILTER(1/2) от ind_pack_stream_ready (results_json), без ожиданий ind_pack KV
+# bt_signals_lr_universal_live_v2.py — live-воркер LR universal bounce: RAW от indicator_stream + FILTER(1/2) от ind_pack_stream_ready (results_json), с поддержкой consensus-кеша (без ожиданий ind_pack KV)
 
 # 🔸 Базовые импорты
 import asyncio
@@ -11,11 +11,18 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # 🔸 Кеши backtester_v1
 from backtester_config import get_indicator_instance, get_ticker_info
 
-# 🔸 Кеш v2 good-bins по mirror1/mirror2 (+ applied run_id)
+# 🔸 Кеш v2 good-bins по mirror1/mirror2 (+ applied run_id) — обычный (state='good')
 from bt_signals_cache_config_v2 import (
     get_mirror_label_cache_v2,
     get_mirror_run_id_v2,
     load_initial_mirror_caches_v2,
+)
+
+# 🔸 Кеш v2 good-bins по mirror1/mirror2 (+ applied run_id) — consensus (state='good' AND consensus=true)
+from bt_signals_cache_consensus_v2 import (
+    get_mirror_label_cache_consensus_v2,
+    get_mirror_run_id_consensus_v2,
+    load_initial_mirror_caches_consensus_v2,
 )
 
 log = logging.getLogger("BT_SIG_LR_UNI_LIVE_V2")
@@ -200,6 +207,7 @@ async def _upsert_live_log(
     st = str(rows[0]["status"] or "")
     return st == "signal_sent"
 
+
 # 🔸 Вставка live-сигнала в bt_signals_values (event-layer: event_key+event_params_hash), публикация в signals_stream только при новом insert
 async def _persist_live_signal(
     pg,
@@ -216,12 +224,10 @@ async def _persist_live_signal(
     signal_uuid = str(uuid.uuid4())
 
     # event-layer идентичность для live (чтобы не плодить дубликаты)
-    # key отражает режим (raw/filter) + направление базового детектора
     mode = str((raw_message or {}).get("mode") or "live_v2").strip().lower()
     event_key = f"lr_universal_live_{mode}_{timeframe}"
 
     # hash параметров детектора (стабильная часть) — используем поля из raw_message, если есть
-    # если чего-то нет, fallback на пустые значения (не упадём)
     trend_type = str((raw_message or {}).get("trend_type") or (raw_message or {}).get("trend") or "").strip().lower()
     zone_k = str((raw_message or {}).get("zone_k") or "")
     keep_half = str((raw_message or {}).get("keep_half") or "")
@@ -231,7 +237,6 @@ async def _persist_live_signal(
     mirror1 = (raw_message or {}).get("layers") or []
     mirrors_sig = ""
     try:
-        # очень короткая подпись: layer_count + first mirror pair ids (для различения конфигов)
         if isinstance(mirror1, list) and mirror1:
             ms = str(((mirror1[0] or {}).get("mirror") or {}).get("scenario_id") or "")
             si = str(((mirror1[0] or {}).get("mirror") or {}).get("signal_id") or "")
@@ -239,13 +244,11 @@ async def _persist_live_signal(
     except Exception:
         mirrors_sig = ""
 
-    # event_params_hash — стабильная подпись конфигурации live-детектора/фильтра
-    event_params_hash = f"trend={trend_type}|zone_k={zone_k}|keep_half={keep_half}|filter={filter_mode}|mirror={mirrors_sig}"
-    # укоротим до 32 (как принято), но без hashlib тоже ок — используем uuid namespace? сделаем sha1 для стабильности
     import hashlib
+
+    event_params_hash = f"trend={trend_type}|zone_k={zone_k}|keep_half={keep_half}|filter={filter_mode}|mirror={mirrors_sig}"
     event_params_hash = hashlib.sha1(event_params_hash.encode("utf-8")).hexdigest()[:16]
 
-    # payload_stable: всё важное кладём сюда (это и есть "raw_message")
     payload_stable_json = json.dumps(raw_message or {}, ensure_ascii=False)
 
     inserted = False
@@ -301,14 +304,20 @@ async def _persist_live_signal(
 
     return inserted
 
-# 🔸 Получение слоя фильтра из кеша v2 (mirror -> required_pairs/good_bins_map/run_id)
+
+# 🔸 Получение слоя фильтра из кеша v2 (mirror -> required_pairs/good_bins_map/run_id), с выбором cache_kind (обычный/consensus)
 def _build_filter_layer_from_cache(
     mirror_scenario_id: int,
     mirror_signal_id: int,
     direction: str,
+    use_consensus: bool,
 ) -> Optional[Dict[str, Any]]:
-    req, good_map = get_mirror_label_cache_v2(mirror_scenario_id, mirror_signal_id, direction)
-    run_id = get_mirror_run_id_v2(mirror_scenario_id, mirror_signal_id, direction)
+    if use_consensus:
+        req, good_map = get_mirror_label_cache_consensus_v2(mirror_scenario_id, mirror_signal_id, direction)
+        run_id = get_mirror_run_id_consensus_v2(mirror_scenario_id, mirror_signal_id, direction)
+    else:
+        req, good_map = get_mirror_label_cache_v2(mirror_scenario_id, mirror_signal_id, direction)
+        run_id = get_mirror_run_id_v2(mirror_scenario_id, mirror_signal_id, direction)
 
     # условия достаточности
     if not req or not good_map:
@@ -321,6 +330,7 @@ def _build_filter_layer_from_cache(
         "applied_run_id": int(run_id) if run_id is not None else None,
         "required_pairs": set(req),
         "good_bins_map": {k: set(v) for k, v in good_map.items()},
+        "use_consensus": bool(use_consensus),
     }
 
 
@@ -357,6 +367,7 @@ def _check_layer_by_pack_results(
     si = int(layer_cache["mirror_signal_id"])
     direction = str(layer_cache["direction"])
     applied_run_id = layer_cache.get("applied_run_id")
+    use_consensus = bool(layer_cache.get("use_consensus") or False)
 
     pair_key = f"{si}:{ms}"
     rec = results_by_pair.get(pair_key)
@@ -369,13 +380,13 @@ def _check_layer_by_pack_results(
             "pair_key": pair_key,
             "mirror": {"scenario_id": ms, "signal_id": si},
             "applied_run_id": applied_run_id,
+            "use_consensus": use_consensus,
         }
 
     ok = rec.get("ok")
     analysis_id = rec.get("analysis_id")
     run_id = rec.get("run_id")
 
-    # ok=false -> блокируем сразу
     if ok is not True:
         reason = rec.get("reason")
         return False, {
@@ -390,6 +401,7 @@ def _check_layer_by_pack_results(
                 "run_id": run_id,
             },
             "applied_run_id": applied_run_id,
+            "use_consensus": use_consensus,
         }
 
     bin_name = rec.get("bin_name")
@@ -401,11 +413,11 @@ def _check_layer_by_pack_results(
             "mirror": {"scenario_id": ms, "signal_id": si},
             "pack_result": {"ok": True, "analysis_id": analysis_id, "run_id": run_id},
             "applied_run_id": applied_run_id,
+            "use_consensus": use_consensus,
         }
 
     bn = str(bin_name).strip()
 
-    # good-hit: хотя бы одно совпадение по required_pairs
     required_pairs: Set[Tuple[int, str]] = set(layer_cache.get("required_pairs") or set())
     good_bins_map: Dict[Tuple[int, str], Set[str]] = layer_cache.get("good_bins_map") or {}
 
@@ -421,7 +433,6 @@ def _check_layer_by_pack_results(
         if aid_i is None or int(aid) == int(aid_i):
             candidate_pairs.append((int(aid), str(tf).strip().lower()))
 
-    # если required_pairs пустой или не сошёлся по времени/analysis_id — считаем, что good-hit невозможен
     if not candidate_pairs:
         return False, {
             "status": "blocked_no_labels_match",
@@ -431,6 +442,7 @@ def _check_layer_by_pack_results(
             "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
             "applied_run_id": applied_run_id,
             "required_pairs_total": len(required_pairs),
+            "use_consensus": use_consensus,
         }
 
     good_hit = False
@@ -454,6 +466,7 @@ def _check_layer_by_pack_results(
             "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
             "applied_run_id": applied_run_id,
             "checked_pairs": checked_pairs,
+            "use_consensus": use_consensus,
         }
 
     return True, {
@@ -464,6 +477,7 @@ def _check_layer_by_pack_results(
         "applied_run_id": applied_run_id,
         "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
         "checked_pairs": checked_pairs,
+        "use_consensus": use_consensus,
     }
 
 
@@ -485,6 +499,8 @@ async def init_lr_universal_live_v2(
     raw_cnt = 0
     filt1_cnt = 0
     filt2_cnt = 0
+    cons_cnt = 0
+    noncons_cnt = 0
 
     for s in signals:
         sid = int(s.get("id") or 0)
@@ -520,6 +536,10 @@ async def init_lr_universal_live_v2(
             message = str(msg_cfg.get("value") or "").strip()
         except Exception:
             raise RuntimeError(f"init_lr_universal_live_v2: signal_id={sid} missing/invalid param 'message'")
+
+        # use_consensus (опционально)
+        uc_cfg = params.get("use_consensus")
+        use_consensus = str((uc_cfg or {}).get("value") or "").strip().lower() == "true"
 
         # bounce params
         trend_cfg = params.get("trend_type")
@@ -580,6 +600,12 @@ async def init_lr_universal_live_v2(
         else:
             raw_cnt += 1
 
+        if filter_mode != "raw":
+            if use_consensus:
+                cons_cnt += 1
+            else:
+                noncons_cnt += 1
+
         cfgs.append(
             {
                 "signal_id": sid,
@@ -593,6 +619,7 @@ async def init_lr_universal_live_v2(
                 "filter_mode": filter_mode,
                 "mirror1": {"scenario_id": m1_sc, "signal_id": m1_si} if has_layer1 else None,
                 "mirror2": {"scenario_id": m2_sc, "signal_id": m2_si} if has_layer2 else None,
+                "use_consensus": bool(use_consensus),
             }
         )
 
@@ -617,7 +644,12 @@ async def init_lr_universal_live_v2(
 
     # initial load caches только если поток фильтров
     if stream_key == IND_PACK_READY_STREAM_KEY:
-        await load_initial_mirror_caches_v2(pg)
+        # если в группе есть filter-инстансы без consensus — грузим обычный кеш
+        if noncons_cnt > 0:
+            await load_initial_mirror_caches_v2(pg)
+        # если есть filter-инстансы с consensus — грузим consensus кеш
+        if cons_cnt > 0:
+            await load_initial_mirror_caches_consensus_v2(pg)
 
     # indicator naming: base = f"{indicator}{length}" (как в indicators_v4)
     ind_inst = get_indicator_instance(int(lr_instance_id))
@@ -646,7 +678,7 @@ async def init_lr_universal_live_v2(
         raise RuntimeError(f"init_lr_universal_live_v2: unknown timeframe step for tf={timeframe}")
 
     log.debug(
-        "BT_SIG_LR_UNI_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, lr_instance_id=%s, indicator_base=%s",
+        "BT_SIG_LR_UNI_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, lr_instance_id=%s, indicator_base=%s, consensus_filters=%s, nonconsensus_filters=%s",
         stream_key,
         len(cfgs),
         raw_cnt,
@@ -655,6 +687,8 @@ async def init_lr_universal_live_v2(
         timeframe,
         lr_instance_id,
         indicator_base,
+        cons_cnt,
+        noncons_cnt,
     )
 
     return {
@@ -686,7 +720,6 @@ async def handle_lr_universal_indicator_ready_v2(
     pg,
     redis,
 ) -> List[Dict[str, Any]]:
-    # live dispatcher ожидает список, но мы пишем всё сами (в БД и signals_stream), поэтому возвращаем []
     ctx["counters"]["messages_total"] = int(ctx["counters"].get("messages_total", 0)) + 1
 
     stream_key = str(ctx.get("stream_key") or "").strip()
@@ -738,7 +771,7 @@ async def _handle_indicator_ready_message(
     prev_time = open_time - step_delta
     decision_time = open_time + step_delta
 
-    # stale: если событие слишком старое относительно decision_time
+    # stale
     now_utc = datetime.utcnow().replace(tzinfo=None)
     if (now_utc - decision_time).total_seconds() > FILTER_STALE_MAX_SEC:
         ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
@@ -807,7 +840,7 @@ async def _handle_indicator_ready_message(
     if center_curr is None:
         missing.append("center_curr")
 
-    # precision цены для logs/details
+    # precision цены
     ticker_info = get_ticker_info(symbol) or {}
     try:
         precision_price = int(ticker_info.get("precision_price") or 8)
@@ -842,7 +875,6 @@ async def _handle_indicator_ready_message(
     if missing:
         details = {**base_details, "result": {"passed": False, "status": "data_missing", "missing": missing}}
         for scfg in ctx.get("signals") or []:
-            # raw-only: если сюда попал filter инстанс, игнорируем
             if str(scfg.get("filter_mode") or "") != "raw":
                 continue
             await _upsert_live_log(
@@ -1002,7 +1034,7 @@ async def _handle_pack_ready_message(
     prev_time = open_time - step_delta
     decision_time = open_time + step_delta
 
-    # stale: если событие слишком старое относительно decision_time
+    # stale
     now_utc = datetime.utcnow().replace(tzinfo=None)
     if (now_utc - decision_time).total_seconds() > FILTER_STALE_MAX_SEC:
         ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
@@ -1089,7 +1121,6 @@ async def _handle_pack_ready_message(
     if center_curr is None:
         missing.append("center_curr")
 
-    # precision цены для logs/details
     ticker_info = get_ticker_info(symbol) or {}
     try:
         precision_price = int(ticker_info.get("precision_price") or 8)
@@ -1123,7 +1154,6 @@ async def _handle_pack_ready_message(
     if missing:
         details = {**base_details, "result": {"passed": False, "status": "data_missing", "missing": missing}}
         for scfg in ctx.get("signals") or []:
-            # filter-only: если сюда попал raw инстанс, игнорируем
             if str(scfg.get("filter_mode") or "") == "raw":
                 continue
             await _upsert_live_log(
@@ -1161,6 +1191,8 @@ async def _handle_pack_ready_message(
         filter_mode = str(scfg.get("filter_mode") or "raw")
         if filter_mode not in ("filter1", "filter2"):
             continue
+
+        use_consensus = bool(scfg.get("use_consensus") or False)
 
         signal_id = int(scfg["signal_id"])
         direction = str(scfg["direction"])
@@ -1204,6 +1236,7 @@ async def _handle_pack_ready_message(
                         "zone_k": zone_k,
                         "keep_half": keep_half,
                         "filter_mode": filter_mode,
+                        "use_consensus": use_consensus,
                         "mirror1": mirror1,
                         "mirror2": mirror2 if filter_mode == "filter2" else None,
                     },
@@ -1226,7 +1259,7 @@ async def _handle_pack_ready_message(
                     open_time=open_time,
                     decision_time=decision_time,
                     status="blocked_no_cache",
-                    details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror1"}},
+                    details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode, "use_consensus": use_consensus}, "filter": {"reason": "missing_mirror1"}},
                 )
                 continue
 
@@ -1242,7 +1275,7 @@ async def _handle_pack_ready_message(
                     open_time=open_time,
                     decision_time=decision_time,
                     status="blocked_no_cache",
-                    details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror2"}},
+                    details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode, "use_consensus": use_consensus}, "filter": {"reason": "missing_mirror2"}},
                 )
                 continue
 
@@ -1254,11 +1287,15 @@ async def _handle_pack_ready_message(
             ms = int(layer["scenario_id"])
             si = int(layer["signal_id"])
 
-            cache_layer = _build_filter_layer_from_cache(ms, si, direction)
+            cache_layer = _build_filter_layer_from_cache(ms, si, direction, use_consensus=use_consensus)
             if cache_layer is None:
                 # пробуем освежить кеши (watcher может ещё не успел)
-                await load_initial_mirror_caches_v2(pg)
-                cache_layer = _build_filter_layer_from_cache(ms, si, direction)
+                if use_consensus:
+                    await load_initial_mirror_caches_consensus_v2(pg)
+                else:
+                    await load_initial_mirror_caches_v2(pg)
+
+                cache_layer = _build_filter_layer_from_cache(ms, si, direction, use_consensus=use_consensus)
 
             if cache_layer is None:
                 await _upsert_live_log(
@@ -1271,7 +1308,7 @@ async def _handle_pack_ready_message(
                     status="blocked_no_cache",
                     details={
                         **base_details,
-                        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
+                        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode, "use_consensus": use_consensus},
                         "filter": {"layer": layer_no, "reason": "mirror_cache_missing", "mirror": {"scenario_id": ms, "signal_id": si}},
                     },
                 )
@@ -1292,7 +1329,7 @@ async def _handle_pack_ready_message(
                     status=str(info.get("status") or "blocked_no_labels_match"),
                     details={
                         **base_details,
-                        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
+                        "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode, "use_consensus": use_consensus},
                         "filter": {"layer": layer_no, "mirror": {"scenario_id": ms, "signal_id": si}, **info},
                     },
                 )
@@ -1309,6 +1346,7 @@ async def _handle_pack_ready_message(
                 "direction": direction,
                 "message": message,
                 "filter_mode": filter_mode,
+                "use_consensus": use_consensus,
                 "mirror1": mirror1,
                 "mirror2": mirror2 if filter_mode == "filter2" else None,
             },
@@ -1331,6 +1369,7 @@ async def _handle_pack_ready_message(
             "source": "backtester_v1",
             "mode": "live_filtered_v2",
             "filter_mode": filter_mode,
+            "use_consensus": use_consensus,
             "price": _round_price(float(close_curr), precision_price) if close_curr is not None else None,
             "trend_type": trend_type,
             "zone_k": zone_k,
@@ -1347,10 +1386,11 @@ async def _handle_pack_ready_message(
 
         ctx["counters"]["filtered_sent_total"] = int(ctx["counters"].get("filtered_sent_total", 0)) + 1
         log.debug(
-            "BT_SIG_LR_UNI_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s mode=%s",
+            "BT_SIG_LR_UNI_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s mode=%s use_consensus=%s",
             signal_id,
             symbol,
             direction,
             open_time.isoformat(),
             filter_mode,
+            use_consensus,
         )

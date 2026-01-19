@@ -19,8 +19,11 @@ from backtester_config import (
 
 # 🔸 Оркестратор псевдо-сигналов
 from bt_signals_main import run_bt_signals_orchestrator
+
 # 🔸 Управление загрузки в кеш таблицы labels (v2)
 from bt_signals_cache_config_v2 import run_bt_signals_cache_watcher_v2
+# 🔸 Управление загрузки в кеш таблицы labels (v2) по consensus=true
+from bt_signals_cache_consensus_v2 import run_bt_signals_cache_watcher_consensus_v2
 
 # 🔸 Оркестратор сценариев
 from bt_scenarios_main import run_bt_scenarios_orchestrator
@@ -81,6 +84,7 @@ async def main():
     await asyncio.gather(
         run_safe_loop(lambda: run_bt_signals_orchestrator(pg, redis), "BT_SIGNALS"),
         run_safe_loop(lambda: run_bt_signals_cache_watcher_v2(pg, redis), "BT_SIGNALS_CACHE_V2"),
+        run_safe_loop(lambda: run_bt_signals_cache_watcher_consensus_v2(pg, redis), "BT_SIGNALS_CACHE_CONSENSUS_V2"),
         run_safe_loop(lambda: run_bt_scenarios_orchestrator(pg, redis), "BT_SCENARIOS"),
         run_safe_loop(lambda: run_bt_scenarios_postproc_v2(pg, redis), "BT_SCENARIOS_POSTPROC_V2"),
         run_safe_loop(lambda: run_bt_analysis_orchestrator(pg, redis), "BT_ANALYSIS"),
