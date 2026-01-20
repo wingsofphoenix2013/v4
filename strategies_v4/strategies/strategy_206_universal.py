@@ -1,14 +1,14 @@
-# strategy_205_universal.py — простая транзитная стратегия: без LAB, без фильтра направления
+# strategy_206_universal.py — простая транзитная стратегия: без LAB, без фильтра направления
 
 # 🔸 Импорты
 import logging
 import json
 
 # 🔸 Логгер
-log = logging.getLogger("strategy_205_universal")
+log = logging.getLogger("strategy_206_universal")
 
 # 🔸 Класс стратегии
-class Strategy205Universal:
+class Strategy206Universal:
     # 🔸 Валидация сигнала (транзитная: принимает любые направления)
     async def validate_signal(self, signal, context):
         # лог результата на уровне info
