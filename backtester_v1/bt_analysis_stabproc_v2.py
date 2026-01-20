@@ -1,4 +1,4 @@
-# bt_analysis_stabproc_v2.py — stabproc v2: проверка "good" биннов победителя на укороченных окнах (50% и 25%) и выставление consensus (run-aware)
+# bt_analysis_stabproc_v2.py — stabproc v2: проверка "good" биннов победителя на укороченных окнах (50% и 25%) и выставление consensus + quart_consensus (run-aware)
 
 import asyncio
 import logging
@@ -60,9 +60,13 @@ async def run_bt_analysis_stabproc_v2_orchestrator(pg, redis) -> None:
 
             total_msgs = 0
             total_pairs = 0
+
             total_rows = 0
-            total_true = 0
-            total_false = 0
+            total_cons_true = 0
+            total_cons_false = 0
+            total_q_true = 0
+            total_q_false = 0
+
             total_skipped = 0
             total_errors = 0
 
@@ -129,14 +133,16 @@ async def run_bt_analysis_stabproc_v2_orchestrator(pg, redis) -> None:
                         await redis.xack(STABPROC_STREAM_KEY, STABPROC_CONSUMER_GROUP, entry_id)
                         continue
 
-                    # группируем по (analysis_id, indicator_param, timeframe, direction)
+                    # 🔸 Группировка winner-биннов по (analysis_id, indicator_param, timeframe, direction)
                     groups = _group_winner_bins(winner_bins)
 
                     rows_updated = 0
-                    rows_true = 0
-                    rows_false = 0
+                    cons_true = 0
+                    cons_false = 0
+                    q_true = 0
+                    q_false = 0
 
-                    for gkey, g in groups.items():
+                    for _, g in groups.items():
                         analysis_id = g["analysis_id"]
                         indicator_param = g["indicator_param"]
                         timeframe = g["timeframe"]
@@ -144,7 +150,7 @@ async def run_bt_analysis_stabproc_v2_orchestrator(pg, redis) -> None:
                         bin_names = g["bin_names"]
                         threshold_by_bin = g["threshold_by_bin"]
 
-                        # статистика по биннам на 50% и 25% окнах
+                        # 🔸 Статистика по биннам на 50% и 25% окнах
                         stats_50 = await _load_bin_stats_in_window(
                             pg=pg,
                             run_id=run_id,
@@ -171,15 +177,21 @@ async def run_bt_analysis_stabproc_v2_orchestrator(pg, redis) -> None:
                             w_to=run_to,
                         )
 
-                        # выставляем consensus по каждому бину
+                        # 🔸 Выставляем consensus/quart_consensus по каждому бину
                         updates: List[Tuple[Any, ...]] = []
+
                         for bn in bin_names:
                             threshold_used = threshold_by_bin.get(bn, Decimal("0"))
 
                             t50, wr50 = stats_50.get(bn, (0, Decimal("0")))
                             t25, wr25 = stats_25.get(bn, (0, Decimal("0")))
 
-                            # trades=0 => consensus=false
+                            # trades=0 => false (по договорённости)
+                            if t25 <= 0:
+                                quart_consensus = False
+                            else:
+                                quart_consensus = (wr25 >= threshold_used)
+
                             if t50 <= 0 or t25 <= 0:
                                 consensus = False
                             else:
@@ -188,31 +200,37 @@ async def run_bt_analysis_stabproc_v2_orchestrator(pg, redis) -> None:
                             updates.append(
                                 (
                                     bool(consensus),
+                                    bool(quart_consensus),
                                     int(run_id),
                                     int(scenario_id),
                                     int(signal_id),
                                     str(direction),
                                     str(score_version),
                                     int(analysis_id),
-                                    indicator_param,          # nullable, используем IS NOT DISTINCT FROM
+                                    indicator_param,   # nullable
                                     str(timeframe),
                                     str(bn),
                                 )
                             )
 
                         # апдейтим пачкой
-                        ok, bad = await _update_consensus_batch(pg=pg, rows=updates)
-                        rows_updated += (ok + bad)
-                        rows_true += ok
-                        rows_false += bad
+                        c_ok, c_bad, q_ok, q_bad = await _update_consensus_batch(pg=pg, rows=updates)
+                        rows_updated += (c_ok + c_bad)  # одно и то же количество строк
+                        cons_true += c_ok
+                        cons_false += c_bad
+                        q_true += q_ok
+                        q_false += q_bad
 
                     total_rows += rows_updated
-                    total_true += rows_true
-                    total_false += rows_false
+                    total_cons_true += cons_true
+                    total_cons_false += cons_false
+                    total_q_true += q_true
+                    total_q_false += q_false
 
                     log.info(
                         "BT_ANALYSIS_STABPROC_V2: pair done — scenario_id=%s signal_id=%s run_id=%s score_version=%s "
-                        "run=[%s..%s], w50_from=%s, w25_from=%s, rows=%s, consensus_true=%s, consensus_false=%s, source_finished_at=%s",
+                        "run=[%s..%s], w50_from=%s, w25_from=%s, rows=%s, consensus_true=%s, consensus_false=%s, "
+                        "quart_true=%s, quart_false=%s, source_finished_at=%s",
                         scenario_id,
                         signal_id,
                         run_id,
@@ -222,22 +240,26 @@ async def run_bt_analysis_stabproc_v2_orchestrator(pg, redis) -> None:
                         w50_from,
                         w25_from,
                         rows_updated,
-                        rows_true,
-                        rows_false,
+                        cons_true,
+                        cons_false,
+                        q_true,
+                        q_false,
                         finished_at_postproc,
                     )
 
                     await _publish_stabproc_ready(redis=redis, ctx=ctx)
-
                     await redis.xack(STABPROC_STREAM_KEY, STABPROC_CONSUMER_GROUP, entry_id)
 
             log.info(
-                "BT_ANALYSIS_STABPROC_V2: batch summary — msgs=%s pairs=%s rows=%s consensus_true=%s consensus_false=%s skipped=%s errors=%s",
+                "BT_ANALYSIS_STABPROC_V2: batch summary — msgs=%s pairs=%s rows=%s "
+                "consensus_true=%s consensus_false=%s quart_true=%s quart_false=%s skipped=%s errors=%s",
                 total_msgs,
                 total_pairs,
                 total_rows,
-                total_true,
-                total_false,
+                total_cons_true,
+                total_cons_false,
+                total_q_true,
+                total_q_false,
                 total_skipped,
                 total_errors,
             )
@@ -268,18 +290,7 @@ async def _ensure_consumer_group(redis) -> None:
                 "BT_ANALYSIS_STABPROC_V2: consumer group '%s' уже существует — SETID '$' для игнора истории до старта",
                 STABPROC_CONSUMER_GROUP,
             )
-            await redis.execute_command(
-                "XGROUP",
-                "SETID",
-                STABPROC_STREAM_KEY,
-                STABPROC_CONSUMER_GROUP,
-                "$",
-            )
-            log.debug(
-                "BT_ANALYSIS_STABPROC_V2: consumer group '%s' SETID='$' выполнен для '%s'",
-                STABPROC_CONSUMER_GROUP,
-                STABPROC_STREAM_KEY,
-            )
+            await redis.execute_command("XGROUP", "SETID", STABPROC_STREAM_KEY, STABPROC_CONSUMER_GROUP, "$")
         else:
             log.error(
                 "BT_ANALYSIS_STABPROC_V2: ошибка при создании consumer group '%s': %s",
@@ -334,7 +345,7 @@ async def _read_from_stream(redis) -> List[Any]:
     return parsed
 
 
-# 🔸 Разбор сообщения bt:analysis:postproc_ready_v2 (сохраняем состав полей как есть)
+# 🔸 Разбор сообщения bt:analysis:postproc_ready_v2 (состав полей как есть)
 def _parse_postproc_ready(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
     try:
         scenario_id = int(fields.get("scenario_id") or 0)
@@ -346,7 +357,6 @@ def _parse_postproc_ready(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
         if scenario_id <= 0 or signal_id <= 0 or run_id <= 0 or not finished_at_str:
             return None
 
-        # поля ниже оставляем как строки (как в исходном сообщении)
         return {
             "scenario_id": scenario_id,
             "signal_id": signal_id,
@@ -366,17 +376,12 @@ def _parse_postproc_ready(fields: Dict[str, str]) -> Optional[Dict[str, Any]]:
 
 # 🔸 Расчёт двух sub-window (50% и 25%) "назад от run_to"
 def _calc_subwindows(run_from: datetime, run_to: datetime) -> Tuple[datetime, datetime]:
-    # длина окна в секундах
     total_sec = (run_to - run_from).total_seconds()
     if total_sec <= 0:
         return run_from, run_from
 
-    # 50% и 25% назад от run_to (свежесть)
-    w50_sec = total_sec * 0.50
-    w25_sec = total_sec * 0.25
-
-    w50_from = run_to - timedelta(seconds=w50_sec)
-    w25_from = run_to - timedelta(seconds=w25_sec)
+    w50_from = run_to - timedelta(seconds=(total_sec * 0.50))
+    w25_from = run_to - timedelta(seconds=(total_sec * 0.25))
 
     return w50_from, w25_from
 
@@ -444,7 +449,6 @@ async def _load_winner_bins(
                 "threshold_used": _d(r["threshold_used"]),
             }
         )
-
     return out
 
 
@@ -535,51 +539,55 @@ async def _load_bin_stats_in_window(
         bn = str(r["bin_name"])
         trades = int(r["trades"] or 0)
         wins = int(r["wins"] or 0)
-
-        if trades > 0:
-            winrate = (Decimal(wins) / Decimal(trades))
-        else:
-            winrate = Decimal("0")
-
+        winrate = (Decimal(wins) / Decimal(trades)) if trades > 0 else Decimal("0")
         out[bn] = (trades, winrate)
 
     return out
 
 
-# 🔸 Обновление consensus пачкой (executemany)
-async def _update_consensus_batch(pg, rows: List[Tuple[Any, ...]]) -> Tuple[int, int]:
+# 🔸 Обновление consensus/quart_consensus пачкой (executemany)
+async def _update_consensus_batch(pg, rows: List[Tuple[Any, ...]]) -> Tuple[int, int, int, int]:
     # условий достаточности
     if not rows:
-        return 0, 0
+        return 0, 0, 0, 0
 
     async with pg.acquire() as conn:
         await conn.executemany(
             f"""
             UPDATE {LABELS_V2_TABLE}
             SET consensus = $1,
+                quart_consensus = $2,
                 updated_at = now()
-            WHERE run_id = $2
-              AND scenario_id = $3
-              AND signal_id = $4
-              AND direction = $5
-              AND score_version = $6
-              AND analysis_id = $7
-              AND indicator_param IS NOT DISTINCT FROM $8
-              AND timeframe = $9
-              AND bin_name = $10
+            WHERE run_id = $3
+              AND scenario_id = $4
+              AND signal_id = $5
+              AND direction = $6
+              AND score_version = $7
+              AND analysis_id = $8
+              AND indicator_param IS NOT DISTINCT FROM $9
+              AND timeframe = $10
+              AND bin_name = $11
             """,
             rows,
         )
 
-    # rows уже содержит финальный consensus; посчитаем ok/bad для логов
-    ok = 0
-    bad = 0
+    cons_ok = 0
+    cons_bad = 0
+    q_ok = 0
+    q_bad = 0
+
     for r in rows:
         if bool(r[0]):
-            ok += 1
+            cons_ok += 1
         else:
-            bad += 1
-    return ok, bad
+            cons_bad += 1
+
+        if bool(r[1]):
+            q_ok += 1
+        else:
+            q_bad += 1
+
+    return cons_ok, cons_bad, q_ok, q_bad
 
 
 # 🔸 Публикация события готовности stabproc v2 (состав как у bt:analysis:postproc_ready_v2)
@@ -593,19 +601,13 @@ async def _publish_stabproc_ready(redis, ctx: Dict[str, Any]) -> None:
                 "scenario_id": str(int(ctx["scenario_id"])),
                 "signal_id": str(int(ctx["signal_id"])),
                 "run_id": str(int(ctx["run_id"])),
-
                 "candidates": str(ctx.get("candidates") or "0"),
                 "score_upserts": str(ctx.get("score_upserts") or "0"),
                 "labels_rows": str(ctx.get("labels_rows") or "0"),
-
                 "winner_analysis_id": str(ctx.get("winner_analysis_id") or "0"),
                 "winner_param": str(ctx.get("winner_param") or ""),
                 "score_version": str(ctx.get("score_version") or "v1"),
-
-                # finished_at — время окончания stabproc
                 "finished_at": finished_at.isoformat(),
-
-                # source_finished_at — время окончания postproc (как "источник" для этого шага)
                 "source_finished_at": ctx.get("finished_at").isoformat() if ctx.get("finished_at") else "",
             },
         )
