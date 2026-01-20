@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -225,7 +226,7 @@ async def _persist_live_signal(
 
     # event-layer идентичность для live (чтобы не плодить дубликаты)
     mode = str((raw_message or {}).get("mode") or "live_v2").strip().lower()
-    event_key = f"lr_universal_live_{mode}_{timeframe}"
+    event_key = f"lr_universal_live_{mode}_{timeframe}_sig{int(signal_id)}"
 
     # hash параметров детектора (стабильная часть) — используем поля из raw_message, если есть
     trend_type = str((raw_message or {}).get("trend_type") or (raw_message or {}).get("trend") or "").strip().lower()
@@ -243,8 +244,6 @@ async def _persist_live_signal(
             mirrors_sig = f"{si}:{ms}"
     except Exception:
         mirrors_sig = ""
-
-    import hashlib
 
     event_params_hash = f"trend={trend_type}|zone_k={zone_k}|keep_half={keep_half}|filter={filter_mode}|mirror={mirrors_sig}"
     event_params_hash = hashlib.sha1(event_params_hash.encode("utf-8")).hexdigest()[:16]
