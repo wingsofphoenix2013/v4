@@ -1,20 +1,31 @@
-# bt_signals_macdcross_live_v2.py — live-воркер MACD cross: RAW от indicator_stream + FILTER(1/2) от ind_pack_stream_ready (results_json). Принципы: 1-в-1 как bt_signals_lr_universal_live_v2.py
+# bt_signals_macdcross_live_v2.py — live-воркер MACD cross: RAW от indicator_stream + FILTER(1/2) от ind_pack_stream_ready (results_json), поддержка use_consensus/use_quart_consensus
 
 # 🔸 Imports
 import asyncio
 import json
 import logging
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 🔸 Project imports
-from backtester_config import get_indicator_instance, get_ticker_info
+from backtester_config import get_ticker_info
 
+# 🔸 Кеш v2 good-bins по mirror (default)
 from bt_signals_cache_config_v2 import (
     get_mirror_label_cache_v2,
     get_mirror_run_id_v2,
     load_initial_mirror_caches_v2,
+)
+
+# 🔸 Кеш v2 good-bins по mirror (consensus/quart)
+from bt_signals_cache_consensus_v2 import (
+    get_mirror_label_cache_consensus_v2,
+    get_mirror_run_id_consensus_v2,
+    get_mirror_label_cache_quart_v2,
+    get_mirror_run_id_quart_v2,
+    load_initial_mirror_caches_consensus_v2,
 )
 
 # 🔸 Logger
@@ -28,7 +39,7 @@ IND_PACK_READY_STREAM_KEY = "ind_pack_stream_ready"
 BB_TS_CLOSE_KEY = "bb:ts:{symbol}:{tf}:c"
 IND_TS_KEY = "ts_ind:{symbol}:{tf}:{param_name}"
 
-# 🔸 Таймшаги TF (в минутах) — пока как в backfill (m5)
+# 🔸 Таймшаги TF (в минутах)
 TF_STEP_MINUTES = {"m5": 5}
 
 # 🔸 Защита от “догоняющих” событий
@@ -183,7 +194,7 @@ async def _persist_live_signal(
 
     # stable key composition
     mode = str((raw_message or {}).get("mode") or "live_v2").strip().lower()
-    event_key = f"macd_cross_live_{mode}_{timeframe}"
+    event_key = f"macd_cross_live_{mode}_{timeframe}_sig{int(signal_id)}"
 
     macd_instance_id = str((raw_message or {}).get("macd_instance_id") or "")
     indicator_base = str((raw_message or {}).get("indicator_base") or "")
@@ -192,24 +203,33 @@ async def _persist_live_signal(
     require_macd_sign = str((raw_message or {}).get("require_macd_sign") or "")
     rule = str((raw_message or {}).get("rule") or "hist_strict_cross")
 
+    # консенсус-флаги (для различения конфигов)
+    use_consensus = str((raw_message or {}).get("use_consensus") or "").strip().lower()
+    use_quart_consensus = str((raw_message or {}).get("use_quart_consensus") or "").strip().lower()
+
     # зеркала (если filtered): краткая подпись для различения конфигов
     filter_mode = str((raw_message or {}).get("filter_mode") or "").strip().lower()
     layers = (raw_message or {}).get("layers") or []
+
     mirrors_sig = ""
     try:
         if isinstance(layers, list) and layers:
-            ms = str(((layers[0] or {}).get("mirror") or {}).get("scenario_id") or "")
-            si = str(((layers[0] or {}).get("mirror") or {}).get("signal_id") or "")
-            mirrors_sig = f"{si}:{ms}"
+            parts = []
+            for layer in layers[:2]:
+                mir = (layer or {}).get("mirror") or {}
+                ms = str(mir.get("scenario_id") or "")
+                si = str(mir.get("signal_id") or "")
+                if ms and si:
+                    parts.append(f"{si}:{ms}")
+            mirrors_sig = ",".join(parts)
     except Exception:
         mirrors_sig = ""
-
-    import hashlib
 
     ep = (
         f"macd_instance_id={macd_instance_id}|base={indicator_base}|tf={timeframe}|"
         f"min_abs_hist={min_abs_hist}|require_macd_sign={require_macd_sign}|rule={rule}|"
-        f"filter={filter_mode}|mirror={mirrors_sig}"
+        f"filter={filter_mode}|mirror={mirrors_sig}|"
+        f"use_consensus={use_consensus}|use_quart_consensus={use_quart_consensus}"
     )
     event_params_hash = hashlib.sha1(ep.encode("utf-8")).hexdigest()[:16]
 
@@ -271,15 +291,34 @@ async def _persist_live_signal(
     return inserted
 
 
-# 🔸 FILTER: build layer cache (mirror labels)
+# 🔸 FILTER: build layer cache (mirror labels) with cache mode selection
 def _build_filter_layer_from_cache(
     mirror_scenario_id: int,
     mirror_signal_id: int,
     direction: str,
+    use_consensus: bool,
+    use_quart_consensus: bool,
 ) -> Optional[Dict[str, Any]]:
-    req, good_map = get_mirror_label_cache_v2(mirror_scenario_id, mirror_signal_id, direction)
-    run_id = get_mirror_run_id_v2(mirror_scenario_id, mirror_signal_id, direction)
+    # quart имеет приоритет над consensus
+    cache_kind = "default"
+    req = None
+    good_map = None
+    run_id = None
 
+    if use_quart_consensus:
+        cache_kind = "quart"
+        req, good_map = get_mirror_label_cache_quart_v2(mirror_scenario_id, mirror_signal_id, direction)
+        run_id = get_mirror_run_id_quart_v2(mirror_scenario_id, mirror_signal_id, direction)
+    elif use_consensus:
+        cache_kind = "consensus"
+        req, good_map = get_mirror_label_cache_consensus_v2(mirror_scenario_id, mirror_signal_id, direction)
+        run_id = get_mirror_run_id_consensus_v2(mirror_scenario_id, mirror_signal_id, direction)
+    else:
+        cache_kind = "default"
+        req, good_map = get_mirror_label_cache_v2(mirror_scenario_id, mirror_signal_id, direction)
+        run_id = get_mirror_run_id_v2(mirror_scenario_id, mirror_signal_id, direction)
+
+    # условия достаточности
     if not req or not good_map:
         return None
 
@@ -290,6 +329,9 @@ def _build_filter_layer_from_cache(
         "applied_run_id": int(run_id) if run_id is not None else None,
         "required_pairs": set(req),
         "good_bins_map": {k: set(v) for k, v in good_map.items()},
+        "cache_kind": cache_kind,
+        "use_consensus": bool(use_consensus),
+        "use_quart_consensus": bool(use_quart_consensus),
     }
 
 
@@ -323,6 +365,7 @@ def _check_layer_by_pack_results(
     si = int(layer_cache["mirror_signal_id"])
     direction = str(layer_cache["direction"])
     applied_run_id = layer_cache.get("applied_run_id")
+    cache_kind = str(layer_cache.get("cache_kind") or "default")
 
     pair_key = f"{si}:{ms}"
     rec = results_by_pair.get(pair_key)
@@ -334,6 +377,7 @@ def _check_layer_by_pack_results(
             "pair_key": pair_key,
             "mirror": {"scenario_id": ms, "signal_id": si},
             "applied_run_id": applied_run_id,
+            "cache_kind": cache_kind,
         }
 
     ok = rec.get("ok")
@@ -354,6 +398,7 @@ def _check_layer_by_pack_results(
                 "run_id": run_id,
             },
             "applied_run_id": applied_run_id,
+            "cache_kind": cache_kind,
         }
 
     bin_name = rec.get("bin_name")
@@ -365,6 +410,7 @@ def _check_layer_by_pack_results(
             "mirror": {"scenario_id": ms, "signal_id": si},
             "pack_result": {"ok": True, "analysis_id": analysis_id, "run_id": run_id},
             "applied_run_id": applied_run_id,
+            "cache_kind": cache_kind,
         }
 
     bn = str(bin_name).strip()
@@ -394,6 +440,7 @@ def _check_layer_by_pack_results(
             "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
             "applied_run_id": applied_run_id,
             "required_pairs_total": len(required_pairs),
+            "cache_kind": cache_kind,
         }
 
     # check bin_name in good bins for any candidate pair
@@ -416,6 +463,7 @@ def _check_layer_by_pack_results(
             "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
             "applied_run_id": applied_run_id,
             "checked_pairs": checked_pairs,
+            "cache_kind": cache_kind,
         }
 
     return True, {
@@ -426,6 +474,7 @@ def _check_layer_by_pack_results(
         "applied_run_id": applied_run_id,
         "pack_result": {"ok": True, "bin_name": bn, "analysis_id": analysis_id, "run_id": run_id},
         "checked_pairs": checked_pairs,
+        "cache_kind": cache_kind,
     }
 
 
@@ -460,6 +509,10 @@ async def init_macdcross_live_v2(
     raw_cnt = 0
     filt1_cnt = 0
     filt2_cnt = 0
+
+    noncons_cnt = 0
+    cons_cnt = 0
+    quart_cnt = 0
 
     # допускаем несколько macd_instance_id в одной группе, но stream_key/timeframe должны быть одинаковыми
     bases: Set[str] = set()
@@ -517,6 +570,13 @@ async def init_macdcross_live_v2(
         rms_cfg = params.get("require_macd_sign")
         require_macd_sign = str((rms_cfg or {}).get("value") or "").strip().lower() == "true"
 
+        # use_consensus / use_quart_consensus (опционально)
+        uc_cfg = params.get("use_consensus")
+        use_consensus = str((uc_cfg or {}).get("value") or "").strip().lower() == "true"
+
+        uq_cfg = params.get("use_quart_consensus")
+        use_quart_consensus = str((uq_cfg or {}).get("value") or "").strip().lower() == "true"
+
         # mirror layer 1/2 (optional)
         m1_sc = m1_si = None
         m2_sc = m2_si = None
@@ -553,6 +613,15 @@ async def init_macdcross_live_v2(
         else:
             raw_cnt += 1
 
+        # счётчики кешей только для filter инстансов
+        if filter_mode != "raw":
+            if use_quart_consensus:
+                quart_cnt += 1
+            elif use_consensus:
+                cons_cnt += 1
+            else:
+                noncons_cnt += 1
+
         cfgs.append(
             {
                 "signal_id": sid,
@@ -566,6 +635,8 @@ async def init_macdcross_live_v2(
                 "filter_mode": filter_mode,
                 "mirror1": {"scenario_id": m1_sc, "signal_id": m1_si} if has_layer1 else None,
                 "mirror2": {"scenario_id": m2_sc, "signal_id": m2_si} if has_layer2 else None,
+                "use_consensus": bool(use_consensus),
+                "use_quart_consensus": bool(use_quart_consensus),
             }
         )
 
@@ -575,6 +646,7 @@ async def init_macdcross_live_v2(
         if timeframe is None:
             timeframe = tf
 
+    # условия достаточности
     if timeframe is None or timeframe not in TF_STEP_MINUTES:
         raise RuntimeError(f"init_macdcross_live_v2: unsupported timeframe={timeframe}")
 
@@ -588,14 +660,21 @@ async def init_macdcross_live_v2(
 
     # initial load caches только если поток фильтров
     if stream_key == IND_PACK_READY_STREAM_KEY:
-        await load_initial_mirror_caches_v2(pg)
+        # default cache (non-consensus)
+        if noncons_cnt > 0:
+            await load_initial_mirror_caches_v2(pg)
+
+        # consensus/quart cache
+        if cons_cnt > 0 or quart_cnt > 0:
+            await load_initial_mirror_caches_consensus_v2(pg)
 
     step_min = TF_STEP_MINUTES.get(timeframe, 0)
     if step_min <= 0:
         raise RuntimeError(f"init_macdcross_live_v2: unknown timeframe step for tf={timeframe}")
 
     log.debug(
-        "BT_SIG_MACD_CROSS_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, bases=%s, instances=%s",
+        "BT_SIG_MACD_CROSS_LIVE_V2: init ok — stream=%s signals=%s (raw=%s, filter1=%s, filter2=%s), tf=%s, bases=%s, instances=%s, "
+        "filters: noncons=%s cons=%s quart=%s",
         stream_key,
         len(cfgs),
         raw_cnt,
@@ -604,6 +683,9 @@ async def init_macdcross_live_v2(
         timeframe,
         sorted(list(bases)),
         sorted(list(instances)),
+        noncons_cnt,
+        cons_cnt,
+        quart_cnt,
     )
 
     return {
@@ -661,25 +743,25 @@ async def _handle_indicator_ready_message(
     open_time_iso = (fields.get("open_time") or "").strip()
     status = (fields.get("status") or "").strip().lower()
 
-    # basic validation
+    # условия достаточности
     if not symbol or not open_time_iso or not timeframe:
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
 
     open_time = _parse_open_time_iso(open_time_iso)
     if open_time is None:
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
 
     # жёсткая фильтрация входного события
     if status != "ready" or timeframe != tf_expected:
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
 
     # indicator_base должен совпасть с одним из cfg (иначе игнор)
     matching_cfgs = [s for s in (ctx.get("signals") or []) if str(s.get("indicator_base") or "") == str(indicator_base)]
     if not matching_cfgs:
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
 
     # compute times
@@ -690,7 +772,7 @@ async def _handle_indicator_ready_message(
     # stale protection
     now_utc = datetime.utcnow().replace(tzinfo=None)
     if (now_utc - decision_time).total_seconds() > FILTER_STALE_MAX_SEC:
-        ctx["counters"]["dropped_stale"] += 1
+        ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
         return
 
     ts_ms = _to_ms_utc(open_time)
@@ -719,7 +801,7 @@ async def _handle_indicator_ready_message(
     try:
         res = await asyncio.wait_for(pipe.execute(), timeout=REDIS_OP_TIMEOUT_SEC)
     except Exception as e:
-        ctx["counters"]["errors_total"] += 1
+        ctx["counters"]["errors_total"] = int(ctx["counters"].get("errors_total", 0)) + 1
         log.error(
             "BT_SIG_MACD_CROSS_LIVE_V2: redis pipeline error (indicator_stream) — symbol=%s, open_time=%s, err=%s",
             symbol,
@@ -782,6 +864,7 @@ async def _handle_indicator_ready_message(
         # data_missing: only RAW configs are logged here
         details = {**base_details, "result": {"passed": False, "status": "data_missing", "missing": missing}}
         for scfg in matching_cfgs:
+            # условия достаточности
             if str(scfg.get("filter_mode") or "") != "raw":
                 continue
             await _upsert_live_log(
@@ -798,8 +881,9 @@ async def _handle_indicator_ready_message(
 
     # Один read → обработка всех RAW инстансов, относящихся к indicator_base
     sent_now = 0
+
     for scfg in matching_cfgs:
-        # only RAW
+        # условия достаточности
         if str(scfg.get("filter_mode") or "raw") != "raw":
             continue
 
@@ -884,7 +968,7 @@ async def _handle_indicator_ready_message(
 
         await _persist_live_signal(pg, redis, signal_id, symbol, timeframe, direction, open_time, decision_time, message, raw_message)
 
-        ctx["counters"]["raw_sent_total"] += 1
+        ctx["counters"]["raw_sent_total"] = int(ctx["counters"].get("raw_sent_total", 0)) + 1
         sent_now += 1
 
         log.debug(
@@ -898,13 +982,12 @@ async def _handle_indicator_ready_message(
 
     # суммарный лог по событию (если что-то отправили)
     if sent_now > 0:
-        log.debug(
-            "BT_SIG_MACD_CROSS_LIVE_V2: RAW batch result — symbol=%s open_time=%s base=%s sent_now=%s (raw_sent_total=%s)",
+        log.info(
+            "BT_SIG_MACD_CROSS_LIVE_V2: RAW sent — symbol=%s open_time=%s base=%s sent_now=%s",
             symbol,
             open_time.isoformat(),
             indicator_base,
             sent_now,
-            int(ctx["counters"].get("raw_sent_total", 0)),
         )
 
 
@@ -928,12 +1011,12 @@ async def _handle_pack_ready_message(
     expected_count = (fields.get("expected_count") or "").strip()
     received_count = (fields.get("received_count") or "").strip()
 
-    # basic validation
+    # условия достаточности
     if not symbol or status != "ok":
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
     if pack_tf != "mtf":
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
 
     # open_time resolve: iso preferred, else ms
@@ -946,7 +1029,7 @@ async def _handle_pack_ready_message(
         except Exception:
             open_time = None
     if open_time is None:
-        ctx["counters"]["ignored_total"] += 1
+        ctx["counters"]["ignored_total"] = int(ctx["counters"].get("ignored_total", 0)) + 1
         return
 
     # compute times
@@ -957,7 +1040,7 @@ async def _handle_pack_ready_message(
     # stale protection
     now_utc = datetime.utcnow().replace(tzinfo=None)
     if (now_utc - decision_time).total_seconds() > FILTER_STALE_MAX_SEC:
-        ctx["counters"]["dropped_stale"] += 1
+        ctx["counters"]["dropped_stale"] = int(ctx["counters"].get("dropped_stale", 0)) + 1
         return
 
     # parse pack results
@@ -977,10 +1060,6 @@ async def _handle_pack_ready_message(
             "results_keys": sorted(list(results_by_pair.keys()))[:200],
         },
     }
-
-    # Для MACD-cross фильтрация опирается на те же “свои” TS данные (hist prev/curr + macd sign), как и RAW.
-    # Тут мы не знаем заранее, какой indicator_base нужен, поэтому читаем TS отдельно на каждый cfg (base),
-    # но делаем это умно: сгруппируем по base.
 
     # ticker precision
     ticker_info = get_ticker_info(symbol) or {}
@@ -1006,9 +1085,10 @@ async def _handle_pack_ready_message(
         by_base.setdefault(str(c.get("indicator_base") or ""), []).append(c)
 
     # читаем close_curr один раз (общий)
-    pipe0 = redis.pipeline()
-    pipe0.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)
+    close_curr: Optional[float] = None
     try:
+        pipe0 = redis.pipeline()
+        pipe0.execute_command("TS.RANGE", close_key, ts_ms, ts_ms)
         res0 = await asyncio.wait_for(pipe0.execute(), timeout=REDIS_OP_TIMEOUT_SEC)
         close_curr = _extract_ts_value(res0[0])
     except Exception:
@@ -1016,7 +1096,9 @@ async def _handle_pack_ready_message(
 
     # per-base TS reads + per-config filter checks
     sent_now = 0
+
     for indicator_base, cfgs_for_base in by_base.items():
+        # условия достаточности
         if not indicator_base:
             continue
 
@@ -1034,10 +1116,11 @@ async def _handle_pack_ready_message(
         pipe.execute_command("TS.RANGE", hist_key, ts_ms, ts_ms)       # hist_curr
         pipe.execute_command("TS.RANGE", macd_key, ts_ms, ts_ms)       # macd_curr
         pipe.execute_command("TS.RANGE", sig_key, ts_ms, ts_ms)        # signal_curr
+
         try:
             res = await asyncio.wait_for(pipe.execute(), timeout=REDIS_OP_TIMEOUT_SEC)
         except Exception as e:
-            ctx["counters"]["errors_total"] += 1
+            ctx["counters"]["errors_total"] = int(ctx["counters"].get("errors_total", 0)) + 1
             log.error(
                 "BT_SIG_MACD_CROSS_LIVE_V2: redis pipeline error (pack_ready) — symbol=%s, open_time=%s, base=%s err=%s",
                 symbol,
@@ -1113,6 +1196,9 @@ async def _handle_pack_ready_message(
             mirror2 = scfg.get("mirror2")
             macd_instance_id = int(scfg["macd_instance_id"])
 
+            use_consensus = bool(scfg.get("use_consensus") or False)
+            use_quart_consensus = bool(scfg.get("use_quart_consensus") or False)
+
             # evaluate cross
             passed, eval_status, eval_extra = _evaluate_macd_cross(
                 direction=direction,
@@ -1140,6 +1226,8 @@ async def _handle_pack_ready_message(
                             "direction": direction,
                             "message": message,
                             "filter_mode": filter_mode,
+                            "use_consensus": use_consensus,
+                            "use_quart_consensus": use_quart_consensus,
                             "macd_instance_id": macd_instance_id,
                             "min_abs_hist": min_abs_hist,
                             "require_macd_sign": require_macd_sign,
@@ -1168,7 +1256,16 @@ async def _handle_pack_ready_message(
                         open_time=open_time,
                         decision_time=decision_time,
                         status="blocked_no_cache",
-                        details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror1"}},
+                        details={
+                            **base_details,
+                            "signal": {
+                                "signal_id": signal_id,
+                                "filter_mode": filter_mode,
+                                "use_consensus": use_consensus,
+                                "use_quart_consensus": use_quart_consensus,
+                            },
+                            "filter": {"reason": "missing_mirror1"},
+                        },
                     )
                     continue
 
@@ -1185,7 +1282,16 @@ async def _handle_pack_ready_message(
                         open_time=open_time,
                         decision_time=decision_time,
                         status="blocked_no_cache",
-                        details={**base_details, "signal": {"signal_id": signal_id, "filter_mode": filter_mode}, "filter": {"reason": "missing_mirror2"}},
+                        details={
+                            **base_details,
+                            "signal": {
+                                "signal_id": signal_id,
+                                "filter_mode": filter_mode,
+                                "use_consensus": use_consensus,
+                                "use_quart_consensus": use_quart_consensus,
+                            },
+                            "filter": {"reason": "missing_mirror2"},
+                        },
                     )
                     continue
 
@@ -1193,15 +1299,32 @@ async def _handle_pack_ready_message(
             blocked = False
 
             for layer in layers_to_check:
-                # build/check cache layer
                 layer_no = int(layer["layer"])
                 ms = int(layer["scenario_id"])
                 si = int(layer["signal_id"])
 
-                cache_layer = _build_filter_layer_from_cache(ms, si, direction)
+                cache_layer = _build_filter_layer_from_cache(
+                    ms,
+                    si,
+                    direction,
+                    use_consensus=use_consensus,
+                    use_quart_consensus=use_quart_consensus,
+                )
+
                 if cache_layer is None:
-                    await load_initial_mirror_caches_v2(pg)
-                    cache_layer = _build_filter_layer_from_cache(ms, si, direction)
+                    # пробуем освежить кеши (watcher мог ещё не успеть)
+                    if use_consensus or use_quart_consensus:
+                        await load_initial_mirror_caches_consensus_v2(pg)
+                    else:
+                        await load_initial_mirror_caches_v2(pg)
+
+                    cache_layer = _build_filter_layer_from_cache(
+                        ms,
+                        si,
+                        direction,
+                        use_consensus=use_consensus,
+                        use_quart_consensus=use_quart_consensus,
+                    )
 
                 if cache_layer is None:
                     await _upsert_live_log(
@@ -1214,14 +1337,24 @@ async def _handle_pack_ready_message(
                         status="blocked_no_cache",
                         details={
                             **base_details,
-                            "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
-                            "filter": {"layer": layer_no, "reason": "mirror_cache_missing", "mirror": {"scenario_id": ms, "signal_id": si}},
+                            "signal": {
+                                "signal_id": signal_id,
+                                "direction": direction,
+                                "message": message,
+                                "filter_mode": filter_mode,
+                                "use_consensus": use_consensus,
+                                "use_quart_consensus": use_quart_consensus,
+                            },
+                            "filter": {
+                                "layer": layer_no,
+                                "reason": "mirror_cache_missing",
+                                "mirror": {"scenario_id": ms, "signal_id": si},
+                            },
                         },
                     )
                     blocked = True
                     break
 
-                # check layer by pack results_json
                 ok_layer, info = _check_layer_by_pack_results(cache_layer, results_by_pair, pack_timeframe=pack_tf)
                 layer_results.append({"layer": layer_no, **info})
 
@@ -1236,7 +1369,14 @@ async def _handle_pack_ready_message(
                         status=str(info.get("status") or "blocked_no_labels_match"),
                         details={
                             **base_details,
-                            "signal": {"signal_id": signal_id, "direction": direction, "message": message, "filter_mode": filter_mode},
+                            "signal": {
+                                "signal_id": signal_id,
+                                "direction": direction,
+                                "message": message,
+                                "filter_mode": filter_mode,
+                                "use_consensus": use_consensus,
+                                "use_quart_consensus": use_quart_consensus,
+                            },
                             "filter": {"layer": layer_no, "mirror": {"scenario_id": ms, "signal_id": si}, **info},
                         },
                     )
@@ -1254,6 +1394,8 @@ async def _handle_pack_ready_message(
                     "direction": direction,
                     "message": message,
                     "filter_mode": filter_mode,
+                    "use_consensus": use_consensus,
+                    "use_quart_consensus": use_quart_consensus,
                     "macd_instance_id": macd_instance_id,
                     "min_abs_hist": min_abs_hist,
                     "require_macd_sign": require_macd_sign,
@@ -1279,6 +1421,8 @@ async def _handle_pack_ready_message(
                 "source": "backtester_v1",
                 "mode": "live_filtered_v2",
                 "filter_mode": filter_mode,
+                "use_consensus": use_consensus,
+                "use_quart_consensus": use_quart_consensus,
                 "pattern": "cross",
                 "rule": "hist_strict_cross",
                 "price": _round_price(float(close_curr), precision_price) if close_curr is not None else None,
@@ -1296,25 +1440,26 @@ async def _handle_pack_ready_message(
 
             await _persist_live_signal(pg, redis, signal_id, symbol, tf_expected, direction, open_time, decision_time, message, raw_message)
 
-            ctx["counters"]["filtered_sent_total"] += 1
+            ctx["counters"]["filtered_sent_total"] = int(ctx["counters"].get("filtered_sent_total", 0)) + 1
             sent_now += 1
 
             log.debug(
-                "BT_SIG_MACD_CROSS_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s base=%s mode=%s",
+                "BT_SIG_MACD_CROSS_LIVE_V2: signal_sent FILTERED — signal_id=%s %s %s %s base=%s mode=%s use_consensus=%s use_quart=%s",
                 signal_id,
                 symbol,
                 direction,
                 open_time.isoformat(),
                 indicator_base,
                 filter_mode,
+                use_consensus,
+                use_quart_consensus,
             )
 
     # суммарный лог по pack-событию (если что-то отправили)
     if sent_now > 0:
-        log.debug(
-            "BT_SIG_MACD_CROSS_LIVE_V2: FILTER batch result — symbol=%s open_time=%s sent_now=%s (filtered_sent_total=%s)",
+        log.info(
+            "BT_SIG_MACD_CROSS_LIVE_V2: FILTER sent — symbol=%s open_time=%s sent_now=%s",
             symbol,
             open_time.isoformat(),
             sent_now,
-            int(ctx["counters"].get("filtered_sent_total", 0)),
         )
