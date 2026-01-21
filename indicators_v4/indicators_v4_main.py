@@ -29,7 +29,7 @@ required_candles = {
     "h1": 800,
 }
 
-AUDIT_WINDOW_HOURS = 72
+AUDIT_WINDOW_HOURS = 672
 
 # 🔸 Константы источника данных (Bybit/feed_bb)
 BB_TS_PREFIX = "bb:ts"                  # bb:ts:{symbol}:{interval}:{field}
