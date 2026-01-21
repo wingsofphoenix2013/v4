@@ -96,6 +96,12 @@ async def run_rsi_reentry_backfill(
     lower_level = _get_float_param(params, "lower_level", 30.0)
     upper_level = _get_float_param(params, "upper_level", 70.0)
 
+    # минимальная длительность (в барах) беспрерывного нахождения в экстремальной зоне перед выходом
+    # если параметр не задан — сохраняем поведение "две точки" (min_extreme_bars=1)
+    min_extreme_bars = _get_int_param(params, "min_extreme_bars", 1)
+    if min_extreme_bars <= 1:
+        min_extreme_bars = 1
+
     # маска направлений: 'long' / 'short' / 'both' (по умолчанию both)
     dir_mask_cfg = params.get("direction_mask")
     if dir_mask_cfg:
@@ -123,6 +129,7 @@ async def run_rsi_reentry_backfill(
         lower_level=lower_level,
         upper_level=upper_level,
         timeframe=timeframe,
+        min_extreme_bars=min_extreme_bars,
     )
 
     # RAW membership не требует scenario/winner
@@ -137,7 +144,7 @@ async def run_rsi_reentry_backfill(
 
     log.debug(
         "BT_SIG_RSI_REENTRY: старт backfill — signal_id=%s ('%s', key=%s), run_id=%s, TF=%s, окно=[%s..%s], тикеров=%s, "
-        "direction_mask=%s, rsi_instance_id=%s, lower=%.2f, upper=%.2f, event_key=%s, hash=%s",
+        "direction_mask=%s, rsi_instance_id=%s, lower=%.2f, upper=%.2f, min_extreme_bars=%s, event_key=%s, hash=%s",
         signal_id,
         name,
         signal_key,
@@ -150,6 +157,7 @@ async def run_rsi_reentry_backfill(
         rsi_instance_id,
         lower_level,
         upper_level,
+        min_extreme_bars,
         event_key,
         event_params_hash,
     )
@@ -176,6 +184,7 @@ async def run_rsi_reentry_backfill(
                     rsi_instance_id=rsi_instance_id,
                     lower_level=lower_level,
                     upper_level=upper_level,
+                    min_extreme_bars=min_extreme_bars,
                     allowed_directions=allowed_directions,
                     tf_delta=tf_delta,
                     event_key=event_key,
@@ -193,34 +202,38 @@ async def run_rsi_reentry_backfill(
     total_long = 0
     total_short = 0
     total_no_data = 0
+    total_gaps_skipped = 0
 
     for res in results:
         if isinstance(res, Exception):
             continue
-        cands, ev_ins, mem_ins, longs, shorts, no_data = res
+        cands, ev_ins, mem_ins, longs, shorts, gaps_skipped, no_data = res
         total_candidates += cands
         total_events_inserted += ev_ins
         total_membership_inserted += mem_ins
         total_long += longs
         total_short += shorts
+        total_gaps_skipped += gaps_skipped
         total_no_data += no_data
 
     finished_at = datetime.utcnow()
 
     log.info(
         "BT_SIG_RSI_REENTRY: backfill готов — signal_id=%s run_id=%s TF=%s window=[%s..%s] tickers=%s "
-        "candidates=%s (long=%s short=%s) events_inserted=%s membership_inserted=%s no_data=%s",
+        "min_extreme_bars=%s candidates=%s (long=%s short=%s) events_inserted=%s membership_inserted=%s gaps_skipped=%s no_data=%s",
         signal_id,
         int(run_id),
         timeframe,
         from_time,
         to_time,
         len(symbols),
+        min_extreme_bars,
         total_candidates,
         total_long,
         total_short,
         total_events_inserted,
         total_membership_inserted,
+        total_gaps_skipped,
         total_no_data,
     )
 
@@ -266,21 +279,22 @@ async def _process_symbol(
     rsi_instance_id: int,
     lower_level: float,
     upper_level: float,
+    min_extreme_bars: int,
     allowed_directions: Set[str],
     tf_delta: timedelta,
     event_key: str,
     event_params_hash: str,
-) -> Tuple[int, int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int, int]:
     async with sema:
         # грузим RSI-серию на m5
         rsi_series = await _load_rsi_series(pg, rsi_instance_id, symbol, from_time, to_time)
         if not rsi_series or len(rsi_series) < 2:
-            return 0, 0, 0, 0, 0, 1
+            return 0, 0, 0, 0, 0, 0, 1
 
         # грузим OHLCV для m5 (для цен)
         ohlcv = await _load_ohlcv_series(pg, symbol, timeframe, from_time, to_time)
         if not ohlcv:
-            return 0, 0, 0, 0, 0, 1
+            return 0, 0, 0, 0, 0, 0, 1
 
         # precision цены
         ticker_info = get_ticker_info(symbol) or {}
@@ -290,7 +304,7 @@ async def _process_symbol(
             precision_price = 8
 
         # генерируем re-entry кандидаты (для разрешённых направлений)
-        candidates, long_count, short_count = _find_rsi_reentry_candidates(
+        candidates, long_count, short_count, gaps_skipped = _find_rsi_reentry_candidates(
             symbol=symbol,
             timeframe=timeframe,
             allowed_directions=allowed_directions,
@@ -298,13 +312,14 @@ async def _process_symbol(
             rsi_instance_id=rsi_instance_id,
             lower_level=lower_level,
             upper_level=upper_level,
+            min_extreme_bars=min_extreme_bars,
             rsi_series=rsi_series,
             ohlcv=ohlcv,
             tf_delta=tf_delta,
         )
 
         if not candidates:
-            return 0, 0, 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, int(gaps_skipped), 0
 
         # вставляем events (идемпотентно)
         events_inserted = await _upsert_events(
@@ -358,10 +373,18 @@ async def _process_symbol(
         if to_membership:
             membership_inserted = await _insert_membership(pg, to_membership)
 
-        return len(candidates), int(events_inserted), int(membership_inserted), int(long_count), int(short_count), 0
+        return (
+            len(candidates),
+            int(events_inserted),
+            int(membership_inserted),
+            int(long_count),
+            int(short_count),
+            int(gaps_skipped),
+            0,
+        )
 
 
-# 🔸 Поиск RSI re-entry кандидатов (2 точки + строгий выход за границу)
+# 🔸 Поиск RSI re-entry кандидатов (2 точки + строгий выход за границу + опциональная длительность в экстремальной зоне)
 def _find_rsi_reentry_candidates(
     symbol: str,
     timeframe: str,
@@ -370,104 +393,165 @@ def _find_rsi_reentry_candidates(
     rsi_instance_id: int,
     lower_level: float,
     upper_level: float,
+    min_extreme_bars: int,
     rsi_series: Dict[datetime, float],
     ohlcv: Dict[datetime, Tuple[float, float, float, float]],
     tf_delta: timedelta,
-) -> Tuple[List[Dict[str, Any]], int, int]:
+) -> Tuple[List[Dict[str, Any]], int, int, int]:
     # условия достаточности
     if not rsi_series or not ohlcv:
-        return [], 0, 0
+        return [], 0, 0, 0
 
-    times = sorted(set(rsi_series.keys()) & set(ohlcv.keys()))
-    if len(times) < 2:
-        return [], 0, 0
+    rsi_times = sorted(rsi_series.keys())
+    if len(rsi_times) < 2:
+        return [], 0, 0, 0
 
     out: List[Dict[str, Any]] = []
     long_count = 0
     short_count = 0
+    gaps_skipped = 0
 
-    for i in range(1, len(times)):
-        prev_ts = times[i - 1]
-        ts = times[i]
+    # streakи экстремальной зоны на RSI-оси (заканчиваются на "текущем" баре)
+    first_ts = rsi_times[0]
+    rsi_first = rsi_series.get(first_ts)
+
+    try:
+        rsi_first_f = float(rsi_first) if rsi_first is not None else None
+    except Exception:
+        rsi_first_f = None
+
+    if rsi_first_f is None:
+        streak_long_extreme = 0
+        streak_short_extreme = 0
+    else:
+        streak_long_extreme = 1 if rsi_first_f < float(lower_level) else 0
+        streak_short_extreme = 1 if rsi_first_f > float(upper_level) else 0
+
+    for i in range(1, len(rsi_times)):
+        prev_ts = rsi_times[i - 1]
+        ts = rsi_times[i]
+
+        # дырка в индикаторе (нарушение непрерывности таймфрейма) — скипаем место разрыва и продолжаем
+        if ts - prev_ts != tf_delta:
+            gaps_skipped += 1
+
+            rsi_curr = rsi_series.get(ts)
+            try:
+                rsi_curr_f = float(rsi_curr) if rsi_curr is not None else None
+            except Exception:
+                rsi_curr_f = None
+
+            if rsi_curr_f is None:
+                streak_long_extreme = 0
+                streak_short_extreme = 0
+            else:
+                streak_long_extreme = 1 if rsi_curr_f < float(lower_level) else 0
+                streak_short_extreme = 1 if rsi_curr_f > float(upper_level) else 0
+
+            continue
 
         rsi_prev = rsi_series.get(prev_ts)
         rsi_curr = rsi_series.get(ts)
         if rsi_prev is None or rsi_curr is None:
-            continue
-
-        ohlcv_curr = ohlcv.get(ts)
-        if not ohlcv_curr:
-            continue
-
-        close_curr = ohlcv_curr[3]
-        if close_curr is None or close_curr == 0:
+            # теоретически не должно быть, но на всякий случай скипаем
             continue
 
         try:
             rsi_prev_f = float(rsi_prev)
             rsi_curr_f = float(rsi_curr)
-            close_f = float(close_curr)
         except Exception:
             continue
+
+        # для цены нужен текущий бар в OHLCV
+        ohlcv_curr = ohlcv.get(ts)
+        if not ohlcv_curr:
+            # нет цены — кандидата не строим, но streak обновляем ниже
+            pass
 
         direction: Optional[str] = None
+        extreme_bars = 0
 
         # LONG: строгий выход из перепроданности (prev < L и curr > L)
+        # + опционально: не менее N баров подряд в перепроданности до выхода (заканчиваются на prev)
         if "long" in allowed_directions:
             if rsi_prev_f < float(lower_level) and rsi_curr_f > float(lower_level):
-                direction = "long"
+                if streak_long_extreme >= int(min_extreme_bars):
+                    direction = "long"
+                    extreme_bars = int(streak_long_extreme)
 
         # SHORT: строгий выход из перекупленности (prev > U и curr < U)
+        # + опционально: не менее N баров подряд в перекупленности до выхода (заканчиваются на prev)
         if direction is None and "short" in allowed_directions:
             if rsi_prev_f > float(upper_level) and rsi_curr_f < float(upper_level):
-                direction = "short"
+                if streak_short_extreme >= int(min_extreme_bars):
+                    direction = "short"
+                    extreme_bars = int(streak_short_extreme)
 
-        if direction is None:
-            continue
+        if direction is not None and ohlcv_curr:
+            close_curr = ohlcv_curr[3]
+            if close_curr is not None and close_curr != 0:
+                try:
+                    close_f = float(close_curr)
+                except Exception:
+                    close_f = None
 
-        # округляем цену (важно: не конвертируем в float, чтобы не получать длинные хвосты в numeric)
-        try:
-            price_rounded = f"{close_f:.{precision_price}f}"
-        except Exception:
-            price_rounded = str(close_f)
+                if close_f is not None:
+                    # округляем цену (важно: не конвертируем в float, чтобы не получать длинные хвосты в numeric)
+                    try:
+                        price_rounded = f"{close_f:.{precision_price}f}"
+                    except Exception:
+                        price_rounded = str(close_f)
 
-        decision_time = ts + tf_delta
+                    decision_time = ts + tf_delta
 
-        payload_stable = {
-            "pattern": "reentry",
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "open_time": ts.isoformat(),
-            "decision_time": decision_time.isoformat(),
-            "direction": direction,
-            "price": price_rounded,
-            "rsi_instance_id": int(rsi_instance_id),
-            "rsi_prev": rsi_prev_f,
-            "rsi_curr": rsi_curr_f,
-            "lower_level": float(lower_level),
-            "upper_level": float(upper_level),
-            "rule": "strict_cross",
-        }
+                    payload_stable = {
+                        "pattern": "reentry",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "open_time": ts.isoformat(),
+                        "decision_time": decision_time.isoformat(),
+                        "direction": direction,
+                        "price": price_rounded,
+                        "rsi_instance_id": int(rsi_instance_id),
+                        "rsi_prev": rsi_prev_f,
+                        "rsi_curr": rsi_curr_f,
+                        "lower_level": float(lower_level),
+                        "upper_level": float(upper_level),
+                        "min_extreme_bars": int(min_extreme_bars),
+                        "extreme_bars": int(extreme_bars),
+                        "rule": "strict_cross",
+                    }
 
-        out.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "open_time": ts,
-                "decision_time": decision_time,
-                "direction": direction,
-                "price": price_rounded,
-                "pattern": "reentry",
-                "payload_stable": payload_stable,
-            }
-        )
+                    out.append(
+                        {
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "open_time": ts,
+                            "decision_time": decision_time,
+                            "direction": direction,
+                            "price": price_rounded,
+                            "pattern": "reentry",
+                            "payload_stable": payload_stable,
+                        }
+                    )
 
-        if direction == "long":
-            long_count += 1
+                    if direction == "long":
+                        long_count += 1
+                    else:
+                        short_count += 1
+
+        # обновляем streakи на текущем баре (ts)
+        if rsi_curr_f < float(lower_level):
+            streak_long_extreme += 1
         else:
-            short_count += 1
+            streak_long_extreme = 0
 
-    return out, long_count, short_count
+        if rsi_curr_f > float(upper_level):
+            streak_short_extreme += 1
+        else:
+            streak_short_extreme = 0
+
+    return out, long_count, short_count, gaps_skipped
 
 
 # 🔸 Upsert events в bt_signals_values (общий event-layer)
@@ -820,16 +904,32 @@ def _get_float_param(params: Dict[str, Any], name: str, default: float) -> float
         return default
 
 
+# 🔸 Вспомогательная функция: безопасное чтение int-параметров сигнала
+def _get_int_param(params: Dict[str, Any], name: str, default: int) -> int:
+    cfg = params.get(name)
+    if cfg is None:
+        return int(default)
+
+    raw = cfg.get("value")
+    try:
+        return int(str(raw))
+    except Exception:
+        return int(default)
+
+
 # 🔸 Формирование стабильного hash набора параметров детектора (для event_params_hash)
 def _make_event_params_hash(
     rsi_instance_id: int,
     lower_level: float,
     upper_level: float,
     timeframe: str,
+    min_extreme_bars: int,
 ) -> str:
     s = (
         f"rsi={int(rsi_instance_id)}|"
         f"lower={float(lower_level)}|upper={float(upper_level)}|"
-        f"tf={str(timeframe)}|rule=reentry_strict"
+        f"tf={str(timeframe)}|"
+        f"min_extreme_bars={int(min_extreme_bars)}|"
+        f"rule=reentry_strict"
     )
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]

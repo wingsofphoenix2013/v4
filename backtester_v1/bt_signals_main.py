@@ -33,7 +33,7 @@ from signals.bt_signals_macdcross_live_v2 import (
 
 # 🔸 Глобальные настройки расписания для всех timer-backfill сигналов
 BT_TIMER_BACKFILL_START_DELAY_SEC = 60       # старт через минуту после запуска backtester_v1
-BT_TIMER_BACKFILL_INTERVAL_SEC = 7200       # повторный запуск полного цикла раз в Х секунд
+BT_TIMER_BACKFILL_INTERVAL_SEC = 14400       # повторный запуск полного цикла раз в Х секунд
 
 # 🔸 Настройки стримовых backfill-сигналов (по умолчанию)
 BT_STREAM_BACKFILL_BATCH_SIZE = 10
